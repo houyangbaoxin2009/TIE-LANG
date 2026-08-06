@@ -63,6 +63,12 @@ pub enum TokenKind {
     For,
     In,
     Return,
+    /// 多分支选择 `switch`
+    Switch,
+    /// switch 分支 `case`
+    Case,
+    /// switch 默认分支 `default`
+    Default,
     Import,
     As,
     True,
@@ -611,6 +617,9 @@ impl<'a> Lexer<'a> {
             "for" => TokenKind::For,
             "in" => TokenKind::In,
             "return" => TokenKind::Return,
+            "switch" => TokenKind::Switch,
+            "case" => TokenKind::Case,
+            "default" => TokenKind::Default,
             "import" => TokenKind::Import,
             "as" => TokenKind::As,
             "true" => TokenKind::True,

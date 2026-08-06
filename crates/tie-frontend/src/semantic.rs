@@ -350,6 +350,61 @@ impl Analyzer {
                 self.check_block(&f.body, scope, ret_ty)?;
                 Ok(())
             }
+            Stmt::Switch(s) => {
+                // subject 表达式类型推断（与 case 值类型必须一致）
+                let subject_ty = self.infer_expr(&s.subject, scope)?;
+                self.result.expr_types.insert(addr_of(&s.subject), subject_ty);
+                // subject 必须是数字、布尔或字符（字符串 case 的 strcmp 留待 M4）
+                if !is_number(subject_ty)
+                    && !is_bool_like(subject_ty)
+                    && !matches!(subject_ty, TypeSpec::Named(TyKw::Char))
+                {
+                    return Err(SemanticError {
+                        span: s.span,
+                        message: format!(
+                            "switch 对象仅支持数字、布尔或字符类型，实际是 {}（字符串 case 留待后续）",
+                            type_name(subject_ty)
+                        ),
+                    });
+                }
+                // case 值必须与 subject 类型一致（字面量类型精确匹配；
+                // 整数字面量可适配任意整数，浮点字面量可适配任意浮点）
+                let mut seen: Vec<String> = Vec::new();
+                for c in &s.cases {
+                    let value_ty = self.infer_expr(&c.value, scope)?;
+                    self.result.expr_types.insert(addr_of(&c.value), value_ty);
+                    // case 值必须是编译期字面量（不允许变量/表达式）
+                    if !is_const_literal(&c.value) {
+                        return Err(SemanticError {
+                            span: c.span,
+                            message: "case 值必须是字面量（整数/浮点/字符/布尔/字符串）".into(),
+                        });
+                    }
+                    // case 值类型必须与 subject 类型匹配
+                    if !types_match(subject_ty, value_ty, Some(&c.value)) {
+                        return Err(SemanticError {
+                            span: c.span,
+                            message: format!(
+                                "case 值类型 {} 与 switch 对象类型 {} 不匹配",
+                                type_name(value_ty),
+                                type_name(subject_ty)
+                            ),
+                        });
+                    }
+                    // 重复 case 检测
+                    let key = literal_key(&c.value);
+                    if seen.contains(&key) {
+                        return Err(SemanticError {
+                            span: c.span,
+                            message: format!("重复的 case 值 {}", key),
+                        });
+                    }
+                    seen.push(key);
+                    self.check_block(&c.body, scope, ret_ty)?;
+                }
+                self.check_block(&s.default_body, scope, ret_ty)?;
+                Ok(())
+            }
         }
     }
 
@@ -616,6 +671,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::If(i) => i.span,
         Stmt::While(w) => w.span,
         Stmt::For(f) => f.span,
+        Stmt::Switch(s) => s.span,
     }
 }
 
@@ -662,6 +718,37 @@ fn types_match(want: TypeSpec, got: TypeSpec, init: Option<&Expr>) -> bool {
 /// 是否为数字类型（整数或浮点）。
 fn is_number(t: TypeSpec) -> bool {
     t.is_number()
+}
+
+/// 是否为编译期字面量（switch 的 case 值只允许字面量）。
+fn is_const_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::IntLit(_) | Expr::FloatLit(_) | Expr::CharLit(_) | Expr::BoolLit(_) | Expr::StrLit(_) => {
+            true
+        }
+        // 负数字面量：`-1` / `-1.5`
+        Expr::Unary { op: UnaryOp::Neg, operand, .. } => {
+            matches!(operand.as_ref(), Expr::IntLit(_) | Expr::FloatLit(_))
+        }
+        _ => false,
+    }
+}
+
+/// 字面量的去重键（用于检测重复 case）。
+fn literal_key(expr: &Expr) -> String {
+    match expr {
+        Expr::IntLit(v) => format!("i:{v}"),
+        Expr::FloatLit(v) => format!("f:{v}"),
+        Expr::CharLit(c) => format!("c:{c:?}"),
+        Expr::BoolLit(b) => format!("b:{b}"),
+        Expr::StrLit(s) => format!("s:{s}"),
+        Expr::Unary { op: UnaryOp::Neg, operand, .. } => match operand.as_ref() {
+            Expr::IntLit(v) => format!("i:-{v}"),
+            Expr::FloatLit(v) => format!("f:-{v}"),
+            _ => "?".into(),
+        },
+        _ => "?".into(),
+    }
 }
 
 /// 是否为布尔类（if/while 条件）。

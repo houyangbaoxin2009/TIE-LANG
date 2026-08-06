@@ -1,0 +1,57 @@
+// switch.tie：P3 switch 多分支选择功能演示
+// 覆盖：整数匹配、default 分支、无匹配、字符匹配
+
+func main() {
+    // 整数匹配 + default
+    var n: i64 = 2
+    switch n {
+        case 1:
+            println("one")
+        case 2:
+            println("two")
+        case 3:
+            println("three")
+        default:
+            println("other")
+    }
+
+    // 无匹配 → default
+    var m: i64 = 99
+    switch m {
+        case 1:
+            println("small")
+        default:
+            println("big")
+    }
+
+    // 字符匹配
+    var c: char = 'Z'
+    switch c {
+        case 'a':
+            println("lower")
+        case 'Z':
+            println("upper")
+        default:
+            println("unknown")
+    }
+
+    // 负数 case
+    var x: i64 = -5
+    switch x {
+        case -1:
+            println("minus one")
+        case -5:
+            println("minus five")
+        default:
+            println("positive")
+    }
+
+    // 布尔匹配
+    var ok: bool = true
+    switch ok {
+        case true:
+            println("yes")
+        case false:
+            println("no")
+    }
+}

@@ -252,6 +252,7 @@ impl<'p> IrGenerator<'p> {
             Stmt::If(i) => self.gen_if(i),
             Stmt::While(w) => self.gen_while(w),
             Stmt::For(f) => self.gen_for(f),
+            Stmt::Switch(s) => self.gen_switch(s),
         }
     }
 
@@ -464,6 +465,135 @@ impl<'p> IrGenerator<'p> {
         self.block_end();
 
         self.block_start(&exit_label);
+        Ok(())
+    }
+
+    /// switch 多分支选择：生成比较链 + 各 case 体块。
+    ///
+    /// 结构（每个 case 一个比较块 + 一个体块）：
+    /// ```text
+    ///   br label %sw.cmp.0
+    /// sw.cmp.0:
+    ///   %c = icmp eq T %subj, <case0 值>
+    ///   br i1 %c, label %sw.body.0, label %sw.cmp.1
+    /// sw.body.0: …; br label %sw.exit
+    /// sw.cmp.1: …（不匹配 → default 或 exit）
+    /// sw.default: …; br label %sw.exit
+    /// sw.exit:
+    /// ```
+    /// 比较类型统一：整数扩展为 i64（icmp eq）、float 扩展为 double（fcmp oeq）、
+    /// 布尔用 i1（icmp eq）、字符用 i32（icmp eq，case 字符字面量同为 i32），
+    /// 保证 case 字面量与 subject 同类型可比较。
+    fn gen_switch(&mut self, s: &tie_frontend::ast::SwitchStmt) -> Result<(), IrError> {
+        // subject 求值 + 统一比较类型（返回比较指令的「运算类型」）
+        let (raw_subj, subj_ty) = self.gen_expr(&s.subject)?;
+        // 字符（LLVM i32）需按语义类型区分：直接 i32 比较，不扩展
+        let is_char = matches!(
+            self.sem_ty_of(&s.subject),
+            Some(TypeSpec::Named(TyKw::Char))
+        );
+        let (subj, cmp_op): (String, &str) = match subj_ty {
+            "i1" => (raw_subj, "icmp eq i1"),
+            "double" => (raw_subj, "fcmp oeq double"),
+            "float" => {
+                // float 扩展为 double，与 case 浮点字面量（double）同类型
+                let ext = self.new_reg();
+                self.line(&format!("{ext} = fpext float {raw_subj} to double"));
+                (ext, "fcmp oeq double")
+            }
+            _ if is_char => {
+                // 字符：LLVM i32，case 字符字面量也是 i32，直接 icmp eq i32
+                (raw_subj, "icmp eq i32")
+            }
+            _ => {
+                // 整数（i8/i16/i32/i64/u*）：扩展为 i64（按符号性 sext/zext）
+                let ext = self.extend_int_to_i64(&raw_subj, subj_ty, &s.subject)?;
+                (ext, "icmp eq i64")
+            }
+        };
+
+        let exit_label = self.new_label("sw.exit");
+        let has_default = !s.default_body.is_empty();
+        // default 标签在循环前统一创建，供最后一个 case 的 else 目标引用，
+        // 也用于 default 体块生成（保证同一标签只定义一次）
+        let def_label = if has_default { Some(self.new_label("sw.default")) } else { None };
+
+        // 无 case 分支：直接跳 default 或 exit
+        if s.cases.is_empty() {
+            match &def_label {
+                Some(def) => {
+                    self.line(&format!("br label %{def}"));
+                    self.gen_switch_body(&s.default_body, def, &exit_label)?;
+                }
+                None => {
+                    self.line(&format!("br label %{exit_label}"));
+                }
+            }
+            self.block_start(&exit_label);
+            return Ok(());
+        }
+
+        // 第一个比较块入口
+        let first_cmp = self.new_label("sw.cmp");
+        self.line(&format!("br label %{first_cmp}"));
+        let mut cur_cmp = first_cmp;
+
+        for (i, case) in s.cases.iter().enumerate() {
+            let is_last = i == s.cases.len() - 1;
+            let body_label = self.new_label("sw.body");
+            // 下一个比较目标：还有 case → 新比较块；否则 → default（有）或 exit
+            let next_cmp = if is_last {
+                None
+            } else {
+                Some(self.new_label("sw.cmp"))
+            };
+
+            // 比较块：subject == case 值
+            self.block_start(&cur_cmp);
+            let (case_val, _case_ty) = self.gen_expr(&case.value)?;
+            let cond = self.new_reg();
+            self.line(&format!("{cond} = {cmp_op} {subj}, {case_val}"));
+            let else_target = match &next_cmp {
+                Some(l) => l.clone(),
+                None => def_label.clone().unwrap_or_else(|| exit_label.clone()),
+            };
+            self.line(&format!("br i1 {cond}, label %{body_label}, label %{else_target}"));
+            self.block_end();
+
+            // 体块：case 语句列表
+            self.gen_switch_body(&case.body, &body_label, &exit_label)?;
+
+            if let Some(l) = next_cmp {
+                cur_cmp = l;
+            }
+        }
+
+        // default 体块（可选）
+        if let Some(def) = &def_label {
+            self.gen_switch_body(&s.default_body, def, &exit_label)?;
+        }
+
+        self.block_start(&exit_label);
+        Ok(())
+    }
+
+    /// 生成 switch 的一个分支体（case 或 default）：语句列表 + 跳回 exit。
+    ///
+    /// 分支体有自己的作用域（内部变量不外泄），结束后无条件跳转到 exit。
+    fn gen_switch_body(
+        &mut self,
+        body: &[Stmt],
+        body_label: &str,
+        exit_label: &str,
+    ) -> Result<(), IrError> {
+        self.block_start(body_label);
+        self.scopes.push(HashMap::new());
+        for st in body {
+            self.gen_stmt(st)?;
+        }
+        self.scopes.pop();
+        self.line(&format!("br label %{exit_label}"));
+        self.block_end();
         Ok(())
     }
 

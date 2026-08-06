@@ -7,7 +7,7 @@
 
 use super::ast::{
     AssignStmt, BinaryOp, Expr, ExprStmt, FnDefStmt, ForStmt, IfStmt, Param, Program, ReturnStmt,
-    Stmt, TableCell, TableId, TypeSpec, UnaryOp, VarDeclStmt, WhileStmt,
+    Stmt, SwitchCase, SwitchStmt, TableCell, TableId, TypeSpec, UnaryOp, VarDeclStmt, WhileStmt,
 };
 use super::lexer::{Span, Token, TokenKind, TyKw};
 use std::fmt;
@@ -140,6 +140,7 @@ impl<'a> Parser<'a> {
             TokenKind::If => self.parse_if().map(Stmt::If),
             TokenKind::While => self.parse_while().map(Stmt::While),
             TokenKind::For => self.parse_for().map(Stmt::For),
+            TokenKind::Switch => self.parse_switch().map(Stmt::Switch),
             TokenKind::Return => self.parse_return().map(Stmt::Return),
             TokenKind::LBrace => {
                 // 裸块（后续版本），此处按语法错误处理
@@ -255,6 +256,71 @@ impl<'a> Parser<'a> {
         let iter = self.parse_expr()?;
         let body = self.parse_block()?;
         Ok(ForStmt { var, iter, body, span })
+    }
+
+    /// `switch subject { case 值: 语句… default: 语句… }`。
+    ///
+    /// case 分支体以行（ASI）或分号结束，遇到下一个 case/default/右花括号时终止。
+    /// default 分支可选且至多一个（语法层不强制顺序，语义层校验）。
+    fn parse_switch(&mut self) -> Result<SwitchStmt, ParseError> {
+        let span = self.advance().span; // switch
+        let subject = self.parse_expr()?;
+        self.expect(TokenKind::LBrace, "'{'")?;
+        let mut cases = Vec::new();
+        let mut default_body: Option<Vec<Stmt>> = None;
+        // 分支循环：case / default / 右花括号
+        loop {
+            match self.peek_kind() {
+                TokenKind::Case => {
+                    let cspan = self.advance().span; // case
+                    let value = self.parse_case_value()?;
+                    self.expect(TokenKind::Colon, "':'")?;
+                    let body = self.parse_switch_body()?;
+                    cases.push(SwitchCase { value, body, span: cspan });
+                }
+                TokenKind::Default => {
+                    let _ = self.advance().span; // default
+                    self.expect(TokenKind::Colon, "':'")?;
+                    default_body = Some(self.parse_switch_body()?);
+                }
+                TokenKind::RBrace => {
+                    self.advance();
+                    break;
+                }
+                _ => {
+                    return Err(self.err(format!(
+                        "switch 体内只允许 case/default/右花括号，实际是 {}",
+                        self.describe(self.peek_kind())
+                    )))
+                }
+            }
+        }
+        Ok(SwitchStmt {
+            subject,
+            cases,
+            default_body: default_body.unwrap_or_default(),
+            span,
+        })
+    }
+
+    /// case 匹配值：编译期字面量（整数/浮点/字符/布尔/字符串/负数字面量）。
+    /// 不支持变量或任意表达式（语义层同样校验）。
+    fn parse_case_value(&mut self) -> Result<Expr, ParseError> {
+        // 负数 case：`case -1:` 由一元负号包裹
+        let expr = self.parse_unary()?;
+        Ok(expr)
+    }
+
+    /// case/default 分支体：连续语句直到下一个 case/default/右花括号/文件结束。
+    fn parse_switch_body(&mut self) -> Result<Vec<Stmt>, ParseError> {
+        let mut stmts = Vec::new();
+        while !matches!(
+            self.peek_kind(),
+            TokenKind::Case | TokenKind::Default | TokenKind::RBrace | TokenKind::Eof
+        ) {
+            stmts.push(self.parse_stmt()?);
+        }
+        Ok(stmts)
     }
 
     /// `return [expr]`。

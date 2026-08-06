@@ -119,6 +119,8 @@ pub enum Stmt {
     While(WhileStmt),
     /// for 循环（`for x in 0..10` / `for x in arr`）
     For(ForStmt),
+    /// switch 多分支选择
+    Switch(SwitchStmt),
 }
 
 /// 赋值语句：对已声明的变量重新赋值（const 不可变）。
@@ -201,6 +203,27 @@ pub struct ForStmt {
     pub var: String,
     /// 迭代对象（`0..10` 会解析为 RangeExpr）
     pub iter: Expr,
+    pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
+/// switch 多分支选择语句。
+#[derive(Debug, Clone)]
+pub struct SwitchStmt {
+    /// 被匹配的表达式（subject）
+    pub subject: Expr,
+    /// case 分支列表（顺序即源码顺序）
+    pub cases: Vec<SwitchCase>,
+    /// default 分支体（可选，无则空）
+    pub default_body: Vec<Stmt>,
+    pub span: Span,
+}
+
+/// switch 的一个 case 分支：`case 值: 语句…`。
+#[derive(Debug, Clone)]
+pub struct SwitchCase {
+    /// case 匹配值（编译期字面量：整数/字符/布尔/字符串）
+    pub value: Expr,
     pub body: Vec<Stmt>,
     pub span: Span,
 }
