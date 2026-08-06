@@ -20,7 +20,10 @@ impl TypeSpec {
     /// - uN → iN（LLVM 无独立无符号类型，无符号性由指令语义体现）
     /// - f32 → float、f64 → double
     /// - bool → i1、char → i32（Rust 风格 char 为 Unicode 标量，4 字节）
-    /// - string → ptr、code → ptr（代码数据作不透明句柄）
+    /// - string → ptr
+    ///
+    /// 注意：`code` 不在此映射中——它是**编译期类型**，代码片段会在语义
+    /// 分析阶段被解析翻译为 AST 子程序，IR 生成阶段已不存在 code 值。
     pub fn llvm_ty(&self) -> &'static str {
         match self {
             TypeSpec::Named(TyKw::I8) | TypeSpec::Named(TyKw::U8) => "i8",
@@ -31,8 +34,13 @@ impl TypeSpec {
             TypeSpec::Named(TyKw::F64) => "double",
             TypeSpec::Named(TyKw::Bool) => "i1",
             TypeSpec::Named(TyKw::Char) => "i32",
-            TypeSpec::Named(TyKw::Str) | TypeSpec::Named(TyKw::Code) => "ptr",
+            TypeSpec::Named(TyKw::Str) => "ptr",
             TypeSpec::Named(TyKw::Void) => "void",
+            // code 为编译期类型，不产生 LLVM 实体；若 IR 生成阶段仍遇到
+            // 说明前端未正确展开 code 片段，属编译器 bug。
+            TypeSpec::Named(TyKw::Code) => unreachable!(
+                "code 是编译期类型，应在语义分析阶段展开为 AST，不应出现在 IR 生成"
+            ),
         }
     }
 
