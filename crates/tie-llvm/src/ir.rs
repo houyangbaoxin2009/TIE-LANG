@@ -86,6 +86,16 @@ impl<'p> IrGenerator<'p> {
         self.out.push_str("source_filename = \"input.tie\"\n\n");
         // printf 声明（println 依赖）
         self.out.push_str("declare i32 @printf(ptr, ...)\n\n");
+        // 字符串运行时依赖（拼接/比较/长度）：
+        // - strlen：字符串长度（len() 内置函数）
+        // - strcmp：字符串比较（== != < > <= >= 与 switch 字符串 case）
+        // - malloc：拼接结果动态分配（string + string → 新串）
+        // - llvm.memcpy：拼接时把两段拷贝进新缓冲区
+        self.out.push_str("declare i64 @strlen(ptr)\n");
+        self.out.push_str("declare i32 @strcmp(ptr, ptr)\n");
+        self.out.push_str("declare ptr @malloc(i64)\n");
+        self.out
+            .push_str("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n\n");
 
         // 收集函数签名（与语义一致）
         let sigs: HashMap<String, FuncSig> = self
@@ -487,28 +497,37 @@ impl<'p> IrGenerator<'p> {
     fn gen_switch(&mut self, s: &tie_frontend::ast::SwitchStmt) -> Result<(), IrError> {
         // subject 求值 + 统一比较类型（返回比较指令的「运算类型」）
         let (raw_subj, subj_ty) = self.gen_expr(&s.subject)?;
+        // 字符串 subject：比较走 strcmp（case 值同为 ptr 字面量），cmp_op 仅作标记
+        let is_str_subj = matches!(
+            self.sem_ty_of(&s.subject),
+            Some(TypeSpec::Named(TyKw::Str))
+        );
         // 字符（LLVM i32）需按语义类型区分：直接 i32 比较，不扩展
         let is_char = matches!(
             self.sem_ty_of(&s.subject),
             Some(TypeSpec::Named(TyKw::Char))
         );
-        let (subj, cmp_op): (String, &str) = match subj_ty {
-            "i1" => (raw_subj, "icmp eq i1"),
-            "double" => (raw_subj, "fcmp oeq double"),
-            "float" => {
-                // float 扩展为 double，与 case 浮点字面量（double）同类型
-                let ext = self.new_reg();
-                self.line(&format!("{ext} = fpext float {raw_subj} to double"));
-                (ext, "fcmp oeq double")
-            }
-            _ if is_char => {
-                // 字符：LLVM i32，case 字符字面量也是 i32，直接 icmp eq i32
-                (raw_subj, "icmp eq i32")
-            }
-            _ => {
-                // 整数（i8/i16/i32/i64/u*）：扩展为 i64（按符号性 sext/zext）
-                let ext = self.extend_int_to_i64(&raw_subj, subj_ty, &s.subject)?;
-                (ext, "icmp eq i64")
+        let (subj, cmp_op): (String, &str) = if is_str_subj {
+            (raw_subj, "strcmp")
+        } else {
+            match subj_ty {
+                "i1" => (raw_subj, "icmp eq i1"),
+                "double" => (raw_subj, "fcmp oeq double"),
+                "float" => {
+                    // float 扩展为 double，与 case 浮点字面量（double）同类型
+                    let ext = self.new_reg();
+                    self.line(&format!("{ext} = fpext float {raw_subj} to double"));
+                    (ext, "fcmp oeq double")
+                }
+                _ if is_char => {
+                    // 字符：LLVM i32，case 字符字面量也是 i32，直接 icmp eq i32
+                    (raw_subj, "icmp eq i32")
+                }
+                _ => {
+                    // 整数（i8/i16/i32/i64/u*）：扩展为 i64（按符号性 sext/zext）
+                    let ext = self.extend_int_to_i64(&raw_subj, subj_ty, &s.subject)?;
+                    (ext, "icmp eq i64")
+                }
             }
         };
 
@@ -551,8 +570,18 @@ impl<'p> IrGenerator<'p> {
             // 比较块：subject == case 值
             self.block_start(&cur_cmp);
             let (case_val, _case_ty) = self.gen_expr(&case.value)?;
-            let cond = self.new_reg();
-            self.line(&format!("{cond} = {cmp_op} {subj}, {case_val}"));
+            let cond = if is_str_subj {
+                // 字符串：strcmp(subj, case) == 0 才算匹配
+                let cmp_res = self.new_reg();
+                self.line(&format!("{cmp_res} = call i32 @strcmp(ptr {subj}, ptr {case_val})"));
+                let c = self.new_reg();
+                self.line(&format!("{c} = icmp eq i32 {cmp_res}, 0"));
+                c
+            } else {
+                let c = self.new_reg();
+                self.line(&format!("{c} = {cmp_op} {subj}, {case_val}"));
+                c
+            };
             let else_target = match &next_cmp {
                 Some(l) => l.clone(),
                 None => def_label.clone().unwrap_or_else(|| exit_label.clone()),
@@ -656,32 +685,50 @@ impl<'p> IrGenerator<'p> {
 
     /// 下标访问：`base[index]` → GEP + load。
     ///
-    /// base 必须是表变量（VarBind.ty 形如 `[N x T]`），index 为整数（i64 或可扩展）。
+    /// base 可以是表变量（VarBind.ty 形如 `[N x T]`）或字符串（取第 i 个字符），
+    /// index 为整数（i64 或可扩展）。
     /// 注意：表变量是聚合类型 `[N x T]`，不能整体 load 到寄存器，因此直接取
     /// VarBind 中保存的 alloca 指针做 GEP（与标量变量的 load 路径不同）。
+    /// 字符串是 ptr 的 alloca（先 load 拿到串首指针），按字节 GEP + load + zext 成 char(i32)。
     fn gen_index(&mut self, base: &Expr, index: &Expr) -> Result<(String, &'static str), IrError> {
-        // base 必须是表变量：查作用域拿到 alloca 指针 + 数组类型名（不做 load）
+        // base 必须是表/字符串变量：查作用域拿到 alloca 指针 + 类型名（不做 load）
         let Expr::Var(name) = base else {
             return Err(IrError {
-                message: "下标访问仅支持表变量（base[index] 的 base 必须是变量）".into(),
+                message: "下标访问仅支持表/字符串变量（base[index] 的 base 必须是变量）".into(),
             });
         };
         let bind = self.lookup_var(name).cloned().ok_or_else(|| IrError {
             message: format!("内部错误：下标访问的变量 '{name}' 未入作用域（函数 {}）", self.cur_fn),
         })?;
-        let arr_ptr = bind.value;
-        let arr_ty = bind.ty;
-        let Some(elem_ty) = parse_array_elem_ty(arr_ty) else {
-            return Err(IrError {
-                message: format!("内部错误：下标访问的对象不是数组类型（{}）", arr_ty),
-            });
-        };
+        let base_ptr = bind.value;
+        let base_ty = bind.ty;
         // 下标值：整数（i64 直接使用，窄整数先扩展）
         let (idx_val, idx_ty) = self.gen_expr(index)?;
         let idx_val = self.extend_int_to_i64(&idx_val, idx_ty, index)?;
+        // 字符串下标：s[i] → 取第 i 个字节，zext 成 char（i32）。
+        // 通过语义类型区分字符串（LLVM "ptr" 无法区分字符串与裸指针）。
+        if matches!(self.sem_ty_of(base), Some(TypeSpec::Named(TyKw::Str))) {
+            // 字符串变量是 alloca ptr，先 load 拿到串首指针
+            let str_ptr = self.new_reg();
+            self.line(&format!("{str_ptr} = load ptr, ptr {base_ptr}"));
+            let ptr = self.new_reg();
+            self.line(&format!("{ptr} = getelementptr i8, ptr {str_ptr}, i64 {idx_val}"));
+            let byte = self.new_reg();
+            self.line(&format!("{byte} = load i8, ptr {ptr}"));
+            // char 在 LLVM 中为 i32：字节零扩展
+            let ch = self.new_reg();
+            self.line(&format!("{ch} = zext i8 {byte} to i32"));
+            return Ok((ch, "i32"));
+        }
+        // 表下标：数组类型必须可解析
+        let Some(elem_ty) = parse_array_elem_ty(base_ty) else {
+            return Err(IrError {
+                message: format!("内部错误：下标访问的对象不是数组类型（{}）", base_ty),
+            });
+        };
         // GEP：基址数组第 0 维、第 idx 元素
         let ptr = self.new_reg();
-        self.line(&format!("{ptr} = getelementptr {arr_ty}, ptr {arr_ptr}, i64 0, i64 {idx_val}"));
+        self.line(&format!("{ptr} = getelementptr {base_ty}, ptr {base_ptr}, i64 0, i64 {idx_val}"));
         let val = self.new_reg();
         self.line(&format!("{val} = load {elem_ty}, ptr {ptr}"));
         Ok((val, elem_ty))
@@ -695,6 +742,13 @@ impl<'p> IrGenerator<'p> {
     ) -> Result<(String, &'static str), IrError> {
         let (lv, lt) = self.gen_expr(lhs)?;
         let (rv, _rt) = self.gen_expr(rhs)?;
+        // 字符串操作：拼接（+）与比较（== != < > <= >=）走运行时函数。
+        // 通过语义类型判断（LLVM 类型名 "ptr" 无法区分字符串与裸指针）。
+        let lhs_is_str = matches!(self.sem_ty_of(lhs), Some(TypeSpec::Named(TyKw::Str)));
+        let rhs_is_str = matches!(self.sem_ty_of(rhs), Some(TypeSpec::Named(TyKw::Str)));
+        if lhs_is_str || rhs_is_str {
+            return self.gen_binary_str(op, lv, rv);
+        }
         // 类型以左侧为准（语义已保证一致）
         let ty = lt;
         // 是否为浮点类型（f32→float / f64→double）
@@ -801,10 +855,76 @@ impl<'p> IrGenerator<'p> {
         Ok((tmp, result_ty))
     }
 
-    /// 函数调用生成：内置 println → printf；用户函数 → call。
+    /// 字符串二元运算：拼接（+）与比较（== != < > <= >=）。
+    ///
+    /// - 拼接：`malloc(len1+len2+1)` → memcpy 两段 → 末尾写 \0，返回新缓冲区（ptr）。
+    /// - 比较：`strcmp(lv, rv)` 结果按有符号与 0 比较，返回 i1。
+    ///
+    /// 语义层已保证两侧都是字符串，这里 lv/rv 均为 ptr（全局常量或变量 load 结果）。
+    fn gen_binary_str(
+        &mut self,
+        op: BinaryOp,
+        lv: String,
+        rv: String,
+    ) -> Result<(String, &'static str), IrError> {
+        // 拼接：动态分配新串
+        if op == BinaryOp::Add {
+            let llen = self.new_reg();
+            self.line(&format!("{llen} = call i64 @strlen(ptr {lv})"));
+            let rlen = self.new_reg();
+            self.line(&format!("{rlen} = call i64 @strlen(ptr {rv})"));
+            let total = self.new_reg();
+            self.line(&format!("{total} = add i64 {llen}, {rlen}"));
+            // 分配 len1+len2+1 字节（末尾 \0）
+            let size = self.new_reg();
+            self.line(&format!("{size} = add i64 {total}, 1"));
+            let buf = self.new_reg();
+            self.line(&format!("{buf} = call ptr @malloc(i64 {size})"));
+            // 拷贝第一段到 buf[0..len1)
+            self.line(&format!(
+                "call void @llvm.memcpy.p0.p0.i64(ptr {buf}, ptr {lv}, i64 {llen}, i1 false)"
+            ));
+            // buf[len1..] 起始指针
+            let off = self.new_reg();
+            self.line(&format!("{off} = getelementptr i8, ptr {buf}, i64 {llen}"));
+            // 拷贝第二段到 buf[len1..len1+len2)
+            self.line(&format!(
+                "call void @llvm.memcpy.p0.p0.i64(ptr {off}, ptr {rv}, i64 {rlen}, i1 false)"
+            ));
+            // 末尾写 \0
+            let end = self.new_reg();
+            self.line(&format!("{end} = getelementptr i8, ptr {buf}, i64 {total}"));
+            self.line(&format!("store i8 0, ptr {end}"));
+            return Ok((buf, "ptr"));
+        }
+        // 比较：strcmp 返回值与 0 做有符号比较
+        let cmp = self.new_reg();
+        self.line(&format!("{cmp} = call i32 @strcmp(ptr {lv}, ptr {rv})"));
+        let icmp = match op {
+            BinaryOp::Eq => "eq",
+            BinaryOp::NotEq => "ne",
+            BinaryOp::Lt => "slt",
+            BinaryOp::Gt => "sgt",
+            BinaryOp::Le => "sle",
+            BinaryOp::Ge => "sge",
+            _ => unreachable!("字符串二元运算只允许 + 与比较"),
+        };
+        let res = self.new_reg();
+        self.line(&format!("{res} = icmp {icmp} i32 {cmp}, 0"));
+        Ok((res, "i1"))
+    }
+
+    /// 函数调用生成：内置 println/len → printf/strlen；用户函数 → call。
     fn gen_call(&mut self, name: &str, args: &[Expr]) -> Result<(String, &'static str), IrError> {
         if name == "println" {
             return self.gen_println(args);
+        }
+        // 内置 len：字符串长度（语义已保证单字符串参数）
+        if name == "len" {
+            let (v, _t) = self.gen_expr(&args[0])?;
+            let len = self.new_reg();
+            self.line(&format!("{len} = call i64 @strlen(ptr {v})"));
+            return Ok((len, "i64"));
         }
         // 用户函数调用
         let sig = self

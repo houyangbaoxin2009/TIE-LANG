@@ -1,0 +1,55 @@
+// strings.tie：P4 字符串操作验证
+// 覆盖：拼接(+)、比较(== != < > <= >=)、长度(len)、下标取字符、switch 字符串
+
+func main() {
+    // 拼接
+    var a: string = "Hello"
+    var b: string = "World"
+    var ab: string = a + " " + b
+    println(ab)          // Hello World
+
+    // 长度
+    var n: i64 = len("tie")
+    println(n)           // 3
+    println(len(ab))     // 11
+
+    // 比较
+    var eq: bool = "abc" == "abc"
+    println(eq)          // 1
+    var ne: bool = "abc" != "abd"
+    println(ne)          // 1
+    var lt: bool = "abc" < "abd"
+    println(lt)          // 1
+    var gt: bool = "z" > "a"
+    println(gt)          // 1
+    var le: bool = "abc" <= "abc"
+    println(le)          // 1
+    var ge: bool = "abd" >= "abc"
+    println(ge)          // 1
+
+    // 下标取字符
+    var s: string = "tie"
+    var c0: char = s[0]
+    var c1: char = s[1]
+    var c2: char = s[2]
+    println(c0)          // t
+    println(c1)          // i
+    println(c2)          // e
+
+    // switch 字符串
+    var name: string = "b"
+    switch name {
+        case "a":
+            println("first")
+        case "b":
+            println("second")
+        default:
+            println("other")
+    }
+
+    // 拼接后比较
+    var greeting: string = "Hello" + " " + "World"
+    if greeting == "Hello World" {
+        println("concat ok")
+    }
+}

@@ -354,15 +354,16 @@ impl Analyzer {
                 // subject 表达式类型推断（与 case 值类型必须一致）
                 let subject_ty = self.infer_expr(&s.subject, scope)?;
                 self.result.expr_types.insert(addr_of(&s.subject), subject_ty);
-                // subject 必须是数字、布尔或字符（字符串 case 的 strcmp 留待 M4）
+                // subject 必须是数字、布尔、字符或字符串（字符串用 strcmp 比较）
                 if !is_number(subject_ty)
                     && !is_bool_like(subject_ty)
                     && !matches!(subject_ty, TypeSpec::Named(TyKw::Char))
+                    && !matches!(subject_ty, TypeSpec::Named(TyKw::Str))
                 {
                     return Err(SemanticError {
                         span: s.span,
                         message: format!(
-                            "switch 对象仅支持数字、布尔或字符类型，实际是 {}（字符串 case 留待后续）",
+                            "switch 对象仅支持数字、布尔、字符或字符串类型，实际是 {}",
                             type_name(subject_ty)
                         ),
                     });
@@ -450,6 +451,24 @@ impl Analyzer {
                     }
                     return Ok(TypeSpec::Named(TyKw::Void));
                 }
+                // 内置函数 len：单参数，要求字符串，返回 i64（字符串长度）
+                if name == "len" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("len() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at);
+                    if !matches!(at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("len() 参数必须是字符串，实际是 {}", type_name(at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::I64));
+                }
                 // 用户函数：校验参数个数与类型
                 let sig = self.result.funcs.get(name).cloned().ok_or_else(|| SemanticError {
                     span: *span,
@@ -527,6 +546,12 @@ impl Analyzer {
                     | BinaryOp::Mul
                     | BinaryOp::Div
                     | BinaryOp::Mod => {
+                        // 字符串拼接：`+` 且两侧都是 string
+                        if *op == BinaryOp::Add
+                            && matches!(lt, TypeSpec::Named(TyKw::Str))
+                        {
+                            return Ok(TypeSpec::Named(TyKw::Str));
+                        }
                         if !is_number(lt) {
                             return Err(SemanticError {
                                 span: *span,
@@ -548,6 +573,10 @@ impl Analyzer {
                     | BinaryOp::Gt
                     | BinaryOp::Le
                     | BinaryOp::Ge => {
+                        // 字符串比较：任意比较运算符且两侧都是 string（用 strcmp）
+                        if matches!(lt, TypeSpec::Named(TyKw::Str)) {
+                            return Ok(TypeSpec::Named(TyKw::Bool));
+                        }
                         if !is_number(lt) && !matches!(lt, TypeSpec::Named(TyKw::Bool)) {
                             return Err(SemanticError {
                                 span: *span,
@@ -608,21 +637,28 @@ impl Analyzer {
                 first_ty
             }
             Expr::Index { base, index, span } => {
-                // 下标访问：base 必须是表，index 必须是整数
+                // 下标访问：base 必须是表（元素读取）或字符串（取字符），index 必须是整数
                 let base_ty = self.infer_expr(base, scope)?;
                 self.result.expr_types.insert(addr_of(base), base_ty);
                 let index_ty = self.infer_expr(index, scope)?;
                 self.result.expr_types.insert(addr_of(index), index_ty);
-                if base_ty != TypeSpec::Named(TyKw::Table) {
-                    return Err(SemanticError {
-                        span: *span,
-                        message: format!("下标访问的对象必须是表，实际是 {}", type_name(base_ty)),
-                    });
-                }
                 if !index_ty.is_int() {
                     return Err(SemanticError {
                         span: *span,
                         message: format!("下标必须是整数，实际是 {}", type_name(index_ty)),
+                    });
+                }
+                // 字符串下标：s[i] → 取第 i 个字符（char）
+                if matches!(base_ty, TypeSpec::Named(TyKw::Str)) {
+                    return Ok(TypeSpec::Named(TyKw::Char));
+                }
+                if base_ty != TypeSpec::Named(TyKw::Table) {
+                    return Err(SemanticError {
+                        span: *span,
+                        message: format!(
+                            "下标访问的对象必须是表或字符串，实际是 {}",
+                            type_name(base_ty)
+                        ),
                     });
                 }
                 // 元素类型：base 是表变量 → 查其布局元数据；是内联表字面量 → 元素同构类型
