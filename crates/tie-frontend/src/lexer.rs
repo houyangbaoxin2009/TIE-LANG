@@ -49,8 +49,12 @@ pub enum TokenKind {
     Ident(String),
 
     // ---- 关键字 ----
-    Fn,
-    Let,
+    /// 函数定义 `func`
+    Func,
+    /// 可变变量声明 `var`
+    Var,
+    /// 不可变变量声明 `const`
+    Const,
     If,
     Else,
     While,
@@ -61,7 +65,7 @@ pub enum TokenKind {
     As,
     True,
     False,
-    /// 类型关键字：int/float/bool/char/string/void
+    /// 类型关键字：i8..u64/f32/f64/bool/char/string/void/code/num/text/misc/table
     TypeKw(TyKw),
 
     // ---- 符号 ----
@@ -98,7 +102,8 @@ pub enum TokenKind {
     Eof,
 }
 
-/// 类型关键字枚举（Rust 风格：i8/i16/i32/i64/u8/u16/u32/u64/f32/f64/bool/char/string/void/code）。
+/// 类型关键字枚举（Rust 风格：i8/i16/i32/i64/u8/u16/u32/u64/f32/f64/bool/char/string/void/code，
+/// 外加宽类型 num/text/misc 与表类型 table）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TyKw {
     /// 有符号整数
@@ -124,6 +129,14 @@ pub enum TyKw {
     Void,
     /// 代码数据（code 是代码类型的关键词）
     Code,
+    /// 宽类型：数（覆盖全部整数与浮点）
+    Num,
+    /// 宽类型：文（覆盖字符串与字符）
+    Text,
+    /// 宽类型：其他（覆盖其余全部类型）
+    Misc,
+    /// 表类型：数组与高级数组（表）
+    Table,
 }
 
 impl TyKw {
@@ -145,6 +158,10 @@ impl TyKw {
             TyKw::Str => "string",
             TyKw::Void => "void",
             TyKw::Code => "code",
+            TyKw::Num => "num",
+            TyKw::Text => "text",
+            TyKw::Misc => "misc",
+            TyKw::Table => "table",
         }
     }
 
@@ -159,6 +176,11 @@ impl TyKw {
     /// 是否为浮点类型。
     pub fn is_float(self) -> bool {
         matches!(self, TyKw::F32 | TyKw::F64)
+    }
+
+    /// 是否为宽类型（num/text/misc，接受范围在语义分析时展开）。
+    pub fn is_wide(self) -> bool {
+        matches!(self, TyKw::Num | TyKw::Text | TyKw::Misc)
     }
 }
 
@@ -294,10 +316,14 @@ impl<'a> Lexer<'a> {
         Some(c)
     }
 
-    /// 预读下一个字符（不消费）。
+    /// 预读当前字符之后的那个字符（不消费）。
+    ///
+    /// 注意：`Peekable::clone()` 会保留已 peek 的字符，因此先 `next()` 丢弃
+    /// 当前字符，再 `next()` 才是真正的下一个字符。
     fn peek_next(&mut self) -> Option<char> {
         let mut it = self.chars.clone();
-        it.next()
+        it.next(); // 丢弃当前已 peek 的字符（若有）
+        it.next() // 返回真正的下一个字符
     }
 
     /// 记录一个 token 到流中，并更新 ASI 追踪状态。
@@ -453,9 +479,8 @@ impl<'a> Lexer<'a> {
                 self.consume_char();
             } else if c == '.' && !is_float {
                 // 仅当下一个字符也是数字时视作小数（避免 `1..10` 中的 `..`）
-                if let Some(next) = self.peek_next()
-                    && next.is_ascii_digit()
-                {
+                let is_decimal = matches!(self.peek_next(), Some(n) if n.is_ascii_digit());
+                if is_decimal {
                     is_float = true;
                     text.push(c);
                     self.consume_char();
@@ -512,8 +537,9 @@ impl<'a> Lexer<'a> {
             }
         }
         let kind = match text.as_str() {
-            "fn" => TokenKind::Fn,
-            "let" => TokenKind::Let,
+            "func" => TokenKind::Func,
+            "var" => TokenKind::Var,
+            "const" => TokenKind::Const,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
             "while" => TokenKind::While,
@@ -539,6 +565,12 @@ impl<'a> Lexer<'a> {
             "string" => TokenKind::TypeKw(TyKw::Str),
             "void" => TokenKind::TypeKw(TyKw::Void),
             "code" => TokenKind::TypeKw(TyKw::Code),
+            // 宽类型（类别框）：num/text/misc 加快编译推导
+            "num" => TokenKind::TypeKw(TyKw::Num),
+            "text" => TokenKind::TypeKw(TyKw::Text),
+            "misc" => TokenKind::TypeKw(TyKw::Misc),
+            // 表类型（数组与高级数组）
+            "table" => TokenKind::TypeKw(TyKw::Table),
             _ => TokenKind::Ident(text),
         };
         Token::new(kind, line, col)

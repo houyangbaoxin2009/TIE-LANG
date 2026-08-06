@@ -7,7 +7,7 @@
 
 use super::ast::{
     BinaryOp, Expr, ExprStmt, FnDefStmt, ForStmt, IfStmt, Param, Program, ReturnStmt, Stmt,
-    TypeSpec, UnaryOp, VarDeclStmt, WhileStmt,
+    TableCell, TableId, TypeSpec, UnaryOp, VarDeclStmt, WhileStmt,
 };
 use super::lexer::{Span, Token, TokenKind, TyKw};
 use std::fmt;
@@ -118,7 +118,7 @@ impl<'a> Parser<'a> {
         // 顶层只允许函数定义（后续版本扩展 import 等）
         while !matches!(self.peek_kind(), TokenKind::Eof) {
             match self.peek_kind() {
-                TokenKind::Fn => stmts.push(Stmt::FnDef(self.parse_fn_def()?)),
+                TokenKind::Func => stmts.push(Stmt::FnDef(self.parse_fn_def()?)),
                 other => {
                     return Err(self.err(format!(
                         "顶层只允许函数定义，实际是 {}",
@@ -135,7 +135,8 @@ impl<'a> Parser<'a> {
     /// 解析一个语句（函数体内）。
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
         match self.peek_kind() {
-            TokenKind::Let => self.parse_var_decl().map(Stmt::VarDecl),
+            TokenKind::Var => self.parse_var_decl(false).map(Stmt::VarDecl),
+            TokenKind::Const => self.parse_var_decl(true).map(Stmt::VarDecl),
             TokenKind::If => self.parse_if().map(Stmt::If),
             TokenKind::While => self.parse_while().map(Stmt::While),
             TokenKind::For => self.parse_for().map(Stmt::For),
@@ -148,9 +149,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `let name[: Ty] = expr`（ASI/分号结束）。
-    fn parse_var_decl(&mut self) -> Result<VarDeclStmt, ParseError> {
-        let span = self.advance().span; // let
+    /// `var name[: Ty] = expr` / `const name[: Ty] = expr`（ASI/分号结束）。
+    fn parse_var_decl(&mut self, is_const: bool) -> Result<VarDeclStmt, ParseError> {
+        let span = self.advance().span; // var / const
         let name = self.expect_ident()?;
         let ty = if self.eat(&TokenKind::Colon) {
             Some(self.parse_type()?)
@@ -160,12 +161,12 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Eq, "'='")?;
         let init = self.parse_expr()?;
         self.expect(TokenKind::Semi, "语句结束符")?;
-        Ok(VarDeclStmt { name, ty, init, span })
+        Ok(VarDeclStmt { name, ty, init, span, is_const })
     }
 
-    /// `fn name(params) -> Ty { stmts }`。
+    /// `func name(params) -> Ty { stmts }`。
     fn parse_fn_def(&mut self) -> Result<FnDefStmt, ParseError> {
-        let span = self.advance().span; // fn
+        let span = self.advance().span; // func
         let name = self.expect_ident()?;
         self.expect(TokenKind::LParen, "'('")?;
         let mut params = Vec::new();
@@ -441,11 +442,93 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::RParen, "')'")?;
                 Ok(inner)
             }
+            TokenKind::LBracket => self.parse_table_lit(span),
             other => Err(ParseError {
                 span,
                 message: format!("无法以 {} 开始表达式", self.describe(&other)),
             }),
         }
+    }
+
+    /// 表字面量 `[col, col; row, row]`。
+    ///
+    /// 语法要点：
+    /// - 逗号 `,` 分隔同一行的元素（列）
+    /// - 分号 `;` 分隔行
+    /// - 元素可为 `value` 或 `id:value`（id 可选）
+    /// - id 可为数字下标（`0:1`）或带引号字符串键（`"a":1`）
+    fn parse_table_lit(&mut self, span: Span) -> Result<Expr, ParseError> {
+        self.expect(TokenKind::LBracket, "'['")?;
+        let mut cells = Vec::new();
+        let mut row = 0usize;
+        // 空表 `[]` 合法
+        if self.eat(&TokenKind::RBracket) {
+            return Ok(Expr::TableLit { cells, span });
+        }
+        loop {
+            // 解析一个元素：`id:value` 或 `value`
+            let cell = self.parse_table_cell(row)?;
+            cells.push(cell);
+            match self.peek_kind() {
+                // 逗号：继续同一行的下一列
+                TokenKind::Comma => {
+                    self.advance();
+                }
+                // 分号：换行（行号 +1）
+                TokenKind::Semi => {
+                    self.advance();
+                    row += 1;
+                }
+                // 右括号：表结束
+                TokenKind::RBracket => {
+                    self.advance();
+                    break;
+                }
+                other => {
+                    return Err(self.err(format!(
+                        "期望 , 或 ; 或 ]，实际是 {}",
+                        self.describe(other)
+                    )))
+                }
+            }
+        }
+        Ok(Expr::TableLit { cells, span })
+    }
+
+    /// 解析表单元格：`id:value`（id 为数字或带引号字符串）或普通 `value`。
+    fn parse_table_cell(&mut self, row: usize) -> Result<TableCell, ParseError> {
+        // 先探测是否为 `id:` 形式：数字或字符串字面量后紧跟冒号
+        let id = match self.peek_kind() {
+            // 数字 id：`0:1`（数字后紧跟冒号）
+            TokenKind::Int(_) => {
+                let save = self.pos;
+                if let TokenKind::Int(v) = self.advance().kind
+                    && self.eat(&TokenKind::Colon)
+                {
+                    Some(TableId::Num(v))
+                } else {
+                    // 不是 id，回退游标，按普通表达式解析
+                    self.pos = save;
+                    None
+                }
+            }
+            // 字符串 id：`"a":1`（字符串后紧跟冒号）
+            TokenKind::Str(_) => {
+                let save = self.pos;
+                if let TokenKind::Str(s) = self.advance().kind
+                    && self.eat(&TokenKind::Colon)
+                {
+                    Some(TableId::Str(s))
+                } else {
+                    // 不是 id，回退游标，按普通表达式解析
+                    self.pos = save;
+                    None
+                }
+            }
+            _ => None,
+        };
+        let value = self.parse_expr()?;
+        Ok(TableCell { id, value, row })
     }
 }
 
@@ -455,7 +538,8 @@ fn expr_span(expr: &Expr) -> Option<Span> {
         Expr::Call { span, .. }
         | Expr::Unary { span, .. }
         | Expr::Binary { span, .. }
-        | Expr::Range { span, .. } => Some(*span),
+        | Expr::Range { span, .. }
+        | Expr::TableLit { span, .. } => Some(*span),
         _ => None,
     }
 }

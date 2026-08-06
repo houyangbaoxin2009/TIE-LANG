@@ -22,8 +22,9 @@ impl TypeSpec {
     /// - bool → i1、char → i32（Rust 风格 char 为 Unicode 标量，4 字节）
     /// - string → ptr
     ///
-    /// 注意：`code` 不在此映射中——它是**编译期类型**，代码片段会在语义
-    /// 分析阶段被解析翻译为 AST 子程序，IR 生成阶段已不存在 code 值。
+    /// 注意：`code`、`num`/`text`/`misc`、`table` 不在此映射中——
+    /// 它们都是编译期概念，语义分析阶段会被展开/校验后转化为具体类型，
+    /// 不应出现在 IR 生成阶段。
     pub fn llvm_ty(&self) -> &'static str {
         match self {
             TypeSpec::Named(TyKw::I8) | TypeSpec::Named(TyKw::U8) => "i8",
@@ -36,11 +37,12 @@ impl TypeSpec {
             TypeSpec::Named(TyKw::Char) => "i32",
             TypeSpec::Named(TyKw::Str) => "ptr",
             TypeSpec::Named(TyKw::Void) => "void",
-            // code 为编译期类型，不产生 LLVM 实体；若 IR 生成阶段仍遇到
-            // 说明前端未正确展开 code 片段，属编译器 bug。
-            TypeSpec::Named(TyKw::Code) => unreachable!(
-                "code 是编译期类型，应在语义分析阶段展开为 AST，不应出现在 IR 生成"
-            ),
+            // 编译期类型，IR 生成阶段不应出现（前端应已展开/校验）。
+            TypeSpec::Named(TyKw::Code | TyKw::Num | TyKw::Text | TyKw::Misc | TyKw::Table) => {
+                unreachable!(
+                    "code/num/text/misc/table 是编译期类型，语义分析阶段应已展开为具体类型"
+                )
+            }
         }
     }
 
@@ -62,6 +64,32 @@ impl TypeSpec {
     /// 是否为数字类型（整数或浮点）。
     pub fn is_number(&self) -> bool {
         self.is_int() || self.is_float()
+    }
+
+    /// 是否为宽类型（num/text/misc，类别框，语义分析时展开为具体类型）。
+    pub fn is_wide(&self) -> bool {
+        matches!(self, TypeSpec::Named(k) if k.is_wide())
+    }
+
+    /// 是否为表类型（table，代表数组与高级数组）。
+    pub fn is_table(&self) -> bool {
+        matches!(self, TypeSpec::Named(TyKw::Table))
+    }
+
+    /// 宽类型是否接受某个具体类型（类别框的归属判断）。
+    ///
+    /// - num：接受全部数类型（整数/浮点）
+    /// - text：接受字符串与字符
+    /// - misc：接受其余类型（bool/void/code/table）
+    pub fn wide_accepts(&self, actual: TypeSpec) -> bool {
+        match self {
+            TypeSpec::Named(TyKw::Num) => actual.is_number(),
+            TypeSpec::Named(TyKw::Text) => {
+                matches!(actual, TypeSpec::Named(TyKw::Str | TyKw::Char))
+            }
+            TypeSpec::Named(TyKw::Misc) => !actual.is_wide(),
+            _ => false,
+        }
     }
 }
 
@@ -95,10 +123,12 @@ pub enum Stmt {
 #[derive(Debug, Clone)]
 pub struct VarDeclStmt {
     pub name: String,
-    /// 显式类型标注（`let x: int`），`None` 表示自动推导
+    /// 显式类型标注（`var x: i64`），`None` 表示自动推导
     pub ty: Option<TypeSpec>,
     /// 初始值表达式
     pub init: Expr,
+    /// 是否不可变（`const` 声明）
+    pub is_const: bool,
     pub span: Span,
 }
 
@@ -184,6 +214,28 @@ pub enum Expr {
     Binary { op: BinaryOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span },
     /// 范围 `0..10`
     Range { start: Box<Expr>, end: Box<Expr>, span: Span },
+    /// 表字面量 `[col, col; row, row]`（高级数组/表，逗号分列、分号分行）
+    TableLit { cells: Vec<TableCell>, span: Span },
+}
+
+/// 表单元格：`value` 或 `id:value`（id 可选，可为数字下标或带引号字符串键）。
+#[derive(Debug, Clone)]
+pub struct TableCell {
+    /// 显式 id；`None` 表示普通位置元素（按隐式编号）
+    pub id: Option<TableId>,
+    /// 元素值（任意类型表达式）
+    pub value: Expr,
+    /// 所属行号（从 0 起），由解析器按 `;` 切分记录
+    pub row: usize,
+}
+
+/// 表元素 id：数字（下标）或字符串（命名键）。
+#[derive(Debug, Clone)]
+pub enum TableId {
+    /// 数字下标（不加引号），如 `[0:1, 1:2]`
+    Num(i64),
+    /// 字符串键（必须加双引号），如 `["a":1]`
+    Str(String),
 }
 
 /// 一元运算符。

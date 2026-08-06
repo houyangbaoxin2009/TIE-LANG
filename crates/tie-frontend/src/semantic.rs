@@ -12,7 +12,6 @@ use super::ast::{BinaryOp, Expr, FnDefStmt, Program, Stmt, TypeSpec, UnaryOp};
 use super::lexer::{Span, TyKw};
 use std::collections::HashMap;
 use std::fmt;
-
 /// 语义错误：携带位置与信息。
 #[derive(Debug, Clone)]
 pub struct SemanticError {
@@ -108,10 +107,39 @@ impl Analyzer {
                 let init_ty = self.infer_expr(&v.init, scope)?;
                 let declared = v.ty;
                 // 类型匹配：显式类型必须与推导类型兼容（int 与 float 不隐式转换；
-                // 但整数字面量可适配任意整数标注、浮点字面量可适配任意浮点标注）
+                // 但整数字面量可适配任意整数标注、浮点字面量可适配任意浮点标注；
+                // 宽类型 num/text/misc 是「类别框」，编译器归类即可，不精确推导）
                 match declared {
                     Some(d) => {
-                        if !types_match(d, init_ty, Some(&v.init)) {
+                        if d.is_wide() {
+                            // 宽类型：只校验初始化表达式是否属于该类别框。
+                            // 通过后 scope 存**具体推导类型**（IR 层无感知宽类型），
+                            // 编译器省去精确匹配校验 → 加快编译速度。
+                            if !d.wide_accepts(init_ty) {
+                                return Err(SemanticError {
+                                    span: v.span,
+                                    message: format!(
+                                        "变量 '{}' 标注 {} 不匹配初始化表达式的类型 {}",
+                                        v.name,
+                                        type_name(d),
+                                        type_name(init_ty)
+                                    ),
+                                });
+                            }
+                            scope.insert(v.name.clone(), init_ty);
+                        } else if d.is_table() {
+                            // table：初始化必须是表字面量（数组/高级数组）
+                            if !matches!(v.init, Expr::TableLit { .. }) {
+                                return Err(SemanticError {
+                                    span: v.span,
+                                    message: format!(
+                                        "变量 '{}' 标注 table，初始化必须是表字面量 [...]",
+                                        v.name
+                                    ),
+                                });
+                            }
+                            scope.insert(v.name.clone(), init_ty);
+                        } else if !types_match(d, init_ty, Some(&v.init)) {
                             return Err(SemanticError {
                                 span: v.span,
                                 message: format!(
@@ -121,8 +149,9 @@ impl Analyzer {
                                     type_name(init_ty)
                                 ),
                             });
+                        } else {
+                            scope.insert(v.name.clone(), d);
                         }
-                        scope.insert(v.name.clone(), d);
                     }
                     None => {
                         if init_ty.is_void() {
@@ -381,6 +410,32 @@ impl Analyzer {
                 // 范围类型：视作 i64 容器（当前仅 for 使用）
                 TypeSpec::Named(TyKw::I64)
             }
+            Expr::TableLit { cells, span } => {
+                // 表字面量：所有元素类型必须一致（表是元素同构的容器）。
+                // 空表视作 i64 元素（类型后续由上下文确定）。
+                if cells.is_empty() {
+                    return Ok(TypeSpec::Named(TyKw::I64));
+                }
+                // 推导第一个元素的类型，其余元素必须与其一致
+                let first_ty = self.infer_expr(&cells[0].value, scope)?;
+                self.result.expr_types.insert(addr_of(&cells[0].value), first_ty);
+                for cell in &cells[1..] {
+                    let ct = self.infer_expr(&cell.value, scope)?;
+                    self.result.expr_types.insert(addr_of(&cell.value), ct);
+                    if !types_compatible(first_ty, ct) {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!(
+                                "表元素类型不一致：{} 与 {}",
+                                type_name(first_ty),
+                                type_name(ct)
+                            ),
+                        });
+                    }
+                }
+                // 表类型：元素类型（当前 IR 阶段仅支持数/字符串元素的同构表）
+                first_ty
+            }
         };
         Ok(ty)
     }
@@ -416,7 +471,8 @@ fn expr_span_of(expr: &Expr) -> Span {
         Expr::Call { span, .. }
         | Expr::Unary { span, .. }
         | Expr::Binary { span, .. }
-        | Expr::Range { span, .. } => *span,
+        | Expr::Range { span, .. }
+        | Expr::TableLit { span, .. } => *span,
     }
 }
 

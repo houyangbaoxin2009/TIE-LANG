@@ -1,0 +1,27 @@
+// tie:logic
+// tie:opt=2
+
+// 宽类型（num/text/misc 类别框）与表字面量语法验证
+// 表字面量运行时（M2）未实现，此文件仅验证前端解析与语义通过
+
+func main() {
+    // 宽类型 num：整数与浮点均接受，scope 存具体推导类型
+    var a: num = 42
+    var b: num = 3.14
+    println(a)
+    println(b)
+
+    // 宽类型 text：字符串与字符均接受
+    var s: text = "hello"
+    println(s)
+
+    // 宽类型 misc：其余类型（bool）
+    var ok: misc = true
+    println(ok)
+
+    // 表字面量语法：逗号分列、分号分行、id 可选
+    var arr: table = [1, 2, 3]
+    var tbl: table = ["a":1, "b":2, "c":3]
+    var grid: table = [1, 2; 3, 4]
+    println("表字面量解析成功")
+}

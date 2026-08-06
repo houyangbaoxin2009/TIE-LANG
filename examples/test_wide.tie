@@ -1,0 +1,5 @@
+func main() {
+    var a: num = 42
+    var b: num = 3.14
+    println(a)
+}

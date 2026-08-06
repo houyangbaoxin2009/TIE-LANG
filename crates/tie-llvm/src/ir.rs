@@ -183,7 +183,23 @@ impl<'p> IrGenerator<'p> {
             Stmt::VarDecl(v) => {
                 let (val, ty) = self.gen_expr(&v.init)?;
                 // 声明类型以语义为准
-                let ty_name = v.ty.map(|t| self.llvm_ty(t)).unwrap_or(ty);
+                let ty_name = match v.ty {
+                    // 宽类型（num/text/misc）与 table 是编译期概念，语义分析阶段
+                    // 已把具体推导类型记录在 expr_types 表中（键为 init 表达式地址），
+                    // IR 阶段按地址取回具体类型，避免直接对宽类型调用 llvm_ty。
+                    Some(t) if t.is_wide() || t.is_table() => {
+                        let key = &v.init as *const Expr as usize;
+                        let concrete = self
+                            .sem
+                            .expr_types
+                            .get(&key)
+                            .copied()
+                            .unwrap_or(TypeSpec::Named(TyKw::I64));
+                        self.llvm_ty(concrete)
+                    }
+                    Some(t) => self.llvm_ty(t),
+                    None => ty,
+                };
                 let alloca = self.new_reg();
                 self.line(&format!("{alloca} = alloca {ty_name}"));
                 self.line(&format!("store {ty_name} {val}, ptr {alloca}"));
@@ -379,6 +395,9 @@ impl<'p> IrGenerator<'p> {
             Expr::Binary { op, lhs, rhs, .. } => self.gen_binary(*op, lhs, rhs),
             Expr::Range { .. } => Err(IrError {
                 message: "范围表达式只能在 for 中使用（不能单独求值）".into(),
+            }),
+            Expr::TableLit { .. } => Err(IrError {
+                message: "表字面量 [...] 的运行时生成尚未实现（M2 复合类型规划中）".into(),
             }),
         }
     }
