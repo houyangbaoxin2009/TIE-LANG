@@ -1,0 +1,9 @@
+[package]
+name = "tie-parser"
+version = "0.1.0"
+edition = "2024"
+description = "tie 语言解析器：递归下降解析 token 流生成 AST"
+
+[dependencies]
+tie-lexer = { path = "../tie-lexer" }
+tie-ast = { path = "../tie-ast" }

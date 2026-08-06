@@ -1,0 +1,27 @@
+# Rust 编译产物
+/target/
+**/*.rs.bk
+
+# 示例编译产物
+/examples/*.exe
+/examples/*.ll
+/examples/*.o
+/examples/*.obj
+
+# IDE 与编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统与临时文件
+Thumbs.db
+.DS_Store
+*.tmp
+
+# 记忆与本地配置（不入库）
+.localmemory/
+
+# 代码索引与计划（本地生成，不入库）
+.codegraph/
+.omo/

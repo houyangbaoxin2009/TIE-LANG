@@ -1,0 +1,7 @@
+[package]
+name = "tie-ast"
+version = "0.1.0"
+edition = "2024"
+description = "tie 语言 AST 节点定义：解析器与解释器共享的语法树契约"
+
+[dependencies]

@@ -1,0 +1,25 @@
+// tie:logic
+// tie:opt=2
+
+// tie 语言入门示例：头与内容分离 + ASI 自动分号
+// 本文件角色为 logic（可执行），通过 tie 总入口编译
+
+fn main() {
+    println("Hello, tie!")
+    println("四段式: 预处理 [前端 中间优化 后端]")
+
+    let x = 42
+    let y: i64 = 8
+    println(x + y)
+    println(x * y)
+
+    if x > y {
+        println("x 大于 y")
+    } else {
+        println("x 不大于 y")
+    }
+
+    for i in 0..10 {
+        println(i)
+    }
+}

@@ -1,0 +1,30 @@
+# tie 语言工作区配置
+#
+# 职责：声明 tie 语言所有子 crate 的工作区成员，
+#       统一 workspace 级依赖与编译参数。
+[workspace]
+resolver = "2"
+members = [
+    "crates/tie-lexer",
+    "crates/tie-ast",
+    "crates/tie-parser",
+    "crates/tie-interp",
+    "crates/tie-cli", "crates/tie-llvm", "crates/tie-prep", "crates/tie",
+]
+
+# workspace 统一编译配置：
+# - 严格警告策略，杜绝被忽略的隐患
+# - 发布构建启用 LTO 与压缩，减小二进制体积
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://git.franj2.top/tie/tie"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

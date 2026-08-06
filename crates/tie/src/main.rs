@@ -1,0 +1,163 @@
+//! tie：tie 语言总入口（四段式调度器）。
+//!
+//! 四段式架构：`预处理 [前端 中间优化 后端]`
+//!
+//! `tie` 是日常使用的一般入口，职责：
+//! 1. 调用 **tie-prep** 完成预处理（清理代码 + 识别文件类型 + 角色判定）；
+//! 2. 按文件角色**自动转交对应的工具链**：
+//!    - `logic` / `library` → 转交 **tie-llvm**（前端 + 中间优化 + 后端）
+//!    - `data` / `ui` / `db` → 识别后提示（对应工具链后续版本实现）
+//!
+//! 用户也可绕过本入口单独使用 tie-prep（纯预处理）或 tie-llvm（直接编译）。
+
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::process::ExitCode;
+use tie_prep::preprocess::FileRole;
+use tie_llvm::driver::{CompileOptions, CompileOutcome};
+use tie_llvm::optimizer::OptLevel;
+
+/// 命令行参数（编译类选项透传给 tie-llvm）。
+struct Args {
+    input: PathBuf,
+    output: Option<PathBuf>,
+    opt_level: Option<OptLevel>,
+    emit_ir_only: bool,
+    keep_ir: bool,
+    /// 只做预处理并打印识别结果，不转交任何工具链
+    prep_only: bool,
+}
+
+/// 使用说明。
+const USAGE: &str = "\
+tie 语言总入口（四段式调度器）
+
+用法:
+  tie <input.tie> [选项]
+
+流程:
+  1. tie-prep 预处理（清理代码 + 识别文件类型）
+  2. 按角色自动转交工具链（logic/library → tie-llvm 编译；
+     data/ui/db → 对应工具链，后续版本）
+
+选项:
+  -o <file>      指定输出可执行文件路径（默认: 输入同名 .exe）
+  -O0|-O1|-O2|-O3
+                 优化级别（默认: -O2）
+  --emit-ir      只生成 LLVM IR（.ll），不继续编译
+  --keep-ir      保留中间 IR 文件
+  --prep-only    只执行预处理并打印识别结果，不编译
+  -h, --help     显示本帮助
+
+单独使用:
+  tie-prep <file.tie>    只做预处理
+  tie-llvm <file.tie>   直接编译（不经过角色分派）
+";
+
+fn parse_args() -> Result<Args, String> {
+    let mut args = env::args().skip(1);
+    let mut input: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut opt_level: Option<OptLevel> = None;
+    let mut emit_ir_only = false;
+    let mut keep_ir = false;
+    let mut prep_only = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                std::process::exit(0);
+            }
+            "-o" => output = Some(PathBuf::from(args.next().ok_or("-o 后缺少输出文件路径")?)),
+            "-O0" => opt_level = Some(OptLevel::O0),
+            "-O1" => opt_level = Some(OptLevel::O1),
+            "-O2" => opt_level = Some(OptLevel::O2),
+            "-O3" => opt_level = Some(OptLevel::O3),
+            "--emit-ir" => emit_ir_only = true,
+            "--keep-ir" => keep_ir = true,
+            "--prep-only" => prep_only = true,
+            other if other.starts_with('-') => return Err(format!("未知选项: {other}")),
+            other => {
+                if input.is_some() {
+                    return Err("只能指定一个输入文件".into());
+                }
+                input = Some(PathBuf::from(other));
+            }
+        }
+    }
+
+    let input = input.ok_or("缺少输入文件，使用 --help 查看用法")?;
+    Ok(Args { input, output, opt_level, emit_ir_only, keep_ir, prep_only })
+}
+
+fn main() -> ExitCode {
+    let args = match parse_args() {
+        Ok(a) => a,
+        Err(msg) => {
+            eprintln!("错误: {msg}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // ---- 第 1 段：预处理（tie-prep）----
+    let source = match fs::read_to_string(&args.input) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("错误: 读取 {} 失败: {e}", args.input.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let pre = tie_prep::preprocess(&source);
+
+    // 打印预处理识别结果
+    println!("[tie] 文件: {} | 角色: {} | 头部: {}", args.input.display(), pre.role, pre.headers.len());
+
+    // --prep-only：只输出识别结果，不转交工具链
+    if args.prep_only {
+        return ExitCode::SUCCESS;
+    }
+
+    // ---- 第 2 段：按角色自动分派 ----
+    match dispatch_role(pre.role, &args) {
+        Ok(outcome) => {
+            println!("{}", outcome.message);
+            ExitCode::SUCCESS
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// 按角色转交对应工具链。
+fn dispatch_role(role: FileRole, args: &Args) -> Result<CompileOutcome, String> {
+    match role {
+        // logic / library → tie-llvm 编译工具链
+        FileRole::Logic | FileRole::Library => {
+            let opts = CompileOptions {
+                input: args.input.clone(),
+                output: args.output.clone(),
+                opt_level: args.opt_level,
+                emit_ir_only: args.emit_ir_only,
+                keep_intermediate: args.keep_ir,
+            };
+            tie_llvm::driver::compile(&opts).map_err(|e| e.to_string())
+        }
+        // data / ui / db → 对应工具链（v0.1 挂接点）
+        FileRole::Data => Ok(CompileOutcome {
+            message: "[tie] 角色为 data（数据交换文件），已转交数据解析工具链 —— v0.1 尚未实现".to_string(),
+            artifact: None,
+        }),
+        FileRole::Ui => Ok(CompileOutcome {
+            message: "[tie] 角色为 ui（界面文件），已转交 UI 工具链 —— v0.1 尚未实现".to_string(),
+            artifact: None,
+        }),
+        FileRole::Db => Ok(CompileOutcome {
+            message: "[tie] 角色为 db（数据库文件），已转交数据库工具链 —— v0.1 尚未实现".to_string(),
+            artifact: None,
+        }),
+    }
+}

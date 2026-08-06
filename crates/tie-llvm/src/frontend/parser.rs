@@ -1,0 +1,461 @@
+//! 语法分析器（Parser）。
+//!
+//! 职责：递归下降解析 token 流生成 AST。
+//!
+//! 说明：文件头部（`// tie:` 指令）已由 tie-prep 预处理阶段提取，
+//! 本解析器只处理清理后的正文源码。
+
+use super::ast::{
+    BinaryOp, Expr, ExprStmt, FnDefStmt, ForStmt, IfStmt, Param, Program, ReturnStmt, Stmt,
+    TypeSpec, UnaryOp, VarDeclStmt, WhileStmt,
+};
+use super::lexer::{Span, Token, TokenKind, TyKw};
+use std::fmt;
+
+/// 语法错误：携带位置与信息。
+#[derive(Debug, Clone)]
+pub struct ParseError {
+    pub span: Span,
+    pub message: String,
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "语法错误 @{}:{}: {}", self.span.line, self.span.col, self.message)
+    }
+}
+
+/// 解析入口：token 流 → 程序 AST。
+pub fn parse_program(tokens: &[Token]) -> Result<Program, ParseError> {
+    Parser::new(tokens).parse_program()
+}
+
+/// 递归下降解析器。
+struct Parser<'a> {
+    tokens: &'a [Token],
+    pos: usize,
+}
+
+impl<'a> Parser<'a> {
+    fn new(tokens: &'a [Token]) -> Self {
+        Self { tokens, pos: 0 }
+    }
+
+    // ---------- 基础游标 ----------
+
+    fn peek(&self) -> &Token {
+        &self.tokens[self.pos.min(self.tokens.len() - 1)]
+    }
+
+    fn peek_kind(&self) -> &TokenKind {
+        &self.peek().kind
+    }
+
+    /// 推进游标并返回被消费的 token（克隆，避免借用冲突）。
+    fn advance(&mut self) -> Token {
+        let tok = self.tokens[self.pos.min(self.tokens.len() - 1)].clone();
+        if !matches!(tok.kind, TokenKind::Eof) {
+            self.pos += 1;
+        }
+        tok
+    }
+
+    /// 当前 token 是否匹配某种类（并推进）。
+    fn eat(&mut self, kind: &TokenKind) -> bool {
+        if self.peek_kind() == kind {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 期望当前 token 为某类，否则报错。
+    fn expect(&mut self, kind: TokenKind, what: &str) -> Result<(), ParseError> {
+        if self.peek_kind() == &kind {
+            self.advance();
+            Ok(())
+        } else {
+            Err(self.err(format!("期望 {what}，实际是 {}", self.describe(self.peek_kind()))))
+        }
+    }
+
+    /// 期望当前 token 为标识符。
+    fn expect_ident(&mut self) -> Result<String, ParseError> {
+        match self.peek_kind() {
+            TokenKind::Ident(name) => {
+                let name = name.clone();
+                self.advance();
+                Ok(name)
+            }
+            _ => Err(self.err(format!("期望标识符，实际是 {}", self.describe(self.peek_kind())))),
+        }
+    }
+
+    /// 构造当前 token 位置上的错误。
+    fn err(&self, message: String) -> ParseError {
+        ParseError { span: self.peek().span, message }
+    }
+
+    /// token 种类的可读描述。
+    fn describe(&self, kind: &TokenKind) -> String {
+        match kind {
+            TokenKind::Ident(n) => format!("标识符 '{n}'"),
+            TokenKind::Int(v) => format!("整数 {v}"),
+            TokenKind::Float(v) => format!("浮点数 {v}"),
+            TokenKind::Str(_) => "字符串".into(),
+            TokenKind::TypeKw(t) => format!("类型 '{}'", t.as_str()),
+            TokenKind::Semi => "分号".into(),
+            TokenKind::Eof => "文件结束".into(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    // ---------- 程序解析 ----------
+
+    fn parse_program(&mut self) -> Result<Program, ParseError> {
+        let mut stmts = Vec::new();
+        // 顶层只允许函数定义（后续版本扩展 import 等）
+        while !matches!(self.peek_kind(), TokenKind::Eof) {
+            match self.peek_kind() {
+                TokenKind::Fn => stmts.push(Stmt::FnDef(self.parse_fn_def()?)),
+                other => {
+                    return Err(self.err(format!(
+                        "顶层只允许函数定义，实际是 {}",
+                        self.describe(other)
+                    )))
+                }
+            }
+        }
+        Ok(Program { stmts })
+    }
+
+    // ---------- 语句解析 ----------
+
+    /// 解析一个语句（函数体内）。
+    fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+        match self.peek_kind() {
+            TokenKind::Let => self.parse_var_decl().map(Stmt::VarDecl),
+            TokenKind::If => self.parse_if().map(Stmt::If),
+            TokenKind::While => self.parse_while().map(Stmt::While),
+            TokenKind::For => self.parse_for().map(Stmt::For),
+            TokenKind::Return => self.parse_return().map(Stmt::Return),
+            TokenKind::LBrace => {
+                // 裸块（后续版本），此处按语法错误处理
+                Err(self.err("函数体内不能有裸代码块".into()))
+            }
+            _ => self.parse_expr_stmt().map(Stmt::Expr),
+        }
+    }
+
+    /// `let name[: Ty] = expr`（ASI/分号结束）。
+    fn parse_var_decl(&mut self) -> Result<VarDeclStmt, ParseError> {
+        let span = self.advance().span; // let
+        let name = self.expect_ident()?;
+        let ty = if self.eat(&TokenKind::Colon) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect(TokenKind::Eq, "'='")?;
+        let init = self.parse_expr()?;
+        self.expect(TokenKind::Semi, "语句结束符")?;
+        Ok(VarDeclStmt { name, ty, init, span })
+    }
+
+    /// `fn name(params) -> Ty { stmts }`。
+    fn parse_fn_def(&mut self) -> Result<FnDefStmt, ParseError> {
+        let span = self.advance().span; // fn
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::LParen, "'('")?;
+        let mut params = Vec::new();
+        if !self.eat(&TokenKind::RParen) {
+            loop {
+                let pspan = self.peek().span;
+                let pname = self.expect_ident()?;
+                self.expect(TokenKind::Colon, "':'")?;
+                let pty = self.parse_type()?;
+                params.push(Param { name: pname, ty: pty, span: pspan });
+                if self.eat(&TokenKind::Comma) {
+                    continue;
+                }
+                self.expect(TokenKind::RParen, "')'")?;
+                break;
+            }
+        }
+        // 返回类型：`-> Ty` 可省略（默认 void）
+        let ret_ty = if self.eat(&TokenKind::Arrow) {
+            self.parse_type()?
+        } else {
+            TypeSpec::Named(TyKw::Void)
+        };
+        let body = self.parse_block()?;
+        Ok(FnDefStmt { name, params, ret_ty, body, span })
+    }
+
+    /// `{ stmts }` 代码块。
+    fn parse_block(&mut self) -> Result<Vec<Stmt>, ParseError> {
+        self.expect(TokenKind::LBrace, "'{'")?;
+        let mut stmts = Vec::new();
+        while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
+            stmts.push(self.parse_stmt()?);
+        }
+        self.expect(TokenKind::RBrace, "'}'")?;
+        Ok(stmts)
+    }
+
+    /// `if cond { } else { }` / `else if` 链。
+    fn parse_if(&mut self) -> Result<IfStmt, ParseError> {
+        let span = self.advance().span; // if
+        let cond = self.parse_expr()?;
+        let then_branch = self.parse_block()?;
+        let else_branch = if self.eat(&TokenKind::Else) {
+            // else if 折叠为嵌套 IfStmt
+            if matches!(self.peek_kind(), TokenKind::If) {
+                vec![Stmt::If(self.parse_if()?)]
+            } else {
+                self.parse_block()?
+            }
+        } else {
+            Vec::new()
+        };
+        Ok(IfStmt { cond, then_branch, else_branch, span })
+    }
+
+    /// `while cond { }`。
+    fn parse_while(&mut self) -> Result<WhileStmt, ParseError> {
+        let span = self.advance().span; // while
+        let cond = self.parse_expr()?;
+        let body = self.parse_block()?;
+        Ok(WhileStmt { cond, body, span })
+    }
+
+    /// `for var in expr { }`。
+    fn parse_for(&mut self) -> Result<ForStmt, ParseError> {
+        let span = self.advance().span; // for
+        let var = self.expect_ident()?;
+        self.expect(TokenKind::In, "'in'")?;
+        let iter = self.parse_expr()?;
+        let body = self.parse_block()?;
+        Ok(ForStmt { var, iter, body, span })
+    }
+
+    /// `return [expr]`。
+    fn parse_return(&mut self) -> Result<ReturnStmt, ParseError> {
+        let span = self.advance().span; // return
+        let expr = if matches!(self.peek_kind(), TokenKind::Semi) {
+            None
+        } else {
+            Some(self.parse_expr()?)
+        };
+        self.expect(TokenKind::Semi, "语句结束符")?;
+        Ok(ReturnStmt { expr, span })
+    }
+
+    /// 表达式语句（以分号/ASI 结束）。
+    fn parse_expr_stmt(&mut self) -> Result<ExprStmt, ParseError> {
+        let expr = self.parse_expr()?;
+        let span = expr_span(&expr).unwrap_or(self.peek().span);
+        self.expect(TokenKind::Semi, "语句结束符")?;
+        Ok(ExprStmt { expr, span })
+    }
+
+    // ---------- 类型解析 ----------
+
+    fn parse_type(&mut self) -> Result<TypeSpec, ParseError> {
+        match self.peek_kind() {
+            TokenKind::TypeKw(ty) => {
+                let ty = *ty;
+                self.advance();
+                Ok(TypeSpec::Named(ty))
+            }
+            other => Err(self.err(format!("期望类型，实际是 {}", self.describe(other)))),
+        }
+    }
+
+    // ---------- 表达式解析（优先级爬升） ----------
+
+    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+        // 范围运算符 `..` 优先级最低：`a..b` 先解析 lhs，再解析 rhs
+        let lhs = self.parse_or()?;
+        if self.eat(&TokenKind::DotDot) {
+            let end = self.parse_expr()?;
+            let span = expr_span(&lhs).unwrap_or(self.peek().span);
+            return Ok(Expr::Range { start: Box::new(lhs), end: Box::new(end), span });
+        }
+        Ok(lhs)
+    }
+
+    fn parse_or(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_and()?;
+        while self.eat(&TokenKind::OrOr) {
+            let rhs = self.parse_and()?;
+            let span = expr_span(&lhs).unwrap_or(self.peek().span);
+            lhs = Expr::Binary { op: BinaryOp::Or, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_and(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_equality()?;
+        while self.eat(&TokenKind::AndAnd) {
+            let rhs = self.parse_equality()?;
+            let span = expr_span(&lhs).unwrap_or(self.peek().span);
+            lhs = Expr::Binary { op: BinaryOp::And, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_equality(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_comparison()?;
+        loop {
+            let op = match self.peek_kind() {
+                TokenKind::EqEq => BinaryOp::Eq,
+                TokenKind::NotEq => BinaryOp::NotEq,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_comparison()?;
+            let span = expr_span(&lhs).unwrap_or(self.peek().span);
+            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_term()?;
+        loop {
+            let op = match self.peek_kind() {
+                TokenKind::Lt => BinaryOp::Lt,
+                TokenKind::Gt => BinaryOp::Gt,
+                TokenKind::Le => BinaryOp::Le,
+                TokenKind::Ge => BinaryOp::Ge,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_term()?;
+            let span = expr_span(&lhs).unwrap_or(self.peek().span);
+            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_term(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_factor()?;
+        loop {
+            let op = match self.peek_kind() {
+                TokenKind::Plus => BinaryOp::Add,
+                TokenKind::Minus => BinaryOp::Sub,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_factor()?;
+            let span = expr_span(&lhs).unwrap_or(self.peek().span);
+            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_factor(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_unary()?;
+        loop {
+            let op = match self.peek_kind() {
+                TokenKind::Star => BinaryOp::Mul,
+                TokenKind::Slash => BinaryOp::Div,
+                TokenKind::Percent => BinaryOp::Mod,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_unary()?;
+            let span = expr_span(&lhs).unwrap_or(self.peek().span);
+            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        let span = self.peek().span;
+        match self.peek_kind() {
+            TokenKind::Minus => {
+                self.advance();
+                let operand = self.parse_unary()?;
+                Ok(Expr::Unary { op: UnaryOp::Neg, operand: Box::new(operand), span })
+            }
+            TokenKind::Bang => {
+                self.advance();
+                let operand = self.parse_unary()?;
+                Ok(Expr::Unary { op: UnaryOp::Not, operand: Box::new(operand), span })
+            }
+            _ => self.parse_primary(),
+        }
+    }
+
+    /// 原子表达式：字面量 / 标识符 / 调用 / 括号 / 范围。
+    fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        let tok = self.peek().clone();
+        let span = tok.span;
+        match tok.kind {
+            TokenKind::Int(v) => {
+                self.advance();
+                Ok(Expr::IntLit(v))
+            }
+            TokenKind::Float(v) => {
+                self.advance();
+                Ok(Expr::FloatLit(v))
+            }
+            TokenKind::Str(s) => {
+                self.advance();
+                Ok(Expr::StrLit(s))
+            }
+            TokenKind::True => {
+                self.advance();
+                Ok(Expr::BoolLit(true))
+            }
+            TokenKind::False => {
+                self.advance();
+                Ok(Expr::BoolLit(false))
+            }
+            TokenKind::Ident(name) => {
+                self.advance();
+                // 函数调用
+                if self.eat(&TokenKind::LParen) {
+                    let mut args = Vec::new();
+                    if !self.eat(&TokenKind::RParen) {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if self.eat(&TokenKind::Comma) {
+                                continue;
+                            }
+                            self.expect(TokenKind::RParen, "')'")?;
+                            break;
+                        }
+                    }
+                    Ok(Expr::Call { name, args, span })
+                } else {
+                    Ok(Expr::Var(name))
+                }
+            }
+            TokenKind::LParen => {
+                self.advance();
+                let inner = self.parse_expr()?;
+                self.expect(TokenKind::RParen, "')'")?;
+                Ok(inner)
+            }
+            other => Err(ParseError {
+                span,
+                message: format!("无法以 {} 开始表达式", self.describe(&other)),
+            }),
+        }
+    }
+}
+
+/// 从表达式中提取 span（辅助函数）。
+fn expr_span(expr: &Expr) -> Option<Span> {
+    match expr {
+        Expr::Call { span, .. }
+        | Expr::Unary { span, .. }
+        | Expr::Binary { span, .. }
+        | Expr::Range { span, .. } => Some(*span),
+        _ => None,
+    }
+}

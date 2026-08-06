@@ -1,0 +1,9 @@
+[package]
+name = "tie-interp"
+version = "0.1.0"
+edition = "2024"
+description = "tie 语言解释器：树遍历求值 AST，内置标准库"
+
+[dependencies]
+tie-ast = { path = "../tie-ast" }
+tie-parser = { path = "../tie-parser" }
