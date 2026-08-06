@@ -5,11 +5,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/tie-lexer",
-    "crates/tie-ast",
-    "crates/tie-parser",
+    "crates/tie-frontend",
     "crates/tie-interp",
-    "crates/tie-cli", "crates/tie-llvm", "crates/tie-prep", "crates/tie",
+    "crates/tie-llvm",
+    "crates/tie-prep",
+    "crates/tie",
 ]
 
 # workspace 统一编译配置：

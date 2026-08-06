@@ -1,11 +1,18 @@
-//! tie 语言工作区测试桩。
+//! tie 语言解释器（规划中）。
 //!
-//! 本模块仅为打通编译链路的占位实现，
-//! 后续由各模块的真实实现替换。
+//! 设计职责：直接解释执行 AST（REPL 交互模式与脚本执行），
+//! 与编译路径（tie-llvm）共享 tie-frontend 前端产物。
+//!
+//! 当前为占位实现，仅验证前端依赖链完整。
 
-use tie_parser::parser_placeholder;
+use tie_frontend::parser::parse_program;
+use tie_frontend::lexer::tokenize;
 
-/// tie-interp 占位函数：返回解释器版本标识。
+/// tie-interp 占位函数：验证前端依赖链完整。
+///
+/// 对空源码做一次「词法 → 语法」全流程，返回解释器版本标识。
 pub fn interp_placeholder() -> String {
-    format!("interp<{}>", parser_placeholder())
+    let tokens = tokenize("").unwrap_or_default();
+    let program = parse_program(&tokens).ok();
+    format!("interp<frontend-ok, stmts={}>", program.map_or(0, |p| p.stmts.len()))
 }

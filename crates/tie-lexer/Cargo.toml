@@ -1,7 +1,0 @@
-[package]
-name = "tie-lexer"
-version = "0.1.0"
-edition = "2024"
-description = "tie 语言词法分析器：把源码字符串切分成 token 流"
-
-[dependencies]

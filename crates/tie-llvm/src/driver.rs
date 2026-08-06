@@ -6,9 +6,9 @@
 //!   → 预处理（清理代码 + 识别文件类型 + 角色判定）   [preprocess]
 //!   → 分派（按角色转交对应工具链）                   [driver::dispatch]
 //!   └── 编译工具链（logic / library）：
-//!         → 词法分析（含 ASI）    [frontend::lexer]
-//!         → 语法分析              [frontend::parser]
-//!         → 语义分析（类型检查）  [frontend::semantic]
+//!         → 词法分析（含 ASI）    [tie_frontend::lexer]
+//!         → 语法分析              [tie_frontend::parser]
+//!         → 语义分析（类型检查）  [tie_frontend::semantic]
 //!         → IR 生成              [ir]
 //!         → opt 中间优化         [optimizer]
 //!         → clang 链接生成可执行 [backend]
@@ -17,11 +17,13 @@
 //! ```
 
 use crate::backend;
-use crate::frontend;
 use crate::ir;
 use crate::optimizer::{self, OptLevel};
 use std::fs;
 use std::path::PathBuf;
+use tie_frontend::lexer::LexError;
+use tie_frontend::parser::{ParseError, parse_program};
+use tie_frontend::semantic::{SemanticError, analyze};
 use tie_prep::preprocess::{self, FileRole, PreprocessResult};
 
 /// 编译选项（来自 CLI）。
@@ -54,11 +56,11 @@ pub enum CompileError {
     /// 源码读取失败
     Read(String),
     /// 前端词法错误
-    Lex(frontend::lexer::LexError),
+    Lex(LexError),
     /// 前端语法错误
-    Parse(frontend::parser::ParseError),
+    Parse(ParseError),
     /// 前端语义错误
-    Semantic(frontend::semantic::SemanticError),
+    Semantic(SemanticError),
     /// IR 生成错误
     Ir(ir::IrError),
     /// 中间优化错误
@@ -156,19 +158,19 @@ fn compile_program(
 
     // ---- 前端 ----
     // 词法分析（含 ASI 分号补全）
-    let tokens = frontend::lexer::tokenize(&pre.cleaned_source).map_err(CompileError::Lex)?;
+    let tokens = tie_frontend::lexer::tokenize(&pre.cleaned_source).map_err(CompileError::Lex)?;
     // 语法分析
-    let program = frontend::parser::parse_program(&tokens).map_err(CompileError::Parse)?;
+    let program = parse_program(&tokens).map_err(CompileError::Parse)?;
     // 语义分析（符号表 + 类型检查）
-    let sem = frontend::semantic::analyze(&program).map_err(CompileError::Semantic)?;
+    let sem = analyze(&program).map_err(CompileError::Semantic)?;
 
     // 入口检查：logic 角色必须定义 main（library 不需要）
     if !opts.emit_ir_only
         && pre.role == FileRole::Logic
         && !sem.funcs.contains_key("main")
     {
-        return Err(CompileError::Semantic(frontend::semantic::SemanticError {
-            span: frontend::lexer::Span { line: 1, col: 1 },
+        return Err(CompileError::Semantic(SemanticError {
+            span: tie_frontend::lexer::Span { line: 1, col: 1 },
             message: "文件角色为 logic，必须定义入口函数 main".into(),
         }));
     }

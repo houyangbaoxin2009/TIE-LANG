@@ -8,6 +8,7 @@ description = "tie 语言编译器（四段式：tie-prep 预处理 + 自研前�
 
 [dependencies]
 tie-prep = { path = "../tie-prep" }
+tie-frontend = { path = "../tie-frontend" }
 
 [lints]
 workspace = true

@@ -1,8 +1,0 @@
-[package]
-name = "tie-cli"
-version = "0.1.0"
-edition = "2024"
-description = "tie 语言命令行入口：REPL 交互模式与脚本文件执行"
-
-[dependencies]
-tie-interp = { path = "../tie-interp" }

@@ -4,10 +4,9 @@
 //! - 库：[driver]::compile 完成「前端 → 中端 → 后端」编译流水线
 //! - CLI：`tie-llvm <input.tie> [选项]` 独立编译工具
 //!
-//! 流水线（四段式中段）：tie-prep 预处理 → 自研前端 → LLVM IR → opt 优化 → clang/lld 链接。
+//! 流水线（四段式中段）：tie-prep 预处理 → tie-frontend 前端 → LLVM IR → opt 优化 → clang/lld 链接。
 
 pub mod backend;
 pub mod driver;
-pub mod frontend;
 pub mod ir;
 pub mod optimizer;

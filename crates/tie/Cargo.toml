@@ -4,11 +4,12 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "tie 语言总入口（四段式调度器）：调用 tie-prep 预处理识别文件类型，自动转交对应工具链（编译→tie-llvm，数据/UI/数据库→后续版本）"
+description = "tie 语言总入口（四段式调度器 + REPL）：调用 tie-prep 预处理识别文件类型，自动转交对应工具链（编译→tie-llvm，解释执行→tie-interp，数据/UI/数据库→后续版本）；无参数进入 REPL"
 
 [dependencies]
 tie-prep = { path = "../tie-prep" }
 tie-llvm = { path = "../tie-llvm" }
+tie-interp = { path = "../tie-interp" }
 
 [lints]
 workspace = true

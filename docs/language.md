@@ -184,18 +184,23 @@ import "./config.tie" as cfg     // 导入 data 文件 → 类型化为只读数
 
 | 阶段 | 内容 | 由谁实现 |
 |---|---|---|
-| 前端 | 词法分析（含 ASI）、语法分析（含头解析）、语义分析（符号表/类型检查） | **tie-llvm 自研** |
-| 中端 | AST → LLVM IR 文本生成；中间优化 | IR 生成自研；**优化交给 `opt`** |
+| 前端 | 词法分析（含 ASI）、语法分析（含头解析）、语义分析（符号表/类型检查） | **tie-frontend 自研** |
+| 中端 | AST → LLVM IR 文本生成；中间优化 | IR 生成自研（tie-llvm）；**优化交给 `opt`** |
 | 后端 | 汇编/目标文件生成、链接 | **交给 `clang`/`lld`** |
 
-## 10. CLI 接口（tie-llvm）
+## 10. CLI 接口（tie）
+
+主入口 `tie`（四段式调度器，合并原 tie-cli 职责）：
 
 ```
-tie-llvm <input.tie> [-o output] [-O0|-O1|-O2|-O3] [--emit-ir] [--target=...]
+tie <input.tie> [-o output] [-O0|-O1|-O2|-O3] [--emit-ir] [--keep-ir] [--prep-only]
+tie             # 无参数 → 进入 REPL 交互模式（tie-interp 解释执行）
 ```
 
 - `--emit-ir`：只输出 LLVM IR（.ll），不继续编译
 - `-O0..3`：优化级别（默认 O2），映射到 `opt -O2`
+- `--prep-only`：只做预处理（tie-prep）并打印识别结果
+- 子工具单独使用：`tie-prep`（纯预处理）、`tie-llvm`（直接编译）、`tie-interp`（解释执行）
 - 后续支持 `--backend=gnu` 切换到 GNU 工具链（gcc/ld）
 
 ## 11. 迭代路线

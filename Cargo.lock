@@ -6,46 +6,28 @@ version = 4
 name = "tie"
 version = "0.1.0"
 dependencies = [
+ "tie-interp",
  "tie-llvm",
  "tie-prep",
 ]
 
 [[package]]
-name = "tie-ast"
+name = "tie-frontend"
 version = "0.1.0"
-
-[[package]]
-name = "tie-cli"
-version = "0.1.0"
-dependencies = [
- "tie-interp",
-]
 
 [[package]]
 name = "tie-interp"
 version = "0.1.0"
 dependencies = [
- "tie-ast",
- "tie-parser",
+ "tie-frontend",
 ]
-
-[[package]]
-name = "tie-lexer"
-version = "0.1.0"
 
 [[package]]
 name = "tie-llvm"
 version = "0.1.0"
 dependencies = [
+ "tie-frontend",
  "tie-prep",
-]
-
-[[package]]
-name = "tie-parser"
-version = "0.1.0"
-dependencies = [
- "tie-ast",
- "tie-lexer",
 ]
 
 [[package]]

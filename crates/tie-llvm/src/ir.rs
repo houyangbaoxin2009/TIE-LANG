@@ -8,9 +8,9 @@
 //! - println 通过声明 `printf` 实现，按参数类型选择格式串
 //! - 函数入口块命名为 `entry`，控制流块命名为 `if.then`/`if.else`/`loop.cond` 等
 
-use crate::frontend::ast::{BinaryOp, Expr, FnDefStmt, Program, Stmt, TypeSpec, UnaryOp};
-use crate::frontend::lexer::TyKw;
-use crate::frontend::semantic::{FuncSig, SemanticResult};
+use tie_frontend::ast::{BinaryOp, Expr, FnDefStmt, Program, Stmt, TypeSpec, UnaryOp};
+use tie_frontend::lexer::TyKw;
+use tie_frontend::semantic::{FuncSig, SemanticResult};
 use std::collections::HashMap;
 
 /// IR 生成结果。
@@ -224,7 +224,7 @@ impl<'p> IrGenerator<'p> {
         }
     }
 
-    fn gen_if(&mut self, i: &crate::frontend::ast::IfStmt) -> Result<(), IrError> {
+    fn gen_if(&mut self, i: &tie_frontend::ast::IfStmt) -> Result<(), IrError> {
         let (cond, _) = self.gen_expr(&i.cond)?;
         let then_label = self.new_label("if.then");
         let else_label = self.new_label("if.else");
@@ -255,7 +255,7 @@ impl<'p> IrGenerator<'p> {
         Ok(())
     }
 
-    fn gen_while(&mut self, w: &crate::frontend::ast::WhileStmt) -> Result<(), IrError> {
+    fn gen_while(&mut self, w: &tie_frontend::ast::WhileStmt) -> Result<(), IrError> {
         let cond_label = self.new_label("loop.cond");
         let body_label = self.new_label("loop.body");
         let exit_label = self.new_label("loop.exit");
@@ -279,7 +279,7 @@ impl<'p> IrGenerator<'p> {
         Ok(())
     }
 
-    fn gen_for(&mut self, f: &crate::frontend::ast::ForStmt) -> Result<(), IrError> {
+    fn gen_for(&mut self, f: &tie_frontend::ast::ForStmt) -> Result<(), IrError> {
         // 仅支持 `for x in start..end`（范围）
         let Expr::Range { start, end, .. } = &f.iter else {
             return Err(IrError {

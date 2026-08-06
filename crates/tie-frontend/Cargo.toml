@@ -1,0 +1,12 @@
+[package]
+name = "tie-frontend"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "tie 语言编译器前端：词法分析（含 ASI）→ 语法分析 → 语义分析（符号表/类型检查），全部自研实现"
+
+[dependencies]
+
+[lints]
+workspace = true

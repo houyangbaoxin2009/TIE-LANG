@@ -1,17 +1,21 @@
-//! tie：tie 语言总入口（四段式调度器）。
+//! tie：tie 语言总入口（四段式调度器 + REPL）。
 //!
 //! 四段式架构：`预处理 [前端 中间优化 后端]`
 //!
-//! `tie` 是日常使用的一般入口，职责：
-//! 1. 调用 **tie-prep** 完成预处理（清理代码 + 识别文件类型 + 角色判定）；
-//! 2. 按文件角色**自动转交对应的工具链**：
-//!    - `logic` / `library` → 转交 **tie-llvm**（前端 + 中间优化 + 后端）
-//!    - `data` / `ui` / `db` → 识别后提示（对应工具链后续版本实现）
+//! `tie` 是日常使用的一般入口（合并了原 tie-cli 职责），功能：
+//! 1. **无参数** → 进入 REPL 交互模式（调用 tie-interp，逐行解释执行）；
+//! 2. **传入文件** → 执行 .tie 脚本：
+//!    - 调用 **tie-prep** 完成预处理（清理代码 + 识别文件类型 + 角色判定）；
+//!    - 按文件角色**自动转交对应的工具链**：
+//!      - `logic` / `library` → 转交 **tie-llvm**（前端 + 中间优化 + 后端）
+//!      - `data` / `ui` / `db` → 识别后提示（对应工具链后续版本实现）
 //!
-//! 用户也可绕过本入口单独使用 tie-prep（纯预处理）或 tie-llvm（直接编译）。
+//! 用户也可绕过本入口单独使用 tie-prep（纯预处理）、tie-llvm（直接编译）
+//! 或 tie-interp（解释执行）。
 
 use std::env;
 use std::fs;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tie_prep::preprocess::FileRole;
@@ -20,7 +24,7 @@ use tie_llvm::optimizer::OptLevel;
 
 /// 命令行参数（编译类选项透传给 tie-llvm）。
 struct Args {
-    input: PathBuf,
+    input: Option<PathBuf>,
     output: Option<PathBuf>,
     opt_level: Option<OptLevel>,
     emit_ir_only: bool,
@@ -31,10 +35,11 @@ struct Args {
 
 /// 使用说明。
 const USAGE: &str = "\
-tie 语言总入口（四段式调度器）
+tie 语言总入口（四段式调度器 + REPL）
 
 用法:
-  tie <input.tie> [选项]
+  tie                进入 REPL 交互模式（逐行解释执行）
+  tie <input.tie> [选项]   编译并执行脚本文件
 
 流程:
   1. tie-prep 预处理（清理代码 + 识别文件类型）
@@ -53,7 +58,40 @@ tie 语言总入口（四段式调度器）
 单独使用:
   tie-prep <file.tie>    只做预处理
   tie-llvm <file.tie>   直接编译（不经过角色分派）
+  tie-interp <file.tie> 直接解释执行（不经过角色分派）
 ";
+
+/// REPL 交互模式入口。
+///
+/// 逐行读取输入并交给解释器执行。当前依赖 tie-interp 占位实现，
+/// 后续版本支持多行语句、历史记录与表达式求值。
+fn repl() -> ExitCode {
+    println!("tie REPL（输入 :quit 退出）");
+    let stdin = io::stdin();
+    loop {
+        print!("> ");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        match stdin.read_line(&mut line) {
+            Ok(0) => return ExitCode::SUCCESS, // EOF（Ctrl+Z / Ctrl+D）
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("读取输入失败: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == ":quit" {
+            return ExitCode::SUCCESS;
+        }
+        // 交给解释器执行（v0.1：占位，输出确认信息）
+        let interp = tie_interp::interp_placeholder();
+        println!("{line} → {interp}");
+    }
+}
 
 fn parse_args() -> Result<Args, String> {
     let mut args = env::args().skip(1);
@@ -88,11 +126,15 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
-    let input = input.ok_or("缺少输入文件，使用 --help 查看用法")?;
     Ok(Args { input, output, opt_level, emit_ir_only, keep_ir, prep_only })
 }
 
 fn main() -> ExitCode {
+    // 无参数 → REPL 交互模式
+    if env::args().len() == 1 {
+        return repl();
+    }
+
     let args = match parse_args() {
         Ok(a) => a,
         Err(msg) => {
@@ -100,19 +142,24 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // 有参数时必须指定输入文件
+    let Some(input) = args.input.as_ref() else {
+        eprintln!("错误: 缺少输入文件，使用 --help 查看用法\n\n{USAGE}");
+        return ExitCode::from(2);
+    };
 
     // ---- 第 1 段：预处理（tie-prep）----
-    let source = match fs::read_to_string(&args.input) {
+    let source = match fs::read_to_string(input) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("错误: 读取 {} 失败: {e}", args.input.display());
+            eprintln!("错误: 读取 {} 失败: {e}", input.display());
             return ExitCode::FAILURE;
         }
     };
     let pre = tie_prep::preprocess(&source);
 
     // 打印预处理识别结果
-    println!("[tie] 文件: {} | 角色: {} | 头部: {}", args.input.display(), pre.role, pre.headers.len());
+    println!("[tie] 文件: {} | 角色: {} | 头部: {}", input.display(), pre.role, pre.headers.len());
 
     // --prep-only：只输出识别结果，不转交工具链
     if args.prep_only {
@@ -120,7 +167,7 @@ fn main() -> ExitCode {
     }
 
     // ---- 第 2 段：按角色自动分派 ----
-    match dispatch_role(pre.role, &args) {
+    match dispatch_role(pre.role, &args, input.clone()) {
         Ok(outcome) => {
             println!("{}", outcome.message);
             ExitCode::SUCCESS
@@ -133,12 +180,12 @@ fn main() -> ExitCode {
 }
 
 /// 按角色转交对应工具链。
-fn dispatch_role(role: FileRole, args: &Args) -> Result<CompileOutcome, String> {
+fn dispatch_role(role: FileRole, args: &Args, input: PathBuf) -> Result<CompileOutcome, String> {
     match role {
         // logic / library → tie-llvm 编译工具链
         FileRole::Logic | FileRole::Library => {
             let opts = CompileOptions {
-                input: args.input.clone(),
+                input,
                 output: args.output.clone(),
                 opt_level: args.opt_level,
                 emit_ir_only: args.emit_ir_only,
