@@ -107,8 +107,10 @@ pub enum Stmt {
     VarDecl(VarDeclStmt),
     /// 函数定义 `fn name(params) -> Ty { body }`
     FnDef(FnDefStmt),
-    /// 表达式语句（调用、赋值等）
+    /// 表达式语句（调用等）
     Expr(ExprStmt),
+    /// 赋值语句 `x = expr`（对已声明变量重新赋值）
+    Assign(AssignStmt),
     /// return 语句
     Return(ReturnStmt),
     /// if/else 分支
@@ -117,6 +119,16 @@ pub enum Stmt {
     While(WhileStmt),
     /// for 循环（`for x in 0..10` / `for x in arr`）
     For(ForStmt),
+}
+
+/// 赋值语句：对已声明的变量重新赋值（const 不可变）。
+#[derive(Debug, Clone)]
+pub struct AssignStmt {
+    /// 被赋值的目标变量名
+    pub target: String,
+    /// 新值表达式
+    pub value: Expr,
+    pub span: Span,
 }
 
 /// 变量声明语句。
@@ -202,6 +214,8 @@ pub enum Expr {
     FloatLit(f64),
     /// 字符串
     StrLit(String),
+    /// 字符（UTF-32 单字符）
+    CharLit(char),
     /// 布尔
     BoolLit(bool),
     /// 变量引用

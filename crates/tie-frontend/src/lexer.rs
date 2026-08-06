@@ -45,6 +45,8 @@ pub enum TokenKind {
     Float(f64),
     /// 字符串字面量（已解码转义）
     Str(String),
+    /// 字符字面量（已解码转义，存单字符的 UTF-32 值）
+    CharLit(char),
     /// 标识符
     Ident(String),
 
@@ -280,6 +282,11 @@ impl<'a> Lexer<'a> {
                     let tok = self.scan_string()?;
                     self.push(tok);
                 }
+                // ---- 字符字面量 ----
+                '\'' => {
+                    let tok = self.scan_char()?;
+                    self.push(tok);
+                }
                 // ---- 数字 ----
                 c if c.is_ascii_digit() => {
                     let tok = self.scan_number();
@@ -465,6 +472,64 @@ impl<'a> Lexer<'a> {
                     self.consume_char();
                 }
             }
+        }
+    }
+
+    /// 字符字面量 `'a'` / `'\n'`（单引号包裹，恰好一个字符，支持转义）。
+    fn scan_char(&mut self) -> Result<Token, LexError> {
+        let (line, col) = (self.line, self.col);
+        self.consume_char(); // 开引号
+        let ch = match self.chars.peek().copied() {
+            None => {
+                return Err(LexError {
+                    span: Span { line, col },
+                    message: "字符字面量未闭合".into(),
+                })
+            }
+            Some('\\') => {
+                self.consume_char();
+                let esc = self
+                    .consume_char()
+                    .ok_or_else(|| LexError {
+                        span: Span { line, col },
+                        message: "转义符后缺少字符".into(),
+                    })?;
+                match esc {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '\\' => '\\',
+                    '"' => '"',
+                    '\'' => '\'',
+                    '0' => '\0',
+                    other => {
+                        return Err(LexError {
+                            span: Span { line, col },
+                            message: format!("未知转义序列 \\{other}"),
+                        })
+                    }
+                }
+            }
+            Some(c) => {
+                self.consume_char();
+                c
+            }
+        };
+        // 闭合引号
+        match self.chars.peek().copied() {
+            Some('\'') => {
+                self.consume_char();
+                Ok(Token::new(TokenKind::CharLit(ch), line, col))
+            }
+            // 多字符字面量（如 'ab'）不合法
+            Some(_) => Err(LexError {
+                span: Span { line, col },
+                message: "字符字面量只能包含一个字符".into(),
+            }),
+            None => Err(LexError {
+                span: Span { line, col },
+                message: "字符字面量未闭合".into(),
+            }),
         }
     }
 

@@ -32,6 +32,8 @@ pub struct SemanticResult {
     pub funcs: HashMap<String, FuncSig>,
     /// 各函数体内表达式的类型推断（AST 节点地址 → 类型）
     pub expr_types: HashMap<usize, TypeSpec>,
+    /// 不可变变量集合（const 声明，赋值时校验）
+    pub const_vars: std::collections::HashSet<String>,
 }
 
 /// 函数签名。
@@ -165,6 +167,10 @@ impl Analyzer {
                 }
                 // 推导类型写入结果表（记录到 init 表达式上，IR 用）
                 self.result.expr_types.insert(addr_of(&v.init), init_ty);
+                // 记录 const 变量（赋值语句会拒绝重赋值）
+                if v.is_const {
+                    self.result.const_vars.insert(v.name.clone());
+                }
                 Ok(())
             }
             Stmt::FnDef(_) => {
@@ -177,6 +183,40 @@ impl Analyzer {
             Stmt::Expr(e) => {
                 let ty = self.infer_expr(&e.expr, scope)?;
                 self.result.expr_types.insert(addr_of(&e.expr), ty);
+                Ok(())
+            }
+            Stmt::Assign(a) => {
+                // 赋值：目标必须已声明；const 不可变；类型必须匹配
+                let target_ty = match scope.get(&a.target) {
+                    Some(t) => *t,
+                    None => {
+                        return Err(SemanticError {
+                            span: a.span,
+                            message: format!("赋值目标 '{}' 未声明", a.target),
+                        })
+                    }
+                };
+                let value_ty = self.infer_expr(&a.value, scope)?;
+                self.result.expr_types.insert(addr_of(&a.value), value_ty);
+                // const 变量不允许重新赋值
+                if self.result.const_vars.contains(&a.target) {
+                    return Err(SemanticError {
+                        span: a.span,
+                        message: format!("不能给 const 变量 '{}' 赋值", a.target),
+                    });
+                }
+                // 类型必须兼容（无字面量适配：赋值用变量原本的具体类型）
+                if !types_match(target_ty, value_ty, Some(&a.value)) {
+                    return Err(SemanticError {
+                        span: a.span,
+                        message: format!(
+                            "赋值类型不匹配：变量 '{}' 类型为 {}，表达式为 {}",
+                            a.target,
+                            type_name(target_ty),
+                            type_name(value_ty)
+                        ),
+                    });
+                }
                 Ok(())
             }
             Stmt::Return(r) => {
@@ -261,6 +301,7 @@ impl Analyzer {
             Expr::FloatLit(_) => TypeSpec::Named(TyKw::F64),
             Expr::BoolLit(_) => TypeSpec::Named(TyKw::Bool),
             Expr::StrLit(_) => TypeSpec::Named(TyKw::Str),
+            Expr::CharLit(_) => TypeSpec::Named(TyKw::Char),
             Expr::Var(name) => match scope.get(name) {
                 Some(t) => *t,
                 None => {
@@ -454,6 +495,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::VarDecl(v) => v.span,
         Stmt::FnDef(f) => f.span,
         Stmt::Expr(e) => e.span,
+        Stmt::Assign(a) => a.span,
         Stmt::Return(r) => r.span,
         Stmt::If(i) => i.span,
         Stmt::While(w) => w.span,
@@ -464,7 +506,8 @@ fn stmt_span(stmt: &Stmt) -> Span {
 /// 从表达式中取 span（含字面量：用占位位置）。
 fn expr_span_of(expr: &Expr) -> Span {
     match expr {
-        Expr::IntLit(_) | Expr::FloatLit(_) | Expr::StrLit(_) | Expr::BoolLit(_) | Expr::Var(_) => {
+        Expr::IntLit(_) | Expr::FloatLit(_) | Expr::StrLit(_) | Expr::CharLit(_) | Expr::BoolLit(_)
+        | Expr::Var(_) => {
             // 字面量无 span，用 (0,0) 占位（语义错误主要针对变量/调用，已有 span）
             Span { line: 0, col: 0 }
         }

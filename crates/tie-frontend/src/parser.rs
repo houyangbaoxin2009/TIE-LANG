@@ -6,8 +6,8 @@
 //! 本解析器只处理清理后的正文源码。
 
 use super::ast::{
-    BinaryOp, Expr, ExprStmt, FnDefStmt, ForStmt, IfStmt, Param, Program, ReturnStmt, Stmt,
-    TableCell, TableId, TypeSpec, UnaryOp, VarDeclStmt, WhileStmt,
+    AssignStmt, BinaryOp, Expr, ExprStmt, FnDefStmt, ForStmt, IfStmt, Param, Program, ReturnStmt,
+    Stmt, TableCell, TableId, TypeSpec, UnaryOp, VarDeclStmt, WhileStmt,
 };
 use super::lexer::{Span, Token, TokenKind, TyKw};
 use std::fmt;
@@ -145,8 +145,24 @@ impl<'a> Parser<'a> {
                 // 裸块（后续版本），此处按语法错误处理
                 Err(self.err("函数体内不能有裸代码块".into()))
             }
-            _ => self.parse_expr_stmt().map(Stmt::Expr),
+            _ => self.parse_expr_or_assign(),
         }
+    }
+
+    /// 表达式语句与赋值语句的统一入口：
+    /// `Ident = ...`（变量名后紧跟等号）→ Assign；否则解析为普通表达式语句。
+    fn parse_expr_or_assign(&mut self) -> Result<Stmt, ParseError> {
+        if let TokenKind::Ident(name) = self.peek_kind() {
+            let name = name.clone();
+            if self.tokens.get(self.pos + 1).map(|t| &t.kind) == Some(&TokenKind::Eq) {
+                let span = self.advance().span; // 目标变量名
+                self.expect(TokenKind::Eq, "'='")?;
+                let value = self.parse_expr()?;
+                self.expect(TokenKind::Semi, "语句结束符")?;
+                return Ok(Stmt::Assign(AssignStmt { target: name, value, span }));
+            }
+        }
+        self.parse_expr_stmt().map(Stmt::Expr)
     }
 
     /// `var name[: Ty] = expr` / `const name[: Ty] = expr`（ASI/分号结束）。
@@ -407,6 +423,10 @@ impl<'a> Parser<'a> {
             TokenKind::Str(s) => {
                 self.advance();
                 Ok(Expr::StrLit(s))
+            }
+            TokenKind::CharLit(c) => {
+                self.advance();
+                Ok(Expr::CharLit(c))
             }
             TokenKind::True => {
                 self.advance();

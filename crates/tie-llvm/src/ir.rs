@@ -213,6 +213,16 @@ impl<'p> IrGenerator<'p> {
                 self.gen_expr(&e.expr)?;
                 Ok(())
             }
+            Stmt::Assign(a) => {
+                // 赋值：查找目标变量绑定（语义已保证存在且非 const）
+                let bind = self.lookup_var(&a.target).cloned().ok_or_else(|| IrError {
+                    message: format!("内部错误：赋值目标 '{}' 未入作用域（函数 {}）", a.target, self.cur_fn),
+                })?;
+                let (val, _ty) = self.gen_expr(&a.value)?;
+                // 按变量的声明类型 store（语义已保证类型匹配）
+                self.line(&format!("store {} {}, ptr {}", bind.ty, val, bind.value));
+                Ok(())
+            }
             Stmt::Return(r) => match &r.expr {
                 Some(e) => {
                     let (val, _ty) = self.gen_expr(e)?;
@@ -355,6 +365,7 @@ impl<'p> IrGenerator<'p> {
             Expr::IntLit(v) => Ok((v.to_string(), "i64")),
             Expr::FloatLit(v) => Ok((format_float(*v), "double")),
             Expr::BoolLit(b) => Ok((if *b { "true".into() } else { "false".into() }, "i1")),
+            Expr::CharLit(c) => Ok(((*c as i32).to_string(), "i32")),
             Expr::StrLit(s) => {
                 let g = self.string_global(s);
                 // 字符串：返回全局常量指针（ptr 类型，供 %s / 传参直接使用）

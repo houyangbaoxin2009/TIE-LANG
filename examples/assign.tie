@@ -1,0 +1,19 @@
+// tie:logic
+
+// 赋值语句验证：var 可重赋值，const 不可
+func main() {
+    var x = 1
+    println(x)
+    x = 2
+    println(x)
+    x = x + 3
+    println(x)
+
+    var f: f64 = 1.5
+    f = 2.5
+    println(f)
+
+    // const 赋值应在语义阶段报错
+    // const c = 10
+    // c = 20
+}
