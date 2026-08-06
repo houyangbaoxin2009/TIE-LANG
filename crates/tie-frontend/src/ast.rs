@@ -230,6 +230,8 @@ pub enum Expr {
     Range { start: Box<Expr>, end: Box<Expr>, span: Span },
     /// 表字面量 `[col, col; row, row]`（高级数组/表，逗号分列、分号分行）
     TableLit { cells: Vec<TableCell>, span: Span },
+    /// 下标访问 `arr[0]`（表/数组元素读取）
+    Index { base: Box<Expr>, index: Box<Expr>, span: Span },
 }
 
 /// 表单元格：`value` 或 `id:value`（id 可选，可为数字下标或带引号字符串键）。

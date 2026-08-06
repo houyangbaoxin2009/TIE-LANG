@@ -8,7 +8,9 @@
 //! 输出：每个函数体内各表达式的推断类型表，供 IR 生成阶段使用
 //! （IR 生成时无需重复推导类型）。
 
-use super::ast::{BinaryOp, Expr, FnDefStmt, Program, Stmt, TypeSpec, UnaryOp};
+use super::ast::{
+    BinaryOp, Expr, FnDefStmt, Program, Stmt, TableId, TypeSpec, UnaryOp,
+};
 use super::lexer::{Span, TyKw};
 use std::collections::HashMap;
 use std::fmt;
@@ -34,6 +36,17 @@ pub struct SemanticResult {
     pub expr_types: HashMap<usize, TypeSpec>,
     /// 不可变变量集合（const 声明，赋值时校验）
     pub const_vars: std::collections::HashSet<String>,
+    /// 表元数据：表字面量表达式地址 → 元素类型与长度（IR 生成布局用）
+    pub tables: HashMap<usize, TableInfo>,
+}
+
+/// 表（table）的布局信息：元素类型与元素个数。
+#[derive(Debug, Clone, Copy)]
+pub struct TableInfo {
+    /// 元素类型（同构容器）
+    pub elem_ty: TypeSpec,
+    /// 元素个数（编译期已知，定长）
+    pub len: usize,
 }
 
 /// 函数签名。
@@ -45,7 +58,11 @@ pub struct FuncSig {
 
 /// 语义分析入口。
 pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
-    let mut ctx = Analyzer { result: SemanticResult::default() };
+    let mut ctx = Analyzer {
+        result: SemanticResult::default(),
+        table_vars: HashMap::new(),
+        cur_fn: String::new(),
+    };
 
     // 第一遍：收集所有函数签名（允许前向引用）
     for stmt in &program.stmts {
@@ -77,10 +94,15 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
 /// 语义分析器上下文。
 struct Analyzer {
     result: SemanticResult,
+    /// 表变量布局：函数内变量名 → 表布局信息（下标访问 / 遍历时查询元素类型）
+    table_vars: HashMap<(String, String), TableInfo>,
+    /// 当前检查的函数名（table_vars 键用）
+    cur_fn: String,
 }
 
 impl Analyzer {
     fn check_fn(&mut self, f: &FnDefStmt) -> Result<(), SemanticError> {
+        self.cur_fn = f.name.clone();
         // 函数体内作用域：参数先入表
         let mut scope: HashMap<String, TypeSpec> = HashMap::new();
         for p in &f.params {
@@ -131,7 +153,7 @@ impl Analyzer {
                             scope.insert(v.name.clone(), init_ty);
                         } else if d.is_table() {
                             // table：初始化必须是表字面量（数组/高级数组）
-                            if !matches!(v.init, Expr::TableLit { .. }) {
+                            let Expr::TableLit { cells, .. } = &v.init else {
                                 return Err(SemanticError {
                                     span: v.span,
                                     message: format!(
@@ -139,8 +161,29 @@ impl Analyzer {
                                         v.name
                                     ),
                                 });
+                            };
+                            // M2 范围：仅支持单行纯位置表（无字符串 id、无分号分行）
+                            let rows: std::collections::HashSet<usize> =
+                                cells.iter().map(|c| c.row).collect();
+                            if rows.len() > 1 {
+                                return Err(SemanticError {
+                                    span: v.span,
+                                    message: "二维表（分号分行）的运行时留待 M3，当前仅支持单行表".into(),
+                                });
                             }
-                            scope.insert(v.name.clone(), init_ty);
+                            if cells.iter().any(|c| matches!(c.id, Some(TableId::Str(_)))) {
+                                return Err(SemanticError {
+                                    span: v.span,
+                                    message: "字符串 id 表（[\"a\":1]）的运行时留待 M3，当前仅支持数字下标".into(),
+                                });
+                            }
+                            // 记录布局元数据：元素类型 = init 推导类型，长度 = 元素个数
+                            let info = TableInfo { elem_ty: init_ty, len: cells.len() };
+                            self.result.tables.insert(addr_of(&v.init), info);
+                            // 变量名 → 布局（下标访问/遍历时按变量名查询元素类型）
+                            self.table_vars.insert((self.cur_fn.clone(), v.name.clone()), info);
+                            // scope 存 Table 标记（表是容器，不是普通值）
+                            scope.insert(v.name.clone(), TypeSpec::Named(TyKw::Table));
                         } else if !types_match(d, init_ty, Some(&v.init)) {
                             return Err(SemanticError {
                                 span: v.span,
@@ -267,11 +310,43 @@ impl Analyzer {
                 Ok(())
             }
             Stmt::For(f) => {
-                // for var in iter：iter 应为范围或数组（范围先支持）
+                // for var in iter：iter 应为范围（默认 i64 元素）或表（元素类型）
                 let iter_ty = self.infer_expr(&f.iter, scope)?;
                 self.result.expr_types.insert(addr_of(&f.iter), iter_ty);
-                // 循环变量类型：范围 → i64（默认整数）
-                scope.insert(f.var.clone(), TypeSpec::Named(TyKw::I64));
+                let elem_ty = if iter_ty == TypeSpec::Named(TyKw::Table) {
+                    // 表遍历：循环变量类型 = 表的元素类型
+                    match &f.iter {
+                        Expr::Var(name) => {
+                            let key = (self.cur_fn.clone(), name.clone());
+                            match self.table_vars.get(&key) {
+                                Some(info) => info.elem_ty,
+                                None => {
+                                    return Err(SemanticError {
+                                        span: f.span,
+                                        message: format!("遍历的表 '{name}' 缺少布局元数据（内部错误）"),
+                                    })
+                                }
+                            }
+                        }
+                        _ => {
+                            return Err(SemanticError {
+                                span: f.span,
+                                message: "表遍历仅支持表变量（内联表字面量遍历留待后续）".into(),
+                            })
+                        }
+                    }
+                } else if matches!(f.iter, Expr::Range { .. }) {
+                    TypeSpec::Named(TyKw::I64)
+                } else {
+                    return Err(SemanticError {
+                        span: f.span,
+                        message: format!(
+                            "for 迭代对象仅支持范围（0..10）或表变量，实际是 {}",
+                            type_name(iter_ty)
+                        ),
+                    });
+                };
+                scope.insert(f.var.clone(), elem_ty);
                 self.check_block(&f.body, scope, ret_ty)?;
                 Ok(())
             }
@@ -477,6 +552,47 @@ impl Analyzer {
                 // 表类型：元素类型（当前 IR 阶段仅支持数/字符串元素的同构表）
                 first_ty
             }
+            Expr::Index { base, index, span } => {
+                // 下标访问：base 必须是表，index 必须是整数
+                let base_ty = self.infer_expr(base, scope)?;
+                self.result.expr_types.insert(addr_of(base), base_ty);
+                let index_ty = self.infer_expr(index, scope)?;
+                self.result.expr_types.insert(addr_of(index), index_ty);
+                if base_ty != TypeSpec::Named(TyKw::Table) {
+                    return Err(SemanticError {
+                        span: *span,
+                        message: format!("下标访问的对象必须是表，实际是 {}", type_name(base_ty)),
+                    });
+                }
+                if !index_ty.is_int() {
+                    return Err(SemanticError {
+                        span: *span,
+                        message: format!("下标必须是整数，实际是 {}", type_name(index_ty)),
+                    });
+                }
+                // 元素类型：base 是表变量 → 查其布局元数据；是内联表字面量 → 元素同构类型
+                match base.as_ref() {
+                    Expr::TableLit { .. } => base_ty,
+                    Expr::Var(name) => {
+                        let key = (self.cur_fn.clone(), name.clone());
+                        match self.table_vars.get(&key) {
+                            Some(info) => info.elem_ty,
+                            None => {
+                                return Err(SemanticError {
+                                    span: *span,
+                                    message: format!("下标访问的表 '{name}' 缺少布局元数据（内部错误）"),
+                                })
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: "下标访问仅支持表变量或表字面量".into(),
+                        })
+                    }
+                }
+            }
         };
         Ok(ty)
     }
@@ -515,7 +631,8 @@ fn expr_span_of(expr: &Expr) -> Span {
         | Expr::Unary { span, .. }
         | Expr::Binary { span, .. }
         | Expr::Range { span, .. }
-        | Expr::TableLit { span, .. } => *span,
+        | Expr::TableLit { span, .. }
+        | Expr::Index { span, .. } => *span,
     }
 }
 

@@ -181,13 +181,18 @@ impl<'p> IrGenerator<'p> {
     fn gen_stmt(&mut self, stmt: &Stmt) -> Result<(), IrError> {
         match stmt {
             Stmt::VarDecl(v) => {
+                // 表变量：直接生成定长数组布局（alloca [N x T] + 逐元素 store），
+                // 长度与元素类型来自语义层 tables 元数据（键 = init 表达式地址）。
+                if v.ty.map(|t| t.is_table()).unwrap_or(false) {
+                    return self.gen_table_var(v);
+                }
                 let (val, ty) = self.gen_expr(&v.init)?;
                 // 声明类型以语义为准
                 let ty_name = match v.ty {
-                    // 宽类型（num/text/misc）与 table 是编译期概念，语义分析阶段
+                    // 宽类型（num/text/misc）是编译期概念，语义分析阶段
                     // 已把具体推导类型记录在 expr_types 表中（键为 init 表达式地址），
                     // IR 阶段按地址取回具体类型，避免直接对宽类型调用 llvm_ty。
-                    Some(t) if t.is_wide() || t.is_table() => {
+                    Some(t) if t.is_wide() => {
                         let key = &v.init as *const Expr as usize;
                         let concrete = self
                             .sem
@@ -250,6 +255,42 @@ impl<'p> IrGenerator<'p> {
         }
     }
 
+    /// 表变量声明：生成定长数组布局。
+    ///
+    /// 布局：`alloca [N x T]`，随后对每个元素 store 到数组内偏移（GEP）。
+    /// 长度与元素类型取自语义层 tables 元数据（键 = init 表达式地址）。
+    fn gen_table_var(&mut self, v: &tie_frontend::ast::VarDeclStmt) -> Result<(), IrError> {
+        let key = &v.init as *const Expr as usize;
+        let info = self
+            .sem
+            .tables
+            .get(&key)
+            .copied()
+            .ok_or_else(|| IrError {
+                message: format!("内部错误：表变量 '{}' 缺少布局元数据", v.name),
+            })?;
+        let elem_llvm = self.llvm_ty(info.elem_ty);
+        let arr_ty = format!("[{} x {}]", info.len, elem_llvm);
+        let alloca = self.new_reg();
+        self.line(&format!("{alloca} = alloca {arr_ty}"));
+        // 逐元素 store 到数组内偏移（GEP 第 0 行，第 i 列）
+        if let Expr::TableLit { cells, .. } = &v.init {
+            for (i, cell) in cells.iter().enumerate() {
+                let (val, _t) = self.gen_expr(&cell.value)?;
+                let ptr = self.new_reg();
+                self.line(&format!("{ptr} = getelementptr {arr_ty}, ptr {alloca}, i64 0, i64 {i}"));
+                self.line(&format!("store {elem_llvm} {val}, ptr {ptr}"));
+            }
+        }
+        // 绑定：变量类型 = 数组类型（下标访问用 GEP，不整体 load）。
+        // 数组类型是动态拼接的字符串，Box::leak 获得 'static 生命周期
+        //（编译器进程短期运行，泄漏少量字符串可接受）。
+        let arr_ty_static: &'static str = Box::leak(arr_ty.into_boxed_str());
+        self.cur_scope_mut()
+            .insert(v.name.clone(), VarBind { value: alloca, ty: arr_ty_static });
+        Ok(())
+    }
+
     fn gen_if(&mut self, i: &tie_frontend::ast::IfStmt) -> Result<(), IrError> {
         let (cond, _) = self.gen_expr(&i.cond)?;
         let then_label = self.new_label("if.then");
@@ -306,10 +347,17 @@ impl<'p> IrGenerator<'p> {
     }
 
     fn gen_for(&mut self, f: &tie_frontend::ast::ForStmt) -> Result<(), IrError> {
-        // 仅支持 `for x in start..end`（范围）
+        // 表遍历：`for item in arr`（arr 为表变量，聚合类型 [N x T]）
+        if let Expr::Var(name) = &f.iter
+            && let Some(bind) = self.lookup_var(name).cloned()
+            && let Some((len, elem_ty)) = parse_array_shape(bind.ty)
+        {
+            return self.gen_for_table(f, &bind, len, elem_ty);
+        }
+        // 范围遍历：`for x in start..end`
         let Expr::Range { start, end, .. } = &f.iter else {
             return Err(IrError {
-                message: format!("for 迭代对象仅支持范围（start..end），当前不支持（函数 {}）", self.cur_fn),
+                message: format!("for 迭代对象仅支持范围（start..end）或表变量（函数 {}）", self.cur_fn),
             });
         };
         let (start_val, start_ty) = self.gen_expr(start)?;
@@ -350,6 +398,68 @@ impl<'p> IrGenerator<'p> {
         let next = self.new_reg();
         self.line(&format!("{next} = add i64 {cur}, 1"));
         self.line(&format!("store i64 {next}, ptr {var_alloca}"));
+        self.line(&format!("br label %{cond_label}"));
+        self.block_end();
+
+        self.block_start(&exit_label);
+        Ok(())
+    }
+
+    /// 表遍历：`for item in arr`，生成 0..N 计数器循环。
+    ///
+    /// 布局：计数器 alloca（i64，0..N）+ 循环变量 alloca（元素类型 T）。
+    /// 每次迭代：GEP 取 arr[i] → load 元素 → store 到循环变量。
+    fn gen_for_table(
+        &mut self,
+        f: &tie_frontend::ast::ForStmt,
+        arr_bind: &VarBind,
+        len: usize,
+        elem_ty: &'static str,
+    ) -> Result<(), IrError> {
+        // 计数器 alloca（i64）
+        let idx_alloca = self.new_reg();
+        self.line(&format!("{idx_alloca} = alloca i64"));
+        self.line(&format!("store i64 0, ptr {idx_alloca}"));
+        // 循环变量 alloca（元素类型 T，每次迭代覆盖）
+        let item_alloca = self.new_reg();
+        self.line(&format!("{item_alloca} = alloca {elem_ty}"));
+
+        let cond_label = self.new_label("for.cond");
+        let body_label = self.new_label("for.body");
+        let exit_label = self.new_label("for.exit");
+        self.line(&format!("br label %{cond_label}"));
+
+        self.block_start(&cond_label);
+        let cur = self.new_reg();
+        let done = self.new_reg();
+        self.line(&format!("{cur} = load i64, ptr {idx_alloca}"));
+        self.line(&format!("{done} = icmp sge i64 {cur}, {len}"));
+        self.line(&format!("br i1 {done}, label %{exit_label}, label %{body_label}"));
+        self.block_end();
+
+        self.block_start(&body_label);
+        // item = arr[cur]（GEP + load）
+        let ptr = self.new_reg();
+        self.line(&format!(
+            "{ptr} = getelementptr {}, ptr {}, i64 0, i64 {cur}",
+            arr_bind.ty, arr_bind.value
+        ));
+        let val = self.new_reg();
+        self.line(&format!("{val} = load {elem_ty}, ptr {ptr}"));
+        self.line(&format!("store {elem_ty} {val}, ptr {item_alloca}"));
+        // 循环变量可见
+        self.scopes.push(HashMap::from([(
+            f.var.clone(),
+            VarBind { value: item_alloca.clone(), ty: elem_ty },
+        )]));
+        for s in &f.body {
+            self.gen_stmt(s)?;
+        }
+        self.scopes.pop();
+        // 自增
+        let next = self.new_reg();
+        self.line(&format!("{next} = add i64 {cur}, 1"));
+        self.line(&format!("store i64 {next}, ptr {idx_alloca}"));
         self.line(&format!("br label %{cond_label}"));
         self.block_end();
 
@@ -408,9 +518,43 @@ impl<'p> IrGenerator<'p> {
                 message: "范围表达式只能在 for 中使用（不能单独求值）".into(),
             }),
             Expr::TableLit { .. } => Err(IrError {
-                message: "表字面量 [...] 的运行时生成尚未实现（M2 复合类型规划中）".into(),
+                message: "表字面量只能用于表变量声明（var x: table = [...]）".into(),
             }),
+            Expr::Index { base, index, .. } => self.gen_index(base, index),
         }
+    }
+
+    /// 下标访问：`base[index]` → GEP + load。
+    ///
+    /// base 必须是表变量（VarBind.ty 形如 `[N x T]`），index 为整数（i64 或可扩展）。
+    /// 注意：表变量是聚合类型 `[N x T]`，不能整体 load 到寄存器，因此直接取
+    /// VarBind 中保存的 alloca 指针做 GEP（与标量变量的 load 路径不同）。
+    fn gen_index(&mut self, base: &Expr, index: &Expr) -> Result<(String, &'static str), IrError> {
+        // base 必须是表变量：查作用域拿到 alloca 指针 + 数组类型名（不做 load）
+        let Expr::Var(name) = base else {
+            return Err(IrError {
+                message: "下标访问仅支持表变量（base[index] 的 base 必须是变量）".into(),
+            });
+        };
+        let bind = self.lookup_var(name).cloned().ok_or_else(|| IrError {
+            message: format!("内部错误：下标访问的变量 '{name}' 未入作用域（函数 {}）", self.cur_fn),
+        })?;
+        let arr_ptr = bind.value;
+        let arr_ty = bind.ty;
+        let Some(elem_ty) = parse_array_elem_ty(arr_ty) else {
+            return Err(IrError {
+                message: format!("内部错误：下标访问的对象不是数组类型（{}）", arr_ty),
+            });
+        };
+        // 下标值：整数（i64 直接使用，窄整数先扩展）
+        let (idx_val, idx_ty) = self.gen_expr(index)?;
+        let idx_val = self.extend_int_to_i64(&idx_val, idx_ty, index)?;
+        // GEP：基址数组第 0 维、第 idx 元素
+        let ptr = self.new_reg();
+        self.line(&format!("{ptr} = getelementptr {arr_ty}, ptr {arr_ptr}, i64 0, i64 {idx_val}"));
+        let val = self.new_reg();
+        self.line(&format!("{val} = load {elem_ty}, ptr {ptr}"));
+        Ok((val, elem_ty))
     }
 
     fn gen_binary(
@@ -748,6 +892,40 @@ impl<'p> IrGenerator<'p> {
 /// 变量名 mangling：防止与 LLVM 保留名冲突（当前原样 + 前缀）。
 fn mangle(name: &str) -> String {
     format!("%{}", name)
+}
+
+/// 从 LLVM 数组类型名 `[N x T]` 中解析元素类型名 `T`。
+///
+/// 用于下标访问（GEP 后 load 的元素类型）。M2 只支持标量元素
+/// （i1/i8/i16/i32/i64/float/double/ptr），返回静态字符串；非数组或嵌套返回 None。
+/// 从 LLVM 数组类型名 `[N x T]` 中解析元素类型名 `T`。
+///
+/// 用于下标访问（GEP 后 load 的元素类型）。M2 只支持标量元素
+/// （i1/i8/i16/i32/i64/float/double/ptr），返回静态字符串；非数组或嵌套返回 None。
+fn parse_array_elem_ty(arr_ty: &str) -> Option<&'static str> {
+    parse_array_shape(arr_ty).map(|(_, elem)| elem)
+}
+
+/// 从 LLVM 数组类型名 `[N x T]` 中解析 (长度 N, 元素类型名 T)。
+///
+/// 用于表遍历（生成 0..N 计数器循环）与下标访问。返回静态字符串。
+fn parse_array_shape(arr_ty: &str) -> Option<(usize, &'static str)> {
+    let rest = arr_ty.strip_prefix('[')?;
+    let (len, elem) = rest.split_once(" x ")?;
+    let len: usize = len.parse().ok()?;
+    let elem = elem.strip_suffix(']')?;
+    let elem = match elem {
+        "i1" => Some("i1"),
+        "i8" => Some("i8"),
+        "i16" => Some("i16"),
+        "i32" => Some("i32"),
+        "i64" => Some("i64"),
+        "float" => Some("float"),
+        "double" => Some("double"),
+        "ptr" => Some("ptr"),
+        _ => None,
+    }?;
+    Some((len, elem))
 }
 
 /// 浮点字面量的 IR 文本（保证含小数点）。

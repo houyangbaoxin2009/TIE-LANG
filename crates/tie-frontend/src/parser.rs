@@ -392,19 +392,36 @@ impl<'a> Parser<'a> {
 
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
         let span = self.peek().span;
-        match self.peek_kind() {
+        let mut expr = match self.peek_kind() {
             TokenKind::Minus => {
                 self.advance();
                 let operand = self.parse_unary()?;
-                Ok(Expr::Unary { op: UnaryOp::Neg, operand: Box::new(operand), span })
+                Expr::Unary { op: UnaryOp::Neg, operand: Box::new(operand), span }
             }
             TokenKind::Bang => {
                 self.advance();
                 let operand = self.parse_unary()?;
-                Ok(Expr::Unary { op: UnaryOp::Not, operand: Box::new(operand), span })
+                Expr::Unary { op: UnaryOp::Not, operand: Box::new(operand), span }
             }
-            _ => self.parse_primary(),
+            _ => self.parse_primary()?,
+        };
+        // 后缀下标访问：`base[index]`（可链式 `a[0][1]`）
+        loop {
+            if self.eat(&TokenKind::LBracket) {
+                let index = self.parse_expr()?;
+                let ispan = self.peek().span;
+                self.expect(TokenKind::RBracket, "']'")?;
+                let base_span = expr_span(&expr).unwrap_or(ispan);
+                expr = Expr::Index {
+                    base: Box::new(expr),
+                    index: Box::new(index),
+                    span: base_span,
+                };
+            } else {
+                break;
+            }
         }
+        Ok(expr)
     }
 
     /// 原子表达式：字面量 / 标识符 / 调用 / 括号 / 范围。

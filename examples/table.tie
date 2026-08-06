@@ -1,0 +1,14 @@
+// table.tie：P2 表（定长数组）功能演示
+// 覆盖：表变量声明、下标访问、表遍历
+
+func main() {
+    // 表变量声明（单行纯位置表，数字 id）
+    var arr: table = [10, 20, 30, 40]
+    // 下标访问
+    println(arr[0])
+    println(arr[2])
+    // 表遍历
+    for item in arr {
+        println(item)
+    }
+}

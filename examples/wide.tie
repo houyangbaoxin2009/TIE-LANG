@@ -2,7 +2,7 @@
 // tie:opt=2
 
 // 宽类型（num/text/misc 类别框）与表字面量语法验证
-// 表字面量运行时（M2）未实现，此文件仅验证前端解析与语义通过
+// M2 表运行时支持单行纯位置表（数字 id），字符串 id 表、二维表留待 M3
 
 func main() {
     // 宽类型 num：整数与浮点均接受，scope 存具体推导类型
@@ -19,9 +19,12 @@ func main() {
     var ok: misc = true
     println(ok)
 
-    // 表字面量语法：逗号分列、分号分行、id 可选
+    // 表字面量：逗号分列（单行纯位置表，M2 支持）；下标访问
     var arr: table = [1, 2, 3]
-    var tbl: table = ["a":1, "b":2, "c":3]
-    var grid: table = [1, 2; 3, 4]
+    println(arr[1])
+    // 表遍历
+    for item in arr {
+        println(item)
+    }
     println("表字面量解析成功")
 }
