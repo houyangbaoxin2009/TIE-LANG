@@ -167,15 +167,25 @@ impl<'p> IrGenerator<'p> {
             self.gen_stmt(stmt)?;
         }
 
-        // 结尾：无 return 时补默认返回
-        let last = self.out.trim_end();
-        let needs_ret = !last.ends_with("ret ") && !last.ends_with("ret void");
+        // 结尾：无 return 时补默认返回。
+        // 判断依据：函数体最后一条非空指令是否以 `ret ` 开头（含 `ret void`/`ret i64 ...`）。
+        let last_line = self
+            .out
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| l.trim().to_string())
+            .unwrap_or_default();
+        let needs_ret = !last_line.starts_with("ret ");
         if needs_ret {
             if f.ret_ty.is_void() {
                 self.line("ret void");
             } else {
-                // 非 void 且缺 return：语义已拦截，这里兜底返回 0
-                self.line(&format!("ret {} 0", self.llvm_ty(f.ret_ty)));
+                // 非 void 且缺 return：语义已拦截，这里兜底返回。
+                // 注意 ptr（string）类型不能用整数 0，必须用 null。
+                let ty = self.llvm_ty(f.ret_ty);
+                let zero = if ty == "ptr" { "null" } else { "0" };
+                self.line(&format!("ret {ty} {zero}"));
             }
         }
 
@@ -263,6 +273,10 @@ impl<'p> IrGenerator<'p> {
             Stmt::While(w) => self.gen_while(w),
             Stmt::For(f) => self.gen_for(f),
             Stmt::Switch(s) => self.gen_switch(s),
+            Stmt::Import(_) => {
+                // import 已在 driver 层展开为函数（语义分析前），IR 阶段不应出现
+                Ok(())
+            }
         }
     }
 
@@ -309,14 +323,17 @@ impl<'p> IrGenerator<'p> {
         let merge_label = self.new_label("if.merge");
         self.line(&format!("br i1 {cond}, label %{then_label}, label %{else_label}"));
 
-        // then 分支
+        // then 分支：若块已以 return 终止（block_terminated），不再追加 br，
+        // 否则 `ret` 后跟 `br` 会产生死代码指令，LLVM 报「指令编号不连续」错误
         self.block_start(&then_label);
         self.scopes.push(HashMap::new());
         for s in &i.then_branch {
             self.gen_stmt(s)?;
         }
         self.scopes.pop();
-        self.line(&format!("br label %{merge_label}"));
+        if !self.block_terminated() {
+            self.line(&format!("br label %{merge_label}"));
+        }
         self.block_end();
 
         // else 分支
@@ -326,7 +343,9 @@ impl<'p> IrGenerator<'p> {
             self.gen_stmt(s)?;
         }
         self.scopes.pop();
-        self.line(&format!("br label %{merge_label}"));
+        if !self.block_terminated() {
+            self.line(&format!("br label %{merge_label}"));
+        }
         self.block_end();
 
         self.block_start(&merge_label);
@@ -350,7 +369,10 @@ impl<'p> IrGenerator<'p> {
             self.gen_stmt(s)?;
         }
         self.scopes.pop();
-        self.line(&format!("br label %{cond_label}"));
+        // 循环体若已以 return 终止，则无需跳回条件块（否则 ret 后产生死代码 br）
+        if !self.block_terminated() {
+            self.line(&format!("br label %{cond_label}"));
+        }
         self.block_end();
 
         self.block_start(&exit_label);
@@ -405,11 +427,14 @@ impl<'p> IrGenerator<'p> {
             self.gen_stmt(s)?;
         }
         self.scopes.pop();
-        // 自增
-        let next = self.new_reg();
-        self.line(&format!("{next} = add i64 {cur}, 1"));
-        self.line(&format!("store i64 {next}, ptr {var_alloca}"));
-        self.line(&format!("br label %{cond_label}"));
+        // 循环体若已以 return 终止，跳过自增与回跳（否则 ret 后产生死代码指令）
+        if !self.block_terminated() {
+            // 自增
+            let next = self.new_reg();
+            self.line(&format!("{next} = add i64 {cur}, 1"));
+            self.line(&format!("store i64 {next}, ptr {var_alloca}"));
+            self.line(&format!("br label %{cond_label}"));
+        }
         self.block_end();
 
         self.block_start(&exit_label);
@@ -467,11 +492,14 @@ impl<'p> IrGenerator<'p> {
             self.gen_stmt(s)?;
         }
         self.scopes.pop();
-        // 自增
-        let next = self.new_reg();
-        self.line(&format!("{next} = add i64 {cur}, 1"));
-        self.line(&format!("store i64 {next}, ptr {idx_alloca}"));
-        self.line(&format!("br label %{cond_label}"));
+        // 循环体若已以 return 终止，跳过自增与回跳（否则 ret 后产生死代码指令）
+        if !self.block_terminated() {
+            // 自增
+            let next = self.new_reg();
+            self.line(&format!("{next} = add i64 {cur}, 1"));
+            self.line(&format!("store i64 {next}, ptr {idx_alloca}"));
+            self.line(&format!("br label %{cond_label}"));
+        }
         self.block_end();
 
         self.block_start(&exit_label);
@@ -621,7 +649,10 @@ impl<'p> IrGenerator<'p> {
             self.gen_stmt(st)?;
         }
         self.scopes.pop();
-        self.line(&format!("br label %{exit_label}"));
+        // 分支体若已以 return 终止，无需跳回 exit（否则 ret 后产生死代码 br）
+        if !self.block_terminated() {
+            self.line(&format!("br label %{exit_label}"));
+        }
         self.block_end();
         Ok(())
     }
@@ -1079,6 +1110,22 @@ impl<'p> IrGenerator<'p> {
     fn line(&mut self, text: &str) {
         self.out.push_str(text);
         self.out.push('\n');
+    }
+
+    /// 判断当前基本块是否已终止（最后一条非空指令是 `ret` 或 `unreachable`）。
+    ///
+    /// 用于分支生成：若分支内已 return（块已终结），不能再追加 `br` 跳转，
+    /// 否则会在 `ret` 后生成死代码指令，LLVM 会报「指令编号不连续」错误。
+    fn block_terminated(&self) -> bool {
+        self.out
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| {
+                let t = l.trim();
+                t.starts_with("ret ") || t.starts_with("unreachable")
+            })
+            .unwrap_or(false)
     }
 
     /// 基本块起始：输出标签行。

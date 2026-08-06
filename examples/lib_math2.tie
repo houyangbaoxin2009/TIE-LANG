@@ -1,0 +1,10 @@
+// lib_math2.tie：P6 二级导入验证——自身再导入 lib_util（嵌套 import）
+import "./lib_util.tie"
+
+func add3(a: i64, b: i64, c: i64) -> i64 {
+    return a + b + c
+}
+
+func sqsum(a: i64, b: i64) -> i64 {
+    return square(a) + square(b)
+}

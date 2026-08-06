@@ -109,7 +109,7 @@ pub enum Stmt {
     FnDef(FnDefStmt),
     /// 表达式语句（调用等）
     Expr(ExprStmt),
-    /// 赋值语句 `x = expr`（对已声明变量重新赋值）
+    /// 赋值语句 `x = expr`（对已声明变量的重新赋值）
     Assign(AssignStmt),
     /// return 语句
     Return(ReturnStmt),
@@ -121,6 +121,18 @@ pub enum Stmt {
     For(ForStmt),
     /// switch 多分支选择
     Switch(SwitchStmt),
+    /// import 导入其他 tie 文件（`import "./x.tie" [as 别名]`，仅顶层）
+    Import(ImportStmt),
+}
+
+/// import 语句：把其他 tie 文件的顶层函数并入当前文件。
+#[derive(Debug, Clone)]
+pub struct ImportStmt {
+    /// 被导入文件的路径（相对当前文件所在目录，如 `"./lib.tie"`）
+    pub path: String,
+    /// 可选别名（`as 别名`）；当前阶段仅解析保留，后续版本用于命名空间限定
+    pub alias: Option<String>,
+    pub span: Span,
 }
 
 /// 赋值语句：对已声明的变量重新赋值（const 不可变）。

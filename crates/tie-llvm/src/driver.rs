@@ -19,8 +19,10 @@
 use crate::backend;
 use crate::ir;
 use crate::optimizer::{self, OptLevel};
+use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tie_frontend::ast::{Program, Stmt};
 use tie_frontend::lexer::LexError;
 use tie_frontend::parser::{ParseError, parse_program};
 use tie_frontend::semantic::{SemanticError, analyze};
@@ -161,6 +163,13 @@ fn compile_program(
     let tokens = tie_frontend::lexer::tokenize(&pre.cleaned_source).map_err(CompileError::Lex)?;
     // 语法分析
     let program = parse_program(&tokens).map_err(CompileError::Parse)?;
+    // import 展开：递归加载被导入文件并内联其顶层函数（含循环检测）
+    let base_dir = opts
+        .input
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let program = expand_imports(program, &base_dir)?;
     // 语义分析（符号表 + 类型检查）
     let sem = analyze(&program).map_err(CompileError::Semantic)?;
 
@@ -212,6 +221,69 @@ fn compile_program(
         message: format!("编译成功: {}", exe_path.display()),
         artifact: Some(exe_path),
     })
+}
+
+/// 递归展开 import 语句：加载被导入文件并把其顶层函数内联进当前程序。
+///
+/// - 路径解析：`import "./x.tie"` 的路径相对**当前文件所在目录**；
+/// - 被导入文件自身也可含 import（递归展开，支持多级导入）；
+/// - 循环检测：用规范化绝对路径集合记录「展开链」，重复访问即报循环导入。
+fn expand_imports(program: Program, base_dir: &Path) -> Result<Program, CompileError> {
+    let mut chain: HashSet<PathBuf> = HashSet::new();
+    expand_imports_inner(program, base_dir, &mut chain)
+}
+
+/// 递归展开的实际实现。
+///
+/// `chain` 是跨递归共享的「展开链」集合（规范化绝对路径），
+/// 用于循环导入检测——必须在同一递归栈内传递，不能每次新建。
+fn expand_imports_inner(
+    program: Program,
+    base_dir: &Path,
+    chain: &mut HashSet<PathBuf>,
+) -> Result<Program, CompileError> {
+    let mut out = Vec::new();
+    for stmt in program.stmts {
+        match stmt {
+            Stmt::Import(imp) => {
+                let import_path = base_dir.join(&imp.path);
+                // 规范化路径（解析 . / ..），用于循环检测
+                let canon = fs::canonicalize(&import_path)
+                    .unwrap_or_else(|_| import_path.clone());
+                if !chain.insert(canon.clone()) {
+                    return Err(CompileError::Semantic(SemanticError {
+                        span: imp.span,
+                        message: format!("循环导入：文件 '{}' 已在导入链中", imp.path),
+                    }));
+                }
+                // 读取 + 预处理 + 词法 + 语法解析被导入文件
+                let source = fs::read_to_string(&import_path)
+                    .map_err(|e| CompileError::Read(format!("导入文件 {} 读取失败: {e}", import_path.display())))?;
+                let pre = preprocess::preprocess(&source);
+                let tokens = tie_frontend::lexer::tokenize(&pre.cleaned_source)
+                    .map_err(|e| CompileError::Lex(LexError {
+                        span: imp.span,
+                        message: format!("导入文件 {} 词法错误: {e}", imp.path),
+                    }))?;
+                let sub_program = parse_program(&tokens)
+                    .map_err(|e| CompileError::Parse(ParseError {
+                        span: imp.span,
+                        message: format!("导入文件 {} 语法错误: {}", imp.path, e.message),
+                    }))?;
+                // 递归展开被导入文件的 import（以该文件所在目录为基准）
+                let sub_dir = import_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let expanded = expand_imports_inner(sub_program, &sub_dir, chain)?;
+                out.extend(expanded.stmts);
+                // 弹出当前文件，允许同目录下其他文件再次导入它（非循环）
+                chain.remove(&canon);
+            }
+            other => out.push(other),
+        }
+    }
+    Ok(Program { stmts: out })
 }
 
 /// 从头部 `opt=N` 选项读取优化级别（`// tie:opt=3`）。

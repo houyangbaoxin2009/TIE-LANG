@@ -223,6 +223,13 @@ impl Analyzer {
                     message: "函数体内不支持嵌套函数定义".into(),
                 })
             }
+            Stmt::Import(_) => {
+                // import 只允许出现在文件顶层（driver 在语义分析前已展开为函数）
+                Err(SemanticError {
+                    span: stmt_span(stmt),
+                    message: "import 语句只能出现在文件顶层".into(),
+                })
+            }
             Stmt::Expr(e) => {
                 let ty = self.infer_expr(&e.expr, scope)?;
                 self.result.expr_types.insert(addr_of(&e.expr), ty);
@@ -708,6 +715,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::While(w) => w.span,
         Stmt::For(f) => f.span,
         Stmt::Switch(s) => s.span,
+        Stmt::Import(i) => i.span,
     }
 }
 

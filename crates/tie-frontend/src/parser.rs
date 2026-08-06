@@ -6,8 +6,9 @@
 //! 本解析器只处理清理后的正文源码。
 
 use super::ast::{
-    AssignStmt, BinaryOp, Expr, ExprStmt, FnDefStmt, ForStmt, IfStmt, Param, Program, ReturnStmt,
-    Stmt, SwitchCase, SwitchStmt, TableCell, TableId, TypeSpec, UnaryOp, VarDeclStmt, WhileStmt,
+    AssignStmt, BinaryOp, Expr, ExprStmt, FnDefStmt, ForStmt, IfStmt, ImportStmt, Param, Program,
+    ReturnStmt, Stmt, SwitchCase, SwitchStmt, TableCell, TableId, TypeSpec, UnaryOp, VarDeclStmt,
+    WhileStmt,
 };
 use super::lexer::{Span, Token, TokenKind, TyKw};
 use std::fmt;
@@ -115,19 +116,61 @@ impl<'a> Parser<'a> {
 
     fn parse_program(&mut self) -> Result<Program, ParseError> {
         let mut stmts = Vec::new();
-        // 顶层只允许函数定义（后续版本扩展 import 等）
+        // 顶层只允许函数定义与 import（import 由 driver 递归展开为函数）
         while !matches!(self.peek_kind(), TokenKind::Eof) {
             match self.peek_kind() {
                 TokenKind::Func => stmts.push(Stmt::FnDef(self.parse_fn_def()?)),
+                TokenKind::Import => stmts.push(Stmt::Import(self.parse_import()?)),
                 other => {
                     return Err(self.err(format!(
-                        "顶层只允许函数定义，实际是 {}",
+                        "顶层只允许函数定义或 import，实际是 {}",
                         self.describe(other)
                     )))
                 }
             }
         }
         Ok(Program { stmts })
+    }
+
+    /// import 语句：`import "./x.tie"` 或 `import "./x.tie" as 别名`。
+    ///
+    /// 路径必须是字符串字面量（相对当前文件所在目录）；`as 别名` 可选。
+    fn parse_import(&mut self) -> Result<ImportStmt, ParseError> {
+        let span = self.advance().span; // 消费 `import`
+        // 路径：字符串字面量
+        let path = match self.peek_kind() {
+            TokenKind::Str(s) => {
+                let s = s.clone();
+                self.advance();
+                s
+            }
+            other => {
+                return Err(self.err(format!(
+                    "import 后必须是字符串路径，实际是 {}",
+                    self.describe(other)
+                )))
+            }
+        };
+        // 可选别名：`as 标识符`
+        let alias = if self.eat(&TokenKind::As) {
+            match self.peek_kind() {
+                TokenKind::Ident(name) => {
+                    let name = name.clone();
+                    self.advance();
+                    Some(name)
+                }
+                other => {
+                    return Err(self.err(format!(
+                        "as 后必须是别名标识符，实际是 {}",
+                        self.describe(other)
+                    )))
+                }
+            }
+        } else {
+            None
+        };
+        self.expect(TokenKind::Semi, "import 语句结束的分号")?;
+        Ok(ImportStmt { path, alias, span })
     }
 
     // ---------- 语句解析 ----------

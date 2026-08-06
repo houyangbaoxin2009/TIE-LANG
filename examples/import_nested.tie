@@ -1,0 +1,14 @@
+// import_nested.tie：P6 二级导入验证——导入 lib_math2（其内部又导入 lib_util）
+
+import "./lib_math2.tie"
+
+func main() {
+    var s: i64 = add3(1, 2, 3)
+    println(s)          // 6
+    var q: i64 = square(7)
+    println(q)          // 49
+    var t: i64 = triple(5)
+    println(t)          // 15
+    var ss: i64 = sqsum(3, 4)
+    println(ss)         // 25
+}

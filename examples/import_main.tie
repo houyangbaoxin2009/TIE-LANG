@@ -1,0 +1,16 @@
+// import_main.tie：P6 import 验证——导入库文件并调用其函数
+
+import "./lib_math.tie"
+
+func main() {
+    var s: i64 = add(3, 4)
+    println(s)               // 7
+    var p: i64 = mul(6, 7)
+    println(p)               // 42
+    var g: string = greet("tie")
+    println(g)               // Hello, tie
+    var m: i64 = max2(10, 5)
+    println(m)               // 10
+    var m2: i64 = max2(5, 10)
+    println(m2)              // 10
+}
