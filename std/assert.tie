@@ -1,0 +1,26 @@
+// tie:library
+// assert.tie：标准库——基础断言函数，失败时打印错误信息并退出进程
+
+// 断言条件为真；条件为假时打印错误并退出（退出码 1）
+func assert(cond: bool) {
+    if !cond {
+        println("assert 失败：条件为假")
+        exit(1)
+    }
+}
+
+// 断言两个整数相等；不相等时打印两个值并退出（退出码 1）
+func assert_eq(a: i64, b: i64) {
+    if a != b {
+        println("assert_eq 失败：" + to_string(a) + " != " + to_string(b))
+        exit(1)
+    }
+}
+
+// 断言两个整数不相等；相等时打印两个值并退出（退出码 1）
+func assert_neq(a: i64, b: i64) {
+    if a == b {
+        println("assert_neq 失败：" + to_string(a) + " == " + to_string(b))
+        exit(1)
+    }
+}

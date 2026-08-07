@@ -1,7 +1,31 @@
 # CHANGELOG
 
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
-里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件**。
+里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库**。
+
+## [Harbor M2] 标准库（std / math） — 2026-08-07
+
+### 新增
+- **语言底座原语（仅语言自身无法表达的部分，Rust 实现，三层 semantic/IR/interp 贯通）**共 21 个：
+  - 文件：`file_read` / `file_write` / `file_append` / `file_exists`
+  - 字符串与转换：`str_char`（Unicode 字符访问）、`to_string`、`parse_int`、`parse_float`
+  - 进程与系统：`exit`、`time_now`（Unix 秒）、`rand_range`（`[min,max)` 区间随机）
+  - 数学（libc，编译/解释两路径行为一致）：`sqrt` / `sin` / `cos` / `tan` / `exp` / `log` / `pow` / `floor` / `ceil` / `round`
+  - `len` 扩展：支持 `table`（返回元素个数）
+- **tie 语言自写标准库 `std/`（贯彻"能 tie 就 tie"）：**
+  - `std/assert.tie` — `assert` / `assert_eq` / `assert_neq`（失败打印错误并退出）
+  - `std/string.tie` — `str_trim` / `str_slice` / `str_contains` / `str_starts_with` / `str_ends_with` / `str_replace`（基于 `str_char`+循环拼接）
+  - `std/math.tie` — `abs` / `max_i` / `min_i` / `clamp` / `is_odd` / `is_even` / `sign_i` / `deg_to_rad` / `rad_to_deg` 等（纯算术实现）
+- **示例**：`examples/std_primitives.tie`、`examples/std_math_primitives.tie`（底座原语演示）、`examples/std_demo.tie`（文件+字符串+断言）、`examples/std_math_demo.tie`（数学库+原语）
+
+### 变更
+- 字符串/数字原语返回堆串统一走 tie-interp C ABI（`tie_free_result` 回收，无泄漏）；数学纯标量走 libc
+- `to_string`/`parse_*` 共用同一 Rust 实现，保证编译与解释两路径**逐字节一致**（如 `to_string(1.0)→"1"`）
+- `.gitignore` 增加 `/std/*.a`（标准库编译产物）
+
+### 测试
+- 全工作区测试通过（frontend 88 / interp 32 / llvm 28 / tie 53 / lsp 4）
+- 新增 interp 单测覆盖 21 原语 + `len(table)` 边界（多字节 UTF-8、越界、文件读写往返、追加、parse 非法输入、rand 越界）
 
 ## [Harbor M1] VSCode 插件（编辑器集成） — 2026-08-07
 

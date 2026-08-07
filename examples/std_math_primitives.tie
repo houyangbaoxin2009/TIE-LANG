@@ -1,0 +1,116 @@
+// tie:logic
+// std_math_primitives.tie：M2 标准库 floor 的数学/时间/随机原语演示。
+// 覆盖：time_now / rand_range / sqrt / sin / cos / tan / exp / log / pow /
+//       floor / ceil / round + len(表)。
+// 这些原语是 M2 标准库中唯一由 Rust 实现的 floor，其余 std 库用 tie 语言自写。
+
+// 浮点近似相等（比较编译/解释两路径的 IEEE 结果）
+func approx(a: f64, b: f64) -> bool {
+    var d: f64 = a - b
+    if d < 0.0 {
+        d = -d
+    }
+    return d < 0.000001
+}
+
+func main() {
+    // ---- 时间 ----
+    var t: i64 = time_now()
+    println("time_now: " + to_string(t))
+    if t <= 0 {
+        println("断言失败: time_now 应大于 0")
+        exit(1)
+    }
+
+    // ---- 随机数 ----
+    var r: i64 = rand_range(5, 10)
+    println("rand_range(5,10): " + to_string(r))
+    if r < 5 || r >= 10 {
+        println("断言失败: rand_range 越界")
+        exit(1)
+    }
+
+    // ---- 数学函数 ----
+    var s: f64 = sqrt(4)
+    println("sqrt(4): " + to_string(s))
+    if !approx(s, 2.0) {
+        println("断言失败: sqrt(4)")
+        exit(1)
+    }
+
+    var sn: f64 = sin(0)
+    println("sin(0): " + to_string(sn))
+    if !approx(sn, 0.0) {
+        println("断言失败: sin(0)")
+        exit(1)
+    }
+    var cs: f64 = cos(0)
+    println("cos(0): " + to_string(cs))
+    if !approx(cs, 1.0) {
+        println("断言失败: cos(0)")
+        exit(1)
+    }
+    var tn: f64 = tan(0)
+    println("tan(0): " + to_string(tn))
+    if !approx(tn, 0.0) {
+        println("断言失败: tan(0)")
+        exit(1)
+    }
+
+    var ex: f64 = exp(0)
+    println("exp(0): " + to_string(ex))
+    if !approx(ex, 1.0) {
+        println("断言失败: exp(0)")
+        exit(1)
+    }
+    var lg: f64 = log(1)
+    println("log(1): " + to_string(lg))
+    if !approx(lg, 0.0) {
+        println("断言失败: log(1)")
+        exit(1)
+    }
+
+    var pw: f64 = pow(2, 3)
+    println("pow(2,3): " + to_string(pw))
+    if !approx(pw, 8.0) {
+        println("断言失败: pow(2,3)")
+        exit(1)
+    }
+
+    var fl: f64 = floor(3.7)
+    println("floor(3.7): " + to_string(fl))
+    if !approx(fl, 3.0) {
+        println("断言失败: floor(3.7)")
+        exit(1)
+    }
+    var ce: f64 = ceil(3.2)
+    println("ceil(3.2): " + to_string(ce))
+    if !approx(ce, 4.0) {
+        println("断言失败: ceil(3.2)")
+        exit(1)
+    }
+    var rd: f64 = round(3.5)
+    println("round(3.5): " + to_string(rd))
+    if !approx(rd, 4.0) {
+        println("断言失败: round(3.5)")
+        exit(1)
+    }
+
+    // ---- len(表) ----
+    var t3: table = [1, 2, 3]
+    var n: i64 = len(t3)
+    println("len([1,2,3]): " + to_string(n))
+    if n != 3 {
+        println("断言失败: len(表)")
+        exit(1)
+    }
+    var n2: i64 = len([10, 20])
+    println("len([10,20]): " + to_string(n2))
+    if n2 != 2 {
+        println("断言失败: len(内联表)")
+        exit(1)
+    }
+
+    println("全部 12 个数学/时间/随机原语 + len(表) 验证通过")
+    exit(0)
+}

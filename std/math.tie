@@ -1,0 +1,110 @@
+// tie:library
+// math.tie：标准库——数学函数
+// 全部基于 + - * / % 与比较运算实现，不调用任何数学原语（sqrt/sin/cos 等仅由 Rust 层提供）
+// 注意：二元运算两侧类型必须一致，浮点运算一律使用浮点字面量（如 2.0 / 180.0）
+
+// 整数绝对值：负数取反，非负数原样返回
+func abs(x: i64) -> i64 {
+    if x < 0 {
+        return -x
+    }
+    return x
+}
+
+// 浮点绝对值：负数取反，非负数原样返回（比较须用浮点字面量 0.0，两侧类型须一致）
+func abs_f(x: f64) -> f64 {
+    if x < 0.0 {
+        return -x
+    }
+    return x
+}
+
+// 两个整数取较大者
+func max_i(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// 两个整数取较小者
+func min_i(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+// 两个浮点取较大者
+func max_f(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// 两个浮点取较小者
+func min_f(a: f64, b: f64) -> f64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+// 浮点夹取：把 x 限制在 [lo, hi] 区间内（小于 lo 取 lo，大于 hi 取 hi）
+func clamp(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo {
+        return lo
+    }
+    if x > hi {
+        return hi
+    }
+    return x
+}
+
+// 整数夹取：把 x 限制在 [lo, hi] 区间内（小于 lo 取 lo，大于 hi 取 hi）
+func clamp_i(x: i64, lo: i64, hi: i64) -> i64 {
+    if x < lo {
+        return lo
+    }
+    if x > hi {
+        return hi
+    }
+    return x
+}
+
+// 判断整数是否为奇数（取模 2 余非零；负数取模余数非零同样判为奇数）
+func is_odd(x: i64) -> bool {
+    return x % 2 != 0
+}
+
+// 判断整数是否为偶数（取模 2 余零）
+func is_even(x: i64) -> bool {
+    return x % 2 == 0
+}
+
+// 两个浮点取平均值
+func avg_f(a: f64, b: f64) -> f64 {
+    return (a + b) / 2.0
+}
+
+// 整数符号：负数返回 -1，正数返回 1，零返回 0
+func sign_i(x: i64) -> i64 {
+    if x < 0 {
+        return -1
+    }
+    if x > 0 {
+        return 1
+    }
+    return 0
+}
+
+// 角度转弧度：deg * π / 180（π 取双精度近似值）
+func deg_to_rad(deg: f64) -> f64 {
+    return deg * 3.141592653589793 / 180.0
+}
+
+// 弧度转角度：rad * 180 / π（π 取双精度近似值）
+func rad_to_deg(rad: f64) -> f64 {
+    return rad * 180.0 / 3.141592653589793
+}

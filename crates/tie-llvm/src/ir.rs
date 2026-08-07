@@ -112,6 +112,29 @@ impl<'p> IrGenerator<'p> {
         self.out.push_str("declare ptr @malloc(i64)\n");
         self.out
             .push_str("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n\n");
+        // M2 标准库 floor 的文件/进程原语（libc 符号）：
+        // - fopen/fwrite/fclose：file_write/file_append/file_exists（编译模式用 libc，
+        //   解释模式用 Rust std::fs，两者行为一致：写成功/追加增长/存在性检查）
+        // - fflush/exit：exit() 与运行时错误路径（先刷新 stdout 再退出，保证消息可见）
+        self.out.push_str("declare ptr @fopen(ptr, ptr)\n");
+        self.out.push_str("declare i64 @fwrite(ptr, i64, i64, ptr)\n");
+        self.out.push_str("declare i32 @fclose(ptr)\n");
+        self.out.push_str("declare i32 @fflush(ptr)\n");
+        self.out.push_str("declare void @exit(i32)\n");
+        // M2 标准库 floor 的数学原语（libc/libm 符号，MSVC ucrt 提供）：
+        // sqrt/sin/cos/tan/exp/log/pow/floor/ceil/round 是纯标量 f64→f64 运算，
+        // 编译模式直接声明 libc 符号（解释模式用 Rust f64 方法，两者 IEEE 754 一致）。
+        // 无条件声明（与 fopen 等一致）：未使用的 extern 声明对 LLVM/clang 无害。
+        self.out.push_str("declare double @sqrt(double)\n");
+        self.out.push_str("declare double @sin(double)\n");
+        self.out.push_str("declare double @cos(double)\n");
+        self.out.push_str("declare double @tan(double)\n");
+        self.out.push_str("declare double @exp(double)\n");
+        self.out.push_str("declare double @log(double)\n");
+        self.out.push_str("declare double @pow(double, double)\n");
+        self.out.push_str("declare double @floor(double)\n");
+        self.out.push_str("declare double @ceil(double)\n");
+        self.out.push_str("declare double @round(double)\n\n");
 
         // 收集函数签名（与语义一致）
         let sigs: HashMap<String, FuncSig> = self
@@ -162,6 +185,35 @@ impl<'p> IrGenerator<'p> {
         }
         if self.used_externs.iter().any(|s| s == "tie_free_result") {
             self.out.push_str("declare void @tie_free_result(ptr)\n");
+        }
+        // M2 标准库 floor 的 C ABI 桥（返回堆串/需解析的原语）：
+        // 与解释路径共用同一份 Rust 实现，保证两路径行为逐字节一致。
+        // 符号与 crates/tie-interp/src/lib.rs 的 #[unsafe(no_mangle)] 导出一一对应。
+        if self.used_externs.iter().any(|s| s == "tie_file_read") {
+            self.out.push_str("declare ptr @tie_file_read(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_str_char") {
+            self.out.push_str("declare ptr @tie_str_char(ptr, i64)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_to_string_i64") {
+            self.out.push_str("declare ptr @tie_to_string_i64(i64)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_to_string_f64") {
+            self.out.push_str("declare ptr @tie_to_string_f64(double)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_parse_int") {
+            self.out.push_str("declare i64 @tie_parse_int(ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_parse_float") {
+            self.out.push_str("declare double @tie_parse_float(ptr, ptr)\n");
+        }
+        // M2 标准库 floor 的时间/随机原语（C ABI 桥，与解释路径共用实现）：
+        // tie_time_now 返回 Unix 秒；tie_rand_range 带 ok 标志（max<=min 时置 0）。
+        if self.used_externs.iter().any(|s| s == "tie_time_now") {
+            self.out.push_str("declare i64 @tie_time_now()\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_rand_range") {
+            self.out.push_str("declare i64 @tie_rand_range(i64, i64, ptr)\n");
         }
         Ok(())
     }
@@ -356,9 +408,17 @@ impl<'p> IrGenerator<'p> {
                 // tie-interp 堆串，立即释放避免累积泄漏。
                 // 注意：仅处理顶层调用；作为变量初值/参数时 v1 接受会话级小泄漏
                 // （REPL 短期会话，量级可忽略）。
+                // 返回 tie-interp 堆串的内置作为独立语句（结果丢弃）时立即释放，
+                // 避免累积泄漏（与 read_line/eval 同一机制；file_read/str_char/to_string
+                // 为 M2 floor 新增的堆串返回原语）。
                 if matches!(
                     &e.expr,
-                    Expr::Call { name, .. } if name == "read_line" || name == "eval"
+                    Expr::Call { name, .. }
+                        if name == "read_line"
+                            || name == "eval"
+                            || name == "file_read"
+                            || name == "str_char"
+                            || name == "to_string"
                 ) {
                     self.mark_used("tie_free_result");
                     self.line(&format!("call void @tie_free_result(ptr {v})"));
@@ -1425,9 +1485,24 @@ impl<'p> IrGenerator<'p> {
         if name == "print" {
             return self.gen_printf(args, false);
         }
-        // 内置 len：字符串长度（语义已保证单字符串参数）
+        // 内置 len：字符串长度或表元素个数（语义已保证单参数为字符串或表）。
+        // 表长度编译期已知（tie 表定长）：表字面量查语义 tables 元数据，表变量查 LLVM
+        // 数组类型 `[N x T]` 的 N，均直接输出常量；字符串走 strlen。
         if name == "len" {
-            let (v, _t) = self.gen_expr(&args[0])?;
+            // 表字面量参数：直接查语义元数据（避免 gen_expr 对 TableLit 报错）
+            if let Expr::TableLit { .. } = &args[0] {
+                let key = &args[0] as *const Expr as usize;
+                let info = self.sem.tables.get(&key).ok_or_else(|| IrError {
+                    message: format!("内部错误：len 的表字面量缺少布局元数据（函数 {}）", self.cur_fn),
+                })?;
+                return Ok((info.len.to_string(), "i64"));
+            }
+            let (v, v_ty) = self.gen_expr(&args[0])?;
+            // 表变量：LLVM 类型为 `[N x T]`，长度 N 编译期已知
+            if let Some((n, _)) = parse_array_shape(v_ty) {
+                return Ok((n.to_string(), "i64"));
+            }
+            // 字符串：strlen
             let len = self.new_reg();
             self.line(&format!("{len} = call i64 @strlen(ptr {v})"));
             return Ok((len, "i64"));
@@ -1450,6 +1525,316 @@ impl<'p> IrGenerator<'p> {
             let tmp = self.new_reg();
             self.line(&format!("{tmp} = call ptr @tie_eval_expr(ptr {v})"));
             return Ok((tmp, "ptr"));
+        }
+        // ---------- M2 标准库 floor 内置函数 ----------
+        //
+        // 设计说明（编译/解释两路径一致性的关键）：
+        // - 返回堆串/需解析的原语（file_read / str_char / to_string / parse_int / parse_float）
+        //   走 tie-interp 的 C ABI 桥——与解释路径共用同一份 Rust 实现，保证行为逐字节一致
+        //   （如 to_string 的 Rust `{}` 格式与 printf %f 不同：1.0 → "1" vs "1.000000"；
+        //   parse 的 Rust 严格解析与 strtoll 宽松解析不同："12abc" 前者报错后者返回 12）。
+        // - 文件写/存在性（file_write / file_append / file_exists）编译模式用 libc
+        //   （fopen/fwrite/fclose），解释模式用 Rust std::fs，两者均返回 bool、无错误消息，
+        //   常规文件行为一致；用二进制模式（"wb"/"ab"/"rb"）避免 Windows 文本模式
+        //   把 \n 转成 \r\n（与 std::fs 的字节语义一致）。
+        // - 返回堆串的内置（file_read / str_char / to_string）沿用 read_line 的堆串机制：
+        //   返回值由 tie-interp 分配，调用方用完必须 tie_free_result（独立语句时在
+        //   gen_stmt 的 Expr 分支统一释放），无泄漏、无重复释放。
+
+        // 内置 file_read：单字符串参数，返回 string（读取文件全部内容）。
+        // 失败（C ABI 桥返回 NULL）→ 运行时错误，文本与解释路径一致。
+        if name == "file_read" {
+            self.mark_used("tie_file_read");
+            self.mark_used("tie_free_result");
+            let (v, _t) = self.gen_expr(&args[0])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_file_read(ptr {v})"));
+            // 判断返回 NULL：失败 → 错误块（退出进程），成功 → ok 块继续
+            let is_null = self.new_reg();
+            self.line(&format!("{is_null} = icmp eq ptr {tmp}, null"));
+            let ok_label = self.new_label("file_read.ok");
+            let err_label = self.new_label("file_read.err");
+            self.line(&format!("br i1 {is_null}, label %{err_label}, label %{ok_label}"));
+            self.block_start(&err_label);
+            self.gen_runtime_error(
+                "运行时错误: file_read 无法读取文件 '%s'",
+                &[("ptr", v)],
+            );
+            self.block_end();
+            // 成功块：返回值即堆串（调用方负责 tie_free_result）
+            self.block_start(&ok_label);
+            return Ok((tmp, "ptr"));
+        }
+        // 内置 file_write / file_append：两个字符串参数，返回 bool（成功与否）。
+        // file_write 覆盖写（"wb"），file_append 追加写（"ab"）。
+        if name == "file_write" || name == "file_append" {
+            let (p, _t) = self.gen_expr(&args[0])?;
+            let (c, _t) = self.gen_expr(&args[1])?;
+            let mode = if name == "file_write" { "wb" } else { "ab" };
+            let mode_g = self.string_global(mode);
+            let f = self.new_reg();
+            self.line(&format!("{f} = call ptr @fopen(ptr {p}, ptr @{mode_g})"));
+            // 打开失败 → false；成功 → fwrite + fclose，返回 (写入字节数 == 内容长度)
+            let is_null = self.new_reg();
+            self.line(&format!("{is_null} = icmp eq ptr {f}, null"));
+            let ok_label = self.new_label("file.open.ok");
+            let fail_label = self.new_label("file.open.fail");
+            let merge_label = self.new_label("file.open.merge");
+            self.line(&format!("br i1 {is_null}, label %{fail_label}, label %{ok_label}"));
+            // 打开失败：返回 false
+            self.block_start(&fail_label);
+            self.line(&format!("br label %{merge_label}"));
+            self.block_end();
+            // 打开成功：写入内容并关闭，返回写入是否完整
+            self.block_start(&ok_label);
+            let len = self.new_reg();
+            self.line(&format!("{len} = call i64 @strlen(ptr {c})"));
+            let written = self.new_reg();
+            self.line(&format!("{written} = call i64 @fwrite(ptr {c}, i64 1, i64 {len}, ptr {f})"));
+            self.line(&format!("call i32 @fclose(ptr {f})"));
+            // 非 void 的未编号调用（fclose 返回 i32）会被解析器分配隐式寄存器号，
+            // 必须用 new_reg 消费掉，否则后续寄存器编号错位（与 gen_printf 的哑返回同理）
+            let _ = self.new_reg();
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = icmp eq i64 {written}, {len}"));
+            self.line(&format!("br label %{merge_label}"));
+            self.block_end();
+            // 合并块：phi 汇合两分支结果
+            self.block_start(&merge_label);
+            let res = self.new_reg();
+            self.line(&format!("{res} = phi i1 [ false, %{fail_label} ], [ {ok}, %{ok_label} ]"));
+            return Ok((res, "i1"));
+        }
+        // 内置 file_exists：单字符串参数，返回 bool（文件是否存在）。
+        // 用 fopen(path, "rb") 探测：能打开即存在。
+        // 注：与解释路径 std::fs::exists 的差异——目录/不可读文件会返回 false
+        //（fopen 需可读），常规文件测试两者一致。
+        if name == "file_exists" {
+            let (p, _t) = self.gen_expr(&args[0])?;
+            let mode_g = self.string_global("rb");
+            let f = self.new_reg();
+            self.line(&format!("{f} = call ptr @fopen(ptr {p}, ptr @{mode_g})"));
+            let is_null = self.new_reg();
+            self.line(&format!("{is_null} = icmp eq ptr {f}, null"));
+            let ok_label = self.new_label("file.exists.ok");
+            let fail_label = self.new_label("file.exists.fail");
+            let merge_label = self.new_label("file.exists.merge");
+            self.line(&format!("br i1 {is_null}, label %{fail_label}, label %{ok_label}"));
+            // 打开失败：不存在 → false
+            self.block_start(&fail_label);
+            self.line(&format!("br label %{merge_label}"));
+            self.block_end();
+            // 打开成功：关闭并返回 true
+            self.block_start(&ok_label);
+            self.line(&format!("call i32 @fclose(ptr {f})"));
+            // 非 void 的未编号调用（fclose 返回 i32）会被解析器分配隐式寄存器号，必须消费掉
+            let _ = self.new_reg();
+            self.line(&format!("br label %{merge_label}"));
+            self.block_end();
+            // 合并块：phi 汇合两分支结果
+            self.block_start(&merge_label);
+            let res = self.new_reg();
+            self.line(&format!("{res} = phi i1 [ false, %{fail_label} ], [ true, %{ok_label} ]"));
+            return Ok((res, "i1"));
+        }
+        // 内置 str_char：字符串 + 整数下标，返回 string（第 i 个 Unicode 码点）。
+        // 走 C ABI 桥（Rust chars().nth 解码 UTF-8），保证多字节字符两路径一致。
+        if name == "str_char" {
+            self.mark_used("tie_str_char");
+            self.mark_used("tie_free_result");
+            let (s, _t) = self.gen_expr(&args[0])?;
+            let (i, i_ty) = self.gen_expr(&args[1])?;
+            // 下标统一扩展到 i64（C ABI 桥的第二个参数类型）
+            let i64 = self.extend_int_to_i64(&i, i_ty, &args[1])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_str_char(ptr {s}, i64 {i64})"));
+            return Ok((tmp, "ptr"));
+        }
+        // 内置 to_string：单数字参数（i64/f64），返回 string（数字格式化）。
+        // 按实参类型分派 i64/f64 桥（与解释路径一致）。
+        if name == "to_string" {
+            let (v, v_ty) = self.gen_expr(&args[0])?;
+            // 查语义类型区分浮点/整数（LLVM 类型名 "i64"/"double" 已能区分，语义表兜底）
+            let is_float = matches!(
+                self.sem_ty_of(&args[0]),
+                Some(TypeSpec::Named(TyKw::F32 | TyKw::F64))
+            ) || v_ty == "double"
+                || v_ty == "float";
+            if is_float {
+                self.mark_used("tie_to_string_f64");
+                // f32 → f64 提升（C ABI 桥接收 double）
+                let v64 = if v_ty == "float" {
+                    let ext = self.new_reg();
+                    self.line(&format!("{ext} = fpext float {v} to double"));
+                    ext
+                } else {
+                    v
+                };
+                let tmp = self.new_reg();
+                self.line(&format!("{tmp} = call ptr @tie_to_string_f64(double {v64})"));
+                return Ok((tmp, "ptr"));
+            }
+            self.mark_used("tie_to_string_i64");
+            // 整数统一扩展到 i64（C ABI 桥接收 i64）
+            let v64 = self.extend_int_to_i64(&v, v_ty, &args[0])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_to_string_i64(i64 {v64})"));
+            return Ok((tmp, "ptr"));
+        }
+        // 内置 parse_int：字符串参数，返回 i64（非法输入 → 运行时错误）。
+        // 走 C ABI 桥（Rust 严格 parse），错误文本与解释路径一致。
+        if name == "parse_int" {
+            self.mark_used("tie_parse_int");
+            let (s, _t) = self.gen_expr(&args[0])?;
+            // 栈上分配 ok 标志（桥写入 0/1），调用后检查
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = alloca i8"));
+            self.line(&format!("store i8 0, ptr {ok}"));
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call i64 @tie_parse_int(ptr {s}, ptr {ok})"));
+            let okv = self.new_reg();
+            self.line(&format!("{okv} = load i8, ptr {ok}"));
+            let is_zero = self.new_reg();
+            self.line(&format!("{is_zero} = icmp eq i8 {okv}, 0"));
+            let ok_label = self.new_label("parse_int.ok");
+            let err_label = self.new_label("parse_int.err");
+            self.line(&format!("br i1 {is_zero}, label %{err_label}, label %{ok_label}"));
+            // 解析失败 → 运行时错误
+            self.block_start(&err_label);
+            self.gen_runtime_error(
+                "运行时错误: parse_int 参数 '%s' 不是合法的整数",
+                &[("ptr", s)],
+            );
+            self.block_end();
+            // 成功块：返回解析值
+            self.block_start(&ok_label);
+            return Ok((tmp, "i64"));
+        }
+        // 内置 parse_float：字符串参数，返回 f64（非法输入 → 运行时错误）。
+        if name == "parse_float" {
+            self.mark_used("tie_parse_float");
+            let (s, _t) = self.gen_expr(&args[0])?;
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = alloca i8"));
+            self.line(&format!("store i8 0, ptr {ok}"));
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call double @tie_parse_float(ptr {s}, ptr {ok})"));
+            let okv = self.new_reg();
+            self.line(&format!("{okv} = load i8, ptr {ok}"));
+            let is_zero = self.new_reg();
+            self.line(&format!("{is_zero} = icmp eq i8 {okv}, 0"));
+            let ok_label = self.new_label("parse_float.ok");
+            let err_label = self.new_label("parse_float.err");
+            self.line(&format!("br i1 {is_zero}, label %{err_label}, label %{ok_label}"));
+            // 解析失败 → 运行时错误
+            self.block_start(&err_label);
+            self.gen_runtime_error(
+                "运行时错误: parse_float 参数 '%s' 不是合法的浮点数",
+                &[("ptr", s)],
+            );
+            self.block_end();
+            // 成功块：返回解析值
+            self.block_start(&ok_label);
+            return Ok((tmp, "double"));
+        }
+        // 内置 exit：整数参数，void（刷新 stdout 后终止进程）。
+        // 编译路径：fflush(NULL) 刷新全部流 → libc exit；解释路径：stdout().flush() + exit。
+        if name == "exit" {
+            let (c, c_ty) = self.gen_expr(&args[0])?;
+            self.line("call i32 @fflush(ptr null)");
+            // 非 void 的未编号调用（fflush 返回 i32）会被解析器分配隐式寄存器号，必须消费掉
+            let _ = self.new_reg();
+            // 退出码统一转为 i32（libc exit 签名）：i32 直接用，i64 截断，窄整数符号扩展
+            let c32 = if c_ty == "i32" {
+                c
+            } else if c_ty == "i64" {
+                let t = self.new_reg();
+                self.line(&format!("{t} = trunc i64 {c} to i32"));
+                t
+            } else {
+                let t = self.new_reg();
+                self.line(&format!("{t} = sext {c_ty} {c} to i32"));
+                t
+            };
+            self.line(&format!("call void @exit(i32 {c32})"));
+            // 终止当前块（exit 不返回；gen_fn 据此不再补 ret）
+            self.line("unreachable");
+            return Ok((self.new_reg(), "void"));
+        }
+        // ---------- M2 数学/时间/随机 floor 内置函数 ----------
+        //
+        // 数学函数（sqrt/sin/cos/tan/exp/log/floor/ceil/round）走 libc/libm
+        // （@sqrt/@sin/...，MSVC ucrt 提供），解释路径用 Rust f64 方法，两者 IEEE 754 一致。
+        // 整数实参统一提升为 double（sitofp）。log 需 x>0：x<=0 报错（与解释路径一致）。
+        if matches!(
+            name,
+            "sqrt" | "sin" | "cos" | "tan" | "exp" | "log" | "floor" | "ceil" | "round"
+        ) {
+            let (v, v_ty) = self.gen_expr(&args[0])?;
+            // 整数参数提升为 double（sitofp）；float 提升为 double（fpext）
+            let vd = self.promote_to_double(&v, v_ty)?;
+            // log 需要 x > 0：x<=0 → 运行时错误（与解释路径 f64::ln 前的检查一致）
+            if name == "log" {
+                let is_le = self.new_reg();
+                self.line(&format!("{is_le} = fcmp ole double {vd}, 0.0"));
+                let ok_label = self.new_label("log.ok");
+                let err_label = self.new_label("log.err");
+                self.line(&format!("br i1 {is_le}, label %{err_label}, label %{ok_label}"));
+                self.block_start(&err_label);
+                self.gen_runtime_error("运行时错误: log 参数必须大于 0", &[]);
+                self.block_end();
+                self.block_start(&ok_label);
+            }
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call double @{name}(double {vd})"));
+            return Ok((tmp, "double"));
+        }
+        // 内置 pow：两个数字参数，返回 f64（x^y）。
+        if name == "pow" {
+            let (x, x_ty) = self.gen_expr(&args[0])?;
+            let (y, y_ty) = self.gen_expr(&args[1])?;
+            let xd = self.promote_to_double(&x, x_ty)?;
+            let yd = self.promote_to_double(&y, y_ty)?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call double @pow(double {xd}, double {yd})"));
+            return Ok((tmp, "double"));
+        }
+        // 内置 time_now：零参数，返回 i64（Unix 纪元秒数）。走 C ABI 桥（与解释路径共用）。
+        if name == "time_now" {
+            self.mark_used("tie_time_now");
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call i64 @tie_time_now()"));
+            return Ok((tmp, "i64"));
+        }
+        // 内置 rand_range：两个整数参数，返回 i64（[min, max) 内随机整数）。
+        // 走 C ABI 桥（ok 标志模式，与 parse_int 一致）；max<=min → 运行时错误。
+        if name == "rand_range" {
+            self.mark_used("tie_rand_range");
+            let (min, min_ty) = self.gen_expr(&args[0])?;
+            let (max, max_ty) = self.gen_expr(&args[1])?;
+            let min64 = self.extend_int_to_i64(&min, min_ty, &args[0])?;
+            let max64 = self.extend_int_to_i64(&max, max_ty, &args[1])?;
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = alloca i8"));
+            self.line(&format!("store i8 0, ptr {ok}"));
+            let tmp = self.new_reg();
+            self.line(&format!(
+                "{tmp} = call i64 @tie_rand_range(i64 {min64}, i64 {max64}, ptr {ok})"
+            ));
+            let okv = self.new_reg();
+            self.line(&format!("{okv} = load i8, ptr {ok}"));
+            let is_zero = self.new_reg();
+            self.line(&format!("{is_zero} = icmp eq i8 {okv}, 0"));
+            let ok_label = self.new_label("rand_range.ok");
+            let err_label = self.new_label("rand_range.err");
+            self.line(&format!("br i1 {is_zero}, label %{err_label}, label %{ok_label}"));
+            // 范围无效 → 运行时错误
+            self.block_start(&err_label);
+            self.gen_runtime_error("运行时错误: rand_range 参数范围无效（max 必须大于 min）", &[]);
+            self.block_end();
+            // 成功块：返回随机值
+            self.block_start(&ok_label);
+            return Ok((tmp, "i64"));
         }
         // 用户函数调用
         let sig = self
@@ -1767,6 +2152,30 @@ impl<'p> IrGenerator<'p> {
         Ok((self.new_reg(), "void"))
     }
 
+    /// 生成运行时错误：printf(错误消息) → fflush(stdout) → exit(1)。
+    ///
+    /// `fmt` 是 printf 格式串（可含 `%s` 等占位符），`args` 是 (LLVM 类型, 值) 列表。
+    /// 文本与解释路径（tie-interp 返回的 Err）保持一致；先刷新 stdout 保证消息可见。
+    /// 末尾 `unreachable` 终止当前基本块（gen_fn 据此不再补 ret）。
+    fn gen_runtime_error(&mut self, fmt: &str, args: &[(&str, String)]) {
+        let g = self.fmt_global(&format!("{fmt}\n"));
+        let arg_str = args
+            .iter()
+            .map(|(t, v)| format!("{t} {v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if args.is_empty() {
+            self.line(&format!("call i32 (ptr, ...) @printf(ptr @{g})"));
+        } else {
+            self.line(&format!("call i32 (ptr, ...) @printf(ptr @{g}, {arg_str})"));
+        }
+        self.line("call i32 @fflush(ptr null)");
+        // 非 void 的未编号调用（fflush 返回 i32）会被解析器分配隐式寄存器号，必须消费掉
+        let _ = self.new_reg();
+        self.line("call void @exit(i32 1)");
+        self.line("unreachable");
+    }
+
     // ---------- 工具 ----------
 
     /// 查询表达式的语义类型（区分有符号/无符号；LLVM 类型名无法区分 u32/i32）。
@@ -1796,6 +2205,30 @@ impl<'p> IrGenerator<'p> {
             self.line(&format!("{ext} = sext {ty} {val} to i64"));
         }
         Ok(ext)
+    }
+
+    /// 将数字值提升为 double（数学函数实参统一为 f64）。
+    ///
+    /// double 直接用；float 用 fpext；整数类型（iN）用 sitofp。
+    fn promote_to_double(
+        &mut self,
+        val: &str,
+        ty: &'static str,
+    ) -> Result<String, IrError> {
+        match ty {
+            "double" => Ok(val.to_string()),
+            "float" => {
+                let ext = self.new_reg();
+                self.line(&format!("{ext} = fpext float {val} to double"));
+                Ok(ext)
+            }
+            // 整数类型：符号扩展为 double（数值语义一致）
+            _ => {
+                let ext = self.new_reg();
+                self.line(&format!("{ext} = sitofp {ty} {val} to double"));
+                Ok(ext)
+            }
+        }
     }
 
     /// 当前作用域可变引用。

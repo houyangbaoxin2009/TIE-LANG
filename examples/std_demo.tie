@@ -1,0 +1,71 @@
+// tie:logic
+// std_demo.tie：标准库演示——导入 assert 与 string 库，演示全部函数与文件操作
+
+import "../std/assert.tie"
+import "../std/string.tie"
+
+// 将布尔值转为可读文本（不依赖 to_string 对 bool 的支持）
+func bool_str(b: bool) -> string {
+    if b {
+        return "true"
+    }
+    return "false"
+}
+
+func main() {
+    // ---- 断言演示 ----
+    assert(true)
+    assert_eq(1 + 1, 2)
+    assert_neq(1, 2)
+    println("断言全部通过")
+
+    // ---- 字符串演示 ----
+    var trimmed: string = str_trim("  hello  ")
+    println("str_trim: [" + trimmed + "]")
+    assert_eq(len(trimmed), 5)
+
+    var sliced: string = str_slice("hello", 1, 4)
+    println("str_slice: " + sliced)
+    assert(sliced == "ell")
+
+    var has: bool = str_contains("hello world", "world")
+    println("str_contains: " + bool_str(has))
+    assert(has)
+
+    var sw: bool = str_starts_with("hello", "he")
+    println("str_starts_with: " + bool_str(sw))
+    assert(sw)
+
+    var ew: bool = str_ends_with("hello", "lo")
+    println("str_ends_with: " + bool_str(ew))
+    assert(ew)
+
+    var replaced: string = str_replace("aaa", "a", "b")
+    println("str_replace: " + replaced)
+    assert(replaced == "bbb")
+
+    // ---- 文件操作演示 ----
+    var path: string = "std_demo_tmp.txt"
+    var w1: bool = file_write(path, "line1\n")
+    println("file_write: " + bool_str(w1))
+    assert(w1)
+
+    var r1: string = file_read(path)
+    println("file_read: " + r1)
+    assert(r1 == "line1\n")
+
+    var ex: bool = file_exists(path)
+    println("file_exists: " + bool_str(ex))
+    assert(ex)
+
+    var w2: bool = file_append(path, "line2\n")
+    println("file_append: " + bool_str(w2))
+    assert(w2)
+
+    var r2: string = file_read(path)
+    println("file_read(追加后): " + r2)
+    assert(r2 == "line1\nline2\n")
+
+    // 无内置删除文件函数，临时文件保留（不清理）
+    println("临时文件保留：" + path)
+}

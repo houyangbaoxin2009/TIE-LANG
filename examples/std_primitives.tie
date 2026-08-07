@@ -1,0 +1,84 @@
+// tie:logic
+// std_primitives.tie：M2 标准库 floor 的 9 个 Rust 层内置原语演示。
+// 覆盖：file_read / file_write / file_append / file_exists / str_char /
+//       to_string / parse_int / parse_float / exit。
+// 这些原语是 M2 标准库中唯一由 Rust 实现的 floor，其余 std 库用 tie 语言自写。
+
+// 布尔 → 可读文本（to_string 只支持数字，bool 需手动转换）
+func bool_str(b: bool) -> string {
+    if b {
+        return "true"
+    }
+    return "false"
+}
+
+func main() {
+    var path: string = "std_primitives_tmp.txt"
+
+    // ---- 文件读写 ----
+    var f: bool = file_write(path, "hello\n")
+    println("file_write: " + bool_str(f))
+
+    var r: string = file_read(path)
+    println("file_read: [" + r + "]")
+    if r != "hello\n" {
+        println("断言失败: file_read 内容不符")
+        exit(1)
+    }
+
+    var ex: bool = file_exists(path)
+    println("file_exists: " + bool_str(ex))
+    if !ex {
+        println("断言失败: 文件应存在")
+        exit(1)
+    }
+
+    var ap: bool = file_append(path, "world\n")
+    println("file_append: " + bool_str(ap))
+    var r2: string = file_read(path)
+    println("file_read(追加后): [" + r2 + "]")
+    if r2 != "hello\nworld\n" {
+        println("断言失败: 追加后内容不符")
+        exit(1)
+    }
+
+    // ---- 字符串 ----
+    var ch: string = str_char("你好tie", 1)
+    println("str_char(你好tie, 1): " + ch)
+    if ch != "好" {
+        println("断言失败: str_char 多字节索引错误")
+        exit(1)
+    }
+    var empty: string = str_char("abc", 99)
+    println("str_char(abc, 99): [" + empty + "]")
+
+    // ---- 数字格式化与解析 ----
+    var si: string = to_string(42)
+    println("to_string(42): " + si)
+    if si != "42" {
+        println("断言失败: to_string(i64)")
+        exit(1)
+    }
+    var sf: string = to_string(3.14)
+    println("to_string(3.14): " + sf)
+    if sf != "3.14" {
+        println("断言失败: to_string(f64)")
+        exit(1)
+    }
+
+    var pi: i64 = parse_int("123")
+    println("parse_int(123): " + to_string(pi))
+    if pi != 123 {
+        println("断言失败: parse_int")
+        exit(1)
+    }
+    var pf: f64 = parse_float("2.5")
+    println("parse_float(2.5): " + to_string(pf))
+    if pf != 2.5 {
+        println("断言失败: parse_float")
+        exit(1)
+    }
+
+    println("全部 9 个 floor 原语验证通过")
+    exit(0)
+}

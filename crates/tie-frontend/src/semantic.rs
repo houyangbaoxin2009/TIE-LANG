@@ -803,7 +803,8 @@ impl Analyzer {
                     }
                     return Ok(TypeSpec::Named(TyKw::Void));
                 }
-                // 内置函数 len：单参数，要求字符串，返回 i64（字符串长度）
+                // 内置函数 len：单参数，要求字符串或表，返回 i64（字符串长度 / 表元素个数）。
+                // M2 扩展：len(表) 返回元素个数（编译期定长，IR 直接输出常量；解释器取运行时长度）。
                 if name == "len" {
                     if args.len() != 1 {
                         return Err(SemanticError {
@@ -813,13 +814,20 @@ impl Analyzer {
                     }
                     let at = self.infer_expr(&args[0], scope)?;
                     self.result.expr_types.insert(addr_of(&args[0]), at.clone());
-                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
-                        return Err(SemanticError {
-                            span: expr_span_of(&args[0]),
-                            message: format!("len() 参数必须是字符串，实际是 {}", type_name(&at)),
-                        });
+                    // 表字面量参数：直接接受（表，编译期已知长度）
+                    if matches!(&args[0], Expr::TableLit { .. }) {
+                        return Ok(TypeSpec::Named(TyKw::I64));
                     }
-                    return Ok(TypeSpec::Named(TyKw::I64));
+                    // 表变量（scope 类型为 Table）或字符串
+                    if matches!(&at, TypeSpec::Named(TyKw::Table))
+                        || matches!(&at, TypeSpec::Named(TyKw::Str))
+                    {
+                        return Ok(TypeSpec::Named(TyKw::I64));
+                    }
+                    return Err(SemanticError {
+                        span: expr_span_of(&args[0]),
+                        message: format!("len() 参数必须是字符串或表，实际是 {}", type_name(&at)),
+                    });
                 }
                 // 内置函数 print：同 println（不换行），任意参数，void
                 if name == "print" {
@@ -862,6 +870,236 @@ impl Analyzer {
                         });
                     }
                     return Ok(TypeSpec::Named(TyKw::Str));
+                }
+                // 内置函数 file_read：单字符串参数，返回 string（读取文件内容；失败运行时报错）。
+                // M2 标准库 floor：文件读取是 Rust 层唯一实现，其余 std 库用 tie 语言自写。
+                if name == "file_read" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("file_read() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("file_read() 参数必须是字符串，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Str));
+                }
+                // 内置函数 file_write / file_append：两个字符串参数，返回 bool（成功与否）。
+                // file_write 覆盖写，file_append 追加写。
+                if name == "file_write" || name == "file_append" {
+                    if args.len() != 2 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("{name}() 期望 2 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    for a in args {
+                        let at = self.infer_expr(a, scope)?;
+                        self.result.expr_types.insert(addr_of(a), at.clone());
+                        if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!("{name}() 参数必须是字符串，实际是 {}", type_name(&at)),
+                            });
+                        }
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Bool));
+                }
+                // 内置函数 file_exists：单字符串参数，返回 bool（文件是否存在）。
+                if name == "file_exists" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("file_exists() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("file_exists() 参数必须是字符串，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Bool));
+                }
+                // 内置函数 str_char：字符串 + 整数下标，返回 string（第 i 个 Unicode 码点；越界返回空串）。
+                // i 按字符（码点）计数，非字节。
+                if name == "str_char" {
+                    if args.len() != 2 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("str_char() 期望 2 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let st = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), st.clone());
+                    if !matches!(&st, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("str_char() 第 1 个参数必须是字符串，实际是 {}", type_name(&st)),
+                        });
+                    }
+                    let it = self.infer_expr(&args[1], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[1]), it.clone());
+                    if !it.is_int() {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[1]),
+                            message: format!("str_char() 第 2 个参数必须是整数，实际是 {}", type_name(&it)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Str));
+                }
+                // 内置函数 to_string：单数字参数（i64/f64），返回 string（数字格式化）。
+                // 数字重载：语义层允许任意数字类型（num 类别框），IR 层按实参类型分派 i64/f64。
+                if name == "to_string" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("to_string() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !is_number(&at) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("to_string() 参数必须是数字（i64/f64），实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Str));
+                }
+                // 内置函数 parse_int：字符串参数，返回 i64（非法输入运行时报错）。
+                if name == "parse_int" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("parse_int() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("parse_int() 参数必须是字符串，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::I64));
+                }
+                // 内置函数 parse_float：字符串参数，返回 f64（非法输入运行时报错）。
+                if name == "parse_float" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("parse_float() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("parse_float() 参数必须是字符串，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::F64));
+                }
+                // 内置函数 exit：整数参数，void（刷新 stdout 后终止进程）。
+                if name == "exit" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("exit() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !at.is_int() {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("exit() 参数必须是整数，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Void));
+                }
+                // 内置函数 time_now：零参数，返回 i64（Unix 纪元秒数）。
+                if name == "time_now" {
+                    if !args.is_empty() {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("time_now() 期望 0 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::I64));
+                }
+                // 内置函数 rand_range：两个整数参数，返回 i64（[min, max) 内随机整数）。
+                if name == "rand_range" {
+                    if args.len() != 2 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("rand_range() 期望 2 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    for a in args {
+                        let at = self.infer_expr(a, scope)?;
+                        self.result.expr_types.insert(addr_of(a), at.clone());
+                        if !at.is_int() {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!("rand_range() 参数必须是整数，实际是 {}", type_name(&at)),
+                            });
+                        }
+                    }
+                    return Ok(TypeSpec::Named(TyKw::I64));
+                }
+                // 内置函数 sqrt/sin/cos/tan/exp/log/floor/ceil/round：单数字参数，返回 f64。
+                // 数字重载：语义层允许任意数字类型（num 类别框），IR 层按实参类型提升为 double。
+                if matches!(
+                    name.as_str(),
+                    "sqrt" | "sin" | "cos" | "tan" | "exp" | "log" | "floor" | "ceil" | "round"
+                ) {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("{name}() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !is_number(&at) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("{name}() 参数必须是数字（i64/f64），实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::F64));
+                }
+                // 内置函数 pow：两个数字参数，返回 f64（x^y）。
+                if name == "pow" {
+                    if args.len() != 2 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("pow() 期望 2 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    for a in args {
+                        let at = self.infer_expr(a, scope)?;
+                        self.result.expr_types.insert(addr_of(a), at.clone());
+                        if !is_number(&at) {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!("pow() 参数必须是数字（i64/f64），实际是 {}", type_name(&at)),
+                            });
+                        }
+                    }
+                    return Ok(TypeSpec::Named(TyKw::F64));
                 }
                 // 用户函数：校验参数个数与类型
                 let sig = self.result.funcs.get(name).cloned().ok_or_else(|| SemanticError {
@@ -1097,6 +1335,9 @@ impl Analyzer {
                     }
                 }
                 // 表类型：元素类型（当前 IR 阶段仅支持数/字符串元素的同构表）
+                // 记录布局元数据：元素类型 + 长度（len(表) 直接查；表变量声明分支同样插入，幂等）
+                let info = TableInfo { elem_ty: first_ty.clone(), len: cells.len() };
+                self.result.tables.insert(addr_of(expr), info);
                 first_ty
             }
             Expr::Index { base, index, span } => {

@@ -1,0 +1,176 @@
+// tie:library
+// string.tie：标准库——字符串工具函数
+// 全部基于 str_char + len + 字符串拼接 + 循环/分支实现，不使用下标索引与字符转换
+
+// 判断单字符字符串是否为空白字符（空格、制表符、换行、回车）
+func is_whitespace(c: string) -> bool {
+    if c == " " {
+        return true
+    }
+    if c == "\t" {
+        return true
+    }
+    if c == "\n" {
+        return true
+    }
+    if c == "\r" {
+        return true
+    }
+    return false
+}
+
+// 去除字符串首尾空白字符；全空白字符串返回空串
+func str_trim(s: string) -> string {
+    var n: i64 = len(s)
+    // 从头部跳过空白，定位第一个非空白字符
+    var start: i64 = 0
+    while start < n && is_whitespace(str_char(s, start)) {
+        start = start + 1
+    }
+    // 从尾部跳过空白，定位最后一个非空白字符之后的位置
+    var end: i64 = n
+    while end > start && is_whitespace(str_char(s, end - 1)) {
+        end = end - 1
+    }
+    // 截取 [start, end) 区间
+    return str_slice(s, start, end)
+}
+
+// 截取字符串 [start, end) 区间的子串；越界自动收敛到边界；空串或 start>=end 返回空串
+func str_slice(s: string, start: i64, end: i64) -> string {
+    var n: i64 = len(s)
+    // 空串直接返回空串
+    if n == 0 {
+        return ""
+    }
+    // 收敛 start 到 [0, n]
+    var lo: i64 = start
+    if lo < 0 {
+        lo = 0
+    }
+    if lo > n {
+        lo = n
+    }
+    // 收敛 end 到 [0, n]
+    var hi: i64 = end
+    if hi < 0 {
+        hi = 0
+    }
+    if hi > n {
+        hi = n
+    }
+    // start >= end 返回空串
+    if lo >= hi {
+        return ""
+    }
+    // 逐字符拼接子串
+    var result: string = ""
+    var i: i64 = lo
+    while i < hi {
+        result = result + str_char(s, i)
+        i = i + 1
+    }
+    return result
+}
+
+// 判断 s 是否包含子串 sub；空子串视为包含
+func str_contains(s: string, sub: string) -> bool {
+    var n: i64 = len(s)
+    var m: i64 = len(sub)
+    // 空子串总是包含
+    if m == 0 {
+        return true
+    }
+    // 子串比主串长，不可能包含
+    if m > n {
+        return false
+    }
+    // 从每个起点位置尝试完整匹配
+    var i: i64 = 0
+    while i <= n - m {
+        var j: i64 = 0
+        var matched: bool = true
+        while j < m && matched {
+            if str_char(s, i + j) != str_char(sub, j) {
+                matched = false
+            }
+            j = j + 1
+        }
+        if matched {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 判断 s 是否以 prefix 开头；空前缀视为真
+func str_starts_with(s: string, prefix: string) -> bool {
+    var n: i64 = len(s)
+    var m: i64 = len(prefix)
+    // 前缀比主串长，不可能匹配
+    if m > n {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(prefix, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 判断 s 是否以 suffix 结尾；空后缀视为真
+func str_ends_with(s: string, suffix: string) -> bool {
+    var n: i64 = len(s)
+    var m: i64 = len(suffix)
+    // 后缀比主串长，不可能匹配
+    if m > n {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, n - m + i) != str_char(suffix, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 将 s 中所有出现的 from 替换为 to；from 为空串时原样返回（避免死循环）
+func str_replace(s: string, from: string, to: string) -> string {
+    var n: i64 = len(s)
+    var m: i64 = len(from)
+    // from 为空串：不替换，直接返回原串
+    if m == 0 {
+        return s
+    }
+    var result: string = ""
+    var i: i64 = 0
+    while i < n {
+        // 检查从 i 开始是否完整匹配 from
+        var matched: bool = true
+        var j: i64 = 0
+        while j < m && matched {
+            if i + j >= n {
+                matched = false
+            } else if str_char(s, i + j) != str_char(from, j) {
+                matched = false
+            }
+            j = j + 1
+        }
+        if matched {
+            // 匹配成功：追加 to，跳过 from 的长度
+            result = result + to
+            i = i + m
+        } else {
+            // 未匹配：追加单个字符，前进一位
+            result = result + str_char(s, i)
+            i = i + 1
+        }
+    }
+    return result
+}

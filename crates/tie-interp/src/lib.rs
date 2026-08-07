@@ -69,6 +69,152 @@ pub extern "C" fn tie_free_result(p: *mut c_char) {
     }
 }
 
+// ---------- M2 标准库 floor 内置函数 C ABI 桥 ----------
+//
+// 设计说明：以下桥函数是「Rust 层唯一实现」的 9 个 floor 原语中返回字符串/需解析的
+// 那部分。编译路径（IR 层）与解释路径（tie-interp）**共用同一份 Rust 实现**，
+// 保证两路径行为逐字节一致（这是 M2 标准库正确性的关键——其余 std 库用 tie 语言自写）。
+//
+// 返回字符串的桥（file_read / str_char / to_string）沿用 read_line 的堆串模式：
+// 返回 `CString::into_raw` 分配的 `*mut c_char`，调用方用完必须 `tie_free_result` 释放。
+// 失败（file_read 读不到文件）返回 NULL，由调用方统一输出错误消息（两路径消息一致）。
+
+/// C ABI 桥：读取文件全部内容，返回新分配的字符串；失败返回 NULL。
+///
+/// 失败时返回 NULL（而非错误串），由调用方（IR 层 / 解释器）统一输出错误消息，
+/// 保证编译与解释两路径的错误文本一致。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_file_read(path: *const c_char) -> *mut c_char {
+    let path = match unsafe { c_char_to_string(path) } {
+        Ok(p) => p,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => string_to_c_char(contents),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// C ABI 桥：取字符串第 i 个 Unicode 码点（按字符计数，非字节），返回新分配的字符串；
+/// 越界（含负数下标）返回空串。
+// 用 Rust `chars().nth(i)` 解码 UTF-8 码点，天然支持多字节字符（如中文）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_str_char(s: *const c_char, i: i64) -> *mut c_char {
+    let s = unsafe { c_char_to_string(s).unwrap_or_default() };
+    let ch = if i < 0 { None } else { s.chars().nth(i as usize) };
+    string_to_c_char(ch.map(|c| c.to_string()).unwrap_or_default())
+}
+
+/// C ABI 桥：i64 → 十进制字符串（与 Rust `{}` 默认格式一致）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_to_string_i64(v: i64) -> *mut c_char {
+    string_to_c_char(v.to_string())
+}
+
+/// C ABI 桥：f64 → 字符串（与 Rust `{}` 默认格式一致，最短往返表示）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_to_string_f64(v: f64) -> *mut c_char {
+    string_to_c_char(v.to_string())
+}
+
+/// C ABI 桥：解析 i64。成功置 `ok=1` 并返回解析值；失败置 `ok=0` 返回 0。
+// 解析语义与 Rust `str::parse::<i64>` 完全一致（编译/解释两路径共用，保证一致）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_parse_int(s: *const c_char, ok: *mut i8) -> i64 {
+    let parsed = match unsafe { c_char_to_string(s) } {
+        Ok(s) => s.parse::<i64>().ok(),
+        Err(_) => None,
+    };
+    match parsed {
+        Some(v) => {
+            unsafe { *ok = 1; }
+            v
+        }
+        None => {
+            unsafe { *ok = 0; }
+            0
+        }
+    }
+}
+
+/// C ABI 桥：解析 f64。成功置 `ok=1` 并返回解析值；失败置 `ok=0` 返回 0.0。
+// 解析语义与 Rust `str::parse::<f64>` 完全一致。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_parse_float(s: *const c_char, ok: *mut i8) -> f64 {
+    let parsed = match unsafe { c_char_to_string(s) } {
+        Ok(s) => s.parse::<f64>().ok(),
+        Err(_) => None,
+    };
+    match parsed {
+        Some(v) => {
+            unsafe { *ok = 1; }
+            v
+        }
+        None => {
+            unsafe { *ok = 0; }
+            0.0
+        }
+    }
+}
+
+/// C ABI 桥：返回 Unix 纪元秒数（i64）。
+///
+/// 编译路径（IR 层）与解释路径共用本桥（SystemTime），保证两路径返回一致的时间戳。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_time_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => 0,
+    }
+}
+
+// 线程局部 xorshift 随机数状态（RNG 状态）。
+//
+// 首次调用时用 SystemTime 播种（保证两次运行产生不同序列）；
+// 之后每次调用做 xorshift64 变换。xorshift 简单快速，足够随机数用途。
+thread_local! {
+    static RNG_STATE: std::cell::Cell<u64> = std::cell::Cell::new(seed_rng());
+}
+
+/// 从当前时间（纳秒）初始化 RNG 种子；种子为 0 时置 1（xorshift 全 0 会卡死）。
+fn seed_rng() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    if t == 0 { 1 } else { t }
+}
+
+/// 生成下一个随机 u64（xorshift64）。
+fn next_rand() -> u64 {
+    RNG_STATE.with(|s| {
+        let mut x = s.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        x
+    })
+}
+
+/// C ABI 桥：返回 [min, max) 内的随机整数。
+///
+/// 成功置 `ok=1` 并返回 [min, max) 内的值；`max <= min` 时置 `ok=0` 返回 0
+/// （由调用方据此输出错误消息，两路径文本一致）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_rand_range(min: i64, max: i64, ok: *mut i8) -> i64 {
+    if max <= min {
+        unsafe { *ok = 0; }
+        return 0;
+    }
+    unsafe { *ok = 1; }
+    // 取模映射到 [0, max-min)，再加 min → [min, max)
+    let span = (max - min) as u64;
+    min + (next_rand() % span) as i64
+}
+
 /// 把 C 字符串（NUL 结尾）读为 Rust String。
 unsafe fn c_char_to_string(p: *const c_char) -> Result<String, String> {
     if p.is_null() {
@@ -433,7 +579,14 @@ impl<'a> Env<'a> {
                 self.call_fn(name, arg_vals)
             }
             Expr::Index { .. } => Err("REPL v1 暂不支持下标访问（表）".into()),
-            Expr::TableLit { .. } => Err("REPL v1 暂不支持表字面量".into()),
+            Expr::TableLit { cells, .. } => {
+                // 表字面量：逐元素求值（M2 单行纯位置表；len 用）
+                let mut vals = Vec::with_capacity(cells.len());
+                for cell in cells {
+                    vals.push(self.eval_expr(&cell.value)?);
+                }
+                Ok(Value::Table(vals))
+            }
             Expr::TupleLit { .. } => Err("REPL v1 暂不支持元组".into()),
             Expr::FieldAccess { .. } => Err("REPL v1 暂不支持字段访问（类/元组）".into()),
             Expr::MethodCall { .. } => Err("REPL v1 暂不支持方法调用（类）".into()),
@@ -627,7 +780,8 @@ impl<'a> Env<'a> {
                 }
                 match &args[0] {
                     Value::Str(s) => Ok(Value::Int(s.len() as i64)),
-                    _ => Err("len 只支持字符串".into()),
+                    Value::Table(cells) => Ok(Value::Int(cells.len() as i64)),
+                    _ => Err("len 只支持字符串或表".into()),
                 }
             }
             "read_line" => {
@@ -649,6 +803,201 @@ impl<'a> Env<'a> {
                     }
                     _ => Err("eval 需要一个字符串参数".into()),
                 }
+            }
+            // ---------- M2 标准库 floor 内置函数 ----------
+            //
+            // 文件类：file_read 走 C ABI 桥（与编译路径共用同一份 Rust 实现），
+            // file_write/file_append/file_exists 直接用 Rust std::fs（编译路径用 libc，
+            // 两者行为一致：写成功/追加增长/存在性检查）。
+            "file_read" => {
+                if args.len() != 1 {
+                    return Err("file_read 需要一个字符串参数".into());
+                }
+                let Value::Str(path) = &args[0] else {
+                    return Err("file_read 需要一个字符串参数".into());
+                };
+                let p = CString::new(path.as_str()).unwrap_or_default();
+                let r = tie_file_read(p.as_ptr());
+                // 失败（NULL）→ 报错（错误消息与编译路径 printf 文本一致）
+                if r.is_null() {
+                    return Err(format!("运行时错误: file_read 无法读取文件 '{path}'"));
+                }
+                let s = unsafe { c_char_to_string(r).unwrap_or_default() };
+                tie_free_result(r);
+                Ok(Value::Str(s))
+            }
+            "file_write" | "file_append" => {
+                if args.len() != 2 {
+                    return Err(format!("{name} 需要两个字符串参数"));
+                }
+                let (Value::Str(path), Value::Str(content)) = (&args[0], &args[1]) else {
+                    return Err(format!("{name} 需要两个字符串参数"));
+                };
+                let ok = if name == "file_write" {
+                    // 覆盖写（create + truncate）
+                    std::fs::write(path, content).is_ok()
+                } else {
+                    // 追加写（不存在则创建）
+                    use std::io::Write;
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .and_then(|mut f| f.write_all(content.as_bytes()))
+                        .is_ok()
+                };
+                Ok(Value::Bool(ok))
+            }
+            "file_exists" => {
+                if args.len() != 1 {
+                    return Err("file_exists 需要一个字符串参数".into());
+                }
+                let Value::Str(path) = &args[0] else {
+                    return Err("file_exists 需要一个字符串参数".into());
+                };
+                Ok(Value::Bool(std::path::Path::new(path).exists()))
+            }
+            // 字符串类：str_char / to_string 走 C ABI 桥（与编译路径共用实现，
+            // 保证 UTF-8 码点索引与数字格式化两路径逐字节一致）。
+            "str_char" => {
+                if args.len() != 2 {
+                    return Err("str_char 需要字符串与整数参数".into());
+                }
+                let (Value::Str(s), Value::Int(i)) = (&args[0], &args[1]) else {
+                    return Err("str_char 需要字符串与整数参数".into());
+                };
+                let p = CString::new(s.as_str()).unwrap_or_default();
+                let r = tie_str_char(p.as_ptr(), *i);
+                let out = unsafe { c_char_to_string(r).unwrap_or_default() };
+                tie_free_result(r);
+                Ok(Value::Str(out))
+            }
+            "to_string" => {
+                if args.len() != 1 {
+                    return Err("to_string 需要一个数字参数".into());
+                }
+                // 数字重载：整数走 i64 桥，浮点走 f64 桥（与编译路径按实参类型分派一致）
+                let r = match &args[0] {
+                    Value::Int(n) => tie_to_string_i64(*n),
+                    Value::Float(f) => tie_to_string_f64(*f),
+                    _ => return Err("to_string 需要一个数字参数".into()),
+                };
+                let s = unsafe { c_char_to_string(r).unwrap_or_default() };
+                tie_free_result(r);
+                Ok(Value::Str(s))
+            }
+            // 解析类：走 C ABI 桥（与编译路径共用同一份 Rust parse）。
+            // 非法输入 → 报错（错误消息与编译路径 printf 文本一致）。
+            "parse_int" => {
+                if args.len() != 1 {
+                    return Err("parse_int 需要一个字符串参数".into());
+                }
+                let Value::Str(s) = &args[0] else {
+                    return Err("parse_int 需要一个字符串参数".into());
+                };
+                let mut ok: i8 = 0;
+                let p = CString::new(s.as_str()).unwrap_or_default();
+                let v = tie_parse_int(p.as_ptr(), &mut ok);
+                if ok == 0 {
+                    return Err(format!("运行时错误: parse_int 参数 '{s}' 不是合法的整数"));
+                }
+                Ok(Value::Int(v))
+            }
+            "parse_float" => {
+                if args.len() != 1 {
+                    return Err("parse_float 需要一个字符串参数".into());
+                }
+                let Value::Str(s) = &args[0] else {
+                    return Err("parse_float 需要一个字符串参数".into());
+                };
+                let mut ok: i8 = 0;
+                let p = CString::new(s.as_str()).unwrap_or_default();
+                let v = tie_parse_float(p.as_ptr(), &mut ok);
+                if ok == 0 {
+                    return Err(format!("运行时错误: parse_float 参数 '{s}' 不是合法的浮点数"));
+                }
+                Ok(Value::Float(v))
+            }
+            // 进程控制：exit 刷新 stdout 后终止进程（编译路径：fflush + libc exit）。
+            "exit" => {
+                if args.len() != 1 {
+                    return Err("exit 需要一个整数参数".into());
+                }
+                let Value::Int(code) = args[0] else {
+                    return Err("exit 需要一个整数参数".into());
+                };
+                use std::io::Write;
+                // 刷新 stdout：保证已输出内容在退出前可见（Windows 控制台有缓冲）
+                let _ = std::io::stdout().flush();
+                std::process::exit(code as i32);
+            }
+            // ---------- M2 数学/时间/随机 floor 内置函数 ----------
+            //
+            // 数学函数（sqrt/sin/cos/tan/exp/log/pow/floor/ceil/round）直接用 Rust f64
+            // 方法，编译路径用 libm（@sqrt/@sin/...），两者对同一输入结果一致（IEEE 754）。
+            // time_now / rand_range 走 C ABI 桥（与编译路径共用同一份 Rust 实现）。
+            "time_now" => {
+                if !args.is_empty() {
+                    return Err("time_now 不需要参数".into());
+                }
+                Ok(Value::Int(tie_time_now()))
+            }
+            "rand_range" => {
+                if args.len() != 2 {
+                    return Err("rand_range 需要两个整数参数".into());
+                }
+                let (Value::Int(min), Value::Int(max)) = (&args[0], &args[1]) else {
+                    return Err("rand_range 需要两个整数参数".into());
+                };
+                let mut ok: i8 = 0;
+                let v = tie_rand_range(*min, *max, &mut ok);
+                if ok == 0 {
+                    return Err("运行时错误: rand_range 参数范围无效（max 必须大于 min）".into());
+                }
+                Ok(Value::Int(v))
+            }
+            "sqrt" | "sin" | "cos" | "tan" | "exp" | "log" | "floor" | "ceil" | "round" => {
+                if args.len() != 1 {
+                    return Err(format!("{name} 需要一个数字参数"));
+                }
+                let x = match &args[0] {
+                    Value::Int(n) => *n as f64,
+                    Value::Float(f) => *f,
+                    _ => return Err(format!("{name} 需要一个数字参数")),
+                };
+                // log 需要 x > 0：x<=0 报错（与编译路径 fcmp 检查一致）
+                if name == "log" && x <= 0.0 {
+                    return Err("运行时错误: log 参数必须大于 0".into());
+                }
+                let r = match name {
+                    "sqrt" => x.sqrt(),
+                    "sin" => x.sin(),
+                    "cos" => x.cos(),
+                    "tan" => x.tan(),
+                    "exp" => x.exp(),
+                    "log" => x.ln(),
+                    "floor" => x.floor(),
+                    "ceil" => x.ceil(),
+                    "round" => x.round(),
+                    _ => unreachable!(),
+                };
+                Ok(Value::Float(r))
+            }
+            "pow" => {
+                if args.len() != 2 {
+                    return Err("pow 需要两个数字参数".into());
+                }
+                let x = match &args[0] {
+                    Value::Int(n) => *n as f64,
+                    Value::Float(f) => *f,
+                    _ => return Err("pow 需要两个数字参数".into()),
+                };
+                let y = match &args[1] {
+                    Value::Int(n) => *n as f64,
+                    Value::Float(f) => *f,
+                    _ => return Err("pow 需要两个数字参数".into()),
+                };
+                Ok(Value::Float(x.powf(y)))
             }
             _ => {
                 // 用户函数（REPL 中定义的）
@@ -691,6 +1040,8 @@ pub enum Value {
     Str(String),
     /// 范围 `start..end`（for 迭代用）
     Range(i64, i64),
+    /// 表（单行元素集合；len 用，M2 范围）
+    Table(Vec<Value>),
     /// 无值（void）
     Void,
 }
@@ -705,6 +1056,7 @@ impl Value {
             Value::Char(_) => "字符",
             Value::Str(_) => "字符串",
             Value::Range(_, _) => "范围",
+            Value::Table(_) => "表",
             Value::Void => "void",
         }
     }
@@ -726,6 +1078,11 @@ impl Value {
             Value::Char(c) => c.to_string(),
             Value::Str(s) => s.clone(),
             Value::Range(s, e) => format!("{s}..{e}"),
+            // 表：输出元素集合（仅 REPL 展示；编译路径不直接打印表）
+            Value::Table(cells) => format!(
+                "[{}]",
+                cells.iter().map(|c| c.to_print_string()).collect::<Vec<_>>().join(", ")
+            ),
             Value::Void => String::new(),
         }
     }
@@ -897,5 +1254,235 @@ mod tests {
         assert_eq!(ev("var x = 1; ++x + x").unwrap(), "4"); // ++x → 2，随后 x=2 → 2+2
         // 浮点自增
         assert_eq!(ev("var x = 1.5; x++; x").unwrap(), "2.5");
+    }
+
+    // ---------- M2 标准库 floor 内置函数测试 ----------
+
+    /// 生成唯一临时文件路径（避免并行测试相互干扰），并清场确保从干净状态开始。
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("tie_floor_{}_{}", std::process::id(), name));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// 把文件路径转义成 tie 字符串字面量可直接嵌入的形式
+    /// （Windows 路径含 `\`，而 tie 词法把 `\x` 当转义序列，需双写）。
+    fn escaped_path(p: &std::path::Path) -> String {
+        p.to_str().unwrap().replace('\\', "\\\\")
+    }
+
+    #[test]
+    fn builtin_file_write_read_roundtrip() {
+        let p = temp_path("roundtrip.txt");
+        let path = escaped_path(&p);
+        // 写 → 读回：内容一致（含换行与多字节 UTF-8）
+        let code = format!(
+            "var w = file_write(\"{path}\", \"hello\\n你好\\n\"); \
+             var r = file_read(\"{path}\"); \
+             (w ? \"ok\" : \"fail\") + \":\" + r"
+        );
+        assert_eq!(ev(&code).unwrap(), "ok:hello\n你好\n");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn builtin_file_append_grows() {
+        let p = temp_path("append.txt");
+        let path = escaped_path(&p);
+        // 覆盖写一行 → 追加一行 → 读回两行
+        let code = format!(
+            "file_write(\"{path}\", \"line1\\n\"); \
+             file_append(\"{path}\", \"line2\\n\"); \
+             file_read(\"{path}\")"
+        );
+        assert_eq!(ev(&code).unwrap(), "line1\nline2\n");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn builtin_file_exists_true_false() {
+        let p = temp_path("exists.txt");
+        let path = escaped_path(&p);
+        // 写前不存在 → false；写后存在 → true
+        let code = format!(
+            "var a = file_exists(\"{path}\"); \
+             file_write(\"{path}\", \"x\"); \
+             var b = file_exists(\"{path}\"); \
+             (a ? \"0\" : \"1\") + (b ? \"1\" : \"0\")"
+        );
+        assert_eq!(ev(&code).unwrap(), "11");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn builtin_file_read_missing_errors() {
+        let p = temp_path("missing.txt");
+        let path = escaped_path(&p);
+        // 文件不存在 → 运行时错误（文本与编译路径一致）
+        let err = ev(&format!("file_read(\"{path}\")")).unwrap_err();
+        assert!(err.contains("运行时错误: file_read 无法读取文件"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn builtin_str_char_index_and_utf8() {
+        // ASCII 索引
+        assert_eq!(ev("str_char(\"hello\", 1)").unwrap(), "e");
+        // 多字节 UTF-8：按码点计数（"你好" 的 0 号字符是 "你"）
+        assert_eq!(ev("str_char(\"你好\", 0)").unwrap(), "你");
+        assert_eq!(ev("str_char(\"你好\", 1)").unwrap(), "好");
+        // 混合中英文
+        assert_eq!(ev("str_char(\"a你b\", 1)").unwrap(), "你");
+        // 越界（下标 == 长度 / 更大）→ 空串
+        assert_eq!(ev("str_char(\"hello\", 5)").unwrap(), "");
+        assert_eq!(ev("str_char(\"hello\", 99)").unwrap(), "");
+        // 负数下标 → 空串
+        assert_eq!(ev("str_char(\"hello\", -1)").unwrap(), "");
+    }
+
+    #[test]
+    fn builtin_to_string_numeric() {
+        // i64 → 十进制
+        assert_eq!(ev("to_string(42)").unwrap(), "42");
+        assert_eq!(ev("to_string(-7)").unwrap(), "-7");
+        assert_eq!(ev("to_string(0)").unwrap(), "0");
+        // f64 → Rust {} 默认格式（最短往返表示）
+        assert_eq!(ev("to_string(3.14)").unwrap(), "3.14");
+        assert_eq!(ev("to_string(1.0)").unwrap(), "1");
+        assert_eq!(ev("to_string(0.5)").unwrap(), "0.5");
+    }
+
+    #[test]
+    fn builtin_parse_int_valid_invalid() {
+        assert_eq!(ev("parse_int(\"123\")").unwrap(), "123");
+        assert_eq!(ev("parse_int(\"-42\")").unwrap(), "-42");
+        assert_eq!(ev("parse_int(\"0\")").unwrap(), "0");
+        // 非法输入 → 运行时错误（文本与编译路径一致）
+        let err = ev("parse_int(\"abc\")").unwrap_err();
+        assert!(err.contains("运行时错误: parse_int 参数 'abc' 不是合法的整数"));
+        // 部分合法（"12abc"）也报错（Rust 严格解析，与 strtoll 宽松解析不同）
+        let err2 = ev("parse_int(\"12abc\")").unwrap_err();
+        assert!(err2.contains("不是合法的整数"));
+    }
+
+    #[test]
+    fn builtin_parse_float_valid_invalid() {
+        assert_eq!(ev("parse_float(\"3.5\")").unwrap(), "3.5");
+        assert_eq!(ev("parse_float(\"-0.25\")").unwrap(), "-0.25");
+        // 整数字符串也能解析为浮点
+        assert_eq!(ev("parse_float(\"2\")").unwrap(), "2");
+        // 非法输入 → 运行时错误
+        let err = ev("parse_float(\"abc\")").unwrap_err();
+        assert!(err.contains("运行时错误: parse_float 参数 'abc' 不是合法的浮点数"));
+    }
+
+    #[test]
+    fn builtin_exit_terminates_process() {
+        // 子进程模式：执行 exit 内置，进程以指定码退出（不返回）
+        if std::env::var_os("TIE_TEST_EXIT_CHILD").is_some() {
+            let _ = Session::new().eval("exit(7)");
+            unreachable!("exit(7) 应终止子进程");
+        }
+        // 父进程模式：重启本测试作为子进程（进程隔离，避免杀死测试运行器），断言退出码
+        let exe = std::env::current_exe().expect("获取测试可执行文件路径");
+        let out = std::process::Command::new(&exe)
+            .args(["--exact", "tests::builtin_exit_terminates_process", "--nocapture"])
+            .env("TIE_TEST_EXIT_CHILD", "1")
+            .output()
+            .expect("启动子进程");
+        assert_eq!(out.status.code(), Some(7));
+    }
+
+    // ---------- M2 数学/时间/随机 floor 内置函数测试 ----------
+
+    #[test]
+    fn builtin_time_now_positive() {
+        // Unix 纪元秒数应 > 0（2026 年显然大于 0）
+        let t: i64 = ev("time_now()").unwrap().parse().unwrap();
+        assert!(t > 0);
+    }
+
+    #[test]
+    fn builtin_rand_range_bounds() {
+        // 循环 100 次：值必须在 [min, max) 内
+        for _ in 0..100 {
+            let v: i64 = ev("rand_range(5, 10)").unwrap().parse().unwrap();
+            assert!((5..10).contains(&v), "rand_range(5,10) 返回 {v} 越界");
+        }
+        // 单元素范围 [7, 8) → 恒为 7
+        assert_eq!(ev("rand_range(7, 8)").unwrap(), "7");
+        // 负数范围
+        let v: i64 = ev("rand_range(-10, 0)").unwrap().parse().unwrap();
+        assert!((-10..0).contains(&v));
+    }
+
+    #[test]
+    fn builtin_rand_range_invalid_errors() {
+        // max <= min → 运行时错误（文本与编译路径一致）
+        let err = ev("rand_range(5, 5)").unwrap_err();
+        assert!(err.contains("运行时错误: rand_range 参数范围无效"));
+        let err2 = ev("rand_range(10, 5)").unwrap_err();
+        assert!(err2.contains("运行时错误: rand_range 参数范围无效"));
+    }
+
+    #[test]
+    fn builtin_math_sqrt() {
+        assert_eq!(ev("sqrt(4)").unwrap(), "2");
+        assert_eq!(ev("sqrt(2.25)").unwrap(), "1.5");
+        // 负数 → NaN（IEEE 语义，与编译路径一致）
+        assert_eq!(ev("sqrt(-1)").unwrap(), "NaN");
+    }
+
+    #[test]
+    fn builtin_math_sin_cos_tan() {
+        // 弧度制：sin(0)=0, cos(0)=1, tan(0)=0
+        assert_eq!(ev("sin(0)").unwrap(), "0");
+        assert_eq!(ev("cos(0)").unwrap(), "1");
+        assert_eq!(ev("tan(0)").unwrap(), "0");
+        // sin(π/2) ≈ 1
+        let v: f64 = ev("sin(1.5707963267948966)").unwrap().parse().unwrap();
+        assert!((v - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn builtin_math_exp_log() {
+        assert_eq!(ev("exp(0)").unwrap(), "1");
+        assert_eq!(ev("log(1)").unwrap(), "0");
+        assert_eq!(ev("log(2.718281828459045)").unwrap(), "1");
+        // log(0) / log(-1) → 运行时错误（文本与编译路径一致）
+        let err = ev("log(0)").unwrap_err();
+        assert!(err.contains("运行时错误: log 参数必须大于 0"));
+        let err2 = ev("log(-1)").unwrap_err();
+        assert!(err2.contains("运行时错误: log 参数必须大于 0"));
+    }
+
+    #[test]
+    fn builtin_math_pow() {
+        assert_eq!(ev("pow(2, 3)").unwrap(), "8");
+        assert_eq!(ev("pow(2, 0.5)").unwrap(), "1.4142135623730951");
+        assert_eq!(ev("pow(10, 2)").unwrap(), "100");
+    }
+
+    #[test]
+    fn builtin_math_floor_ceil_round() {
+        // floor/ceil/round（round 为四舍五入远离零）
+        assert_eq!(ev("floor(3.7)").unwrap(), "3");
+        assert_eq!(ev("floor(-3.7)").unwrap(), "-4");
+        assert_eq!(ev("ceil(3.2)").unwrap(), "4");
+        assert_eq!(ev("ceil(-3.2)").unwrap(), "-3");
+        assert_eq!(ev("round(3.5)").unwrap(), "4");
+        assert_eq!(ev("round(2.5)").unwrap(), "3");
+        assert_eq!(ev("round(-2.5)").unwrap(), "-3");
+    }
+
+    #[test]
+    fn builtin_len_table() {
+        // len(表)：元素个数（单行 [1,2,3] → 3）
+        assert_eq!(ev("len([1, 2, 3])").unwrap(), "3");
+        assert_eq!(ev("len([])").unwrap(), "0");
+        // len(字符串表)
+        assert_eq!(ev("len([\"a\", \"b\"])").unwrap(), "2");
+        // len(字符串) 保持原行为（字节数）
+        assert_eq!(ev("len(\"hello\")").unwrap(), "5");
     }
 }
