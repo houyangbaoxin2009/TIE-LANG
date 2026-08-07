@@ -7,8 +7,8 @@
 
 use super::ast::{
     AssignStmt, BinaryOp, Expr, ExprStmt, FnDefStmt, ForStmt, IfStmt, ImportStmt, Param, Program,
-    ReturnStmt, Stmt, SwitchCase, SwitchStmt, TableCell, TableId, TypeSpec, UnaryOp, VarDeclStmt,
-    WhileStmt,
+    ReturnStmt, Stmt, SwitchCase, SwitchStmt, TableCell, TableId, TupleField, TypeSpec, UnaryOp,
+    VarDeclStmt, WhileStmt,
 };
 use super::lexer::{Span, Token, TokenKind, TyKw};
 use std::fmt;
@@ -35,11 +35,13 @@ pub fn parse_program(tokens: &[Token]) -> Result<Program, ParseError> {
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
+    /// 解构 desugar 用的临时变量计数器（生成 `_tmpN` 唯一名）
+    tmp_counter: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(tokens: &'a [Token]) -> Self {
-        Self { tokens, pos: 0 }
+        Self { tokens, pos: 0, tmp_counter: 0 }
     }
 
     // ---------- 基础游标 ----------
@@ -175,21 +177,28 @@ impl<'a> Parser<'a> {
 
     // ---------- 语句解析 ----------
 
-    /// 解析一个语句（函数体内）。
-    fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+    /// 解析一条或多条语句（var/const 元组解构会展开为多条）。
+    ///
+    /// 返回 Vec 的原因：`var (q, r) = divmod(10, 3);` 在解析层 desugar 为
+    /// 临时变量声明 + 逐字段声明两条语句（见 parse_var_decl）。
+    fn parse_stmt(&mut self) -> Result<Vec<Stmt>, ParseError> {
         match self.peek_kind() {
-            TokenKind::Var => self.parse_var_decl(false).map(Stmt::VarDecl),
-            TokenKind::Const => self.parse_var_decl(true).map(Stmt::VarDecl),
-            TokenKind::If => self.parse_if().map(Stmt::If),
-            TokenKind::While => self.parse_while().map(Stmt::While),
-            TokenKind::For => self.parse_for().map(Stmt::For),
-            TokenKind::Switch => self.parse_switch().map(Stmt::Switch),
-            TokenKind::Return => self.parse_return().map(Stmt::Return),
+            TokenKind::Var => {
+                self.parse_var_decl(false).map(|ds| ds.into_iter().map(Stmt::VarDecl).collect())
+            }
+            TokenKind::Const => {
+                self.parse_var_decl(true).map(|ds| ds.into_iter().map(Stmt::VarDecl).collect())
+            }
+            TokenKind::If => Ok(vec![Stmt::If(self.parse_if()?)]),
+            TokenKind::While => Ok(vec![Stmt::While(self.parse_while()?)]),
+            TokenKind::For => Ok(vec![Stmt::For(self.parse_for()?)]),
+            TokenKind::Switch => Ok(vec![Stmt::Switch(self.parse_switch()?)]),
+            TokenKind::Return => Ok(vec![Stmt::Return(self.parse_return()?)]),
             TokenKind::LBrace => {
                 // 裸块（后续版本），此处按语法错误处理
                 Err(self.err("函数体内不能有裸代码块".into()))
             }
-            _ => self.parse_expr_or_assign(),
+            _ => Ok(vec![self.parse_expr_or_assign()?]),
         }
     }
 
@@ -210,8 +219,16 @@ impl<'a> Parser<'a> {
     }
 
     /// `var name[: Ty] = expr` / `const name[: Ty] = expr`（ASI/分号结束）。
-    fn parse_var_decl(&mut self, is_const: bool) -> Result<VarDeclStmt, ParseError> {
+    ///
+    /// 元组解构：`var (q, r) = expr;` → 解析层 desugar 为
+    /// `var _tmpN = expr; var q = _tmpN.Item1; var r = _tmpN.Item2;`
+    /// （临时变量不可变共享源值，字段声明继承用户的 const 标记）。
+    fn parse_var_decl(&mut self, is_const: bool) -> Result<Vec<VarDeclStmt>, ParseError> {
         let span = self.advance().span; // var / const
+        // 元组解构：变量名位置是左括号
+        if matches!(self.peek_kind(), TokenKind::LParen) {
+            return self.parse_tuple_destructure(span, is_const);
+        }
         let name = self.expect_ident()?;
         let ty = if self.eat(&TokenKind::Colon) {
             Some(self.parse_type()?)
@@ -221,7 +238,65 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Eq, "'='")?;
         let init = self.parse_expr()?;
         self.expect(TokenKind::Semi, "语句结束符")?;
-        Ok(VarDeclStmt { name, ty, init, span, is_const })
+        Ok(vec![VarDeclStmt { name, ty, init, span, is_const }])
+    }
+
+    /// 元组解构声明：`var (q, r) = expr;`（desugar 为临时变量 + 逐字段声明）。
+    ///
+    /// 仅支持标识符列表（嵌套解构、忽略占位 `_` 留待后续版本）。
+    fn parse_tuple_destructure(
+        &mut self,
+        span: Span,
+        is_const: bool,
+    ) -> Result<Vec<VarDeclStmt>, ParseError> {
+        self.expect(TokenKind::LParen, "'('")?;
+        let mut names = Vec::new();
+        // 空解构 `var () = ...` 不支持
+        if self.eat(&TokenKind::RParen) {
+            return Err(ParseError {
+                span,
+                message: "空解构 () 不支持".into(),
+            });
+        }
+        loop {
+            names.push(self.expect_ident()?);
+            if self.eat(&TokenKind::Comma) {
+                continue;
+            }
+            self.expect(TokenKind::RParen, "')'")?;
+            break;
+        }
+        self.expect(TokenKind::Eq, "'='")?;
+        let init = self.parse_expr()?;
+        self.expect(TokenKind::Semi, "语句结束符")?;
+        // 生成唯一临时变量名 `_tmpN`（下划线开头，避免与用户变量冲突）
+        let tmp = format!("_tmp{}", self.tmp_counter);
+        self.tmp_counter += 1;
+        // 第一条：临时变量持有元组值（const 语义由后续字段声明承载，临时变量可写）
+        let mut decls = vec![VarDeclStmt {
+            name: tmp.clone(),
+            ty: None,
+            init,
+            span,
+            is_const: false,
+        }];
+        // 逐字段：`var q = _tmpN.Item1;`（按 C# 规则 ItemN 从 1 编号）
+        for (i, name) in names.iter().enumerate() {
+            let access = format!("Item{}", i + 1);
+            let field = Expr::TupleField {
+                base: Box::new(Expr::Var(tmp.clone())),
+                access,
+                span,
+            };
+            decls.push(VarDeclStmt {
+                name: name.clone(),
+                ty: None,
+                init: field,
+                span,
+                is_const,
+            });
+        }
+        Ok(decls)
     }
 
     /// `func name(params) -> Ty { stmts }`。
@@ -259,7 +334,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::LBrace, "'{'")?;
         let mut stmts = Vec::new();
         while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
-            stmts.push(self.parse_stmt()?);
+            stmts.extend(self.parse_stmt()?);
         }
         self.expect(TokenKind::RBrace, "'}'")?;
         Ok(stmts)
@@ -361,7 +436,7 @@ impl<'a> Parser<'a> {
             self.peek_kind(),
             TokenKind::Case | TokenKind::Default | TokenKind::RBrace | TokenKind::Eof
         ) {
-            stmts.push(self.parse_stmt()?);
+            stmts.extend(self.parse_stmt()?);
         }
         Ok(stmts)
     }
@@ -395,8 +470,46 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(TypeSpec::Named(ty))
             }
+            // 元组类型：`(i64, string)` / `(x: i64, y: i64)`
+            TokenKind::LParen => self.parse_tuple_type(),
             other => Err(self.err(format!("期望类型，实际是 {}", self.describe(other)))),
         }
+    }
+
+    /// 元组类型：`(T1, T2, ...)` 或 `(name: T1, name: T2, ...)`（字段名可选）。
+    ///
+    /// 空元组 `()` 不支持（C# 风格：无空元组）。
+    fn parse_tuple_type(&mut self) -> Result<TypeSpec, ParseError> {
+        let span = self.peek().span;
+        self.expect(TokenKind::LParen, "'('")?;
+        let mut fields = Vec::new();
+        // 空元组 `()`：不支持
+        if self.eat(&TokenKind::RParen) {
+            return Err(ParseError {
+                span,
+                message: "空元组类型 () 不支持".into(),
+            });
+        }
+        loop {
+            // 命名字段：`x: i64`（标识符后紧跟冒号）
+            let name = if matches!(self.peek_kind(), TokenKind::Ident(_))
+                && self.tokens.get(self.pos + 1).map(|t| &t.kind) == Some(&TokenKind::Colon)
+            {
+                let n = self.expect_ident()?;
+                self.expect(TokenKind::Colon, "':'")?;
+                Some(n)
+            } else {
+                None
+            };
+            let ty = self.parse_type()?;
+            fields.push(TupleField { name, ty });
+            if self.eat(&TokenKind::Comma) {
+                continue;
+            }
+            self.expect(TokenKind::RParen, "')'")?;
+            break;
+        }
+        Ok(TypeSpec::Tuple(fields))
     }
 
     // ---------- 表达式解析（优先级爬升） ----------
@@ -514,7 +627,7 @@ impl<'a> Parser<'a> {
             }
             _ => self.parse_primary()?,
         };
-        // 后缀下标访问：`base[index]`（可链式 `a[0][1]`）
+        // 后缀访问：`base[index]` 下标与 `base.field` 元组字段（可链式，如 `a[0][1]`、`p.x.Item1`）
         loop {
             if self.eat(&TokenKind::LBracket) {
                 let index = self.parse_expr()?;
@@ -524,6 +637,33 @@ impl<'a> Parser<'a> {
                 expr = Expr::Index {
                     base: Box::new(expr),
                     index: Box::new(index),
+                    span: base_span,
+                };
+            } else if self.eat(&TokenKind::Dot) {
+                // 元组字段访问：`.Item1` / `.x` / `.0`（字段名、ItemN 或数字下标）
+                let access = match self.peek_kind() {
+                    TokenKind::Ident(name) => {
+                        let name = name.clone();
+                        self.advance();
+                        name
+                    }
+                    TokenKind::Int(v) => {
+                        let v = *v;
+                        self.advance();
+                        v.to_string()
+                    }
+                    other => {
+                        return Err(self.err(format!(
+                            "字段访问 '.' 后必须是字段名/ItemN/数字下标，实际是 {}",
+                            self.describe(other)
+                        )))
+                    }
+                };
+                let dspan = self.peek().span;
+                let base_span = expr_span(&expr).unwrap_or(dspan);
+                expr = Expr::TupleField {
+                    base: Box::new(expr),
+                    access,
                     span: base_span,
                 };
             } else {
@@ -582,18 +722,69 @@ impl<'a> Parser<'a> {
                     Ok(Expr::Var(name))
                 }
             }
-            TokenKind::LParen => {
-                self.advance();
-                let inner = self.parse_expr()?;
-                self.expect(TokenKind::RParen, "')'")?;
-                Ok(inner)
-            }
+            TokenKind::LParen => self.parse_paren_or_tuple(span),
             TokenKind::LBracket => self.parse_table_lit(span),
             other => Err(ParseError {
                 span,
                 message: format!("无法以 {} 开始表达式", self.describe(&other)),
             }),
         }
+    }
+
+    /// `(` 起始：元组字面量 `(1, "a")` / `(x: 1, y: 2)`，或分组表达式 `(expr)`。
+    ///
+    /// 判定规则：解析第一个字段后遇逗号 → 元组字面量；否则是分组表达式。
+    /// 空元组 `()` 不支持（C# 风格：无空元组）。
+    fn parse_paren_or_tuple(&mut self, span: Span) -> Result<Expr, ParseError> {
+        self.expect(TokenKind::LParen, "'('")?;
+        // 空元组 `()`：不支持
+        if self.eat(&TokenKind::RParen) {
+            return Err(ParseError {
+                span,
+                message: "空元组 () 不支持".into(),
+            });
+        }
+        // 第一个字段
+        let first = self.parse_tuple_field()?;
+        // 遇逗号 → 元组字面量（含后续字段）
+        if self.eat(&TokenKind::Comma) {
+            let mut fields = Vec::new();
+            fields.push(first);
+            loop {
+                fields.push(self.parse_tuple_field()?);
+                if self.eat(&TokenKind::Comma) {
+                    continue;
+                }
+                self.expect(TokenKind::RParen, "')'")?;
+                break;
+            }
+            return Ok(Expr::TupleLit { fields, span });
+        }
+        // 无逗号 → 分组表达式 `(expr)`。命名字段不允许出现在分组里（`(x: 1)` 是元组）。
+        self.expect(TokenKind::RParen, "')'")?;
+        if first.0.is_some() {
+            return Err(ParseError {
+                span,
+                message: "命名字段必须作为元组元素（如 (x: 1, y: 2)），单个 (x: 1) 不是合法表达式".into(),
+            });
+        }
+        Ok(first.1)
+    }
+
+    /// 元组字段：`name: expr`（命名字段）或 `expr`（匿名）。
+    fn parse_tuple_field(&mut self) -> Result<(Option<String>, Expr), ParseError> {
+        // 命名字段探测：标识符后紧跟冒号
+        if let TokenKind::Ident(name) = self.peek_kind()
+            && self.tokens.get(self.pos + 1).map(|t| &t.kind) == Some(&TokenKind::Colon)
+        {
+            let name = name.clone();
+            self.advance();
+            self.expect(TokenKind::Colon, "':'")?;
+            let value = self.parse_expr()?;
+            return Ok((Some(name), value));
+        }
+        let value = self.parse_expr()?;
+        Ok((None, value))
     }
 
     /// 表字面量 `[col, col; row, row]`。
@@ -685,7 +876,10 @@ fn expr_span(expr: &Expr) -> Option<Span> {
         | Expr::Unary { span, .. }
         | Expr::Binary { span, .. }
         | Expr::Range { span, .. }
-        | Expr::TableLit { span, .. } => Some(*span),
+        | Expr::TableLit { span, .. }
+        | Expr::Index { span, .. }
+        | Expr::TupleLit { span, .. }
+        | Expr::TupleField { span, .. } => Some(*span),
         _ => None,
     }
 }

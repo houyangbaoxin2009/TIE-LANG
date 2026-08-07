@@ -5,11 +5,25 @@
 
 use super::lexer::{Span, TyKw};
 
-/// 类型标注：基本类型关键字（复合类型语法后续版本扩展）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 类型标注：基本类型关键字或元组类型。
+///
+/// 注意：元组字段（[TupleField]）内联在类型里而非用「标记 + 元数据表」——
+/// 元组需要结构比较（types_match）、出现在类型标注（无表达式地址可做键）、
+/// 进入函数签名并支持嵌套，这些场景都必须内联携带字段类型。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeSpec {
     /// 显式标注的基本类型（i8..u64/f32/f64/bool/char/string/void/code）
     Named(TyKw),
+    /// 元组类型 `(T1, T2)` / `(x: T1, y: T2)`（元素 ≥1，字段名可空）
+    Tuple(Vec<TupleField>),
+}
+
+/// 元组的一个字段：可选字段名 + 类型（名字进类型，供 `.x` 命名访问）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TupleField {
+    /// 字段名（`(x: i64)` 的 `x`）；`None` 表示位置字段（`(i64, string)`）
+    pub name: Option<String>,
+    pub ty: TypeSpec,
 }
 
 impl TypeSpec {
@@ -25,6 +39,9 @@ impl TypeSpec {
     /// 注意：`code`、`num`/`text`/`misc`、`table` 不在此映射中——
     /// 它们都是编译期概念，语义分析阶段会被展开/校验后转化为具体类型，
     /// 不应出现在 IR 生成阶段。
+    ///
+    /// 元组（Tuple）也不在此映射：元组映射为字面结构体类型 `{i64, ptr}`，
+    /// 需要泄漏 + 去重缓存，由 IR 生成器的 llvm_ty 包装函数处理。
     pub fn llvm_ty(&self) -> &'static str {
         match self {
             TypeSpec::Named(TyKw::I8) | TypeSpec::Named(TyKw::U8) => "i8",
@@ -42,6 +59,9 @@ impl TypeSpec {
                 unreachable!(
                     "code/num/text/misc/table 是编译期类型，语义分析阶段应已展开为具体类型"
                 )
+            }
+            TypeSpec::Tuple(_) => {
+                unreachable!("元组类型映射为字面结构体，需由 IR 生成器的 llvm_ty 包装处理（含泄漏与缓存）")
             }
         }
     }
@@ -81,7 +101,7 @@ impl TypeSpec {
     /// - num：接受全部数类型（整数/浮点）
     /// - text：接受字符串与字符
     /// - misc：接受其余类型（bool/void/code/table）
-    pub fn wide_accepts(&self, actual: TypeSpec) -> bool {
+    pub fn wide_accepts(&self, actual: &TypeSpec) -> bool {
         match self {
             TypeSpec::Named(TyKw::Num) => actual.is_number(),
             TypeSpec::Named(TyKw::Text) => {
@@ -267,6 +287,10 @@ pub enum Expr {
     TableLit { cells: Vec<TableCell>, span: Span },
     /// 下标访问 `arr[0]`（表/数组元素读取）
     Index { base: Box<Expr>, index: Box<Expr>, span: Span },
+    /// 元组字面量 `(1, "a")` / `(x: 1, y: 2)`（C# 风格；元素 ≥1）
+    TupleLit { fields: Vec<(Option<String>, Expr)>, span: Span },
+    /// 元组字段访问 `t.Item1` / `t.x` / `t.0`（access 存 "ItemN" / 名字 / 数字下标文本）
+    TupleField { base: Box<Expr>, access: String, span: Span },
 }
 
 /// 表单元格：`value` 或 `id:value`（id 可选，可为数字下标或带引号字符串键）。

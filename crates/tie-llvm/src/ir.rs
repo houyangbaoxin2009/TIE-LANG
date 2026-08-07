@@ -56,6 +56,8 @@ struct IrGenerator<'p> {
     str_count: u32,
     /// 格式串缓存：格式串 → 全局常量名
     fmt_cache: HashMap<String, String>,
+    /// 元组聚合类型缓存：类型文本 → 泄漏的 'static 类型名（去重，避免重复泄漏）
+    ty_cache: HashMap<String, &'static str>,
     /// 当前所在函数
     cur_fn: String,
 }
@@ -71,6 +73,7 @@ pub fn gen_ir(program: &Program, sem: &SemanticResult) -> Result<IrOutput, IrErr
         scopes: Vec::new(),
         str_count: 0,
         fmt_cache: HashMap::new(),
+        ty_cache: HashMap::new(),
         cur_fn: String::new(),
     };
     generator.run()?;
@@ -106,8 +109,8 @@ impl<'p> IrGenerator<'p> {
                 Stmt::FnDef(f) => Some((
                     f.name.clone(),
                     FuncSig {
-                        param_tys: f.params.iter().map(|p| p.ty).collect(),
-                        ret_ty: f.ret_ty,
+                        param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
+                        ret_ty: f.ret_ty.clone(),
                     },
                 )),
                 _ => None,
@@ -135,10 +138,10 @@ impl<'p> IrGenerator<'p> {
         self.scopes.clear();
 
         // 签名行
-        let ret_llvm = self.llvm_ty(f.ret_ty);
+        let ret_llvm = self.llvm_ty(&f.ret_ty);
         let mut params = Vec::new();
         for p in &f.params {
-            params.push(format!("{} {}", self.llvm_ty(p.ty), mangle(&p.name)));
+            params.push(format!("{} {}", self.llvm_ty(&p.ty), mangle(&p.name)));
         }
         self.out.push_str(&format!(
             "define {} @{}({}) {{\n",
@@ -153,7 +156,7 @@ impl<'p> IrGenerator<'p> {
         // 参数入作用域：alloca + store
         let mut scope = HashMap::new();
         for p in &f.params {
-            let ty = self.llvm_ty(p.ty);
+            let ty = self.llvm_ty(&p.ty);
             let pname = mangle(&p.name);
             let alloca = self.new_reg();
             self.line(&format!("{alloca} = alloca {ty}"));
@@ -183,7 +186,7 @@ impl<'p> IrGenerator<'p> {
             } else {
                 // 非 void 且缺 return：语义已拦截，这里兜底返回。
                 // 注意 ptr（string）类型不能用整数 0，必须用 null。
-                let ty = self.llvm_ty(f.ret_ty);
+                let ty = self.llvm_ty(&f.ret_ty);
                 let zero = if ty == "ptr" { "null" } else { "0" };
                 self.line(&format!("ret {ty} {zero}"));
             }
@@ -203,12 +206,12 @@ impl<'p> IrGenerator<'p> {
             Stmt::VarDecl(v) => {
                 // 表变量：直接生成定长数组布局（alloca [N x T] + 逐元素 store），
                 // 长度与元素类型来自语义层 tables 元数据（键 = init 表达式地址）。
-                if v.ty.map(|t| t.is_table()).unwrap_or(false) {
+                if v.ty.as_ref().map(|t| t.is_table()).unwrap_or(false) {
                     return self.gen_table_var(v);
                 }
                 let (val, ty) = self.gen_expr(&v.init)?;
                 // 声明类型以语义为准
-                let ty_name = match v.ty {
+                let ty_name = match &v.ty {
                     // 宽类型（num/text/misc）是编译期概念，语义分析阶段
                     // 已把具体推导类型记录在 expr_types 表中（键为 init 表达式地址），
                     // IR 阶段按地址取回具体类型，避免直接对宽类型调用 llvm_ty。
@@ -218,9 +221,9 @@ impl<'p> IrGenerator<'p> {
                             .sem
                             .expr_types
                             .get(&key)
-                            .copied()
+                            .cloned()
                             .unwrap_or(TypeSpec::Named(TyKw::I64));
-                        self.llvm_ty(concrete)
+                        self.llvm_ty(&concrete)
                     }
                     Some(t) => self.llvm_ty(t),
                     None => ty,
@@ -257,9 +260,9 @@ impl<'p> IrGenerator<'p> {
                         .sem
                         .funcs
                         .get(&self.cur_fn)
-                        .map(|s| s.ret_ty)
+                        .map(|s| s.ret_ty.clone())
                         .unwrap_or(TypeSpec::Named(TyKw::I64));
-                    let ret_llvm = self.llvm_ty(ret_ty);
+                    let ret_llvm = self.llvm_ty(&ret_ty);
                     // 非字面量场景语义已保证类型一致；字面量直接按签名类型写出常量
                     self.line(&format!("ret {ret_llvm} {val}"));
                     Ok(())
@@ -290,11 +293,11 @@ impl<'p> IrGenerator<'p> {
             .sem
             .tables
             .get(&key)
-            .copied()
+            .cloned()
             .ok_or_else(|| IrError {
                 message: format!("内部错误：表变量 '{}' 缺少布局元数据", v.name),
             })?;
-        let elem_llvm = self.llvm_ty(info.elem_ty);
+        let elem_llvm = self.llvm_ty(&info.elem_ty);
         let arr_ty = format!("[{} x {}]", info.len, elem_llvm);
         let alloca = self.new_reg();
         self.line(&format!("{alloca} = alloca {arr_ty}"));
@@ -711,6 +714,49 @@ impl<'p> IrGenerator<'p> {
                 message: "表字面量只能用于表变量声明（var x: table = [...]）".into(),
             }),
             Expr::Index { base, index, .. } => self.gen_index(base, index),
+            Expr::TupleLit { fields, .. } => {
+                // 元组字面量 → 逐字段 insertvalue 构造聚合值。
+                // 聚合类型与字段类型以语义结果为准（含标注适配后的精确类型）。
+                let tuple_ty = self.sem_ty_of(expr).ok_or_else(|| IrError {
+                    message: format!("内部错误：元组字面量缺少语义类型（函数 {}）", self.cur_fn),
+                })?;
+                let TypeSpec::Tuple(tfs) = &tuple_ty else {
+                    return Err(IrError {
+                        message: format!("内部错误：元组字面量语义类型不是元组（函数 {}）", self.cur_fn),
+                    });
+                };
+                let agg_ty = self.llvm_ty(&tuple_ty);
+                // insertvalue 链：undef 起始，逐字段插入
+                let mut cur = "undef".to_string();
+                for (i, ((_name, e), tf)) in fields.iter().zip(tfs.iter()).enumerate() {
+                    let (v, _t) = self.gen_expr(e)?;
+                    let ft = self.llvm_ty(&tf.ty);
+                    let tmp = self.new_reg();
+                    self.line(&format!("{tmp} = insertvalue {agg_ty} {cur}, {ft} {v}, {i}"));
+                    cur = tmp;
+                }
+                Ok((cur, agg_ty))
+            }
+            Expr::TupleField { base, access, .. } => {
+                // 元组字段访问 → extractvalue（聚合类型的第 idx 字段）
+                let (bv, _bt) = self.gen_expr(base)?;
+                let base_ty = self.sem_ty_of(base).ok_or_else(|| IrError {
+                    message: format!("内部错误：元组字段访问缺少基类型（函数 {}）", self.cur_fn),
+                })?;
+                let TypeSpec::Tuple(tfs) = &base_ty else {
+                    return Err(IrError {
+                        message: format!("内部错误：字段访问的对象不是元组（函数 {}）", self.cur_fn),
+                    });
+                };
+                let idx = tuple_field_index(&base_ty, access).ok_or_else(|| IrError {
+                    message: format!("内部错误：元组字段 '{access}' 解析失败（函数 {}）", self.cur_fn),
+                })?;
+                let agg_ty = self.llvm_ty(&base_ty);
+                let ft = self.llvm_ty(&tfs[idx].ty);
+                let tmp = self.new_reg();
+                self.line(&format!("{tmp} = extractvalue {agg_ty} {bv}, {idx}"));
+                Ok((tmp, ft))
+            }
         }
     }
 
@@ -971,10 +1017,10 @@ impl<'p> IrGenerator<'p> {
         // 而字面量 gen_expr 返回 i64，需要按签名类型生成
         for (a, want_ty) in args.iter().zip(sig.param_tys.iter()) {
             let (v, _t) = self.gen_expr(a)?;
-            let aty = self.llvm_ty(*want_ty);
+            let aty = self.llvm_ty(want_ty);
             arg_list.push(format!("{aty} {v}"));
         }
-        let ret_llvm = self.llvm_ty(sig.ret_ty);
+        let ret_llvm = self.llvm_ty(&sig.ret_ty);
         let tmp = self.new_reg();
         if sig.ret_ty.is_void() {
             self.line(&format!("call void @{}({})", name, arg_list.join(", ")));
@@ -1057,7 +1103,7 @@ impl<'p> IrGenerator<'p> {
 
     /// 查询表达式的语义类型（区分有符号/无符号；LLVM 类型名无法区分 u32/i32）。
     fn sem_ty_of(&self, e: &Expr) -> Option<TypeSpec> {
-        self.sem.expr_types.get(&(e as *const Expr as usize)).copied()
+        self.sem.expr_types.get(&(e as *const Expr as usize)).cloned()
     }
 
     /// 将整数统一扩展到 i64（for 循环变量固定为 i64；按符号性 sext/zext）。
@@ -1151,8 +1197,25 @@ impl<'p> IrGenerator<'p> {
     }
 
     /// TypeSpec → LLVM 类型名。
-    fn llvm_ty(&self, t: TypeSpec) -> &'static str {
-        t.llvm_ty()
+    ///
+    /// 元组类型映射为 LLVM 字面结构体 `{T1, T2, ...}`：递归拼接字段类型文本，
+    /// 动态分配后 Box::leak 获得 'static 生命周期，并用 ty_cache 去重
+    /// （同一形状的元组只泄漏一份，编译器进程短期运行可接受）。
+    fn llvm_ty(&mut self, t: &TypeSpec) -> &'static str {
+        match t {
+            TypeSpec::Named(_) => t.llvm_ty(),
+            TypeSpec::Tuple(fields) => {
+                let inner: Vec<&str> = fields.iter().map(|f| self.llvm_ty(&f.ty)).collect();
+                let text = format!("{{{}}}", inner.join(", "));
+                if let Some(s) = self.ty_cache.get(&text) {
+                    return s;
+                }
+                // 先缓存再泄漏：text 作为缓存键与泄漏的 'static 字符串共用一份堆内存
+                let leaked: &'static str = Box::leak(text.into_boxed_str());
+                self.ty_cache.insert(leaked.to_string(), leaked);
+                leaked
+            }
+        }
     }
 
     /// 字符串全局常量（去重）。
@@ -1185,6 +1248,33 @@ impl<'p> IrGenerator<'p> {
 }
 
 // ---------- 模块级工具 ----------
+
+/// 解析元组字段访问 `access`，返回字段下标（与前端语义层同规则）。
+///
+/// 支持三种形式：
+/// - 命名：`.x` / `.q`（按字段名查找）；
+/// - 位置：`.Item1`、`.Item2` …（1 起编号）；
+/// - 数字：`.0`、`.1` …（0 起编号）。
+///
+/// 找不到返回 None（语义层已保证合法，此处仅内部防御）。
+fn tuple_field_index(tuple_ty: &TypeSpec, access: &str) -> Option<usize> {
+    let TypeSpec::Tuple(fields) = tuple_ty else {
+        return None;
+    };
+    // 数字下标：`.0` 起
+    if let Ok(i) = access.parse::<usize>() {
+        return (i < fields.len()).then_some(i);
+    }
+    // ItemN：1 起编号
+    if let Some(n) = access.strip_prefix("Item")
+        && let Ok(i) = n.parse::<usize>()
+    {
+        let zero = i.checked_sub(1)?;
+        return (zero < fields.len()).then_some(zero);
+    }
+    // 字段名
+    fields.iter().position(|f| f.name.as_deref() == Some(access))
+}
 
 /// 变量名 mangling：防止与 LLVM 保留名冲突（当前原样 + 前缀）。
 fn mangle(name: &str) -> String {
