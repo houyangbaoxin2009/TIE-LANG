@@ -19,6 +19,11 @@ use std::collections::HashMap;
 pub struct IrOutput {
     /// LLVM IR 文本
     pub ir: String,
+    /// 用到的 tie-interp 库导出符号（read_line/eval 等 REPL 内置函数）。
+    ///
+    /// driver 链接阶段据此**按需**链接 tie-interp 静态库：
+    /// 非空才链接（普通程序不依赖 interp 库），空则不链接。
+    pub used_externs: Vec<String>,
 }
 
 /// IR 生成错误（一般来自语义结果的缺失，正常情况不应触发）。
@@ -63,6 +68,8 @@ struct IrGenerator<'p> {
     fmt_cache: HashMap<String, String>,
     /// 元组聚合类型缓存：类型文本 → 泄漏的 'static 类型名（去重，避免重复泄漏）
     ty_cache: HashMap<String, &'static str>,
+    /// 用到的 tie-interp 库导出符号（去重收集；link 阶段按需链接）
+    used_externs: Vec<String>,
     /// 当前所在函数
     cur_fn: String,
 }
@@ -79,10 +86,11 @@ pub fn gen_ir(program: &Program, sem: &SemanticResult) -> Result<IrOutput, IrErr
         str_count: 0,
         fmt_cache: HashMap::new(),
         ty_cache: HashMap::new(),
+        used_externs: Vec::new(),
         cur_fn: String::new(),
     };
     generator.run()?;
-    Ok(IrOutput { ir: generator.out })
+    Ok(IrOutput { ir: generator.out, used_externs: generator.used_externs })
 }
 
 impl<'p> IrGenerator<'p> {
@@ -92,7 +100,7 @@ impl<'p> IrGenerator<'p> {
         // 模块头
         self.out.push_str("; ModuleID = 'tie'\n");
         self.out.push_str("source_filename = \"input.tie\"\n\n");
-        // printf 声明（println 依赖）
+        // printf 声明（println/print 依赖）
         self.out.push_str("declare i32 @printf(ptr, ...)\n\n");
         // 字符串运行时依赖（拼接/比较/长度）：
         // - strlen：字符串长度（len() 内置函数）
@@ -142,6 +150,19 @@ impl<'p> IrGenerator<'p> {
         // 函数体生成过程中延迟收集的全局常量，统一输出到模块级
         self.out.push('\n');
         self.out.push_str(&self.globals);
+
+        // tie-interp 库导出符号声明：仅在用到 read_line/eval 时输出（按需）。
+        // 符号与 crates/tie-interp/src/lib.rs 的 #[unsafe(no_mangle)] 导出一一对应。
+        if self.used_externs.iter().any(|s| s == "tie_read_line") {
+            self.out
+                .push_str("declare ptr @tie_read_line()\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_eval_expr") {
+            self.out.push_str("declare ptr @tie_eval_expr(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_free_result") {
+            self.out.push_str("declare void @tie_free_result(ptr)\n");
+        }
         Ok(())
     }
 
@@ -330,7 +351,18 @@ impl<'p> IrGenerator<'p> {
             }
             Stmt::FnDef(_) => Ok(()), // 顶层函数，不在此生成
             Stmt::Expr(e) => {
-                self.gen_expr(&e.expr)?;
+                let (v, _ty) = self.gen_expr(&e.expr)?;
+                // REPL 内置作为独立语句（结果丢弃）：read_line()/eval() 返回
+                // tie-interp 堆串，立即释放避免累积泄漏。
+                // 注意：仅处理顶层调用；作为变量初值/参数时 v1 接受会话级小泄漏
+                // （REPL 短期会话，量级可忽略）。
+                if matches!(
+                    &e.expr,
+                    Expr::Call { name, .. } if name == "read_line" || name == "eval"
+                ) {
+                    self.mark_used("tie_free_result");
+                    self.line(&format!("call void @tie_free_result(ptr {v})"));
+                }
                 Ok(())
             }
             Stmt::Assign(a) => {
@@ -1179,10 +1211,14 @@ impl<'p> IrGenerator<'p> {
         Ok((res, "i1"))
     }
 
-    /// 函数调用生成：内置 println/len → printf/strlen；用户函数 → call。
+    /// 函数调用生成：内置 println/print/len/read_line/eval → printf/strlen/interp 库；
+    /// 用户函数 → call。
     fn gen_call(&mut self, name: &str, args: &[Expr]) -> Result<(String, &'static str), IrError> {
         if name == "println" {
-            return self.gen_println(args);
+            return self.gen_printf(args, true);
+        }
+        if name == "print" {
+            return self.gen_printf(args, false);
         }
         // 内置 len：字符串长度（语义已保证单字符串参数）
         if name == "len" {
@@ -1190,6 +1226,25 @@ impl<'p> IrGenerator<'p> {
             let len = self.new_reg();
             self.line(&format!("{len} = call i64 @strlen(ptr {v})"));
             return Ok((len, "i64"));
+        }
+        // 内置 read_line：零参数，调用 tie-interp 库读一行（REPL 自举）。
+        // 语义层已保证无参数；返回值是 tie-interp 分配的堆串，调用方用完必须
+        // tie_free_result 释放（repl 场景在 gen_stmt 的 Expr 分支统一释放）。
+        if name == "read_line" {
+            self.mark_used("tie_read_line");
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_read_line()"));
+            return Ok((tmp, "ptr"));
+        }
+        // 内置 eval：单字符串参数，调用 tie-interp 库动态求值代码（REPL 自举）。
+        // 语义层已保证恰好 1 个字符串参数；返回值同上为堆串（调用方负责释放）。
+        if name == "eval" {
+            self.mark_used("tie_eval_expr");
+            self.mark_used("tie_free_result");
+            let (v, _t) = self.gen_expr(&args[0])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_eval_expr(ptr {v})"));
+            return Ok((tmp, "ptr"));
         }
         // 用户函数调用
         let sig = self
@@ -1434,12 +1489,17 @@ impl<'p> IrGenerator<'p> {
         }
     }
 
-    /// println 生成：按参数类型选 printf 格式串。
-    fn gen_println(&mut self, args: &[Expr]) -> Result<(String, &'static str), IrError> {
+    /// println/print 生成：按参数类型选 printf 格式串。
+    ///
+    /// `newline` 为 true 时格式串末尾追加 `\n`（println），否则不换行（print）。
+    fn gen_printf(&mut self, args: &[Expr], newline: bool) -> Result<(String, &'static str), IrError> {
+        let nl = if newline { "\n" } else { "" };
         if args.is_empty() {
-            // 空 println → 只换行
-            let fmt = self.fmt_global("\n");
-            self.line(&format!("call i32 (ptr, ...) @printf(ptr @{fmt})"));
+            // 空 println → 只换行；空 print → 无操作
+            if newline {
+                let fmt = self.fmt_global("\n");
+                self.line(&format!("call i32 (ptr, ...) @printf(ptr @{fmt})"));
+            }
             return Ok((self.new_reg(), "void"));
         }
         let (v, t) = self.gen_expr(&args[0])?;
@@ -1450,54 +1510,54 @@ impl<'p> IrGenerator<'p> {
             Some(TypeSpec::Named(TyKw::U8 | TyKw::U16 | TyKw::U32 | TyKw::U64))
         );
         let is_char = matches!(sem, Some(TypeSpec::Named(TyKw::Char)));
-        // 按类型选 (格式串, 传参类型, 传参值)
+        // 按类型选 (格式串, 传参类型, 传参值)；格式串统一追加换行/不换行后缀
         let (fmt, arg_ty, arg): (&str, &str, String) = match t {
-            "double" => ("%f\n", "double", v),
+            "double" => ("%f", "double", v),
             // f32 → f64（printf 变参提升规则），%f
             "float" => {
                 let ext = self.new_reg();
                 self.line(&format!("{ext} = fpext float {v} to double"));
-                ("%f\n", "double", ext)
+                ("%f", "double", ext)
             }
             // 字符串：直接打印内容
-            "ptr" => ("%s\n", "ptr", v),
+            "ptr" => ("%s", "ptr", v),
             "i1" => {
                 // bool 直接打印 0/1（v0.1 简化，后续版本转 true/false 文本）
                 let ext = self.new_reg();
                 self.line(&format!("{ext} = zext i1 {v} to i64"));
-                ("%lld\n", "i64", ext)
+                ("%lld", "i64", ext)
             }
             // 窄整数（i8/i16）：提升到 i32 后按符号性选 %d/%u
             "i8" | "i16" => {
                 let ext = self.new_reg();
                 if is_unsigned {
                     self.line(&format!("{ext} = zext {t} {v} to i32"));
-                    ("%u\n", "i32", ext)
+                    ("%u", "i32", ext)
                 } else {
                     self.line(&format!("{ext} = sext {t} {v} to i32"));
-                    ("%d\n", "i32", ext)
+                    ("%d", "i32", ext)
                 }
             }
             // char → %c；i32 按符号性 %d/%u
-            "i32" if is_char => ("%c\n", "i32", v),
+            "i32" if is_char => ("%c", "i32", v),
             "i32" => {
                 if is_unsigned {
-                    ("%u\n", "i32", v)
+                    ("%u", "i32", v)
                 } else {
-                    ("%d\n", "i32", v)
+                    ("%d", "i32", v)
                 }
             }
             // i64/u64：%lld/%llu
             "i64" => {
                 if is_unsigned {
-                    ("%llu\n", "i64", v)
+                    ("%llu", "i64", v)
                 } else {
-                    ("%lld\n", "i64", v)
+                    ("%lld", "i64", v)
                 }
             }
-            _ => ("%lld\n", "i64", v),
+            _ => ("%lld", "i64", v),
         };
-        let g = self.fmt_global(fmt);
+        let g = self.fmt_global(&format!("{fmt}{nl}"));
         self.line(&format!("call i32 (ptr, ...) @printf(ptr @{g}, {arg_ty} {arg})"));
         Ok((self.new_reg(), "void"))
     }
@@ -1673,6 +1733,13 @@ impl<'p> IrGenerator<'p> {
         }
     }
 
+    /// 记录用到的 tie-interp 库导出符号（去重；link 阶段按需链接静态库）。
+    fn mark_used(&mut self, symbol: &str) {
+        if !self.used_externs.contains(&symbol.to_string()) {
+            self.used_externs.push(symbol.to_string());
+        }
+    }
+
     /// 字符串全局常量（去重）。
     fn string_global(&mut self, s: &str) -> String {
         self.str_count += 1;
@@ -1839,7 +1906,7 @@ fn escape_ir_string(s: &str) -> (usize, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::gen_ir;
+    use super::{gen_ir, IrOutput};
     use tie_frontend::lexer::tokenize;
     use tie_frontend::parser::parse_program;
     use tie_frontend::semantic::analyze;
@@ -1852,6 +1919,14 @@ mod tests {
         let program = parse_program(&toks).expect("语法分析失败");
         let sem = analyze(&program).expect("语义分析失败");
         gen_ir(&program, &sem).expect("IR 生成失败").ir
+    }
+
+    /// 完整编译管道（返回 IrOutput：IR 文本 + used_externs）。
+    fn 编译_输出(src: &str) -> IrOutput {
+        let toks = tokenize(src).expect("词法分析失败");
+        let program = parse_program(&toks).expect("语法分析失败");
+        let sem = analyze(&program).expect("语义分析失败");
+        gen_ir(&program, &sem).expect("IR 生成失败")
     }
 
     /// 管道结果（负例用）：任一阶段失败返回 Err（含 IR 层防御性报错）。
@@ -1874,6 +1949,33 @@ mod tests {
         assert!(ir.contains("declare i32 @strcmp(ptr, ptr)"));
         assert!(ir.contains("declare ptr @malloc(i64)"));
         assert!(ir.contains("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)"));
+        // 未使用 read_line/eval 时，不应输出 interp 库声明
+        assert!(!ir.contains("tie_read_line"));
+        assert!(!ir.contains("tie_eval_expr"));
+    }
+
+    #[test]
+    fn repl内置函数生成interp调用与声明() {
+        // read_line：调用 tie_read_line，收集 used_externs
+        let out = 编译_输出("func main() {\n    var line = read_line()\n    println(line)\n}");
+        assert!(out.ir.contains("call ptr @tie_read_line()"));
+        assert!(out.ir.contains("declare ptr @tie_read_line()"));
+        assert!(out.used_externs.contains(&"tie_read_line".to_string()));
+        // eval：调用 tie_eval_expr + tie_free_result（作为独立语句时释放堆串）
+        let out2 = 编译_输出("func main() {\n    var r = eval(\"1 + 2\")\n    println(r)\n}");
+        assert!(out2.ir.contains("call ptr @tie_eval_expr(ptr "));
+        assert!(out2.ir.contains("declare ptr @tie_eval_expr(ptr)"));
+        assert!(out2.used_externs.contains(&"tie_eval_expr".to_string()));
+        // 独立语句形式的 eval()：结果丢弃，生成 free
+        let out3 = 编译_输出("func main() {\n    eval(\"var x = 1\")\n}");
+        assert!(out3.ir.contains("call void @tie_free_result(ptr %"));
+        assert!(out3.used_externs.contains(&"tie_free_result".to_string()));
+        // print：不换行（格式串末尾无 \n）
+        let out4 = 编译_输出("func main() {\n    print(42)\n}");
+        assert!(out4.ir.contains("@printf(ptr @.str."));
+        // 普通程序：used_externs 为空（不链接 interp 库）
+        let out5 = 编译_输出("func main() {\n    println(1)\n}");
+        assert!(out5.used_externs.is_empty());
     }
 
     #[test]

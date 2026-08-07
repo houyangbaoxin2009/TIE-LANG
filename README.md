@@ -60,7 +60,7 @@ x 大于 y
 ```
 tie <input.tie> [-o output] [-O0|-O1|-O2|-O3] [--target <三元组>] [--emit-ir] [--keep-ir] [--prep-only]
 tie --lsp        # 语言服务器模式（LSP over stdio，供编辑器接入）
-tie             # 无参数 → 进入 REPL 交互模式（tie-interp 解释执行）
+tie             # 无参数 → 进入 REPL 交互模式（启动 tie 语言自写的 repl.exe，自举）
 ```
 
 | 选项 | 说明 |
@@ -91,6 +91,16 @@ tie examples/lib_math.tie          # → examples/lib_math.a（经 clang -c 生�
 - `tie-llvm <file.tie>` —— 直接编译（不经过角色分派）
 - `tie-interp <file.tie>` —— 直接解释执行
 
+REPL 自举：REPL 外壳 `repl/repl.tie` 用 tie 语言自身编写（`print` + `read_line` + `eval`），
+经 tie-llvm 编译并链接 tie-interp 静态库（C ABI 桥）生成 `repl.exe`。构建：
+
+```bash
+cargo build --release -p tie-interp          # 产出 target/release/tie_interp.lib
+target/release/tie-llvm.exe repl/repl.tie    # 链接 interp 库生成 repl/repl.exe
+```
+
+`tie` 无参数时按 `TIE_REPL_EXE` → tie.exe 同目录 → 当前目录查找 repl.exe。
+
 ## 工程结构
 
 ```text
@@ -100,8 +110,9 @@ tie/
 │   ├── tie-frontend/  前端：词法（含 ASI）→ 语法 → 语义（符号表/类型检查），自研；独立 CLI 可调试
 │   ├── tie-llvm/      中端+后端驱动：AST → LLVM IR 文本生成；调用 opt/clang/lld
 │   ├── tie-lsp/       语言服务器：JSON-RPC 2.0 over stdio，复用前端三阶段提供诊断与 hover
-│   ├── tie-interp/    解释执行（占位，REPL 用）
-│   └── tie/           CLI 主入口：角色分派调度器 + REPL
+│   ├── tie-interp/    解释执行：树遍历求值 AST + C ABI 桥（staticlib），REPL 自举核心
+│   └── tie/           CLI 主入口：角色分派调度器 + REPL（启动 repl.exe）
+├── repl/repl.tie     REPL 外壳（tie 语言自写，自举；编译链接 tie-interp 静态库）
 ├── docs/language.md   语法规范
 ├── examples/          示例程序（hello / wide / table / tuple / oop / 负例 oop_neg_* 等）
 └── Cargo.toml         workspace（统一 edition/lints/release 配置）

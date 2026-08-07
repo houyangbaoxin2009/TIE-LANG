@@ -1,0 +1,26 @@
+// tie:logic
+// tie:opt=2
+
+// tie 语言自写的 REPL 外壳（自举）：
+// - 与编译路径（tie-llvm）共享前端，经 clang 链接 tie-interp 静态库（C ABI 桥）；
+// - 内建函数 read_line（读一行）/ eval（动态求值代码）由 tie-interp 库提供；
+// - 无限循环 + EOF 时 tie_read_line 内部 exit(0)（与 Rust 版 repl 行为一致）。
+
+func main() -> i64 {
+    println("tie REPL（输入 :quit 退出）")
+    while true {
+        // 提示符不换行（print 内建；Windows 控制台缓冲由 tie_read_line 内部刷新）
+        print("> ")
+        var line = read_line()
+        if line == ":quit" {
+            return 0
+        }
+        // 空行直接跳过；其余交给解释器求值，非空结果打印
+        if line != "" {
+            var result = eval(line)
+            if result != "" {
+                println(result)
+            }
+        }
+    }
+}

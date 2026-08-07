@@ -36,17 +36,34 @@ impl std::fmt::Display for BackendError {
     }
 }
 
-/// 链接生成可执行文件：`clang [--target=T] input.ll -o output`。
+/// 链接生成可执行文件：`clang [--target=T] input.ll [附加静态库] -o output`。
 ///
 /// clang 会自行完成：IR → 汇编 → 目标文件 → 链接（链接 CRT 与系统库）。
 /// `target` 为 `Some(三元组)` 时交叉编译（如 `x86_64-pc-windows-msvc`）。
-pub fn link(input: &Path, output: &Path, target: Option<&str>) -> Result<(), BackendError> {
+/// `extra_libs` 为附加静态库（如 tie-interp 的 .lib）——REPL 自举用；
+/// 附带补 Rust std 依赖的 Windows 系统库（链接 Rust staticlib 必需）。
+pub fn link(
+    input: &Path,
+    output: &Path,
+    target: Option<&str>,
+    extra_libs: &[std::path::PathBuf],
+) -> Result<(), BackendError> {
     let clang = find_clang().ok_or(BackendError::NotFound)?;
     let mut cmd = Command::new(&clang);
     cmd.arg(input).arg("-o").arg(output);
     // 交叉编译：clang 按目标三元组选择后端与系统库
     if let Some(t) = target {
         cmd.arg(format!("--target={t}"));
+    }
+    // 附加静态库（tie-interp .lib）与 Rust std 的 Windows 系统库依赖：
+    // 静态库内的 std 代码引用了 ws2_32/userenv/ntdll/bcrypt 等系统 API，
+    // clang 链接时需显式给出（Rust 的 rustc 会自动带上，clang 不会）。
+    for lib in extra_libs {
+        cmd.arg(lib);
+    }
+    if !extra_libs.is_empty() {
+        cmd.arg("-lws2_32").arg("-luserenv").arg("-lntdll").arg("-lbcrypt");
+        cmd.arg("-ladvapi32").arg("-lole32").arg("-lshell32");
     }
     let out = cmd.output();
     match out {

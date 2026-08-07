@@ -15,7 +15,6 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tie_prep::preprocess::FileRole;
@@ -73,34 +72,61 @@ tie 语言总入口（四段式调度器 + REPL）
 
 /// REPL 交互模式入口。
 ///
-/// 逐行读取输入并交给解释器执行。当前依赖 tie-interp 占位实现，
-/// 后续版本支持多行语句、历史记录与表达式求值。
+/// 启动 tie 语言自写的 REPL 外壳 `repl.exe`（自举：外壳本身用 tie 语言编写，
+/// 经 tie-llvm 编译并链接 tie-interp 静态库）。查找顺序：
+/// 1. 环境变量 `TIE_REPL_EXE`（显式指定）；
+/// 2. 当前可执行文件（tie.exe）所在目录的 repl.exe（发布部署常见布局）；
+/// 3. 当前工作目录的 repl.exe（开发期：cargo run -p tie 时在 workspace 根）。
+/// 找不到时给出构建提示（repl/repl.tie 编译产物）。
 fn repl() -> ExitCode {
-    println!("tie REPL（输入 :quit 退出）");
-    let stdin = io::stdin();
-    loop {
-        print!("> ");
-        let _ = io::stdout().flush();
-        let mut line = String::new();
-        match stdin.read_line(&mut line) {
-            Ok(0) => return ExitCode::SUCCESS, // EOF（Ctrl+Z / Ctrl+D）
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("读取输入失败: {e}");
-                return ExitCode::FAILURE;
+    let exe = find_repl_exe();
+    let Some(exe) = exe else {
+        eprintln!(
+            "未找到 REPL 外壳 repl.exe。请先构建（自举）:\n\
+             1. cargo build --release -p tie-interp\n\
+             2. target\\release\\tie-llvm.exe repl\\repl.tie\n\
+             3. 将 repl\\repl.exe 放到当前目录或 tie.exe 同目录\n\
+             （或用环境变量 TIE_REPL_EXE 指定路径）"
+        );
+        return ExitCode::FAILURE;
+    };
+    // 子进程接管 stdio：REPL 交互（stdin 输入 + stdout 输出）原样透传
+    match std::process::Command::new(&exe).status() {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Err(e) => {
+            eprintln!("启动 REPL 失败: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// 查找 REPL 外壳可执行文件（env → exe 同目录 → 当前目录）。
+fn find_repl_exe() -> Option<PathBuf> {
+    // 1. 环境变量显式指定
+    if let Some(p) = env::var_os("TIE_REPL_EXE") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    // Windows 下 repl.exe；其他平台 repl
+    let exe_name = if cfg!(target_os = "windows") { "repl.exe" } else { "repl" };
+    // 2. 当前可执行文件（tie.exe）所在目录
+    if let Ok(cur) = env::current_exe() {
+        if let Some(dir) = cur.parent() {
+            let p = dir.join(exe_name);
+            if p.is_file() {
+                return Some(p);
             }
         }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line == ":quit" {
-            return ExitCode::SUCCESS;
-        }
-        // 交给解释器执行（v0.1：占位，输出确认信息）
-        let interp = tie_interp::interp_placeholder();
-        println!("{line} → {interp}");
     }
+    // 3. 当前工作目录
+    let p = PathBuf::from(exe_name);
+    if p.is_file() {
+        return Some(p);
+    }
+    None
 }
 
 fn parse_args() -> Result<Args, String> {

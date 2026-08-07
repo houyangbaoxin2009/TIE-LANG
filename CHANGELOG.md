@@ -2,6 +2,29 @@
 
 tie 语言项目的变更记录，按里程碑（M0→M4）组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [REPL] 解释执行自举 — 2026-08-07
+
+### 新增
+- `tie-interp` 解释器（完整求值器）：树遍历执行 AST，动态类型（int/float/bool/char/string/range/void）
+- 两趟解析：顶层 `func` 定义注册进持久 Session；其余代码包装为 `func main() { ... }` 执行，
+  顶层 `var` 声明落入 globals、跨行持久（REPL 连续输入 `var x=1` 后 `x+1` 的基础）
+- 控制流：if/else、while、for 范围遍历、return 传播（Flow 枚举，非错误通道）
+- 内置函数：`println`/`print`/`len`/`read_line`（读 stdin 一行，EOF 退出）/
+  `eval`（动态求值代码，递归重入安全，Session 用 thread_local RefCell 避免 Mutex 死锁）
+- C ABI 桥（`tie_eval_expr`/`tie_read_line`/`tie_free_result`）：staticlib 产物，
+  catch_unwind 包裹（panic 跨 extern "C" 是 UB）
+- **自举外壳 `repl/repl.tie`**：REPL 外壳本身用 tie 语言编写（`print("> ")` + `read_line` +
+  `eval` + 无限循环），经 tie-llvm 编译并链接 tie-interp 静态库生成 `repl.exe`；
+  `tie` 无参数时启动 repl.exe（查找：`TIE_REPL_EXE` 环境变量 → tie.exe 同目录 → 当前目录）
+- 编译路径扩展：语义层 `read_line`(→string)/`eval`(string→string)/`print` 内置签名；
+  IR 层按需声明并调用 interp 库符号，`IrOutput.used_externs` 记录用到的符号，
+  driver 据此**按需链接** tie-interp 静态库（`TIE_INTERP_LIB` 环境变量 / target 目录 / exe 同目录）；
+  跨 target 守卫：带 interp 依赖的程序交叉编译时明确报错（interp 库仅本机构建）
+- 链接补 Windows 系统库（`ws2_32`/`userenv`/`ntdll`/`bcrypt` 等，Rust staticlib 的 std 依赖）
+
+### 文档
+- README.md：REPL 自举说明与工程结构更新（tie-interp 从占位改为完整解释器）
+
 ## [LSP] 语言服务器 — 2026-08-07
 
 ### 新增

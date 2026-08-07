@@ -221,7 +221,35 @@ fn compile_program(
                 .output
                 .clone()
                 .unwrap_or_else(|| opts.input.with_extension("exe"));
-            backend::link(&opt_ir_path, &exe_path, target.as_deref())
+            // REPL 自举：程序用到 tie-interp 库导出（read_line/eval）时，
+            // 按需解析并链接 tie-interp 静态库（used_externs 非空才链接）。
+            let extra_libs = if ir_out.used_externs.is_empty() {
+                Vec::new()
+            } else {
+                // 跨 target 守卫：interp 库是本机编译产物，交叉编译到其他
+                // 平台时无法链接（架构/系统库不匹配），直接报错提示。
+                if let Some(t) = &target
+                    && t != host_target()
+                {
+                    return Err(CompileError::Backend(backend::BackendError::RunFailed(
+                        format!(
+                            "程序使用了 REPL 内置函数（read_line/eval），但目标 '{t}' 与本机 {} 不同：\
+                             tie-interp 静态库仅本机构建，暂不支持带 interp 依赖的交叉编译",
+                            host_target()
+                        ),
+                    )));
+                }
+                let lib = resolve_interp_lib().ok_or_else(|| {
+                    CompileError::Backend(backend::BackendError::RunFailed(
+                        "程序使用了 REPL 内置函数（read_line/eval），但未找到 tie-interp 静态库。\
+                         请先构建 tie-interp（cargo build -p tie-interp --release），\
+                         或设置环境变量 TIE_INTERP_LIB 指向 tie_interp.lib"
+                            .into(),
+                    ))
+                })?;
+                vec![lib]
+            };
+            backend::link(&opt_ir_path, &exe_path, target.as_deref(), &extra_libs)
                 .map_err(CompileError::Backend)?;
             cleanup_intermediates(&ir_path, &opt_ir_path, opts.keep_intermediate);
             Ok(CompileOutcome {
@@ -375,6 +403,62 @@ fn normalize_target(name: &str) -> String {
         "macos-arm64" | "darwin-arm64" => "arm64-apple-darwin".to_string(),
         other => other.to_string(),
     }
+}
+
+/// 本机目标三元组（交叉编译守卫用：interp 库仅本机构建）。
+fn host_target() -> &'static str {
+    if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        "x86_64-pc-windows-msvc"
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        "aarch64-pc-windows-msvc"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "x86_64-unknown-linux-gnu"
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        "aarch64-unknown-linux-gnu"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "x86_64-apple-darwin"
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "arm64-apple-darwin"
+    } else {
+        "unknown-target"
+    }
+}
+
+/// 解析 tie-interp 静态库路径（REPL 自举：read_line/eval 依赖）。
+///
+/// 查找顺序：
+/// 1. 环境变量 `TIE_INTERP_LIB`（显式指定，最高优先级）；
+/// 2. 本机 target/release 或 target/debug（cargo 构建产物）；
+/// 3. 当前可执行文件所在目录（发布部署时与 tie.exe 同目录）。
+fn resolve_interp_lib() -> Option<PathBuf> {
+    // 1. 环境变量显式指定
+    if let Some(p) = std::env::var_os("TIE_INTERP_LIB") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // Windows 静态库文件名 tie_interp.lib；其他平台 libtie_interp.a
+    let lib_name = if cfg!(target_os = "windows") {
+        "tie_interp.lib"
+    } else {
+        "libtie_interp.a"
+    };
+    // 2. cargo 构建产物目录（相对当前工作目录向上找 target）
+    for dir in ["target/release", "target/debug"] {
+        let p = Path::new(dir).join(lib_name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // 3. 当前可执行文件所在目录
+    if let Ok(exe) = std::env::current_exe() {
+        let p = exe.parent().map(|d| d.join(lib_name))?;
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// 头部指令文本列表（错误/消息展示用）。

@@ -815,6 +815,48 @@ impl Analyzer {
                     }
                     return Ok(TypeSpec::Named(TyKw::I64));
                 }
+                // 内置函数 print：同 println（不换行），任意参数，void
+                if name == "print" {
+                    for a in args {
+                        let at = self.infer_expr(a, scope)?;
+                        if matches!(&at, TypeSpec::Tuple(_)) {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!("print 不支持元组参数（类型 {}）", type_name(&at)),
+                            });
+                        }
+                        self.result.expr_types.insert(addr_of(a), at);
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Void));
+                }
+                // 内置函数 read_line：零参数，返回 string（REPL 自举：读 stdin 一行）
+                if name == "read_line" {
+                    if !args.is_empty() {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("read_line() 期望 0 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Str));
+                }
+                // 内置函数 eval：单参数 string，返回 string（REPL 自举：动态求值代码）
+                if name == "eval" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("eval() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("eval() 参数必须是字符串，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Str));
+                }
                 // 用户函数：校验参数个数与类型
                 let sig = self.result.funcs.get(name).cloned().ok_or_else(|| SemanticError {
                     span: *span,
@@ -1431,6 +1473,58 @@ mod tests {
             "错误消息 '{}' 应包含关键字 '{}'",
             err.message,
             keyword
+        );
+    }
+
+    #[test]
+    fn repl内置函数通过() {
+        // read_line / eval / print：REPL 自举新增的内置函数，语义检查应通过
+        let sem = analyze_src(
+            r#"
+            func main() {
+                var name = read_line()
+                println(name)
+                var r = eval("1 + 2")
+                print(r)
+            }
+            "#,
+        )
+        .expect("应当通过语义检查");
+        // read_line 返回 string、eval 返回 string（记录在调用表达式上）
+        assert!(sem
+            .expr_types
+            .values()
+            .any(|t| matches!(t, TypeSpec::Named(TyKw::Str))));
+    }
+
+    #[test]
+    fn repl内置函数参数错误报错() {
+        // read_line 不接受参数
+        expect_err(
+            r#"
+            func main() {
+                var x = read_line("hi")
+            }
+            "#,
+            "read_line() 期望 0 个参数",
+        );
+        // eval 参数必须是字符串
+        expect_err(
+            r#"
+            func main() {
+                var x = eval(42)
+            }
+            "#,
+            "eval() 参数必须是字符串",
+        );
+        // eval 必须恰好 1 个参数
+        expect_err(
+            r#"
+            func main() {
+                var x = eval()
+            }
+            "#,
+            "eval() 期望 1 个参数",
         );
     }
 
