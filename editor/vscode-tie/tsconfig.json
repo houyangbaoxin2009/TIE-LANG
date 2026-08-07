@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    // 模块与目标：VSCode 扩展宿主运行在 Node，产物为 CommonJS
+    "module": "commonjs",
+    "target": "ES2020",
+    "lib": ["ES2020"],
+    "moduleResolution": "node",
+    // 源码目录 src → 输出目录 out
+    "rootDir": "src",
+    "outDir": "out",
+    // 严格模式：保证类型安全
+    "strict": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    // 类型检查产物说明：out/extension.js 最终由 esbuild 生成（tsc 只做检查与占位输出）
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": ["src"]
+}

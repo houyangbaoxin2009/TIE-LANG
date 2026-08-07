@@ -1,15 +1,16 @@
 {
   "name": "vscode-tie",
   "displayName": "tie Language Support",
-  "description": "tie 语言支持：语法高亮 + 语言服务器（诊断 / hover），启动 tie --lsp",
+  "description": "tie 语言支持：语法高亮、智能缩进、代码片段 + 语言服务器（诊断 / hover / 跳转定义 / 补全），启动 tie --lsp",
   "version": "0.1.0",
   "publisher": "tie",
+  "license": "MIT",
   "engines": {
     "vscode": "^1.75.0"
   },
   "categories": ["Programming Languages"],
   "activationEvents": ["onLanguage:tie"],
-  "main": "./extension.js",
+  "main": "./out/extension.js",
   "contributes": {
     "languages": [
       {
@@ -37,5 +38,19 @@
         }
       }
     }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./ && node esbuild.mjs",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^8.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.75.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
   }
 }

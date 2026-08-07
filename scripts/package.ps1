@@ -153,13 +153,18 @@ if (Test-Path $ExamplesSrc) {
     Write-Host "  examples/ ✔" -ForegroundColor DarkGray
 }
 
-# editor/vscode-tie/：VSCode 扩展
+# editor/vscode-tie/：VSCode 扩展（净化复制——排除 node_modules/ 与 out/ 构建产物，
+# 源码分发：用户 npm install + npm run compile 或 vsce package 后安装）
 $EditorSrc = Join-Path $Root "editor\vscode-tie"
 if (Test-Path $EditorSrc) {
     $EditorTarget = Join-Path $DistDir "editor\vscode-tie"
     New-Item -ItemType Directory -Path $EditorTarget -Force | Out-Null
-    Copy-Item (Join-Path $EditorSrc "*") $EditorTarget -Recurse
-    Write-Host "  editor/vscode-tie/ ✔" -ForegroundColor DarkGray
+    Get-ChildItem $EditorSrc -Force | Where-Object {
+        $_.Name -notin @("node_modules", "out")
+    } | ForEach-Object {
+        Copy-Item $_.FullName $EditorTarget -Recurse
+    }
+    Write-Host "  editor/vscode-tie/ ✔（已排除 node_modules/、out/）" -ForegroundColor DarkGray
 }
 
 Write-Host "[3/4] 发行目录组装完成" -ForegroundColor Green

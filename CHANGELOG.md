@@ -1,8 +1,29 @@
 # CHANGELOG
 
-tie 语言项目的变更记录，按里程碑（M0→M5）组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件**。
 
-## [M5] 正式发行版 — 2026-08-07
+## [Harbor M1] VSCode 插件（编辑器集成） — 2026-08-07
+
+### 新增
+- `editor/vscode-tie` 重构为 TypeScript 标准工程（vscode-languageclient + esbuild 打包）：
+  语法高亮（含 M4 运算符、宽类型、头指令着色）、智能缩进（onEnterRules）、代码片段、
+  VSIX 打包安装（README 含开发调试 / 打包 / 配置说明）
+- tie-lsp 新增跳转定义 `textDocument/definition`（函数 / 方法 / 字段 / 类 / 变量）与
+  自动补全 `textDocument/completion`（关键词 / 类型 / 内置函数 / 顶层函数 / 类名 +
+  `类名.` 成员补全），capabilities 声明 definitionProvider / completionProvider
+  （triggerCharacters `["."]`）
+- LSP 测试 +20（共 53 通过）：definition 函数 / 方法 / 变量命中与未命中、文档未打开、
+  completion 全集 / 类成员 / 未打开文档
+
+### 文档
+- README.md：路线图重组为「架构 → M 里程碑」两级（Harbor 架构新增 M1 VSCode 插件条目）；
+  tie-lsp 描述更新为
+  诊断 / hover / 跳转定义 / 补全
+- editor/vscode-tie/README.md：扩展安装（F5 开发调试 / vsix 打包）、配置（tie.lsp.command）、
+  功能清单、协议兼容说明
+
+## [Harbor M0] 正式发行版基础 — 2026-08-07
 
 ### 新增
 - 版本规则确立：正式发行版号 `年份.修订号`（如 2026.1）；内部代号 `2026.1 "Harbor 港湾"`（首个正式版 = 工具链首次靠岸）

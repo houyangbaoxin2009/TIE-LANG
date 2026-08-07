@@ -1,0 +1,9 @@
+# 打包 vsix 时排除的目录/文件（保留 out/、syntaxes/、snippets/、language-configuration.json、package.json、README.md）
+src/**
+node_modules/**
+esbuild.mjs
+tsconfig.json
+.vscode/**
+.gitignore
+.vscodeignore
+**/*.map

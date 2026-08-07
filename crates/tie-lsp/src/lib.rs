@@ -6,7 +6,7 @@
 //! 模块划分：
 //! - [jsonrpc]：JSON-RPC 2.0 分帧编解码（Content-Length 头 + JSON 体）
 //! - [lsp]：LSP 协议类型定义（serde 结构）
-//! - [diagnostics]：tie-frontend 三阶段分析 → 诊断；hover 查询
+//! - [diagnostics]：tie-frontend 三阶段分析 → 诊断；hover / 跳转定义 / 自动补全查询
 //! - [server]：服务器状态与请求分发（纯函数，可测）
 
 pub mod diagnostics;

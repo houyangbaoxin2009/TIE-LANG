@@ -87,7 +87,7 @@ tie examples/lib_math.tie          # → examples/lib_math.a（经 clang -c 生�
 
 - `tie-prep <file.tie>` —— 纯预处理
 - `tie-frontend <file.tie>` —— 前端三阶段（词法/语法/语义），带 `--tokens`/`--ast`/`--check` 调试视图
-- `tie-lsp` —— 语言服务器（LSP over stdio），向编辑器提供诊断与 hover，可与 VSCode 等配合（等价于 `tie --lsp`）
+- `tie-lsp` —— 语言服务器（LSP over stdio），向编辑器提供诊断 / hover / 跳转定义 / 补全，可与 VSCode 等配合（等价于 `tie --lsp`）
 - `tie-llvm <file.tie>` —— 直接编译（不经过角色分派）
 - `tie-interp <file.tie>` —— 直接解释执行
 
@@ -109,7 +109,7 @@ tie/
 │   ├── tie-prep/      预处理：清理代码、提取头、识别文件角色（logic/ui/db/data/library）
 │   ├── tie-frontend/  前端：词法（含 ASI）→ 语法 → 语义（符号表/类型检查），自研；独立 CLI 可调试
 │   ├── tie-llvm/      中端+后端驱动：AST → LLVM IR 文本生成；调用 opt/clang/lld
-│   ├── tie-lsp/       语言服务器：JSON-RPC 2.0 over stdio，复用前端三阶段提供诊断与 hover
+│   ├── tie-lsp/       语言服务器：JSON-RPC 2.0 over stdio，复用前端三阶段提供诊断 / hover / 跳转定义 / 补全
 │   ├── tie-interp/    解释执行：树遍历求值 AST + C ABI 桥（staticlib），REPL 自举核心
 │   └── tie/           CLI 主入口：角色分派调度器 + REPL（启动 repl.exe）
 ├── repl/repl.tie     REPL 外壳（tie 语言自写，自举；编译链接 tie-interp 静态库）
@@ -146,7 +146,14 @@ tie/
 
 后续支持 `--backend=gnu` 切换到 GNU 工具链（gcc/ld）。
 
-## 早期开发路线图
+## 开发路线图
+
+路线图按**架构**（正式发行版代号）组织：每个架构下有独立的 M 里程碑序列（从 M1 起）。
+正式发行前的开发归入**预开发版本**（Pre-release）。
+
+### 预开发版本（M0–M4）
+
+正式发行前的语言核心基础建设，为 Harbor 发行版奠定基础。
 
 | 里程碑 | 内容 | 状态 |
 | --- | --- | --- |
@@ -155,4 +162,12 @@ tie/
 | M2 | 复合类型（表/数组、元组）、`import`、头类型分派（data） | ✅ 完成 |
 | M3 | class/OOP、库编译、`--target` 交叉 | ✅ 完成 |
 | M4 | 运算符扩展：复合赋值（`+=`/`-=` 等）、位运算（`&`/`\|`/`^`/`<<`/`>>`）、三目 `?:`、自增自减 `++`/`--` | ✅ 完成 |
-| M5 | 正式发行版：版本规则（年份.修订号）、内部代号（2026.1 "Harbor"）、工具链合集打包（`scripts/package.ps1` → zip） | 进行中 |
+
+### Harbor（2026.1）
+
+首个正式发行版架构——工具链第一次靠岸停泊，形成可交付的稳定形态。
+
+| 里程碑 | 内容 | 状态 |
+| --- | --- | --- |
+| M0 | 正式发行版基础：版本规则（年份.修订号）、内部代号（2026.1 "Harbor"）、工具链合集打包（`scripts/package.ps1` → zip） | ✅ 完成 |
+| M1 | VSCode 插件：语法高亮 / 智能缩进 / 代码片段 + LSP 客户端（诊断 / hover / 跳转定义 / 补全），TypeScript 重构 | 进行中 |

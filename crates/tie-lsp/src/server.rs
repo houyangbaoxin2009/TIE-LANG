@@ -11,6 +11,8 @@
 //! - `initialize` / `initialized` / `shutdown` / `exit`：生命周期
 //! - `textDocument/didOpen` / `didChange` / `didClose`：文档同步（全量）
 //! - `textDocument/hover`：hover 查询
+//! - `textDocument/definition`：跳转定义
+//! - `textDocument/completion`：自动补全
 //! - `textDocument/publishDiagnostics`：服务器主动推送的诊断通知
 //! 其余方法返回 MethodNotFound（-32601）。
 
@@ -20,6 +22,7 @@ use serde_json::{json, Value};
 
 use crate::diagnostics;
 use crate::lsp::{
+    CompletionList, CompletionOptions, CompletionParams, DefinitionParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     HoverParams, InitializeResult, PublishDiagnosticsParams, ServerCapabilities, ServerInfo,
 };
@@ -79,6 +82,8 @@ pub fn handle_message(state: &mut ServerState, msg: Value) -> Vec<Value> {
         "textDocument/didChange" => did_change(state, &params),
         "textDocument/didClose" => did_close(state, &params),
         "textDocument/hover" => hover(state, id, &params),
+        "textDocument/definition" => definition(state, id, &params),
+        "textDocument/completion" => completion(state, id, &params),
         _ => vec![error_response(id, ERR_METHOD_NOT_FOUND, &format!("方法未找到：{method}"))],
     }
 }
@@ -91,6 +96,8 @@ fn initialize(state: &mut ServerState, id: Option<Value>) -> Vec<Value> {
         capabilities: ServerCapabilities {
             text_document_sync: TEXT_DOCUMENT_SYNC_FULL,
             hover_provider: true,
+            definition_provider: true,
+            completion_provider: CompletionOptions { trigger_characters: vec![".".into()] },
         },
         server_info: ServerInfo {
             name: SERVER_NAME.into(),
@@ -159,6 +166,45 @@ fn hover(state: &ServerState, id: Option<Value>, params: &Value) -> Vec<Value> {
     vec![success_response(id, result)]
 }
 
+/// `textDocument/definition`：跳转定义，未命中 result 为 null。
+fn definition(state: &ServerState, id: Option<Value>, params: &Value) -> Vec<Value> {
+    let Ok(params) = serde_json::from_value::<DefinitionParams>(params.clone()) else {
+        return vec![error_response(id, ERR_INVALID_PARAMS, "无效参数：textDocument/definition")];
+    };
+    let uri = params.text_document.uri;
+    let Some(source) = state.documents.get(&uri) else {
+        // 文档不在内存：返回 null
+        return vec![success_response(id, Value::Null)];
+    };
+    let result = match diagnostics::definition(source, params.position.line, params.position.character) {
+        Some(range) => {
+            // 定义位置：uri 与请求文档相同（v1 单文档，不做跨文件跳转）
+            let loc = crate::lsp::Location { uri: uri.clone(), range };
+            serde_json::to_value(loc).expect("Location 序列化不应失败")
+        }
+        None => Value::Null,
+    };
+    vec![success_response(id, result)]
+}
+
+/// `textDocument/completion`：返回补全列表（文档未打开时为空列表）。
+fn completion(state: &ServerState, id: Option<Value>, params: &Value) -> Vec<Value> {
+    let Ok(params) = serde_json::from_value::<CompletionParams>(params.clone()) else {
+        return vec![error_response(id, ERR_INVALID_PARAMS, "无效参数：textDocument/completion")];
+    };
+    let uri = params.text_document.uri;
+    let Some(source) = state.documents.get(&uri) else {
+        // 文档不在内存：返回空列表
+        let list = CompletionList { is_incomplete: false, items: Vec::new() };
+        let result = serde_json::to_value(list).expect("CompletionList 序列化不应失败");
+        return vec![success_response(id, result)];
+    };
+    let items = diagnostics::completion(source, params.position.line, params.position.character);
+    let list = CompletionList { is_incomplete: false, items };
+    let result = serde_json::to_value(list).expect("CompletionList 序列化不应失败");
+    vec![success_response(id, result)]
+}
+
 /// 构造 `textDocument/publishDiagnostics` 通知（对当前全文跑三阶段诊断）。
 fn publish_diagnostics(uri: &str, source: &str) -> Value {
     let params = PublishDiagnosticsParams {
@@ -215,7 +261,8 @@ mod tests {
         "func add(a: i64, b: i64) -> i64 {\n    return a + b\n}\nfunc main() {\n    println(add(1, 2))\n}\n"
     }
 
-    /// initialize 请求 → capabilities 响应（textDocumentSync=1、hoverProvider=true、serverInfo）。
+    /// initialize 请求 → capabilities 响应（textDocumentSync=1、hoverProvider=true、
+    /// definitionProvider=true、completionProvider.triggerCharacters=["."]、serverInfo）。
     #[test]
     fn initialize请求返回capabilities() {
         let mut state = ServerState::default();
@@ -226,6 +273,12 @@ mod tests {
         assert_eq!(resp["id"], json!(1));
         assert_eq!(resp["result"]["capabilities"]["textDocumentSync"], json!(1));
         assert_eq!(resp["result"]["capabilities"]["hoverProvider"], json!(true));
+        assert_eq!(resp["result"]["capabilities"]["definitionProvider"], json!(true));
+        assert_eq!(
+            resp["result"]["capabilities"]["completionProvider"]["triggerCharacters"],
+            json!(["."]),
+            "补全触发字符应为点"
+        );
         assert_eq!(resp["result"]["serverInfo"]["name"], "tie-lsp");
         assert_eq!(resp["result"]["serverInfo"]["version"], "0.1.0");
     }
@@ -379,11 +432,11 @@ mod tests {
         assert!(out[0]["result"].is_null(), "文档未打开应返回 null");
     }
 
-    /// 未支持的方法（如 goto-definition）：MethodNotFound 错误（-32601）。
+    /// 未支持的方法（如 rename）：MethodNotFound 错误（-32601）。
     #[test]
     fn 未支持方法返回方法未找到() {
         let mut state = ServerState::default();
-        let out = handle_message(&mut state, 请求(6, "textDocument/definition", json!({})));
+        let out = handle_message(&mut state, 请求(6, "textDocument/rename", json!({})));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["id"], json!(6));
         assert_eq!(out[0]["error"]["code"], json!(-32601));
@@ -396,5 +449,174 @@ mod tests {
         let mut state = ServerState::default();
         let out = handle_message(&mut state, json!({"jsonrpc": "2.0", "id": 7}));
         assert_eq!(out[0]["error"]["code"], json!(-32600));
+    }
+
+    /// 定义测试源码：类（字段/静态方法/实例方法）+ 顶层函数 + main 中的变量与调用。
+    fn 定义源码() -> &'static str {
+        r#"class Point {
+    var x: i64
+    var y: i64
+    static method create() -> Point {
+        return Point(0, 0)
+    }
+    method dist() -> i64 {
+        return this.x
+    }
+}
+func add(a: i64, b: i64) -> i64 {
+    return a + b
+}
+func main() {
+    var count = 1
+    var p = Point.create()
+    println(add(count, 2))
+    println(p.dist())
+}
+"#
+    }
+
+    /// definition 命中函数调用 add（line 16、character 12）→ 返回 add 定义处位置
+    /// （line 10、character 5），且 uri 与请求文档一致。
+    #[test]
+    fn 跳转定义命中函数调用返回位置() {
+        let mut state = ServerState::default();
+        handle_message(&mut state, 打开文档("file:///a.tie", 定义源码()));
+        let out = handle_message(
+            &mut state,
+            请求(20, "textDocument/definition", json!({
+                "textDocument": {"uri": "file:///a.tie"},
+                "position": {"line": 16, "character": 12}
+            })),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["id"], json!(20));
+        assert_eq!(out[0]["result"]["uri"], "file:///a.tie");
+        assert_eq!(out[0]["result"]["range"]["start"]["line"], json!(10));
+        assert_eq!(out[0]["result"]["range"]["start"]["character"], json!(5));
+    }
+
+    /// definition 命中类构造 Point（line 4、character 15）→ 返回 class Point 定义处
+    /// （line 0、character 6）。
+    #[test]
+    fn 跳转定义命中类构造返回位置() {
+        let mut state = ServerState::default();
+        handle_message(&mut state, 打开文档("file:///a.tie", 定义源码()));
+        let out = handle_message(
+            &mut state,
+            请求(21, "textDocument/definition", json!({
+                "textDocument": {"uri": "file:///a.tie"},
+                "position": {"line": 4, "character": 15}
+            })),
+        );
+        assert_eq!(out[0]["result"]["range"]["start"]["line"], json!(0));
+        assert_eq!(out[0]["result"]["range"]["start"]["character"], json!(6));
+    }
+
+    /// definition 命中变量 count（line 16、character 16）→ 返回 var count 声明处
+    /// （line 14、character 8）。
+    #[test]
+    fn 跳转定义命中变量返回声明位置() {
+        let mut state = ServerState::default();
+        handle_message(&mut state, 打开文档("file:///a.tie", 定义源码()));
+        let out = handle_message(
+            &mut state,
+            请求(22, "textDocument/definition", json!({
+                "textDocument": {"uri": "file:///a.tie"},
+                "position": {"line": 16, "character": 16}
+            })),
+        );
+        assert_eq!(out[0]["result"]["range"]["start"]["line"], json!(14));
+        assert_eq!(out[0]["result"]["range"]["start"]["character"], json!(8));
+    }
+
+    /// definition 未命中（光标在关键字 func 上，line 10、character 0）→ result 为 null。
+    #[test]
+    fn 跳转定义未命中返回null() {
+        let mut state = ServerState::default();
+        handle_message(&mut state, 打开文档("file:///a.tie", 定义源码()));
+        let out = handle_message(
+            &mut state,
+            请求(23, "textDocument/definition", json!({
+                "textDocument": {"uri": "file:///a.tie"},
+                "position": {"line": 10, "character": 0}
+            })),
+        );
+        assert!(out[0]["result"].is_null(), "关键字处应返回 null");
+    }
+
+    /// definition 文档未打开 → result 为 null。
+    #[test]
+    fn 跳转定义文档未打开返回null() {
+        let mut state = ServerState::default();
+        let out = handle_message(
+            &mut state,
+            请求(24, "textDocument/definition", json!({
+                "textDocument": {"uri": "file:///ghost.tie"},
+                "position": {"line": 0, "character": 5}
+            })),
+        );
+        assert!(out[0]["result"].is_null(), "文档未打开应返回 null");
+    }
+
+    /// completion 请求 → 补全列表（isIncomplete=false）含 func/var/println/i64。
+    #[test]
+    fn 补全请求返回全集列表() {
+        let mut state = ServerState::default();
+        handle_message(&mut state, 打开文档("file:///a.tie", 定义源码()));
+        let out = handle_message(
+            &mut state,
+            请求(25, "textDocument/completion", json!({
+                "textDocument": {"uri": "file:///a.tie"},
+                "position": {"line": 14, "character": 0}
+            })),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["id"], json!(25));
+        assert_eq!(out[0]["result"]["isIncomplete"], json!(false));
+        let items = out[0]["result"]["items"].as_array().expect("items 应为数组");
+        let labels: Vec<&str> = items
+            .iter()
+            .filter_map(|i| i["label"].as_str())
+            .collect();
+        assert!(labels.contains(&"func"), "应含关键词 func：{labels:?}");
+        assert!(labels.contains(&"var"), "应含关键词 var：{labels:?}");
+        assert!(labels.contains(&"println"), "应含内置函数 println：{labels:?}");
+        assert!(labels.contains(&"i64"), "应含类型 i64：{labels:?}");
+    }
+
+    /// completion 点场景：`Point.`（line 15、character 18）→ 只补该类成员（x/y/create/dist）。
+    #[test]
+    fn 补全类名点后返回类成员() {
+        let mut state = ServerState::default();
+        handle_message(&mut state, 打开文档("file:///a.tie", 定义源码()));
+        let out = handle_message(
+            &mut state,
+            请求(26, "textDocument/completion", json!({
+                "textDocument": {"uri": "file:///a.tie"},
+                "position": {"line": 15, "character": 18}
+            })),
+        );
+        let items = out[0]["result"]["items"].as_array().expect("items 应为数组");
+        let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+        assert!(labels.contains(&"x"), "应含字段 x：{labels:?}");
+        assert!(labels.contains(&"create"), "应含方法 create：{labels:?}");
+        assert!(labels.contains(&"dist"), "应含方法 dist：{labels:?}");
+        assert!(!labels.contains(&"func"), "点场景不应含关键词：{labels:?}");
+    }
+
+    /// completion 文档未打开 → 返回空列表（isIncomplete=false）。
+    #[test]
+    fn 补全文档未打开返回空列表() {
+        let mut state = ServerState::default();
+        let out = handle_message(
+            &mut state,
+            请求(27, "textDocument/completion", json!({
+                "textDocument": {"uri": "file:///ghost.tie"},
+                "position": {"line": 0, "character": 0}
+            })),
+        );
+        assert_eq!(out[0]["result"]["isIncomplete"], json!(false));
+        let items = out[0]["result"]["items"].as_array().expect("items 应为数组");
+        assert!(items.is_empty(), "文档未打开应返回空列表");
     }
 }

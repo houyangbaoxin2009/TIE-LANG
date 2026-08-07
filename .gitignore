@@ -11,6 +11,9 @@
 # IDE 与编辑器
 .idea/
 .vscode/
+# 例外：VSCode 扩展的调试配置（F5 开发调试必需，见 editor/vscode-tie/README.md）
+!editor/vscode-tie/.vscode/
+!editor/vscode-tie/.vscode/*
 *.swp
 *.swo
 

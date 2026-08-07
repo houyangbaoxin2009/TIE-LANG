@@ -110,6 +110,26 @@ pub struct HoverParams {
     pub position: Position,
 }
 
+/// `textDocument/definition` 请求参数（跳转定义）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct DefinitionParams {
+    /// 目标文档
+    #[serde(rename = "textDocument")]
+    pub text_document: TextDocumentIdentifier,
+    /// 光标位置（0-based）
+    pub position: Position,
+}
+
+/// `textDocument/completion` 请求参数（自动补全）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompletionParams {
+    /// 目标文档
+    #[serde(rename = "textDocument")]
+    pub text_document: TextDocumentIdentifier,
+    /// 补全触发位置（0-based）
+    pub position: Position,
+}
+
 // ==================== 服务器 → 客户端（响应/通知） ====================
 
 /// `initialize` 请求的响应 result。
@@ -122,7 +142,7 @@ pub struct InitializeResult {
     pub server_info: ServerInfo,
 }
 
-/// 服务器能力声明（v1 子集：全文同步 + hover）。
+/// 服务器能力声明（v1 子集：全文同步 + hover + 跳转定义 + 补全）。
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerCapabilities {
     /// 文本同步方式：1 = 全量同步（Full）
@@ -131,6 +151,12 @@ pub struct ServerCapabilities {
     /// 是否支持 hover
     #[serde(rename = "hoverProvider")]
     pub hover_provider: bool,
+    /// 是否支持跳转定义（`textDocument/definition`）
+    #[serde(rename = "definitionProvider")]
+    pub definition_provider: bool,
+    /// 补全能力（`textDocument/completion`），`triggerCharacters: ["."]` 触发成员补全
+    #[serde(rename = "completionProvider")]
+    pub completion_provider: CompletionOptions,
 }
 
 /// 服务器自身信息。
@@ -180,6 +206,53 @@ pub struct MarkupContent {
     pub value: String,
 }
 
+/// `textDocument/definition` 请求的响应 result（LSP `Location`）。
+///
+/// 字段：uri + 定义处范围（覆盖整个名字，便于编辑器高亮）。
+#[derive(Debug, Clone, Serialize)]
+pub struct Location {
+    /// 定义所在文档的 uri（v1 单文档：与请求同一 uri）
+    pub uri: String,
+    /// 定义处范围（0-based）
+    pub range: Range,
+}
+
+/// 单个补全项（LSP `CompletionItem` 子集）。
+///
+/// `kind` / `detail` 可选：`#[serde(skip_serializing_if)]` 使缺省字段不输出
+/// （VSCode 等客户端对缺失字段宽容）。
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionItem {
+    /// 补全文本（插入到光标处的标识符）
+    pub label: String,
+    /// 补全项种类（LSP `CompletionItemKind`：3=Function、7=Class、14=Keyword 等）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<u32>,
+    /// 补充说明（如函数签名 `func add(a: i64, b: i64) -> i64`）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// `textDocument/completion` 请求的响应 result（LSP `CompletionList`）。
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionList {
+    /// 是否不完整：false = 当前列表即全部结果
+    #[serde(rename = "isIncomplete")]
+    pub is_incomplete: bool,
+    /// 补全项列表
+    pub items: Vec<CompletionItem>,
+}
+
+/// 补全能力选项（LSP `CompletionOptions`）。
+///
+/// `triggerCharacters`：无需 Ctrl+Space 即自动弹出的字符（`.` 触发成员补全）。
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionOptions {
+    /// 触发字符列表
+    #[serde(rename = "triggerCharacters")]
+    pub trigger_characters: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +264,8 @@ mod tests {
             capabilities: ServerCapabilities {
                 text_document_sync: 1,
                 hover_provider: true,
+                definition_provider: true,
+                completion_provider: CompletionOptions { trigger_characters: vec![".".into()] },
             },
             server_info: ServerInfo {
                 name: "tie-lsp".into(),
@@ -200,6 +275,11 @@ mod tests {
         let value = serde_json::to_value(&result).expect("序列化应成功");
         assert_eq!(value["capabilities"]["textDocumentSync"], serde_json::json!(1));
         assert_eq!(value["capabilities"]["hoverProvider"], serde_json::json!(true));
+        assert_eq!(value["capabilities"]["definitionProvider"], serde_json::json!(true));
+        assert_eq!(
+            value["capabilities"]["completionProvider"]["triggerCharacters"],
+            serde_json::json!(["."])
+        );
         assert_eq!(value["serverInfo"]["name"], "tie-lsp");
     }
 
@@ -225,5 +305,52 @@ mod tests {
         assert_eq!(params.text_document.uri, "file:///a.tie");
         assert_eq!(params.position.line, 0);
         assert_eq!(params.position.character, 5);
+    }
+
+    /// DefinitionParams / CompletionParams 反序列化：与 hover 同构（textDocument + position）。
+    #[test]
+    fn 定义与补全参数反序列化() {
+        let raw = serde_json::json!({
+            "textDocument": {"uri": "file:///a.tie"},
+            "position": {"line": 3, "character": 12}
+        });
+        let params: DefinitionParams = serde_json::from_value(raw.clone()).expect("definition 解析应成功");
+        assert_eq!(params.text_document.uri, "file:///a.tie");
+        assert_eq!(params.position, Position { line: 3, character: 12 });
+        let params: CompletionParams = serde_json::from_value(raw).expect("completion 解析应成功");
+        assert_eq!(params.position.line, 3);
+    }
+
+    /// Location / CompletionList 序列化字段名符合 LSP 规范（uri/range/isIncomplete）。
+    #[test]
+    fn 定义与补全响应字段名符合规范() {
+        let loc = Location {
+            uri: "file:///a.tie".into(),
+            range: Range {
+                start: Position { line: 1, character: 5 },
+                end: Position { line: 1, character: 8 },
+            },
+        };
+        let v = serde_json::to_value(&loc).expect("序列化应成功");
+        assert_eq!(v["uri"], "file:///a.tie");
+        assert_eq!(v["range"]["start"]["line"], serde_json::json!(1));
+        assert_eq!(v["range"]["end"]["character"], serde_json::json!(8));
+
+        let list = CompletionList {
+            is_incomplete: false,
+            items: vec![CompletionItem {
+                label: "func".into(),
+                kind: Some(14),
+                detail: None,
+            }],
+        };
+        let v = serde_json::to_value(&list).expect("序列化应成功");
+        assert_eq!(v["isIncomplete"], serde_json::json!(false));
+        assert_eq!(v["items"][0]["label"], "func");
+        assert_eq!(v["items"][0]["kind"], serde_json::json!(14));
+        assert!(
+            v["items"][0].get("detail").is_none(),
+            "detail 为 None 时不应输出该字段"
+        );
     }
 }

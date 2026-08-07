@@ -14,11 +14,25 @@
   "repository": {
     "comments": {
       "patterns": [
+        { "include": "#head" },
         { "name": "comment.line.double-slash.tie", "match": "//.*$" },
         {
           "name": "comment.block.tie",
           "begin": "/\\*",
           "end": "\\*/"
+        }
+      ]
+    },
+    "head": {
+      "patterns": [
+        {
+          "name": "meta.preprocessor.tie",
+          "match": "(//)(\\s*)(tie:[a-zA-Z_][a-zA-Z0-9_-]*)(.*)$",
+          "captures": {
+            "1": { "name": "punctuation.definition.comment.tie" },
+            "3": { "name": "keyword.control.directive.tie" },
+            "4": { "name": "string.unquoted.tie" }
+          }
         }
       ]
     },
@@ -30,7 +44,7 @@
     },
     "numbers": {
       "patterns": [
-        { "name": "constant.numeric.tie", "match": "\\b(0[xX][0-9a-fA-F_]+|\\d[\\d_]*(\\.\\d[\\d_]*)?)\\b" }
+        { "name": "constant.numeric.tie", "match": "\\b(0[xX][0-9a-fA-F_]+|\\d[\\d_]*(\\.[\\d_]+)?)\\b" }
       ]
     },
     "keywords": {
@@ -40,14 +54,17 @@
           "match": "\\b(func|var|const|if|else|while|for|return|import|class|method|static|this|extends|switch|case|default|in)\\b"
         },
         { "name": "constant.language.tie", "match": "\\b(true|false)\\b" },
-        { "name": "keyword.operator.tie", "match": "\\b(and|or|not)\\b|(==|!=|<=|>=|&&|\\|\\||\\+|-|\\*|/|%|!|>|<|=)" }
+        {
+          "name": "keyword.operator.tie",
+          "match": "\\+\\+|--|<<=|>>=|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<|>>|<=|>=|==|!=|&&|\\|\\||->|\\.\\.|[+\\-*/%&|^!<>=?:]"
+        }
       ]
     },
     "types": {
       "patterns": [
         {
           "name": "storage.type.tie",
-          "match": "\\b(i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|bool|char|string|void|code)\\b"
+          "match": "\\b(i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|bool|char|string|void|code|num|text|misc|table)\\b"
         }
       ]
     },
