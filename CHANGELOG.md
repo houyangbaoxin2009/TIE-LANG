@@ -10,6 +10,8 @@ tie 语言项目的变更记录，按里程碑（M0→M4）组织。格式参考
 - 文档同步：`didOpen` / `didChange`（全量）/ `didClose`，变更即推送诊断
 - `hover`：函数签名（`func name(params) -> Ret`）与类信息（含 `extends` 父类）
 - 协议自研：仅依赖 serde/serde_json，不引入 lsp-server 等现成框架
+- 接入主入口：`tie --lsp` 启动语言服务器（与 `tie-lsp` 等价）；核心主循环提炼为库入口
+  `tie_lsp::run_server()`，独立二进制与主命令复用同一实现
 
 ## [M3] class/OOP — 2026-08-07
 

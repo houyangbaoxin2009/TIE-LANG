@@ -1,58 +1,12 @@
-//! tie-lsp 入口：stdio 分帧读写循环。
+//! tie-lsp 独立二进制入口：调用库入口 [tie_lsp::run_server]。
 //!
-//! 职责：以 JSON-RPC 2.0 over stdio 方式与编辑器（如 VSCode）通信：
-//! - 从 stdin 按 Content-Length 分帧读取消息；
-//! - 交给 [crate::server::handle_message] 处理（纯函数，可测）；
-//! - 把返回的响应/通知分帧写到 stdout；
-//! - 收到 `exit` 通知（或 stdin EOF）后退出进程。
-//!
-//! 说明：v1 退出码从简——无论是否收到 shutdown，exit 后统一以 0 退出。
+//! 职责：作为可单独执行的二进制，启动语言服务器主循环。
+//! 主循环逻辑在库入口（[tie_lsp::run_server]），与 tie 主命令的
+//! `tie --lsp` 复用同一份实现（单点维护）。
 
-mod diagnostics;
-mod jsonrpc;
-mod lsp;
-mod server;
-
-use std::io::{self, BufReader, BufWriter};
 use std::process::ExitCode;
 
-use server::ServerState;
-
-/// 服务主循环。
-///
-/// 每轮：读一帧 → 分发处理 → 写出所有输出消息 → 检查退出标记。
-/// 读取失败或 EOF 即结束循环（EOF 表示编辑器已关闭管道）。
+/// 启动语言服务器（stdio 分帧读写），退出码透传库入口结果。
 fn main() -> ExitCode {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    // 注：Windows 上 Rust 的 stdio 默认启用二进制模式，\r\n 不会被转换，分帧安全
-    let mut reader = BufReader::new(stdin.lock());
-    let mut writer = BufWriter::new(stdout.lock());
-    let mut state = ServerState::default();
-
-    loop {
-        match jsonrpc::read_message(&mut reader) {
-            // 正常读到一条消息：分发并写出
-            Ok(Some(msg)) => {
-                for out in server::handle_message(&mut state, msg) {
-                    if let Err(e) = jsonrpc::write_message(&mut writer, &out) {
-                        // stdout 已断（编辑器退出）：直接结束
-                        eprintln!("tie-lsp：写出消息失败：{e}");
-                        break;
-                    }
-                }
-                if state.exit_requested {
-                    break; // 收到 exit 通知
-                }
-            }
-            // 输入流正常结束（EOF）：退出
-            Ok(None) => break,
-            // 帧损坏：记录并退出（v1 从简，不尝试恢复）
-            Err(e) => {
-                eprintln!("tie-lsp：读取消息失败：{e}");
-                break;
-            }
-        }
-    }
-    ExitCode::from(0)
+    tie_lsp::run_server()
 }

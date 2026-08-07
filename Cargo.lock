@@ -92,6 +92,7 @@ version = "0.1.0"
 dependencies = [
  "tie-interp",
  "tie-llvm",
+ "tie-lsp",
  "tie-prep",
 ]
 

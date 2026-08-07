@@ -33,6 +33,8 @@ struct Args {
     prep_only: bool,
     /// 交叉编译目标三元组（如 x86_64-pc-windows-msvc / win-x64）
     target: Option<String>,
+    /// 启动语言服务器（LSP over stdio），复用 tie-lsp 主循环
+    lsp_mode: bool,
 }
 
 /// 使用说明。
@@ -41,6 +43,7 @@ tie 语言总入口（四段式调度器 + REPL）
 
 用法:
   tie                进入 REPL 交互模式（逐行解释执行）
+  tie --lsp          启动语言服务器（LSP over stdio，供编辑器接入）
   tie <input.tie> [选项]   编译并执行脚本文件
 
 流程:
@@ -57,6 +60,7 @@ tie 语言总入口（四段式调度器 + REPL）
   --emit-ir      只生成 LLVM IR（.ll），不继续编译
   --keep-ir      保留中间 IR 文件
   --prep-only    只执行预处理并打印识别结果，不编译
+  --lsp          以语言服务器模式运行（读 stdin 的 LSP 消息并写 stdout）
   -h, --help     显示本帮助
 
 单独使用:
@@ -108,6 +112,7 @@ fn parse_args() -> Result<Args, String> {
     let mut keep_ir = false;
     let mut prep_only = false;
     let mut target: Option<String> = None;
+    let mut lsp_mode = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -128,6 +133,7 @@ fn parse_args() -> Result<Args, String> {
             "--emit-ir" => emit_ir_only = true,
             "--keep-ir" => keep_ir = true,
             "--prep-only" => prep_only = true,
+            "--lsp" => lsp_mode = true,
             other if other.starts_with('-') => return Err(format!("未知选项: {other}")),
             other => {
                 if input.is_some() {
@@ -138,7 +144,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
-    Ok(Args { input, output, opt_level, emit_ir_only, keep_ir, prep_only, target })
+    Ok(Args { input, output, opt_level, emit_ir_only, keep_ir, prep_only, target, lsp_mode })
 }
 
 fn main() -> ExitCode {
@@ -154,6 +160,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // --lsp：启动语言服务器（LSP over stdio），复用 tie-lsp 主循环
+    if args.lsp_mode {
+        return tie_lsp::run_server();
+    }
     // 有参数时必须指定输入文件
     let Some(input) = args.input.as_ref() else {
         eprintln!("错误: 缺少输入文件，使用 --help 查看用法\n\n{USAGE}");
