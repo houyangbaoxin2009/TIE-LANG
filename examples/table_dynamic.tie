@@ -1,0 +1,56 @@
+// tie:logic
+// 动态表（table_new_*/table_push/table_at）示例：
+// 运行时可增长的表，支持 push、下标读取、len、for 遍历。
+// 编译路径（tie-llvm）与解释路径（tie-interp）行为逐字节一致。
+
+// 用循环构建一个动态 i64 表（1..10）
+func build_numbers(n: i64) -> table {
+    var t = table_new_i64()
+    var i = 1
+    while i <= n {
+        table_push(t, i)
+        i++
+    }
+    return t
+}
+
+func main() {
+    // 1) 构建 + len + 下标读取
+    var nums = build_numbers(10)
+    println("len(nums) = " + to_string(len(nums)))
+    println("nums[0] = " + to_string(nums[0]))
+    println("nums[9] = " + to_string(nums[9]))
+
+    // 2) for 遍历求和
+    var sum = 0
+    for x in nums {
+        sum = sum + x
+    }
+    println("sum(1..10) = " + to_string(sum))
+
+    // 3) table_at 读取
+    println("table_at(nums, 5) = " + to_string(table_at(nums, 5)))
+
+    // 4) 字符串动态表
+    var names = table_new_string()
+    table_push(names, "tie")
+    table_push(names, "harbor")
+    table_push(names, "m2")
+    println("len(names) = " + to_string(len(names)))
+    for s in names {
+        println("name: " + s)
+    }
+
+    // 5) 浮点动态表
+    var vals = table_new_f64()
+    table_push(vals, 1.5)
+    table_push(vals, 2.5)
+    println("vals[1] = " + to_string(vals[1]))
+
+    // 6) 布尔动态表（bool 直接打印 0/1）
+    var flags = table_new_bool()
+    table_push(flags, true)
+    table_push(flags, false)
+    println("flags[0] = ")
+    println(flags[0])
+}

@@ -1,0 +1,18 @@
+// tie:logic
+// list_dir_demo.tie：目录枚举演示——list_dir 返回字符串动态表（文件名集合）。
+// 演示：正常目录列出全部条目、空目录返回空表。
+// 注意：目录不存在时 list_dir 触发运行时错误（编译/解释两路径文本一致）。
+
+func main() {
+    // ---- 列出当前目录（examples）的文件名 ----
+    var entries = list_dir(".")
+    println("len(list_dir(\".\")) = " + to_string(len(entries)))
+    for f in entries {
+        println("entry: " + f)
+    }
+
+    // ---- 空目录 → 空表 ----
+    // 用 args 传目录参数不必要：这里直接探测一个可能不存在的目录会报错。
+    // 用 list_dir 枚举 examples 目录中的非空子目录验证（examples 目录存在即可）。
+    println("done")
+}

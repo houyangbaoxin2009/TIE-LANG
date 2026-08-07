@@ -1,0 +1,34 @@
+// tie:logic
+// tie:opt=2
+
+// 命名空间语法演示：块式声明 + :: 路径访问 + . 成员调用
+// 编译：tie examples/namespace_demo.tie
+// 期望输出：Hello from tcmsg / Hello from tcmsg.error
+
+namespace tcmsg {
+    func hello() -> string {
+        return "Hello from tcmsg"
+    }
+
+    namespace error {
+        func hello() -> string {
+            return "Hello from tcmsg.error"
+        }
+
+        // 命名空间内裸调用：前缀补全 → tcmsg::error::inner
+        func inner() -> string {
+            return "inner"
+        }
+
+        func call_inner() -> string {
+            return inner()
+        }
+    }
+}
+
+func main() {
+    // 路径访问（::）+ 成员调用（.）
+    println(tcmsg.hello())
+    println(tcmsg.error.hello())
+    println(tcmsg.error.call_inner())
+}

@@ -39,23 +39,41 @@ pub struct SemanticResult {
     pub const_vars: std::collections::HashSet<String>,
     /// 表元数据：表字面量表达式地址 → 元素类型与长度（IR 生成布局用）
     pub tables: HashMap<usize, TableInfo>,
+    /// 表变量元数据：函数名 + 变量名 → 元素类型与动态标志（IR 生成动态表操作用）。
+    /// 与 Analyzer 内部的 table_vars 同步（IR 层只读 SemanticResult，不持有 Analyzer）。
+    pub table_vars: HashMap<(String, String), TableInfo>,
+    /// 函数返回的动态表元素类型：函数名 → 元素类型（None = 未知/冲突，调用方不可
+    /// 对返回表做 for/下标/table_at）。无泛型，靠分析函数体内 return 语句推断。
+    pub table_ret_elems: HashMap<String, Option<TypeSpec>>,
     /// 类信息：类名 → 拍平后的字段/方法表（P8，IR 布局与 mangle 用）
     pub classes: HashMap<String, ClassInfo>,
+    /// 命名空间函数全名：FnDefStmt 地址 → 全名（如 "tcmsg::error::no_file"）。
+    /// 仅命名空间内的函数需要（顶层函数全名即裸名）。IR 层生成 LLVM 符号用。
+    pub fn_full_names: HashMap<usize, String>,
+    /// 命名空间调用解析：调用表达式地址 → 解析后的全名（如 MethodCall 的 receiver
+    /// 是 Path 时拼接 "tcmsg::error::no_file"）。IR 层与解释层据此生成调用目标。
+    /// 键与 expr_types 一致（AST 节点地址），调用方用 addr_of(expr) 查询。
+    pub resolved_calls: HashMap<usize, String>,
 }
 
-/// 表（table）的布局信息：元素类型与元素个数。
+/// 表（table）的布局信息：元素类型、元素个数与是否动态。
 #[derive(Debug, Clone)]
 pub struct TableInfo {
     /// 元素类型（同构容器）
     pub elem_ty: TypeSpec,
-    /// 元素个数（编译期已知，定长）
+    /// 元素个数（编译期已知，定长；动态表为 0，运行时以 len 为准）
     pub len: usize,
+    /// 是否动态表（table_new_* 创建，运行时 {ptr,len,cap} 结构；false = 定长字面量）
+    pub dynamic: bool,
 }
 
 /// 函数签名。
 #[derive(Debug, Clone)]
 pub struct FuncSig {
     pub param_tys: Vec<TypeSpec>,
+    /// 参数默认值（可选参数）：与 param_tys 等长对齐，None = 必选参数。
+    /// 调用点省略实参时按此补齐（LLVM 函数签名不变，缺省实参在调用点生成）。
+    pub param_defaults: Vec<Option<Expr>>,
     pub ret_ty: TypeSpec,
 }
 
@@ -93,31 +111,75 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
         result: SemanticResult::default(),
         table_vars: HashMap::new(),
         cur_fn: String::new(),
+        ns_stack: Vec::new(),
     };
 
-    // 第一遍：收集所有函数签名（允许前向引用）
+    // 第一遍：收集所有函数签名（允许前向引用）。
+    // 顶层函数以裸名注册；命名空间内函数以全名（"tcmsg::error::no_file"）注册，
+    // 并记录 FnDefStmt 地址 → 全名的映射（IR 层生成 LLVM 符号用）。
     for stmt in &program.stmts {
-        if let Stmt::FnDef(f) = stmt {
-            let sig = FuncSig {
-                param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
-                ret_ty: f.ret_ty.clone(),
-            };
-            if ctx.result.funcs.insert(f.name.clone(), sig).is_some() {
-                return Err(SemanticError {
-                    span: f.span,
-                    message: format!("函数 '{}' 重复定义", f.name),
-                });
+        match stmt {
+            Stmt::FnDef(f) => {
+                let sig = FuncSig {
+                    param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
+                    param_defaults: f.params.iter().map(|p| p.default.clone()).collect(),
+                    ret_ty: f.ret_ty.clone(),
+                };
+                if ctx.result.funcs.insert(f.name.clone(), sig).is_some() {
+                    return Err(SemanticError {
+                        span: f.span,
+                        message: format!("函数 '{}' 重复定义", f.name),
+                    });
+                }
             }
+            Stmt::Namespace(ns) => {
+                // 命名空间体内函数：递归注册全名（当前命名空间路径 + 函数名）
+                ctx.collect_ns_funcs(&ns.body, &ns.path)?;
+            }
+            _ => {}
         }
     }
 
     // 类收集：继承链解析（环检测）+ 字段/方法拍平 + 冲突检查（类名 vs 函数名）
     ctx.collect_classes(program)?;
 
-    // 第二遍：检查函数体
+    // 内置 list_dir：返回「字符串动态表」（文件名集合）。预登记元素类型，使
+    // `var t = list_dir(p)` / `for x in list_dir(p)` / `table_at(t, i)` 的
+    // 元素类型静态可知（与 table_new_string 同布局；IR 层按 string 桥访问）。
+    ctx.result
+        .table_ret_elems
+        .insert("list_dir".to_string(), Some(TypeSpec::Named(TyKw::Str)));
+
+    // 表返回预扫描（fixpoint）：收集「返回动态表」的函数及其元素类型，支持前向引用。
+    // 一个函数返回动态表，当且仅当其 return 表达式是 table_new_* 调用、调用另一个
+    // 已知返回动态表的函数，或返回本函数内声明的动态表变量。反复扫描直到不再新增。
+    loop {
+        let mut changed = false;
+        for stmt in &program.stmts {
+            if let Stmt::FnDef(f) = stmt {
+                if ctx.result.table_ret_elems.contains_key(&f.name) {
+                    continue;
+                }
+                // 先收集本函数内声明的动态表变量 → 元素类型（供 return 变量解析）
+                let mut local: HashMap<String, TypeSpec> = HashMap::new();
+                ctx.collect_local_dyn_tables(&f.body, &mut local);
+                if let Some(te) = ctx.scan_return_table_elem(&f.body, &local) {
+                    ctx.result.table_ret_elems.insert(f.name.clone(), Some(te));
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // 第二遍：检查函数体（含命名空间内函数；裸调用按命名空间前缀补全解析）
     for stmt in &program.stmts {
-        if let Stmt::FnDef(f) = stmt {
-            ctx.check_fn(f)?;
+        match stmt {
+            Stmt::FnDef(f) => ctx.check_fn(f)?,
+            Stmt::Namespace(ns) => ctx.check_ns_stmts(&ns.body, &ns.path)?,
+            _ => {}
         }
     }
 
@@ -141,11 +203,84 @@ struct Analyzer {
     table_vars: HashMap<(String, String), TableInfo>,
     /// 当前检查的函数名（table_vars 键用）
     cur_fn: String,
+    /// 当前命名空间前缀栈（检查命名空间体内的函数时用；空 = 顶层）。
+    /// 元素按从外到内排列，如 `namespace tcmsg { namespace error { } }` → ["tcmsg","error"]。
+    ns_stack: Vec<String>,
 }
 
 impl Analyzer {
+    /// 命名空间内函数收集（第一遍）：递归注册全名（路径段::函数名），支持嵌套命名空间。
+    ///
+    /// - 函数以全名进 funcs 表（如 "tcmsg::error::no_file"），供命名空间路径调用解析；
+    /// - 同时记录 FnDefStmt 地址 → 全名到 fn_full_names（IR 层生成 LLVM 符号用）。
+    /// - 体内类定义：当前不支持（命名空间内只允许函数与嵌套命名空间，parser 已限制）。
+    fn collect_ns_funcs(&mut self, stmts: &[Stmt], prefix: &[String]) -> Result<(), SemanticError> {
+        for stmt in stmts {
+            match stmt {
+                Stmt::FnDef(f) => {
+                    // 全名 = 命名空间路径（已含外层）:: 函数名
+                    let mut segs = prefix.to_vec();
+                    segs.push(f.name.clone());
+                    let full = segs.join("::");
+                    let sig = FuncSig {
+                        param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
+                        param_defaults: f.params.iter().map(|p| p.default.clone()).collect(),
+                        ret_ty: f.ret_ty.clone(),
+                    };
+                    if self.result.funcs.insert(full.clone(), sig).is_some() {
+                        return Err(SemanticError {
+                            span: f.span,
+                            message: format!("函数 '{}' 在命名空间 '{}' 中重复定义", f.name, prefix.join("::")),
+                        });
+                    }
+                    // FnDefStmt 地址 → 全名（IR 层生成符号用；与 AST 同生命周期）
+                    self.result
+                        .fn_full_names
+                        .insert(f as *const FnDefStmt as usize, full);
+                }
+                Stmt::Namespace(inner) => {
+                    // 嵌套命名空间：路径拼接后递归
+                    let mut segs = prefix.to_vec();
+                    segs.extend(inner.path.iter().cloned());
+                    self.collect_ns_funcs(&inner.body, &segs)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// 命名空间体内语句检查（第二遍）：维护 ns_stack（裸调用前缀补全依据），
+    /// 递归检查体内函数与嵌套命名空间。
+    fn check_ns_stmts(&mut self, stmts: &[Stmt], prefix: &[String]) -> Result<(), SemanticError> {
+        // 推入当前命名空间路径（check_fn 内部据此补全裸调用）
+        self.ns_stack.extend(prefix.iter().cloned());
+        for stmt in stmts {
+            match stmt {
+                Stmt::FnDef(f) => self.check_fn(f)?,
+                Stmt::Namespace(inner) => {
+                    // 嵌套命名空间：外层前缀已在栈上，递归只推内层路径
+                    self.check_ns_stmts(&inner.body, &inner.path)?;
+                }
+                _ => {}
+            }
+        }
+        // 弹出本层前缀（恢复调用方栈状态）
+        let cur = self.ns_stack.len();
+        self.ns_stack.truncate(cur.saturating_sub(prefix.len()));
+        Ok(())
+    }
+
     fn check_fn(&mut self, f: &FnDefStmt) -> Result<(), SemanticError> {
-        self.cur_fn = f.name.clone();
+        // cur_fn 用全名（命名空间函数 = 路径::函数名），与 IR 层 gen_fn 的 cur_fn
+        // 一致——table_vars/table_ret_elems 的键都依赖它（IR 层按同名查表）。
+        self.cur_fn = if self.ns_stack.is_empty() {
+            f.name.clone()
+        } else {
+            let mut segs = self.ns_stack.clone();
+            segs.push(f.name.clone());
+            segs.join("::")
+        };
         // 函数体内作用域：参数先入表
         let mut scope: HashMap<String, TypeSpec> = HashMap::new();
         for p in &f.params {
@@ -154,6 +289,81 @@ impl Analyzer {
                     span: p.span,
                     message: format!("参数 '{}' 重复", p.name),
                 });
+            }
+        }
+        // 可选参数（默认值）校验（M2.1 默认值参数）：
+        // - 默认值必须跟在必选参数之后（一旦出现默认值，后续参数必须都有默认值）；
+        // - 默认值限字面量：标量字面量（数/布尔/字符/字符串）或空表 `[]`（非空表
+        //   字面量暂不支持——表默认值的布局元数据按调用点展开，非空表会因语义
+        //   元数据键（表达式地址）与调用点克隆体不一致而失效，故语义层直接拦截）；
+        // - 默认值类型必须与参数类型匹配。
+        let mut seen_default = false;
+        for p in &f.params {
+            if p.default.is_some() {
+                seen_default = true;
+            } else if seen_default {
+                return Err(SemanticError {
+                    span: p.span,
+                    message: format!(
+                        "参数 '{}' 缺少默认值：可选参数（带默认值）必须连续排在必选参数之后",
+                        p.name
+                    ),
+                });
+            }
+        }
+        for p in &f.params {
+            let Some(d) = &p.default else { continue };
+            // 限字面量：标量字面量或空表 `[]`
+            let is_ok_literal = match d {
+                Expr::IntLit(_)
+                | Expr::FloatLit(_)
+                | Expr::BoolLit(_)
+                | Expr::CharLit(_)
+                | Expr::StrLit(_) => true,
+                Expr::TableLit { cells, .. } => cells.is_empty(),
+                _ => false,
+            };
+            if !is_ok_literal {
+                return Err(SemanticError {
+                    span: expr_span_of(d),
+                    message: format!(
+                        "参数 '{}' 的默认值必须是字面量（数/布尔/字符/字符串或空表 []）",
+                        p.name
+                    ),
+                });
+            }
+            // 类型匹配：默认值推导类型必须与参数类型兼容（空表 → table）
+            let dt = self.infer_expr(d, &scope)?;
+            if !types_match(&p.ty, &dt, Some(d)) {
+                return Err(SemanticError {
+                    span: expr_span_of(d),
+                    message: format!(
+                        "参数 '{}' 默认值类型不匹配：期望 {}，实际 {}",
+                        p.name,
+                        type_name(&p.ty),
+                        type_name(&dt)
+                    ),
+                });
+            }
+        }
+        // 表参数：按「动态字符串表」登记布局元数据（M2 无泛型，约定 table<string>）。
+        // 使函数体内可对表参数做 for 遍历 / len / table_at / 下标访问（如 std/json.tie
+        // 的 json_array/json_object 消费调用方传入的序列化片段表）。元素类型固定为 string，
+        // 与动态表（table_new_*）的 table_vars 布局结构一致。
+        for p in &f.params {
+            if p.ty == TypeSpec::Named(TyKw::Table) {
+                let info = TableInfo {
+                    elem_ty: TypeSpec::Named(TyKw::Str),
+                    len: 0,
+                    dynamic: true,
+                };
+                // 键用 cur_fn 全名（命名空间函数 = 路径::函数名），与 IR 层查询一致；
+                // 用裸名 f.name 会导致命名空间函数内下标访问查不到布局元数据。
+                self.table_vars
+                    .insert((self.cur_fn.clone(), p.name.clone()), info.clone());
+                self.result
+                    .table_vars
+                    .insert((self.cur_fn.clone(), p.name.clone()), info);
             }
         }
         for stmt in &f.body {
@@ -306,6 +516,16 @@ impl Analyzer {
                     message: format!("参数 '{}' 重复", p.name),
                 });
             }
+            // 方法默认值参数暂不支持（M3）：MethodSig 无默认值字段，调用点无法补齐。
+            if p.default.is_some() {
+                return Err(SemanticError {
+                    span: p.span,
+                    message: format!(
+                        "方法参数 '{}' 不支持默认值（方法默认值参数留待 M3，函数已支持）",
+                        p.name
+                    ),
+                });
+            }
         }
         for stmt in &m.body {
             self.check_stmt(stmt, &mut scope, &m.ret_ty)?;
@@ -381,39 +601,47 @@ impl Analyzer {
                             }
                             scope.insert(v.name.clone(), init_ty.clone());
                         } else if d.is_table() {
-                            // table：初始化必须是表字面量（数组/高级数组）
-                            let Expr::TableLit { cells, .. } = &v.init else {
-                                return Err(SemanticError {
-                                    span: v.span,
-                                    message: format!(
-                                        "变量 '{}' 标注 table，初始化必须是表字面量 [...]",
-                                        v.name
-                                    ),
-                                });
-                            };
-                            // M2 范围：仅支持单行纯位置表（无字符串 id、无分号分行）
-                            let rows: std::collections::HashSet<usize> =
-                                cells.iter().map(|c| c.row).collect();
-                            if rows.len() > 1 {
-                                return Err(SemanticError {
-                                    span: v.span,
-                                    message: "二维表（分号分行）的运行时留待 M3，当前仅支持单行表".into(),
-                                });
+                            // table：初始化必须是表字面量（定长）或 table_new_*/返回表的
+                            // 函数调用（动态，运行时 {ptr,len,cap} 结构）。
+                            if let Expr::TableLit { cells, .. } = &v.init {
+                                // M2 范围：仅支持单行纯位置表（无字符串 id、无分号分行）
+                                let rows: std::collections::HashSet<usize> =
+                                    cells.iter().map(|c| c.row).collect();
+                                if rows.len() > 1 {
+                                    return Err(SemanticError {
+                                        span: v.span,
+                                        message: "二维表（分号分行）的运行时留待 M3，当前仅支持单行表".into(),
+                                    });
+                                }
+                                if cells.iter().any(|c| matches!(c.id, Some(TableId::Str(_)))) {
+                                    return Err(SemanticError {
+                                        span: v.span,
+                                        message: "字符串 id 表（[\"a\":1]）的运行时留待 M3，当前仅支持数字下标".into(),
+                                    });
+                                }
+                                // 记录布局元数据：元素类型 = init 推导类型，长度 = 元素个数
+                                let info = TableInfo {
+                                    elem_ty: init_ty.clone(),
+                                    len: cells.len(),
+                                    dynamic: false,
+                                };
+                                self.result.tables.insert(addr_of(&v.init), info.clone());
+                                // 变量名 → 布局（下标访问/遍历时按变量名查询元素类型）
+                                self.table_vars
+                                    .insert((self.cur_fn.clone(), v.name.clone()), info.clone());
+                                self.result
+                                    .table_vars
+                                    .insert((self.cur_fn.clone(), v.name.clone()), info);
+                            } else {
+                                // 动态表：table_new_* 或返回表的函数调用（元素类型静态已知）
+                                let elem_ty = self.dynamic_table_elem_ty(&v.init, &v.name)?;
+                                let info = TableInfo { elem_ty, len: 0, dynamic: true };
+                                self.table_vars
+                                    .insert((self.cur_fn.clone(), v.name.clone()), info.clone());
+                                self.result
+                                    .table_vars
+                                    .insert((self.cur_fn.clone(), v.name.clone()), info);
                             }
-                            if cells.iter().any(|c| matches!(c.id, Some(TableId::Str(_)))) {
-                                return Err(SemanticError {
-                                    span: v.span,
-                                    message: "字符串 id 表（[\"a\":1]）的运行时留待 M3，当前仅支持数字下标".into(),
-                                });
-                            }
-                            // 记录布局元数据：元素类型 = init 推导类型，长度 = 元素个数
-                            let info = TableInfo {
-                                elem_ty: init_ty.clone(),
-                                len: cells.len(),
-                            };
-                            self.result.tables.insert(addr_of(&v.init), info.clone());
-                            // 变量名 → 布局（下标访问/遍历时按变量名查询元素类型）
-                            self.table_vars.insert((self.cur_fn.clone(), v.name.clone()), info);
                             // scope 存 Table 标记（表是容器，不是普通值）
                             scope.insert(v.name.clone(), TypeSpec::Named(TyKw::Table));
                         } else if !types_match(d, &init_ty, Some(&v.init)) {
@@ -436,6 +664,17 @@ impl Analyzer {
                                 span: v.span,
                                 message: format!("变量 '{}' 不能用 void 表达式初始化", v.name),
                             });
+                        }
+                        // 未标注的动态表：`var x = table_new_i64()` / `var x = make_list(5)`
+                        // （init_ty 为 Table 标记，元素类型需从调用名/返回表推断）
+                        if init_ty == TypeSpec::Named(TyKw::Table) {
+                            let elem_ty = self.dynamic_table_elem_ty(&v.init, &v.name)?;
+                            let info = TableInfo { elem_ty, len: 0, dynamic: true };
+                            self.table_vars
+                                .insert((self.cur_fn.clone(), v.name.clone()), info.clone());
+                            self.result
+                                .table_vars
+                                .insert((self.cur_fn.clone(), v.name.clone()), info);
                         }
                         scope.insert(v.name.clone(), init_ty.clone());
                     }
@@ -471,6 +710,19 @@ impl Analyzer {
                     span: stmt_span(stmt),
                     message: "import 语句只能出现在文件顶层".into(),
                 })
+            }
+            Stmt::Namespace(ns) => {
+                // 命名空间块（函数体内出现）：命名空间只允许在顶层（parser 已限制），
+                // 但防御性处理——递归检查体内语句。体内 FnDef/嵌套 Namespace 已由
+                // analyze 顶层收集阶段以全名注册并检查，此处跳过避免重复检查与
+                // "嵌套函数定义"误报；其余语句（如表达式）递归检查。
+                for s in &ns.body {
+                    match s {
+                        Stmt::FnDef(_) | Stmt::Namespace(_) => {} // 已由 analyze 处理
+                        _ => self.check_stmt(s, scope, ret_ty)?,
+                    }
+                }
+                Ok(())
             }
             Stmt::Expr(e) => {
                 let ty = self.infer_expr(&e.expr, scope)?;
@@ -541,6 +793,14 @@ impl Analyzer {
                     && matches!(e, Expr::TupleLit { .. })
                 {
                     self.result.expr_types.insert(addr_of(e), ret_ty.clone());
+                }
+                // 动态表返回：记录元素类型（供调用方推断返回表的元素类型）。
+                // 支持返回 table_new_*、返回表的函数调用，或本函数内声明的动态表变量。
+                if let Some(e) = &r.expr
+                    && matches!(ret_ty, TypeSpec::Named(TyKw::Table))
+                {
+                    let elem_ty = self.table_arg_elem_ty(e, scope)?;
+                    self.result.table_ret_elems.insert(self.cur_fn.clone(), Some(elem_ty));
                 }
                 Ok(())
             }
@@ -757,6 +1017,18 @@ impl Analyzer {
                     })
                 }
             },
+            // 命名空间路径（a::b::c）本身不是值表达式：只能作为 MethodCall 的
+            // receiver（tcmsg::error.no_file()），独立出现即语义错误。
+            Expr::Path { segments, span } => {
+                return Err(SemanticError {
+                    span: *span,
+                    message: format!(
+                        "命名空间路径 '{}' 不能作为值使用（只能用于调用，如 '{}::xxx()'）",
+                        segments.join("::"),
+                        segments.join("::")
+                    ),
+                })
+            }
             Expr::Call { name, args, span } => {
                 // 构造调用：`Counter(1, 2)` 命中类名 → 按字段逐位置初始化（P8）。
                 // 参数个数 ≤ 字段数（缺省用字段默认值/零值）；类型逐个匹配。
@@ -828,6 +1100,102 @@ impl Analyzer {
                         span: expr_span_of(&args[0]),
                         message: format!("len() 参数必须是字符串或表，实际是 {}", type_name(&at)),
                     });
+                }
+                // 内置函数 table_new_*：零参数，创建空动态表，返回 table。
+                // 元素类型由函数名决定（i64/f64/string/bool），运行时 {ptr,len,cap} 结构。
+                if let Some(elem_ty) = table_new_elem_ty(name) {
+                    if !args.is_empty() {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("{name}() 期望 0 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    // 记下返回元素类型（调用点处用：函数返回表时由 table_ret_elems 承担，
+                    // 直接赋给变量的动态表由 VarDecl 分支的 dynamic_table_elem_ty 解析）。
+                    self.result.expr_types.insert(addr_of(expr), TypeSpec::Named(TyKw::Table));
+                    let _ = elem_ty;
+                    return Ok(TypeSpec::Named(TyKw::Table));
+                }
+                // 内置函数 table_push：双参数（表 + 元素），void。
+                // 元素类型须与表的元素类型一致（定长/动态表均查 table_vars）。
+                if name == "table_push" {
+                    if args.len() != 2 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("table_push() 期望 2 个参数（表, 元素），实际 {} 个", args.len()),
+                        });
+                    }
+                    let t_ty = self.infer_expr(&args[0], scope)?;
+                    let x_ty = self.infer_expr(&args[1], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[1]), x_ty.clone());
+                    if !matches!(&t_ty, TypeSpec::Named(TyKw::Table)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("table_push() 第 1 个参数必须是表，实际是 {}", type_name(&t_ty)),
+                        });
+                    }
+                    // 第 1 个参数必须是表变量（table_vars 才有元素类型；IR 需地址写回）
+                    let Expr::Var(name0) = &args[0] else {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: "table_push() 第 1 个参数必须是表变量（不能是字面量/下标）".into(),
+                        });
+                    };
+                    let info = self
+                        .table_vars
+                        .get(&(self.cur_fn.clone(), name0.clone()))
+                        .ok_or_else(|| SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("table_push() 找不到表变量 '{}' 的元素类型", name0),
+                        })?;
+                    // 只有动态表（table_new_* 创建）可 push；定长表用下标赋值/字面量
+                    if !info.dynamic {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("table_push() 只能用于动态表（table_new_* 创建），'{}' 是定长表", name0),
+                        });
+                    }
+                    if !types_match(&info.elem_ty, &x_ty, Some(&args[1])) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[1]),
+                            message: format!(
+                                "table_push() 元素类型不匹配：表 '{}' 的元素是 {}，推入的是 {}",
+                                name0,
+                                type_name(&info.elem_ty),
+                                type_name(&x_ty)
+                            ),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Void));
+                }
+                // 内置函数 table_at：双参数（表, 下标），返回表元素类型。
+                // 下标必须整数；越界是运行时错误（编译路径与解释路径报一致中文错误）。
+                if name == "table_at" {
+                    if args.len() != 2 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("table_at() 期望 2 个参数（表, 下标），实际 {} 个", args.len()),
+                        });
+                    }
+                    let t_ty = self.infer_expr(&args[0], scope)?;
+                    let i_ty = self.infer_expr(&args[1], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[1]), i_ty.clone());
+                    if !matches!(&t_ty, TypeSpec::Named(TyKw::Table)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("table_at() 第 1 个参数必须是表，实际是 {}", type_name(&t_ty)),
+                        });
+                    }
+                    if !i_ty.is_int() {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[1]),
+                            message: format!("table_at() 下标必须是整数，实际是 {}", type_name(&i_ty)),
+                        });
+                    }
+                    // 元素类型：表变量（table_vars）/ 返回表的函数（table_ret_elems）。
+                    // 定长表用下标 t[i] 访问，table_at 仅用于动态表（运行时 {ptr,len,cap}）。
+                    let elem_ty = self.table_arg_elem_ty(&args[0], scope)?;
+                    return Ok(elem_ty);
                 }
                 // 内置函数 print：同 println（不换行），任意参数，void
                 if name == "print" {
@@ -1059,6 +1427,125 @@ impl Analyzer {
                     }
                     return Ok(TypeSpec::Named(TyKw::I64));
                 }
+                // 内置函数 arg_count：零参数，返回 i64（命令行用户参数个数，不含程序名）。
+                // 进程/环境 floor：编译与解释两路径共用 std::env::args（见 tie-interp 桥）。
+                if name == "arg_count" {
+                    if !args.is_empty() {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("arg_count() 期望 0 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::I64));
+                }
+                // 内置函数 arg_string：整数参数，返回 string（第 i 个用户命令行参数；
+                // 越界返回空串）。
+                if name == "arg_string" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("arg_string() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !at.is_int() {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("arg_string() 参数必须是整数，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Str));
+                }
+                // 内置函数 list_dir：单字符串参数（目录路径），返回 table<string>（文件名集合）。
+                // 目录不存在/读取失败 → 运行时错误（文本与编译路径一致）。
+                // M2 文件系统 floor：目录枚举是 Rust 层唯一实现（tie 无法表达目录遍历）。
+                if name == "list_dir" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("list_dir() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("list_dir() 参数必须是字符串，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Table));
+                }
+                // 内置函数 msg_set_lang：单字符串参数（语言名），void（切换消息语言）。
+                // 消息系统 floor（#25）：语言与字典是进程内可变状态，tie 无全局可变变量，
+                // 由 Rust 层 thread_local 持有（实在不行才 Rust 的典型场景）。
+                if name == "msg_set_lang" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("msg_set_lang() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("msg_set_lang() 参数必须是字符串，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Void));
+                }
+                // 内置函数 msg_get_lang：零参数，返回 string（当前消息语言）。
+                // 与 msg_set_lang 配套：供标准库按当前语言匹配文本（tcmsg 综合方案）。
+                if name == "msg_get_lang" {
+                    if !args.is_empty() {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("msg_get_lang() 期望 0 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Str));
+                }
+                // 内置函数 msg_register：三个字符串参数（键, 语言, 文本），void（登记消息）。
+                if name == "msg_register" {
+                    if args.len() != 3 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("msg_register() 期望 3 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    for a in args {
+                        let at = self.infer_expr(a, scope)?;
+                        self.result.expr_types.insert(addr_of(a), at.clone());
+                        if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!("msg_register() 参数必须是字符串，实际是 {}", type_name(&at)),
+                            });
+                        }
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Void));
+                }
+                // 内置函数 msg_t：单字符串参数（键），返回 string（当前语言翻译，回退 zh，再回退键本身）。
+                if name == "msg_t" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("msg_t() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("msg_t() 参数必须是字符串，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Str));
+                }
                 // 内置函数 sqrt/sin/cos/tan/exp/log/floor/ceil/round：单数字参数，返回 f64。
                 // 数字重载：语义层允许任意数字类型（num 类别框），IR 层按实参类型提升为 double。
                 if matches!(
@@ -1101,17 +1588,47 @@ impl Analyzer {
                     }
                     return Ok(TypeSpec::Named(TyKw::F64));
                 }
-                // 用户函数：校验参数个数与类型
-                let sig = self.result.funcs.get(name).cloned().ok_or_else(|| SemanticError {
-                    span: *span,
-                    message: format!("未定义的函数 '{name}'"),
+                // 用户函数：校验参数个数与类型。
+                // 裸名解析顺序：先查裸名（顶层函数），再按当前命名空间前缀补全
+                // （命名空间内函数互调，如 tcmsg::error 内 error_guard() 裸调）。
+                // 若补全命中，记录调用表达式 → 全名映射（IR/解释层生成调用目标）。
+                let call_name = if self.result.funcs.contains_key(name) {
+                    name.clone()
+                } else if !self.ns_stack.is_empty() {
+                    let mut segs = self.ns_stack.clone();
+                    segs.push(name.clone());
+                    let full = segs.join("::");
+                    if self.result.funcs.contains_key(&full) {
+                        full
+                    } else {
+                        name.clone() // 前缀补全未命中：保持裸名，下方按未定义报错
+                    }
+                } else {
+                    name.clone()
+                };
+                let sig = self.result.funcs.get(&call_name).cloned().ok_or_else(|| {
+                    SemanticError {
+                        span: *span,
+                        message: format!("未定义的函数 '{name}'"),
+                    }
                 })?;
-                if sig.param_tys.len() != args.len() {
+                // 裸调用命中命名空间函数 → 记录全名（IR/解释层据此生成调用）
+                if call_name != *name {
+                    self.result.resolved_calls.insert(addr_of(expr), call_name.clone());
+                }
+                // 参数个数区间检查（默认值参数）：实参数必须在 [必选数, 总形参数] 内。
+                // 必选数 = 无默认值的形参数（可选参数连续排在尾部，已由 check_fn 保证）。
+                let required = sig
+                    .param_defaults
+                    .iter()
+                    .take_while(|d| d.is_none())
+                    .count();
+                if args.len() < required || args.len() > sig.param_tys.len() {
                     return Err(SemanticError {
                         span: *span,
                         message: format!(
-                            "函数 '{name}' 期望 {} 个参数，实际 {} 个",
-                            sig.param_tys.len(),
+                            "函数 '{call_name}' 期望 {} 个参数，实际 {} 个",
+                            param_count_desc(required, sig.param_tys.len()),
                             args.len()
                         ),
                     });
@@ -1122,7 +1639,7 @@ impl Analyzer {
                         return Err(SemanticError {
                             span: expr_span_of(a),
                             message: format!(
-                                "调用 '{name}' 参数类型不匹配：期望 {}，实际 {}",
+                                "调用 '{call_name}' 参数类型不匹配：期望 {}，实际 {}",
                                 type_name(want),
                                 type_name(&at)
                             ),
@@ -1336,7 +1853,7 @@ impl Analyzer {
                 }
                 // 表类型：元素类型（当前 IR 阶段仅支持数/字符串元素的同构表）
                 // 记录布局元数据：元素类型 + 长度（len(表) 直接查；表变量声明分支同样插入，幂等）
-                let info = TableInfo { elem_ty: first_ty.clone(), len: cells.len() };
+                let info = TableInfo { elem_ty: first_ty.clone(), len: cells.len(), dynamic: false };
                 self.result.tables.insert(addr_of(expr), info);
                 first_ty
             }
@@ -1475,7 +1992,88 @@ impl Analyzer {
             }
             Expr::MethodCall { receiver, method, args, span } => {
                 // 方法调用：receiver 是变量/this → 实例方法（receiver 类型必须是类）；
-                // receiver 是类名 → 静态方法（无 this）。同一变体两种语义，此处分发。
+                // receiver 是类名 → 静态方法（无 this）；
+                // receiver 是命名空间路径（a::b）→ 命名空间函数调用（无 this）。
+                // 同一变体多种语义，此处分发。
+                //
+                // 命名空间函数：receiver 是 Expr::Path（a::b）、未绑定 Var（a）或
+                // FieldAccess 链（a.b，即 tcmsg.error.no_file 的 tcmsg.error）——
+                // 后两者是点分/单段命名空间的语法形态。全名 = 路径段::方法名
+                // （如 tcmsg::error.no_file() → "tcmsg::error::no_file"）。
+                // 记录调用表达式 → 全名映射，IR/解释层据此生成调用目标。
+                // 注意：Var/FieldAccess 只在「未绑定变量（非类实例/非变量）」时按
+                // 命名空间试探——绑定变量走实例方法，类名走静态方法。
+                let ns_prefix: Option<Vec<String>> = match receiver.as_ref() {
+                    Expr::Path { segments, .. } => Some(segments.clone()),
+                    Expr::Var(rname) if !scope.contains_key(rname) => {
+                        // 单段命名空间：funcs 中存在 `rname::` 前缀键即视为命名空间，
+                        // 全名缺失时由下方 get().ok_or_else 报"命名空间函数未定义"。
+                        if ns_prefix_exists(&self.result.funcs, &[rname.clone()]) {
+                            Some(vec![rname.clone()])
+                        } else {
+                            None
+                        }
+                    }
+                    // 点分命名空间链（tcmsg.error.no_file）：拍平 FieldAccess → 路径段
+                    Expr::FieldAccess { .. }
+                        if ns_path_segments(receiver, scope).is_some() =>
+                    {
+                        let segs = ns_path_segments(receiver, scope).expect("上面已确认 Some");
+                        // 存在该前缀的命名空间函数即视为命名空间调用
+                        if ns_prefix_exists(&self.result.funcs, &segs) {
+                            Some(segs)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(segs) = ns_prefix {
+                    let mut segs = segs;
+                    segs.push(method.clone());
+                    let full = segs.join("::");
+                    let sig = self
+                        .result
+                        .funcs
+                        .get(&full)
+                        .cloned()
+                        .ok_or_else(|| SemanticError {
+                            span: *span,
+                            message: format!("命名空间函数 '{full}' 未定义"),
+                        })?;
+                    // 参数个数区间检查（默认值参数）：实参数必须在 [必选数, 总形参数] 内。
+                    let required = sig
+                        .param_defaults
+                        .iter()
+                        .take_while(|d| d.is_none())
+                        .count();
+                    if args.len() < required || args.len() > sig.param_tys.len() {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!(
+                                "命名空间函数 '{full}' 期望 {} 个参数，实际 {} 个",
+                                param_count_desc(required, sig.param_tys.len()),
+                                args.len()
+                            ),
+                        });
+                    }
+                    for (a, want) in args.iter().zip(sig.param_tys.iter()) {
+                        let at = self.infer_expr(a, scope)?;
+                        if !types_match(want, &at, Some(a)) {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!(
+                                    "调用 '{full}' 参数类型不匹配：期望 {}，实际 {}",
+                                    type_name(want),
+                                    type_name(&at)
+                                ),
+                            });
+                        }
+                        self.result.expr_types.insert(addr_of(a), at);
+                    }
+                    self.result.resolved_calls.insert(addr_of(expr), full);
+                    return Ok(sig.ret_ty);
+                }
                 // 静态方法：receiver 是 Var 且名字在 classes 表中（未绑定变量）
                 if let Expr::Var(rname) = receiver.as_ref()
                     && !scope.contains_key(rname)
@@ -1545,6 +2143,190 @@ impl Analyzer {
             }
         };
         Ok(ty)
+    }
+
+    /// 递归扫描语句树，寻找「返回动态表」的 return 表达式元素类型。
+    ///
+    /// 用于表返回预扫描（fixpoint）：遍历语句块（含 if/while/for 嵌套）的 return 语句，
+    /// 若其表达式是 table_new_* 调用、调用已知返回动态表的函数，或返回本函数内声明的
+    /// 动态表变量（local 表），则返回元素类型。
+    fn scan_return_table_elem(&self, stmts: &[Stmt], local: &HashMap<String, TypeSpec>) -> Option<TypeSpec> {
+        for s in stmts {
+            match s {
+                Stmt::Return(r) => {
+                    let e = r.expr.as_ref()?;
+                    match e {
+                        Expr::Call { name, .. } => {
+                            // table_new_*：元素类型由名字决定
+                            if let Some(elem) = table_new_elem_ty(name) {
+                                return Some(elem);
+                            }
+                            // 调用已知返回动态表的函数
+                            match self.result.table_ret_elems.get(name) {
+                                Some(Some(elem)) => return Some(elem.clone()),
+                                _ => continue,
+                            }
+                        }
+                        // 返回本函数内声明的动态表变量
+                        Expr::Var(name) => {
+                            if let Some(elem) = local.get(name) {
+                                return Some(elem.clone());
+                            }
+                            continue;
+                        }
+                        _ => continue,
+                    }
+                }
+                Stmt::If(i) => {
+                    if let Some(e) = self.scan_return_table_elem(&i.then_branch, local) {
+                        return Some(e);
+                    }
+                    if let Some(e) = self.scan_return_table_elem(&i.else_branch, local) {
+                        return Some(e);
+                    }
+                }
+                Stmt::While(w) => {
+                    if let Some(e) = self.scan_return_table_elem(&w.body, local) {
+                        return Some(e);
+                    }
+                }
+                Stmt::For(f) => {
+                    if let Some(e) = self.scan_return_table_elem(&f.body, local) {
+                        return Some(e);
+                    }
+                }
+                Stmt::Switch(s) => {
+                    for c in &s.cases {
+                        if let Some(e) = self.scan_return_table_elem(&c.body, local) {
+                            return Some(e);
+                        }
+                    }
+                    if let Some(e) = self.scan_return_table_elem(&s.default_body, local) {
+                        return Some(e);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// 收集语句块内声明的动态表变量 → 元素类型（供表返回预扫描解析 `return 变量`）。
+    ///
+    /// 只认 `var x = table_new_*()` 或 `var x = <已知返回表的函数>()`；嵌套块一并收集。
+    fn collect_local_dyn_tables(&self, stmts: &[Stmt], out: &mut HashMap<String, TypeSpec>) {
+        for s in stmts {
+            match s {
+                Stmt::VarDecl(v) => {
+                    if let Expr::Call { name, .. } = &v.init {
+                        if let Some(elem) = table_new_elem_ty(name) {
+                            out.insert(v.name.clone(), elem);
+                        } else if let Some(Some(elem)) = self.result.table_ret_elems.get(name) {
+                            out.insert(v.name.clone(), elem.clone());
+                        }
+                    }
+                }
+                Stmt::If(i) => {
+                    self.collect_local_dyn_tables(&i.then_branch, out);
+                    self.collect_local_dyn_tables(&i.else_branch, out);
+                }
+                Stmt::While(w) => self.collect_local_dyn_tables(&w.body, out),
+                Stmt::For(f) => self.collect_local_dyn_tables(&f.body, out),
+                Stmt::Switch(s) => {
+                    for c in &s.cases {
+                        self.collect_local_dyn_tables(&c.body, out);
+                    }
+                    self.collect_local_dyn_tables(&s.default_body, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// 解析「动态表构造/返回」调用的元素类型。
+    ///
+    /// 支持：table_new_*（元素类型由名字决定）与返回动态表的用户函数
+    /// （元素类型由 table_ret_elems 推断）。返回 Err 表示该表达式不是合法的动态表来源。
+    fn dynamic_table_elem_ty(&self, expr: &Expr, var_name: &str) -> Result<TypeSpec, SemanticError> {
+        let Expr::Call { name, span, .. } = expr else {
+            return Err(SemanticError {
+                span: expr_span_of(expr),
+                message: format!(
+                    "变量 '{}' 标注 table，初始化必须是表字面量 [...] 或 table_new_* / 返回表的函数调用",
+                    var_name
+                ),
+            });
+        };
+        // table_new_*：元素类型由名字决定
+        if let Some(elem) = table_new_elem_ty(name) {
+            return Ok(elem);
+        }
+        // 用户函数返回表：查 table_ret_elems
+        match self.result.table_ret_elems.get(name) {
+            Some(Some(elem)) => Ok(elem.clone()),
+            Some(None) => Err(SemanticError {
+                span: *span,
+                message: format!(
+                    "函数 '{name}' 返回的表元素类型未知，无法确定 '{}' 的元素类型",
+                    var_name
+                ),
+            }),
+            None => Err(SemanticError {
+                span: *span,
+                message: format!("函数 '{name}' 未定义或不是返回表的函数"),
+            }),
+        }
+    }
+
+    /// 解析 table_at / 下标访问的表参数的元素类型。
+    ///
+    /// 表字面量查 tables 元数据；表变量查 table_vars；返回表的函数查 table_ret_elems。
+    fn table_arg_elem_ty(
+        &self,
+        expr: &Expr,
+        scope: &HashMap<String, TypeSpec>,
+    ) -> Result<TypeSpec, SemanticError> {
+        match expr {
+            Expr::TableLit { .. } => {
+                let info = self.result.tables.get(&addr_of(expr)).ok_or_else(|| SemanticError {
+                    span: expr_span_of(expr),
+                    message: "找不到表字面量的元素类型元数据".into(),
+                })?;
+                Ok(info.elem_ty.clone())
+            }
+            Expr::Var(name) => {
+                // 表变量：查 table_vars（定长/动态统一）
+                if let Some(info) = self.table_vars.get(&(self.cur_fn.clone(), name.clone())) {
+                    return Ok(info.elem_ty.clone());
+                }
+                // 函数参数（scope 类型为 Table，但无 table_vars 元数据）→ 元素类型未知
+                if matches!(scope.get(name), Some(TypeSpec::Named(TyKw::Table))) {
+                    return Err(SemanticError {
+                        span: expr_span_of(expr),
+                        message: format!("表参数 '{}' 的元素类型未知，无法确定 table_at 返回类型", name),
+                    });
+                }
+                Err(SemanticError {
+                    span: expr_span_of(expr),
+                    message: format!("'{}' 不是表变量", name),
+                })
+            }
+            Expr::Call { name, .. } => match self.result.table_ret_elems.get(name) {
+                Some(Some(elem)) => Ok(elem.clone()),
+                Some(None) => Err(SemanticError {
+                    span: expr_span_of(expr),
+                    message: format!("函数 '{name}' 返回的表元素类型未知"),
+                }),
+                None => Err(SemanticError {
+                    span: expr_span_of(expr),
+                    message: format!("函数 '{name}' 未定义或不是返回表的函数"),
+                }),
+            },
+            _ => Err(SemanticError {
+                span: expr_span_of(expr),
+                message: "table_at 第 1 个参数必须是表字面量、表变量或返回表的函数".into(),
+            }),
+        }
     }
 
     /// 校验方法调用的实参（个数 + 逐个类型匹配）。
@@ -1701,6 +2483,53 @@ fn addr_of(expr: &Expr) -> usize {
     expr as *const Expr as usize
 }
 
+/// 命名空间路径段提取：把 `tcmsg.error.hello` 的 receiver（FieldAccess 链/Var）
+/// 递归拍平为路径段 ["tcmsg","error"]。
+///
+/// 条件：链上每个标识符都必须是**未绑定**的（非变量、非 this、非类实例字段），
+/// 否则它可能是实例字段链（obj.field.method 之类），不属于命名空间。
+/// 返回 None 表示不是命名空间形态（调用方按实例/静态方法处理）。
+/// 参数个数区间的中文措辞（不含「个」）：必选数 == 总数 → "N"；否则 "N-M"。
+/// 与调用点模板「期望 {desc} 个参数」拼接。
+fn param_count_desc(required: usize, total: usize) -> String {
+    if required == total {
+        format!("{total}")
+    } else {
+        format!("{required}-{total}")
+    }
+}
+
+fn ns_path_segments(expr: &Expr, scope: &HashMap<String, TypeSpec>) -> Option<Vec<String>> {
+    match expr {
+        Expr::Var(name) => {
+            // 未绑定（非变量/非 this）才是命名空间首段；this 是实例对象
+            if name == "this" || scope.contains_key(name) {
+                None
+            } else {
+                Some(vec![name.clone()])
+            }
+        }
+        Expr::FieldAccess { base, field, .. } => {
+            let mut segs = ns_path_segments(base, scope)?;
+            // 字段名也必须未绑定（类实例字段链的中间段通常绑定在对象上，
+            // 但语义上 FieldAccess 的 field 无独立绑定——保守起见：基座必须是
+            // 命名空间形态（Var/FieldAccess 链），field 直接追加）
+            segs.push(field.clone());
+            Some(segs)
+        }
+        _ => None,
+    }
+}
+
+/// 命名空间前缀存在判定：funcs 中是否存在以 `路径段::` 开头的函数键。
+/// 用于把「未绑定 Var/FieldAccess 链」识别为命名空间（如 tcmsg.hello() 的
+/// tcmsg 是命名空间而非变量）。存在即视为命名空间，即使目标全名未注册
+/// 也走命名空间调用路径（由下方 get().ok_or_else 报"命名空间函数未定义"）。
+fn ns_prefix_exists(funcs: &HashMap<String, FuncSig>, segs: &[String]) -> bool {
+    let prefix = format!("{}::", segs.join("::"));
+    funcs.keys().any(|k| k.starts_with(&prefix))
+}
+
 /// 从语句中取 span。
 fn stmt_span(stmt: &Stmt) -> Span {
     match stmt {
@@ -1714,6 +2543,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::For(f) => f.span,
         Stmt::Switch(s) => s.span,
         Stmt::Import(i) => i.span,
+        Stmt::Namespace(n) => n.span,
         Stmt::Class(c) => c.span,
         Stmt::FieldAssign(f) => f.span,
     }
@@ -1736,6 +2566,7 @@ fn expr_span_of(expr: &Expr) -> Span {
         | Expr::Index { span, .. }
         | Expr::TupleLit { span, .. }
         | Expr::FieldAccess { span, .. }
+        | Expr::Path { span, .. }
         | Expr::MethodCall { span, .. } => *span,
     }
 }
@@ -1791,6 +2622,9 @@ fn types_match(want: &TypeSpec, got: &TypeSpec, init: Option<&Expr>) -> bool {
     match init {
         Some(Expr::IntLit(_)) => want.is_int() && got.is_int(),
         Some(Expr::FloatLit(_)) => want.is_float() && got.is_float(),
+        // 表字面量可传给 table 参数（元素类型与长度由字面量布局元数据记录，
+        // IR/解释路径按布局访问；如 tcmsg::error.no_file(["zh-cn","en-us"])）
+        Some(Expr::TableLit { .. }) => matches!(want, TypeSpec::Named(TyKw::Table)),
         _ => false,
     }
 }
@@ -1798,6 +2632,17 @@ fn types_match(want: &TypeSpec, got: &TypeSpec, init: Option<&Expr>) -> bool {
 /// 是否为数字类型（整数或浮点）。
 fn is_number(t: &TypeSpec) -> bool {
     t.is_number()
+}
+
+/// table_new_* 内置函数名 → 元素类型（动态表构造）。
+fn table_new_elem_ty(name: &str) -> Option<TypeSpec> {
+    match name {
+        "table_new_i64" => Some(TypeSpec::Named(TyKw::I64)),
+        "table_new_f64" => Some(TypeSpec::Named(TyKw::F64)),
+        "table_new_string" => Some(TypeSpec::Named(TyKw::Str)),
+        "table_new_bool" => Some(TypeSpec::Named(TyKw::Bool)),
+        _ => None,
+    }
 }
 
 /// 是否为编译期字面量（switch 的 case 值只允许字面量）。
@@ -1893,6 +2738,200 @@ mod tests {
             "错误消息 '{}' 应包含关键字 '{}'",
             err.message,
             keyword
+        );
+    }
+
+    #[test]
+    fn 命名空间函数以全名注册且路径调用解析() {
+        // tcmsg::error.no_file(...) → 全名 "tcmsg::error::no_file" 注册并解析
+        let sem = analyze_src(
+            "namespace tcmsg {\n\
+             \x20   namespace error {\n\
+             \x20       func no_file(langs: table) -> string {\n\
+             \x20           return \"file not found\"\n\
+             \x20       }\n\
+             \x20   }\n\
+             }\n\
+             func main() {\n\
+             \x20   var m = tcmsg::error.no_file([\"zh-cn\",\"en-us\"])\n\
+             }\n",
+        )
+        .expect("命名空间语义分析应通过");
+        // 全名注册
+        assert!(sem.funcs.contains_key("tcmsg::error::no_file"), "命名空间函数应以全名注册");
+        // 调用点解析记录（MethodCall 表达式地址 → 全名）
+        assert!(
+            sem.resolved_calls.values().any(|v| v == "tcmsg::error::no_file"),
+            "命名空间路径调用应记录全名，实际 {:#?}",
+            sem.resolved_calls
+        );
+    }
+
+    #[test]
+    fn 命名空间内函数裸调用按前缀补全() {
+        // tcmsg::error 内两个函数互调：helper() 裸调用 → 解析为 tcmsg::error::helper
+        let sem = analyze_src(
+            "namespace tcmsg.error {\n\
+             \x20   func no_file(langs: table) -> string {\n\
+             \x20       return helper()\n\
+             \x20   }\n\
+             \x20   func helper() -> string {\n\
+             \x20       return \"x\"\n\
+             \x20   }\n\
+             }\n\
+             func main() {\n\
+             \x20   var m = tcmsg::error.no_file([\"zh-cn\"])\n\
+             }\n",
+        )
+        .expect("命名空间内裸调用应通过前缀补全");
+        assert!(sem.funcs.contains_key("tcmsg::error::no_file"));
+        assert!(sem.funcs.contains_key("tcmsg::error::helper"));
+    }
+
+    #[test]
+    fn 默认值参数省略实参合法且类型校验() {
+        // 默认值参数：省略实参的调用通过区间检查；签名登记默认值表达式。
+        let sem = analyze_src(
+            "func greet(name: string, prefix: string = \"Hello\") -> string {\n\
+             \x20   return prefix + \", \" + name\n\
+             }\n\
+             func main() {\n\
+             \x20   var a = greet(\"World\")            // 省略默认参数\n\
+             \x20   var b = greet(\"World\", \"Hi\")     // 显式传参\n\
+             \x20   var c = greet(\"World\", \"Hi\", \"x\") // 超参 → 报错\n\
+             }\n",
+        );
+        // 超参报错（c 行）：但 analyze 一次成功则说明 a/b 合法；这里单独断言 c 失败
+        assert!(sem.is_err(), "超过总形参数应报错，实际通过：{sem:?}");
+        // 合法路径：只省略默认参数的调用
+        let sem = analyze_src(
+            "func greet(name: string, prefix: string = \"Hello\") -> string {\n\
+             \x20   return prefix + \", \" + name\n\
+             }\n\
+             func main() {\n\
+             \x20   var a = greet(\"World\")\n\
+             \x20   var b = greet(\"World\", \"Hi\")\n\
+             }\n",
+        )
+        .expect("省略默认参数应通过区间检查");
+        // 签名登记默认值：第 2 个参数带默认值
+        let sig = sem.funcs.get("greet").expect("greet 应注册");
+        assert_eq!(sig.param_defaults.len(), 2);
+        assert!(sig.param_defaults[0].is_none(), "必选参数无默认值");
+        assert!(sig.param_defaults[1].is_some(), "可选参数有默认值");
+    }
+
+    #[test]
+    fn 默认值参数限制规则() {
+        // 可选参数必须连续排在必选参数之后
+        expect_err(
+            "func f(a: i64 = 1, b: i64) {\n}\nfunc main() {\n}\n",
+            "必须连续排在必选参数之后",
+        );
+        // 默认值必须是字面量（变量引用 → 报错）
+        expect_err(
+            "func f(a: i64 = x) {\n}\nfunc main() {\n  var x = 1\n}\n",
+            "默认值必须是字面量",
+        );
+        // 非空表字面量默认值 → 报错
+        expect_err(
+            "func f(t: table = [1, 2]) {\n}\nfunc main() {\n}\n",
+            "默认值必须是字面量",
+        );
+        // 默认值类型不匹配（字符串默认值给 i64 参数）→ 报错
+        expect_err(
+            "func f(a: i64 = \"x\") {\n}\nfunc main() {\n}\n",
+            "默认值类型不匹配",
+        );
+        // 空表 [] 默认值 → 合法（table 参数）
+        analyze_src(
+            "func f(t: table = []) {\n}\nfunc main() {\n}\n",
+        )
+        .expect("空表默认值应合法");
+    }
+
+    #[test]
+    fn 命名空间函数未定义报错() {
+        expect_err(
+            "namespace tcmsg {\n\
+             \x20   func main() {\n\
+             \x20       var m = tcmsg::error.no_file()\n\
+             \x20   }\n\
+             }\n",
+            "命名空间函数 'tcmsg::error::no_file' 未定义",
+        );
+    }
+
+    #[test]
+    fn 命名空间路径不能作为值使用() {
+        expect_err(
+            "func main() {\n\
+             \x20   var x = tcmsg::error\n\
+             }\n",
+            "不能作为值使用",
+        );
+    }
+
+    #[test]
+    fn 命名空间内函数重复定义报错() {
+        expect_err(
+            "namespace tcmsg {\n\
+             \x20   func dup() -> string {\n\
+             \x20       return \"a\"\n\
+             \x20   }\n\
+             \x20   func dup() -> string {\n\
+             \x20       return \"b\"\n\
+             \x20   }\n\
+             }\n",
+            "重复定义",
+        );
+    }
+
+    #[test]
+    fn 单段命名空间调用解析为全名() {
+        // tcmsg.hello()：语法层是 MethodCall { receiver: Var("tcmsg") }，
+        // 语义层应把未绑定 Var + funcs 前缀命中识别为命名空间调用 → tcmsg::hello。
+        let sem = analyze_src(
+            "namespace tcmsg {\n\
+             \x20   func hello() -> string {\n\
+             \x20       return \"x\"\n\
+             \x20   }\n\
+             }\n\
+             func main() {\n\
+             \x20   var m = tcmsg.hello()\n\
+             }\n",
+        )
+        .expect("单段命名空间调用应通过语义分析");
+        assert!(sem.funcs.contains_key("tcmsg::hello"));
+        assert!(
+            sem.resolved_calls.values().any(|v| v == "tcmsg::hello"),
+            "单段命名空间调用应记录全名 tcmsg::hello，实际 {:#?}",
+            sem.resolved_calls
+        );
+    }
+
+    #[test]
+    fn 点分命名空间调用解析为全名() {
+        // tcmsg.error.no_file()：语法层是 MethodCall { receiver: FieldAccess{Var(tcmsg).error} }，
+        // 语义层应把未绑定 FieldAccess 链 + funcs 前缀命中识别为命名空间调用。
+        let sem = analyze_src(
+            "namespace tcmsg {\n\
+             \x20   namespace error {\n\
+             \x20       func no_file() -> string {\n\
+             \x20           return \"x\"\n\
+             \x20       }\n\
+             \x20   }\n\
+             }\n\
+             func main() {\n\
+             \x20   var m = tcmsg.error.no_file()\n\
+             }\n",
+        )
+        .expect("点分命名空间调用应通过语义分析");
+        assert!(sem.funcs.contains_key("tcmsg::error::no_file"));
+        assert!(
+            sem.resolved_calls.values().any(|v| v == "tcmsg::error::no_file"),
+            "点分命名空间调用应记录全名 tcmsg::error::no_file，实际 {:#?}",
+            sem.resolved_calls
         );
     }
 
@@ -2559,6 +3598,178 @@ mod tests {
             }
             "#,
             "自增/自减的操作数必须是可写数字变量",
+        );
+    }
+
+    #[test]
+    fn 动态表table_new零参数返回table() {
+        // table_new_*：零参数创建空动态表，返回 table 类型
+        let sem = analyze_src(
+            r#"
+            func main() {
+                var t = table_new_i64()
+            }
+            "#,
+        )
+        .expect("table_new_i64 应通过");
+        // 动态表变量登记到 table_vars，元素类型 i64、动态标志 true
+        let info = sem.table_vars.get(&("main".to_string(), "t".to_string())).expect("应有表元数据");
+        assert_eq!(info.elem_ty, TypeSpec::Named(TyKw::I64));
+        assert!(info.dynamic, "table_new 创建的是动态表");
+    }
+
+    #[test]
+    fn 动态表标注table接受table_new调用() {
+        // 标注 table 的变量可用 table_new_* 初始化（此前只允许字面量）
+        analyze_src(
+            r#"
+            func main() {
+                var t: table = table_new_string()
+                table_push(t, "hi")
+            }
+            "#,
+        )
+        .expect("标注 table + table_new_string 初始化应通过");
+    }
+
+    #[test]
+    fn 动态表table_new错误参数个数报错() {
+        expect_err(
+            r#"
+            func main() {
+                var t = table_new_i64(5)
+            }
+            "#,
+            "期望 0 个参数",
+        );
+    }
+
+    #[test]
+    fn 动态表table_push类型匹配通过() {
+        analyze_src(
+            r#"
+            func main() {
+                var t = table_new_f64()
+                table_push(t, 1.5)
+                table_push(t, 2.0)
+            }
+            "#,
+        )
+        .expect("f64 表推入浮点字面量应通过");
+    }
+
+    #[test]
+    fn 动态表table_push元素类型不匹配报错() {
+        // 元素类型与表不一致：i64 表推入字符串
+        expect_err(
+            r#"
+            func main() {
+                var t = table_new_i64()
+                table_push(t, "oops")
+            }
+            "#,
+            "元素类型不匹配",
+        );
+    }
+
+    #[test]
+    fn 动态表table_push非表变量报错() {
+        expect_err(
+            r#"
+            func main() {
+                var t = table_new_i64()
+                table_push(table_new_i64(), 5)
+            }
+            "#,
+            "必须是表变量",
+        );
+    }
+
+    #[test]
+    fn 动态表table_at返回元素类型() {
+        let sem = analyze_src(
+            r#"
+            func main() {
+                var t = table_new_bool()
+                var b: bool = table_at(t, 0)
+            }
+            "#,
+        )
+        .expect("bool 表 table_at 返回 bool 应通过");
+        assert!(sem.table_vars.contains_key(&("main".to_string(), "t".to_string())));
+    }
+
+    #[test]
+    fn 动态表table_at下标非整数报错() {
+        expect_err(
+            r#"
+            func main() {
+                var t = table_new_i64()
+                var x = table_at(t, "a")
+            }
+            "#,
+            "下标必须是整数",
+        );
+    }
+
+    #[test]
+    fn 动态表下标与遍历用元素类型() {
+        // 动态表与定长表统一支持 t[i] 与 for-in（元素类型查 table_vars）
+        analyze_src(
+            r#"
+            func main() {
+                var t = table_new_i64()
+                table_push(t, 1)
+                table_push(t, 2)
+                var a = t[0]
+                for e in t {
+                    var b = e
+                }
+            }
+            "#,
+        )
+        .expect("动态表 t[i] 与 for-in 应通过");
+    }
+
+    #[test]
+    fn 函数返回动态表元素类型传播() {
+        // make_list 返回 table_new_i64，调用方 var t = make_list(3) 继承 i64 元素类型
+        let sem = analyze_src(
+            r#"
+            func make_list(n: i64) -> table {
+                var t = table_new_i64()
+                var i = 0
+                while i < n {
+                    table_push(t, i)
+                    i++
+                }
+                return t
+            }
+            func main() {
+                var t = make_list(3)
+                table_push(t, 99)
+            }
+            "#,
+        )
+        .expect("返回表的函数 + 调用方继承元素类型应通过");
+        let info = sem.table_vars.get(&("main".to_string(), "t".to_string())).expect("应有表元数据");
+        assert_eq!(info.elem_ty, TypeSpec::Named(TyKw::I64));
+        assert!(info.dynamic);
+        assert_eq!(sem.table_ret_elems.get("make_list"), Some(&Some(TypeSpec::Named(TyKw::I64))));
+    }
+
+    #[test]
+    fn 函数返回动态表类型不匹配报错() {
+        // 函数声明返回 table 但 return 非动态表来源 → 报错
+        expect_err(
+            r#"
+            func bad() -> table {
+                var x = 1
+                return x
+            }
+            func main() {}
+            "#,
+            "return 类型不匹配",
         );
     }
 }

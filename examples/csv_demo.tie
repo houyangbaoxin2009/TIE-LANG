@@ -1,0 +1,71 @@
+// tie:logic
+// csv_demo.tie：CSV 标准库演示——str_split（string.tie）+ csv_read / csv_cells（csv.tie）
+// 自动生成临时 CSV 文件（file_write），读取后用 csv_cells 切分单元格并断言核对。
+// 注意：csv.tie 内部已展开 string.tie，本文件不要再重复导入 string.tie
+// （当前 import 展开不做去重，重复导入会导致 str_split 等函数重复定义）。
+
+import "../std/csv.tie"
+import "../std/assert.tie"
+
+func main() {
+    // ---- str_split 基础（string.tie，随 csv.tie 展开）----
+    var parts = str_split("a,b,c", ",")
+    assert_eq(len(parts), 3)
+    assert(parts[0] == "a")
+    assert(parts[1] == "b")
+    assert(parts[2] == "c")
+    println("str_split(\"a,b,c\", \",\") → 3 个元素 ✓")
+
+    // 连续分隔符 → 空字符串元素
+    var gap = str_split("a,,b", ",")
+    assert_eq(len(gap), 3)
+    assert(gap[1] == "")
+    println("str_split(\"a,,b\", \",\") → 中间空元素 ✓")
+
+    // 空分隔符 → 单元素表 [s]
+    var none = str_split("hello", "")
+    assert_eq(len(none), 1)
+    assert(none[0] == "hello")
+    println("str_split(..., \"\") → 单元素 ✓")
+
+    // ---- CSV 写入 + 读取（含 \r\n 与中文 UTF-8）----
+    var path: string = "csv_demo_tmp.csv"
+    var w: bool = file_write(path, "name,age,city\r\n张三,30,北京\n李四,25,上海\n")
+    assert(w)
+    var rows = csv_read(path)
+    // 3 数据行 + 末尾空行（文件以 \n 结尾产生）→ 共 4 个元素
+    assert_eq(len(rows), 4)
+
+    // 表头行：末尾 \r 已被 strip_cr 去除
+    var header = csv_cells(rows[0], ",")
+    assert_eq(len(header), 3)
+    assert(header[0] == "name")
+    assert(header[1] == "age")
+    assert(header[2] == "city")
+    println("表头: " + header[0] + "," + header[1] + "," + header[2])
+
+    // 数据行 1（中文验证 UTF-8 逐字符切分）
+    var row1 = csv_cells(rows[1], ",")
+    assert_eq(len(row1), 3)
+    assert(row1[0] == "张三")
+    assert(row1[1] == "30")
+    assert(row1[2] == "北京")
+    println("行1: " + row1[0] + "," + row1[1] + "," + row1[2])
+
+    // 数据行 2
+    var row2 = csv_cells(rows[2], ",")
+    assert(row2[2] == "上海")
+    println("行2: " + row2[0] + "," + row2[1] + "," + row2[2])
+
+    // 末尾空行（与 split 语义一致）
+    assert(rows[3] == "")
+    println("末尾空行 ✓")
+
+    // ---- 其他分隔符 ----
+    var semi = csv_cells("x;y;z", ";")
+    assert_eq(len(semi), 3)
+    assert(semi[2] == "z")
+    println("csv_cells(..., \";\") → 3 元素 ✓")
+
+    println("csv 演示全部通过")
+}

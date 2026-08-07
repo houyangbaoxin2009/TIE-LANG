@@ -215,6 +215,347 @@ pub extern "C" fn tie_rand_range(min: i64, max: i64, ok: *mut i8) -> i64 {
     min + (next_rand() % span) as i64
 }
 
+// ---------- 进程/环境 floor 内置函数 C ABI 桥 ----------
+//
+// 设计说明：arg_count / arg_string 走 std::env::args()（进程运行时查询真实 argv），
+// 编译路径（IR 层）与解释路径共用本桥，保证两路径返回一致：
+// - 编译后的 exe：静态链接本库后，std::env::args() 读取进程命令行（Windows 走
+//   GetCommandLineW，Linux 走 /proc/self/cmdline），与 C main 的 argv 一致；
+// - 解释路径（tie-interp / REPL）：解释器进程自身的命令行参数，REPL 无用户参数 → 0。
+// argv 约定（文档化）：arg_count 返回「程序名之后」的用户参数个数（`prog a b c` → 3）；
+// arg_string(i) 按 0 基索引用户参数（arg_string(0)="a"），越界（负数或 >= 个数）返回空串。
+
+/// C ABI 桥：返回命令行用户参数个数（argv[0] 程序名之后的数量；`prog a b c` → 3）。
+///
+/// 实现：`std::env::args()` 至少含程序名（argv[0]），用户参数 = 总数 - 1；
+/// 极端环境（无 argv）时用 saturating_sub 保证下限 0（>= 0 契约）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_arg_count() -> i64 {
+    std::env::args().count().saturating_sub(1) as i64
+}
+
+/// C ABI 桥：返回第 i 个用户命令行参数（0 基，跳过 argv[0] 程序名），返回新分配的字符串；
+/// 越界（负数下标或 >= 参数个数）返回空串。
+///
+/// 与 tie_str_char 同一堆串模式：返回 `CString::into_raw` 分配的 `*mut c_char`，
+/// 调用方用完必须 `tie_free_result` 释放。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_arg_string(i: i64) -> *mut c_char {
+    // 收集用户参数（skip(1) 跳过 argv[0] 程序名），按 i 索引；i 越界 → None → 空串
+    let s = if i < 0 {
+        None
+    } else {
+        std::env::args().skip(1).nth(i as usize)
+    };
+    string_to_c_char(s.unwrap_or_default())
+}
+
+// ---------- 消息系统（#25）floor C ABI 桥 ----------
+//
+// 设计说明：tie 语言没有全局可变状态（编译程序无顶层 var），而消息系统的
+// 「当前语言 + 字典」恰恰是跨函数共享的可变状态，tie 自身无法表达——这是
+// 「实在不行才 Rust」的典型场景。状态由 Rust 层 thread_local 持有：
+// - lang：当前语言（默认 "zh"），msg_set_lang 切换；
+// - dict：(键, 语言) → 文本 的字典，msg_register 登记（同键同语言覆盖）；
+// - msg_t 查询顺序：当前语言 → 回退 "zh" → 再回退「键本身」。
+// 编译路径（IR 层）与解释路径共用本桥（thread_local 各线程独立，两路径单线程一致）。
+
+/// 消息系统运行时状态（thread_local；语言与字典随调用累积）。
+#[derive(Default)]
+struct MsgState {
+    /// 当前语言（默认 "zh"）
+    lang: String,
+    /// (键, 语言) → 文本 的消息字典
+    dict: std::collections::HashMap<(String, String), String>,
+}
+
+thread_local! {
+    static MSG_STATE: std::cell::RefCell<MsgState> = std::cell::RefCell::new(MsgState::default());
+}
+
+/// C ABI 桥：切换消息系统当前语言（如 "zh" / "en"）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_msg_set_lang(lang: *const c_char) {
+    let lang = unsafe { c_char_to_string(lang).unwrap_or_default() };
+    MSG_STATE.with(|s| s.borrow_mut().lang = lang);
+}
+
+/// C ABI 桥：读取消息系统当前语言，返回新分配的堆串（调用方用完必须 tie_free_result）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_msg_get_lang() -> *mut c_char {
+    let lang = MSG_STATE.with(|s| s.borrow().lang.clone());
+    string_to_c_char(lang)
+}
+
+/// C ABI 桥：登记一条消息文本（键 + 语言 + 文本；同键同语言覆盖旧文本）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_msg_register(key: *const c_char, lang: *const c_char, text: *const c_char) {
+    let key = unsafe { c_char_to_string(key).unwrap_or_default() };
+    let lang = unsafe { c_char_to_string(lang).unwrap_or_default() };
+    let text = unsafe { c_char_to_string(text).unwrap_or_default() };
+    MSG_STATE.with(|s| {
+        s.borrow_mut().dict.insert((key, lang), text);
+    });
+}
+
+/// C ABI 桥：查询键的翻译文本，返回新分配的堆串（调用方用完必须 tie_free_result）。
+///
+/// 查询顺序：当前语言 → 回退 "zh" → 回退「键本身」（未登记时原样返回键）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_msg_t(key: *const c_char) -> *mut c_char {
+    let key = unsafe { c_char_to_string(key).unwrap_or_default() };
+    let out = MSG_STATE.with(|s| {
+        let s = s.borrow();
+        // 1) 当前语言
+        if let Some(text) = s.dict.get(&(key.clone(), s.lang.clone())) {
+            return text.clone();
+        }
+        // 2) 回退 zh
+        if s.lang != "zh"
+            && let Some(text) = s.dict.get(&(key.clone(), "zh".to_string()))
+        {
+            return text.clone();
+        }
+        // 3) 回退键本身
+        key.clone()
+    });
+    string_to_c_char(out)
+}
+
+// ---------- 动态表（table_new_* / table_push / table_at）C ABI 桥 ----------
+//
+// 设计说明（编译/解释两路径一致性的关键）：动态表在**编译路径**（IR 层）表示为
+// 「堆分配的 {data, len, cap, elem_size} 结构体指针」，表值本身是 ptr（与字符串
+// 一致，便于函数参数/返回传递）。所有动态表操作（新建/追加/读取/长度/释放）都走
+// 本桥——Rust 层是唯一实现，保证编译路径行为与解释路径（Value::Table(Vec)）一致：
+// - 扩容：容量翻倍（初始 8）；
+// - 越界错误文本：由 IR 层（table_at 的 ok 标志）与解释路径共用同一句中文消息。
+// 内存：data 缓冲区用 Rust 分配器（alloc/realloc/dealloc），仅由本桥分配与释放
+// （tie_table_free），自洽无混用；程序退出时泄漏可接受（与 C 一致），但循环内创建
+// 的动态表在作用域结束时由 IR 发射 tie_table_free 释放，避免逐次迭代泄漏。
+
+/// 动态表运行时结构（C 布局；仅本桥内部使用，IR 侧只持有不透明 ptr）。
+///
+/// `pub` 仅为满足 C ABI 导出函数签名（`*mut DynTable`）的可见性要求；
+/// 字段不公开，外部（IR 层）只把它当不透明指针传递。
+#[repr(C)]
+pub struct DynTable {
+    /// 元素缓冲区指针（cap==0 时为 null）
+    data: *mut std::ffi::c_void,
+    /// 当前元素个数
+    len: i64,
+    /// 缓冲区容量（元素个数）
+    cap: i64,
+    /// 单个元素字节数（i64/f64/ptr=8，bool=1）
+    elem_size: i64,
+}
+
+/// 扩容：len==cap 时把缓冲区容量翻倍（初始 8），用 Rust 分配器 realloc。
+///
+/// 安全：data 由本桥分配（alloc/realloc），cap 记录旧容量，realloc 的旧布局
+/// 由「旧容量 × 元素大小」精确还原，满足 Rust 分配器契约。
+unsafe fn dyn_table_grow(t: &mut DynTable) {
+    if t.len < t.cap {
+        return;
+    }
+    let elem = t.elem_size as usize;
+    let old_cap = t.cap as usize;
+    let new_cap = if old_cap == 0 { 8 } else { old_cap * 2 };
+    let align = std::mem::align_of::<i64>();
+    let new_layout =
+        std::alloc::Layout::from_size_align(new_cap * elem, align).expect("动态表扩容布局合法");
+    let new_data = if t.data.is_null() {
+        unsafe { std::alloc::alloc(new_layout) }
+    } else {
+        let old_layout = std::alloc::Layout::from_size_align(old_cap * elem, align)
+            .expect("动态表旧布局合法");
+        unsafe { std::alloc::realloc(t.data as *mut u8, old_layout, new_cap * elem) }
+    };
+    t.data = new_data as *mut std::ffi::c_void;
+    t.cap = new_cap as i64;
+}
+
+/// C ABI 桥：新建空动态表（元素字节大小由调用方传入：i64/f64/ptr=8，bool=1）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_table_new(elem_size: i64) -> *mut DynTable {
+    let layout = std::alloc::Layout::new::<DynTable>();
+    let ptr = unsafe { std::alloc::alloc(layout) } as *mut DynTable;
+    if ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        std::ptr::write(
+            ptr,
+            DynTable { data: std::ptr::null_mut(), len: 0, cap: 0, elem_size },
+        );
+    }
+    ptr
+}
+
+/// C ABI 桥：释放动态表（先释放元素缓冲区，再释放结构体本身）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_table_free(t: *mut DynTable) {
+    if t.is_null() {
+        return;
+    }
+    unsafe {
+        let tbl = &mut *t;
+        if !tbl.data.is_null() {
+            let size = (tbl.cap as usize) * (tbl.elem_size as usize);
+            let layout = std::alloc::Layout::from_size_align(size, std::mem::align_of::<i64>())
+                .expect("动态表释放布局合法");
+            std::alloc::dealloc(tbl.data as *mut u8, layout);
+        }
+        std::alloc::dealloc(t as *mut u8, std::alloc::Layout::new::<DynTable>());
+    }
+}
+
+/// C ABI 桥：返回动态表当前长度（元素个数）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_table_len(t: *mut DynTable) -> i64 {
+    if t.is_null() {
+        return 0;
+    }
+    unsafe { (*t).len }
+}
+
+/// C ABI 桥：向动态表追加 i64 元素。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_table_push_i64(t: *mut DynTable, x: i64) {
+    unsafe {
+        let tbl = &mut *t;
+        dyn_table_grow(tbl);
+        (tbl.data as *mut i64).add(tbl.len as usize).write(x);
+        tbl.len += 1;
+    }
+}
+
+/// C ABI 桥：向动态表追加 f64 元素。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_table_push_f64(t: *mut DynTable, x: f64) {
+    unsafe {
+        let tbl = &mut *t;
+        dyn_table_grow(tbl);
+        (tbl.data as *mut f64).add(tbl.len as usize).write(x);
+        tbl.len += 1;
+    }
+}
+
+/// C ABI 桥：向动态表追加字符串元素（存储借用指针，不复制、不释放）。
+///
+/// 约定：被追加的串指针必须比表存活更久（tie 无显式 free，串要么是全局常量、
+/// 要么由变量持有到程序退出），因此表中存借用指针是安全的。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_table_push_string(t: *mut DynTable, x: *const c_char) {
+    unsafe {
+        let tbl = &mut *t;
+        dyn_table_grow(tbl);
+        (tbl.data as *mut *const c_char).add(tbl.len as usize).write(x);
+        tbl.len += 1;
+    }
+}
+
+/// C ABI 桥：向动态表追加 bool 元素（C 侧按 i8 传递）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_table_push_bool(t: *mut DynTable, x: i8) {
+    unsafe {
+        let tbl = &mut *t;
+        dyn_table_grow(tbl);
+        (tbl.data as *mut i8).add(tbl.len as usize).write(x);
+        tbl.len += 1;
+    }
+}
+
+/// C ABI 桥：读取动态表第 i 个 i64 元素。越界（负数或 >= len）置 ok=0 并返回 0。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_table_at_i64(t: *mut DynTable, i: i64, ok: *mut i8) -> i64 {
+    unsafe {
+        let tbl = &*t;
+        if i < 0 || i >= tbl.len {
+            *ok = 0;
+            return 0;
+        }
+        *ok = 1;
+        (tbl.data as *const i64).add(i as usize).read()
+    }
+}
+
+/// C ABI 桥：读取动态表第 i 个 f64 元素。越界置 ok=0。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_table_at_f64(t: *mut DynTable, i: i64, ok: *mut i8) -> f64 {
+    unsafe {
+        let tbl = &*t;
+        if i < 0 || i >= tbl.len {
+            *ok = 0;
+            return 0.0;
+        }
+        *ok = 1;
+        (tbl.data as *const f64).add(i as usize).read()
+    }
+}
+
+/// C ABI 桥：读取动态表第 i 个字符串元素（返回借用指针，调用方不得释放）。
+/// 越界置 ok=0 并返回空指针。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_table_at_string(t: *mut DynTable, i: i64, ok: *mut i8) -> *mut c_char {
+    unsafe {
+        let tbl = &*t;
+        if i < 0 || i >= tbl.len {
+            *ok = 0;
+            return std::ptr::null_mut();
+        }
+        *ok = 1;
+        (tbl.data as *const *mut c_char).add(i as usize).read()
+    }
+}
+
+/// C ABI 桥：读取动态表第 i 个 bool 元素（C 侧按 i8 返回）。越界置 ok=0。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_table_at_bool(t: *mut DynTable, i: i64, ok: *mut i8) -> i8 {
+    unsafe {
+        let tbl = &*t;
+        if i < 0 || i >= tbl.len {
+            *ok = 0;
+            return 0;
+        }
+        *ok = 1;
+        (tbl.data as *const i8).add(i as usize).read()
+    }
+}
+
+/// C ABI 桥：列出目录中的文件名（仅文件名，不含路径），返回字符串动态表；失败返回 NULL。
+///
+/// 实现：`std::fs::read_dir` 枚举目录（条目顺序由文件系统给出，不排序），
+/// 每个条目名作为借用指针推入表（泄漏的堆串，遵守「字符串元素是借用指针」的
+/// 动态表约定；程序退出时回收，可接受）。目录不存在/无权限等读取失败 → NULL，
+/// 由调用方（IR 层 / 解释器）统一输出错误消息，保证两路径的错误文本一致。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_list_dir(path: *const c_char) -> *mut DynTable {
+    let path = match unsafe { c_char_to_string(path) } {
+        Ok(p) => p,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    // 收集条目名（只取文件名部分；单个条目读取失败跳过）
+    let entries: Vec<String> = match std::fs::read_dir(&path) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    // 新建字符串动态表（elem_size=8，与 table_new_string 一致），逐个推入条目名
+    let t = tie_table_new(8);
+    if t.is_null() {
+        return t;
+    }
+    for name in entries {
+        // 泄漏堆串作为表的借用元素（与 table_push_string 同一约定，调用方不释放）
+        let c = CString::new(name).unwrap_or_default();
+        tie_table_push_string(t, c.into_raw());
+    }
+    t
+}
+
 /// 把 C 字符串（NUL 结尾）读为 Rust String。
 unsafe fn c_char_to_string(p: *const c_char) -> Result<String, String> {
     if p.is_null() {
@@ -319,6 +660,9 @@ impl Session {
     }
 
     /// 注册顶层定义（func → funcs；class/import → v1 暂不支持）。
+    ///
+    /// 命名空间（Namespace）递归注册：体内函数以全名（路径段::函数名）进 funcs，
+    /// 使 `tcmsg::error.no_file(...)` 路径调用与命名空间内裸调用都能命中。
     fn register_top_level(&mut self, program: tie_frontend::ast::Program) -> Result<String, String> {
         let mut count = 0;
         for stmt in &program.stmts {
@@ -327,12 +671,38 @@ impl Session {
                     self.funcs.insert(f.name.clone(), f.clone());
                     count += 1;
                 }
+                Stmt::Namespace(ns) => {
+                    count += self.register_ns_funcs(&ns.body, &ns.path)?;
+                }
                 Stmt::Class(_) => return Err("REPL v1 暂不支持类定义".into()),
                 Stmt::Import(_) => return Err("REPL v1 暂不支持 import".into()),
-                _ => return Err("顶层只允许函数/类/import 定义".into()),
+                _ => return Err("顶层只允许函数/类/import/命名空间定义".into()),
             }
         }
         Ok(format!("已定义 {count} 个函数"))
+    }
+
+    /// 递归注册命名空间体内函数（全名 = 当前路径::函数名），支持嵌套命名空间。
+    fn register_ns_funcs(&mut self, stmts: &[Stmt], prefix: &[String]) -> Result<usize, String> {
+        let mut count = 0;
+        for stmt in stmts {
+            match stmt {
+                Stmt::FnDef(f) => {
+                    let mut segs = prefix.to_vec();
+                    segs.push(f.name.clone());
+                    let full = segs.join("::");
+                    self.funcs.insert(full, f.clone());
+                    count += 1;
+                }
+                Stmt::Namespace(inner) => {
+                    let mut segs = prefix.to_vec();
+                    segs.extend(inner.path.iter().cloned());
+                    count += self.register_ns_funcs(&inner.body, &segs)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(count)
     }
 }
 
@@ -348,11 +718,15 @@ enum Flow {
 struct Env<'a> {
     session: &'a mut Session,
     scopes: Vec<std::collections::HashMap<String, Value>>,
+    /// 当前执行函数的命名空间前缀（空 = 顶层函数）。
+    /// 命名空间内裸调用（如 tcmsg::error 内 helper()）据此补全为全名
+    /// （helper → tcmsg::error::helper）；由 call_fn 执行函数体时设置/恢复。
+    cur_ns: Vec<String>,
 }
 
 impl<'a> Env<'a> {
     fn new(session: &'a mut Session) -> Self {
-        Self { session, scopes: Vec::new() }
+        Self { session, scopes: Vec::new(), cur_ns: Vec::new() }
     }
 
     /// 变量查找：作用域栈 → 顶层 globals。
@@ -471,6 +845,20 @@ impl<'a> Env<'a> {
                             }
                         }
                     }
+                    // 表遍历：`for x in t`——逐元素绑定循环变量（定长字面量表与动态表
+                    // 在解释器里都是 Value::Table(Vec)，统一处理）。
+                    Value::Table(cells) => {
+                        for item in cells {
+                            self.scopes.push(std::collections::HashMap::new());
+                            self.scopes.last_mut().unwrap().insert(f.var.clone(), item);
+                            let flow = self.exec_block(&f.body);
+                            self.scopes.pop();
+                            match flow? {
+                                Flow::Normal(v) => last = v,
+                                flow @ Flow::Return(_) => return Ok(flow),
+                            }
+                        }
+                    }
                     _ => return Err("for 的迭代对象必须是范围（0..10）".into()),
                 }
                 Ok(Flow::Normal(last))
@@ -481,6 +869,11 @@ impl<'a> Env<'a> {
             Stmt::FnDef(f) => {
                 // 函数体内的嵌套函数定义 → 注册进 funcs（从简）
                 self.session.funcs.insert(f.name.clone(), f.clone());
+                Ok(Flow::Normal(None))
+            }
+            Stmt::Namespace(_) => {
+                // 命名空间声明：REPL 顶层已由 register_top_level 递归注册，
+                // 函数体内（不应出现）防御性空操作。
                 Ok(Flow::Normal(None))
             }
             Stmt::FieldAssign(_) => Err("REPL v1 暂不支持字段赋值（类）".into()),
@@ -575,10 +968,50 @@ impl<'a> Env<'a> {
                 Ok(Value::Range(s, e))
             }
             Expr::Call { name, args, .. } => {
+                // table_push 需要**原地修改**表变量（Value::Table 是 Vec，按值传参
+                // 无法写回作用域），故在 eval_expr 特判：直接对变量做 push 并写回。
+                if name == "table_push" {
+                    return self.eval_table_push(args);
+                }
                 let arg_vals = self.eval_args(args)?;
-                self.call_fn(name, arg_vals)
+                // 裸调用名解析：先查裸名（顶层/内置函数），查不到则按当前命名空间
+                // 前缀补全（命名空间内函数互调，如 tcmsg::error 内 helper()）。
+                let resolved = if self.session.funcs.contains_key(name) {
+                    name.clone()
+                } else if !self.cur_ns.is_empty() {
+                    let mut segs = self.cur_ns.clone();
+                    segs.push(name.clone());
+                    let full = segs.join("::");
+                    if self.session.funcs.contains_key(&full) {
+                        full
+                    } else {
+                        name.clone()
+                    }
+                } else {
+                    name.clone()
+                };
+                self.call_fn(&resolved, arg_vals)
             }
-            Expr::Index { .. } => Err("REPL v1 暂不支持下标访问（表）".into()),
+            Expr::Index { base, index, .. } => {
+                // 表下标：t[i] 读取第 i 个元素（越界 → 运行时错误，文本与编译路径一致）
+                let b = self.eval_expr(base)?;
+                let i = self.eval_expr(index)?;
+                let Value::Int(i) = i else {
+                    return Err("下标必须是整数".into());
+                };
+                match b {
+                    Value::Table(cells) => {
+                        if i < 0 || i as usize >= cells.len() {
+                            return Err(format!(
+                                "运行时错误: 下标越界：索引 {i} 超出长度 {}",
+                                cells.len()
+                            ));
+                        }
+                        Ok(cells[i as usize].clone())
+                    }
+                    _ => Err("下标访问仅支持表".into()),
+                }
+            }
             Expr::TableLit { cells, .. } => {
                 // 表字面量：逐元素求值（M2 单行纯位置表；len 用）
                 let mut vals = Vec::with_capacity(cells.len());
@@ -589,13 +1022,105 @@ impl<'a> Env<'a> {
             }
             Expr::TupleLit { .. } => Err("REPL v1 暂不支持元组".into()),
             Expr::FieldAccess { .. } => Err("REPL v1 暂不支持字段访问（类/元组）".into()),
-            Expr::MethodCall { .. } => Err("REPL v1 暂不支持方法调用（类）".into()),
+            Expr::MethodCall { receiver, method, args, .. } => {
+                // 命名空间函数调用：receiver 是路径（tcmsg::error）、未绑定变量
+                // （tcmsg，单段）或 FieldAccess 链（tcmsg.error，点分），方法名即
+                // 函数名 → 全名 tcmsg::error::no_file，与编译路径（resolved_calls）一致。
+                let ns_prefix: Option<Vec<String>> = match receiver.as_ref() {
+                    Expr::Path { segments, .. } => Some(segments.clone()),
+                    Expr::Var(rname) if !self.is_declared(rname) => {
+                        // 单段命名空间：funcs 中存在 `rname::` 前缀键即视为命名空间，
+                        // 无条件按全名调用（全名缺失时由 call_fn 报"未定义的函数"）。
+                        if self.has_ns_prefix(&[rname.clone()]) {
+                            Some(vec![rname.clone()])
+                        } else {
+                            None
+                        }
+                    }
+                    Expr::FieldAccess { .. } => {
+                        // 点分命名空间链：递归拍平 receiver 为路径段，
+                        // 存在该前缀的命名空间函数即视为命名空间调用。
+                        if let Some(segs) = self.ns_segments(receiver) {
+                            if self.has_ns_prefix(&segs) {
+                                Some(segs)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(segs) = ns_prefix {
+                    let mut segs = segs;
+                    segs.push(method.clone());
+                    let full = segs.join("::");
+                    let arg_vals = self.eval_args(args)?;
+                    return self.call_fn(&full, arg_vals);
+                }
+                // 其余方法调用（类）：REPL v1 暂不支持
+                Err("REPL v1 暂不支持方法调用（类）".into())
+            }
+            // 命名空间路径独立出现：只能作调用 receiver，解释器防御报错
+            Expr::Path { segments, .. } => Err(format!(
+                "命名空间路径 '{}' 不能作为值使用（只能用于调用）",
+                segments.join("::")
+            )),
         }
     }
 
     /// 求值实参列表。
     fn eval_args(&mut self, args: &[Expr]) -> Result<Vec<Value>, String> {
         args.iter().map(|a| self.eval_expr(a)).collect()
+    }
+
+    /// 命名空间路径段提取（解释层版）：把 `tcmsg.error` 的 FieldAccess 链/Var
+    /// 递归拍平为 ["tcmsg","error"]。条件：每个标识符都未声明（非变量/非 this）。
+    fn ns_segments(&self, expr: &Expr) -> Option<Vec<String>> {
+        match expr {
+            Expr::Var(name) if name != "this" && !self.is_declared(name) => {
+                Some(vec![name.clone()])
+            }
+            Expr::FieldAccess { base, field, .. } => {
+                let mut segs = self.ns_segments(base)?;
+                segs.push(field.clone());
+                Some(segs)
+            }
+            _ => None,
+        }
+    }
+
+    /// 命名空间前缀存在判定：funcs 中是否存在以 `路径段::` 开头的函数键。
+    /// 用于把「未绑定 Var/FieldAccess 链」识别为命名空间（如 tcmsg.hello() 的
+    /// tcmsg 是命名空间而非变量）。存在即视为命名空间，即使目标全名未注册
+    /// 也走命名空间调用路径（由 call_fn 产生"未定义的函数"错误）。
+    fn has_ns_prefix(&self, segs: &[String]) -> bool {
+        let prefix = format!("{}::", segs.join("::"));
+        self.session.funcs.keys().any(|k| k.starts_with(&prefix))
+    }
+
+    /// 动态表追加：`table_push(t, x)`——对表变量 t 原地 push 元素 x 并写回作用域。
+    ///
+    /// 与编译路径一致：第 1 个参数必须是表变量（Value::Table），元素类型由语义层
+    /// 静态校验（解释器动态求值，此处只做运行时类型检查）。
+    fn eval_table_push(&mut self, args: &[Expr]) -> Result<Value, String> {
+        if args.len() != 2 {
+            return Err("table_push 需要表与元素参数".into());
+        }
+        let Expr::Var(name) = &args[0] else {
+            return Err("table_push 的第 1 个参数必须是表变量".into());
+        };
+        let val = self.eval_expr(&args[1])?;
+        let cur = self
+            .lookup(name)
+            .ok_or_else(|| format!("变量 '{name}' 未声明"))?;
+        let Value::Table(mut cells) = cur else {
+            return Err("table_push 的第 1 个参数必须是表".into());
+        };
+        cells.push(val);
+        self.assign(name, Value::Table(cells))?;
+        Ok(Value::Void)
     }
 
     /// 自增/自减（M4）：`++x` / `--x` / `x++` / `x--`。
@@ -784,6 +1309,32 @@ impl<'a> Env<'a> {
                     _ => Err("len 只支持字符串或表".into()),
                 }
             }
+            // ---------- 动态表构造/读取内置函数 ----------
+            //
+            // 解释路径用 Value::Table(Vec) 表示表（不经过 C ABI 桥的堆结构体），
+            // 但行为与编译路径一致：新建空表 → push 追加 → len 取运行时长度 →
+            // table_at 读取（越界报同一句中文错误，文本与 IR 层 table_at 完全一致）。
+            "table_new_i64" | "table_new_f64" | "table_new_string" | "table_new_bool" => {
+                if !args.is_empty() {
+                    return Err(format!("{name} 不需要参数"));
+                }
+                Ok(Value::Table(Vec::new()))
+            }
+            "table_at" => {
+                if args.len() != 2 {
+                    return Err("table_at 需要表与整数下标参数".into());
+                }
+                let (Value::Table(cells), Value::Int(i)) = (&args[0], &args[1]) else {
+                    return Err("table_at 需要表与整数下标参数".into());
+                };
+                if *i < 0 || *i as usize >= cells.len() {
+                    return Err(format!(
+                        "运行时错误: table_at 下标越界：索引 {i} 超出长度 {}",
+                        cells.len()
+                    ));
+                }
+                Ok(cells[*i as usize].clone())
+            }
             "read_line" => {
                 // 通过 C ABI 读一行（与编译路径一致：含 stdout 刷新与 EOF 退出）
                 let p = tie_read_line();
@@ -856,6 +1407,91 @@ impl<'a> Env<'a> {
                     return Err("file_exists 需要一个字符串参数".into());
                 };
                 Ok(Value::Bool(std::path::Path::new(path).exists()))
+            }
+            // ---------- 消息系统（#25）内置函数 ----------
+            //
+            // 与编译路径一致：走 C ABI 桥 tie_msg_*（共用同一份 thread_local 状态），
+            // 保证两路径消息注册/查询行为逐字节一致（含回退 zh / 回退键本身）。
+            "msg_set_lang" => {
+                if args.len() != 1 {
+                    return Err("msg_set_lang 需要一个字符串参数".into());
+                }
+                let Value::Str(lang) = &args[0] else {
+                    return Err("msg_set_lang 需要一个字符串参数".into());
+                };
+                let l = CString::new(lang.as_str()).unwrap_or_default();
+                tie_msg_set_lang(l.as_ptr());
+                Ok(Value::Void)
+            }
+            "msg_get_lang" => {
+                if !args.is_empty() {
+                    return Err("msg_get_lang 不需要参数".into());
+                }
+                // 读取当前语言（堆串，用完释放，与 msg_t 同机制）
+                let p = tie_msg_get_lang();
+                let s = unsafe { c_char_to_string(p).unwrap_or_default() };
+                tie_free_result(p);
+                Ok(Value::Str(s))
+            }
+            "msg_register" => {
+                if args.len() != 3 {
+                    return Err("msg_register 需要三个字符串参数（键, 语言, 文本）".into());
+                }
+                let (Value::Str(key), Value::Str(lang), Value::Str(text)) =
+                    (&args[0], &args[1], &args[2])
+                else {
+                    return Err("msg_register 需要三个字符串参数（键, 语言, 文本）".into());
+                };
+                let k = CString::new(key.as_str()).unwrap_or_default();
+                let l = CString::new(lang.as_str()).unwrap_or_default();
+                let x = CString::new(text.as_str()).unwrap_or_default();
+                tie_msg_register(k.as_ptr(), l.as_ptr(), x.as_ptr());
+                Ok(Value::Void)
+            }
+            "msg_t" => {
+                if args.len() != 1 {
+                    return Err("msg_t 需要一个字符串参数".into());
+                }
+                let Value::Str(key) = &args[0] else {
+                    return Err("msg_t 需要一个字符串参数".into());
+                };
+                let k = CString::new(key.as_str()).unwrap_or_default();
+                // 返回堆串，用完必须释放（与 file_read 同机制）
+                let p = tie_msg_t(k.as_ptr());
+                let s = unsafe { c_char_to_string(p).unwrap_or_default() };
+                tie_free_result(p);
+                Ok(Value::Str(s))
+            }
+            // 目录类：list_dir 走 C ABI 桥（与编译路径共用 std::fs::read_dir），
+            // 返回字符串动态表（文件名集合）；目录无效 → 报错（错误文本与编译路径一致）。
+            // 表在解释器里是 Value::Table(Vec)：读出桥表的全部字符串条目后调用
+            // tie_table_free 释放「指针数组 + 表结构」；字符串元素按借用约定由桥泄漏
+            //（与 table_push_string 一致，调用方不释放），因此读出的 Value::Str 是拷贝。
+            "list_dir" => {
+                if args.len() != 1 {
+                    return Err("list_dir 需要一个字符串参数".into());
+                }
+                let Value::Str(path) = &args[0] else {
+                    return Err("list_dir 需要一个字符串参数".into());
+                };
+                let p = CString::new(path.as_str()).unwrap_or_default();
+                let t = tie_list_dir(p.as_ptr());
+                // 失败（NULL）→ 报错（错误消息与编译路径 printf 文本一致）
+                if t.is_null() {
+                    return Err(format!("运行时错误: list_dir 无法读取目录 '{path}'"));
+                }
+                // 读出全部条目（元素类型 string，data 缓冲区为 *const c_char 数组）
+                let mut cells: Vec<Value> = Vec::new();
+                unsafe {
+                    let tbl = &*t;
+                    for i in 0..tbl.len {
+                        let ptr = (tbl.data as *const *const c_char).add(i as usize).read();
+                        cells.push(Value::Str(c_char_to_string(ptr).unwrap_or_default()));
+                    }
+                }
+                // 释放桥表（指针数组 + 结构体；字符串元素按约定泄漏，不重复释放）
+                tie_table_free(t);
+                Ok(Value::Table(cells))
             }
             // 字符串类：str_char / to_string 走 C ABI 桥（与编译路径共用实现，
             // 保证 UTF-8 码点索引与数字格式化两路径逐字节一致）。
@@ -956,6 +1592,27 @@ impl<'a> Env<'a> {
                 }
                 Ok(Value::Int(v))
             }
+            // 进程/环境类：arg_count / arg_string 走 C ABI 桥（与编译路径共用
+            // std::env::args，保证两路径返回一致的命令行参数）。
+            "arg_count" => {
+                if !args.is_empty() {
+                    return Err("arg_count 不需要参数".into());
+                }
+                Ok(Value::Int(tie_arg_count()))
+            }
+            "arg_string" => {
+                if args.len() != 1 {
+                    return Err("arg_string 需要 1 个整数参数".into());
+                }
+                let Value::Int(i) = args[0] else {
+                    return Err("arg_string 需要一个整数参数".into());
+                };
+                // 走 C ABI 桥取堆串（越界返回空串），用完释放
+                let p = tie_arg_string(i);
+                let s = unsafe { c_char_to_string(p).unwrap_or_default() };
+                tie_free_result(p);
+                Ok(Value::Str(s))
+            }
             "sqrt" | "sin" | "cos" | "tan" | "exp" | "log" | "floor" | "ceil" | "round" => {
                 if args.len() != 1 {
                     return Err(format!("{name} 需要一个数字参数"));
@@ -1000,22 +1657,46 @@ impl<'a> Env<'a> {
                 Ok(Value::Float(x.powf(y)))
             }
             _ => {
-                // 用户函数（REPL 中定义的）
+                // 用户函数（REPL 中定义的；命名空间函数以全名注册）
                 if let Some(f) = self.session.funcs.get(name).cloned() {
-                    if f.params.len() != args.len() {
+                    // 参数个数区间检查（默认值参数）：实参数必须在 [必选数, 总形参数] 内。
+                    // 必选数 = 无默认值的形参数（可选参数连续排在尾部，语义层已保证）。
+                    let required = f.params.iter().take_while(|p| p.default.is_none()).count();
+                    if args.len() < required || args.len() > f.params.len() {
                         return Err(format!(
-                            "函数 '{name}' 期望 {} 个参数，实际 {} 个",
+                            "函数 '{name}' 期望 {}-{} 个参数，实际 {} 个",
+                            required,
                             f.params.len(),
                             args.len()
                         ));
                     }
-                    // 压新作用域绑定参数
+                    // 函数体执行期间，裸调用按本函数命名空间前缀补全：
+                    // 全名 "tcmsg::error::no_file" → 前缀 ["tcmsg","error"]
+                    let saved_ns = std::mem::take(&mut self.cur_ns);
+                    if name.contains("::") {
+                        let mut segs: Vec<String> = name.split("::").map(|s| s.to_string()).collect();
+                        segs.pop(); // 去掉函数名，剩命名空间路径
+                        self.cur_ns = segs;
+                    }
+                    // 压新作用域绑定参数：实参在前，缺省参数按默认值表达式求值补齐
+                    //（默认值限字面量/空表，eval_expr 直接求值，无作用域依赖）。
                     self.scopes.push(std::collections::HashMap::new());
-                    for (p, v) in f.params.iter().zip(args) {
+                    for (i, p) in f.params.iter().enumerate() {
+                        let v = if let Some(v) = args.get(i) {
+                            v.clone()
+                        } else if let Some(d) = &p.default {
+                            self.eval_expr(d)?
+                        } else {
+                            return Err(format!(
+                                "函数 '{name}' 缺少第 {} 个参数且无默认值",
+                                i + 1
+                            ));
+                        };
                         self.scopes.last_mut().unwrap().insert(p.name.clone(), v);
                     }
                     let result = self.exec_block(&f.body);
                     self.scopes.pop();
+                    self.cur_ns = saved_ns;
                     // 处理 return 传播
                     match result? {
                         Flow::Normal(Some(v)) => Ok(v),
@@ -1137,6 +1818,146 @@ mod tests {
         assert_eq!(ev("10 - 3 * 2").unwrap(), "4");
         assert_eq!(ev("7 / 2").unwrap(), "3"); // 整数除法
         assert_eq!(ev("7 % 3").unwrap(), "1");
+    }
+
+    #[test]
+    fn eval_namespace_call() {
+        // 命名空间函数路径调用：tcmsg.error.hello() → 全名 tcmsg::error::hello。
+        // 分两阶段（REPL 语义）：先注册定义，再执行表达式。
+        let mut s = Session::new();
+        s.eval(
+            "namespace tcmsg {\n\
+             \x20func hello() -> string {\n\
+             \x20\x20\x20\x20return \"ns hello\"\n\
+             \x20}\n\
+             \x20namespace error {\n\
+             \x20\x20\x20\x20func hello() -> string {\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20return \"err hello\"\n\
+             \x20\x20\x20\x20}\n\
+             \x20\x20\x20\x20func inner() -> string {\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20return \"inner\"\n\
+             \x20\x20\x20\x20}\n\
+             \x20\x20\x20\x20func call_inner() -> string {\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20return inner()\n\
+             \x20\x20\x20\x20}\n\
+             \x20}\n\
+             }\n",
+        )
+        .unwrap();
+        assert_eq!(s.eval("tcmsg.hello()").unwrap(), "ns hello");
+        assert_eq!(s.eval("tcmsg.error.hello()").unwrap(), "err hello");
+        assert_eq!(s.eval("tcmsg.error.call_inner()").unwrap(), "inner");
+    }
+
+    #[test]
+    fn eval_ns_missing_fn_err() {
+        let mut s = Session::new();
+        s.eval("namespace tcmsg {\nfunc ok() -> string {\nreturn \"x\"\n}\n}\n")
+            .unwrap();
+        let err = s.eval("tcmsg.missing()").unwrap_err();
+        assert!(err.contains("未定义的函数 'tcmsg::missing'"), "错误：{err}");
+    }
+
+    #[test]
+    fn eval_ns_table_lit_arg() {
+        // 用户核心 API 形态：命名空间函数 + 表字面量实参
+        // （tcmsg::error.no_file(["zh-cn","en-us"])）——解释路径。
+        // 表字面量实参在解释器里求值为 Value::Table，按位置传给函数参数。
+        let mut s = Session::new();
+        s.eval(
+            "namespace tcmsg {\n\
+             \x20namespace error {\n\
+             \x20\x20\x20\x20func no_file(langs: table) -> string {\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20return \"File not found\"\n\
+             \x20\x20\x20\x20}\n\
+             \x20}\n\
+             }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            s.eval("tcmsg::error.no_file([\"zh-cn\", \"en-us\"])").unwrap(),
+            "File not found"
+        );
+        // 函数体内消费表实参：len(表) 返回元素个数（与编译路径一致）
+        s.eval(
+            "namespace tcmsg {\n\
+             \x20func count(langs: table) -> i64 {\n\
+             \x20\x20\x20\x20return len(langs)\n\
+             \x20}\n\
+             }\n",
+        )
+        .unwrap();
+        assert_eq!(s.eval("tcmsg.count([\"zh-cn\", \"en-us\"])").unwrap(), "2");
+    }
+
+    #[test]
+    fn eval_default_arg_省略与传参() {
+        // 默认值参数（解释路径）：省略可选参数用默认值，显式传参覆盖。
+        let mut s = Session::new();
+        s.eval(
+            "func greet(name: string, prefix: string = \"Hello\") -> string {\n\
+             \x20\x20\x20\x20return prefix + \", \" + name\n\
+             }\n",
+        )
+        .unwrap();
+        assert_eq!(s.eval("greet(\"World\")").unwrap(), "Hello, World");
+        assert_eq!(s.eval("greet(\"World\", \"Hi\")").unwrap(), "Hi, World");
+        // 超参 → 报错（区间检查）
+        let err = s.eval("greet(\"World\", \"Hi\", \"x\")").unwrap_err();
+        assert!(err.contains("期望 1-2 个参数"), "错误：{err}");
+    }
+
+    #[test]
+    fn eval_default_arg_tcmsg综合方案() {
+        // tcmsg 综合方案形态（解释路径）：langs 必选 + texts 可选（空表默认值）。
+        // 省略 texts → 查字典（方案 B）；传 texts → 直接返回调用方文本（方案 A）。
+        let mut s = Session::new();
+        s.eval(
+            "namespace tcmsg {\n\
+             \x20namespace error {\n\
+             \x20\x20\x20\x20func no_file(langs: table, texts: table = []) -> string {\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20msg_register(\"error.no_file\", \"zh\", \"文件不存在\")\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20msg_register(\"error.no_file\", \"en\", \"File not found\")\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20if len(texts) > 0 {\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20return texts[0]\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20}\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20return msg_t(\"error.no_file\")\n\
+             \x20\x20\x20\x20}\n\
+             \x20}\n\
+             }\n",
+        )
+        .unwrap();
+        // 方案 B：省略 texts → 查字典（当前语言 en → "File not found"）
+        s.eval("msg_set_lang(\"en\")").unwrap();
+        assert_eq!(
+            s.eval("tcmsg::error.no_file([\"zh-cn\", \"en-us\"])").unwrap(),
+            "File not found"
+        );
+        // 方案 A：传 texts → 直接返回调用方文本
+        assert_eq!(
+            s.eval("tcmsg::error.no_file([\"zh-cn\", \"en-us\"], [\"调用方提供的文本\"])")
+                .unwrap(),
+            "调用方提供的文本"
+        );
+    }
+
+    #[test]
+    fn eval_msg_三件套含回退规则() {
+        // 消息系统：msg_register 登记 (键,语言)→文本；msg_t 查询按
+        // 当前语言 → 回退 zh → 回退键本身的顺序（与 C ABI 桥一致）。
+        let mut s = Session::new();
+        s.eval("msg_register(\"err.no_file\", \"zh\", \"文件不存在\")").unwrap();
+        s.eval("msg_register(\"err.no_file\", \"en\", \"File not found\")").unwrap();
+        // 默认语言 zh：命中 zh 文本
+        assert_eq!(s.eval("msg_t(\"err.no_file\")").unwrap(), "文件不存在");
+        // 切换 en：命中 en 文本
+        s.eval("msg_set_lang(\"en\")").unwrap();
+        assert_eq!(s.eval("msg_t(\"err.no_file\")").unwrap(), "File not found");
+        // 切换未登记语言 ja：回退 zh
+        s.eval("msg_set_lang(\"ja\")").unwrap();
+        assert_eq!(s.eval("msg_t(\"err.no_file\")").unwrap(), "文件不存在");
+        // 未登记键：回退键本身
+        assert_eq!(s.eval("msg_t(\"err.unknown\")").unwrap(), "err.unknown");
     }
 
     #[test]
@@ -1265,6 +2086,13 @@ mod tests {
         p
     }
 
+    /// 生成唯一临时目录路径（list_dir 测试用），并清场确保从干净状态开始。
+    fn temp_dir_path(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("tie_floor_{}_{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
     /// 把文件路径转义成 tie 字符串字面量可直接嵌入的形式
     /// （Windows 路径含 `\`，而 tie 词法把 `\x` 当转义序列，需双写）。
     fn escaped_path(p: &std::path::Path) -> String {
@@ -1322,6 +2150,53 @@ mod tests {
         let err = ev(&format!("file_read(\"{path}\")")).unwrap_err();
         assert!(err.contains("运行时错误: file_read 无法读取文件"));
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn builtin_list_dir_lists_entries() {
+        // 临时目录里放 3 个文件，list_dir 应全部列出（条目顺序由文件系统给出，不排序）
+        let dir = temp_dir_path("listdir_ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        std::fs::write(dir.join("b.txt"), "b").unwrap();
+        std::fs::write(dir.join("c.txt"), "c").unwrap();
+        let path = escaped_path(&dir);
+        let code = format!(
+            r#"var t = list_dir("{path}")
+var n = len(t)
+var names: string = ""
+for x in t {{
+    names = names + x + ","
+}}
+to_string(n) + ":" + names"#
+        );
+        let out = ev(&code).unwrap();
+        // 恰好 3 个条目，且全部包含三个文件名
+        assert!(out.starts_with("3:"), "list_dir 长度应为 3，实际: {out}");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            assert!(out.contains(name), "list_dir 应包含 {name}，实际: {out}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_list_dir_empty_dir() {
+        // 空目录 → 空表（len == 0）
+        let dir = temp_dir_path("listdir_empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = escaped_path(&dir);
+        let out = ev(&format!("len(list_dir(\"{path}\"))")).unwrap();
+        assert_eq!(out, "0");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_list_dir_missing_dir_errors() {
+        // 目录不存在 → 运行时错误（文本与编译路径一致）
+        let dir = temp_dir_path("listdir_missing");
+        let path = escaped_path(&dir);
+        let err = ev(&format!("list_dir(\"{path}\")")).unwrap_err();
+        assert!(err.contains("运行时错误: list_dir 无法读取目录"));
     }
 
     #[test]
@@ -1425,6 +2300,59 @@ mod tests {
         assert!(err2.contains("运行时错误: rand_range 参数范围无效"));
     }
 
+    // ---------- 进程/环境 floor 内置函数测试 ----------
+
+    #[test]
+    fn builtin_arg_count_matches_env() {
+        // 解释器运行在测试进程内：arg_count 应等于进程用户参数个数（skip(1) 跳过程序名）
+        let want = std::env::args().skip(1).count() as i64;
+        let got: i64 = ev("arg_count()").unwrap().parse().unwrap();
+        assert_eq!(got, want, "arg_count() 应与 std::env::args 用户参数个数一致");
+        // 参数个数永远 >= 0（无参数进程 → 0）
+        assert!(got >= 0);
+    }
+
+    #[test]
+    fn builtin_arg_string_matches_env() {
+        // 逐个对比 tie 的 arg_string 与进程真实参数（skip(1) 跳过 argv[0] 程序名）
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        for (i, want) in args.iter().enumerate() {
+            let got = ev(&format!("arg_string({i})")).unwrap();
+            assert_eq!(got, *want, "arg_string({i}) 应与进程参数一致");
+        }
+        // 越界（下标 == 个数 / 更大 / 负数）→ 空串
+        assert_eq!(ev(&format!("arg_string({})", args.len())).unwrap(), "");
+        assert_eq!(ev("arg_string(999999999)").unwrap(), "");
+        assert_eq!(ev("arg_string(-1)").unwrap(), "");
+    }
+
+    #[test]
+    fn std_format_helpers() {
+        // 加载 std/format.tie（tie 语言自写库，include_str! 保证测试的就是发行版源码）
+        let lib = include_str!("../../../std/format.tie");
+        let mut s = Session::new();
+        s.eval(lib).unwrap(); // 注册库函数
+        // format_int：委托 to_string
+        assert_eq!(s.eval("format_int(42)").unwrap(), "42");
+        assert_eq!(s.eval("format_int(-7)").unwrap(), "-7");
+        assert_eq!(s.eval("format_int(0)").unwrap(), "0");
+        // format_pad：右对齐、左侧补空格；宽度不足/相等不截断
+        assert_eq!(s.eval("format_pad(42, 6)").unwrap(), "    42");
+        assert_eq!(s.eval("format_pad(42, 2)").unwrap(), "42");
+        assert_eq!(s.eval("format_pad(42, 0)").unwrap(), "42");
+        assert_eq!(s.eval("format_pad(-7, 4)").unwrap(), "  -7");
+        // format_int_hex：小写十六进制、无 0x；负数「-」+ 绝对值
+        assert_eq!(s.eval("format_int_hex(255)").unwrap(), "ff");
+        assert_eq!(s.eval("format_int_hex(0)").unwrap(), "0");
+        assert_eq!(s.eval("format_int_hex(16)").unwrap(), "10");
+        assert_eq!(s.eval("format_int_hex(4095)").unwrap(), "fff");
+        assert_eq!(s.eval("format_int_hex(-255)").unwrap(), "-ff");
+        assert_eq!(s.eval("format_int_hex(3735928559)").unwrap(), "deadbeef");
+        // format(bool)：true / false
+        assert_eq!(s.eval("format(true)").unwrap(), "true");
+        assert_eq!(s.eval("format(false)").unwrap(), "false");
+    }
+
     #[test]
     fn builtin_math_sqrt() {
         assert_eq!(ev("sqrt(4)").unwrap(), "2");
@@ -1484,5 +2412,102 @@ mod tests {
         assert_eq!(ev("len([\"a\", \"b\"])").unwrap(), "2");
         // len(字符串) 保持原行为（字节数）
         assert_eq!(ev("len(\"hello\")").unwrap(), "5");
+    }
+
+    #[test]
+    fn dyn_table_new_push_len() {
+        // table_new_i64 → push 1..100 → len 应为 100（动态增长）
+        let code = r#"
+            var t: table = table_new_i64()
+            var i: i64 = 1
+            while i <= 100 {
+                table_push(t, i)
+                i = i + 1
+            }
+            len(t)
+        "#;
+        assert_eq!(ev(code).unwrap(), "100");
+        // 空表 len 为 0
+        assert_eq!(ev("len(table_new_i64())").unwrap(), "0");
+    }
+
+    #[test]
+    fn dyn_table_at_reads_element() {
+        // table_at 读取第 i 个元素（0 基）
+        let code = r#"
+            var t: table = table_new_i64()
+            table_push(t, 10)
+            table_push(t, 20)
+            table_push(t, 30)
+            table_at(t, 1)
+        "#;
+        assert_eq!(ev(code).unwrap(), "20");
+        // 下标访问 t[i] 与 table_at 等价
+        let code2 = r#"
+            var t: table = table_new_i64()
+            table_push(t, 7)
+            table_push(t, 8)
+            t[0]
+        "#;
+        assert_eq!(ev(code2).unwrap(), "7");
+    }
+
+    #[test]
+    fn dyn_table_at_out_of_bounds_errors() {
+        // 越界（负数 / >= len）→ 运行时错误，文本与编译路径一致
+        let code = r#"
+            var t: table = table_new_i64()
+            table_push(t, 1)
+            table_at(t, 5)
+        "#;
+        let err = ev(code).unwrap_err();
+        assert!(err.contains("运行时错误: table_at 下标越界：索引 5 超出长度 1"), "实际: {err}");
+        let err2 = ev("table_at(table_new_i64(), -1)").unwrap_err();
+        assert!(err2.contains("运行时错误: table_at 下标越界"), "实际：{err2}");
+    }
+
+    #[test]
+    fn dyn_table_string_build_and_for() {
+        // table_new_string 构建字符串表，for 遍历打印
+        let code = r#"
+            var t: table = table_new_string()
+            table_push(t, "a")
+            table_push(t, "b")
+            table_push(t, "c")
+            var out = ""
+            for x in t {
+                out = out + x
+            }
+            out
+        "#;
+        assert_eq!(ev(code).unwrap(), "abc");
+        // table_at 读字符串元素
+        let code2 = r#"
+            var t: table = table_new_string()
+            table_push(t, "hello")
+            table_push(t, "world")
+            table_at(t, 1)
+        "#;
+        assert_eq!(ev(code2).unwrap(), "world");
+    }
+
+    #[test]
+    fn dyn_table_bool_and_f64() {
+        // bool 表：push 后 table_at 读取
+        let code = r#"
+            var t: table = table_new_bool()
+            table_push(t, true)
+            table_push(t, false)
+            table_at(t, 0)
+        "#;
+        assert_eq!(ev(code).unwrap(), "true");
+        // f64 表：push 后 len 与 table_at
+        let code2 = r#"
+            var t: table = table_new_f64()
+            table_push(t, 1.5)
+            table_push(t, 2.5)
+            len(t)
+        "#;
+        assert_eq!(ev(code2).unwrap(), "2");
     }
 }

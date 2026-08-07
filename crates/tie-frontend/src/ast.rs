@@ -148,6 +148,8 @@ pub enum Stmt {
     Switch(SwitchStmt),
     /// import 导入其他 tie 文件（`import "./x.tie" [as 别名]`，仅顶层）
     Import(ImportStmt),
+    /// 命名空间声明 `namespace tcmsg { ... }`（C# 风格块式；仅顶层，可嵌套/点分）
+    Namespace(NamespaceStmt),
     /// 类定义 `class Name [extends Parent] { 字段/方法 }`（P8，仅顶层）
     Class(ClassDefStmt),
     /// 字段赋值 `obj.field = expr`（P8，对已存在实例字段的写入）
@@ -161,6 +163,20 @@ pub struct ImportStmt {
     pub path: String,
     /// 可选别名（`as 别名`）；当前阶段仅解析保留，后续版本用于命名空间限定
     pub alias: Option<String>,
+    pub span: Span,
+}
+
+/// 命名空间声明（C# 风格块式）：`namespace tcmsg { ... }`。
+///
+/// 仅允许出现在文件顶层；路径为点分/嵌套组合出的完整命名空间名
+/// （如 `namespace tcmsg.error { }` 或嵌套 `namespace tcmsg { namespace error { } }`）。
+/// 体内可含函数定义/类定义/嵌套命名空间；作用域与符号注册由语义层处理。
+#[derive(Debug, Clone)]
+pub struct NamespaceStmt {
+    /// 命名空间路径段（如 `tcmsg.error` 存为 ["tcmsg", "error"]）
+    pub path: Vec<String>,
+    /// 命名空间体内的语句（函数/类/嵌套命名空间等）
+    pub body: Vec<Stmt>,
     pub span: Span,
 }
 
@@ -205,6 +221,9 @@ pub struct FnDefStmt {
 pub struct Param {
     pub name: String,
     pub ty: TypeSpec,
+    /// 默认值表达式（可选参数）：调用时省略该实参则用默认值补齐。
+    /// 限字面量（含空表 `[]`），与类字段默认值规则一致（避免作用域依赖）。
+    pub default: Option<Expr>,
     pub span: Span,
 }
 
@@ -371,10 +390,17 @@ pub enum Expr {
     ///
     /// 同一变体管两种，语义层按 base 的推导类型分发。
     FieldAccess { base: Box<Expr>, field: String, span: Span },
+    /// 命名空间路径 `a::b::c`（C#/Rust 风格，`::` 分隔；如 `tcmsg::error`）。
+    ///
+    /// 作为独立表达式仅表示"命名空间路径"；真正的函数调用是
+    /// `MethodCall { receiver: Path(...), method: "no_file", .. }`（`tcmsg::error.no_file()`），
+    /// 语义层按 receiver 是 Path 解析为命名空间函数调用。
+    Path { segments: Vec<String>, span: Span },
     /// 方法调用 `obj.m(args)`（实例）/ `MyClass.m(args)`（静态）（P8）
     ///
     /// receiver 是变量/this → 实例方法（receiver 地址作隐藏 this 参数）；
-    /// receiver 是类名 → 静态方法（无 this）。同一变体管两种，语义层区分。
+    /// receiver 是类名 → 静态方法（无 this）；receiver 是命名空间路径（Expr::Path）
+    /// → 命名空间函数调用（全名 = 路径段 + 方法名）。同一变体管三种，语义层区分。
     MethodCall { receiver: Box<Expr>, method: String, args: Vec<Expr>, span: Span },
 }
 

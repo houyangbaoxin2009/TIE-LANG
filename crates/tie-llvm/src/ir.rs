@@ -9,7 +9,8 @@
 //! - 函数入口块命名为 `entry`，控制流块命名为 `if.then`/`if.else`/`loop.cond` 等
 
 use tie_frontend::ast::{
-    BinaryOp, Expr, FieldAssignStmt, FnDefStmt, MethodDefStmt, Program, Stmt, TypeSpec, UnaryOp,
+    BinaryOp, Expr, FieldAssignStmt, FnDefStmt, MethodDefStmt, Program, Stmt, TableCell, TypeSpec,
+    UnaryOp,
 };
 use tie_frontend::lexer::TyKw;
 use tie_frontend::semantic::{ClassInfo, FuncSig, MethodSig, SemanticResult};
@@ -146,6 +147,7 @@ impl<'p> IrGenerator<'p> {
                     f.name.clone(),
                     FuncSig {
                         param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
+                        param_defaults: f.params.iter().map(|p| p.default.clone()).collect(),
                         ret_ty: f.ret_ty.clone(),
                     },
                 )),
@@ -153,10 +155,14 @@ impl<'p> IrGenerator<'p> {
             })
             .collect();
 
-        // 生成各函数
+        // 生成各函数（顶层 + 命名空间内）：全名 = 顶层裸名 / 命名空间路径::函数名。
+        // 递归遍历命名空间体，fn_full_names 提供 FnDefStmt 地址 → 全名映射
+        // （与语义层一致；gen_fn 用全名生成 LLVM 符号）。
         for stmt in &self.program.stmts {
             if let Stmt::FnDef(f) = stmt {
-                self.gen_fn(f, &sigs)?;
+                self.gen_fn(f, &f.name, &sigs)?;
+            } else if let Stmt::Namespace(ns) = stmt {
+                self.gen_ns_fns(&ns.body, &ns.path, &sigs)?;
             }
         }
 
@@ -215,13 +221,102 @@ impl<'p> IrGenerator<'p> {
         if self.used_externs.iter().any(|s| s == "tie_rand_range") {
             self.out.push_str("declare i64 @tie_rand_range(i64, i64, ptr)\n");
         }
+        // 进程/环境 floor 的 C ABI 桥（与解释路径共用 std::env::args）：
+        // tie_arg_count 返回用户参数个数；tie_arg_string 返回第 i 个用户参数（堆串）。
+        if self.used_externs.iter().any(|s| s == "tie_arg_count") {
+            self.out.push_str("declare i64 @tie_arg_count()\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_arg_string") {
+            self.out.push_str("declare ptr @tie_arg_string(i64)\n");
+        }
+        // 文件系统 floor 的 C ABI 桥：tie_list_dir 返回字符串动态表（DynTable 指针），
+        // 目录不存在/读取失败返回 NULL（调用方统一输出错误消息，两路径文本一致）。
+        if self.used_externs.iter().any(|s| s == "tie_list_dir") {
+            self.out.push_str("declare ptr @tie_list_dir(ptr)\n");
+        }
+        // 消息系统 floor（#25）的 C ABI 桥（进程内可变状态由 Rust 层 thread_local 持有）：
+        // tie_msg_set_lang 切换当前语言；tie_msg_register 登记 (键,语言) → 文本；
+        // tie_msg_t 查询翻译（当前语言 → 回退 zh → 回退键本身），返回堆串。
+        if self.used_externs.iter().any(|s| s == "tie_msg_set_lang") {
+            self.out.push_str("declare void @tie_msg_set_lang(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_msg_get_lang") {
+            self.out.push_str("declare ptr @tie_msg_get_lang()\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_msg_register") {
+            self.out.push_str("declare void @tie_msg_register(ptr, ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_msg_t") {
+            self.out.push_str("declare ptr @tie_msg_t(ptr)\n");
+        }
+        // 动态表（table_new_*/table_push/table_at）的 C ABI 桥（与解释路径共用实现）：
+        // tie_table_new 创建空表（elem_size 决定元素宽度）；tie_table_push_* 追加元素；
+        // tie_table_at_* 按下标读取（越界置 ok=0）；tie_table_len 返回元素个数；
+        // tie_table_free 释放表内存（作用域弹出时对 owned 表调用，防逐次迭代泄漏）。
+        if self.used_externs.iter().any(|s| s == "tie_table_new") {
+            self.out.push_str("declare ptr @tie_table_new(i64)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_table_free") {
+            self.out.push_str("declare void @tie_table_free(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_table_len") {
+            self.out.push_str("declare i64 @tie_table_len(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_table_push_i64") {
+            self.out.push_str("declare void @tie_table_push_i64(ptr, i64)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_table_push_f64") {
+            self.out.push_str("declare void @tie_table_push_f64(ptr, double)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_table_push_string") {
+            self.out.push_str("declare void @tie_table_push_string(ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_table_push_bool") {
+            self.out.push_str("declare void @tie_table_push_bool(ptr, i1)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_table_at_i64") {
+            self.out.push_str("declare i64 @tie_table_at_i64(ptr, i64, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_table_at_f64") {
+            self.out.push_str("declare double @tie_table_at_f64(ptr, i64, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_table_at_string") {
+            self.out.push_str("declare ptr @tie_table_at_string(ptr, i64, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_table_at_bool") {
+            self.out.push_str("declare i1 @tie_table_at_bool(ptr, i64, ptr)\n");
+        }
         Ok(())
     }
 
     // ---------- 函数生成 ----------
 
-    fn gen_fn(&mut self, f: &FnDefStmt, sigs: &HashMap<String, FuncSig>) -> Result<(), IrError> {
-        self.cur_fn = f.name.clone();
+    /// 命名空间体内函数生成（顶层发射循环递归入口）：全名 = 当前路径::函数名，
+    /// 嵌套命名空间递归拼接路径。与语义层 collect_ns_funcs 的路径规则一致。
+    fn gen_ns_fns(&mut self, stmts: &[Stmt], prefix: &[String], sigs: &HashMap<String, FuncSig>) -> Result<(), IrError> {
+        for stmt in stmts {
+            match stmt {
+                Stmt::FnDef(f) => {
+                    let mut segs = prefix.to_vec();
+                    segs.push(f.name.clone());
+                    let full = segs.join("::");
+                    self.gen_fn(f, &full, sigs)?;
+                }
+                Stmt::Namespace(inner) => {
+                    let mut segs = prefix.to_vec();
+                    segs.extend(inner.path.iter().cloned());
+                    self.gen_ns_fns(&inner.body, &segs, sigs)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn gen_fn(&mut self, f: &FnDefStmt, full_name: &str, sigs: &HashMap<String, FuncSig>) -> Result<(), IrError> {
+        // LLVM 符号名：顶层函数 = 裸名；命名空间函数 = 全名转 $（tcmsg::error::no_file
+        // → tcmsg$error$no_file，与类方法 mangle 同约定）。
+        self.cur_fn = full_name.to_string();
         self.reg = 0;
         self.scopes.clear();
 
@@ -234,7 +329,7 @@ impl<'p> IrGenerator<'p> {
         self.out.push_str(&format!(
             "define {} @{}({}) {{\n",
             ret_llvm,
-            f.name,
+            ns_symbol(full_name),
             params.join(", ")
         ));
         // 入口块
@@ -369,6 +464,17 @@ impl<'p> IrGenerator<'p> {
     fn gen_stmt(&mut self, stmt: &Stmt) -> Result<(), IrError> {
         match stmt {
             Stmt::VarDecl(v) => {
+                // 动态表变量（table_new_* 或返回表的函数初始化）：运行时 {ptr,len,cap} 结构。
+                // 语义层 table_vars 已登记 dynamic=true；IR 生成 table_new 调用并绑定为 ptr。
+                if self
+                    .sem
+                    .table_vars
+                    .get(&(self.cur_fn.clone(), v.name.clone()))
+                    .map(|info| info.dynamic)
+                    .unwrap_or(false)
+                {
+                    return self.gen_dyn_table_var(v);
+                }
                 // 表变量：直接生成定长数组布局（alloca [N x T] + 逐元素 store），
                 // 长度与元素类型来自语义层 tables 元数据（键 = init 表达式地址）。
                 if v.ty.as_ref().map(|t| t.is_table()).unwrap_or(false) {
@@ -402,6 +508,7 @@ impl<'p> IrGenerator<'p> {
                 Ok(())
             }
             Stmt::FnDef(_) => Ok(()), // 顶层函数，不在此生成
+            Stmt::Namespace(_) => Ok(()), // 命名空间体内函数由顶层发射循环生成
             Stmt::Expr(e) => {
                 let (v, _ty) = self.gen_expr(&e.expr)?;
                 // REPL 内置作为独立语句（结果丢弃）：read_line()/eval() 返回
@@ -419,6 +526,7 @@ impl<'p> IrGenerator<'p> {
                             || name == "file_read"
                             || name == "str_char"
                             || name == "to_string"
+                            || name == "arg_string"
                 ) {
                     self.mark_used("tie_free_result");
                     self.line(&format!("call void @tie_free_result(ptr {v})"));
@@ -609,6 +717,46 @@ impl<'p> IrGenerator<'p> {
         Ok(())
     }
 
+    /// 动态表变量声明：生成 table_new_* 调用并绑定为不透明指针。
+    ///
+    /// 布局：`alloca ptr` 存表指针（运行时 {ptr,len,cap} 结构），随后调用
+    /// `tie_table_new(elem_size)` 创建空表并 store。元素宽度由语义层 table_vars
+    /// 的元素类型决定（i64/f64/string=8，bool=1）。
+    fn gen_dyn_table_var(&mut self, v: &tie_frontend::ast::VarDeclStmt) -> Result<(), IrError> {
+        let info = self
+            .sem
+            .table_vars
+            .get(&(self.cur_fn.clone(), v.name.clone()))
+            .cloned()
+            .ok_or_else(|| IrError {
+                message: format!("内部错误：动态表变量 '{}' 缺少布局元数据", v.name),
+            })?;
+        let elem_llvm = self.llvm_ty(&info.elem_ty);
+        let elem_size = match elem_llvm {
+            "i1" => 1,
+            _ => 8,
+        };
+        // 初始化表达式决定表指针来源：
+        // - 返回表的用户函数调用（如 build_numbers(10)）→ 调用该函数取表指针；
+        // - 其余（table_new_* 等）→ 直接 tie_table_new 新建空表。
+        let tptr = if let Expr::Call { name: fname, args, .. } = &v.init {
+            let (r, _t) = self.gen_call(fname, args)?;
+            r
+        } else {
+            self.mark_used("tie_table_new");
+            let t = self.new_reg();
+            self.line(&format!("{t} = call ptr @tie_table_new(i64 {elem_size})"));
+            t
+        };
+        let alloca = self.new_reg();
+        self.line(&format!("{alloca} = alloca ptr"));
+        self.line(&format!("store ptr {tptr}, ptr {alloca}"));
+        // 绑定：变量类型 = ptr（动态表不透明指针，与字符串一致）
+        self.cur_scope_mut()
+            .insert(v.name.clone(), VarBind { value: alloca, ty: "ptr", by_ptr: false });
+        Ok(())
+    }
+
     fn gen_if(&mut self, i: &tie_frontend::ast::IfStmt) -> Result<(), IrError> {
         let (cond, _) = self.gen_expr(&i.cond)?;
         let then_label = self.new_label("if.then");
@@ -679,6 +827,20 @@ impl<'p> IrGenerator<'p> {
             && let Some((len, elem_ty)) = parse_array_shape(bind.ty)
         {
             return self.gen_for_table(f, &bind, len, elem_ty);
+        }
+        // 动态表遍历：`for item in t`（t 为 table_new_* 创建的动态表）。
+        // 语义层 table_vars 标记 dynamic=true；循环 0..len(t)，每次 tie_table_at 读取。
+        if let Expr::Var(name) = &f.iter
+            && let Some(bind) = self.lookup_var(name).cloned()
+            && bind.ty == "ptr"
+            && self
+                .sem
+                .table_vars
+                .get(&(self.cur_fn.clone(), name.clone()))
+                .map(|info| info.dynamic)
+                .unwrap_or(false)
+        {
+            return self.gen_for_dyn_table(f, &bind);
         }
         // 范围遍历：`for x in start..end`
         let Expr::Range { start, end, .. } = &f.iter else {
@@ -799,7 +961,78 @@ impl<'p> IrGenerator<'p> {
         Ok(())
     }
 
-    /// switch 多分支选择：生成比较链 + 各 case 体块。
+    /// 动态表遍历：`for item in t`，生成 0..len(t) 计数器循环。
+    ///
+    /// 布局：计数器 alloca（i64，0..len(t)）+ 循环变量 alloca（元素类型 T）。
+    /// 每次迭代：调用 tie_table_at 读取元素 → store 到循环变量。
+    /// 与定长表 gen_for_table 共用计数器/循环变量骨架，仅元素读取走动态表桥。
+    fn gen_for_dyn_table(
+        &mut self,
+        f: &tie_frontend::ast::ForStmt,
+        tbl_bind: &VarBind,
+    ) -> Result<(), IrError> {
+        // 元素类型：来自语义层 table_vars（动态表的 LLVM 类型恒为 "ptr"）
+        let elem_ty = self.dyn_table_elem_ty(&f.iter)?;
+        let elem_llvm = self.llvm_ty(&elem_ty);
+        let suffix = table_elem_suffix(elem_llvm);
+        self.mark_used(&format!("tie_table_at_{suffix}"));
+        // 表指针：变量是 alloca ptr，先 load 出表指针（在 entry 块，越界在此循环内已由 at 桥处理）
+        let tptr = self.new_reg();
+        self.line(&format!("{tptr} = load ptr, ptr {}", tbl_bind.value));
+        // 计数器 alloca（i64）
+        let idx_alloca = self.new_reg();
+        self.line(&format!("{idx_alloca} = alloca i64"));
+        self.line(&format!("store i64 0, ptr {idx_alloca}"));
+        // 循环变量 alloca（元素类型 T，每次迭代覆盖）
+        let item_alloca = self.new_reg();
+        self.line(&format!("{item_alloca} = alloca {elem_llvm}"));
+
+        let cond_label = self.new_label("for.cond");
+        let body_label = self.new_label("for.body");
+        let exit_label = self.new_label("for.exit");
+        self.line(&format!("br label %{cond_label}"));
+
+        self.block_start(&cond_label);
+        let cur = self.new_reg();
+        self.line(&format!("{cur} = load i64, ptr {idx_alloca}"));
+        // 长度运行时求值：每次进入条件块调用 tie_table_len（寄存器须按分配顺序递增）
+        let tlen = self.table_len_reg(&tptr)?;
+        let done = self.new_reg();
+        self.line(&format!("{done} = icmp sge i64 {cur}, {tlen}"));
+        self.line(&format!("br i1 {done}, label %{exit_label}, label %{body_label}"));
+        self.block_end();
+
+        self.block_start(&body_label);
+        // item = table_at(t, cur)（越界理论上不会发生：cur < len(t) 且表只增不减）
+        let ok = self.new_reg();
+        self.line(&format!("{ok} = alloca i1"));
+        self.line(&format!("store i1 1, ptr {ok}"));
+        let val = self.new_reg();
+        self.line(&format!(
+            "{val} = call {elem_llvm} @tie_table_at_{suffix}(ptr {tptr}, i64 {cur}, ptr {ok})"
+        ));
+        self.line(&format!("store {elem_llvm} {val}, ptr {item_alloca}"));
+        // 循环变量可见
+        self.scopes.push(HashMap::from([(
+            f.var.clone(),
+            VarBind { value: item_alloca.clone(), ty: elem_llvm, by_ptr: false },
+        )]));
+        for s in &f.body {
+            self.gen_stmt(s)?;
+        }
+        self.scopes.pop();
+        // 循环体若已以 return 终止，跳过自增与回跳（否则 ret 后产生死代码指令）
+        if !self.block_terminated() {
+            let next = self.new_reg();
+            self.line(&format!("{next} = add i64 {cur}, 1"));
+            self.line(&format!("store i64 {next}, ptr {idx_alloca}"));
+            self.line(&format!("br label %{cond_label}"));
+        }
+        self.block_end();
+
+        self.block_start(&exit_label);
+        Ok(())
+    }
     ///
     /// 结构（每个 case 一个比较块 + 一个体块）：
     /// ```text
@@ -980,7 +1213,14 @@ impl<'p> IrGenerator<'p> {
                 if let Some(info) = self.sem.classes.get(name).cloned() {
                     return self.gen_construct(name, &info, args);
                 }
-                self.gen_call(name, args)
+                // 命名空间内裸调用（如 tcmsg::error 内 helper()）：语义层已把调用点
+                // 解析为全名记录在 resolved_calls，这里取全名生成调用目标。
+                let key = expr as *const Expr as usize;
+                if let Some(full) = self.sem.resolved_calls.get(&key) {
+                    self.gen_call(full, args)
+                } else {
+                    self.gen_call(name, args)
+                }
             }
             Expr::Unary { op, operand, .. } => {
                 // 自增/自减（M4）：操作数必须是变量（语义层保证），
@@ -1134,6 +1374,31 @@ impl<'p> IrGenerator<'p> {
                 }
             }
             Expr::MethodCall { receiver, method, args, .. } => {
+                // 命名空间函数调用：receiver 是 Path（a::b）、未绑定 Var（a，单段）或
+                // FieldAccess 链（a.b，点分命名空间）。语义层已把调用点解析为全名
+                // （a::b::method）记录在 resolved_calls——以解析记录为准统一分发。
+                let key = expr as *const Expr as usize;
+                if let Expr::Path { .. } = receiver.as_ref() {
+                    let full = self.sem.resolved_calls.get(&key).cloned().ok_or_else(|| {
+                        IrError {
+                            message: format!(
+                                "内部错误：命名空间调用缺少解析记录（{}，函数 {}）",
+                                method,
+                                self.cur_fn
+                            ),
+                        }
+                    })?;
+                    return self.gen_call(&full, args);
+                }
+                // 单段命名空间（tcmsg.hello()）与点分命名空间（tcmsg.error.hello()）：
+                // receiver 是未绑定 Var 或 FieldAccess 链，且语义层有全名解析记录。
+                if (matches!(receiver.as_ref(), Expr::Var(n) if !self.scope_has(n))
+                    || matches!(receiver.as_ref(), Expr::FieldAccess { .. }))
+                    && self.sem.resolved_calls.contains_key(&key)
+                {
+                    let full = self.sem.resolved_calls[&key].clone();
+                    return self.gen_call(&full, args);
+                }
                 // 方法调用：实例方法（receiver 地址作 this 首参）或静态方法（无 this）
                 // ——与语义层同一判定：receiver 是未绑定变量且名字是类名 → 静态
                 if let Expr::Var(rname) = receiver.as_ref()
@@ -1144,6 +1409,10 @@ impl<'p> IrGenerator<'p> {
                 }
                 self.gen_instance_call(receiver, method, args)
             }
+            // 命名空间路径独立出现：语义层已拦截（只能作调用 receiver），IR 层防御
+            Expr::Path { .. } => Err(IrError {
+                message: format!("内部错误：命名空间路径不能作为值（函数 {}）", self.cur_fn),
+            }),
         }
     }
 
@@ -1183,6 +1452,44 @@ impl<'p> IrGenerator<'p> {
             let ch = self.new_reg();
             self.line(&format!("{ch} = zext i8 {byte} to i32"));
             return Ok((ch, "i32"));
+        }
+        // 动态表下标：t[i] → tie_table_at（运行时 {ptr,len,cap}，越界报错）。
+        // 动态表变量绑定为 ptr，语义层 table_vars 标记 dynamic=true。
+        if self
+            .sem
+            .table_vars
+            .get(&(self.cur_fn.clone(), name.clone()))
+            .map(|info| info.dynamic)
+            .unwrap_or(false)
+        {
+            let elem_ty = self.dyn_table_elem_ty(base)?;
+            let elem_llvm = self.llvm_ty(&elem_ty);
+            let suffix = table_elem_suffix(elem_llvm);
+            self.mark_used(&format!("tie_table_at_{suffix}"));
+            // 表变量是 alloca ptr，先 load 出表指针
+            let tptr = self.new_reg();
+            self.line(&format!("{tptr} = load ptr, ptr {base_ptr}"));
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = alloca i1"));
+            self.line(&format!("store i1 1, ptr {ok}"));
+            let val = self.new_reg();
+            self.line(&format!(
+                "{val} = call {elem_llvm} @tie_table_at_{suffix}(ptr {tptr}, i64 {idx_val}, ptr {ok})"
+            ));
+            let okv = self.new_reg();
+            self.line(&format!("{okv} = load i1, ptr {ok}"));
+            let ok_label = self.new_label("table_at.ok");
+            let err_label = self.new_label("table_at.err");
+            self.line(&format!("br i1 {okv}, label %{ok_label}, label %{err_label}"));
+            self.block_start(&err_label);
+            let tlen = self.table_len_reg(&tptr)?;
+            self.gen_runtime_error(
+                "运行时错误: table_at 下标越界：索引 %lld 超出长度 %lld",
+                &[("i64", idx_val.clone()), ("i64", tlen)],
+            );
+            self.block_end();
+            self.block_start(&ok_label);
+            return Ok((val, elem_llvm));
         }
         // 表下标：数组类型必须可解析
         let Some(elem_ty) = parse_array_elem_ty(base_ty) else {
@@ -1502,10 +1809,85 @@ impl<'p> IrGenerator<'p> {
             if let Some((n, _)) = parse_array_shape(v_ty) {
                 return Ok((n.to_string(), "i64"));
             }
+            // 动态表变量：LLVM 类型为 ptr，语义层 table_vars 标记 dynamic=true。
+            // 长度运行时求值：调用 tie_table_len。
+            if let Expr::Var(name) = &args[0]
+                && self
+                    .sem
+                    .table_vars
+                    .get(&(self.cur_fn.clone(), name.clone()))
+                    .map(|info| info.dynamic)
+                    .unwrap_or(false)
+            {
+                let len = self.table_len_reg(&v)?;
+                return Ok((len, "i64"));
+            }
             // 字符串：strlen
             let len = self.new_reg();
             self.line(&format!("{len} = call i64 @strlen(ptr {v})"));
             return Ok((len, "i64"));
+        }
+        // 内置 table_new_*：零参数，创建空动态表，返回不透明指针（运行时 {ptr,len,cap}）。
+        // 元素宽度由函数名决定：i64/f64/string=8 字节，bool=1 字节（与 tie-interp 桥一致）。
+        if let Some(elem_size) = table_new_elem_size(name) {
+            self.mark_used("tie_table_new");
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_table_new(i64 {elem_size})"));
+            return Ok((tmp, "ptr"));
+        }
+        // 内置 table_push：双参数（动态表变量 + 元素），void。
+        // 元素类型由语义层保证与表一致；按元素类型选对应 push 桥。
+        if name == "table_push" {
+            let Expr::Var(tname) = &args[0] else {
+                return Err(IrError {
+                    message: format!("内部错误：table_push 第 1 个参数不是表变量（函数 {}）", self.cur_fn),
+                });
+            };
+            let bind = self.lookup_var(tname).cloned().ok_or_else(|| IrError {
+                message: format!("内部错误：table_push 找不到表变量 '{}'（函数 {}）", tname, self.cur_fn),
+            })?;
+            // 表变量绑定的是 alloca（存 ptr），需 load 出表指针
+            let tptr = self.new_reg();
+            self.line(&format!("{tptr} = load ptr, ptr {}", bind.value));
+            let (x, x_ty) = self.gen_expr(&args[1])?;
+            let suffix = table_elem_suffix(x_ty);
+            self.mark_used(&format!("tie_table_push_{suffix}"));
+            self.line(&format!("call void @tie_table_push_{suffix}(ptr {tptr}, {x_ty} {x})"));
+            return Ok((String::new(), "void"));
+        }
+        // 内置 table_at：双参数（动态表 + 整数下标），返回表元素类型。
+        // 越界 → 运行时错误（ok 标志置 0），文本与解释路径一致。
+        if name == "table_at" {
+            let (t, _t_ty) = self.gen_expr(&args[0])?;
+            let (i, _i_ty) = self.gen_expr(&args[1])?;
+            // 元素类型来自语义元数据（表变量查 table_vars，返回表的函数查 table_ret_elems）
+            let elem_ty = self.dyn_table_elem_ty(&args[0])?;
+            let elem_llvm = self.llvm_ty(&elem_ty);
+            let suffix = table_elem_suffix(elem_llvm);
+            self.mark_used(&format!("tie_table_at_{suffix}"));
+            // ok 标志：alloca i1，桥函数越界时置 0
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = alloca i1"));
+            self.line(&format!("store i1 1, ptr {ok}"));
+            let val = self.new_reg();
+            self.line(&format!(
+                "{val} = call {elem_llvm} @tie_table_at_{suffix}(ptr {t}, i64 {i}, ptr {ok})"
+            ));
+            // 检查 ok：0 → 运行时错误（越界）
+            let okv = self.new_reg();
+            self.line(&format!("{okv} = load i1, ptr {ok}"));
+            let ok_label = self.new_label("table_at.ok");
+            let err_label = self.new_label("table_at.err");
+            self.line(&format!("br i1 {okv}, label %{ok_label}, label %{err_label}"));
+            self.block_start(&err_label);
+            let tlen = self.table_len_reg(&t)?;
+            self.gen_runtime_error(
+                "运行时错误: table_at 下标越界：索引 %lld 超出长度 %lld",
+                &[("i64", i.clone()), ("i64", tlen)],
+            );
+            self.block_end();
+            self.block_start(&ok_label);
+            return Ok((val, elem_llvm));
         }
         // 内置 read_line：零参数，调用 tie-interp 库读一行（REPL 自举）。
         // 语义层已保证无参数；返回值是 tie-interp 分配的堆串，调用方用完必须
@@ -1836,7 +2218,86 @@ impl<'p> IrGenerator<'p> {
             self.block_start(&ok_label);
             return Ok((tmp, "i64"));
         }
-        // 用户函数调用
+        // 内置 arg_count：零参数，返回 i64（命令行用户参数个数，不含程序名）。
+        // 走 C ABI 桥（与解释路径共用 std::env::args，编译后的 exe 直接读进程 argv）。
+        if name == "arg_count" {
+            self.mark_used("tie_arg_count");
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call i64 @tie_arg_count()"));
+            return Ok((tmp, "i64"));
+        }
+        // 内置 arg_string：整数参数，返回 string（第 i 个用户命令行参数；越界返回空串）。
+        // 返回值是 tie-interp 分配的堆串，调用方用完必须 tie_free_result 释放
+        // （独立语句时在 gen_stmt 的 Expr 分支统一释放，与 file_read/str_char 同机制）。
+        if name == "arg_string" {
+            self.mark_used("tie_arg_string");
+            self.mark_used("tie_free_result");
+            let (i, i_ty) = self.gen_expr(&args[0])?;
+            // 下标统一扩展到 i64（C ABI 桥的参数类型）
+            let i64 = self.extend_int_to_i64(&i, i_ty, &args[0])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_arg_string(i64 {i64})"));
+            return Ok((tmp, "ptr"));
+        }
+        // 内置 list_dir：单字符串参数（目录路径），返回字符串动态表（DynTable 指针）。
+        // 走 C ABI 桥（与解释路径共用 std::fs::read_dir）；目录无效 → 运行时错误。
+        if name == "list_dir" {
+            self.mark_used("tie_list_dir");
+            let (p, _t) = self.gen_expr(&args[0])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_list_dir(ptr {p})"));
+            // 判断返回 NULL：失败 → 错误块（退出进程），成功 → ok 块继续
+            let is_null = self.new_reg();
+            self.line(&format!("{is_null} = icmp eq ptr {tmp}, null"));
+            let ok_label = self.new_label("list_dir.ok");
+            let err_label = self.new_label("list_dir.err");
+            self.line(&format!("br i1 {is_null}, label %{err_label}, label %{ok_label}"));
+            self.block_start(&err_label);
+            self.gen_runtime_error("运行时错误: list_dir 无法读取目录 '%s'", &[("ptr", p)]);
+            self.block_end();
+            // 成功块：返回值即表指针（调用方可用 len/for/table_at 访问）
+            self.block_start(&ok_label);
+            return Ok((tmp, "ptr"));
+        }
+        // 内置 msg_set_lang：单字符串参数，void（切换消息系统当前语言）。
+        // 走 C ABI 桥（与解释路径共用 thread_local 状态）。
+        if name == "msg_set_lang" {
+            self.mark_used("tie_msg_set_lang");
+            let (l, _t) = self.gen_expr(&args[0])?;
+            self.line(&format!("call void @tie_msg_set_lang(ptr {l})"));
+            return Ok((String::new(), "void"));
+        }
+        // 内置 msg_get_lang：零参数，返回 string（当前消息语言）。
+        // 返回值是 tie-interp 分配的堆串，调用方用完必须 tie_free_result 释放。
+        if name == "msg_get_lang" {
+            self.mark_used("tie_msg_get_lang");
+            self.mark_used("tie_free_result");
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_msg_get_lang()"));
+            return Ok((tmp, "ptr"));
+        }
+        // 内置 msg_register：三个字符串参数（键, 语言, 文本），void（登记消息；同键同语言覆盖）。
+        if name == "msg_register" {
+            self.mark_used("tie_msg_register");
+            let (k, _t) = self.gen_expr(&args[0])?;
+            let (l, _t) = self.gen_expr(&args[1])?;
+            let (x, _t) = self.gen_expr(&args[2])?;
+            self.line(&format!("call void @tie_msg_register(ptr {k}, ptr {l}, ptr {x})"));
+            return Ok((String::new(), "void"));
+        }
+        // 内置 msg_t：单字符串参数（键），返回 string（当前语言翻译，回退 zh，再回退键本身）。
+        // 返回值是 tie-interp 分配的堆串，调用方用完必须 tie_free_result 释放。
+        if name == "msg_t" {
+            self.mark_used("tie_msg_t");
+            self.mark_used("tie_free_result");
+            let (k, _t) = self.gen_expr(&args[0])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_msg_t(ptr {k})"));
+            return Ok((tmp, "ptr"));
+        }
+        // 用户函数调用。符号名：命名空间函数全名（含 ::）转 $（与 gen_fn 的
+        // ns_symbol 一致，保证定义与调用两侧符号同名）。
+        let symbol = ns_symbol(name);
         let sig = self
             .sem
             .funcs
@@ -1847,21 +2308,80 @@ impl<'p> IrGenerator<'p> {
             })?;
         let mut arg_list = Vec::new();
         // 参数类型以函数签名为准：字面量可能被语义适配（如 i32 参数传 42 字面量），
-        // 而字面量 gen_expr 返回 i64，需要按签名类型生成
-        for (a, want_ty) in args.iter().zip(sig.param_tys.iter()) {
-            let (v, _t) = self.gen_expr(a)?;
+        // 而字面量 gen_expr 返回 i64，需要按签名类型生成。
+        // 默认值参数（可选参数）：实参不足时按签名默认值补齐——LLVM 函数签名不变
+        // （含全部形参），缺省实参在调用点直接生成（默认值限字面量/空表，无作用域依赖）。
+        for (i, want_ty) in sig.param_tys.iter().enumerate() {
+            // 实参来源：调用方提供的实参；不足时取该形参的默认值表达式
+            let a = if let Some(a) = args.get(i) {
+                a
+            } else {
+                sig.param_defaults
+                    .get(i)
+                    .and_then(|d| d.as_ref())
+                    .ok_or_else(|| IrError {
+                        message: format!(
+                            "内部错误：函数 '{name}' 缺少第 {} 个实参且无默认值（函数 {}）",
+                            i + 1,
+                            self.cur_fn
+                        ),
+                    })?
+            };
+            // 表字面量实参：table 形参在 LLVM 中是不透明 ptr（动态表），
+            // 与定长表变量声明的数组布局不同，这里按动态表构造
+            // （tie_table_new + 逐元素 tie_table_push_*），返回表指针。
+            // 元素类型/长度来自语义布局元数据（infer_expr 已按表达式地址记录）。
+            let (v, _t) = if let Expr::TableLit { cells, .. } = a {
+                (self.gen_table_lit_arg(a, cells)?, "ptr")
+            } else {
+                self.gen_expr(a)?
+            };
             let aty = self.llvm_ty(want_ty);
             arg_list.push(format!("{aty} {v}"));
         }
         let ret_llvm = self.llvm_ty(&sig.ret_ty);
         let tmp = self.new_reg();
         if sig.ret_ty.is_void() {
-            self.line(&format!("call void @{}({})", name, arg_list.join(", ")));
+            self.line(&format!("call void @{}({})", symbol, arg_list.join(", ")));
             Ok((tmp, "void"))
         } else {
-            self.line(&format!("{tmp} = call {ret_llvm} @{}({})", name, arg_list.join(", ")));
+            self.line(&format!("{tmp} = call {ret_llvm} @{}({})", symbol, arg_list.join(", ")));
             Ok((tmp, ret_llvm))
         }
+    }
+
+    /// 表字面量实参 → 动态表构造（tie_table_new + 逐元素 tie_table_push_*）。
+    ///
+    /// 背景：table 形参在 LLVM 中是不透明 ptr（运行时 {ptr,len,cap} 结构，见
+    /// llvm_ty 的 Named(Table) => "ptr"），与定长表变量声明的数组布局
+    /// `[N x T]` 不同——实参按动态表传递，函数体内用 table_len / table_at /
+    /// 下标访问（与 table_new_* 创建的动态表行为一致）。
+    ///
+    /// 元素类型与长度来自语义布局元数据（infer_expr 的 TableLit 分支已按
+    /// 表达式地址记录到 result.tables，键 = 表达式地址，与 len 内置同款取键）。
+    /// 元素宽度：i1=1 字节，其余（i64/f64/ptr）=8 字节（与 tie-interp 桥一致）。
+    /// 空表（元数据缺失）防御：生成空动态表（i64 元素、长度 0）。
+    fn gen_table_lit_arg(&mut self, expr: &Expr, cells: &[TableCell]) -> Result<String, IrError> {
+        // 查语义布局元数据（元素类型 + 长度）；空表可能无记录，按 i64 空表兜底
+        let key = expr as *const Expr as usize;
+        let info = self.sem.tables.get(&key);
+        let elem_llvm = match info {
+            Some(i) => self.llvm_ty(&i.elem_ty),
+            None => "i64",
+        };
+        let elem_size = if elem_llvm == "i1" { 1 } else { 8 };
+        let suffix = table_elem_suffix(elem_llvm);
+        // 新建空动态表
+        self.mark_used("tie_table_new");
+        let t = self.new_reg();
+        self.line(&format!("{t} = call ptr @tie_table_new(i64 {elem_size})"));
+        // 逐元素求值并 push（元素值 LLVM 类型与桥参数类型一致）
+        self.mark_used(&format!("tie_table_push_{suffix}"));
+        for cell in cells {
+            let (v, _vt) = self.gen_expr(&cell.value)?;
+            self.line(&format!("call void @tie_table_push_{suffix}(ptr {t}, {elem_llvm} {v})"));
+        }
+        Ok(t)
     }
 
     // ---------- 类相关生成（P8） ----------
@@ -2170,7 +2690,10 @@ impl<'p> IrGenerator<'p> {
             self.line(&format!("call i32 (ptr, ...) @printf(ptr @{g}, {arg_str})"));
         }
         self.line("call i32 @fflush(ptr null)");
-        // 非 void 的未编号调用（fflush 返回 i32）会被解析器分配隐式寄存器号，必须消费掉
+        // 错误块含两个非 void 的未编号调用（printf、fflush 均返回 i32），
+        // LLVM 解析器会为它们各分配一个隐式寄存器号，必须全部消费掉，
+        // 否则后续块显式寄存器号会与隐式号冲突（"instruction expected to be numbered"）。
+        let _ = self.new_reg();
         let _ = self.new_reg();
         self.line("call void @exit(i32 1)");
         self.line("unreachable");
@@ -2244,6 +2767,50 @@ impl<'p> IrGenerator<'p> {
     /// 变量名是否已在作用域中（用于区分方法调用的 receiver 是变量还是类名）。
     fn scope_has(&self, name: &str) -> bool {
         self.lookup_var(name).is_some()
+    }
+
+    /// 解析动态表表达式的元素类型（table_at 返回类型 / 下标访问用）。
+    ///
+    /// 表变量查 table_vars（键 = 当前函数 + 变量名）；返回表的函数调用查 table_ret_elems。
+    /// 动态表的 LLVM 类型恒为 "ptr"，元素类型必须从语义元数据取。
+    fn dyn_table_elem_ty(&self, expr: &Expr) -> Result<TypeSpec, IrError> {
+        match expr {
+            Expr::Var(name) => {
+                let key = (self.cur_fn.clone(), name.clone());
+                self.sem
+                    .table_vars
+                    .get(&key)
+                    .map(|info| info.elem_ty.clone())
+                    .ok_or_else(|| IrError {
+                        message: format!(
+                            "内部错误：动态表变量 '{}' 缺少元素类型元数据（函数 {}）",
+                            name, self.cur_fn
+                        ),
+                    })
+            }
+            Expr::Call { name, .. } => self
+                .sem
+                .table_ret_elems
+                .get(name)
+                .and_then(|o| o.clone())
+                .ok_or_else(|| IrError {
+                    message: format!(
+                        "内部错误：返回表的函数 '{}' 缺少元素类型元数据（函数 {}）",
+                        name, self.cur_fn
+                    ),
+                }),
+            _ => Err(IrError {
+                message: format!("内部错误：table_at 第 1 个参数不是动态表（函数 {}）", self.cur_fn),
+            }),
+        }
+    }
+
+    /// 生成 tie_table_len 调用，返回表长度寄存器（table_at 越界错误消息用）。
+    fn table_len_reg(&mut self, t: &str) -> Result<String, IrError> {
+        self.mark_used("tie_table_len");
+        let len = self.new_reg();
+        self.line(&format!("{len} = call i64 @tie_table_len(ptr {t})"));
+        Ok(len)
     }
 
     /// 当前函数/方法的返回类型（Return 生成按签名类型适配字面量）。
@@ -2332,6 +2899,9 @@ impl<'p> IrGenerator<'p> {
     /// （同一形状的类型只泄漏一份，编译器进程短期运行可接受）。
     fn llvm_ty(&mut self, t: &TypeSpec) -> &'static str {
         match t {
+            // 动态表：运行时 {ptr,len,cap} 结构，IR 层以不透明指针持有（与字符串一致）。
+            // 定长表（字面量）不经过此路径（gen_table_var 直接按数组类型布局）。
+            TypeSpec::Named(TyKw::Table) => "ptr",
             TypeSpec::Named(_) => t.llvm_ty(),
             TypeSpec::Tuple(fields) => {
                 let inner: Vec<&str> = fields.iter().map(|f| self.llvm_ty(&f.ty)).collect();
@@ -2476,6 +3046,12 @@ fn mangle(name: &str) -> String {
     format!("%{}", name)
 }
 
+/// 命名空间全名 → LLVM 符号名：`::` 不是 LLVM 标识符合法字符，统一转为 `$`
+/// （与类方法 mangle `类名$方法名` 同约定；顶层函数名不含 `::`，原样返回）。
+fn ns_symbol(full_name: &str) -> String {
+    full_name.replace("::", "$")
+}
+
 /// 从 LLVM 数组类型名 `[N x T]` 中解析元素类型名 `T`。
 ///
 /// 用于下标访问（GEP 后 load 的元素类型）。M2 只支持标量元素
@@ -2508,6 +3084,27 @@ fn parse_array_shape(arr_ty: &str) -> Option<(usize, &'static str)> {
         _ => None,
     }?;
     Some((len, elem))
+}
+
+/// table_new_* 内置函数名 → 元素宽度（字节）。与 tie-interp 桥的 elem_size 一致：
+/// i64/f64/string=8（指针/64 位），bool=1。
+fn table_new_elem_size(name: &str) -> Option<i64> {
+    match name {
+        "table_new_i64" | "table_new_f64" | "table_new_string" => Some(8),
+        "table_new_bool" => Some(1),
+        _ => None,
+    }
+}
+
+/// LLVM 元素类型名 → 动态表桥后缀（tie_table_push_*/tie_table_at_*）。
+fn table_elem_suffix(llvm_ty: &str) -> &'static str {
+    match llvm_ty {
+        "i64" => "i64",
+        "double" => "f64",
+        "ptr" => "string",
+        "i1" => "bool",
+        _ => "i64", // 防御：其余标量按 i64 处理（语义层已限制元素类型）
+    }
 }
 
 /// 浮点字面量的 IR 文本（保证含小数点）。

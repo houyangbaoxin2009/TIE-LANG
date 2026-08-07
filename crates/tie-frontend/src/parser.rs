@@ -7,8 +7,9 @@
 
 use super::ast::{
     AssignStmt, BinaryOp, ClassDefStmt, ClassField, Expr, ExprStmt, FieldAssignStmt, FnDefStmt,
-    ForStmt, IfStmt, ImportStmt, MethodDefStmt, Param, Program, ReturnStmt, Stmt, SwitchCase,
-    SwitchStmt, TableCell, TableId, TupleField, TypeSpec, UnaryOp, VarDeclStmt, WhileStmt,
+    ForStmt, IfStmt, ImportStmt, MethodDefStmt, NamespaceStmt, Param, Program, ReturnStmt, Stmt,
+    SwitchCase, SwitchStmt, TableCell, TableId, TupleField, TypeSpec, UnaryOp, VarDeclStmt,
+    WhileStmt,
 };
 use super::lexer::{Span, Token, TokenKind, TyKw};
 use std::fmt;
@@ -118,21 +119,53 @@ impl<'a> Parser<'a> {
 
     fn parse_program(&mut self) -> Result<Program, ParseError> {
         let mut stmts = Vec::new();
-        // 顶层只允许函数定义、import 与类定义（import 由 driver 递归展开为函数）
+        // 顶层只允许函数定义、import、类定义与命名空间声明（import 由 driver 递归展开为函数）
         while !matches!(self.peek_kind(), TokenKind::Eof) {
             match self.peek_kind() {
                 TokenKind::Func => stmts.push(Stmt::FnDef(self.parse_fn_def()?)),
                 TokenKind::Import => stmts.push(Stmt::Import(self.parse_import()?)),
                 TokenKind::Class => stmts.push(Stmt::Class(self.parse_class()?)),
+                TokenKind::Namespace => stmts.push(Stmt::Namespace(self.parse_namespace()?)),
                 other => {
                     return Err(self.err(format!(
-                        "顶层只允许函数定义、import 或类定义，实际是 {}",
+                        "顶层只允许函数定义、import、类定义或命名空间声明，实际是 {}",
                         self.describe(other)
                     )))
                 }
             }
         }
         Ok(Program { stmts })
+    }
+
+    /// 命名空间声明（C# 风格块式）：`namespace tcmsg { ... }` 或点分 `namespace tcmsg.error { ... }`。
+    ///
+    /// 路径段用 `.` 连接（点分声明）；体内允许函数定义、类定义与嵌套命名空间。
+    /// 前缀命名（`namespace tcmsg;`）由 tie-prep 预处理转化为块式后进入本函数。
+    fn parse_namespace(&mut self) -> Result<NamespaceStmt, ParseError> {
+        let span = self.advance().span; // 消费 `namespace`
+        // 路径：至少一段标识符，可点分（`tcmsg.error`）
+        let mut path = vec![self.expect_ident()?];
+        while self.eat(&TokenKind::Dot) {
+            path.push(self.expect_ident()?);
+        }
+        self.expect(TokenKind::LBrace, "命名空间声明必须跟 '{'")?;
+        // 体内语句：函数 / 类 / 嵌套命名空间
+        let mut body = Vec::new();
+        while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
+            match self.peek_kind() {
+                TokenKind::Func => body.push(Stmt::FnDef(self.parse_fn_def()?)),
+                TokenKind::Class => body.push(Stmt::Class(self.parse_class()?)),
+                TokenKind::Namespace => body.push(Stmt::Namespace(self.parse_namespace()?)),
+                other => {
+                    return Err(self.err(format!(
+                        "命名空间体内只允许函数定义、类定义或嵌套命名空间，实际是 {}",
+                        self.describe(other)
+                    )))
+                }
+            }
+        }
+        self.expect(TokenKind::RBrace, "命名空间声明必须跟 '}'")?;
+        Ok(NamespaceStmt { path, body, span })
     }
 
     /// import 语句：`import "./x.tie"` 或 `import "./x.tie" as 别名`。
@@ -382,7 +415,14 @@ impl<'a> Parser<'a> {
                 let pname = self.expect_ident()?;
                 self.expect(TokenKind::Colon, "':'")?;
                 let pty = self.parse_type()?;
-                params.push(Param { name: pname, ty: pty, span: pspan });
+                // 默认值（可选参数）：`name: Ty = 字面量`。限字面量（含空表 []），
+                // 与类字段默认值规则一致（语义层校验类型，语法层只负责解析）。
+                let default = if self.eat(&TokenKind::Eq) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                params.push(Param { name: pname, ty: pty, default, span: pspan });
                 if self.eat(&TokenKind::Comma) {
                     continue;
                 }
@@ -467,7 +507,13 @@ impl<'a> Parser<'a> {
                 let pname = self.expect_ident()?;
                 self.expect(TokenKind::Colon, "':'")?;
                 let pty = self.parse_type()?;
-                params.push(Param { name: pname, ty: pty, span: pspan });
+                // 默认值（可选参数）：`name: Ty = 字面量`（与函数定义同一语法）。
+                let default = if self.eat(&TokenKind::Eq) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                params.push(Param { name: pname, ty: pty, default, span: pspan });
                 if self.eat(&TokenKind::Comma) {
                     continue;
                 }
@@ -967,6 +1013,17 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Ident(name) => {
                 self.advance();
+                // 命名空间路径：`a::b::c`（`::` 分隔，C#/Rust 风格）。
+                // 构建 Expr::Path 后返回，后续 `.m(args)` 由 parse_unary 的 Dot 分支
+                // 组装为 MethodCall（receiver = Path，语义层按命名空间函数解析）。
+                if *self.peek_kind() == TokenKind::DoubleColon {
+                    let mut segments = vec![name];
+                    while self.eat(&TokenKind::DoubleColon) {
+                        let seg = self.expect_ident()?;
+                        segments.push(seg);
+                    }
+                    return Ok(Expr::Path { segments, span });
+                }
                 // 函数调用
                 if self.eat(&TokenKind::LParen) {
                     let mut args = Vec::new();
@@ -1200,6 +1257,47 @@ mod tests {
     fn parse_err(src: &str) -> ParseError {
         let tokens = tokenize(src).expect("词法分析应成功");
         parse_program(&tokens).expect_err("语法分析应失败")
+    }
+
+    #[test]
+    fn 命名空间块式声明解析出路径与体内函数() {
+        let prog = parse("namespace tcmsg {\n    func no_file(langs: table) -> string {\n        return \"x\"\n    }\n}\n");
+        let Stmt::Namespace(ns) = &prog.stmts[0] else { panic!("期望命名空间声明") };
+        assert_eq!(ns.path, vec!["tcmsg"]);
+        let Stmt::FnDef(f) = &ns.body[0] else { panic!("期望命名空间体内的函数定义") };
+        assert_eq!(f.name, "no_file");
+    }
+
+    #[test]
+    fn 命名空间点分声明解析出完整路径() {
+        let prog = parse("namespace tcmsg.error {\n}\n");
+        let Stmt::Namespace(ns) = &prog.stmts[0] else { panic!("期望命名空间声明") };
+        assert_eq!(ns.path, vec!["tcmsg", "error"]);
+        assert!(ns.body.is_empty());
+    }
+
+    #[test]
+    fn 命名空间路径表达式解析出segments与调用链() {
+        // tcmsg::error.no_file(["zh-cn","en-us"]) → MethodCall { receiver: Path([tcmsg,error]), method: no_file }
+        let prog = parse("func main() {\n    var m = tcmsg::error.no_file([\"zh-cn\",\"en-us\"])\n}\n");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::VarDecl(v) = &f.body[0] else { panic!("期望变量声明") };
+        let Expr::MethodCall { receiver, method, args, .. } = &v.init else {
+            panic!("期望命名空间方法调用，实际 {:#?}", v.init)
+        };
+        assert_eq!(method, "no_file");
+        let Expr::Path { segments, .. } = receiver.as_ref() else {
+            panic!("期望 receiver 是命名空间路径，实际 {:#?}", receiver)
+        };
+        assert_eq!(segments, &vec!["tcmsg".to_string(), "error".to_string()]);
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn 命名空间路径缺段时报错() {
+        // `tcmsg::` 后必须是标识符
+        let err = parse_err("func main() {\n    var x = tcmsg::1\n}\n");
+        assert!(err.message.contains("期望标识符"), "错误信息：{}", err.message);
     }
 
     #[test]

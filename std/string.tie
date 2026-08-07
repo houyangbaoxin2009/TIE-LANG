@@ -174,3 +174,48 @@ func str_replace(s: string, from: string, to: string) -> string {
     }
     return result
 }
+
+// 按分隔符 sep 把 s 切分为字符串动态表（表元素为各段子串）：
+// - sep 为空串时不切分，返回单元素表 [s]（避免死循环）；
+// - 连续出现的分隔符产生空字符串元素（"a,,b" 按 "," 切 → ["a","","b"]）；
+// - 分隔符开头/结尾时首尾产生空字符串元素（",a," → ["","a",""]）；
+// - s 为空串时返回 [" " 的一个空元素]（与主流语言 split 语义一致）。
+// 算法：从左到右扫描，命中 sep 即切出一段 [start, i)，跳过 sep 后继续；
+// 扫描结束后把最后一段 [start, n) 推入（可能为空串）。
+func str_split(s: string, sep: string) -> table {
+    var t = table_new_string()
+    var m: i64 = len(sep)
+    // 空分隔符：不切分，整串作为唯一元素
+    if m == 0 {
+        table_push(t, s)
+        return t
+    }
+    var n: i64 = len(s)
+    var start: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        // 检查从 i 开始是否完整匹配 sep
+        var matched: bool = true
+        var j: i64 = 0
+        while j < m && matched {
+            if i + j >= n {
+                matched = false
+            } else if str_char(s, i + j) != str_char(sep, j) {
+                matched = false
+            }
+            j = j + 1
+        }
+        if matched {
+            // 切出一段 [start, i)，跳过 sep 继续
+            table_push(t, str_slice(s, start, i))
+            i = i + m
+            start = i
+        } else {
+            // 未命中：前进一位
+            i = i + 1
+        }
+    }
+    // 收尾：最后一段 [start, n)（sep 结尾时 start==n → 空元素）
+    table_push(t, str_slice(s, start, n))
+    return t
+}

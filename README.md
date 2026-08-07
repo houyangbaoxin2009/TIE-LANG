@@ -113,6 +113,7 @@ tie/
 │   ├── tie-interp/    解释执行：树遍历求值 AST + C ABI 桥（staticlib），REPL 自举核心
 │   └── tie/           CLI 主入口：角色分派调度器 + REPL（启动 repl.exe）
 ├── repl/repl.tie     REPL 外壳（tie 语言自写，自举；编译链接 tie-interp 静态库）
+├── std/              标准库（tie 语言自写：assert / string / math / tcmsg 等，基于语言底座原语）
 ├── docs/language.md   语法规范
 ├── examples/          示例程序（hello / wide / table / tuple / oop / 负例 oop_neg_* 等）
 └── Cargo.toml         workspace（统一 edition/lints/release 配置）
@@ -171,5 +172,5 @@ tie/
 | --- | --- | --- |
 | M0 | 正式发行版基础：版本规则（年份.修订号）、内部代号（2026.1 "Harbor"）、工具链合集打包（`scripts/package.ps1` → zip） | ✅ 完成 |
 | M1 | VSCode 插件：语法高亮 / 智能缩进 / 代码片段 + LSP 客户端（诊断 / hover / 跳转定义 / 补全），TypeScript 重构 | ✅ 完成 |
-| M2 | 标准库：`std/`（文件 / 字符串 / 断言）+ `math`（数学函数）+ 20+ 语言底座原语，为自举与生态奠定基础 | ✅ 完成 |
+| M2 | 标准库：`std/`（文件 / 字符串 / 断言）+ `math`（数学函数）+ 20+ 语言底座原语 + **`tcmsg` 控制台信息库（i18n，命名空间形式）** + **默认值参数**（可选参数省略时用字面量默认值），为自举与生态奠定基础 | ✅ 完成 |
 | M3 | 预处理器自举：完全用 tie 语言重写 `tie-prep`，使其可扩展（编译器自举阶段一） | 规划中 |

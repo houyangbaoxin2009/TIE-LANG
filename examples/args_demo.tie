@@ -1,0 +1,18 @@
+// tie:logic
+// args_demo.tie：命令行参数演示——arg_count / arg_string 原语
+// 运行：args_demo.exe a b c → 输出 3 与每个参数；无参数运行 → 0
+
+func main() {
+    // 用户参数个数（不含程序名）：`exe a b c` → 3
+    var n: i64 = arg_count()
+    println("arg_count = " + to_string(n))
+    // 逐个打印参数（0 基索引用户参数；越界返回空串）
+    var i: i64 = 0
+    while i < n {
+        println("arg_string(" + to_string(i) + ") = [" + arg_string(i) + "]")
+        i = i + 1
+    }
+    // 越界验证：arg_string(n) 与负数下标都应返回空串
+    println("arg_string(" + to_string(n) + ") = [" + arg_string(n) + "]")
+    println("arg_string(-1) = [" + arg_string(-1) + "]")
+}

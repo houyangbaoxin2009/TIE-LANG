@@ -81,6 +81,8 @@ pub enum TokenKind {
     Static,
     /// 继承 `extends`
     Extends,
+    /// 命名空间声明 `namespace tcmsg { }`
+    Namespace,
     True,
     False,
     /// 类型关键字：i8..u64/f32/f64/bool/char/string/void/code/num/text/misc/table
@@ -95,6 +97,8 @@ pub enum TokenKind {
     RBracket,
     Comma,
     Colon,
+    /// 命名空间路径分隔符 `::`（C#/Rust 风格，如 `tcmsg::error`）
+    DoubleColon,
     /// 分号（显式写出或 ASI 自动补全）
     Semi,
     Dot,
@@ -418,6 +422,7 @@ impl<'a> Lexer<'a> {
                             k,
                             TokenKind::Comma
                                 | TokenKind::Colon
+                                | TokenKind::DoubleColon
                                 | TokenKind::Dot
                                 | TokenKind::DotDot
                                 | TokenKind::LParen
@@ -677,6 +682,8 @@ impl<'a> Lexer<'a> {
             "this" => TokenKind::This,
             "static" => TokenKind::Static,
             "extends" => TokenKind::Extends,
+            // 命名空间（命名空间语法，C# 风格块式声明）
+            "namespace" => TokenKind::Namespace,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             "i8" => TokenKind::TypeKw(TyKw::I8),
@@ -735,6 +742,8 @@ impl<'a> Lexer<'a> {
                 ('|', '|') => Some(TokenKind::OrOr),
                 ('.', '.') => Some(TokenKind::DotDot),
                 ('-', '>') => Some(TokenKind::Arrow),
+                // 命名空间路径分隔符 `::`（双冒号；单个 `:` 仍是 Colon）
+                (':', ':') => Some(TokenKind::DoubleColon),
                 // M4 复合赋值：`op =`
                 ('+', '=') => Some(TokenKind::PlusEq),
                 ('-', '=') => Some(TokenKind::MinusEq),

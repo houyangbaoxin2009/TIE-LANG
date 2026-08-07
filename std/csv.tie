@@ -1,0 +1,42 @@
+// tie:library
+// csv.tie：标准库——CSV 读取（纯 tie 实现，基于 file_read + string.tie 的切分）
+// 本文件 import string.tie（str_split / str_slice / str_char）：
+// 注意——当前 import 展开不做去重，调用方只需导入 csv.tie（string.tie 会随
+// 之展开）；若再重复导入 string.tie，会导致 str_split 等函数重复定义。
+// csv_cells 直接委托 str_split，保证与 string.tie 的语义逐字符一致。
+
+import "./string.tie"
+
+// 读取 CSV 文件全部内容为字符串表（一行一个元素）：
+// - file_read 读全文，按 "\n" 切分；
+// - 每行末尾的 "\r"（Windows 换行残留）自动去除；
+// - 空行保留为空字符串元素；文件以 \n 结尾时末尾会产生一个空元素
+//   （与 split 语义一致），调用方可按需过滤。
+// 每行内的单元格由调用方用 csv_cells(row, ",") 切分（支持任意分隔符）。
+func csv_read(path: string) -> table {
+    var content: string = file_read(path)
+    var raw = str_split(content, "\n")
+    var lines = table_new_string()
+    var n: i64 = len(raw)
+    var i: i64 = 0
+    while i < n {
+        table_push(lines, strip_cr(raw[i]))
+        i = i + 1
+    }
+    return lines
+}
+
+// 把一行 CSV 文本按分隔符切分为单元格表（str_split 的别名，直接委托）；
+// sep 为空串时返回单元素 [line]。
+func csv_cells(line: string, sep: string) -> table {
+    return str_split(line, sep)
+}
+
+// 去掉字符串末尾的一个回车符 "\r"（Windows 换行残留）；无 \r 时原样返回
+func strip_cr(s: string) -> string {
+    var n: i64 = len(s)
+    if n > 0 && str_char(s, n - 1) == "\r" {
+        return str_slice(s, 0, n - 1)
+    }
+    return s
+}

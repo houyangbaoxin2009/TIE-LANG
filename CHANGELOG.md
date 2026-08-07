@@ -3,6 +3,60 @@
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库**。
 
+## [Harbor M2.1] 默认值参数与 tcmsg 控制台信息库 — 2026-08-08
+
+### 新增
+- **命名空间（namespace）**：`namespace tcmsg { }` 块式声明（C# 风格），`::` 路径访问 +
+  `.` 成员调用（`tcmsg.error.no_file(...)` / `tcmsg::error.no_file(...)`）；
+  命名空间内裸调用自动前缀补全（`inner()` → `tcmsg::error::inner`）
+- **动态表运行时**：`table_new_i64/f64/string/bool`（建空表）+ `table_push`（追加）+
+  `table_at`（下标读取，越界报错）+ `len(table)`，编译（IR 走 C ABI 桥）与解释两路径一致；
+  支持表字面量作函数实参（IR 按动态表构造）
+- **新底座原语**：`list_dir`（目录列表 → 字符串动态表）、`table_*` 系列
+- **std/string.tie 新增 `str_split`**：按分隔符切分为字符串动态表（连续分隔符产生空元素，
+  与主流语言 split 语义一致）
+- **std/csv.tie**：CSV 解析/生成（基于 str_split + 表操作）
+- **std/format.tie**：格式化工具（format_int / format_pad 等）
+- **默认值参数（语言特性）**：函数参数可带默认值，调用时可省略可选参数：
+  - 语法：`func greet(name: string, prefix: string = "Hello")`（`参数名: 类型 = 字面量`）
+  - 规则：可选参数**必须连续排在必选参数之后**；默认值限字面量（数/布尔/字符/字符串/空表 `[]`，
+    非空表字面量/变量引用报「默认值必须是字面量」）；默认值类型须与形参类型匹配
+  - 语义：函数调用点按实参数**区间检查**（`期望 N 个参数` / `期望 N-M 个参数`，N = 必选参数个数）；
+    方法参数默认值暂不支持（报「方法默认值参数留待 M3」）
+  - 双路径实现：LLVM 函数签名不变（含全部形参），缺省实参在**调用点**补齐（IR 层）；
+    解释器 `call_fn` 区间检查 + 求值默认值补齐
+- **语言底座原语 `msg_get_lang`**：读取消息系统当前语言（与 `msg_set_lang` 配套，返回 string），
+  语义/IR/interp/C ABI 桥（`tie_msg_get_lang`）四层贯通，供标准库按当前语言匹配文本
+- **`std/tcmsg.tie` 控制台信息库（命名空间形式，旧扁平 `tcmsg_*` API 废弃）**：
+  - `tcmsg.register(key, lang, content)` / `tcmsg.t(key)` / `tcmsg.set_lang(lang)`
+    （透传底座原语 `msg_register` / `msg_t` / `msg_set_lang`，回退规则：当前语言 → zh → 键本身）
+  - `tcmsg.error/warn/info(key)` 分级打印（前缀「错误: / 警告: / 信息: 」+ 当前语言翻译）
+  - **综合方案形态** `tcmsg::error.no_file(langs: table, texts: table = [])`（默认值参数落地实例）：
+    - 方案 A（调用方传 `texts`）：`len(texts) > 0` → 按当前语言**前缀匹配** `langs`（地区码 `zh-cn`
+      匹配基础码 `zh`）取对应文本，未命中回退第一个文本——文本随调用自包含
+    - 方案 B（省略 `texts`，空表默认值）：`msg_t("error.no_file")` 查字典——单一事实来源
+  - 依赖 `std/string.tie`（`str_starts_with` 前缀匹配；import 展开不去重，调用方只导入 tcmsg.tie 即可）
+- **示例**：`examples/namespace_demo.tie`（命名空间）、`examples/table_dynamic.tie`（动态表）、
+  `examples/csv_demo.tie`、`examples/format_demo.tie`、`examples/list_dir_demo.tie`、
+  `examples/args_demo.tie`、`examples/tcmsg_demo.tie`（多语言登记/切换/查询、方案 A/B、回退规则断言）
+
+### 修复
+- 命名空间函数 `table` 形参布局元数据注册键用裸名 `f.name` 而非全名 `cur_fn` →
+  命名空间函数内 table 下标访问报「缺少布局元数据」；改为以完整命名注册（预存 bug）
+- 参数个数错误消息出现重复「个」字（`期望 1 个 个参数`）→ `param_count_desc` 返回区间描述
+  （`"N"` / `"N-M"`），与模板「期望 {} 个参数」解耦
+- `text` 是类型关键字不可作参数名 → `tcmsg.register` 参数名 `text` 改为 `content`
+
+### 测试
+- 全工作区测试通过（frontend 112 / interp 49 / llvm 28 / lsp 53 / prep 4 = **246**）
+- 新增 frontend +2：默认值参数省略实参合法且类型校验、默认值参数限制规则
+- 新增 interp +2：`eval_default_arg_省略与传参`（省略/显式传参/超参区间报错）、
+  `eval_default_arg_tcmsg综合方案`（方案 B 查字典 / 方案 A 调用方文本）
+
+### 文档
+- docs/language.md：§6 函数新增「默认值参数」语法说明
+- README.md：路线图 M2 条目补充 tcmsg 控制台信息库与默认值参数
+
 ## [Harbor M2] 标准库（std / math） — 2026-08-07
 
 ### 新增
