@@ -1,0 +1,20 @@
+# tie-lsp：tie 语言服务器（LSP）包配置
+#
+# 职责：声明 tie-lsp 的依赖与编译参数。
+# 说明：基于 JSON-RPC 2.0 over stdio，复用 tie-frontend 三阶段分析提供诊断与 hover；
+#       自研协议层，不引入 lsp-server / lsp-types / tower-lsp 等现成框架。
+[package]
+name = "tie-lsp"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "tie 语言服务器（LSP）：基于 JSON-RPC 2.0 over stdio，复用 tie-frontend 三阶段分析提供诊断与 hover"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tie-frontend = { path = "../tie-frontend" }
+
+[lints]
+workspace = true

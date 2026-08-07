@@ -62,6 +62,7 @@ tie 语言总入口（四段式调度器 + REPL）
 单独使用:
   tie-prep <file.tie>    只做预处理
   tie-frontend <file.tie> 只做前端三阶段（词法/语法/语义，调试与教学用）
+  tie-lsp               语言服务器（LSP over stdio，为编辑器提供诊断与 hover）
   tie-llvm <file.tie>   直接编译（不经过角色分派）
   tie-interp <file.tie> 直接解释执行（不经过角色分派）
 ";

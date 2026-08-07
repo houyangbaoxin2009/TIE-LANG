@@ -2,6 +2,15 @@
 
 tie 语言项目的变更记录，按里程碑（M0→M4）组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [LSP] 语言服务器 — 2026-08-07
+
+### 新增
+- `tie-lsp` 语言服务器：基于 JSON-RPC 2.0 over stdio，与编辑器（VSCode 等）通信
+- 三阶段诊断：复用 tie-frontend 词法/语法/语义分析，错误 → LSP 诊断推送（fail-fast）
+- 文档同步：`didOpen` / `didChange`（全量）/ `didClose`，变更即推送诊断
+- `hover`：函数签名（`func name(params) -> Ret`）与类信息（含 `extends` 父类）
+- 协议自研：仅依赖 serde/serde_json，不引入 lsp-server 等现成框架
+
 ## [M3] class/OOP — 2026-08-07
 
 ### 新增

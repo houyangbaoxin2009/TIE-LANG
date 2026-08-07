@@ -85,6 +85,7 @@ tie examples/lib_math.tie          # → examples/lib_math.a（经 clang -c 生�
 
 - `tie-prep <file.tie>` —— 纯预处理
 - `tie-frontend <file.tie>` —— 前端三阶段（词法/语法/语义），带 `--tokens`/`--ast`/`--check` 调试视图
+- `tie-lsp` —— 语言服务器（LSP over stdio），向编辑器提供诊断与 hover，可与 VSCode 等配合
 - `tie-llvm <file.tie>` —— 直接编译（不经过角色分派）
 - `tie-interp <file.tie>` —— 直接解释执行
 
@@ -96,6 +97,7 @@ tie/
 │   ├── tie-prep/      预处理：清理代码、提取头、识别文件角色（logic/ui/db/data/library）
 │   ├── tie-frontend/  前端：词法（含 ASI）→ 语法 → 语义（符号表/类型检查），自研；独立 CLI 可调试
 │   ├── tie-llvm/      中端+后端驱动：AST → LLVM IR 文本生成；调用 opt/clang/lld
+│   ├── tie-lsp/       语言服务器：JSON-RPC 2.0 over stdio，复用前端三阶段提供诊断与 hover
 │   ├── tie-interp/    解释执行（占位，REPL 用）
 │   └── tie/           CLI 主入口：角色分派调度器 + REPL
 ├── docs/language.md   语法规范

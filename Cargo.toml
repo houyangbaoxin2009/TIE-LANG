@@ -10,6 +10,7 @@ members = [
     "crates/tie-llvm",
     "crates/tie-prep",
     "crates/tie",
+    "crates/tie-lsp",
 ]
 
 # workspace 统一编译配置：
