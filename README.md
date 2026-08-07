@@ -58,25 +58,33 @@ x 大于 y
 主入口 `tie`（四段式调度器，合并原 tie-cli 职责）：
 
 ```
-tie <input.tie> [-o output] [-O0|-O1|-O2|-O3] [--emit-ir] [--keep-ir] [--prep-only]
+tie <input.tie> [-o output] [-O0|-O1|-O2|-O3] [--target <三元组>] [--emit-ir] [--keep-ir] [--prep-only]
 tie             # 无参数 → 进入 REPL 交互模式（tie-interp 解释执行）
 ```
 
 | 选项 | 说明 |
 | --- | --- |
-| `-o <file>` | 指定输出可执行文件路径（默认：输入同名 `.exe`） |
+| `-o <file>` | 指定输出文件路径（logic 默认：输入同名 `.exe`；library 默认：输入同名 `.a`） |
 | `-O0..-O3` | 优化级别（默认 `-O2`），映射到 `opt -O2` |
+| `--target <三元组>` | 交叉编译目标（如 `win-x64` / `x86_64-pc-windows-msvc`，默认本机）。支持平台别名：`win-x64`、`win-x86`、`win-arm64`、`linux-x64`、`linux-arm64`、`macos-x64`、`macos-arm64`，也可直接写 LLVM 三元组 |
 | `--emit-ir` | 只生成 LLVM IR（.ll），不继续编译 |
 | `--keep-ir` | 保留中间 IR 文件 |
 | `--prep-only` | 只做预处理（tie-prep）并打印识别结果 |
 | `-h, --help` | 显示帮助 |
 
 流程：`tie-prep` 预处理（清理代码 + 识别文件类型）→ 按角色自动转交工具链
-（`logic`/`library` → tie-llvm 编译；`data`/`ui`/`db` → 对应工具链，后续版本）。
+（`logic` → 编译为可执行文件；`library` → 编译为静态库 `.a`；`data`/`ui`/`db` → 对应工具链，后续版本）。
+
+库编译示例（`// tie:library` 角色，定义函数不定义 main）：
+
+```bash
+tie examples/lib_math.tie          # → examples/lib_math.a（经 clang -c 生成 .o，llvm-ar rcs 打包）
+```
 
 子工具可单独使用：
 
 - `tie-prep <file.tie>` —— 纯预处理
+- `tie-frontend <file.tie>` —— 前端三阶段（词法/语法/语义），带 `--tokens`/`--ast`/`--check` 调试视图
 - `tie-llvm <file.tie>` —— 直接编译（不经过角色分派）
 - `tie-interp <file.tie>` —— 直接解释执行
 
@@ -86,7 +94,7 @@ tie             # 无参数 → 进入 REPL 交互模式（tie-interp 解释执�
 tie/
 ├── crates/
 │   ├── tie-prep/      预处理：清理代码、提取头、识别文件角色（logic/ui/db/data/library）
-│   ├── tie-frontend/  前端：词法（含 ASI）→ 语法 → 语义（符号表/类型检查），自研
+│   ├── tie-frontend/  前端：词法（含 ASI）→ 语法 → 语义（符号表/类型检查），自研；独立 CLI 可调试
 │   ├── tie-llvm/      中端+后端驱动：AST → LLVM IR 文本生成；调用 opt/clang/lld
 │   ├── tie-interp/    解释执行（占位，REPL 用）
 │   └── tie/           CLI 主入口：角色分派调度器 + REPL
@@ -130,5 +138,5 @@ tie/
 | M0 | 词法（含 ASI）+ 语法 + 语义 + IR 生成 + LLVM 后端打通，跑通 `println`/算术/变量 | ✅ 完成 |
 | M1 | 控制流 if/while/for、函数调用、string 处理 | ✅ 完成 |
 | M2 | 复合类型（表/数组、元组）、`import`、头类型分派（data） | ✅ 完成 |
-| M3 | class/OOP、库编译、`--target` 交叉 | 进行中（class/OOP ✅，库编译/交叉规划） |
+| M3 | class/OOP、库编译、`--target` 交叉 | ✅ 完成 |
 | M4 | `// tie:ui` 界面、`// tie:db` 数据库、GNU 后端、性能优化 | 规划 |

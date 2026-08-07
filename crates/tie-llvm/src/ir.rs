@@ -1834,3 +1834,244 @@ fn escape_ir_string(s: &str) -> (usize, String) {
     }
     (len, out)
 }
+
+// ---------- 单元测试 ----------
+
+#[cfg(test)]
+mod tests {
+    use super::gen_ir;
+    use tie_frontend::lexer::tokenize;
+    use tie_frontend::parser::parse_program;
+    use tie_frontend::semantic::analyze;
+
+    /// 完整编译管道：源码 → 词法 → 语法 → 语义 → LLVM IR 文本。
+    ///
+    /// 不经过文件系统，正例测试均应通过；任一阶段失败即 panic。
+    fn 编译(src: &str) -> String {
+        let toks = tokenize(src).expect("词法分析失败");
+        let program = parse_program(&toks).expect("语法分析失败");
+        let sem = analyze(&program).expect("语义分析失败");
+        gen_ir(&program, &sem).expect("IR 生成失败").ir
+    }
+
+    /// 管道结果（负例用）：任一阶段失败返回 Err（含 IR 层防御性报错）。
+    fn 管道(src: &str) -> Result<String, String> {
+        let toks = tokenize(src).map_err(|e| format!("词法: {e}"))?;
+        let program = parse_program(&toks).map_err(|e| format!("语法: {e}"))?;
+        let sem = analyze(&program).map_err(|e| format!("语义: {e}"))?;
+        gen_ir(&program, &sem).map(|o| o.ir).map_err(|e| format!("IR: {e}"))
+    }
+
+    #[test]
+    fn 模块头与运行时函数声明() {
+        let ir = 编译("func main() {}");
+        assert!(ir.contains("; ModuleID = 'tie'"));
+        assert!(ir.contains("source_filename = \"input.tie\""));
+        // println 依赖的 printf 声明（变参函数）
+        assert!(ir.contains("declare i32 @printf(ptr, ...)"));
+        // 字符串运行时依赖：长度 / 比较 / 拼接分配 / 拼接拷贝
+        assert!(ir.contains("declare i64 @strlen(ptr)"));
+        assert!(ir.contains("declare i32 @strcmp(ptr, ptr)"));
+        assert!(ir.contains("declare ptr @malloc(i64)"));
+        assert!(ir.contains("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)"));
+    }
+
+    #[test]
+    fn 函数定义生成签名与入口块() {
+        let ir = 编译("func add(a: i64, b: i64) -> i64 {\n    return a + b\n}\nfunc main() {}");
+        // 参数按 类型 %名 格式拼入签名，入口块固定命名 entry
+        assert!(ir.contains("define i64 @add(i64 %a, i64 %b) {"));
+        assert!(ir.contains("entry:"));
+        assert!(ir.contains("ret i64 %"));
+    }
+
+    #[test]
+    fn 变量声明生成alloca与store() {
+        let ir = 编译("func main() {\n    var x: i64 = 42\n    var y: i64 = x + 1\n}");
+        // 变量采用 alloca/store/load 模式（依赖 opt 的 mem2reg 提升）
+        assert!(ir.contains("= alloca i64"));
+        assert!(ir.contains("store i64 42, ptr %"));
+    }
+
+    #[test]
+    fn 算术表达式生成add与mul指令() {
+        let ir = 编译("func main() {\n    var x: i64 = (3 + 4) * 5\n}");
+        assert!(ir.contains("= add i64 3, 4"));
+        assert!(ir.contains("= mul i64 %"));
+    }
+
+    #[test]
+    fn 用户函数调用生成call指令() {
+        let ir = 编译("func add(a: i64, b: i64) -> i64 {\n    return a + b\n}\nfunc main() {\n    var r: i64 = add(1, 2)\n    println(r)\n}");
+        // 字面量实参按函数签名类型写出（i64）
+        assert!(ir.contains("call i64 @add(i64 1, i64 2)"));
+    }
+
+    #[test]
+    fn if语句生成条件跳转与三块结构() {
+        let ir = 编译("func main() {\n    var x: i64 = 3\n    if x > 1 {\n        println(1)\n    } else {\n        println(0)\n    }\n}");
+        assert!(ir.contains("= icmp sgt i64"));
+        assert!(ir.contains("br i1 %"));
+        assert!(ir.contains("if.then."));
+        assert!(ir.contains("if.else."));
+        assert!(ir.contains("if.merge."));
+    }
+
+    #[test]
+    fn while循环生成三块结构() {
+        let ir = 编译("func main() {\n    var i: i64 = 0\n    while i < 3 {\n        i = i + 1\n    }\n}");
+        assert!(ir.contains("br label %loop.cond."));
+        assert!(ir.contains("loop.cond."));
+        assert!(ir.contains("loop.body."));
+        assert!(ir.contains("loop.exit."));
+        assert!(ir.contains("= icmp slt i64"));
+    }
+
+    #[test]
+    fn for范围循环生成三块与结束条件() {
+        let ir = 编译("func main() {\n    for i in 0..10 {\n        println(i)\n    }\n}");
+        assert!(ir.contains("for.cond."));
+        assert!(ir.contains("for.body."));
+        assert!(ir.contains("for.exit."));
+        // 循环结束条件：i >= end（sge）
+        assert!(ir.contains("= icmp sge i64"));
+        // 循环体末尾自增
+        assert!(ir.contains("= add i64 %"));
+    }
+
+    #[test]
+    fn 表遍历生成计数器循环() {
+        let ir = 编译("func main() {\n    var arr: table = [10, 20, 30]\n    for item in arr {\n        println(item)\n    }\n}");
+        assert!(ir.contains("for.cond."));
+        assert!(ir.contains("for.body."));
+        assert!(ir.contains("for.exit."));
+        // 每次迭代 GEP 取 arr[i] → load 元素 → store 到循环变量
+        assert!(ir.contains("getelementptr [3 x i64], ptr %"));
+        assert!(ir.contains("= load i64, ptr %"));
+    }
+
+    #[test]
+    fn switch生成比较链与各分支块() {
+        let ir = 编译("func main() {\n    var n: i64 = 2\n    switch n {\n        case 1:\n            println(1)\n        case 2:\n            println(2)\n        default:\n            println(0)\n    }\n}");
+        // switch 展开为比较链：sw.cmp 比较块 → sw.body 体块 → sw.default → sw.exit
+        assert!(ir.contains("sw.cmp."));
+        assert!(ir.contains("sw.body."));
+        assert!(ir.contains("sw.default."));
+        assert!(ir.contains("sw.exit."));
+        assert!(ir.contains("= icmp eq i64"));
+    }
+
+    #[test]
+    fn 表变量生成数组布局与逐元素写入() {
+        let ir = 编译("func main() {\n    var arr: table = [10, 20, 30]\n}");
+        // 定长数组布局：alloca [N x T]
+        assert!(ir.contains("= alloca [3 x i64]"));
+        // 逐元素 GEP 到数组内偏移后 store
+        assert!(ir.contains("getelementptr [3 x i64], ptr %"));
+        assert!(ir.contains("store i64 10, ptr %"));
+        assert!(ir.contains("store i64 20, ptr %"));
+        assert!(ir.contains("store i64 30, ptr %"));
+    }
+
+    #[test]
+    fn 表下标访问生成gep与load() {
+        let ir = 编译("func main() {\n    var arr: table = [10, 20, 30]\n    var x: i64 = arr[1]\n    println(x)\n}");
+        // 下标访问：GEP 第 0 行第 i 列 → load 元素
+        assert!(ir.contains("getelementptr [3 x i64], ptr %"));
+        assert!(ir.contains("= load i64, ptr %"));
+    }
+
+    #[test]
+    fn println生成printf调用与格式串() {
+        let ir = 编译("func main() {\n    println(\"hi\")\n    println(42)\n}");
+        // 字符串参数：%s 格式；i64 参数：%lld 格式
+        assert!(ir.contains("call i32 (ptr, ...) @printf(ptr @.str."));
+        assert!(ir.contains("c\"hi\\00\""));
+        assert!(ir.contains("c\"%lld\\0A\\00\""));
+    }
+
+    #[test]
+    fn 字符串拼接生成malloc与memcpy() {
+        let ir = 编译("func main() {\n    var s: string = \"Hello\" + \"World\"\n}");
+        // 拼接：strlen 两段 → 总长+1 → malloc → memcpy 两段 → 末尾写 \0
+        assert!(ir.contains("= call i64 @strlen(ptr @.str."));
+        assert!(ir.contains("= call ptr @malloc(i64 %"));
+        assert!(ir.contains("call void @llvm.memcpy.p0.p0.i64(ptr %"));
+        assert!(ir.contains("store i8 0, ptr %"));
+    }
+
+    #[test]
+    fn 字符串比较与len内置函数() {
+        let ir = 编译("func main() {\n    var e: bool = \"abc\" == \"abd\"\n    var n: i64 = len(\"tie\")\n}");
+        // 比较：strcmp 结果与 0 比较；len：strlen
+        assert!(ir.contains("= call i32 @strcmp(ptr @.str."));
+        assert!(ir.contains("= icmp eq i32 %"));
+        assert!(ir.contains("= call i64 @strlen(ptr @.str."));
+    }
+
+    #[test]
+    fn 类实例方法生成this参数与字段gep() {
+        let ir = 编译("class Point {\n    var x: i64\n    var y: i64\n    method area() -> i64 {\n        return this.x * this.y\n    }\n}\nfunc main() {\n    var p = Point(3, 4)\n    println(p.area())\n}");
+        // 实例方法签名：隐藏 this 首参（ptr %this）
+        assert!(ir.contains("define i64 @Point$area(ptr %this) {"));
+        // 字段访问：按拍平偏移 GEP（x→0，y→1）
+        assert!(ir.contains("getelementptr {i64, i64}, ptr %this, i32 0, i32 0"));
+        assert!(ir.contains("getelementptr {i64, i64}, ptr %this, i32 0, i32 1"));
+        // 构造：insertvalue 链构建结构体值；实例调用：receiver 地址作 this 实参
+        assert!(ir.contains("insertvalue {i64, i64}"));
+        assert!(ir.contains("= call i64 @Point$area(ptr %"));
+    }
+
+    #[test]
+    fn 类静态方法不接收this() {
+        let ir = 编译("class Point {\n    var x: i64\n    var y: i64\n    static method create(x: i64, y: i64) -> i64 {\n        return x + y\n    }\n}\nfunc main() {\n    println(Point.create(1, 2))\n}");
+        // 静态方法签名与普通函数一致：无 this 首参
+        assert!(ir.contains("define i64 @Point$create(i64 %x, i64 %y) {"));
+        assert!(!ir.contains("Point$create(ptr"));
+        // 类名调用 → 静态调用（无 this 实参）
+        assert!(ir.contains("call i64 @Point$create(i64 1, i64 2)"));
+    }
+
+    #[test]
+    fn 类构造与字段赋值() {
+        let ir = 编译("class Point {\n    var x: i64\n    var y: i64\n}\nfunc main() {\n    var p = Point(3, 4)\n    p.x = 100\n    println(p.x)\n}");
+        // 构造：逐字段 insertvalue（字段顺序与拍平顺序一致）
+        assert!(ir.contains("insertvalue {i64, i64} undef, i64 3, 0"));
+        assert!(ir.contains("insertvalue {i64, i64} %"));
+        // 字段赋值：GEP 到字段偏移后 store
+        assert!(ir.contains("getelementptr {i64, i64}, ptr %"));
+        assert!(ir.contains("store i64 100, ptr %"));
+    }
+
+    #[test]
+    fn main函数生成i32签名与返回0() {
+        let ir = 编译("func main() -> i32 {\n    return 0\n}");
+        assert!(ir.contains("define i32 @main() {"));
+        assert!(ir.contains("entry:"));
+        assert!(ir.contains("ret i32 0"));
+    }
+
+    #[test]
+    fn 元组字面量生成insertvalue与extractvalue() {
+        let ir = 编译("func main() {\n    var t = (10, 20)\n    println(t.Item1)\n}");
+        // 字面量：undef 起始逐字段 insertvalue；访问：load 后 extractvalue
+        assert!(ir.contains("insertvalue {i64, i64} undef, i64 10, 0"));
+        assert!(ir.contains("insertvalue {i64, i64} %"));
+        assert!(ir.contains("= extractvalue {i64, i64} %"));
+    }
+
+    #[test]
+    fn 负例_范围表达式不能单独求值() {
+        // 语义层对 Range 只校验两端整数；IR 层防御性报错
+        // （范围只能在 for 中作为迭代对象，不能作为普通表达式求值）
+        let result = 管道("func main() {\n    var r = 1..3\n}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn 负例_表字面量不能用于非表变量() {
+        // 表字面量只允许出现在 table 类型变量声明中（语义层拦截）
+        let result = 管道("func main() {\n    var x: i64 = [1, 2]\n}");
+        assert!(result.is_err());
+    }
+}

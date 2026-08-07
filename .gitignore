@@ -25,3 +25,6 @@ Thumbs.db
 # 代码索引与计划（本地生成，不入库）
 .codegraph/
 .omo/
+
+# 库编译产物
+/examples/*.a

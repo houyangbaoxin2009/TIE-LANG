@@ -24,7 +24,7 @@
 
 ## 文档
 
-- 维护 README.md、CONTRIBUTING.md、CHANGELOG.md
+- 维护 README.md、CHANGELOG.md
 
 ## 沟通风格
 

@@ -1,7 +1,9 @@
-//! 后端：调用 LLVM 工具链（clang/lld）把优化后的 IR 编译链接为可执行文件。
+//! 后端：调用 LLVM 工具链（clang/lld）把优化后的 IR 编译链接为可执行文件或库。
 //!
 //! 对应《编译原理》的目标代码生成与链接阶段，具体工作交给 LLVM：
-//! `clang optimized.ll -o output.exe`（内部自动完成汇编与链接）。
+//! - `clang optimized.ll -o output.exe`（内部自动完成汇编与链接，生成可执行文件）
+//! - `clang -c optimized.ll -o output.o` + `llvm-ar rcs libxxx.a output.o`（生成静态库）
+//! - 交叉编译：给 clang 传 `--target=<三元组>`（如 `--target=x86_64-pc-windows-msvc`）
 
 use std::path::Path;
 use std::process::Command;
@@ -13,6 +15,10 @@ pub enum BackendError {
     NotFound,
     /// clang 调用失败（含 stderr）
     RunFailed(String),
+    /// llvm-ar 可执行文件不存在
+    ArNotFound,
+    /// llvm-ar 调用失败（含 stderr）
+    ArFailed(String),
 }
 
 impl std::fmt::Display for BackendError {
@@ -22,27 +28,72 @@ impl std::fmt::Display for BackendError {
                 write!(f, "未找到 clang，请确认 LLVM 已安装并在 PATH 中")
             }
             BackendError::RunFailed(msg) => write!(f, "后端编译失败: {msg}"),
+            BackendError::ArNotFound => {
+                write!(f, "未找到 llvm-ar，请确认 LLVM 已安装并在 PATH 中")
+            }
+            BackendError::ArFailed(msg) => write!(f, "静态库打包失败: {msg}"),
         }
     }
 }
 
-/// 链接生成可执行文件：`clang input.ll -o output`。
+/// 链接生成可执行文件：`clang [--target=T] input.ll -o output`。
 ///
 /// clang 会自行完成：IR → 汇编 → 目标文件 → 链接（链接 CRT 与系统库）。
-pub fn link(input: &Path, output: &Path) -> Result<(), BackendError> {
+/// `target` 为 `Some(三元组)` 时交叉编译（如 `x86_64-pc-windows-msvc`）。
+pub fn link(input: &Path, output: &Path, target: Option<&str>) -> Result<(), BackendError> {
     let clang = find_clang().ok_or(BackendError::NotFound)?;
-    let out = Command::new(&clang)
-        .arg(input)
-        .arg("-o")
-        .arg(output)
-        // Windows 下避免弹出控制台窗口（GUI 程序用 -mwindows 由后续版本按头类型控制）
-        .output();
+    let mut cmd = Command::new(&clang);
+    cmd.arg(input).arg("-o").arg(output);
+    // 交叉编译：clang 按目标三元组选择后端与系统库
+    if let Some(t) = target {
+        cmd.arg(format!("--target={t}"));
+    }
+    let out = cmd.output();
     match out {
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => Err(BackendError::RunFailed(
             String::from_utf8_lossy(&o.stderr).trim().to_string(),
         )),
         Err(e) => Err(BackendError::RunFailed(e.to_string())),
+    }
+}
+
+/// 编译 IR 为独立目标文件：`clang [--target=T] -c input.ll -o output.o`。
+///
+/// 库编译第一步：生成目标文件（.o/.obj），供静态库打包。
+pub fn compile_object(
+    input: &Path,
+    output: &Path,
+    target: Option<&str>,
+) -> Result<(), BackendError> {
+    let clang = find_clang().ok_or(BackendError::NotFound)?;
+    let mut cmd = Command::new(&clang);
+    cmd.arg("-c").arg(input).arg("-o").arg(output);
+    if let Some(t) = target {
+        cmd.arg(format!("--target={t}"));
+    }
+    let out = cmd.output();
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(BackendError::RunFailed(
+            String::from_utf8_lossy(&o.stderr).trim().to_string(),
+        )),
+        Err(e) => Err(BackendError::RunFailed(e.to_string())),
+    }
+}
+
+/// 打包静态库：`llvm-ar rcs libxxx.a xxx.o`。
+///
+/// 库编译第二步：把目标文件归档为静态库（.a）。
+pub fn archive(object: &Path, archive: &Path) -> Result<(), BackendError> {
+    let ar = find_llvm_ar().ok_or(BackendError::ArNotFound)?;
+    let out = Command::new(&ar).arg("rcs").arg(archive).arg(object).output();
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(BackendError::ArFailed(
+            String::from_utf8_lossy(&o.stderr).trim().to_string(),
+        )),
+        Err(e) => Err(BackendError::ArFailed(e.to_string())),
     }
 }
 
@@ -53,6 +104,20 @@ fn find_clang() -> Option<std::path::PathBuf> {
     }
     for dir in ["D:\\LLVM\\bin", "C:\\Program Files\\LLVM\\bin", "C:\\LLVM\\bin"] {
         let p = Path::new(dir).join("clang.exe");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// 查找 llvm-ar 可执行文件（PATH → 常见安装位置）。
+fn find_llvm_ar() -> Option<std::path::PathBuf> {
+    if let Some(path) = which("llvm-ar") {
+        return Some(path);
+    }
+    for dir in ["D:\\LLVM\\bin", "C:\\Program Files\\LLVM\\bin", "C:\\LLVM\\bin"] {
+        let p = Path::new(dir).join("llvm-ar.exe");
         if p.exists() {
             return Some(p);
         }

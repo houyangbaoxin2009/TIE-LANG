@@ -719,3 +719,366 @@ impl<'a> Lexer<'a> {
         Ok(Token::new(kind, line, col))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- ASI 自动分号补全 ----------
+
+    /// 行尾是标识符/整数时换行补分号；补出的分号位于下一行行首
+    /// （finish_line 在消费换行后执行，故 span 是下一行 (line+1, 1)）。
+    #[test]
+    fn 行尾标识符自动补分号() {
+        let toks = tokenize("var x = 1\nvar y").expect("不应报错");
+        let semis: Vec<_> = toks.iter().filter(|t| t.kind == TokenKind::Semi).collect();
+        assert_eq!(semis.len(), 1, "仅第一行行尾应补一个分号");
+        assert_eq!((semis[0].span.line, semis[0].span.col), (2, 1), "补出的分号在下一行行首");
+    }
+
+    /// 行尾是整数/字符串时换行补分号，每个语句行各补一个。
+    #[test]
+    fn 行尾整数与字符串自动补分号() {
+        let toks = tokenize("x = 1\ns = \"hi\"\n").expect("不应报错");
+        let semis: Vec<_> = toks.iter().filter(|t| t.kind == TokenKind::Semi).collect();
+        assert_eq!(semis.len(), 2, "两行语句各补一个分号");
+        // 第一个分号紧跟整数 1（证明是整数行尾补出来的，而不是字符串行）
+        let int_idx = toks.iter().position(|t| t.kind == TokenKind::Int(1)).expect("有整数 1");
+        assert!(matches!(toks[int_idx + 1].kind, TokenKind::Semi), "整数后应紧跟补出的分号");
+    }
+
+    /// 行尾是二元运算符（+ - * / % == != < > <= >= && || =）→ 语句未结束，不补分号。
+    #[test]
+    fn 行尾二元运算符不补分号() {
+        for src in [
+            "a +\nb", "a -\nb", "a *\nb", "a /\nb", "a %\nb", "a ==\nb", "a !=\nb", "a <\nb",
+            "a >\nb", "a <=\nb", "a >=\nb", "a &&\nb", "a ||\nb", "a =\nb",
+        ] {
+            let toks = tokenize(src).expect("不应报错");
+            assert!(
+                !toks.iter().any(|t| t.kind == TokenKind::Semi),
+                "源码 {src:?} 行尾是二元运算符，不应补分号"
+            );
+        }
+    }
+
+    /// `(` / `[` 内换行表示表达式续行，不补分号；闭合括号后的行尾才补。
+    #[test]
+    fn 括号内换行不补分号() {
+        for src in ["f(1,\n2)\n", "[1,\n2]\n"] {
+            let toks = tokenize(src).expect("不应报错");
+            let semis: Vec<_> = toks.iter().filter(|t| t.kind == TokenKind::Semi).collect();
+            assert_eq!(semis.len(), 1, "源码 {src:?} 应只在右括号行尾补一个分号");
+            let semi_idx = toks.iter().position(|t| t.kind == TokenKind::Semi).expect("有分号");
+            assert!(
+                matches!(toks[semi_idx - 1].kind, TokenKind::RParen | TokenKind::RBracket),
+                "分号应跟在右括号之后"
+            );
+        }
+    }
+
+    /// 行尾是 `else` / `in` → 语句未结束，不补分号。
+    #[test]
+    fn 行尾else与in不补分号() {
+        // else 行尾：else 后应紧跟左大括号，中间无分号
+        let toks = tokenize("if x\nelse {").expect("不应报错");
+        let else_idx = toks.iter().position(|t| t.kind == TokenKind::Else).expect("有 else");
+        assert!(matches!(toks[else_idx + 1].kind, TokenKind::LBrace), "else 后应紧跟左大括号");
+        // in 行尾：整个流中不应出现分号
+        let toks = tokenize("for x in\nlist").expect("不应报错");
+        assert!(!toks.iter().any(|t| t.kind == TokenKind::Semi), "in 行尾不补分号");
+    }
+
+    /// 行尾是 `{` / `}` → 块边界，不补分号（finish_line 排除列表含 LBrace/RBrace）。
+    #[test]
+    fn 行尾大括号不补分号() {
+        let toks = tokenize("if x\n{\n}").expect("不应报错");
+        let semis: Vec<_> = toks.iter().filter(|t| t.kind == TokenKind::Semi).collect();
+        assert_eq!(semis.len(), 1, "只有 if 条件行行尾补分号，{{ 与 }} 行尾不补");
+        let brace_idx = toks.iter().position(|t| t.kind == TokenKind::LBrace).expect("有左大括号");
+        assert!(matches!(toks[brace_idx + 1].kind, TokenKind::RBrace), "块内不应插入分号");
+    }
+
+    /// 显式写出的分号不会被再次补全（补全只发生在行尾无分号时）。
+    #[test]
+    fn 显式分号不重复补全() {
+        let toks = tokenize("x = 1;\ny = 2\n").expect("不应报错");
+        let n = toks.iter().filter(|t| t.kind == TokenKind::Semi).count();
+        assert_eq!(n, 2, "第一行显式 1 个，第二行补全 1 个，共 2 个");
+    }
+
+    // ---------- 注释 ----------
+
+    /// 行注释 `//` 不产生任何 token。
+    #[test]
+    fn 行注释不产生token() {
+        let toks = tokenize("var x = 1 // 注释\nvar y").expect("不应报错");
+        assert_eq!(toks.len(), 8, "注释不应产生 token（8 = var x = 1 分号 var y Eof）");
+        assert!(!toks.iter().any(|t| matches!(t.kind, TokenKind::Str(_))), "注释文本不应成为字符串");
+        assert!(toks.iter().any(|t| t.kind == TokenKind::Semi), "注释前的语句行尾仍补分号");
+    }
+
+    /// 块注释 `/* */`（可跨行）不产生任何 token。
+    #[test]
+    fn 块注释不产生token() {
+        let toks = tokenize("/* 块\n注释 */ x\n").expect("不应报错");
+        assert_eq!(toks.len(), 3, "只有标识符 x、补出的分号和 Eof");
+        assert!(matches!(&toks[0].kind, TokenKind::Ident(s) if s == "x"));
+        assert!(matches!(toks[1].kind, TokenKind::Semi));
+    }
+
+    /// 块注释未闭合 → 报错，消息含「未闭合」。
+    #[test]
+    fn 块注释未闭合报错() {
+        let err = tokenize("var x /* 未闭合").expect_err("块注释未闭合应报错");
+        assert!(err.message.contains("未闭合"), "错误消息：{}", err.message);
+    }
+
+    // ---------- 字符串 ----------
+
+    /// 字符串转义 `\n \t \r \\ \" \' \0` 全部正确解码。
+    #[test]
+    fn 字符串转义正确解码() {
+        let toks = tokenize("\"a\\nb\\tc\\\\d\\\"e\\'f\\0g\\r\"").expect("不应报错");
+        assert!(
+            matches!(&toks[0].kind, TokenKind::Str(s) if s == "a\nb\tc\\d\"e'f\0g\r"),
+            "转义解码结果：{:?}",
+            toks[0].kind
+        );
+    }
+
+    /// 未知转义序列（如 `\q`）→ 报错，消息含「未知转义」。
+    #[test]
+    fn 字符串未知转义报错() {
+        let err = tokenize("\"\\q\"").expect_err("未知转义应报错");
+        assert!(err.message.contains("未知转义"), "错误消息：{}", err.message);
+    }
+
+    /// 字符串未闭合 → 报错，消息含「未闭合」。
+    #[test]
+    fn 字符串未闭合报错() {
+        let err = tokenize("\"abc").expect_err("未闭合字符串应报错");
+        assert!(err.message.contains("未闭合"), "错误消息：{}", err.message);
+    }
+
+    // ---------- 字符字面量 ----------
+
+    /// 字符字面量 `'a'` / `'\n'` / `'\''`（转义）识别为 CharLit。
+    #[test]
+    fn 字符字面量识别() {
+        let toks = tokenize("'a' '\\n' '\\''").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::CharLit('a')));
+        assert!(matches!(toks[1].kind, TokenKind::CharLit('\n')));
+        assert!(matches!(toks[2].kind, TokenKind::CharLit('\'')));
+    }
+
+    /// 多字符字面量 `'ab'` → 报错，消息含「只能包含一个字符」。
+    #[test]
+    fn 字符字面量多字符报错() {
+        let err = tokenize("'ab'").expect_err("多字符字面量应报错");
+        assert!(err.message.contains("只能包含一个字符"), "错误消息：{}", err.message);
+    }
+
+    // ---------- 数字 ----------
+
+    /// 整数与含小数点的浮点（`2.5`）。
+    #[test]
+    fn 整数与浮点识别() {
+        let toks = tokenize("1 2.5 100 0").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(1)));
+        assert!(matches!(toks[1].kind, TokenKind::Float(f) if f == 2.5));
+        assert!(matches!(toks[2].kind, TokenKind::Int(100)));
+        assert!(matches!(toks[3].kind, TokenKind::Int(0)));
+    }
+
+    /// 指数形式浮点：1e5 / 1.5e-3 / 2E3。
+    #[test]
+    fn 指数浮点识别() {
+        for (src, expected) in [("1e5", 100000.0), ("1.5e-3", 0.0015), ("2E3", 2000.0)] {
+            let toks = tokenize(src).expect("不应报错");
+            let got = match toks[0].kind {
+                TokenKind::Float(f) => f,
+                _ => panic!("源码 {src:?} 应为浮点"),
+            };
+            assert!((got - expected).abs() < 1e-9, "源码 {src:?} 解析为 {got}，期望 {expected}");
+        }
+    }
+
+    /// `1..10` 中 `..` 是范围运算符，不被误认为小数点（scan_number 只在
+    /// 小数点后跟数字时才按浮点处理）。
+    #[test]
+    fn 范围运算符不被误认为小数点() {
+        let toks = tokenize("1..10").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(1)));
+        assert!(matches!(toks[1].kind, TokenKind::DotDot));
+        assert!(matches!(toks[2].kind, TokenKind::Int(10)));
+        // 成员访问 `a.b` 与范围 `1..2` 共存，各自正确
+        let toks = tokenize("a.b 1..2").expect("不应报错");
+        assert!(matches!(toks[1].kind, TokenKind::Dot));
+        assert!(matches!(toks[3].kind, TokenKind::Int(1)));
+        assert!(matches!(toks[4].kind, TokenKind::DotDot));
+    }
+
+    // ---------- 位置与 Eof ----------
+
+    /// Span 的 line/col 从 1 开始；补出的分号位于下一行行首。
+    #[test]
+    fn 位置信息从1开始且正确() {
+        let toks = tokenize("var x\n  if y").expect("不应报错");
+        assert_eq!((toks[0].span.line, toks[0].span.col), (1, 1), "var");
+        assert_eq!((toks[1].span.line, toks[1].span.col), (1, 5), "x");
+        assert_eq!((toks[2].span.line, toks[2].span.col), (2, 1), "补出的分号");
+        assert_eq!((toks[3].span.line, toks[3].span.col), (2, 3), "if");
+        assert_eq!((toks[4].span.line, toks[4].span.col), (2, 6), "y");
+        assert_eq!((toks[5].span.line, toks[5].span.col), (2, 7), "Eof 在文件末尾");
+    }
+
+    /// 空源码只产生一个 Eof；任何 token 流末尾恒有 Eof。
+    #[test]
+    fn 空源码仅含eof且末尾恒有eof() {
+        let toks = tokenize("").expect("空源码不应报错");
+        assert_eq!(toks.len(), 1, "空源码只有 Eof");
+        assert!(matches!(toks[0].kind, TokenKind::Eof));
+        assert_eq!((toks[0].span.line, toks[0].span.col), (1, 1));
+        let toks = tokenize("x = 1").expect("不应报错");
+        assert!(matches!(toks.last().expect("非空流").kind, TokenKind::Eof), "Eof 恒在末尾");
+    }
+
+    // ---------- 关键字与标识符 ----------
+
+    /// 控制流/OOP/字面量关键字逐一识别（func..false 共 21 个）。
+    #[test]
+    fn 关键字全部识别() {
+        let src = "func var const if else while for in return switch case default import as class method this static extends true false";
+        let toks = tokenize(src).expect("不应报错");
+        let expected = [
+            TokenKind::Func,
+            TokenKind::Var,
+            TokenKind::Const,
+            TokenKind::If,
+            TokenKind::Else,
+            TokenKind::While,
+            TokenKind::For,
+            TokenKind::In,
+            TokenKind::Return,
+            TokenKind::Switch,
+            TokenKind::Case,
+            TokenKind::Default,
+            TokenKind::Import,
+            TokenKind::As,
+            TokenKind::Class,
+            TokenKind::Method,
+            TokenKind::This,
+            TokenKind::Static,
+            TokenKind::Extends,
+            TokenKind::True,
+            TokenKind::False,
+        ];
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(toks[i].kind, *want, "第 {i} 个关键字");
+        }
+        assert!(matches!(toks[expected.len()].kind, TokenKind::Eof));
+    }
+
+    /// 类型关键字 i8..table 逐一识别为 TypeKw(TyKw::*)（共 19 个）。
+    #[test]
+    fn 类型关键字识别() {
+        let src = "i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool char string void code num text misc table";
+        let toks = tokenize(src).expect("不应报错");
+        let expected = [
+            TyKw::I8,
+            TyKw::I16,
+            TyKw::I32,
+            TyKw::I64,
+            TyKw::U8,
+            TyKw::U16,
+            TyKw::U32,
+            TyKw::U64,
+            TyKw::F32,
+            TyKw::F64,
+            TyKw::Bool,
+            TyKw::Char,
+            TyKw::Str,
+            TyKw::Void,
+            TyKw::Code,
+            TyKw::Num,
+            TyKw::Text,
+            TyKw::Misc,
+            TyKw::Table,
+        ];
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(toks[i].kind, TokenKind::TypeKw(*want), "第 {i} 个类型关键字");
+        }
+        assert!(matches!(toks[expected.len()].kind, TokenKind::Eof));
+    }
+
+    /// 含关键字前缀/后缀的标识符仍是标识符；完整拼写才是关键字。
+    #[test]
+    fn 标识符与关键字区分() {
+        let toks = tokenize("variable ifx _x i32x x1").expect("不应报错");
+        for t in &toks[..5] {
+            assert!(matches!(t.kind, TokenKind::Ident(_)), "应识别为标识符：{t:?}");
+        }
+        assert!(matches!(&toks[0].kind, TokenKind::Ident(s) if s == "variable"));
+        // 对照：完整拼写仍是关键字 / 类型关键字
+        let toks = tokenize("if i32").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::If));
+        assert!(matches!(toks[1].kind, TokenKind::TypeKw(TyKw::I32)));
+    }
+
+    // ---------- 符号 ----------
+
+    /// 双字符符号（== != <= >= && || .. ->）与单字符符号逐一定位。
+    #[test]
+    fn 运算符与符号识别() {
+        let toks = tokenize("== != <= >= && || .. ->").expect("不应报错");
+        let want2 = [
+            TokenKind::EqEq,
+            TokenKind::NotEq,
+            TokenKind::Le,
+            TokenKind::Ge,
+            TokenKind::AndAnd,
+            TokenKind::OrOr,
+            TokenKind::DotDot,
+            TokenKind::Arrow,
+        ];
+        for (i, w) in want2.iter().enumerate() {
+            assert_eq!(toks[i].kind, *w, "第 {i} 个双字符符号");
+        }
+        assert!(matches!(toks[want2.len()].kind, TokenKind::Eof));
+        // 单字符符号（含显式分号）
+        let toks = tokenize("(){}[],:;.+*-/%=<>!").expect("不应报错");
+        let want1 = [
+            TokenKind::LParen,
+            TokenKind::RParen,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::LBracket,
+            TokenKind::RBracket,
+            TokenKind::Comma,
+            TokenKind::Colon,
+            TokenKind::Semi,
+            TokenKind::Dot,
+            TokenKind::Plus,
+            TokenKind::Star,
+            TokenKind::Minus,
+            TokenKind::Slash,
+            TokenKind::Percent,
+            TokenKind::Eq,
+            TokenKind::Lt,
+            TokenKind::Gt,
+            TokenKind::Bang,
+        ];
+        for (i, w) in want1.iter().enumerate() {
+            assert_eq!(toks[i].kind, *w, "第 {i} 个单字符符号");
+        }
+        assert!(matches!(toks[want1.len()].kind, TokenKind::Eof));
+    }
+
+    /// 无法识别的字符（如 `@`）→ 报错，消息含「无法识别」。
+    #[test]
+    fn 无法识别字符报错() {
+        let err = tokenize("@x").expect_err("无法识别的字符应报错");
+        assert!(err.message.contains("无法识别"), "错误消息：{}", err.message);
+    }
+}

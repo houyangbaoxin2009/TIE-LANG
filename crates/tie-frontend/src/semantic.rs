@@ -1409,3 +1409,479 @@ fn type_name(t: &TypeSpec) -> &'static str {
         TypeSpec::Class(name) => Box::leak(name.clone().into_boxed_str()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::tokenize;
+    use crate::parser::parse_program;
+
+    /// 完整前端管道：词法 → 语法 → 语义。
+    fn analyze_src(src: &str) -> Result<SemanticResult, SemanticError> {
+        let tokens = tokenize(src).expect("词法分析失败");
+        let program = parse_program(&tokens).expect("语法分析失败");
+        analyze(&program)
+    }
+
+    /// 断言语义分析报错，且错误消息包含关键字。
+    fn expect_err(src: &str, keyword: &str) {
+        let err = analyze_src(src).expect_err("应当报语义错误");
+        assert!(
+            err.message.contains(keyword),
+            "错误消息 '{}' 应包含关键字 '{}'",
+            err.message,
+            keyword
+        );
+    }
+
+    #[test]
+    fn 函数签名收集() {
+        let sem = analyze_src(
+            r#"
+            func add(a: i64, b: i64) -> i64 {
+                return a + b
+            }
+            func greet(name: string) {
+                println(name)
+            }
+            func main() {
+                const MAX = 10
+                println(MAX)
+            }
+            "#,
+        )
+        .expect("应当通过语义检查");
+        // funcs 表：函数名齐全
+        assert!(sem.funcs.contains_key("add"));
+        assert!(sem.funcs.contains_key("greet"));
+        assert!(sem.funcs.contains_key("main"));
+        // 参数类型与返回类型逐项核对
+        assert_eq!(
+            sem.funcs["add"].param_tys,
+            vec![TypeSpec::Named(TyKw::I64), TypeSpec::Named(TyKw::I64)]
+        );
+        assert_eq!(sem.funcs["add"].ret_ty, TypeSpec::Named(TyKw::I64));
+        assert_eq!(sem.funcs["greet"].param_tys, vec![TypeSpec::Named(TyKw::Str)]);
+        // 省略 `-> Ty` 的返回类型默认为 void
+        assert_eq!(sem.funcs["greet"].ret_ty, TypeSpec::Named(TyKw::Void));
+        // const 变量登记进 const_vars
+        assert!(sem.const_vars.contains("MAX"));
+    }
+
+    #[test]
+    fn 函数重复定义报错() {
+        expect_err(
+            r#"
+            func f() {}
+            func f() {}
+            func main() {
+                println(1)
+            }
+            "#,
+            "重复定义",
+        );
+    }
+
+    #[test]
+    fn 使用未声明变量报错() {
+        expect_err(
+            r#"
+            func main() {
+                println(x)
+            }
+            "#,
+            "未声明的变量",
+        );
+    }
+
+    #[test]
+    fn const变量赋值报错() {
+        expect_err(
+            r#"
+            func main() {
+                const x = 1
+                x = 2
+            }
+            "#,
+            "不能给 const 变量",
+        );
+    }
+
+    #[test]
+    fn 变量类型不匹配报错() {
+        // i64 变量赋 string 值：类型不匹配
+        expect_err(
+            r#"
+            func main() {
+                var x: i64 = "hello"
+            }
+            "#,
+            "类型不匹配",
+        );
+    }
+
+    #[test]
+    fn return类型与函数签名不一致报错() {
+        expect_err(
+            r#"
+            func f() -> i64 {
+                return "hello"
+            }
+            func main() {
+                println(1)
+            }
+            "#,
+            "return 类型不匹配",
+        );
+    }
+
+    #[test]
+    fn return类型与签名一致通过() {
+        let sem = analyze_src(
+            r#"
+            func add(a: i64, b: i64) -> i64 {
+                return a + b
+            }
+            func main() {
+                println(add(1, 2))
+            }
+            "#,
+        )
+        .expect("应当通过语义检查");
+        assert_eq!(sem.funcs["add"].ret_ty, TypeSpec::Named(TyKw::I64));
+    }
+
+    #[test]
+    fn 类名与函数名冲突报错() {
+        expect_err(
+            r#"
+            func Point() -> i64 {
+                return 1
+            }
+            class Point {
+                var x: i64
+            }
+            func main() {
+                println(1)
+            }
+            "#,
+            "与函数名冲突",
+        );
+    }
+
+    #[test]
+    fn 继承环检测报错() {
+        // A extends B，B extends A → 死循环，必须报错
+        expect_err(
+            r#"
+            class A extends B {
+                var a: i64
+            }
+            class B extends A {
+                var b: i64
+            }
+            func main() {
+                println(1)
+            }
+            "#,
+            "类继承形成环",
+        );
+    }
+
+    #[test]
+    fn 子类遮蔽父类方法与字段拍平() {
+        let sem = analyze_src(
+            r#"
+            class Animal {
+                var name: string
+                var age: i64
+                method speak() -> string {
+                    return this.name + " makes a sound"
+                }
+            }
+            class Dog extends Animal {
+                var breed: string
+                method speak() -> string {
+                    return this.name + " barks"
+                }
+                method info() -> string {
+                    return "I am a " + this.breed
+                }
+            }
+            func main() {
+                var d = Dog("Rex", 3, "Golden")
+                println(d.speak())
+            }
+            "#,
+        )
+        .expect("应当通过语义检查");
+        // 字段拍平：父类字段在前，子类字段在后（顺序即 LLVM 结构体字段序）
+        let dog = &sem.classes["Dog"];
+        assert_eq!(dog.fields.len(), 3);
+        assert_eq!(dog.field_index["name"], 0);
+        assert_eq!(dog.field_index["age"], 1);
+        assert_eq!(dog.field_index["breed"], 2);
+        // 方法拍平：子类遮蔽父类同名方法，method_owner 记录实际定义类
+        assert!(dog.methods.contains_key("speak"));
+        assert!(dog.methods.contains_key("info"));
+        assert_eq!(dog.method_owner["speak"], "Dog");
+        assert_eq!(dog.method_owner["info"], "Dog");
+        // 父类自身的方法归属
+        assert_eq!(sem.classes["Animal"].method_owner["speak"], "Animal");
+    }
+
+    #[test]
+    fn 方法重复定义报错() {
+        expect_err(
+            r#"
+            class A {
+                method f() {}
+                method f() {}
+            }
+            func main() {
+                println(1)
+            }
+            "#,
+            "重复定义",
+        );
+    }
+
+    #[test]
+    fn 方法内this使用正确() {
+        let sem = analyze_src(
+            r#"
+            class Counter {
+                var count: i64
+                method inc() {
+                    this.count = this.count + 1
+                }
+                method get() -> i64 {
+                    return this.count
+                }
+            }
+            func main() {
+                var c = Counter(0)
+                c.inc()
+                println(c.get())
+            }
+            "#,
+        )
+        .expect("应当通过语义检查");
+        // 方法签名收集进 classes 表
+        let counter = &sem.classes["Counter"];
+        assert!(counter.methods.contains_key("inc"));
+        assert!(counter.methods.contains_key("get"));
+        assert_eq!(counter.methods["get"].ret_ty, TypeSpec::Named(TyKw::I64));
+        // 实例方法不标记静态
+        assert!(!counter.methods["inc"].is_static);
+    }
+
+    #[test]
+    fn 静态方法内使用this报错() {
+        // 静态方法不绑定 this：体内引用 this 视为未声明变量
+        expect_err(
+            r#"
+            class Counter {
+                var count: i64
+                static method bad() {
+                    println(this.count)
+                }
+            }
+            func main() {
+                println(1)
+            }
+            "#,
+            "未声明的变量",
+        );
+    }
+
+    #[test]
+    fn 表字面量元数据记录元素类型与长度() {
+        let sem = analyze_src(
+            r#"
+            func main() {
+                var arr: table = [10, 20, 30]
+                println(arr[1])
+            }
+            "#,
+        )
+        .expect("应当通过语义检查");
+        // tables 元数据：元素类型 i64、长度 3（供 IR 布局）
+        assert_eq!(sem.tables.len(), 1);
+        assert!(sem
+            .tables
+            .values()
+            .any(|t| t.elem_ty == TypeSpec::Named(TyKw::I64) && t.len == 3));
+    }
+
+    #[test]
+    fn 表元素类型不一致报错() {
+        // 表是同构容器：元素类型必须全部一致
+        expect_err(
+            r#"
+            func main() {
+                var arr: table = [1, "a"]
+            }
+            "#,
+            "表元素类型不一致",
+        );
+    }
+
+    #[test]
+    fn 宽类型num推导出具体类型写入expr_types() {
+        let sem = analyze_src(
+            r#"
+            func main() {
+                var a: num = 42
+                var b: i64 = a
+            }
+            "#,
+        )
+        .expect("应当通过语义检查");
+        // 宽类型通过后 scope 存具体推导类型（i64），
+        // 后续 `var b: i64 = a` 类型匹配即证明推导生效
+        // 且 expr_types 记录了字面量 42 的具体类型
+        assert!(sem.expr_types.values().any(|t| *t == TypeSpec::Named(TyKw::I64)));
+    }
+
+    #[test]
+    fn 宽类型num拒绝字符串初始化() {
+        expect_err(
+            r#"
+            func main() {
+                var a: num = "hello"
+            }
+            "#,
+            "不匹配",
+        );
+    }
+
+    #[test]
+    fn 宽类型text推导出字符串类型() {
+        let sem = analyze_src(
+            r#"
+            func main() {
+                var s: text = "hello"
+                var t: string = s
+            }
+            "#,
+        )
+        .expect("应当通过语义检查");
+        // text 类别框接受字符串，scope 存具体类型 string
+        assert!(sem.expr_types.values().any(|t| *t == TypeSpec::Named(TyKw::Str)));
+    }
+
+    #[test]
+    fn 元组解构与命名字段访问合法() {
+        let sem = analyze_src(
+            r#"
+            func divmod(a: i64, b: i64) -> (q: i64, r: i64) {
+                return (a / b, a % b)
+            }
+            func main() {
+                var (q, r) = divmod(17, 5)
+                println(q)
+                println(r)
+                var p = (x: 3, y: 4)
+                println(p.x)
+            }
+            "#,
+        )
+        .expect("应当通过语义检查");
+        // 函数签名含元组返回类型（命名元组，两字段）
+        assert!(matches!(
+            &sem.funcs["divmod"].ret_ty,
+            TypeSpec::Tuple(fields) if fields.len() == 2
+        ));
+        // 解构逐字段声明 + 命名访问均通过类型检查
+        assert!(sem
+            .expr_types
+            .values()
+            .any(|t| matches!(t, TypeSpec::Tuple(_))));
+    }
+
+    #[test]
+    fn 元组访问不存在的字段报错() {
+        expect_err(
+            r#"
+            func main() {
+                var p = (x: 3, y: 4)
+                println(p.z)
+            }
+            "#,
+            "元组没有字段",
+        );
+    }
+
+    #[test]
+    fn 函数调用参数个数不匹配报错() {
+        expect_err(
+            r#"
+            func f(a: i64) {
+                println(a)
+            }
+            func main() {
+                f(1, 2)
+            }
+            "#,
+            "期望 1 个参数",
+        );
+    }
+
+    #[test]
+    fn 调用未定义函数报错() {
+        expect_err(
+            r#"
+            func main() {
+                foo()
+            }
+            "#,
+            "未定义的函数",
+        );
+    }
+
+    #[test]
+    fn 赋值目标未声明报错() {
+        expect_err(
+            r#"
+            func main() {
+                x = 1
+            }
+            "#,
+            "赋值目标",
+        );
+    }
+
+    #[test]
+    fn if条件必须是bool报错() {
+        expect_err(
+            r#"
+            func main() {
+                if 1 {
+                    println(1)
+                }
+            }
+            "#,
+            "if 条件必须是 bool",
+        );
+    }
+
+    #[test]
+    fn 静态方法通过实例调用报错() {
+        expect_err(
+            r#"
+            class Counter {
+                var count: i64
+                static method make() -> i64 {
+                    return 1
+                }
+            }
+            func main() {
+                var c = Counter(0)
+                println(c.make())
+            }
+            "#,
+            "必须通过类名调用",
+        );
+    }
+}

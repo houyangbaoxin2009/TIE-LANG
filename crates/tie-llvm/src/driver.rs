@@ -33,7 +33,7 @@ use tie_prep::preprocess::{self, FileRole, PreprocessResult};
 pub struct CompileOptions {
     /// 输入源码路径
     pub input: PathBuf,
-    /// 输出可执行文件路径（默认：输入同名 .exe）
+    /// 输出可执行文件路径（默认：输入同名 .exe；library 角色默认 .a）
     pub output: Option<PathBuf>,
     /// 优化级别（None = 未显式指定，可由头部 `opt=` 覆盖）
     pub opt_level: Option<OptLevel>,
@@ -41,6 +41,8 @@ pub struct CompileOptions {
     pub emit_ir_only: bool,
     /// 保留中间文件（.ll），否则编译成功后清理
     pub keep_intermediate: bool,
+    /// 目标三元组（交叉编译，如 `x86_64-pc-windows-msvc`；None = 本机默认）
+    pub target: Option<String>,
 }
 
 /// 编译产物：消息 + 可选产物路径。
@@ -158,6 +160,14 @@ fn compile_program(
         .or_else(|| header_opt_level(&pre.headers))
         .unwrap_or_default();
 
+    // 目标三元组优先级：CLI 显式指定 > 头部 `target=三元组` > 本机默认（None）
+    // 两者都经过平台别名规范化（win-x64 → x86_64-pc-windows-msvc）
+    let target = opts
+        .target
+        .clone()
+        .map(|t| normalize_target(t.trim()))
+        .or_else(|| header_target(&pre.headers));
+
     // ---- 前端 ----
     // 词法分析（含 ASI 分号补全）
     let tokens = tie_frontend::lexer::tokenize(&pre.cleaned_source).map_err(CompileError::Lex)?;
@@ -204,23 +214,57 @@ fn compile_program(
     optimizer::optimize(&ir_path, &opt_ir_path, opt_level).map_err(CompileError::Optimize)?;
 
     // ---- 后端 ----
-    // clang 链接生成可执行
-    let exe_path = opts
-        .output
-        .clone()
-        .unwrap_or_else(|| opts.input.with_extension("exe"));
-    backend::link(&opt_ir_path, &exe_path).map_err(CompileError::Backend)?;
-
-    // 清理中间文件（除非要求保留）
-    if !opts.keep_intermediate {
-        let _ = fs::remove_file(&ir_path);
-        let _ = fs::remove_file(&opt_ir_path);
+    // 按角色区分产物：logic → 链接可执行文件；library → 编译目标文件 + 打包静态库
+    match pre.role {
+        FileRole::Logic => {
+            let exe_path = opts
+                .output
+                .clone()
+                .unwrap_or_else(|| opts.input.with_extension("exe"));
+            backend::link(&opt_ir_path, &exe_path, target.as_deref())
+                .map_err(CompileError::Backend)?;
+            cleanup_intermediates(&ir_path, &opt_ir_path, opts.keep_intermediate);
+            Ok(CompileOutcome {
+                message: format!("编译成功: {}", exe_path.display()),
+                artifact: Some(exe_path),
+            })
+        }
+        FileRole::Library => {
+            let lib_path = opts
+                .output
+                .clone()
+                .unwrap_or_else(|| lib_output_path(&opts.input));
+            // 第一步：IR → 目标文件（.o）
+            let obj_path = opts.input.with_extension("o");
+            backend::compile_object(&opt_ir_path, &obj_path, target.as_deref())
+                .map_err(CompileError::Backend)?;
+            // 第二步：目标文件 → 静态库（.a）
+            backend::archive(&obj_path, &lib_path).map_err(CompileError::Backend)?;
+            // 清理中间文件（.ll / .o），除非要求保留
+            cleanup_intermediates(&ir_path, &opt_ir_path, opts.keep_intermediate);
+            let _ = fs::remove_file(&obj_path);
+            Ok(CompileOutcome {
+                message: format!("库编译成功: {}", lib_path.display()),
+                artifact: Some(lib_path),
+            })
+        }
+        // 理论不可达：compile_program 只由 Dispatch::Compile（logic/library）调用
+        _ => unreachable!("compile_program 仅处理 logic/library 角色"),
     }
+}
 
-    Ok(CompileOutcome {
-        message: format!("编译成功: {}", exe_path.display()),
-        artifact: Some(exe_path),
-    })
+/// 删除中间文件（.ll / .opt.ll），`keep` 为 true 时保留。
+fn cleanup_intermediates(ir: &Path, opt_ir: &Path, keep: bool) {
+    if !keep {
+        let _ = fs::remove_file(ir);
+        let _ = fs::remove_file(opt_ir);
+    }
+}
+
+/// library 角色默认输出路径：`lib<输入名>.a`（如 `lib_math.tie` → `liblib_math.a` 不友好，
+/// 改为 `<输入名>.a`：`lib_math.a`）。
+fn lib_output_path(input: &Path) -> PathBuf {
+    input.with_extension("a")
 }
 
 /// 递归展开 import 语句：加载被导入文件并把其顶层函数内联进当前程序。
@@ -302,6 +346,35 @@ fn header_opt_level(headers: &[preprocess::Header]) -> Option<OptLevel> {
         }
     }
     None
+}
+
+/// 从头部 `target=...` 选项读取目标三元组（`// tie:target=win-x64`）。
+///
+/// 支持常见平台别名 → LLVM 三元组映射；未知名称按原样作为三元组透传给 clang
+/// （clang 会校验合法性）。
+fn header_target(headers: &[preprocess::Header]) -> Option<String> {
+    for h in headers {
+        if let Some((key, val)) = h.as_option()
+            && key == "target"
+        {
+            return Some(normalize_target(val.trim()));
+        }
+    }
+    None
+}
+
+/// 平台别名 → LLVM 三元组；无别名时原样返回。
+fn normalize_target(name: &str) -> String {
+    match name {
+        "win-x64" | "windows-x64" => "x86_64-pc-windows-msvc".to_string(),
+        "win-x86" | "windows-x86" => "i686-pc-windows-msvc".to_string(),
+        "win-arm64" | "windows-arm64" => "aarch64-pc-windows-msvc".to_string(),
+        "linux-x64" | "linux-x86_64" => "x86_64-unknown-linux-gnu".to_string(),
+        "linux-arm64" | "linux-aarch64" => "aarch64-unknown-linux-gnu".to_string(),
+        "macos-x64" | "darwin-x64" => "x86_64-apple-darwin".to_string(),
+        "macos-arm64" | "darwin-arm64" => "arm64-apple-darwin".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// 头部指令文本列表（错误/消息展示用）。

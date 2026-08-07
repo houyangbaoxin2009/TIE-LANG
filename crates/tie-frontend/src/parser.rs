@@ -1045,3 +1045,453 @@ fn is_addressable_base(expr: &Expr) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::tokenize;
+
+    /// 完整前端管道：词法 → 语法，成功时返回程序 AST。
+    fn parse(src: &str) -> Program {
+        let tokens = tokenize(src).expect("词法分析应成功");
+        parse_program(&tokens).expect("语法分析应成功")
+    }
+
+    /// 完整前端管道：词法 → 语法，失败时返回语法错误。
+    fn parse_err(src: &str) -> ParseError {
+        let tokens = tokenize(src).expect("词法分析应成功");
+        parse_program(&tokens).expect_err("语法分析应失败")
+    }
+
+    #[test]
+    fn 函数定义解析出函数名参数与返回类型() {
+        let prog = parse("func f(a: i64, b: i64) -> i64 {\n    return a + b\n}\nfunc g() {}\n");
+        assert_eq!(prog.stmts.len(), 2);
+        // 带参数与返回类型
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        assert_eq!(f.name, "f");
+        assert_eq!(f.params.len(), 2);
+        assert_eq!(f.params[0].name, "a");
+        assert!(matches!(f.params[0].ty, TypeSpec::Named(TyKw::I64)));
+        assert_eq!(f.params[1].name, "b");
+        assert!(matches!(f.params[1].ty, TypeSpec::Named(TyKw::I64)));
+        assert!(matches!(f.ret_ty, TypeSpec::Named(TyKw::I64)));
+        // 函数体 `return a + b`
+        let Stmt::Return(r) = &f.body[0] else { panic!("期望 return 语句") };
+        let Some(expr) = &r.expr else { panic!("期望返回值") };
+        assert!(matches!(
+            expr,
+            Expr::Binary { op: BinaryOp::Add, lhs, rhs, .. }
+                if matches!(lhs.as_ref(), Expr::Var(n) if n == "a")
+                    && matches!(rhs.as_ref(), Expr::Var(n) if n == "b")
+        ));
+        // 返回类型省略 → 默认 void
+        let Stmt::FnDef(g) = &prog.stmts[1] else { panic!("期望函数定义") };
+        assert_eq!(g.name, "g");
+        assert!(g.params.is_empty());
+        assert!(matches!(g.ret_ty, TypeSpec::Named(TyKw::Void)));
+    }
+
+    #[test]
+    fn var声明解析出类型标注与初始值() {
+        let prog = parse("func main() {\n    var x: i64 = 42\n}");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::VarDecl(v) = &f.body[0] else { panic!("期望变量声明") };
+        assert_eq!(v.name, "x");
+        assert!(matches!(v.ty, Some(TypeSpec::Named(TyKw::I64))));
+        assert!(matches!(&v.init, Expr::IntLit(42)));
+        assert!(!v.is_const, "var 声明应可变");
+    }
+
+    #[test]
+    fn const声明解析出不可变标志() {
+        let prog = parse("func main() {\n    const c = \"hi\"\n}");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::VarDecl(v) = &f.body[0] else { panic!("期望变量声明") };
+        assert_eq!(v.name, "c");
+        assert!(v.ty.is_none(), "无类型标注时应自动推导");
+        assert!(matches!(&v.init, Expr::StrLit(s) if s == "hi"));
+        assert!(v.is_const, "const 声明应不可变");
+    }
+
+    #[test]
+    fn 元组解构声明拆为临时变量与字段访问() {
+        let prog = parse("func main() {\n    var (q, r) = divmod(10, 3)\n}");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        // desugar：`_tmp0` + `q` + `r` 三条声明
+        assert_eq!(f.body.len(), 3);
+        // 第一条：临时变量持有元组值
+        let Stmt::VarDecl(t) = &f.body[0] else { panic!("期望变量声明") };
+        assert_eq!(t.name, "_tmp0");
+        assert!(!t.is_const);
+        assert!(matches!(
+            &t.init,
+            Expr::Call { name, args, .. } if name == "divmod" && args.len() == 2
+        ));
+        // 第二条：`q = _tmp0.Item1`
+        let Stmt::VarDecl(q) = &f.body[1] else { panic!("期望变量声明") };
+        assert_eq!(q.name, "q");
+        assert!(matches!(
+            &q.init,
+            Expr::FieldAccess { base, field, .. }
+                if matches!(base.as_ref(), Expr::Var(n) if n == "_tmp0") && field == "Item1"
+        ));
+        // 第三条：`r = _tmp0.Item2`
+        let Stmt::VarDecl(r) = &f.body[2] else { panic!("期望变量声明") };
+        assert_eq!(r.name, "r");
+        assert!(matches!(
+            &r.init,
+            Expr::FieldAccess { base, field, .. }
+                if matches!(base.as_ref(), Expr::Var(n) if n == "_tmp0") && field == "Item2"
+        ));
+    }
+
+    #[test]
+    fn 变量赋值解析为assign语句() {
+        let prog = parse("func main() {\n    x = x + 1\n}");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::Assign(a) = &f.body[0] else { panic!("期望赋值语句") };
+        assert_eq!(a.target, "x");
+        assert!(matches!(
+            &a.value,
+            Expr::Binary { op: BinaryOp::Add, lhs, rhs, .. }
+                if matches!(lhs.as_ref(), Expr::Var(n) if n == "x")
+                    && matches!(rhs.as_ref(), Expr::IntLit(1))
+        ));
+    }
+
+    #[test]
+    fn 对象字段赋值解析为字段赋值语句() {
+        let prog = parse("func main() {\n    obj.field = v\n}");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::FieldAssign(fa) = &f.body[0] else { panic!("期望字段赋值语句") };
+        assert!(matches!(fa.base.as_ref(), Expr::Var(n) if n == "obj"));
+        assert_eq!(fa.field, "field");
+        assert!(matches!(&fa.value, Expr::Var(n) if n == "v"));
+    }
+
+    #[test]
+    fn 字段链赋值保留链式base() {
+        let prog = parse("func main() {\n    obj.a.b = v\n}");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::FieldAssign(fa) = &f.body[0] else { panic!("期望字段赋值语句") };
+        // base 应为 `obj.a`，field 为 `b`
+        assert!(matches!(
+            fa.base.as_ref(),
+            Expr::FieldAccess { base, field, .. }
+                if matches!(base.as_ref(), Expr::Var(n) if n == "obj") && field == "a"
+        ));
+        assert_eq!(fa.field, "b");
+    }
+
+    #[test]
+    fn if语句解析出条件与两分支() {
+        let prog = parse("func main() {\n    if x > 0 {\n        y = 1\n    } else {\n        y = 2\n    }\n}");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::If(s) = &f.body[0] else { panic!("期望 if 语句") };
+        assert!(matches!(&s.cond, Expr::Binary { op: BinaryOp::Gt, lhs, rhs, .. }
+            if matches!(lhs.as_ref(), Expr::Var(n) if n == "x")
+                && matches!(rhs.as_ref(), Expr::IntLit(0))));
+        // then 分支含 `y = 1`
+        assert_eq!(s.then_branch.len(), 1);
+        assert!(matches!(&s.then_branch[0], Stmt::Assign(a) if a.target == "y"));
+        // else 分支含 `y = 2`
+        assert_eq!(s.else_branch.len(), 1);
+        assert!(matches!(&s.else_branch[0], Stmt::Assign(a) if a.target == "y"));
+    }
+
+    #[test]
+    fn else_if链折叠为嵌套if() {
+        let prog = parse(
+            "func main() {\n    if a {\n        y = 1\n    } else if b {\n        y = 2\n    } else {\n        y = 3\n    }\n}",
+        );
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::If(s) = &f.body[0] else { panic!("期望 if 语句") };
+        assert!(matches!(&s.cond, Expr::Var(n) if n == "a"));
+        // else 分支应折叠为嵌套 IfStmt（而非多条语句）
+        assert_eq!(s.else_branch.len(), 1);
+        let Stmt::If(inner) = &s.else_branch[0] else { panic!("期望嵌套 if") };
+        assert!(matches!(&inner.cond, Expr::Var(n) if n == "b"));
+        assert!(matches!(&inner.then_branch[0], Stmt::Assign(a) if a.target == "y"));
+        // 最内层 else 分支含 `y = 3`
+        assert!(matches!(&inner.else_branch[0], Stmt::Assign(a) if a.target == "y"));
+    }
+
+    #[test]
+    fn while循环解析出条件与循环体() {
+        let prog = parse("func main() {\n    while i < 10 {\n        i = i + 1\n    }\n}");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::While(w) = &f.body[0] else { panic!("期望 while 语句") };
+        assert!(matches!(&w.cond, Expr::Binary { op: BinaryOp::Lt, .. }));
+        assert_eq!(w.body.len(), 1);
+        assert!(matches!(&w.body[0], Stmt::Assign(a) if a.target == "i"));
+    }
+
+    #[test]
+    fn for循环解析出范围与表两种迭代式() {
+        let prog = parse(
+            "func main() {\n    for i in 0..10 {\n        sum = sum + i\n    }\n    for item in arr {\n        total = total + item\n    }\n}",
+        );
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        // 范围迭代：iter 为 Range 表达式
+        let Stmt::For(rng) = &f.body[0] else { panic!("期望 for 语句") };
+        assert_eq!(rng.var, "i");
+        assert!(matches!(
+            &rng.iter,
+            Expr::Range { start, end, .. }
+                if matches!(start.as_ref(), Expr::IntLit(0)) && matches!(end.as_ref(), Expr::IntLit(10))
+        ));
+        assert_eq!(rng.body.len(), 1);
+        // 表遍历：iter 为变量引用
+        let Stmt::For(tbl) = &f.body[1] else { panic!("期望 for 语句") };
+        assert_eq!(tbl.var, "item");
+        assert!(matches!(&tbl.iter, Expr::Var(n) if n == "arr"));
+    }
+
+    #[test]
+    fn switch解析出多分支与default() {
+        let prog = parse(
+            "func main() {\n    switch x {\n        case 1:\n            y = 10\n        case -1:\n            y = -10\n        default:\n            y = 0\n    }\n}",
+        );
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::Switch(s) = &f.body[0] else { panic!("期望 switch 语句") };
+        assert!(matches!(&s.subject, Expr::Var(n) if n == "x"));
+        assert_eq!(s.cases.len(), 2);
+        // case 1 分支
+        assert!(matches!(&s.cases[0].value, Expr::IntLit(1)));
+        assert!(matches!(&s.cases[0].body[0], Stmt::Assign(a) if a.target == "y"));
+        // case -1 分支（负数由一元负号包裹）
+        assert!(matches!(
+            &s.cases[1].value,
+            Expr::Unary { op: UnaryOp::Neg, operand, .. }
+                if matches!(operand.as_ref(), Expr::IntLit(1))
+        ));
+        // default 分支
+        assert_eq!(s.default_body.len(), 1);
+        assert!(matches!(&s.default_body[0], Stmt::Assign(a) if a.target == "y"));
+    }
+
+    #[test]
+    fn import无别名解析() {
+        let prog = parse("import \"./lib.tie\"\nfunc main() {}\n");
+        let Stmt::Import(imp) = &prog.stmts[0] else { panic!("期望 import 语句") };
+        assert_eq!(imp.path, "./lib.tie");
+        assert!(imp.alias.is_none());
+    }
+
+    #[test]
+    fn import带别名解析() {
+        let prog = parse("import \"./lib.tie\" as lib\nfunc main() {}\n");
+        let Stmt::Import(imp) = &prog.stmts[0] else { panic!("期望 import 语句") };
+        assert_eq!(imp.path, "./lib.tie");
+        assert_eq!(imp.alias.as_deref(), Some("lib"));
+    }
+
+    #[test]
+    fn 类定义解析出字段方法与继承() {
+        let prog = parse(
+            "class Point extends Base {\n    var x: i64 = 0\n    var y: i64\n    static method origin() -> Point {\n        return 0\n    }\n    method move(dx: i64) -> void {\n        this.x = dx\n    }\n}",
+        );
+        let Stmt::Class(c) = &prog.stmts[0] else { panic!("期望类定义") };
+        assert_eq!(c.name, "Point");
+        assert_eq!(c.parent.as_deref(), Some("Base"));
+        // 字段：`x`（带默认值）与 `y`（无默认值）
+        assert_eq!(c.fields.len(), 2);
+        assert_eq!(c.fields[0].name, "x");
+        assert!(matches!(c.fields[0].ty, Some(TypeSpec::Named(TyKw::I64))));
+        assert!(matches!(&c.fields[0].init, Some(Expr::IntLit(0))));
+        assert_eq!(c.fields[1].name, "y");
+        assert!(c.fields[1].init.is_none());
+        // 方法：静态 `origin` 与实例 `move`
+        assert_eq!(c.methods.len(), 2);
+        let m0 = &c.methods[0];
+        assert!(m0.is_static);
+        assert_eq!(m0.name, "origin");
+        assert!(matches!(&m0.ret_ty, TypeSpec::Class(n) if n == "Point"));
+        let m1 = &c.methods[1];
+        assert!(!m1.is_static);
+        assert_eq!(m1.name, "move");
+        assert_eq!(m1.params.len(), 1);
+        assert_eq!(m1.params[0].name, "dx");
+        assert!(matches!(m1.params[0].ty, TypeSpec::Named(TyKw::I64)));
+        // 实例方法体内 `this.x = dx` 解析为 FieldAssign，base 为 this
+        let Stmt::FieldAssign(fa) = &m1.body[0] else { panic!("期望字段赋值语句") };
+        assert!(matches!(fa.base.as_ref(), Expr::Var(n) if n == "this"));
+        assert_eq!(fa.field, "x");
+    }
+
+    #[test]
+    fn 表字面量位置元素解析() {
+        let prog = parse("func main() {\n    var t = [1, 2, 3]\n}");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::VarDecl(v) = &f.body[0] else { panic!("期望变量声明") };
+        let Expr::TableLit { cells, .. } = &v.init else { panic!("期望表字面量") };
+        assert_eq!(cells.len(), 3);
+        for cell in cells {
+            assert!(cell.id.is_none(), "位置元素应无显式 id");
+            assert_eq!(cell.row, 0, "单行表元素行号应为 0");
+        }
+        assert!(matches!(&cells[0].value, Expr::IntLit(1)));
+        assert!(matches!(&cells[2].value, Expr::IntLit(3)));
+    }
+
+    #[test]
+    fn 表字面量字符串键值解析() {
+        let prog = parse("func main() {\n    var t = [\"a\": 1, 0: 2]\n}");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::VarDecl(v) = &f.body[0] else { panic!("期望变量声明") };
+        let Expr::TableLit { cells, .. } = &v.init else { panic!("期望表字面量") };
+        assert_eq!(cells.len(), 2);
+        // 字符串键 `"a": 1`
+        assert!(matches!(&cells[0].id, Some(TableId::Str(s)) if s == "a"));
+        assert!(matches!(&cells[0].value, Expr::IntLit(1)));
+        // 数字下标 `0: 2`
+        assert!(matches!(&cells[1].id, Some(TableId::Num(0))));
+        assert!(matches!(&cells[1].value, Expr::IntLit(2)));
+    }
+
+    #[test]
+    fn 二元运算优先级乘法高于加法且括号可改序() {
+        let prog = parse(
+            "func f() -> i64 {\n    return 1 + 2 * 3\n}\nfunc g() -> i64 {\n    return (1 + 2) * 3\n}",
+        );
+        // `1 + 2 * 3`：乘法先结合，嵌套在加法右侧
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::Return(r) = &f.body[0] else { panic!("期望 return 语句") };
+        let Some(expr) = &r.expr else { panic!("期望返回值") };
+        assert!(matches!(
+            expr,
+            Expr::Binary { op: BinaryOp::Add, lhs, rhs, .. }
+                if matches!(lhs.as_ref(), Expr::IntLit(1))
+                    && matches!(
+                        rhs.as_ref(),
+                        Expr::Binary { op: BinaryOp::Mul, .. }
+                    )
+        ));
+        // `(1 + 2) * 3`：括号提升加法，乘法在最外层
+        let Stmt::FnDef(g) = &prog.stmts[1] else { panic!("期望函数定义") };
+        let Stmt::Return(r) = &g.body[0] else { panic!("期望 return 语句") };
+        let Some(expr) = &r.expr else { panic!("期望返回值") };
+        assert!(matches!(
+            expr,
+            Expr::Binary { op: BinaryOp::Mul, lhs, rhs, .. }
+                if matches!(
+                    lhs.as_ref(),
+                    Expr::Binary { op: BinaryOp::Add, .. }
+                ) && matches!(rhs.as_ref(), Expr::IntLit(3))
+        ));
+    }
+
+    #[test]
+    fn 一元负号与逻辑非解析() {
+        let prog = parse(
+            "func f() -> i64 {\n    return -x\n}\nfunc g() -> bool {\n    return !flag\n}",
+        );
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::Return(r) = &f.body[0] else { panic!("期望 return 语句") };
+        assert!(matches!(
+            &r.expr,
+            Some(Expr::Unary { op: UnaryOp::Neg, operand, .. })
+                if matches!(operand.as_ref(), Expr::Var(n) if n == "x")
+        ));
+        let Stmt::FnDef(g) = &prog.stmts[1] else { panic!("期望函数定义") };
+        let Stmt::Return(r) = &g.body[0] else { panic!("期望 return 语句") };
+        assert!(matches!(
+            &r.expr,
+            Some(Expr::Unary { op: UnaryOp::Not, operand, .. })
+                if matches!(operand.as_ref(), Expr::Var(n) if n == "flag")
+        ));
+    }
+
+    #[test]
+    fn 调用成员访问与下标链式解析() {
+        let prog = parse(
+            "func main() {\n    println(\"hi\")\n    var t = arr[0]\n    var u = p.x\n    var v = obj.m(1, 2)\n    var w = a[0].b\n}",
+        );
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        // 函数调用语句
+        let Stmt::Expr(e) = &f.body[0] else { panic!("期望表达式语句") };
+        assert!(matches!(&e.expr, Expr::Call { name, args, .. }
+            if name == "println" && args.len() == 1));
+        // 下标访问 `arr[0]`
+        let Stmt::VarDecl(t) = &f.body[1] else { panic!("期望变量声明") };
+        assert!(matches!(&t.init, Expr::Index { base, index, .. }
+            if matches!(base.as_ref(), Expr::Var(n) if n == "arr")
+                && matches!(index.as_ref(), Expr::IntLit(0))));
+        // 字段访问 `p.x`
+        let Stmt::VarDecl(u) = &f.body[2] else { panic!("期望变量声明") };
+        assert!(matches!(&u.init, Expr::FieldAccess { base, field, .. }
+            if matches!(base.as_ref(), Expr::Var(n) if n == "p") && field == "x"));
+        // 方法调用 `obj.m(1, 2)`
+        let Stmt::VarDecl(v) = &f.body[3] else { panic!("期望变量声明") };
+        assert!(matches!(&v.init, Expr::MethodCall { receiver, method, args, .. }
+            if matches!(receiver.as_ref(), Expr::Var(n) if n == "obj")
+                && method == "m" && args.len() == 2));
+        // 链式 `a[0].b`：字段访问套下标
+        let Stmt::VarDecl(w) = &f.body[4] else { panic!("期望变量声明") };
+        assert!(matches!(&w.init, Expr::FieldAccess { base, field, .. }
+            if matches!(base.as_ref(), Expr::Index { .. }) && field == "b"));
+    }
+
+    #[test]
+    fn 元组字面量与分组表达式解析() {
+        let prog = parse(
+            "func main() {\n    var t = (1, \"a\")\n    var u = (x: 1, y: 2)\n    var v = (1 + 2) * 3\n}",
+        );
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        // 匿名元组 `(1, "a")`
+        let Stmt::VarDecl(t) = &f.body[0] else { panic!("期望变量声明") };
+        assert!(matches!(&t.init, Expr::TupleLit { fields, .. } if fields.len() == 2));
+        // 命名元组 `(x: 1, y: 2)`
+        let Stmt::VarDecl(u) = &f.body[1] else { panic!("期望变量声明") };
+        let Expr::TupleLit { fields, .. } = &u.init else { panic!("期望元组字面量") };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].0.as_deref(), Some("x"));
+        assert!(matches!(&fields[0].1, Expr::IntLit(1)));
+        // 分组表达式 `(1 + 2) * 3` 不是元组
+        let Stmt::VarDecl(v) = &f.body[2] else { panic!("期望变量声明") };
+        assert!(matches!(
+            &v.init,
+            Expr::Binary { op: BinaryOp::Mul, lhs, .. }
+                if matches!(lhs.as_ref(), Expr::Binary { op: BinaryOp::Add, .. })
+        ));
+    }
+
+    #[test]
+    fn 顶层裸语句报错() {
+        let err = parse_err("x = 1\n");
+        assert!(
+            err.message.contains("顶层只允许"),
+            "错误信息应提示顶层限制，实际：{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn import缺路径或缺别名报错() {
+        // import 后缺字符串路径
+        let err1 = parse_err("import 123\nfunc main() {}\n");
+        assert!(
+            err1.message.contains("import 后必须是字符串路径"),
+            "实际：{}",
+            err1.message
+        );
+        // `as` 后缺别名
+        let err2 = parse_err("import \"./lib.tie\" as\n");
+        assert!(
+            err2.message.contains("as 后必须是别名标识符"),
+            "实际：{}",
+            err2.message
+        );
+    }
+
+    #[test]
+    fn 函数体内裸代码块报错() {
+        let err = parse_err("func main() {\n    {\n        x = 1\n    }\n}\n");
+        assert!(
+            err.message.contains("函数体内不能有裸代码块"),
+            "实际：{}",
+            err.message
+        );
+    }
+}

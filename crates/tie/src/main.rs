@@ -31,6 +31,8 @@ struct Args {
     keep_ir: bool,
     /// 只做预处理并打印识别结果，不转交任何工具链
     prep_only: bool,
+    /// 交叉编译目标三元组（如 x86_64-pc-windows-msvc / win-x64）
+    target: Option<String>,
 }
 
 /// 使用说明。
@@ -47,9 +49,11 @@ tie 语言总入口（四段式调度器 + REPL）
      data/ui/db → 对应工具链，后续版本）
 
 选项:
-  -o <file>      指定输出可执行文件路径（默认: 输入同名 .exe）
+  -o <file>      指定输出文件路径（默认: 输入同名 .exe；library 角色默认 .a）
   -O0|-O1|-O2|-O3
                  优化级别（默认: -O2）
+  --target <三元组>
+                 交叉编译目标（如 win-x64 / x86_64-pc-windows-msvc，默认: 本机）
   --emit-ir      只生成 LLVM IR（.ll），不继续编译
   --keep-ir      保留中间 IR 文件
   --prep-only    只执行预处理并打印识别结果，不编译
@@ -57,6 +61,7 @@ tie 语言总入口（四段式调度器 + REPL）
 
 单独使用:
   tie-prep <file.tie>    只做预处理
+  tie-frontend <file.tie> 只做前端三阶段（词法/语法/语义，调试与教学用）
   tie-llvm <file.tie>   直接编译（不经过角色分派）
   tie-interp <file.tie> 直接解释执行（不经过角色分派）
 ";
@@ -101,6 +106,7 @@ fn parse_args() -> Result<Args, String> {
     let mut emit_ir_only = false;
     let mut keep_ir = false;
     let mut prep_only = false;
+    let mut target: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -113,6 +119,11 @@ fn parse_args() -> Result<Args, String> {
             "-O1" => opt_level = Some(OptLevel::O1),
             "-O2" => opt_level = Some(OptLevel::O2),
             "-O3" => opt_level = Some(OptLevel::O3),
+            "--target" => target = Some(args.next().ok_or("--target 后缺少目标三元组")?),
+            // 兼容 `--target=<三元组>` 写法
+            other if other.starts_with("--target=") => {
+                target = Some(other["--target=".len()..].to_string());
+            }
             "--emit-ir" => emit_ir_only = true,
             "--keep-ir" => keep_ir = true,
             "--prep-only" => prep_only = true,
@@ -126,7 +137,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
-    Ok(Args { input, output, opt_level, emit_ir_only, keep_ir, prep_only })
+    Ok(Args { input, output, opt_level, emit_ir_only, keep_ir, prep_only, target })
 }
 
 fn main() -> ExitCode {
@@ -190,6 +201,7 @@ fn dispatch_role(role: FileRole, args: &Args, input: PathBuf) -> Result<CompileO
                 opt_level: args.opt_level,
                 emit_ir_only: args.emit_ir_only,
                 keep_intermediate: args.keep_ir,
+                target: args.target.clone(),
             };
             tie_llvm::driver::compile(&opts).map_err(|e| e.to_string())
         }
