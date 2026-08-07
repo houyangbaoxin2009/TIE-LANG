@@ -1,0 +1,20 @@
+// oop_neg_b.tie：负例——寄存器中的类值不可寻址（方法调用结果直接调用方法）
+// 期望：语义错误「方法调用的对象需要可寻址的类实例」
+
+class Counter {
+    var count: i64
+    method inc() {
+        this.count = this.count + 1
+    }
+    method get() -> i64 {
+        return this.count
+    }
+}
+
+func make() -> Counter {
+    return Counter(0)
+}
+
+func main() {
+    println(make().get())
+}

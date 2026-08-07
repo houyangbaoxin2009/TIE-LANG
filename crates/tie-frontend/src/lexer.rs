@@ -71,6 +71,16 @@ pub enum TokenKind {
     Default,
     Import,
     As,
+    /// 类定义 `class`
+    Class,
+    /// 方法定义 `method`
+    Method,
+    /// 当前实例 `this`
+    This,
+    /// 静态 `static`
+    Static,
+    /// 继承 `extends`
+    Extends,
     True,
     False,
     /// 类型关键字：i8..u64/f32/f64/bool/char/string/void/code/num/text/misc/table
@@ -622,6 +632,12 @@ impl<'a> Lexer<'a> {
             "default" => TokenKind::Default,
             "import" => TokenKind::Import,
             "as" => TokenKind::As,
+            // 面向对象（P8）：class/method/this/static/extends
+            "class" => TokenKind::Class,
+            "method" => TokenKind::Method,
+            "this" => TokenKind::This,
+            "static" => TokenKind::Static,
+            "extends" => TokenKind::Extends,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             "i8" => TokenKind::TypeKw(TyKw::I8),

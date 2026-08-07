@@ -8,9 +8,11 @@
 //! - println 通过声明 `printf` 实现，按参数类型选择格式串
 //! - 函数入口块命名为 `entry`，控制流块命名为 `if.then`/`if.else`/`loop.cond` 等
 
-use tie_frontend::ast::{BinaryOp, Expr, FnDefStmt, Program, Stmt, TypeSpec, UnaryOp};
+use tie_frontend::ast::{
+    BinaryOp, Expr, FieldAssignStmt, FnDefStmt, MethodDefStmt, Program, Stmt, TypeSpec, UnaryOp,
+};
 use tie_frontend::lexer::TyKw;
-use tie_frontend::semantic::{FuncSig, SemanticResult};
+use tie_frontend::semantic::{ClassInfo, FuncSig, MethodSig, SemanticResult};
 use std::collections::HashMap;
 
 /// IR 生成结果。
@@ -38,6 +40,9 @@ struct VarBind {
     value: String,
     /// LLVM 类型名
     ty: &'static str,
+    /// 是否按指针绑定（by_ptr）：为 true 时 value 本身即对象地址
+    /// （this 参数不 alloca，直接绑定参数寄存器），false 为常规 alloca。
+    by_ptr: bool,
 }
 
 /// IR 生成器。
@@ -124,6 +129,16 @@ impl<'p> IrGenerator<'p> {
             }
         }
 
+        // 生成各类的方法（P8）：按类定义顺序，逐个方法生成。
+        // 方法名 mangling：`@<定义类>$<方法名>`（继承中同名方法各自独立生成）。
+        for stmt in &self.program.stmts {
+            if let Stmt::Class(c) = stmt {
+                for m in &c.methods {
+                    self.gen_method(m, &c.name)?;
+                }
+            }
+        }
+
         // 函数体生成过程中延迟收集的全局常量，统一输出到模块级
         self.out.push('\n');
         self.out.push_str(&self.globals);
@@ -161,7 +176,7 @@ impl<'p> IrGenerator<'p> {
             let alloca = self.new_reg();
             self.line(&format!("{alloca} = alloca {ty}"));
             self.line(&format!("store {ty} {pname}, ptr {alloca}"));
-            scope.insert(p.name.clone(), VarBind { value: alloca, ty });
+            scope.insert(p.name.clone(), VarBind { value: alloca, ty, by_ptr: false });
         }
         self.scopes.push(scope);
 
@@ -199,6 +214,83 @@ impl<'p> IrGenerator<'p> {
         Ok(())
     }
 
+    // ---------- 方法生成（P8） ----------
+
+    /// 方法生成：`define ret @<类>$<方法>(ptr %this, 参数...)`。
+    ///
+    /// - 实例方法：第一个参数是隐藏的 this（`ptr`），绑定为 by_ptr VarBind（不 alloca，
+    ///   直接引用参数寄存器作为对象地址，字段访问 GEP 时用该地址）。
+    /// - 静态方法：无 this 参数，签名与普通函数一致。
+    fn gen_method(&mut self, m: &MethodDefStmt, class_name: &str) -> Result<(), IrError> {
+        self.cur_fn = format!("{class_name}${}", m.name);
+        self.reg = 0;
+        self.scopes.clear();
+
+        // 签名行：实例方法首参为 this（ptr），静态方法无
+        let ret_llvm = self.llvm_ty(&m.ret_ty);
+        let mut params = Vec::new();
+        if !m.is_static {
+            params.push("ptr %this".to_string());
+        }
+        for p in &m.params {
+            params.push(format!("{} {}", self.llvm_ty(&p.ty), mangle(&p.name)));
+        }
+        self.out
+            .push_str(&format!("define {} @{}({}) {{\n", ret_llvm, self.cur_fn, params.join(", ")));
+        // 入口块
+        self.out.push_str("entry:\n");
+        self.indent();
+
+        // 参数入作用域：this 直接绑定参数寄存器（by_ptr，不 alloca）；
+        // 普通参数 alloca + store（与函数一致）
+        let mut scope = HashMap::new();
+        if !m.is_static {
+            let this_ty = self.llvm_ty(&TypeSpec::Class(class_name.to_string()));
+            scope.insert(
+                "this".to_string(),
+                VarBind { value: "%this".to_string(), ty: this_ty, by_ptr: true },
+            );
+        }
+        for p in &m.params {
+            let ty = self.llvm_ty(&p.ty);
+            let pname = mangle(&p.name);
+            let alloca = self.new_reg();
+            self.line(&format!("{alloca} = alloca {ty}"));
+            self.line(&format!("store {ty} {pname}, ptr {alloca}"));
+            scope.insert(p.name.clone(), VarBind { value: alloca, ty, by_ptr: false });
+        }
+        self.scopes.push(scope);
+
+        // 方法体
+        for stmt in &m.body {
+            self.gen_stmt(stmt)?;
+        }
+
+        // 结尾：无 return 时补默认返回（与 gen_fn 同一逻辑）
+        let last_line = self
+            .out
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| l.trim().to_string())
+            .unwrap_or_default();
+        let needs_ret = !last_line.starts_with("ret ");
+        if needs_ret {
+            if m.ret_ty.is_void() {
+                self.line("ret void");
+            } else {
+                let ty = self.llvm_ty(&m.ret_ty);
+                let zero = if ty == "ptr" { "null" } else { "0" };
+                self.line(&format!("ret {ty} {zero}"));
+            }
+        }
+
+        self.dedent();
+        self.out.push_str("}\n\n");
+        self.scopes.pop();
+        Ok(())
+    }
+
     // ---------- 语句生成 ----------
 
     fn gen_stmt(&mut self, stmt: &Stmt) -> Result<(), IrError> {
@@ -233,7 +325,7 @@ impl<'p> IrGenerator<'p> {
                 self.line(&format!("store {ty_name} {val}, ptr {alloca}"));
                 // 变量类型：int/float/bool 等；string 特殊（ptr）
                 self.cur_scope_mut()
-                    .insert(v.name.clone(), VarBind { value: alloca, ty: ty_name });
+                    .insert(v.name.clone(), VarBind { value: alloca, ty: ty_name, by_ptr: false });
                 Ok(())
             }
             Stmt::FnDef(_) => Ok(()), // 顶层函数，不在此生成
@@ -254,14 +346,10 @@ impl<'p> IrGenerator<'p> {
             Stmt::Return(r) => match &r.expr {
                 Some(e) => {
                     let (val, _ty) = self.gen_expr(e)?;
-                    // 返回类型以函数签名为准：字面量可能被语义适配
-                    // （如返回 i32 的函数 `return 42`，字面量推导为 i64）
-                    let ret_ty = self
-                        .sem
-                        .funcs
-                        .get(&self.cur_fn)
-                        .map(|s| s.ret_ty.clone())
-                        .unwrap_or(TypeSpec::Named(TyKw::I64));
+                    // 返回类型以当前函数/方法签名为准：字面量可能被语义适配
+                    // （如返回 i32 的函数 `return 42`，字面量推导为 i64）。
+                    // 方法名形如 `类$方法`，从 classes 表查签名（不在 funcs 表）。
+                    let ret_ty = self.current_ret_ty();
                     let ret_llvm = self.llvm_ty(&ret_ty);
                     // 非字面量场景语义已保证类型一致；字面量直接按签名类型写出常量
                     self.line(&format!("ret {ret_llvm} {val}"));
@@ -276,11 +364,62 @@ impl<'p> IrGenerator<'p> {
             Stmt::While(w) => self.gen_while(w),
             Stmt::For(f) => self.gen_for(f),
             Stmt::Switch(s) => self.gen_switch(s),
+            Stmt::Class(_) => {
+                // 类定义只在顶层生成方法（run 中遍历），函数体内不应出现
+                Ok(())
+            }
+            Stmt::FieldAssign(fa) => self.gen_field_assign(fa),
             Stmt::Import(_) => {
                 // import 已在 driver 层展开为函数（语义分析前），IR 阶段不应出现
                 Ok(())
             }
         }
+    }
+
+    /// 字段赋值：`obj.field = value` → GEP 到字段偏移 + store（P8）。
+    ///
+    /// base 必须是可寻址的类实例（变量/this/字段链，语义已保证），
+    /// 字段偏移取自语义层 field_index（继承拍平后的权威 GEP 下标）。
+    fn gen_field_assign(&mut self, fa: &FieldAssignStmt) -> Result<(), IrError> {
+        // base 地址：变量/this → 绑定指针；字段链 → 逐级 GEP（gen_class_addr 内部处理）
+        let (base_ptr, base_llvm) = self.gen_class_addr(&fa.base)?;
+        // base 语义类型必须是类：取拍平 field_index 的字段下标
+        let base_ty = self.sem_ty_of(&fa.base).ok_or_else(|| IrError {
+            message: format!("内部错误：字段赋值缺少基类型（函数 {}）", self.cur_fn),
+        })?;
+        let TypeSpec::Class(class_name) = &base_ty else {
+            return Err(IrError {
+                message: format!(
+                    "内部错误：字段赋值的对象不是类（{}，函数 {}）",
+                    type_name_of(&base_ty),
+                    self.cur_fn
+                ),
+            });
+        };
+        let info = self
+            .sem
+            .classes
+            .get(class_name)
+            .cloned()
+            .ok_or_else(|| IrError {
+                message: format!("内部错误：类 '{class_name}' 无信息（函数 {}）", self.cur_fn),
+            })?;
+        let idx = info.field_index.get(&fa.field).copied().ok_or_else(|| IrError {
+            message: format!(
+                "内部错误：类 '{class_name}' 无字段 '{}'（函数 {}）",
+                fa.field, self.cur_fn
+            ),
+        })?;
+        // 字段类型（语义已保证与 value 匹配）
+        let fty = info.fields[idx].ty.clone().expect("字段类型已在类收集时解析");
+        let f_llvm = self.llvm_ty(&fty);
+        // 值
+        let (val, _t) = self.gen_expr(&fa.value)?;
+        // GEP 到字段偏移，store 直写（Oracle 方案：不读改写）
+        let ptr = self.new_reg();
+        self.line(&format!("{ptr} = getelementptr {base_llvm}, ptr {base_ptr}, i32 0, i32 {idx}"));
+        self.line(&format!("store {f_llvm} {val}, ptr {ptr}"));
+        Ok(())
     }
 
     /// 表变量声明：生成定长数组布局。
@@ -315,7 +454,7 @@ impl<'p> IrGenerator<'p> {
         //（编译器进程短期运行，泄漏少量字符串可接受）。
         let arr_ty_static: &'static str = Box::leak(arr_ty.into_boxed_str());
         self.cur_scope_mut()
-            .insert(v.name.clone(), VarBind { value: alloca, ty: arr_ty_static });
+            .insert(v.name.clone(), VarBind { value: alloca, ty: arr_ty_static, by_ptr: false });
         Ok(())
     }
 
@@ -424,7 +563,7 @@ impl<'p> IrGenerator<'p> {
         // 循环变量可见
         self.scopes.push(HashMap::from([(
             f.var.clone(),
-            VarBind { value: var_alloca.clone(), ty: "i64" },
+            VarBind { value: var_alloca.clone(), ty: "i64", by_ptr: false },
         )]));
         for s in &f.body {
             self.gen_stmt(s)?;
@@ -489,7 +628,7 @@ impl<'p> IrGenerator<'p> {
         // 循环变量可见
         self.scopes.push(HashMap::from([(
             f.var.clone(),
-            VarBind { value: item_alloca.clone(), ty: elem_ty },
+            VarBind { value: item_alloca.clone(), ty: elem_ty, by_ptr: false },
         )]));
         for s in &f.body {
             self.gen_stmt(s)?;
@@ -685,7 +824,13 @@ impl<'p> IrGenerator<'p> {
                 self.line(&format!("{tmp} = load {ty}, ptr {}", bind.value));
                 Ok((tmp, ty))
             }
-            Expr::Call { name, args, .. } => self.gen_call(name, args),
+            Expr::Call { name, args, .. } => {
+                // 构造调用：类名(...) → insertvalue 链构建结构体值（P8）
+                if let Some(info) = self.sem.classes.get(name).cloned() {
+                    return self.gen_construct(name, &info, args);
+                }
+                self.gen_call(name, args)
+            }
             Expr::Unary { op, operand, .. } => {
                 let (val, ty) = self.gen_expr(operand)?;
                 match op {
@@ -737,25 +882,68 @@ impl<'p> IrGenerator<'p> {
                 }
                 Ok((cur, agg_ty))
             }
-            Expr::TupleField { base, access, .. } => {
-                // 元组字段访问 → extractvalue（聚合类型的第 idx 字段）
-                let (bv, _bt) = self.gen_expr(base)?;
+            Expr::FieldAccess { base, field, .. } => {
+                // 字段访问（读）：按 base 的语义类型分发——
+                // 元组 → extractvalue（寄存器中的聚合值直接取字段）；
+                // 类实例 → GEP + load（对象在 alloca/参数中，按字段偏移读）。
                 let base_ty = self.sem_ty_of(base).ok_or_else(|| IrError {
-                    message: format!("内部错误：元组字段访问缺少基类型（函数 {}）", self.cur_fn),
+                    message: format!("内部错误：字段访问缺少基类型（函数 {}）", self.cur_fn),
                 })?;
-                let TypeSpec::Tuple(tfs) = &base_ty else {
-                    return Err(IrError {
-                        message: format!("内部错误：字段访问的对象不是元组（函数 {}）", self.cur_fn),
-                    });
-                };
-                let idx = tuple_field_index(&base_ty, access).ok_or_else(|| IrError {
-                    message: format!("内部错误：元组字段 '{access}' 解析失败（函数 {}）", self.cur_fn),
-                })?;
-                let agg_ty = self.llvm_ty(&base_ty);
-                let ft = self.llvm_ty(&tfs[idx].ty);
-                let tmp = self.new_reg();
-                self.line(&format!("{tmp} = extractvalue {agg_ty} {bv}, {idx}"));
-                Ok((tmp, ft))
+                match &base_ty {
+                    TypeSpec::Tuple(tfs) => {
+                        let (bv, _bt) = self.gen_expr(base)?;
+                        let idx = tuple_field_index(&base_ty, field).ok_or_else(|| IrError {
+                            message: format!("内部错误：元组字段 '{field}' 解析失败（函数 {}）", self.cur_fn),
+                        })?;
+                        let agg_ty = self.llvm_ty(&base_ty);
+                        let ft = self.llvm_ty(&tfs[idx].ty);
+                        let tmp = self.new_reg();
+                        self.line(&format!("{tmp} = extractvalue {agg_ty} {bv}, {idx}"));
+                        Ok((tmp, ft))
+                    }
+                    TypeSpec::Class(class_name) => {
+                        // 取对象地址：变量/字段链 → 地址；否则不可寻址
+                        let (base_ptr, base_llvm) = self.gen_class_addr(base)?;
+                        let info = self
+                            .sem
+                            .classes
+                            .get(class_name)
+                            .cloned()
+                            .ok_or_else(|| IrError {
+                                message: format!("内部错误：类 '{class_name}' 无信息（函数 {}）", self.cur_fn),
+                            })?;
+                        let idx = info.field_index.get(field).copied().ok_or_else(|| IrError {
+                            message: format!("内部错误：类 '{class_name}' 无字段 '{field}'（函数 {}）", self.cur_fn),
+                        })?;
+                        let fty = info.fields[idx].ty.clone().expect("字段类型已在类收集时解析");
+                        let f_llvm = self.llvm_ty(&fty);
+                        let ptr = self.new_reg();
+                        self.line(&format!(
+                            "{ptr} = getelementptr {base_llvm}, ptr {base_ptr}, i32 0, i32 {idx}"
+                        ));
+                        let val = self.new_reg();
+                        self.line(&format!("{val} = load {f_llvm}, ptr {ptr}"));
+                        Ok((val, f_llvm))
+                    }
+                    _ => Err(IrError {
+                        message: format!(
+                            "内部错误：字段访问的对象不是元组/类（{}，函数 {}）",
+                            type_name_of(&base_ty),
+                            self.cur_fn
+                        ),
+                    }),
+                }
+            }
+            Expr::MethodCall { receiver, method, args, .. } => {
+                // 方法调用：实例方法（receiver 地址作 this 首参）或静态方法（无 this）
+                // ——与语义层同一判定：receiver 是未绑定变量且名字是类名 → 静态
+                if let Expr::Var(rname) = receiver.as_ref()
+                    && !self.scope_has(rname)
+                    && self.sem.classes.contains_key(rname)
+                {
+                    return self.gen_static_call(rname, method, args);
+                }
+                self.gen_instance_call(receiver, method, args)
             }
         }
     }
@@ -1031,6 +1219,221 @@ impl<'p> IrGenerator<'p> {
         }
     }
 
+    // ---------- 类相关生成（P8） ----------
+
+    /// 构造调用：`类名(实参...)` → insertvalue 链构建结构体值（P8）。
+    ///
+    /// 字段顺序与语义层拍平顺序一致（父类字段在前）。每个字段：
+    /// - 有对应实参 → 用实参值；
+    /// - 无实参（缺省）→ 用字段默认值（字面量）；无默认值 → 零值（0/0.0/false/null）。
+    fn gen_construct(
+        &mut self,
+        class_name: &str,
+        info: &ClassInfo,
+        args: &[Expr],
+    ) -> Result<(String, &'static str), IrError> {
+        let agg_ty = self.llvm_ty(&TypeSpec::Class(class_name.to_string()));
+        let mut cur = "undef".to_string();
+        for (i, f) in info.fields.iter().enumerate() {
+            let fty = f.ty.clone().expect("字段类型已在类收集时解析");
+            let f_llvm = self.llvm_ty(&fty);
+            // 实参在前（语义已保证 args.len() <= fields.len()）
+            let val = if let Some(a) = args.get(i) {
+                let (v, _t) = self.gen_expr(a)?;
+                v
+            } else {
+                // 缺省：默认值字面量；无 → 零值
+                match &f.init {
+                    Some(init_expr) => {
+                        let (v, _t) = self.gen_expr(init_expr)?;
+                        v
+                    }
+                    None => zero_value(f_llvm).to_string(),
+                }
+            };
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = insertvalue {agg_ty} {cur}, {f_llvm} {val}, {i}"));
+            cur = tmp;
+        }
+        Ok((cur, agg_ty))
+    }
+
+    /// 静态方法调用：`类名.方法(实参...)`（无 this 隐藏参数）。
+    ///
+    /// 方法名 mangling：`@<定义类>$<方法名>`（method_owner 给出实际定义类）。
+    fn gen_static_call(&mut self, class_name: &str, method: &str, args: &[Expr]) -> Result<(String, &'static str), IrError> {
+        let info = self
+            .sem
+            .classes
+            .get(class_name)
+            .cloned()
+            .ok_or_else(|| IrError {
+                message: format!("内部错误：类 '{class_name}' 无信息（函数 {}）", self.cur_fn),
+            })?;
+        let sig = info.methods.get(method).cloned().ok_or_else(|| IrError {
+            message: format!("内部错误：类 '{class_name}' 无方法 '{method}'（函数 {}）", self.cur_fn),
+        })?;
+        if !sig.is_static {
+            return Err(IrError {
+                message: format!(
+                    "内部错误：实例方法 '{method}' 被当作静态方法调用（函数 {}）",
+                    self.cur_fn
+                ),
+            });
+        }
+        // 定义类：继承中同名方法可能由父类定义
+        let owner = info.method_owner.get(method).cloned().unwrap_or_else(|| class_name.to_string());
+        let mname = format!("{owner}${method}");
+        self.emit_method_call(&mname, &sig, args, None)
+    }
+
+    /// 实例方法调用：`obj.方法(实参...)`（obj 地址作隐藏 this 首参）。
+    ///
+    /// receiver 必须是可寻址的类实例（变量/this/字段链）——语义已保证，
+    /// gen_class_addr 内部做地址解析；方法名 mangling 同上。
+    fn gen_instance_call(
+        &mut self,
+        receiver: &Expr,
+        method: &str,
+        args: &[Expr],
+    ) -> Result<(String, &'static str), IrError> {
+        // receiver 语义类型 → 类名
+        let recv_ty = self.sem_ty_of(receiver).ok_or_else(|| IrError {
+            message: format!("内部错误：方法调用缺少 receiver 类型（函数 {}）", self.cur_fn),
+        })?;
+        let TypeSpec::Class(class_name) = &recv_ty else {
+            return Err(IrError {
+                message: format!(
+                    "内部错误：方法调用的对象不是类（{}，函数 {}）",
+                    type_name_of(&recv_ty),
+                    self.cur_fn
+                ),
+            });
+        };
+        let info = self
+            .sem
+            .classes
+            .get(class_name)
+            .cloned()
+            .ok_or_else(|| IrError {
+                message: format!("内部错误：类 '{class_name}' 无信息（函数 {}）", self.cur_fn),
+            })?;
+        let sig = info.methods.get(method).cloned().ok_or_else(|| IrError {
+            message: format!("内部错误：类 '{class_name}' 无方法 '{method}'（函数 {}）", self.cur_fn),
+        })?;
+        if sig.is_static {
+            return Err(IrError {
+                message: format!(
+                    "内部错误：静态方法 '{method}' 被当作实例方法调用（函数 {}）",
+                    self.cur_fn
+                ),
+            });
+        }
+        // receiver 地址（this 隐藏参数）
+        let (this_ptr, _this_llvm) = self.gen_class_addr(receiver)?;
+        // 定义类（继承遮蔽时取实际定义类）
+        let owner = info.method_owner.get(method).cloned().unwrap_or_else(|| class_name.to_string());
+        let mname = format!("{owner}${method}");
+        self.emit_method_call(&mname, &sig, args, Some(&this_ptr))
+    }
+
+    /// 方法调用公共发射：参数列表组装 + call 指令（可选 this 首参）。
+    fn emit_method_call(
+        &mut self,
+        mname: &str,
+        sig: &MethodSig,
+        args: &[Expr],
+        this_ptr: Option<&str>,
+    ) -> Result<(String, &'static str), IrError> {
+        let mut arg_list = Vec::new();
+        // this 首参：receiver 地址（ptr）
+        if let Some(tp) = this_ptr {
+            arg_list.push(format!("ptr {tp}"));
+        }
+        // 普通参数（类型以方法签名为准，字面量按签名类型写）
+        for (a, want_ty) in args.iter().zip(sig.param_tys.iter()) {
+            let (v, _t) = self.gen_expr(a)?;
+            let aty = self.llvm_ty(want_ty);
+            arg_list.push(format!("{aty} {v}"));
+        }
+        let ret_llvm = self.llvm_ty(&sig.ret_ty);
+        let tmp = self.new_reg();
+        if sig.ret_ty.is_void() {
+            self.line(&format!("call void @{mname}({})", arg_list.join(", ")));
+            Ok((tmp, "void"))
+        } else {
+            self.line(&format!("{tmp} = call {ret_llvm} @{mname}({})", arg_list.join(", ")));
+            Ok((tmp, ret_llvm))
+        }
+    }
+
+    /// 求类实例表达式的内存地址（供字段 GEP 与方法调用 this 使用）。
+    ///
+    /// 支持：
+    /// - 变量（VarBind：alloca 指针 / by_ptr 的 this 参数指针）→ 直接返回绑定地址；
+    /// - 字段链（obj.a.b）→ 递归：先取 obj 地址，再逐级 GEP 到字段。
+    ///
+    /// 返回 (地址寄存器, 该地址指向的结构体 LLVM 类型)。
+    /// 语义层已保证表达式类型为类，此处仅内部防御。
+    fn gen_class_addr(&mut self, expr: &Expr) -> Result<(String, &'static str), IrError> {
+        match expr {
+            // 变量/this：绑定地址即对象地址（alloca 或 by_ptr 参数）
+            Expr::Var(name) => {
+                let bind = self.lookup_var(name).cloned().ok_or_else(|| IrError {
+                    message: format!("内部错误：变量 '{name}' 未入作用域（函数 {}）", self.cur_fn),
+                })?;
+                // by_ptr（this 参数）：value 即对象指针，直接使用；普通变量：alloca 指针。
+                // 两者对 GEP 等价，这里统一按绑定地址返回。
+                let _ = bind.by_ptr;
+                Ok((bind.value, bind.ty))
+            }
+            // 字段链：取 base 地址 → GEP 到字段偏移
+            Expr::FieldAccess { base, field, .. } => {
+                let (base_ptr, base_llvm) = self.gen_class_addr(base)?;
+                // base 语义类型必须是类（字段偏移取拍平 field_index）
+                let base_ty = self.sem_ty_of(base).ok_or_else(|| IrError {
+                    message: format!("内部错误：字段链缺少基类型（函数 {}）", self.cur_fn),
+                })?;
+                let TypeSpec::Class(class_name) = &base_ty else {
+                    return Err(IrError {
+                        message: format!(
+                            "内部错误：字段链的基类型不是类（{}，函数 {}）",
+                            type_name_of(&base_ty),
+                            self.cur_fn
+                        ),
+                    });
+                };
+                let info = self
+                    .sem
+                    .classes
+                    .get(class_name)
+                    .cloned()
+                    .ok_or_else(|| IrError {
+                        message: format!("内部错误：类 '{class_name}' 无信息（函数 {}）", self.cur_fn),
+                    })?;
+                let idx = info.field_index.get(field).copied().ok_or_else(|| IrError {
+                    message: format!(
+                        "内部错误：类 '{class_name}' 无字段 '{field}'（函数 {}）",
+                        self.cur_fn
+                    ),
+                })?;
+                let fty = info.fields[idx].ty.clone().expect("字段类型已在类收集时解析");
+                let f_llvm = self.llvm_ty(&fty);
+                let ptr = self.new_reg();
+                self.line(&format!(
+                    "{ptr} = getelementptr {base_llvm}, ptr {base_ptr}, i32 0, i32 {idx}"
+                ));
+                Ok((ptr, f_llvm))
+            }
+            _ => Err(IrError {
+                message: format!(
+                    "内部错误：类实例必须可寻址（变量/this/字段链），函数 {}",
+                    self.cur_fn
+                ),
+            }),
+        }
+    }
+
     /// println 生成：按参数类型选 printf 格式串。
     fn gen_println(&mut self, args: &[Expr]) -> Result<(String, &'static str), IrError> {
         if args.is_empty() {
@@ -1140,6 +1543,31 @@ impl<'p> IrGenerator<'p> {
         self.scopes.iter().rev().find_map(|s| s.get(name))
     }
 
+    /// 变量名是否已在作用域中（用于区分方法调用的 receiver 是变量还是类名）。
+    fn scope_has(&self, name: &str) -> bool {
+        self.lookup_var(name).is_some()
+    }
+
+    /// 当前函数/方法的返回类型（Return 生成按签名类型适配字面量）。
+    ///
+    /// 普通函数名查 funcs 表；方法名形如 `类$方法`，从 classes 表的方法签名查
+    /// （方法不在 funcs 表中，返回类型不能回落为 i64——如方法返回 string/类）。
+    fn current_ret_ty(&self) -> TypeSpec {
+        // 方法名：`类$方法`
+        if let Some((class_name, method_name)) = self.cur_fn.split_once('$')
+            && let Some(info) = self.sem.classes.get(class_name)
+            && let Some(sig) = info.methods.get(method_name)
+        {
+            return sig.ret_ty.clone();
+        }
+        // 普通函数（或兜底）
+        self.sem
+            .funcs
+            .get(&self.cur_fn)
+            .map(|s| s.ret_ty.clone())
+            .unwrap_or(TypeSpec::Named(TyKw::I64))
+    }
+
     /// 新临时寄存器名（%1, %2, ...）。
     fn new_reg(&mut self) -> String {
         self.reg += 1;
@@ -1198,9 +1626,12 @@ impl<'p> IrGenerator<'p> {
 
     /// TypeSpec → LLVM 类型名。
     ///
-    /// 元组类型映射为 LLVM 字面结构体 `{T1, T2, ...}`：递归拼接字段类型文本，
+    /// 元组/类类型都映射为 LLVM 字面结构体 `{T1, T2, ...}`：
+    /// - 元组：递归拼接字段类型文本；
+    /// - 类：取语义层拍平后的字段（父类字段在前，顺序即 GEP 偏移）。
+    ///
     /// 动态分配后 Box::leak 获得 'static 生命周期，并用 ty_cache 去重
-    /// （同一形状的元组只泄漏一份，编译器进程短期运行可接受）。
+    /// （同一形状的类型只泄漏一份，编译器进程短期运行可接受）。
     fn llvm_ty(&mut self, t: &TypeSpec) -> &'static str {
         match t {
             TypeSpec::Named(_) => t.llvm_ty(),
@@ -1211,6 +1642,30 @@ impl<'p> IrGenerator<'p> {
                     return s;
                 }
                 // 先缓存再泄漏：text 作为缓存键与泄漏的 'static 字符串共用一份堆内存
+                let leaked: &'static str = Box::leak(text.into_boxed_str());
+                self.ty_cache.insert(leaked.to_string(), leaked);
+                leaked
+            }
+            TypeSpec::Class(class_name) => {
+                // 类 → 拍平字段结构体：字段类型已在语义层解析为 Some。
+                // 类必然已收集（语义层保证），此处 expect 兜底（与元组字段解析一致）。
+                let info = self
+                    .sem
+                    .classes
+                    .get(class_name)
+                    .unwrap_or_else(|| panic!("内部错误：类 '{class_name}' 无信息（函数 {}）", self.cur_fn));
+                let inner: Vec<&str> = info
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        let ft = f.ty.as_ref().expect("字段类型已在类收集时解析");
+                        self.llvm_ty(ft)
+                    })
+                    .collect();
+                let text = format!("{{{}}}", inner.join(", "));
+                if let Some(s) = self.ty_cache.get(&text) {
+                    return s;
+                }
                 let leaked: &'static str = Box::leak(text.into_boxed_str());
                 self.ty_cache.insert(leaked.to_string(), leaked);
                 leaked
@@ -1248,6 +1703,41 @@ impl<'p> IrGenerator<'p> {
 }
 
 // ---------- 模块级工具 ----------
+
+/// TypeSpec 的展示名（错误信息用；与前端语义层 type_name 规则一致）。
+fn type_name_of(t: &TypeSpec) -> &'static str {
+    match t {
+        TypeSpec::Named(k) => match k {
+            TyKw::I8 => "i8",
+            TyKw::I16 => "i16",
+            TyKw::I32 => "i32",
+            TyKw::I64 => "i64",
+            TyKw::U8 => "u8",
+            TyKw::U16 => "u16",
+            TyKw::U32 => "u32",
+            TyKw::U64 => "u64",
+            TyKw::F32 => "f32",
+            TyKw::F64 => "f64",
+            TyKw::Bool => "bool",
+            TyKw::Char => "char",
+            TyKw::Str => "string",
+            TyKw::Void => "void",
+            _ => "类型",
+        },
+        TypeSpec::Tuple(_) => "元组",
+        TypeSpec::Class(_) => "类",
+    }
+}
+
+/// 类型的零值文本（构造调用缺省字段兜底）：数字 0、浮点 0.0、bool false、指针 null。
+fn zero_value(llvm_ty: &str) -> &'static str {
+    match llvm_ty {
+        "ptr" => "null",
+        "double" | "float" => "0.0",
+        "i1" => "false",
+        _ => "0",
+    }
+}
 
 /// 解析元组字段访问 `access`，返回字段下标（与前端语义层同规则）。
 ///

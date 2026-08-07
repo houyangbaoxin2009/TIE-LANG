@@ -6,9 +6,9 @@
 //! 本解析器只处理清理后的正文源码。
 
 use super::ast::{
-    AssignStmt, BinaryOp, Expr, ExprStmt, FnDefStmt, ForStmt, IfStmt, ImportStmt, Param, Program,
-    ReturnStmt, Stmt, SwitchCase, SwitchStmt, TableCell, TableId, TupleField, TypeSpec, UnaryOp,
-    VarDeclStmt, WhileStmt,
+    AssignStmt, BinaryOp, ClassDefStmt, ClassField, Expr, ExprStmt, FieldAssignStmt, FnDefStmt,
+    ForStmt, IfStmt, ImportStmt, MethodDefStmt, Param, Program, ReturnStmt, Stmt, SwitchCase,
+    SwitchStmt, TableCell, TableId, TupleField, TypeSpec, UnaryOp, VarDeclStmt, WhileStmt,
 };
 use super::lexer::{Span, Token, TokenKind, TyKw};
 use std::fmt;
@@ -118,14 +118,15 @@ impl<'a> Parser<'a> {
 
     fn parse_program(&mut self) -> Result<Program, ParseError> {
         let mut stmts = Vec::new();
-        // 顶层只允许函数定义与 import（import 由 driver 递归展开为函数）
+        // 顶层只允许函数定义、import 与类定义（import 由 driver 递归展开为函数）
         while !matches!(self.peek_kind(), TokenKind::Eof) {
             match self.peek_kind() {
                 TokenKind::Func => stmts.push(Stmt::FnDef(self.parse_fn_def()?)),
                 TokenKind::Import => stmts.push(Stmt::Import(self.parse_import()?)),
+                TokenKind::Class => stmts.push(Stmt::Class(self.parse_class()?)),
                 other => {
                     return Err(self.err(format!(
-                        "顶层只允许函数定义或 import，实际是 {}",
+                        "顶层只允许函数定义、import 或类定义，实际是 {}",
                         self.describe(other)
                     )))
                 }
@@ -203,7 +204,8 @@ impl<'a> Parser<'a> {
     }
 
     /// 表达式语句与赋值语句的统一入口：
-    /// `Ident = ...`（变量名后紧跟等号）→ Assign；否则解析为普通表达式语句。
+    /// `Ident = ...`（变量名后紧跟等号）→ Assign；`obj.field = ...` → FieldAssign；
+    /// 否则解析为普通表达式语句。
     fn parse_expr_or_assign(&mut self) -> Result<Stmt, ParseError> {
         if let TokenKind::Ident(name) = self.peek_kind() {
             let name = name.clone();
@@ -215,7 +217,47 @@ impl<'a> Parser<'a> {
                 return Ok(Stmt::Assign(AssignStmt { target: name, value, span }));
             }
         }
-        self.parse_expr_stmt().map(Stmt::Expr)
+        // 字段赋值：`obj.field = expr`（base 限定 Var/this 或字段链，见语义层校验）。
+        // 先解析完整表达式，若后跟 `=` 且表达式是纯字段访问链 → FieldAssign。
+        let expr = self.parse_expr()?;
+        if self.eat(&TokenKind::Eq) {
+            match &expr {
+                // base 必须可寻址：变量/this 或 FieldAccess 链（`obj.a.b = v`）
+                Expr::FieldAccess { base, field, span } if is_addressable_base(base) => {
+                    let value = self.parse_expr()?;
+                    let fspan = *span;
+                    self.expect(TokenKind::Semi, "语句结束符")?;
+                    return Ok(Stmt::FieldAssign(FieldAssignStmt {
+                        base: base.clone(),
+                        field: field.clone(),
+                        value,
+                        span: fspan,
+                    }));
+                }
+                // 变量赋值（理论上前面的快速路径已拦截，此处防御）
+                Expr::Var(name) => {
+                    let value = self.parse_expr()?;
+                    let aspan = expr_span(&expr).unwrap_or(self.peek().span);
+                    self.expect(TokenKind::Semi, "语句结束符")?;
+                    return Ok(Stmt::Assign(AssignStmt {
+                        target: name.clone(),
+                        value,
+                        span: aspan,
+                    }));
+                }
+                _ => {
+                    return Err(self.err("赋值目标必须是变量或对象字段".into()));
+                }
+            }
+        }
+        self.parse_expr_stmt_tail(expr).map(Stmt::Expr)
+    }
+
+    /// 表达式语句尾处理：以分号/ASI 结束。
+    fn parse_expr_stmt_tail(&mut self, expr: Expr) -> Result<ExprStmt, ParseError> {
+        let span = expr_span(&expr).unwrap_or(self.peek().span);
+        self.expect(TokenKind::Semi, "语句结束符")?;
+        Ok(ExprStmt { expr, span })
     }
 
     /// `var name[: Ty] = expr` / `const name[: Ty] = expr`（ASI/分号结束）。
@@ -283,9 +325,9 @@ impl<'a> Parser<'a> {
         // 逐字段：`var q = _tmpN.Item1;`（按 C# 规则 ItemN 从 1 编号）
         for (i, name) in names.iter().enumerate() {
             let access = format!("Item{}", i + 1);
-            let field = Expr::TupleField {
+            let field = Expr::FieldAccess {
                 base: Box::new(Expr::Var(tmp.clone())),
-                access,
+                field: access,
                 span,
             };
             decls.push(VarDeclStmt {
@@ -327,6 +369,91 @@ impl<'a> Parser<'a> {
         };
         let body = self.parse_block()?;
         Ok(FnDefStmt { name, params, ret_ty, body, span })
+    }
+
+    /// `class Name [extends Parent] { 字段… 方法… }`（仅顶层，P8）。
+    ///
+    /// 类体由字段声明（`var name[: Ty] [= 默认值]`）与方法定义
+    /// （`[static] method name(params) -> Ty { body }`）交错组成。
+    fn parse_class(&mut self) -> Result<ClassDefStmt, ParseError> {
+        let span = self.advance().span; // class
+        let name = self.expect_ident()?;
+        // 继承：`extends Parent`
+        let parent = if self.eat(&TokenKind::Extends) {
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        self.expect(TokenKind::LBrace, "'{'")?;
+        let mut fields = Vec::new();
+        let mut methods = Vec::new();
+        while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
+            match self.peek_kind() {
+                // 字段：`var name[: Ty] [= 默认值]`
+                TokenKind::Var => {
+                    let fspan = self.advance().span; // var
+                    let fname = self.expect_ident()?;
+                    let ty = if self.eat(&TokenKind::Colon) {
+                        Some(self.parse_type()?)
+                    } else {
+                        None
+                    };
+                    let init = if self.eat(&TokenKind::Eq) {
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    self.expect(TokenKind::Semi, "字段声明结束符")?;
+                    fields.push(ClassField { name: fname, ty, init, span: fspan });
+                }
+                // 方法：`[static] method ...`
+                TokenKind::Method | TokenKind::Static => {
+                    methods.push(self.parse_method()?);
+                }
+                other => {
+                    return Err(self.err(format!(
+                        "类体内只允许字段(var)或方法(method/static method)，实际是 {}",
+                        self.describe(other)
+                    )))
+                }
+            }
+        }
+        self.expect(TokenKind::RBrace, "'}'")?;
+        Ok(ClassDefStmt { name, parent, fields, methods, span })
+    }
+
+    /// `[static] method name(params) -> Ty { body }`（P8）。
+    ///
+    /// 与 parse_fn_def 结构相同，多一个可选 `static` 前缀与 `method` 关键字。
+    fn parse_method(&mut self) -> Result<MethodDefStmt, ParseError> {
+        let span = self.peek().span;
+        let is_static = self.eat(&TokenKind::Static);
+        self.expect(TokenKind::Method, "'method'")?;
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::LParen, "'('")?;
+        let mut params = Vec::new();
+        if !self.eat(&TokenKind::RParen) {
+            loop {
+                let pspan = self.peek().span;
+                let pname = self.expect_ident()?;
+                self.expect(TokenKind::Colon, "':'")?;
+                let pty = self.parse_type()?;
+                params.push(Param { name: pname, ty: pty, span: pspan });
+                if self.eat(&TokenKind::Comma) {
+                    continue;
+                }
+                self.expect(TokenKind::RParen, "')'")?;
+                break;
+            }
+        }
+        // 返回类型：`-> Ty` 可省略（默认 void）
+        let ret_ty = if self.eat(&TokenKind::Arrow) {
+            self.parse_type()?
+        } else {
+            TypeSpec::Named(TyKw::Void)
+        };
+        let body = self.parse_block()?;
+        Ok(MethodDefStmt { name, is_static, params, ret_ty, body, span })
     }
 
     /// `{ stmts }` 代码块。
@@ -453,14 +580,6 @@ impl<'a> Parser<'a> {
         Ok(ReturnStmt { expr, span })
     }
 
-    /// 表达式语句（以分号/ASI 结束）。
-    fn parse_expr_stmt(&mut self) -> Result<ExprStmt, ParseError> {
-        let expr = self.parse_expr()?;
-        let span = expr_span(&expr).unwrap_or(self.peek().span);
-        self.expect(TokenKind::Semi, "语句结束符")?;
-        Ok(ExprStmt { expr, span })
-    }
-
     // ---------- 类型解析 ----------
 
     fn parse_type(&mut self) -> Result<TypeSpec, ParseError> {
@@ -472,6 +591,12 @@ impl<'a> Parser<'a> {
             }
             // 元组类型：`(i64, string)` / `(x: i64, y: i64)`
             TokenKind::LParen => self.parse_tuple_type(),
+            // 类类型：`MyClass`（用户自定义类型，P8）
+            TokenKind::Ident(name) => {
+                let name = name.clone();
+                self.advance();
+                Ok(TypeSpec::Class(name))
+            }
             other => Err(self.err(format!("期望类型，实际是 {}", self.describe(other)))),
         }
     }
@@ -627,7 +752,7 @@ impl<'a> Parser<'a> {
             }
             _ => self.parse_primary()?,
         };
-        // 后缀访问：`base[index]` 下标与 `base.field` 元组字段（可链式，如 `a[0][1]`、`p.x.Item1`）
+        // 后缀访问：`base[index]` 下标与 `base.field` 字段访问（可链式，如 `a[0][1]`、`p.x.y`）
         loop {
             if self.eat(&TokenKind::LBracket) {
                 let index = self.parse_expr()?;
@@ -640,8 +765,8 @@ impl<'a> Parser<'a> {
                     span: base_span,
                 };
             } else if self.eat(&TokenKind::Dot) {
-                // 元组字段访问：`.Item1` / `.x` / `.0`（字段名、ItemN 或数字下标）
-                let access = match self.peek_kind() {
+                // 字段名/方法名：`.x`（字段访问）或 `.m`（方法调用，后紧跟 `(`）
+                let field = match self.peek_kind() {
                     TokenKind::Ident(name) => {
                         let name = name.clone();
                         self.advance();
@@ -654,18 +779,36 @@ impl<'a> Parser<'a> {
                     }
                     other => {
                         return Err(self.err(format!(
-                            "字段访问 '.' 后必须是字段名/ItemN/数字下标，实际是 {}",
+                            "字段访问 '.' 后必须是字段名/方法名/数字下标，实际是 {}",
                             self.describe(other)
                         )))
                     }
                 };
                 let dspan = self.peek().span;
                 let base_span = expr_span(&expr).unwrap_or(dspan);
-                expr = Expr::TupleField {
-                    base: Box::new(expr),
-                    access,
-                    span: base_span,
-                };
+                // 方法调用：字段名后紧跟 `(`（如 `obj.m(1, 2)`）
+                if self.eat(&TokenKind::LParen) {
+                    let mut args = Vec::new();
+                    if !self.eat(&TokenKind::RParen) {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if self.eat(&TokenKind::Comma) {
+                                continue;
+                            }
+                            self.expect(TokenKind::RParen, "')'")?;
+                            break;
+                        }
+                    }
+                    expr = Expr::MethodCall {
+                        receiver: Box::new(expr),
+                        method: field,
+                        args,
+                        span: base_span,
+                    };
+                } else {
+                    // 字段访问：`.x` / `.Item1` / `.0`（元组与类共用，语义层按 base 类型分发）
+                    expr = Expr::FieldAccess { base: Box::new(expr), field, span: base_span };
+                }
             } else {
                 break;
             }
@@ -721,6 +864,12 @@ impl<'a> Parser<'a> {
                 } else {
                     Ok(Expr::Var(name))
                 }
+            }
+            // 当前实例 `this`：以特殊变量名形式进入表达式
+            // （lexer 已把 this 作为关键字，用户无法声明同名变量，语义层识别该名）
+            TokenKind::This => {
+                self.advance();
+                Ok(Expr::Var("this".to_string()))
             }
             TokenKind::LParen => self.parse_paren_or_tuple(span),
             TokenKind::LBracket => self.parse_table_lit(span),
@@ -879,7 +1028,20 @@ fn expr_span(expr: &Expr) -> Option<Span> {
         | Expr::TableLit { span, .. }
         | Expr::Index { span, .. }
         | Expr::TupleLit { span, .. }
-        | Expr::TupleField { span, .. } => Some(*span),
+        | Expr::FieldAccess { span, .. }
+        | Expr::MethodCall { span, .. } => Some(*span),
         _ => None,
+    }
+}
+
+/// 表达式是否可寻址（可作为字段赋值/字段访问的 base）。
+///
+/// 可寻址：变量（含 this）或 FieldAccess 链（`obj.a.b` 的 GEP 链天然有地址）；
+/// 不可寻址：寄存器中的类值（方法调用结果、构造表达式直接连用）——P8 语义层报错。
+fn is_addressable_base(expr: &Expr) -> bool {
+    match expr {
+        Expr::Var(_) => true,
+        Expr::FieldAccess { base, .. } => is_addressable_base(base),
+        _ => false,
     }
 }

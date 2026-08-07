@@ -16,6 +16,8 @@ pub enum TypeSpec {
     Named(TyKw),
     /// 元组类型 `(T1, T2)` / `(x: T1, y: T2)`（元素 ≥1，字段名可空）
     Tuple(Vec<TupleField>),
+    /// 类类型（用户自定义 OOP 类型，P8）
+    Class(String),
 }
 
 /// 元组的一个字段：可选字段名 + 类型（名字进类型，供 `.x` 命名访问）。
@@ -62,6 +64,9 @@ impl TypeSpec {
             }
             TypeSpec::Tuple(_) => {
                 unreachable!("元组类型映射为字面结构体，需由 IR 生成器的 llvm_ty 包装处理（含泄漏与缓存）")
+            }
+            TypeSpec::Class(_) => {
+                unreachable!("类类型映射为字面结构体，需由 IR 生成器的 llvm_ty 包装处理（含泄漏与缓存）")
             }
         }
     }
@@ -143,6 +148,10 @@ pub enum Stmt {
     Switch(SwitchStmt),
     /// import 导入其他 tie 文件（`import "./x.tie" [as 别名]`，仅顶层）
     Import(ImportStmt),
+    /// 类定义 `class Name [extends Parent] { 字段/方法 }`（P8，仅顶层）
+    Class(ClassDefStmt),
+    /// 字段赋值 `obj.field = expr`（P8，对已存在实例字段的写入）
+    FieldAssign(FieldAssignStmt),
 }
 
 /// import 语句：把其他 tie 文件的顶层函数并入当前文件。
@@ -194,6 +203,66 @@ pub struct FnDefStmt {
 pub struct Param {
     pub name: String,
     pub ty: TypeSpec,
+    pub span: Span,
+}
+
+/// 类定义语句（P8）：`class Name [extends Parent] { 字段… 方法… }`。
+///
+/// 仅允许出现在文件顶层（与 import 相同）；字段与方法并列在类体内。
+#[derive(Debug, Clone)]
+pub struct ClassDefStmt {
+    /// 类名（全局唯一，不能与函数名/其他类名冲突）
+    pub name: String,
+    /// 父类名（`extends Parent`）；`None` 表示无继承
+    pub parent: Option<String>,
+    /// 自身字段（不含继承的；拍平由语义层完成）
+    pub fields: Vec<ClassField>,
+    /// 自身方法（不含继承的；遮蔽解析由语义层完成）
+    pub methods: Vec<MethodDefStmt>,
+    pub span: Span,
+}
+
+/// 类的一个字段声明：`var name[: Ty] [= 默认值]`（P8）。
+///
+/// 默认值限编译期字面量（构造缺省时兜底）；字段恒可变（const 字段留后续版本）。
+#[derive(Debug, Clone)]
+pub struct ClassField {
+    pub name: String,
+    /// 显式类型标注（`var count: i64`）；`None` 由默认值推导
+    pub ty: Option<TypeSpec>,
+    /// 默认值（`var count = 0`）；`None` 表示构造时必须传参
+    pub init: Option<Expr>,
+    pub span: Span,
+}
+
+/// 类的一个方法定义（P8）：`[static] method name(params) -> Ty { body }`。
+///
+/// 与 [FnDefStmt] 同构 + `is_static`；不复用 FnDefStmt 以免污染顶层函数构造点。
+/// 实例方法体内 `this` 绑定当前实例（语义层处理）。
+#[derive(Debug, Clone)]
+pub struct MethodDefStmt {
+    pub name: String,
+    /// 静态方法：不绑定 this，通过 `类名.方法名()` 调用
+    pub is_static: bool,
+    pub params: Vec<Param>,
+    /// 返回类型（省略时为 void）
+    pub ret_ty: TypeSpec,
+    pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
+/// 字段赋值语句（P8）：`obj.field = expr`。
+///
+/// 与 [AssignStmt] 分开：AssignStmt 的 `target: String` 快速路径是既有工作代码，
+/// 新增变体零触碰现有路径。base 限变量或 this（语义层校验）。
+#[derive(Debug, Clone)]
+pub struct FieldAssignStmt {
+    /// 实例表达式（限 Var/this；寄存器中的类值不可寻址，P8 报错）
+    pub base: Box<Expr>,
+    /// 字段名
+    pub field: String,
+    /// 新值表达式
+    pub value: Expr,
     pub span: Span,
 }
 
@@ -289,8 +358,18 @@ pub enum Expr {
     Index { base: Box<Expr>, index: Box<Expr>, span: Span },
     /// 元组字面量 `(1, "a")` / `(x: 1, y: 2)`（C# 风格；元素 ≥1）
     TupleLit { fields: Vec<(Option<String>, Expr)>, span: Span },
-    /// 元组字段访问 `t.Item1` / `t.x` / `t.0`（access 存 "ItemN" / 名字 / 数字下标文本）
-    TupleField { base: Box<Expr>, access: String, span: Span },
+    /// 字段访问（读）`base.field`（P8 统一变体）：
+    ///
+    /// - base 是元组 → 元组字段（`.x` 命名 / `.Item1` / `.0`，语义层按 tuple_field_index 解析）；
+    /// - base 是类实例 → 类字段（`.x` 命名，field_index 解析）。
+    ///
+    /// 同一变体管两种，语义层按 base 的推导类型分发。
+    FieldAccess { base: Box<Expr>, field: String, span: Span },
+    /// 方法调用 `obj.m(args)`（实例）/ `MyClass.m(args)`（静态）（P8）
+    ///
+    /// receiver 是变量/this → 实例方法（receiver 地址作隐藏 this 参数）；
+    /// receiver 是类名 → 静态方法（无 this）。同一变体管两种，语义层区分。
+    MethodCall { receiver: Box<Expr>, method: String, args: Vec<Expr>, span: Span },
 }
 
 /// 表单元格：`value` 或 `id:value`（id 可选，可为数字下标或带引号字符串键）。

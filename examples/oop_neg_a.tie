@@ -1,0 +1,13 @@
+// oop_neg_a.tie：负例——寄存器中的类值不可寻址（构造表达式直接字段访问）
+// 期望：语义错误「类实例 'Counter' 的字段访问需要可寻址对象」
+
+class Counter {
+    var count: i64
+    method inc() {
+        this.count = this.count + 1
+    }
+}
+
+func main() {
+    println(Counter(0).count)
+}

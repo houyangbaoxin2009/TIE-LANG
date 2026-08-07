@@ -1,0 +1,14 @@
+// oop_neg_c.tie：负例——静态方法通过实例调用（应报错：静态方法必须通过类名调用）
+// 期望：语义错误「静态方法 'make' 必须通过类名调用」
+
+class Counter {
+    var count: i64
+    static method make() -> i64 {
+        return 1
+    }
+}
+
+func main() {
+    var c = Counter(0)
+    println(c.make())
+}

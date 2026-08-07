@@ -9,10 +9,11 @@
 //! （IR 生成时无需重复推导类型）。
 
 use super::ast::{
-    BinaryOp, Expr, FnDefStmt, Program, Stmt, TableId, TupleField, TypeSpec, UnaryOp,
+    BinaryOp, ClassDefStmt, ClassField, Expr, FnDefStmt, MethodDefStmt, Program, Stmt, TableId,
+    TupleField, TypeSpec, UnaryOp,
 };
 use super::lexer::{Span, TyKw};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 /// 语义错误：携带位置与信息。
 #[derive(Debug, Clone)]
@@ -27,7 +28,7 @@ impl fmt::Display for SemanticError {
     }
 }
 
-/// 语义分析结果：函数签名表 + 函数内表达式类型推断表。
+/// 语义分析结果：函数签名表 + 函数内表达式类型推断表 + 类信息表。
 #[derive(Debug, Default)]
 pub struct SemanticResult {
     /// 函数签名：函数名 → 签名
@@ -38,6 +39,8 @@ pub struct SemanticResult {
     pub const_vars: std::collections::HashSet<String>,
     /// 表元数据：表字面量表达式地址 → 元素类型与长度（IR 生成布局用）
     pub tables: HashMap<usize, TableInfo>,
+    /// 类信息：类名 → 拍平后的字段/方法表（P8，IR 布局与 mangle 用）
+    pub classes: HashMap<String, ClassInfo>,
 }
 
 /// 表（table）的布局信息：元素类型与元素个数。
@@ -54,6 +57,34 @@ pub struct TableInfo {
 pub struct FuncSig {
     pub param_tys: Vec<TypeSpec>,
     pub ret_ty: TypeSpec,
+}
+
+/// 类的方法签名（P8）。
+#[derive(Debug, Clone)]
+pub struct MethodSig {
+    /// 静态方法：不绑定 this，通过 `类名.方法名()` 调用
+    pub is_static: bool,
+    pub param_tys: Vec<TypeSpec>,
+    pub ret_ty: TypeSpec,
+}
+
+/// 类的完整信息（P8）：字段与方法均为**继承拍平**后的结果。
+///
+/// 字段顺序即 LLVM 结构体字段序（父类字段在前，子类字段在后）；
+/// `field_index` 是字段名 → GEP 偏移的唯一权威来源（语义校验与 IR 生成共用，
+/// 避免两处各自遍历拍平造成错位）。
+#[derive(Debug, Clone)]
+pub struct ClassInfo {
+    /// 直接父类名（`extends Parent`）
+    pub parent: Option<String>,
+    /// 拍平字段（含继承），顺序即 LLVM 结构体字段序
+    pub fields: Vec<ClassField>,
+    /// 字段名 → 字段下标（拍平顺序，IR 的 GEP 偏移）
+    pub field_index: HashMap<String, usize>,
+    /// 拍平方法（子类同名方法遮蔽父类）
+    pub methods: HashMap<String, MethodSig>,
+    /// 方法名 → 实际定义它的类（mangle 用 `@<定义类>$<方法名>`）
+    pub method_owner: HashMap<String, String>,
 }
 
 /// 语义分析入口。
@@ -80,10 +111,22 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
         }
     }
 
+    // 类收集：继承链解析（环检测）+ 字段/方法拍平 + 冲突检查（类名 vs 函数名）
+    ctx.collect_classes(program)?;
+
     // 第二遍：检查函数体
     for stmt in &program.stmts {
         if let Stmt::FnDef(f) = stmt {
             ctx.check_fn(f)?;
+        }
+    }
+
+    // 第三遍：检查方法体（this 绑定、成员访问、类型检查）
+    for stmt in &program.stmts {
+        if let Stmt::Class(c) = stmt {
+            for m in &c.methods {
+                ctx.check_method(m, &c.name)?;
+            }
         }
     }
 
@@ -117,6 +160,192 @@ impl Analyzer {
             self.check_stmt(stmt, &mut scope, &f.ret_ty)?;
         }
         Ok(())
+    }
+
+    /// 类收集（第一遍的延续）：继承链解析 + 字段/方法拍平 + 冲突检查。
+    ///
+    /// 顺序保证：父类先于子类拍平（递归），拍平结果存 `result.classes`。
+    fn collect_classes(&mut self, program: &Program) -> Result<(), SemanticError> {
+        // 第一步：类名登记与冲突检查（类名 vs 函数名、类名 vs 类名）
+        for stmt in &program.stmts {
+            if let Stmt::Class(c) = stmt {
+                if self.result.funcs.contains_key(&c.name) {
+                    return Err(SemanticError {
+                        span: c.span,
+                        message: format!("类名 '{}' 与函数名冲突", c.name),
+                    });
+                }
+                if self.result.classes.contains_key(&c.name) {
+                    return Err(SemanticError {
+                        span: c.span,
+                        message: format!("类 '{}' 重复定义", c.name),
+                    });
+                }
+                self.result.classes.insert(c.name.clone(), ClassInfo {
+                    parent: c.parent.clone(),
+                    fields: Vec::new(),
+                    field_index: HashMap::new(),
+                    methods: HashMap::new(),
+                    method_owner: HashMap::new(),
+                });
+            }
+        }
+        // 第二步：逐个类做继承链拍平（递归解析父类字段/方法）
+        // 先构造「类名 → 定义」映射以便查找父类
+        let defs: HashMap<String, &ClassDefStmt> = program
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Class(c) => Some((c.name.clone(), c)),
+                _ => None,
+            })
+            .collect();
+        let names: Vec<String> = self.result.classes.keys().cloned().collect();
+        for name in names {
+            let info = self.flatten_class(&name, &defs, &mut HashSet::new())?;
+            // 拍平后的结果替换占位
+            self.result.classes.insert(name, info);
+        }
+        Ok(())
+    }
+
+    /// 拍平单个类：递归合并父类字段/方法，自身字段/方法叠加，环检测。
+    ///
+    /// `chain` 是当前继承链上的类名集合（路径环检测用，非全局访问集合）。
+    fn flatten_class(
+        &self,
+        name: &str,
+        defs: &HashMap<String, &ClassDefStmt>,
+        chain: &mut HashSet<String>,
+    ) -> Result<ClassInfo, SemanticError> {
+        // 环检测：`class A extends B` 且 B 又依赖 A → 死循环
+        if !chain.insert(name.to_string()) {
+            return Err(SemanticError {
+                span: defs.get(name).map(|c| c.span).unwrap_or(Span { line: 0, col: 0 }),
+                message: format!("类继承形成环（含 '{name}'）"),
+            });
+        }
+        let def = defs.get(name).ok_or_else(|| SemanticError {
+            span: Span { line: 0, col: 0 },
+            message: format!("内部错误：类 '{name}' 无定义"),
+        })?;
+        let mut info = ClassInfo {
+            parent: def.parent.clone(),
+            fields: Vec::new(),
+            field_index: HashMap::new(),
+            methods: HashMap::new(),
+            method_owner: HashMap::new(),
+        };
+        // 父类字段/方法拍平（递归；父类未定义 → 报错）
+        if let Some(p) = &def.parent {
+            if !defs.contains_key(p) {
+                return Err(SemanticError {
+                    span: def.span,
+                    message: format!("父类 '{p}' 未定义"),
+                });
+            }
+            let pinfo = self.flatten_class(p, defs, chain)?;
+            info.fields = pinfo.fields;
+            info.field_index = pinfo.field_index;
+            info.methods = pinfo.methods;
+            info.method_owner = pinfo.method_owner;
+        }
+        // 自身字段：字段名跨继承链唯一（布局平铺后重名即歧义）
+        for f in &def.fields {
+            if info.field_index.contains_key(&f.name) {
+                return Err(SemanticError {
+                    span: f.span,
+                    message: format!(
+                        "字段 '{name}.{}' 与继承链中的字段重名（字段名必须跨继承链唯一）",
+                        f.name
+                    ),
+                });
+            }
+            // 解析字段类型（显式标注优先；否则从默认值字面量推导；都无 → 报错）
+            let fty = self.resolve_class_field_ty(f)?;
+            let mut cf = f.clone();
+            cf.ty = Some(fty);
+            let idx = info.fields.len();
+            info.fields.push(cf);
+            info.field_index.insert(f.name.clone(), idx);
+        }
+        // 自身方法：同名遮蔽父类（method_owner 记录实际定义类），同类内重名报错
+        for m in &def.methods {
+            if let Some(owner) = info.method_owner.get(&m.name)
+                && owner == name
+            {
+                return Err(SemanticError {
+                    span: m.span,
+                    message: format!("方法 '{name}.{}' 重复定义", m.name),
+                });
+            }
+            let sig = MethodSig {
+                is_static: m.is_static,
+                param_tys: m.params.iter().map(|p| p.ty.clone()).collect(),
+                ret_ty: m.ret_ty.clone(),
+            };
+            info.methods.insert(m.name.clone(), sig);
+            info.method_owner.insert(m.name.clone(), name.to_string());
+        }
+        chain.remove(name);
+        Ok(info)
+    }
+
+    /// 检查方法体：实例方法先绑定 `this`（当前类类型），静态方法不绑定。
+    fn check_method(&mut self, m: &MethodDefStmt, class_name: &str) -> Result<(), SemanticError> {
+        self.cur_fn = format!("{class_name}.{}", m.name);
+        // 方法体内作用域：this（实例方法）+ 参数
+        let mut scope: HashMap<String, TypeSpec> = HashMap::new();
+        if !m.is_static {
+            scope.insert("this".to_string(), TypeSpec::Class(class_name.to_string()));
+        }
+        for p in &m.params {
+            if scope.insert(p.name.clone(), p.ty.clone()).is_some() {
+                return Err(SemanticError {
+                    span: p.span,
+                    message: format!("参数 '{}' 重复", p.name),
+                });
+            }
+        }
+        for stmt in &m.body {
+            self.check_stmt(stmt, &mut scope, &m.ret_ty)?;
+        }
+        Ok(())
+    }
+
+    /// 解析类字段的具体类型（P8）。
+    ///
+    /// 规则：显式标注优先；无标注但有默认值 → 从默认值字面量推导；
+    /// 两者皆无 → 报错（IR 无法确定字段类型）。
+    fn resolve_class_field_ty(&self, f: &ClassField) -> Result<TypeSpec, SemanticError> {
+        // 有显式标注：直接用（默认值类型由后续构造/赋值校验把关）
+        if let Some(t) = &f.ty {
+            return Ok(t.clone());
+        }
+        // 无标注：从默认值字面量推导（P8 限字面量，保证类型可静态确定）
+        let ty = match &f.init {
+            Some(Expr::IntLit(_)) => TypeSpec::Named(TyKw::I64),
+            Some(Expr::FloatLit(_)) => TypeSpec::Named(TyKw::F64),
+            Some(Expr::BoolLit(_)) => TypeSpec::Named(TyKw::Bool),
+            Some(Expr::StrLit(_)) => TypeSpec::Named(TyKw::Str),
+            Some(Expr::CharLit(_)) => TypeSpec::Named(TyKw::Char),
+            Some(_) => {
+                return Err(SemanticError {
+                    span: f.span,
+                    message: format!(
+                        "字段 '{}' 无类型标注，默认值必须是字面量（当前是表达式）",
+                        f.name
+                    ),
+                })
+            }
+            None => {
+                return Err(SemanticError {
+                    span: f.span,
+                    message: format!("字段 '{}' 必须标注类型或有默认值", f.name),
+                })
+            }
+        };
+        Ok(ty)
     }
 
     fn check_stmt(
@@ -434,6 +663,58 @@ impl Analyzer {
                 self.check_block(&s.default_body, scope, ret_ty)?;
                 Ok(())
             }
+            Stmt::Class(_) => {
+                // 类定义只允许出现在文件顶层（analyze 第三遍统一检查方法体）
+                Err(SemanticError {
+                    span: stmt_span(stmt),
+                    message: "类定义只能出现在文件顶层".into(),
+                })
+            }
+            Stmt::FieldAssign(fa) => {
+                // 字段赋值：base 必须是类实例（变量/this/字段链，可寻址），字段存在，类型匹配
+                let base_ty = self.infer_expr(&fa.base, scope)?;
+                self.result.expr_types.insert(addr_of(&fa.base), base_ty.clone());
+                let TypeSpec::Class(class_name) = &base_ty else {
+                    return Err(SemanticError {
+                        span: fa.span,
+                        message: format!(
+                            "字段赋值的对象必须是类实例，实际是 {}",
+                            type_name(&base_ty)
+                        ),
+                    });
+                };
+                let info = self
+                    .result
+                    .classes
+                    .get(class_name)
+                    .cloned()
+                    .ok_or_else(|| SemanticError {
+                        span: fa.span,
+                        message: format!("内部错误：类 '{class_name}' 无信息"),
+                    })?;
+                let field_ty = info
+                    .field_index
+                    .get(&fa.field)
+                    .map(|&i| info.fields[i].ty.clone().expect("字段类型已在类收集时解析"))
+                    .ok_or_else(|| SemanticError {
+                        span: fa.span,
+                        message: format!("类 '{class_name}' 没有字段 '{}'", fa.field),
+                    })?;
+                let value_ty = self.infer_expr(&fa.value, scope)?;
+                self.result.expr_types.insert(addr_of(&fa.value), value_ty.clone());
+                if !types_match(&field_ty, &value_ty, Some(&fa.value)) {
+                    return Err(SemanticError {
+                        span: fa.span,
+                        message: format!(
+                            "字段赋值类型不匹配：'{class_name}.{}' 类型为 {}，表达式为 {}",
+                            fa.field,
+                            type_name(&field_ty),
+                            type_name(&value_ty)
+                        ),
+                    });
+                }
+                Ok(())
+            }
         }
     }
 
@@ -471,6 +752,37 @@ impl Analyzer {
                 }
             },
             Expr::Call { name, args, span } => {
+                // 构造调用：`Counter(1, 2)` 命中类名 → 按字段逐位置初始化（P8）。
+                // 参数个数 ≤ 字段数（缺省用字段默认值/零值）；类型逐个匹配。
+                if let Some(info) = self.result.classes.get(name).cloned() {
+                    if args.len() > info.fields.len() {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!(
+                                "构造 '{name}' 最多 {} 个参数（字段数），实际 {} 个",
+                                info.fields.len(),
+                                args.len()
+                            ),
+                        });
+                    }
+                    for (a, f) in args.iter().zip(info.fields.iter()) {
+                        let at = self.infer_expr(a, scope)?;
+                        let fty = f.ty.clone().expect("字段类型已在类收集时解析");
+                        if !types_match(&fty, &at, Some(a)) {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!(
+                                    "构造 '{name}' 参数类型不匹配：字段 '{}' 期望 {}，实际 {}",
+                                    f.name,
+                                    type_name(&fty),
+                                    type_name(&at)
+                                ),
+                            });
+                        }
+                        self.result.expr_types.insert(addr_of(a), at);
+                    }
+                    return Ok(TypeSpec::Class(name.clone()));
+                }
                 // 内置函数 println：任意参数，void（元组除外——IR 层 printf 变参无法传结构体）
                 if name == "println" {
                     for a in args {
@@ -753,30 +1065,171 @@ impl Analyzer {
                 }
                 TypeSpec::Tuple(tys)
             }
-            Expr::TupleField { base, access, span } => {
-                // 字段访问：base 必须是元组；字段名/ItemN/数字 → 下标（越界或名字不存在报错）
+            Expr::FieldAccess { base, field, span } => {
+                // 字段访问（读）：base 是元组 → 元组字段（命名/ItemN/数字）；
+                // base 是类实例 → 类字段（命名）。按 base 的推导类型分发。
                 let base_ty = self.infer_expr(base, scope)?;
                 self.result.expr_types.insert(addr_of(base), base_ty.clone());
-                let TypeSpec::Tuple(fields) = &base_ty else {
+                match &base_ty {
+                    TypeSpec::Tuple(fields) => {
+                        let idx = tuple_field_index(&base_ty, field).ok_or_else(|| SemanticError {
+                            span: *span,
+                            message: format!(
+                                "元组没有字段 '{field}'（元组字段为 {}）",
+                                type_name(&base_ty)
+                            ),
+                        })?;
+                        fields[idx].ty.clone()
+                    }
+                    TypeSpec::Class(class_name) => {
+                        // 寄存器中的类值不可寻址：构造表达式/方法调用结果直接连用字段
+                        // 会在 IR 阶段无法取地址，语义层提前报错（Oracle 方案）。
+                        if !is_addressable_expr(base) {
+                            return Err(SemanticError {
+                                span: *span,
+                                message: format!(
+                                    "类实例 '{class_name}' 的字段访问需要可寻址对象（变量/this/字段链），"
+                                ),
+                            });
+                        }
+                        let info = self
+                            .result
+                            .classes
+                            .get(class_name)
+                            .cloned()
+                            .ok_or_else(|| SemanticError {
+                                span: *span,
+                                message: format!("内部错误：类 '{class_name}' 无信息"),
+                            })?;
+                        let idx = info
+                            .field_index
+                            .get(field)
+                            .copied()
+                            .ok_or_else(|| SemanticError {
+                                span: *span,
+                                message: format!("类 '{class_name}' 没有字段 '{field}'"),
+                            })?;
+                        info.fields[idx].ty.clone().expect("字段类型已在类收集时解析")
+                    }
+                    _ => {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!(
+                                "字段访问 '.' 的对象必须是元组或类实例，实际是 {}",
+                                type_name(&base_ty)
+                            ),
+                        })
+                    }
+                }
+            }
+            Expr::MethodCall { receiver, method, args, span } => {
+                // 方法调用：receiver 是变量/this → 实例方法（receiver 类型必须是类）；
+                // receiver 是类名 → 静态方法（无 this）。同一变体两种语义，此处分发。
+                // 静态方法：receiver 是 Var 且名字在 classes 表中（未绑定变量）
+                if let Expr::Var(rname) = receiver.as_ref()
+                    && !scope.contains_key(rname)
+                    && self.result.classes.contains_key(rname)
+                {
+                    let class_name = rname.clone();
+                    let info = self.result.classes[&class_name].clone();
+                    let sig = info.methods.get(method).cloned().ok_or_else(|| SemanticError {
+                        span: *span,
+                        message: format!("类 '{class_name}' 没有方法 '{method}'"),
+                    })?;
+                    if !sig.is_static {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!(
+                                "实例方法 '{method}' 必须通过实例调用（如 obj.{method}(...)）"
+                            ),
+                        });
+                    }
+                    self.check_call_args(method, &sig.param_tys, args, scope, span)?;
+                    return Ok(sig.ret_ty);
+                }
+                // 实例方法：receiver 推断类型必须是类
+                let recv_ty = self.infer_expr(receiver, scope)?;
+                self.result.expr_types.insert(addr_of(receiver), recv_ty.clone());
+                let TypeSpec::Class(class_name) = &recv_ty else {
                     return Err(SemanticError {
                         span: *span,
                         message: format!(
-                            "字段访问 '.' 的对象必须是元组，实际是 {}",
-                            type_name(&base_ty)
+                            "方法调用的对象必须是类实例，实际是 {}",
+                            type_name(&recv_ty)
                         ),
                     });
                 };
-                let idx = tuple_field_index(&base_ty, access).ok_or_else(|| SemanticError {
+                // 寄存器中的类值不可寻址：构造表达式/方法调用结果直接调用方法
+                // 会在 IR 阶段无法取 this 地址，语义层提前报错（Oracle 方案）。
+                if !is_addressable_expr(receiver) {
+                    return Err(SemanticError {
+                        span: *span,
+                        // 寄存器中的类值不可寻址：无法取 this 地址
+                        message: "方法调用的对象需要可寻址的类实例（变量/this/字段链）".to_string(),
+                    });
+                }
+                let info = self
+                    .result
+                    .classes
+                    .get(class_name)
+                    .cloned()
+                    .ok_or_else(|| SemanticError {
+                        span: *span,
+                        message: format!("内部错误：类 '{class_name}' 无信息"),
+                    })?;
+                let sig = info.methods.get(method).cloned().ok_or_else(|| SemanticError {
                     span: *span,
-                    message: format!(
-                        "元组没有字段 '{access}'（元组字段为 {}）",
-                        type_name(&base_ty)
-                    ),
+                    message: format!("类 '{class_name}' 没有方法 '{method}'"),
                 })?;
-                fields[idx].ty.clone()
+                if sig.is_static {
+                    return Err(SemanticError {
+                        span: *span,
+                        message: format!(
+                            "静态方法 '{method}' 必须通过类名调用（如 {class_name}.{method}(...)）"
+                        ),
+                    });
+                }
+                self.check_call_args(method, &sig.param_tys, args, scope, span)?;
+                sig.ret_ty
             }
         };
         Ok(ty)
+    }
+
+    /// 校验方法调用的实参（个数 + 逐个类型匹配）。
+    fn check_call_args(
+        &mut self,
+        method: &str,
+        param_tys: &[TypeSpec],
+        args: &[Expr],
+        scope: &HashMap<String, TypeSpec>,
+        span: &Span,
+    ) -> Result<(), SemanticError> {
+        if param_tys.len() != args.len() {
+            return Err(SemanticError {
+                span: *span,
+                message: format!(
+                    "方法 '{method}' 期望 {} 个参数，实际 {} 个",
+                    param_tys.len(),
+                    args.len()
+                ),
+            });
+        }
+        for (a, want) in args.iter().zip(param_tys.iter()) {
+            let at = self.infer_expr(a, scope)?;
+            if !types_match(want, &at, Some(a)) {
+                return Err(SemanticError {
+                    span: expr_span_of(a),
+                    message: format!(
+                        "调用 '{method}' 参数类型不匹配：期望 {}，实际 {}",
+                        type_name(want),
+                        type_name(&at)
+                    ),
+                });
+            }
+            self.result.expr_types.insert(addr_of(a), at);
+        }
+        Ok(())
     }
 }
 
@@ -800,6 +1253,8 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::For(f) => f.span,
         Stmt::Switch(s) => s.span,
         Stmt::Import(i) => i.span,
+        Stmt::Class(c) => c.span,
+        Stmt::FieldAssign(f) => f.span,
     }
 }
 
@@ -818,7 +1273,21 @@ fn expr_span_of(expr: &Expr) -> Span {
         | Expr::TableLit { span, .. }
         | Expr::Index { span, .. }
         | Expr::TupleLit { span, .. }
-        | Expr::TupleField { span, .. } => *span,
+        | Expr::FieldAccess { span, .. }
+        | Expr::MethodCall { span, .. } => *span,
+    }
+}
+
+/// 类实例表达式是否可寻址（P8）。
+///
+/// 可寻址：变量（含 this）或 FieldAccess 链（`obj.a.b` 的 GEP 链天然有内存地址）；
+/// 不可寻址：寄存器中的类值（构造表达式/方法调用结果直接连用）——IR 层无法取地址，
+/// 必须先在语义层报错（Oracle 方案：寄存器中的类值不可寻址）。
+fn is_addressable_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Var(_) => true,
+        Expr::FieldAccess { base, .. } => is_addressable_expr(base),
+        _ => false,
     }
 }
 
@@ -937,5 +1406,6 @@ fn type_name(t: &TypeSpec) -> &'static str {
     match t {
         TypeSpec::Named(k) => k.as_str(),
         TypeSpec::Tuple(_) => "tuple",
+        TypeSpec::Class(name) => Box::leak(name.clone().into_boxed_str()),
     }
 }
