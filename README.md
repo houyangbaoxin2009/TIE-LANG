@@ -13,6 +13,8 @@ tie 是一门**通用编程语言**：用一门语言写逻辑、写界面、写
 | --- | --- |
 | [README.md](README.md) | 本文件：工程入口（快速开始、CLI、结构、流水线、路线图） |
 | [docs/language.md](docs/language.md) | 语法规范：文件结构、类型系统、语句/控制流、函数、面向对象、语法速查表 |
+| [docs/ai-guide.md](docs/ai-guide.md) | AI 教学指南：语言用法 + 负例 + 编译器架构（教 AI 用/开发 tie） |
+| [docs/prompt-pack.md](docs/prompt-pack.md) | 可粘贴 Prompt 包：自包含简介，直接发给任何 AI |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更记录（按里程碑） |
 
 ## 快速开始
