@@ -21,6 +21,7 @@ Thumbs.db
 
 # 记忆与本地配置（不入库）
 .localmemory/
+opencode.json
 
 # 代码索引与计划（本地生成，不入库）
 .codegraph/
