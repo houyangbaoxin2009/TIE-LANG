@@ -1,0 +1,41 @@
+{
+  "name": "vscode-tie",
+  "displayName": "tie Language Support",
+  "description": "tie 语言支持：语法高亮 + 语言服务器（诊断 / hover），启动 tie --lsp",
+  "version": "0.1.0",
+  "publisher": "tie",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": ["Programming Languages"],
+  "activationEvents": ["onLanguage:tie"],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "tie",
+        "aliases": ["tie", "tie language"],
+        "extensions": [".tie"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "tie",
+        "scopeName": "source.tie",
+        "path": "./syntaxes/tie.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "tie",
+      "properties": {
+        "tie.lsp.command": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["tie", "--lsp"],
+          "description": "启动 tie 语言服务器的命令。默认 ['tie', '--lsp']；若 tie 不在 PATH，可设为绝对路径，如 ['F:/Projects/tie/target/debug/tie.exe', '--lsp']"
+        }
+      }
+    }
+  }
+}

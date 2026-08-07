@@ -1,0 +1,72 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "tie",
+  "scopeName": "source.tie",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#functions" },
+    { "include": "#identifiers" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "name": "comment.line.double-slash.tie", "match": "//.*$" },
+        {
+          "name": "comment.block.tie",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        { "name": "string.quoted.double.tie", "begin": "\"", "end": "\"", "patterns": [{ "name": "constant.character.escape.tie", "match": "\\\\." }] },
+        { "name": "string.quoted.single.tie", "begin": "'", "end": "'" }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        { "name": "constant.numeric.tie", "match": "\\b(0[xX][0-9a-fA-F_]+|\\d[\\d_]*(\\.\\d[\\d_]*)?)\\b" }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.tie",
+          "match": "\\b(func|var|const|if|else|while|for|return|import|class|method|static|this|extends|switch|case|default|in)\\b"
+        },
+        { "name": "constant.language.tie", "match": "\\b(true|false)\\b" },
+        { "name": "keyword.operator.tie", "match": "\\b(and|or|not)\\b|(==|!=|<=|>=|&&|\\|\\||\\+|-|\\*|/|%|!|>|<|=)" }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "storage.type.tie",
+          "match": "\\b(i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|bool|char|string|void|code)\\b"
+        }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        {
+          "name": "support.function.builtin.tie",
+          "match": "\\b(println|print|len|read_line|eval)\\b"
+        },
+        {
+          "name": "entity.name.function.tie",
+          "match": "\\b[a-zA-Z_][a-zA-Z0-9_]*\\s*(?=\\()"
+        }
+      ]
+    },
+    "identifiers": {
+      "patterns": [
+        { "name": "variable.other.tie", "match": "\\b[a-zA-Z_][a-zA-Z0-9_]*\\b" }
+      ]
+    }
+  }
+}
