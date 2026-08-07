@@ -116,6 +116,26 @@ pub enum TokenKind {
     OrOr,     // ||
     Bang,     // !
 
+    // ---- M4 运算符扩展：复合赋值 / 位运算 / 自增自减 / 三目 ----
+    PlusEq,     // +=
+    MinusEq,    // -=
+    StarEq,     // *=
+    SlashEq,    // /=
+    PercentEq,  // %=
+    AmpEq,      // &=
+    PipeEq,     // |=
+    CaretEq,    // ^=
+    ShlEq,      // <<=
+    ShrEq,      // >>=
+    Amp,        // &
+    Pipe,       // |
+    Caret,      // ^
+    Shl,        // <<
+    Shr,        // >>
+    Inc,        // ++
+    Dec,        // --
+    Question,   // ?
+
     // ---- 特殊 ----
     Eof,
 }
@@ -204,6 +224,9 @@ impl TyKw {
 
 impl TokenKind {
     /// 是否为二元运算符（用于 ASI 判断：行尾是运算符则语句未结束）。
+    ///
+    /// M4 说明：复合赋值/位运算/移位/三目问号都算「运算符」→ 行尾不补分号；
+    /// 自增自减 `++`/`--` 特意**不加入**——后缀 `i++\n` 应结束语句（补分号）。
     fn is_bin_op(&self) -> bool {
         matches!(
             self,
@@ -221,6 +244,22 @@ impl TokenKind {
                 | TokenKind::AndAnd
                 | TokenKind::OrOr
                 | TokenKind::Eq
+                | TokenKind::PlusEq
+                | TokenKind::MinusEq
+                | TokenKind::StarEq
+                | TokenKind::SlashEq
+                | TokenKind::PercentEq
+                | TokenKind::AmpEq
+                | TokenKind::PipeEq
+                | TokenKind::CaretEq
+                | TokenKind::ShlEq
+                | TokenKind::ShrEq
+                | TokenKind::Amp
+                | TokenKind::Pipe
+                | TokenKind::Caret
+                | TokenKind::Shl
+                | TokenKind::Shr
+                | TokenKind::Question
         )
     }
 }
@@ -666,10 +705,25 @@ impl<'a> Lexer<'a> {
         Token::new(kind, line, col)
     }
 
-    /// 符号：单字符与双字符运算符。
+    /// 符号：单字符 / 双字符 / 三字符（`<<=` `>>=`）运算符。
     fn scan_symbol(&mut self) -> Result<Token, LexError> {
         let (line, col) = (self.line, self.col);
         let c = self.consume_char().unwrap();
+        // 三字符移位复合赋值 `<<=` / `>>=`：与双字符移位 `<<`/`>>` 拆开单独处理
+        //（否则 pair 表先命中 Shl/Shr 就返回，第三个 `=` 会被误认成下一个 token）。
+        if let Some(next) = self.chars.peek().copied() {
+            if (c == '<' && next == '<') || (c == '>' && next == '>') {
+                self.consume_char(); // 消费第二个 '<' / '>'
+                // 第三个字符是 '=' → 复合移位赋值 `<<=` / `>>=`
+                if self.chars.peek() == Some(&'=') {
+                    self.consume_char();
+                    let kind = if c == '<' { TokenKind::ShlEq } else { TokenKind::ShrEq };
+                    return Ok(Token::new(kind, line, col));
+                }
+                let kind = if c == '<' { TokenKind::Shl } else { TokenKind::Shr };
+                return Ok(Token::new(kind, line, col));
+            }
+        }
         // 双字符符号
         if let Some(next) = self.chars.peek().copied() {
             let pair = match (c, next) {
@@ -681,6 +735,18 @@ impl<'a> Lexer<'a> {
                 ('|', '|') => Some(TokenKind::OrOr),
                 ('.', '.') => Some(TokenKind::DotDot),
                 ('-', '>') => Some(TokenKind::Arrow),
+                // M4 复合赋值：`op =`
+                ('+', '=') => Some(TokenKind::PlusEq),
+                ('-', '=') => Some(TokenKind::MinusEq),
+                ('*', '=') => Some(TokenKind::StarEq),
+                ('/', '=') => Some(TokenKind::SlashEq),
+                ('%', '=') => Some(TokenKind::PercentEq),
+                ('&', '=') => Some(TokenKind::AmpEq),
+                ('|', '=') => Some(TokenKind::PipeEq),
+                ('^', '=') => Some(TokenKind::CaretEq),
+                // M4 自增自减：`++` / `--`
+                ('+', '+') => Some(TokenKind::Inc),
+                ('-', '-') => Some(TokenKind::Dec),
                 _ => None,
             };
             if let Some(kind) = pair {
@@ -709,6 +775,11 @@ impl<'a> Lexer<'a> {
             '<' => TokenKind::Lt,
             '>' => TokenKind::Gt,
             '!' => TokenKind::Bang,
+            // M4 位运算与三目
+            '&' => TokenKind::Amp,
+            '|' => TokenKind::Pipe,
+            '^' => TokenKind::Caret,
+            '?' => TokenKind::Question,
             other => {
                 return Err(LexError {
                     span: Span { line, col },
@@ -758,6 +829,31 @@ mod tests {
             assert!(
                 !toks.iter().any(|t| t.kind == TokenKind::Semi),
                 "源码 {src:?} 行尾是二元运算符，不应补分号"
+            );
+        }
+    }
+
+    /// 行尾是 M4 运算符（复合赋值/位运算/移位/三目问号）→ 语句未结束，不补分号；
+    /// 但 `++`/`--` 不算二元运算符，后缀 `i++\n` 行尾应补分号结束语句。
+    #[test]
+    fn 行尾m4运算符不补分号() {
+        for src in [
+            "x +=\n1", "x -=\n1", "x *=\n1", "x /=\n1", "x %=\n1", "x &=\n1", "x |=\n1",
+            "x ^=\n1", "x <<=\n1", "x >>=\n1", "a &\nb", "a |\nb", "a ^\nb", "a <<\nb",
+            "a >>\nb", "a ?\nb : c",
+        ] {
+            let toks = tokenize(src).expect("不应报错");
+            assert!(
+                !toks.iter().any(|t| t.kind == TokenKind::Semi),
+                "源码 {src:?} 行尾是 M4 运算符，不应补分号"
+            );
+        }
+        // 对照组：后缀 `i++` / `i--` 行尾应补分号（自增自减不加入 is_bin_op）
+        for src in ["i++\n", "i--\n"] {
+            let toks = tokenize(src).expect("不应报错");
+            assert!(
+                toks.iter().any(|t| t.kind == TokenKind::Semi),
+                "源码 {src:?} 行尾是自增/自减，应补分号结束语句"
             );
         }
     }
@@ -1046,8 +1142,10 @@ mod tests {
             assert_eq!(toks[i].kind, *w, "第 {i} 个双字符符号");
         }
         assert!(matches!(toks[want2.len()].kind, TokenKind::Eof));
-        // 单字符符号（含显式分号）
-        let toks = tokenize("(){}[],:;.+*-/%=<>!").expect("不应报错");
+        // 单字符符号（含显式分号）。
+        // 注：`%` 与 `=` 之间加空格隔开——M4 起 `%=` 是复合赋值 PercentEq 单 token，
+        // 本测试只验证「单字符符号」的逐个识别，故避免 `%=` 相邻被吞并。
+        let toks = tokenize("(){}[],:;.+*-/% =<>!").expect("不应报错");
         let want1 = [
             TokenKind::LParen,
             TokenKind::RParen,
@@ -1073,6 +1171,44 @@ mod tests {
             assert_eq!(toks[i].kind, *w, "第 {i} 个单字符符号");
         }
         assert!(matches!(toks[want1.len()].kind, TokenKind::Eof));
+    }
+
+    /// M4 运算符扩展识别：复合赋值（含三字符 `<<=`/`>>=`）、位运算、移位、自增自减、三目问号。
+    #[test]
+    fn m4运算符扩展识别() {
+        // 复合赋值：`+=` 等（`<<=`/`>>=` 是三字符，验证先吃 `<<` 再特判 `=`）
+        let toks = tokenize("x += 1").expect("不应报错");
+        assert!(matches!(toks[1].kind, TokenKind::PlusEq), "复合加等应识别为 PlusEq");
+        let toks = tokenize("x <<= 2").expect("不应报错");
+        assert!(matches!(toks[1].kind, TokenKind::ShlEq), "三字符 <<= 应识别为 ShlEq");
+        let toks = tokenize("x >>= 2").expect("不应报错");
+        assert!(matches!(toks[1].kind, TokenKind::ShrEq), "三字符 >>= 应识别为 ShrEq");
+        let toks = tokenize("a -= b *= c /= d %= e").expect("不应报错");
+        assert!(matches!(toks[1].kind, TokenKind::MinusEq));
+        assert!(matches!(toks[3].kind, TokenKind::StarEq));
+        assert!(matches!(toks[5].kind, TokenKind::SlashEq));
+        assert!(matches!(toks[7].kind, TokenKind::PercentEq));
+        let toks = tokenize("a &= b |= c ^= d").expect("不应报错");
+        assert!(matches!(toks[1].kind, TokenKind::AmpEq));
+        assert!(matches!(toks[3].kind, TokenKind::PipeEq));
+        assert!(matches!(toks[5].kind, TokenKind::CaretEq));
+        // 纯移位：`<<` / `>>`（不是复合赋值）
+        let toks = tokenize("a << b >> c").expect("不应报错");
+        assert!(matches!(toks[1].kind, TokenKind::Shl));
+        assert!(matches!(toks[3].kind, TokenKind::Shr));
+        // 位运算单字符：`&` / `|` / `^`
+        let toks = tokenize("a & b | c ^ d").expect("不应报错");
+        assert!(matches!(toks[1].kind, TokenKind::Amp));
+        assert!(matches!(toks[3].kind, TokenKind::Pipe));
+        assert!(matches!(toks[5].kind, TokenKind::Caret));
+        // 三目：`?` 与 `:`（`:` 仍是 Colon）
+        let toks = tokenize("a ? b : c").expect("不应报错");
+        assert!(matches!(toks[1].kind, TokenKind::Question));
+        assert!(matches!(toks[3].kind, TokenKind::Colon));
+        // 自增自减：`++` / `--`
+        let toks = tokenize("i++ j--").expect("不应报错");
+        assert!(matches!(toks[1].kind, TokenKind::Inc));
+        assert!(matches!(toks[3].kind, TokenKind::Dec));
     }
 
     /// 无法识别的字符（如 `@`）→ 报错，消息含「无法识别」。

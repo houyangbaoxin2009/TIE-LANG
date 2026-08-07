@@ -264,8 +264,24 @@ impl<'a> Env<'a> {
                 Ok(Flow::Normal(Some(val)))
             }
             Stmt::Assign(a) => {
-                let val = self.eval_expr(&a.value)?;
-                self.assign(&a.target, val)?;
+                // 复合赋值（M4）：load 目标当前值 → 与右值做二元运算 → 写回
+                match a.op {
+                    // 普通赋值：直接求右值并写回
+                    None => {
+                        let val = self.eval_expr(&a.value)?;
+                        self.assign(&a.target, val)?;
+                    }
+                    // 复合赋值（+= -= *= /= %= &= |= ^= <<= >>=）：
+                    // 目标必须已声明（语义/运行时均校验）；BinaryOp 是 Copy，直接取出
+                    Some(op) => {
+                        let cur = self
+                            .lookup(&a.target)
+                            .ok_or_else(|| format!("变量 '{}' 未声明", a.target))?;
+                        let rv = self.eval_expr(&a.value)?;
+                        let val = self.eval_binary(op, cur, rv)?;
+                        self.assign(&a.target, val)?;
+                    }
+                }
                 Ok(Flow::Normal(None))
             }
             Stmt::Return(r) => {
@@ -354,6 +370,17 @@ impl<'a> Env<'a> {
                 .lookup(name)
                 .ok_or_else(|| format!("变量 '{name}' 未声明")),
             Expr::Unary { op, operand, .. } => {
+                // 自增/自减（M4）：操作数必须是变量（语义层保证），
+                // 需可写访问（load 当前值 → ±1 → assign 写回），先走专门路径
+                if matches!(
+                    op,
+                    tie_frontend::ast::UnaryOp::PreInc
+                        | tie_frontend::ast::UnaryOp::PreDec
+                        | tie_frontend::ast::UnaryOp::PostInc
+                        | tie_frontend::ast::UnaryOp::PostDec
+                ) {
+                    return self.eval_inc_dec(*op, operand);
+                }
                 let v = self.eval_expr(operand)?;
                 match op {
                     tie_frontend::ast::UnaryOp::Neg => match v {
@@ -365,12 +392,30 @@ impl<'a> Env<'a> {
                         Value::Bool(b) => Ok(Value::Bool(!b)),
                         _ => Err("逻辑非只能作用于布尔".into()),
                     },
+                    // 自增/自减已在上方 eval_inc_dec 提前返回，此处不可达
+                    tie_frontend::ast::UnaryOp::PreInc
+                    | tie_frontend::ast::UnaryOp::PreDec
+                    | tie_frontend::ast::UnaryOp::PostInc
+                    | tie_frontend::ast::UnaryOp::PostDec => {
+                        unreachable!("自增/自减已在 eval_inc_dec 中处理")
+                    }
                 }
             }
             Expr::Binary { op, lhs, rhs, .. } => {
                 let l = self.eval_expr(lhs)?;
                 let r = self.eval_expr(rhs)?;
                 self.eval_binary(*op, l, r)
+            }
+            Expr::Ternary { cond, then_expr, else_expr, .. } => {
+                // 三目运算 `cond ? then : else`（M4）：短路求值——
+                // 先求条件，真则求 then，假则求 else（只求所选分支）。
+                // 条件判断与 if 语句一致（is_truthy：必须布尔）。
+                let c = self.eval_expr(cond)?;
+                if c.is_truthy()? {
+                    self.eval_expr(then_expr)
+                } else {
+                    self.eval_expr(else_expr)
+                }
             }
             Expr::Range { start, end, .. } => {
                 let s = match self.eval_expr(start)? {
@@ -398,6 +443,53 @@ impl<'a> Env<'a> {
     /// 求值实参列表。
     fn eval_args(&mut self, args: &[Expr]) -> Result<Vec<Value>, String> {
         args.iter().map(|a| self.eval_expr(a)).collect()
+    }
+
+    /// 自增/自减（M4）：`++x` / `--x` / `x++` / `x--`。
+    ///
+    /// 操作数必须是变量（语义层保证），流程：load 当前值 → ±1 → assign 写回；
+    /// 前缀（++x/--x）返回**新值**，后缀（x++/x--）返回**旧值**。
+    /// 整数与浮点都支持（±1 / ±1.0）。
+    fn eval_inc_dec(
+        &mut self,
+        op: tie_frontend::ast::UnaryOp,
+        operand: &Expr,
+    ) -> Result<Value, String> {
+        let Expr::Var(name) = operand else {
+            return Err("自增/自减只支持变量".into());
+        };
+        // 取当前值（变量必须已声明）
+        let cur = self
+            .lookup(name)
+            .ok_or_else(|| format!("变量 '{name}' 未声明"))?;
+        // 按当前值类型计算新值：整数 ±1，浮点 ±1.0
+        let new = match &cur {
+            Value::Int(n) => {
+                let d = if matches!(op, tie_frontend::ast::UnaryOp::PreInc | tie_frontend::ast::UnaryOp::PostInc) {
+                    1
+                } else {
+                    -1
+                };
+                Value::Int(n + d)
+            }
+            Value::Float(n) => {
+                let d = if matches!(op, tie_frontend::ast::UnaryOp::PreInc | tie_frontend::ast::UnaryOp::PostInc) {
+                    1.0
+                } else {
+                    -1.0
+                };
+                Value::Float(n + d)
+            }
+            _ => return Err("自增/自减只能作用于数字".into()),
+        };
+        // 写回变量
+        self.assign(name, new.clone())?;
+        // 前缀返回新值，后缀返回旧值
+        Ok(if matches!(op, tie_frontend::ast::UnaryOp::PreInc | tie_frontend::ast::UnaryOp::PreDec) {
+            new
+        } else {
+            cur
+        })
     }
 
     /// 二元运算求值（动态类型检查）。
@@ -459,6 +551,24 @@ impl<'a> Env<'a> {
                 BinaryOp::And | BinaryOp::Or => {
                     return Err("整数不能做逻辑运算（需布尔）".into());
                 }
+                // M4 位运算（仅整数）：按位与/或/异或
+                BinaryOp::BitAnd => Value::Int(a & b),
+                BinaryOp::BitOr => Value::Int(a | b),
+                BinaryOp::BitXor => Value::Int(a ^ b),
+                // M4 移位：Rust 移位量是 u32 且越界会 panic，
+                // 保守限制移位量必须在 0..64 范围内（i64 位宽）
+                BinaryOp::Shl => {
+                    if !(0..64).contains(&b) {
+                        return Err("左移量必须在 0..64 范围内".into());
+                    }
+                    Value::Int(a << b as u32)
+                }
+                BinaryOp::Shr => {
+                    if !(0..64).contains(&b) {
+                        return Err("右移量必须在 0..64 范围内".into());
+                    }
+                    Value::Int(a >> b as u32)
+                }
             }),
             (Value::Float(a), Value::Float(b)) => match op {
                 BinaryOp::Add => Ok(Value::Float(a + b)),
@@ -473,12 +583,18 @@ impl<'a> Env<'a> {
                 BinaryOp::Le => Ok(Value::Bool(a <= b)),
                 BinaryOp::Ge => Ok(Value::Bool(a >= b)),
                 BinaryOp::And | BinaryOp::Or => Err("浮点数不能做逻辑运算（需布尔）".into()),
+                // M4 位运算/移位只支持整数（语义层已拦，此处防御）
+                BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::Shl
+                | BinaryOp::Shr => Err("位运算/移位只支持整数".into()),
             },
             (Value::Bool(a), Value::Bool(b)) => match op {
                 BinaryOp::And => Ok(Value::Bool(a && b)),
                 BinaryOp::Or => Ok(Value::Bool(a || b)),
                 BinaryOp::Eq => Ok(Value::Bool(a == b)),
                 BinaryOp::NotEq => Ok(Value::Bool(a != b)),
+                // M4 位运算/移位/算术对布尔不合法（明确报错，与其余运算符一致）
+                BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::Shl
+                | BinaryOp::Shr => Err("位运算/移位只支持整数".into()),
                 _ => Err("布尔只能做逻辑运算与相等比较".into()),
             },
             _ => Err(format!(
@@ -640,6 +756,12 @@ fn op_display(op: tie_frontend::ast::BinaryOp) -> &'static str {
         BinaryOp::Ge => ">=",
         BinaryOp::And => "&&",
         BinaryOp::Or => "||",
+        // M4 位运算/移位（错误提示用）
+        BinaryOp::BitAnd => "&",
+        BinaryOp::BitOr => "|",
+        BinaryOp::BitXor => "^",
+        BinaryOp::Shl => "<<",
+        BinaryOp::Shr => ">>",
     }
 }
 
@@ -721,5 +843,59 @@ mod tests {
         let mut s = Session::new();
         s.eval("var x = 1").unwrap();
         assert_eq!(s.eval("x + 1").unwrap(), "2");
+    }
+
+    // ---------- M4 运算符扩展测试 ----------
+
+    #[test]
+    fn eval_bitwise() {
+        assert_eq!(ev("5 & 3").unwrap(), "1");
+        assert_eq!(ev("5 | 8").unwrap(), "13");
+        assert_eq!(ev("5 ^ 1").unwrap(), "4");
+        assert_eq!(ev("8 >> 2").unwrap(), "2");
+        assert_eq!(ev("1 << 3").unwrap(), "8");
+        // 负数右移：算术右移（高位补 1）
+        assert_eq!(ev("-8 >> 2").unwrap(), "-2");
+        // 移位量越界 → 报错（不 panic）
+        assert!(ev("1 << 64").is_err());
+    }
+
+    #[test]
+    fn eval_compound_assign() {
+        assert_eq!(ev("var x: i64 = 1; x += 2; x").unwrap(), "3");
+        assert_eq!(ev("var x: i64 = 12; x -= 1; x").unwrap(), "11");
+        assert_eq!(ev("var x: i64 = 3; x *= 4; x").unwrap(), "12");
+        assert_eq!(ev("var x: i64 = 10; x /= 2; x").unwrap(), "5");
+        assert_eq!(ev("var x: i64 = 5; x %= 3; x").unwrap(), "2");
+        // 位运算复合赋值
+        assert_eq!(ev("var x: i64 = 5; x &= 3; x").unwrap(), "1");
+        assert_eq!(ev("var x: i64 = 5; x |= 8; x").unwrap(), "13");
+        assert_eq!(ev("var x: i64 = 5; x ^= 1; x").unwrap(), "4");
+        assert_eq!(ev("var x: i64 = 1; x <<= 3; x").unwrap(), "8");
+        assert_eq!(ev("var x: i64 = 8; x >>= 2; x").unwrap(), "2");
+        // 字符串复合拼接
+        assert_eq!(ev("var s = \"a\"; s += \"b\"; s").unwrap(), "ab");
+    }
+
+    #[test]
+    fn eval_ternary() {
+        assert_eq!(ev("1 > 0 ? 10 : 20").unwrap(), "10");
+        assert_eq!(ev("1 < 0 ? 10 : 20").unwrap(), "20");
+        // 嵌套三目 + 变量
+        assert_eq!(ev("var x: i64 = 5; (x > 0 ? 1 : 0) + 1").unwrap(), "2");
+    }
+
+    #[test]
+    fn eval_inc_dec() {
+        // 语句形式：后缀/前缀自增自减后变量值
+        assert_eq!(ev("var x = 1; x++; x").unwrap(), "2");
+        assert_eq!(ev("var x = 1; ++x; x").unwrap(), "2");
+        assert_eq!(ev("var x = 2; x--; x").unwrap(), "1");
+        assert_eq!(ev("var x = 2; --x; x").unwrap(), "1");
+        // 表达式形式：后缀返回旧值、前缀返回新值
+        assert_eq!(ev("var x = 1; x++ + x").unwrap(), "3"); // x++ → 1，随后 x=2 → 1+2
+        assert_eq!(ev("var x = 1; ++x + x").unwrap(), "4"); // ++x → 2，随后 x=2 → 2+2
+        // 浮点自增
+        assert_eq!(ev("var x = 1.5; x++; x").unwrap(), "2.5");
     }
 }

@@ -478,7 +478,7 @@ impl Analyzer {
                 Ok(())
             }
             Stmt::Assign(a) => {
-                // 赋值：目标必须已声明；const 不可变；类型必须匹配
+                // 赋值：目标必须已声明；const 不可变；普通赋值类型匹配 / 复合赋值按运算符校验
                 let target_ty = match scope.get(&a.target) {
                     Some(t) => t.clone(),
                     None => {
@@ -490,15 +490,18 @@ impl Analyzer {
                 };
                 let value_ty = self.infer_expr(&a.value, scope)?;
                 self.result.expr_types.insert(addr_of(&a.value), value_ty.clone());
-                // const 变量不允许重新赋值
+                // const 变量不允许重新赋值（普通赋值与复合赋值一律禁止）
                 if self.result.const_vars.contains(&a.target) {
                     return Err(SemanticError {
                         span: a.span,
                         message: format!("不能给 const 变量 '{}' 赋值", a.target),
                     });
                 }
-                // 类型必须兼容（无字面量适配：赋值用变量原本的具体类型）
-                if !types_match(&target_ty, &value_ty, Some(&a.value)) {
+                // 复合赋值：按运算符类型规则校验（字符串 += 先放行，其余按运算符要求）
+                if let Some(op) = a.op {
+                    self.check_compound_assign(&target_ty, op, &value_ty, &a.value, a.span)?;
+                } else if !types_match(&target_ty, &value_ty, Some(&a.value)) {
+                    // 普通赋值：类型必须兼容（字面量可适配目标类型）
                     return Err(SemanticError {
                         span: a.span,
                         message: format!(
@@ -702,7 +705,10 @@ impl Analyzer {
                     })?;
                 let value_ty = self.infer_expr(&fa.value, scope)?;
                 self.result.expr_types.insert(addr_of(&fa.value), value_ty.clone());
-                if !types_match(&field_ty, &value_ty, Some(&fa.value)) {
+                // 复合字段赋值：按运算符类型规则校验（与 Assign 共用辅助函数）
+                if let Some(op) = fa.op {
+                    self.check_compound_assign(&field_ty, op, &value_ty, &fa.value, fa.span)?;
+                } else if !types_match(&field_ty, &value_ty, Some(&fa.value)) {
                     return Err(SemanticError {
                         span: fa.span,
                         message: format!(
@@ -910,6 +916,32 @@ impl Analyzer {
                         }
                         TypeSpec::Named(TyKw::Bool)
                     }
+                    // M4 自增自减（前缀 ++/-- 与后缀 ++/--）：操作数必须是可写的数字变量/字段
+                    UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::PostInc | UnaryOp::PostDec => {
+                        // const 变量：专门报错（与普通赋值的报错风格一致）
+                        if let Expr::Var(name) = operand.as_ref() {
+                            if self.result.const_vars.contains(name) {
+                                return Err(SemanticError {
+                                    span: *span,
+                                    message: format!("不能对 const 变量 '{name}' 自增/自减"),
+                                });
+                            }
+                        } else if !matches!(operand.as_ref(), Expr::FieldAccess { .. }) {
+                            // 其余不可写操作数（字面量/调用结果等）
+                            return Err(SemanticError {
+                                span: *span,
+                                message: "自增/自减的操作数必须是可写数字变量".into(),
+                            });
+                        }
+                        // 类型必须是数字（整数或浮点）
+                        if !is_number(&ot) {
+                            return Err(SemanticError {
+                                span: *span,
+                                message: "自增/自减的操作数必须是可写数字变量".into(),
+                            });
+                        }
+                        ot
+                    }
                 }
             }
             Expr::Binary { op, lhs, rhs, span } => {
@@ -989,7 +1021,43 @@ impl Analyzer {
                         }
                         TypeSpec::Named(TyKw::Bool)
                     }
+                    // M4 位运算与移位：仅支持整数（浮点不行，is_number 不够精确）
+                    BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::Shl | BinaryOp::Shr => {
+                        if !lt.is_int() {
+                            return Err(SemanticError {
+                                span: *span,
+                                message: format!("位运算只支持整数，不能用于 {}", type_name(&lt)),
+                            });
+                        }
+                        lt
+                    }
                 }
+            }
+            Expr::Ternary { cond, then_expr, else_expr, span } => {
+                // M4 三目：条件必须是 bool，两分支类型必须一致，返回 then 分支的类型
+                let ct = self.infer_expr(cond, scope)?;
+                self.result.expr_types.insert(addr_of(cond), ct.clone());
+                if !is_bool_like(&ct) {
+                    return Err(SemanticError {
+                        span: *span,
+                        message: "三目条件必须是 bool".into(),
+                    });
+                }
+                let then_ty = self.infer_expr(then_expr, scope)?;
+                self.result.expr_types.insert(addr_of(then_expr), then_ty.clone());
+                let else_ty = self.infer_expr(else_expr, scope)?;
+                self.result.expr_types.insert(addr_of(else_expr), else_ty.clone());
+                if !types_compatible(&then_ty, &else_ty) {
+                    return Err(SemanticError {
+                        span: *span,
+                        message: format!(
+                            "三目两分支类型不一致：{} 与 {}",
+                            type_name(&then_ty),
+                            type_name(&else_ty)
+                        ),
+                    });
+                }
+                then_ty
             }
             Expr::Range { start, end, span } => {
                 let st = self.infer_expr(start, scope)?;
@@ -1273,6 +1341,116 @@ impl Analyzer {
         }
         Ok(())
     }
+
+    /// 复合赋值类型校验（M4）：`x op= v` 中 op 对应的二元运算对 target/value 的类型要求。
+    ///
+    /// 规则（与 infer_expr 的 Binary 分支类型规则对齐）：
+    /// - `+=`：数字相加，或字符串拼接复合（target 是 string 且 value 也是 string，先放行）；
+    /// - `-=` / `*=` / `/=`：两侧数字且兼容；
+    /// - `%=`：仅整数（取模只支持整数）；
+    /// - 位运算复合（`&=` `|=` `^=` `<<=` `>>=`）：仅整数；
+    /// - 比较/逻辑运算符不能用于复合赋值。
+    ///
+    /// 值表达式用 types_match（含整数字面量适配目标类型，与 `x += 1` 中 1 适配 x 的类型一致）。
+    fn check_compound_assign(
+        &self,
+        target_ty: &TypeSpec,
+        op: BinaryOp,
+        value_ty: &TypeSpec,
+        value: &Expr,
+        span: Span,
+    ) -> Result<(), SemanticError> {
+        // 值必须与目标类型匹配（含字面量适配）；字符串拼接的 Add 由上面的分支放行后同样要校验
+        let ty_ok = || types_match(target_ty, value_ty, Some(value));
+        match op {
+            // 字符串拼接复合：`s += "a"`（target 是 string 且 value 也是 string）
+            BinaryOp::Add if matches!(target_ty, TypeSpec::Named(TyKw::Str)) => {
+                if !ty_ok() {
+                    return Err(SemanticError {
+                        span,
+                        message: format!(
+                            "复合赋值类型不匹配：目标类型 {} 与表达式 {}",
+                            type_name(target_ty),
+                            type_name(value_ty)
+                        ),
+                    });
+                }
+                Ok(())
+            }
+            // 算术复合：`+=`（数字）`-=` `*=` `/=`（数字且兼容）
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+                if !target_ty.is_number() {
+                    return Err(SemanticError {
+                        span,
+                        message: format!("复合赋值运算符不能用于 {}", type_name(target_ty)),
+                    });
+                }
+                if !ty_ok() {
+                    return Err(SemanticError {
+                        span,
+                        message: format!(
+                            "复合赋值类型不匹配：目标类型 {} 与表达式 {}",
+                            type_name(target_ty),
+                            type_name(value_ty)
+                        ),
+                    });
+                }
+                Ok(())
+            }
+            // 取模复合：`%=` 仅整数
+            BinaryOp::Mod => {
+                if !target_ty.is_int() {
+                    return Err(SemanticError {
+                        span,
+                        message: format!("复合赋值取模只支持整数，目标类型是 {}", type_name(target_ty)),
+                    });
+                }
+                if !ty_ok() {
+                    return Err(SemanticError {
+                        span,
+                        message: format!(
+                            "复合赋值类型不匹配：目标类型 {} 与表达式 {}",
+                            type_name(target_ty),
+                            type_name(value_ty)
+                        ),
+                    });
+                }
+                Ok(())
+            }
+            // 位运算复合：`&=` `|=` `^=` `<<=` `>>=` 仅整数
+            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::Shl | BinaryOp::Shr => {
+                if !target_ty.is_int() {
+                    return Err(SemanticError {
+                        span,
+                        message: format!("复合赋值位运算只支持整数，目标类型是 {}", type_name(target_ty)),
+                    });
+                }
+                if !ty_ok() {
+                    return Err(SemanticError {
+                        span,
+                        message: format!(
+                            "复合赋值类型不匹配：目标类型 {} 与表达式 {}",
+                            type_name(target_ty),
+                            type_name(value_ty)
+                        ),
+                    });
+                }
+                Ok(())
+            }
+            // 比较/逻辑运算符不能用于复合赋值
+            BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::Gt
+            | BinaryOp::Le
+            | BinaryOp::Ge
+            | BinaryOp::And
+            | BinaryOp::Or => Err(SemanticError {
+                span,
+                message: "无效的复合赋值运算符".into(),
+            }),
+        }
+    }
 }
 
 // ---------- 辅助 ----------
@@ -1311,6 +1489,7 @@ fn expr_span_of(expr: &Expr) -> Span {
         Expr::Call { span, .. }
         | Expr::Unary { span, .. }
         | Expr::Binary { span, .. }
+        | Expr::Ternary { span, .. }
         | Expr::Range { span, .. }
         | Expr::TableLit { span, .. }
         | Expr::Index { span, .. }
@@ -1976,6 +2155,169 @@ mod tests {
             }
             "#,
             "必须通过类名调用",
+        );
+    }
+
+    // ---------- M4 运算符扩展 ----------
+
+    #[test]
+    fn 位运算类型检查() {
+        // i64 位运算/移位合法（& | ^ << >>）
+        let sem = analyze_src(
+            r#"
+            func main() {
+                var x: i64 = 1
+                var y: i64 = x & 3
+                var z: i64 = x | 2 ^ 1
+                var w: i64 = x << 2 >> 1
+            }
+            "#,
+        )
+        .expect("整数位运算应通过语义检查");
+        assert!(sem.expr_types.values().any(|t| *t == TypeSpec::Named(TyKw::I64)));
+        // 浮点位运算报错（位运算只支持整数）——两侧同为 f64 才能命中位运算整数校验
+        expect_err(
+            r#"
+            func main() {
+                var f: f64 = 1.0
+                var g: f64 = 2.0
+                var y = f & g
+            }
+            "#,
+            "位运算只支持整数",
+        );
+    }
+
+    #[test]
+    fn 复合赋值类型检查() {
+        // i64 全部复合赋值运算符通过
+        analyze_src(
+            r#"
+            func main() {
+                var x: i64 = 5
+                x += 1
+                x -= 2
+                x *= 3
+                x /= 4
+                x %= 2
+                x &= 1
+                x |= 2
+                x ^= 3
+                x <<= 1
+                x >>= 2
+            }
+            "#,
+        )
+        .expect("i64 复合赋值应通过");
+        // 字符串拼接复合 `s += "a"` 通过
+        analyze_src(
+            r#"
+            func main() {
+                var s: string = "hello"
+                s += " world"
+            }
+            "#,
+        )
+        .expect("字符串 += 应通过");
+        // 取模复合值类型不匹配（`x %= 1.5`：x 是 i64，1.5 是 f64）报错
+        expect_err(
+            r#"
+            func main() {
+                var x: i64 = 5
+                x %= 1.5
+            }
+            "#,
+            "复合赋值类型不匹配",
+        );
+        // 字符串做减法复合报错（复合赋值运算符不能用于 string）
+        expect_err(
+            r#"
+            func main() {
+                var s: string = "a"
+                s -= "b"
+            }
+            "#,
+            "复合赋值运算符不能用于",
+        );
+    }
+
+    #[test]
+    fn 三目类型检查() {
+        // 两分支同类型（i64）通过
+        analyze_src(
+            r#"
+            func main() {
+                var a: i64 = 1
+                var b: i64 = a > 0 ? 1 : -1
+            }
+            "#,
+        )
+        .expect("三目两分支同类型应通过");
+        // 两分支类型不一致报错
+        expect_err(
+            r#"
+            func main() {
+                var a: i64 = 1
+                var b = a > 0 ? 1 : "x"
+            }
+            "#,
+            "三目两分支类型不一致",
+        );
+        // 条件非 bool 报错
+        expect_err(
+            r#"
+            func main() {
+                var b = 1 ? 2 : 3
+            }
+            "#,
+            "三目条件必须是 bool",
+        );
+    }
+
+    #[test]
+    fn 自增自减类型检查() {
+        // 数字变量自增自减通过（前缀与后缀、整数与浮点）
+        analyze_src(
+            r#"
+            func main() {
+                var x: i64 = 1
+                x++
+                ++x
+                x--
+                --x
+                var f: f64 = 1.0
+                f++
+            }
+            "#,
+        )
+        .expect("数字变量自增自减应通过");
+        // 对 const 变量自增报错
+        expect_err(
+            r#"
+            func main() {
+                const x = 1
+                x++
+            }
+            "#,
+            "不能对 const 变量",
+        );
+        // 对未声明变量自增报错
+        expect_err(
+            r#"
+            func main() {
+                y++
+            }
+            "#,
+            "未声明的变量",
+        );
+        // 对字面量（不可写）自增报错
+        expect_err(
+            r#"
+            func main() {
+                1++
+            }
+            "#,
+            "自增/自减的操作数必须是可写数字变量",
         );
     }
 }

@@ -204,23 +204,25 @@ impl<'a> Parser<'a> {
     }
 
     /// 表达式语句与赋值语句的统一入口：
-    /// `Ident = ...`（变量名后紧跟等号）→ Assign；`obj.field = ...` → FieldAssign；
+    /// `Ident op= ...`（变量名后紧跟赋值运算符）→ Assign；`obj.field op= ...` → FieldAssign；
     /// 否则解析为普通表达式语句。
     fn parse_expr_or_assign(&mut self) -> Result<Stmt, ParseError> {
+        // 快速路径：变量名后紧跟赋值运算符（`=` 或 `+=` 等复合赋值）→ Assign
         if let TokenKind::Ident(name) = self.peek_kind() {
             let name = name.clone();
-            if self.tokens.get(self.pos + 1).map(|t| &t.kind) == Some(&TokenKind::Eq) {
+            if self.tokens.get(self.pos + 1).map(|t| is_assign_op_kind(&t.kind)).unwrap_or(false) {
                 let span = self.advance().span; // 目标变量名
-                self.expect(TokenKind::Eq, "'='")?;
+                // 预探测已确认是赋值运算符，flatten 取出内层 Option<BinaryOp>（Eq→None）
+                let op = self.eat_assign_op().flatten();
                 let value = self.parse_expr()?;
                 self.expect(TokenKind::Semi, "语句结束符")?;
-                return Ok(Stmt::Assign(AssignStmt { target: name, value, span }));
+                return Ok(Stmt::Assign(AssignStmt { target: name, op, value, span }));
             }
         }
-        // 字段赋值：`obj.field = expr`（base 限定 Var/this 或字段链，见语义层校验）。
-        // 先解析完整表达式，若后跟 `=` 且表达式是纯字段访问链 → FieldAssign。
+        // 字段赋值：`obj.field op= expr`（base 限定 Var/this 或字段链，见语义层校验）。
+        // 先解析完整表达式，若后跟赋值运算符且表达式是纯字段访问链 → FieldAssign。
         let expr = self.parse_expr()?;
-        if self.eat(&TokenKind::Eq) {
+        if let Some(op) = self.eat_assign_op() {
             match &expr {
                 // base 必须可寻址：变量/this 或 FieldAccess 链（`obj.a.b = v`）
                 Expr::FieldAccess { base, field, span } if is_addressable_base(base) => {
@@ -230,6 +232,7 @@ impl<'a> Parser<'a> {
                     return Ok(Stmt::FieldAssign(FieldAssignStmt {
                         base: base.clone(),
                         field: field.clone(),
+                        op,
                         value,
                         span: fspan,
                     }));
@@ -241,6 +244,7 @@ impl<'a> Parser<'a> {
                     self.expect(TokenKind::Semi, "语句结束符")?;
                     return Ok(Stmt::Assign(AssignStmt {
                         target: name.clone(),
+                        op,
                         value,
                         span: aspan,
                     }));
@@ -251,6 +255,31 @@ impl<'a> Parser<'a> {
             }
         }
         self.parse_expr_stmt_tail(expr).map(Stmt::Expr)
+    }
+
+    /// 尝试消费一个赋值运算符（`=` 或复合赋值 `+=` 等）。
+    ///
+    /// 返回值的三层含义：
+    /// - `None`：当前 token 不是赋值运算符（没匹配到）；
+    /// - `Some(None)`：普通赋值 `=`；
+    /// - `Some(Some(op))`：复合赋值（如 `+=` → BinaryOp::Add）。
+    fn eat_assign_op(&mut self) -> Option<Option<BinaryOp>> {
+        let op = match self.peek_kind() {
+            TokenKind::Eq => None,
+            TokenKind::PlusEq => Some(BinaryOp::Add),
+            TokenKind::MinusEq => Some(BinaryOp::Sub),
+            TokenKind::StarEq => Some(BinaryOp::Mul),
+            TokenKind::SlashEq => Some(BinaryOp::Div),
+            TokenKind::PercentEq => Some(BinaryOp::Mod),
+            TokenKind::AmpEq => Some(BinaryOp::BitAnd),
+            TokenKind::PipeEq => Some(BinaryOp::BitOr),
+            TokenKind::CaretEq => Some(BinaryOp::BitXor),
+            TokenKind::ShlEq => Some(BinaryOp::Shl),
+            TokenKind::ShrEq => Some(BinaryOp::Shr),
+            _ => return None,
+        };
+        self.advance();
+        Some(op)
     }
 
     /// 表达式语句尾处理：以分号/ASI 结束。
@@ -640,12 +669,33 @@ impl<'a> Parser<'a> {
     // ---------- 表达式解析（优先级爬升） ----------
 
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        // 范围运算符 `..` 优先级最低：`a..b` 先解析 lhs，再解析 rhs
-        let lhs = self.parse_or()?;
+        // 范围运算符 `..` 优先级最低：先解析三目，再检查范围
+        let lhs = self.parse_ternary()?;
         if self.eat(&TokenKind::DotDot) {
             let end = self.parse_expr()?;
             let span = expr_span(&lhs).unwrap_or(self.peek().span);
             return Ok(Expr::Range { start: Box::new(lhs), end: Box::new(end), span });
+        }
+        Ok(lhs)
+    }
+
+    /// 三目运算符 `cond ? then : else`（M4，优先级仅高于范围、低于 `||`）。
+    ///
+    /// 右结合：`?` 后的 then 分支与 `:` 后的 else 分支都用 parse_expr 递归，
+    /// 因此 `a ? b ? 1 : 2 : 3` 解析为 `a ? (b ? 1 : 2) : 3`（与 C 一致）。
+    fn parse_ternary(&mut self) -> Result<Expr, ParseError> {
+        let lhs = self.parse_or()?;
+        if self.eat(&TokenKind::Question) {
+            let then_expr = self.parse_expr()?;
+            self.expect(TokenKind::Colon, "':'")?;
+            let else_expr = self.parse_expr()?;
+            let span = expr_span(&lhs).unwrap_or(self.peek().span);
+            return Ok(Expr::Ternary {
+                cond: Box::new(lhs),
+                then_expr: Box::new(then_expr),
+                else_expr: Box::new(else_expr),
+                span,
+            });
         }
         Ok(lhs)
     }
@@ -661,11 +711,44 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_and(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_equality()?;
+        let mut lhs = self.parse_bit_or()?;
         while self.eat(&TokenKind::AndAnd) {
-            let rhs = self.parse_equality()?;
+            let rhs = self.parse_bit_or()?;
             let span = expr_span(&lhs).unwrap_or(self.peek().span);
             lhs = Expr::Binary { op: BinaryOp::And, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+        }
+        Ok(lhs)
+    }
+
+    /// 按位或 `|`（M4，优先级：低于 `&&`、高于 `^`）。逐级调用 parse_bit_xor。
+    fn parse_bit_or(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_bit_xor()?;
+        while self.eat(&TokenKind::Pipe) {
+            let rhs = self.parse_bit_xor()?;
+            let span = expr_span(&lhs).unwrap_or(self.peek().span);
+            lhs = Expr::Binary { op: BinaryOp::BitOr, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+        }
+        Ok(lhs)
+    }
+
+    /// 按位异或 `^`（M4，优先级：低于 `|`、高于 `&`）。逐级调用 parse_bit_and。
+    fn parse_bit_xor(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_bit_and()?;
+        while self.eat(&TokenKind::Caret) {
+            let rhs = self.parse_bit_and()?;
+            let span = expr_span(&lhs).unwrap_or(self.peek().span);
+            lhs = Expr::Binary { op: BinaryOp::BitXor, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+        }
+        Ok(lhs)
+    }
+
+    /// 按位与 `&`（M4，优先级：低于 `^`、高于 `== !=`）。逐级调用 parse_equality。
+    fn parse_bit_and(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_equality()?;
+        while self.eat(&TokenKind::Amp) {
+            let rhs = self.parse_equality()?;
+            let span = expr_span(&lhs).unwrap_or(self.peek().span);
+            lhs = Expr::Binary { op: BinaryOp::BitAnd, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
         }
         Ok(lhs)
     }
@@ -687,13 +770,30 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_term()?;
+        let mut lhs = self.parse_shift()?;
         loop {
             let op = match self.peek_kind() {
                 TokenKind::Lt => BinaryOp::Lt,
                 TokenKind::Gt => BinaryOp::Gt,
                 TokenKind::Le => BinaryOp::Le,
                 TokenKind::Ge => BinaryOp::Ge,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_shift()?;
+            let span = expr_span(&lhs).unwrap_or(self.peek().span);
+            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+        }
+        Ok(lhs)
+    }
+
+    /// 移位 `<<` / `>>`（M4，优先级：低于比较、高于加减）。逐级调用 parse_term。
+    fn parse_shift(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_term()?;
+        loop {
+            let op = match self.peek_kind() {
+                TokenKind::Shl => BinaryOp::Shl,
+                TokenKind::Shr => BinaryOp::Shr,
                 _ => break,
             };
             self.advance();
@@ -749,6 +849,18 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let operand = self.parse_unary()?;
                 Expr::Unary { op: UnaryOp::Not, operand: Box::new(operand), span }
+            }
+            // M4 前缀自增 `++x`：先增后取新值
+            TokenKind::Inc => {
+                self.advance();
+                let operand = self.parse_unary()?;
+                Expr::Unary { op: UnaryOp::PreInc, operand: Box::new(operand), span }
+            }
+            // M4 前缀自减 `--x`：先减后取新值
+            TokenKind::Dec => {
+                self.advance();
+                let operand = self.parse_unary()?;
+                Expr::Unary { op: UnaryOp::PreDec, operand: Box::new(operand), span }
             }
             _ => self.parse_primary()?,
         };
@@ -809,6 +921,14 @@ impl<'a> Parser<'a> {
                     // 字段访问：`.x` / `.Item1` / `.0`（元组与类共用，语义层按 base 类型分发）
                     expr = Expr::FieldAccess { base: Box::new(expr), field, span: base_span };
                 }
+            } else if self.eat(&TokenKind::Inc) {
+                // M4 后缀自增 `x++`：先取旧值后增（用操作数自身 span 包裹）
+                let pspan = expr_span(&expr).unwrap_or(self.peek().span);
+                expr = Expr::Unary { op: UnaryOp::PostInc, operand: Box::new(expr), span: pspan };
+            } else if self.eat(&TokenKind::Dec) {
+                // M4 后缀自减 `x--`：先取旧值后减
+                let pspan = expr_span(&expr).unwrap_or(self.peek().span);
+                expr = Expr::Unary { op: UnaryOp::PostDec, operand: Box::new(expr), span: pspan };
             } else {
                 break;
             }
@@ -1024,6 +1144,7 @@ fn expr_span(expr: &Expr) -> Option<Span> {
         Expr::Call { span, .. }
         | Expr::Unary { span, .. }
         | Expr::Binary { span, .. }
+        | Expr::Ternary { span, .. }
         | Expr::Range { span, .. }
         | Expr::TableLit { span, .. }
         | Expr::Index { span, .. }
@@ -1032,6 +1153,24 @@ fn expr_span(expr: &Expr) -> Option<Span> {
         | Expr::MethodCall { span, .. } => Some(*span),
         _ => None,
     }
+}
+
+/// 是否为赋值运算符 token（`=` 或 `+=` 等复合赋值）——快速路径的预探测用（不消费）。
+fn is_assign_op_kind(kind: &TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Eq
+            | TokenKind::PlusEq
+            | TokenKind::MinusEq
+            | TokenKind::StarEq
+            | TokenKind::SlashEq
+            | TokenKind::PercentEq
+            | TokenKind::AmpEq
+            | TokenKind::PipeEq
+            | TokenKind::CaretEq
+            | TokenKind::ShlEq
+            | TokenKind::ShrEq
+    )
 }
 
 /// 表达式是否可寻址（可作为字段赋值/字段访问的 base）。
@@ -1493,5 +1632,150 @@ mod tests {
             "实际：{}",
             err.message
         );
+    }
+
+    // ---------- M4 运算符扩展 ----------
+
+    #[test]
+    fn 位运算优先级按c标准排列() {
+        // `1 | 2 ^ 3 & 4`：优先级从低到高为 `|` < `^` < `&`
+        // → 顶层 `|`，右操作数是 `^`，`^` 的右操作数是 `&`
+        let prog = parse("func f() -> i64 {\n    return 1 | 2 ^ 3 & 4\n}");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::Return(r) = &f.body[0] else { panic!("期望 return 语句") };
+        let Some(expr) = &r.expr else { panic!("期望返回值") };
+        assert!(matches!(
+            expr,
+            Expr::Binary { op: BinaryOp::BitOr, lhs, rhs, .. }
+                if matches!(lhs.as_ref(), Expr::IntLit(1))
+                    && matches!(
+                        rhs.as_ref(),
+                        Expr::Binary { op: BinaryOp::BitXor, lhs, rhs, .. }
+                            if matches!(lhs.as_ref(), Expr::IntLit(2))
+                                && matches!(
+                                    rhs.as_ref(),
+                                    Expr::Binary { op: BinaryOp::BitAnd, lhs, rhs, .. }
+                                        if matches!(lhs.as_ref(), Expr::IntLit(3))
+                                            && matches!(rhs.as_ref(), Expr::IntLit(4))
+                                )
+                    )
+        ));
+    }
+
+    #[test]
+    fn 移位运算解析为shl与shr() {
+        let prog = parse("func f() -> i64 {\n    return 8 >> 2\n}\nfunc g() -> i64 {\n    return 1 << 3\n}");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::Return(r) = &f.body[0] else { panic!("期望 return 语句") };
+        assert!(matches!(
+            &r.expr,
+            Some(Expr::Binary { op: BinaryOp::Shr, lhs, rhs, .. })
+                if matches!(lhs.as_ref(), Expr::IntLit(8)) && matches!(rhs.as_ref(), Expr::IntLit(2))
+        ));
+        let Stmt::FnDef(g) = &prog.stmts[1] else { panic!("期望函数定义") };
+        let Stmt::Return(r) = &g.body[0] else { panic!("期望 return 语句") };
+        assert!(matches!(
+            &r.expr,
+            Some(Expr::Binary { op: BinaryOp::Shl, lhs, rhs, .. })
+                if matches!(lhs.as_ref(), Expr::IntLit(1)) && matches!(rhs.as_ref(), Expr::IntLit(3))
+        ));
+    }
+
+    #[test]
+    fn 三目运算符解析出条件与两分支() {
+        // `a > 0 ? 1 : -1`：cond 是 `a > 0`，then 是 `1`，else 是 `-1`（一元负号包裹）
+        let prog = parse("func f() -> i64 {\n    return a > 0 ? 1 : -1\n}");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::Return(r) = &f.body[0] else { panic!("期望 return 语句") };
+        let Some(Expr::Ternary { cond, then_expr, else_expr, .. }) = &r.expr else {
+            panic!("期望三目表达式")
+        };
+        assert!(matches!(
+            cond.as_ref(),
+            Expr::Binary { op: BinaryOp::Gt, lhs, rhs, .. }
+                if matches!(lhs.as_ref(), Expr::Var(n) if n == "a")
+                    && matches!(rhs.as_ref(), Expr::IntLit(0))
+        ));
+        assert!(matches!(then_expr.as_ref(), Expr::IntLit(1)));
+        assert!(matches!(
+            else_expr.as_ref(),
+            Expr::Unary { op: UnaryOp::Neg, operand, .. }
+                if matches!(operand.as_ref(), Expr::IntLit(1))
+        ));
+    }
+
+    #[test]
+    fn 嵌套三目右结合解析() {
+        // `a ? b ? 1 : 2 : 3`：外层 then 分支是内层三目（右结合）
+        let prog = parse("func f() -> i64 {\n    return a ? b ? 1 : 2 : 3\n}");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::Return(r) = &f.body[0] else { panic!("期望 return 语句") };
+        let Some(Expr::Ternary { cond, then_expr, else_expr, .. }) = &r.expr else {
+            panic!("期望三目表达式")
+        };
+        assert!(matches!(cond.as_ref(), Expr::Var(n) if n == "a"));
+        // then 分支是嵌套三目 `b ? 1 : 2`
+        assert!(matches!(
+            then_expr.as_ref(),
+            Expr::Ternary { cond, then_expr, else_expr, .. }
+                if matches!(cond.as_ref(), Expr::Var(n) if n == "b")
+                    && matches!(then_expr.as_ref(), Expr::IntLit(1))
+                    && matches!(else_expr.as_ref(), Expr::IntLit(2))
+        ));
+        // else 分支 `3`
+        assert!(matches!(else_expr.as_ref(), Expr::IntLit(3)));
+    }
+
+    #[test]
+    fn 复合赋值解析出运算符与普通赋值op为none() {
+        let prog = parse("func main() {\n    x += 1\n    x = 1\n    obj.f -= 2\n}");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        // `x += 1`：复合加等 op=Some(Add)
+        let Stmt::Assign(a) = &f.body[0] else { panic!("期望赋值语句") };
+        assert_eq!(a.target, "x");
+        assert_eq!(a.op, Some(BinaryOp::Add));
+        // `x = 1`：普通赋值 op=None
+        let Stmt::Assign(a) = &f.body[1] else { panic!("期望赋值语句") };
+        assert_eq!(a.target, "x");
+        assert_eq!(a.op, None);
+        // `obj.f -= 2`：字段复合减等 op=Some(Sub)
+        let Stmt::FieldAssign(fa) = &f.body[2] else { panic!("期望字段赋值语句") };
+        assert!(matches!(fa.base.as_ref(), Expr::Var(n) if n == "obj"));
+        assert_eq!(fa.field, "f");
+        assert_eq!(fa.op, Some(BinaryOp::Sub));
+    }
+
+    #[test]
+    fn 自增自减前缀与后缀解析() {
+        let prog = parse("func main() {\n    ++x\n    x++\n    --y\n    y--\n}");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        // `++x` → PreInc
+        let Stmt::Expr(e) = &f.body[0] else { panic!("期望表达式语句") };
+        assert!(matches!(
+            &e.expr,
+            Expr::Unary { op: UnaryOp::PreInc, operand, .. }
+                if matches!(operand.as_ref(), Expr::Var(n) if n == "x")
+        ));
+        // `x++` → PostInc
+        let Stmt::Expr(e) = &f.body[1] else { panic!("期望表达式语句") };
+        assert!(matches!(
+            &e.expr,
+            Expr::Unary { op: UnaryOp::PostInc, operand, .. }
+                if matches!(operand.as_ref(), Expr::Var(n) if n == "x")
+        ));
+        // `--y` → PreDec
+        let Stmt::Expr(e) = &f.body[2] else { panic!("期望表达式语句") };
+        assert!(matches!(
+            &e.expr,
+            Expr::Unary { op: UnaryOp::PreDec, operand, .. }
+                if matches!(operand.as_ref(), Expr::Var(n) if n == "y")
+        ));
+        // `y--` → PostDec
+        let Stmt::Expr(e) = &f.body[3] else { panic!("期望表达式语句") };
+        assert!(matches!(
+            &e.expr,
+            Expr::Unary { op: UnaryOp::PostDec, operand, .. }
+                if matches!(operand.as_ref(), Expr::Var(n) if n == "y")
+        ));
     }
 }

@@ -370,9 +370,41 @@ impl<'p> IrGenerator<'p> {
                 let bind = self.lookup_var(&a.target).cloned().ok_or_else(|| IrError {
                     message: format!("内部错误：赋值目标 '{}' 未入作用域（函数 {}）", a.target, self.cur_fn),
                 })?;
-                let (val, _ty) = self.gen_expr(&a.value)?;
-                // 按变量的声明类型 store（语义已保证类型匹配）
-                self.line(&format!("store {} {}, ptr {}", bind.ty, val, bind.value));
+                match a.op {
+                    // 普通赋值：直接求右值并 store（按变量的声明类型，语义已保证类型匹配）
+                    None => {
+                        let (val, _ty) = self.gen_expr(&a.value)?;
+                        self.line(&format!("store {} {}, ptr {}", bind.ty, val, bind.value));
+                    }
+                    // 复合赋值（+= -= *= /= %= &= |= ^= <<= >>=，M4）：
+                    // load 目标当前值 → 与右值做二元运算 → store 结果回目标。
+                    // 运算指令生成复用 gen_binary_on_regs（与 gen_binary 同一套逻辑）。
+                    Some(op) => {
+                        let (rv, _rty) = self.gen_expr(&a.value)?;
+                        let cur = self.new_reg();
+                        self.line(&format!("{cur} = load {}, ptr {}", bind.ty, bind.value));
+                        // 目标是否字符串：LLVM 类型名 "ptr" 无法区分字符串与裸指针。
+                        // 复合赋值目标为 ptr 的场景只有字符串拼接（+=），
+                        // 类/元组/数组不进标量复合赋值（语义层已拦），故用 ptr 近似。
+                        let lhs_is_str = bind.ty == "ptr";
+                        // 无符号性：右值表达式的语义类型近似（右值非字面量时与目标同型，
+                        // 字面量默认 i64 有符号——无符号复合除法/取模/右移是边缘场景，
+                        // 早期开发按有符号处理可接受）。
+                        let rhs_is_unsigned = matches!(
+                            self.sem_ty_of(&a.value),
+                            Some(TypeSpec::Named(TyKw::U8 | TyKw::U16 | TyKw::U32 | TyKw::U64))
+                        );
+                        let (res, _t) = self.gen_binary_on_regs(
+                            op,
+                            lhs_is_str,
+                            cur,
+                            bind.ty,
+                            rv,
+                            rhs_is_unsigned,
+                        )?;
+                        self.line(&format!("store {} {}, ptr {}", bind.ty, res, bind.value));
+                    }
+                }
                 Ok(())
             }
             Stmt::Return(r) => match &r.expr {
@@ -445,12 +477,39 @@ impl<'p> IrGenerator<'p> {
         // 字段类型（语义已保证与 value 匹配）
         let fty = info.fields[idx].ty.clone().expect("字段类型已在类收集时解析");
         let f_llvm = self.llvm_ty(&fty);
-        // 值
-        let (val, _t) = self.gen_expr(&fa.value)?;
-        // GEP 到字段偏移，store 直写（Oracle 方案：不读改写）
+        // GEP 定位字段地址（普通赋值与复合赋值共用）
         let ptr = self.new_reg();
         self.line(&format!("{ptr} = getelementptr {base_llvm}, ptr {base_ptr}, i32 0, i32 {idx}"));
-        self.line(&format!("store {f_llvm} {val}, ptr {ptr}"));
+        match fa.op {
+            // 普通赋值：直接 store
+            None => {
+                let (val, _t) = self.gen_expr(&fa.value)?;
+                self.line(&format!("store {f_llvm} {val}, ptr {ptr}"));
+            }
+            // 复合字段赋值（obj.f += v，M4）：
+            // load 字段当前值 → 与右值运算 → store 结果回字段偏移。
+            // 运算生成复用 gen_binary_on_regs；字符串字段拼接（obj.s += "x"）同样支持。
+            Some(op) => {
+                let (rv, _rty) = self.gen_expr(&fa.value)?;
+                let cur = self.new_reg();
+                self.line(&format!("{cur} = load {f_llvm}, ptr {ptr}"));
+                // 无符号性：右值表达式语义类型近似（与标量复合赋值同一简化决策）
+                let lhs_is_str = f_llvm == "ptr";
+                let rhs_is_unsigned = matches!(
+                    self.sem_ty_of(&fa.value),
+                    Some(TypeSpec::Named(TyKw::U8 | TyKw::U16 | TyKw::U32 | TyKw::U64))
+                );
+                let (res, _t) = self.gen_binary_on_regs(
+                    op,
+                    lhs_is_str,
+                    cur,
+                    f_llvm,
+                    rv,
+                    rhs_is_unsigned,
+                )?;
+                self.line(&format!("store {f_llvm} {res}, ptr {ptr}"));
+            }
+        }
         Ok(())
     }
 
@@ -864,6 +923,15 @@ impl<'p> IrGenerator<'p> {
                 self.gen_call(name, args)
             }
             Expr::Unary { op, operand, .. } => {
+                // 自增/自减（M4）：操作数必须是变量（语义层保证），
+                // 需直接读写其 alloca（load → 运算 → store），不能先 gen_expr——
+                // 否则只拿到 load 出的临时寄存器，无法写回。
+                if matches!(
+                    op,
+                    UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::PostInc | UnaryOp::PostDec
+                ) {
+                    return self.gen_inc_dec(*op, operand);
+                }
                 let (val, ty) = self.gen_expr(operand)?;
                 match op {
                     UnaryOp::Neg => {
@@ -881,9 +949,48 @@ impl<'p> IrGenerator<'p> {
                         self.line(&format!("{tmp} = xor i1 {val}, true"));
                         Ok((tmp, "i1"))
                     }
+                    // 自增/自减已在上方 gen_inc_dec 提前返回，此处不可达
+                    UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::PostInc | UnaryOp::PostDec => {
+                        unreachable!("自增/自减已在 gen_inc_dec 中处理")
+                    }
                 }
             }
             Expr::Binary { op, lhs, rhs, .. } => self.gen_binary(*op, lhs, rhs),
+            Expr::Ternary { cond, then_expr, else_expr, .. } => {
+                // 三目运算 `cond ? then : else`（M4）：短路求值。
+                // 结构（与 gen_if 同构的三块 + phi 汇合）：
+                //   br i1 %cond, label %tern.then.N, label %tern.else.N
+                //   tern.then.N: 求 then；br label %tern.merge.N
+                //   tern.else.N: 求 else；br label %tern.merge.N
+                //   tern.merge.N: %r = phi T [ then, %tern.then.N ], [ else, %tern.else.N ]
+                // 表达式内没有 return 语句（语义层限制），分支内无需 block_terminated
+                // 检查，直接 br merge 即可。
+                let (cond, _) = self.gen_expr(cond)?;
+                let then_label = self.new_label("tern.then");
+                let else_label = self.new_label("tern.else");
+                let merge_label = self.new_label("tern.merge");
+                self.line(&format!("br i1 {cond}, label %{then_label}, label %{else_label}"));
+
+                // then 分支：求 then 分支值
+                self.block_start(&then_label);
+                let (tv, t_ty) = self.gen_expr(then_expr)?;
+                self.line(&format!("br label %{merge_label}"));
+                self.block_end();
+
+                // else 分支：求 else 分支值
+                self.block_start(&else_label);
+                let (ev, _e_ty) = self.gen_expr(else_expr)?;
+                self.line(&format!("br label %{merge_label}"));
+                self.block_end();
+
+                // 合并块：phi 汇合两分支值（语义层保证两分支同型，类型取 then 分支）
+                self.block_start(&merge_label);
+                let phi = self.new_reg();
+                self.line(&format!(
+                    "{phi} = phi {t_ty} [ {tv}, %{then_label} ], [ {ev}, %{else_label} ]"
+                ));
+                Ok((phi, t_ty))
+            }
             Expr::Range { .. } => Err(IrError {
                 message: "范围表达式只能在 for 中使用（不能单独求值）".into(),
             }),
@@ -1031,6 +1138,61 @@ impl<'p> IrGenerator<'p> {
         Ok((val, elem_ty))
     }
 
+    /// 自增/自减（M4）：对变量 alloca 执行 load → add/sub → store。
+    ///
+    /// - 前缀（++x/--x）：返回运算后的**新值**；
+    /// - 后缀（x++/x--）：返回运算前的**旧值**。
+    ///
+    /// 简化决策：仅支持变量操作数（[Expr::Var]，语义层已保证）；对象字段的自增/自减
+    /// （obj.f++）留后续版本，此处返回明确 IrError（GEP + load + op + store 链未实现）。
+    fn gen_inc_dec(&mut self, op: UnaryOp, operand: &Expr) -> Result<(String, &'static str), IrError> {
+        // 仅支持变量操作数（语义层已保证；此处防御）
+        let Expr::Var(name) = operand else {
+            return Err(IrError {
+                message: "暂不支持对象字段的自增/自减（M4 简化：++/-- 仅支持变量）".into(),
+            });
+        };
+        // 取变量绑定：alloca 指针 + LLVM 类型名（照抄 gen_stmt Assign 的 lookup_var 用法）
+        let bind = self.lookup_var(name).cloned().ok_or_else(|| IrError {
+            message: format!("内部错误：自增/自减的变量 '{name}' 未入作用域（函数 {}）", self.cur_fn),
+        })?;
+        let ty = bind.ty;
+        // 自增/自减只对数字类型合法（语义层已保证；此处防御性报错，避免生成非法指令）
+        let is_float = ty == "double" || ty == "float";
+        if ty == "ptr" || ty.starts_with('{') || ty.starts_with('[') {
+            return Err(IrError {
+                message: format!("自增/自减只支持数字类型（{} 不能自增/自减）", ty),
+            });
+        }
+        // load 当前值
+        let cur = self.new_reg();
+        self.line(&format!("{cur} = load {ty}, ptr {}", bind.value));
+        // 新值：整数 add/sub 1（LLVM 立即数 1 即 iN 字面量，与任意整数宽度兼容）；
+        // 浮点 fadd/fsub 1.0
+        let new = self.new_reg();
+        let one = if is_float { "1.0" } else { "1" };
+        match op {
+            UnaryOp::PreInc | UnaryOp::PostInc => {
+                let opcode = if is_float { "fadd" } else { "add" };
+                self.line(&format!("{new} = {opcode} {ty} {cur}, {one}"));
+            }
+            UnaryOp::PreDec | UnaryOp::PostDec => {
+                let opcode = if is_float { "fsub" } else { "sub" };
+                self.line(&format!("{new} = {opcode} {ty} {cur}, {one}"));
+            }
+            UnaryOp::Neg | UnaryOp::Not => unreachable!("Neg/Not 不走 gen_inc_dec"),
+        }
+        // store 新值回 alloca
+        self.line(&format!("store {ty} {new}, ptr {}", bind.value));
+        // 前缀返回新值，后缀返回旧值
+        match op {
+            UnaryOp::PreInc | UnaryOp::PreDec => Ok((new, ty)),
+            UnaryOp::PostInc | UnaryOp::PostDec => Ok((cur, ty)),
+            UnaryOp::Neg | UnaryOp::Not => unreachable!("Neg/Not 不走 gen_inc_dec"),
+        }
+    }
+
+    /// 二元运算生成：两侧表达式求值后交给 [gen_binary_on_regs] 统一生成指令。
     fn gen_binary(
         &mut self,
         op: BinaryOp,
@@ -1043,19 +1205,40 @@ impl<'p> IrGenerator<'p> {
         // 通过语义类型判断（LLVM 类型名 "ptr" 无法区分字符串与裸指针）。
         let lhs_is_str = matches!(self.sem_ty_of(lhs), Some(TypeSpec::Named(TyKw::Str)));
         let rhs_is_str = matches!(self.sem_ty_of(rhs), Some(TypeSpec::Named(TyKw::Str)));
-        if lhs_is_str || rhs_is_str {
-            return self.gen_binary_str(op, lv, rv);
-        }
-        // 类型以左侧为准（语义已保证一致）
-        let ty = lt;
-        // 是否为浮点类型（f32→float / f64→double）
-        let is_float = ty == "double" || ty == "float";
         // 无符号性：查语义类型（LLVM 类型名 "i32" 无法区分 u32/i32）
         let lhs_sem = self.sem_ty_of(lhs);
         let is_unsigned = matches!(
             lhs_sem,
             Some(TypeSpec::Named(TyKw::U8 | TyKw::U16 | TyKw::U32 | TyKw::U64))
         );
+        self.gen_binary_on_regs(op, lhs_is_str || rhs_is_str, lv, lt, rv, is_unsigned)
+    }
+
+    /// 在已求值的寄存器对上执行二元运算（gen_binary 与复合赋值共用的核心）。
+    ///
+    /// - `lhs_is_str`：左操作数是字符串（拼接/比较走 [gen_binary_str] 运行时函数）；
+    /// - `lv`/`lt`：左操作数寄存器与其 LLVM 类型名（复合赋值中为「load 出的目标当前值」）；
+    /// - `rv`：右操作数寄存器；
+    /// - `is_unsigned`：无符号标志（决定 udiv/urem/lshr 等指令语义）。
+    ///
+    /// 返回 (结果寄存器, LLVM 类型名)；比较/逻辑结果为 i1，其余同操作数类型。
+    fn gen_binary_on_regs(
+        &mut self,
+        op: BinaryOp,
+        lhs_is_str: bool,
+        lv: String,
+        lt: &'static str,
+        rv: String,
+        is_unsigned: bool,
+    ) -> Result<(String, &'static str), IrError> {
+        // 字符串操作：拼接（+）与比较（== != < > <= >=）走运行时函数
+        if lhs_is_str {
+            return self.gen_binary_str(op, lv, rv);
+        }
+        // 类型以左侧为准（语义已保证一致）
+        let ty = lt;
+        // 是否为浮点类型（f32→float / f64→double）
+        let is_float = ty == "double" || ty == "float";
         let tmp = self.new_reg();
         let instr: String = match op {
             BinaryOp::Add => {
@@ -1135,9 +1318,25 @@ impl<'p> IrGenerator<'p> {
             }
             BinaryOp::And => format!("and i1 {lv}, {rv}"),
             BinaryOp::Or => format!("or i1 {lv}, {rv}"),
+            // M4 位运算（仅整数，语义层已保证两侧同为整数类型）：
+            // 按位与/或/异或与逻辑 and/or 指令同助记符，仅操作数类型不同
+            //（逻辑为 i1，位运算为整数类型）。
+            BinaryOp::BitAnd => format!("and {ty} {lv}, {rv}"),
+            BinaryOp::BitOr => format!("or {ty} {lv}, {rv}"),
+            BinaryOp::BitXor => format!("xor {ty} {lv}, {rv}"),
+            // 左移：无符号性不影响 shl
+            BinaryOp::Shl => format!("shl {ty} {lv}, {rv}"),
+            // 右移：有符号算术右移（ashr），无符号逻辑右移（lshr）
+            BinaryOp::Shr => {
+                if is_unsigned {
+                    format!("lshr {ty} {lv}, {rv}")
+                } else {
+                    format!("ashr {ty} {lv}, {rv}")
+                }
+            }
         };
         self.line(&format!("{tmp} = {instr}"));
-        // 比较/逻辑结果为 i1
+        // 比较/逻辑结果为 i1；位运算/移位/算术结果同操作数类型
         let result_ty = match op {
             BinaryOp::Eq
             | BinaryOp::NotEq
@@ -1204,7 +1403,13 @@ impl<'p> IrGenerator<'p> {
             BinaryOp::Gt => "sgt",
             BinaryOp::Le => "sle",
             BinaryOp::Ge => "sge",
-            _ => unreachable!("字符串二元运算只允许 + 与比较"),
+            // 位运算/移位/逻辑对字符串不合法（语义层已拦截），此处防御性报错
+            // 而非 unreachable panic（match 穷尽 + 错误信息明确）。
+            _ => {
+                return Err(IrError {
+                    message: format!("字符串二元运算只允许 + 与比较（不支持的运算符：{op:?}）"),
+                });
+            }
         };
         let res = self.new_reg();
         self.line(&format!("{res} = icmp {icmp} i32 {cmp}, 0"));
@@ -2175,5 +2380,59 @@ mod tests {
         // 表字面量只允许出现在 table 类型变量声明中（语义层拦截）
         let result = 管道("func main() {\n    var x: i64 = [1, 2]\n}");
         assert!(result.is_err());
+    }
+
+    // ---------- M4 运算符扩展测试 ----------
+
+    #[test]
+    fn 位运算生成与移位指令() {
+        let ir = 编译("func main() {\n    var x: i64 = 5\n    println(x & 3)\n    println(x | 8)\n    println(x ^ 1)\n    println(8 >> 2)\n    println(1 << 3)\n}");
+        // 按位与/或/异或：and/or/xor 作用于整数类型（逻辑 And/Or 是 i1，可区分）
+        assert!(ir.contains("= and i64 %"));
+        assert!(ir.contains("= or i64 %"));
+        assert!(ir.contains("= xor i64 %"));
+        // 右移：有符号整数 → 算术右移 ashr；左移 → shl（立即数 1/3 即 i64 字面量）
+        assert!(ir.contains("= ashr i64 8, 2"));
+        assert!(ir.contains("= shl i64 1, 3"));
+    }
+
+    #[test]
+    fn 复合赋值生成load运算store() {
+        let ir = 编译("func main() {\n    var x: i64 = 1\n    x += 2\n    x *= 4\n    x -= 1\n    x /= 2\n    x %= 3\n}");
+        // 复合赋值 = load 目标当前值 → 二元运算 → store 回目标
+        assert!(ir.contains("= add i64 %"));
+        assert!(ir.contains("= mul i64 %"));
+        assert!(ir.contains("= sub i64 %"));
+        assert!(ir.contains("= sdiv i64 %"));
+        assert!(ir.contains("= srem i64 %"));
+        assert!(ir.contains("store i64 %"));
+    }
+
+    #[test]
+    fn 字符串复合拼接生成malloc与memcpy() {
+        let ir = 编译("func main() {\n    var s: string = \"a\"\n    s += \"b\"\n}");
+        // s += "b"：load 当前串指针 → 走字符串拼接（strlen/malloc/memcpy）→ store 回变量
+        assert!(ir.contains("= call i64 @strlen(ptr %"));
+        assert!(ir.contains("= call ptr @malloc(i64 %"));
+        assert!(ir.contains("store ptr %"));
+    }
+
+    #[test]
+    fn 三目运算生成phi汇合() {
+        let ir = 编译("func main() {\n    var x: i64 = 5\n    println(x > 0 ? 100 : -1)\n    println(x < 0 ? 1 : 2)\n}");
+        // 三块结构：tern.then / tern.else / tern.merge + phi 汇合（类型取 then 分支 i64）
+        assert!(ir.contains("tern.then."));
+        assert!(ir.contains("tern.else."));
+        assert!(ir.contains("tern.merge."));
+        assert!(ir.contains("= phi i64"));
+    }
+
+    #[test]
+    fn 自增自减生成load运算与store() {
+        let ir = 编译("func main() {\n    var x: i64 = 1\n    x++\n    ++x\n    x--\n    println(x--)\n    println(++x)\n}");
+        // 自增/自减 = load 当前值 → add/sub 1 → store 回变量
+        assert!(ir.contains("= add i64 %"));
+        assert!(ir.contains("= sub i64 %"));
+        assert!(ir.contains("store i64 %"));
     }
 }

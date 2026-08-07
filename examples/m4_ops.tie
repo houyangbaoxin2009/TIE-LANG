@@ -1,0 +1,66 @@
+// tie:logic
+
+// M4 运算符扩展示例：复合赋值、位运算、三目、自增自减
+func main() {
+    // 复合赋值
+    var x: i64 = 10
+    x += 5
+    println(x)   // 15
+    x -= 3
+    println(x)   // 12
+    x *= 2
+    println(x)   // 24
+    x /= 4
+    println(x)   // 6
+    x %= 4
+    println(x)   // 2
+
+    // 位运算
+    var a: i64 = 6   // 110
+    var b: i64 = 3   // 011
+    println(a & b)   // 2
+    println(a | b)   // 7
+    println(a ^ b)   // 5
+    println(a << 1)  // 12
+    println(a >> 1)  // 3
+
+    // 复合位运算
+    a &= b
+    println(a)       // 2
+    a |= 1
+    println(a)       // 3
+    a ^= 1
+    println(a)       // 2
+
+    // 三目运算
+    var t: i64 = 5
+    var m: i64 = t > 3 ? 100 : -1
+    println(m)       // 100
+    var n: i64 = t > 10 ? 1 : 2
+    println(n)       // 2
+
+    // 自增自减
+    var c: i64 = 0
+    c++
+    println(c)       // 1
+    ++c
+    println(c)       // 2
+    c--
+    println(c)       // 1
+    --c
+    println(c)       // 0
+
+    // 前缀返回新值，后缀返回旧值
+    var d: i64 = 5
+    var e: i64 = d++
+    println(e)       // 5（旧值）
+    println(d)       // 6
+    var f: i64 = ++d
+    println(f)       // 7（新值）
+    println(d)       // 7
+
+    // 字符串复合拼接
+    var s = "foo"
+    s += "bar"
+    println(s)       // foobar
+}

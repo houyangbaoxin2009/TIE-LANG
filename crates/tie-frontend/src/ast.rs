@@ -169,6 +169,8 @@ pub struct ImportStmt {
 pub struct AssignStmt {
     /// 被赋值的目标变量名
     pub target: String,
+    /// 赋值运算符：`None` 为普通赋值 `=`；`Some(op)` 为复合赋值 `+=`/`-=` 等
+    pub op: Option<BinaryOp>,
     /// 新值表达式
     pub value: Expr,
     pub span: Span,
@@ -261,6 +263,8 @@ pub struct FieldAssignStmt {
     pub base: Box<Expr>,
     /// 字段名
     pub field: String,
+    /// 赋值运算符：`None` 为普通赋值 `=`；`Some(op)` 为复合赋值 `+=`/`-=` 等
+    pub op: Option<BinaryOp>,
     /// 新值表达式
     pub value: Expr,
     pub span: Span,
@@ -350,6 +354,8 @@ pub enum Expr {
     Unary { op: UnaryOp, operand: Box<Expr>, span: Span },
     /// 二元运算 `a + b`
     Binary { op: BinaryOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span },
+    /// 三目运算 `cond ? then : else`（M4）
+    Ternary { cond: Box<Expr>, then_expr: Box<Expr>, else_expr: Box<Expr>, span: Span },
     /// 范围 `0..10`
     Range { start: Box<Expr>, end: Box<Expr>, span: Span },
     /// 表字面量 `[col, col; row, row]`（高级数组/表，逗号分列、分号分行）
@@ -395,8 +401,18 @@ pub enum TableId {
 /// 一元运算符。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
+    /// 取负 `-x`
     Neg,
+    /// 逻辑非 `!x`
     Not,
+    /// 前缀自增 `++x`（M4）：先增后取新值
+    PreInc,
+    /// 前缀自减 `--x`（M4）：先减后取新值
+    PreDec,
+    /// 后缀自增 `x++`（M4）：先取旧值后增
+    PostInc,
+    /// 后缀自减 `x--`（M4）：先取旧值后减
+    PostDec,
 }
 
 /// 二元运算符。
@@ -415,4 +431,14 @@ pub enum BinaryOp {
     Ge,
     And,
     Or,
+    /// 按位与 `&`（M4，仅整数）
+    BitAnd,
+    /// 按位或 `|`（M4，仅整数）
+    BitOr,
+    /// 按位异或 `^`（M4，仅整数）
+    BitXor,
+    /// 左移 `<<`（M4，仅整数）
+    Shl,
+    /// 右移 `>>`（M4，仅整数；有符号算术右移、无符号逻辑右移）
+    Shr,
 }
