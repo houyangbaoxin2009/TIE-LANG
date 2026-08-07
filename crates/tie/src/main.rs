@@ -36,6 +36,14 @@ struct Args {
     lsp_mode: bool,
 }
 
+/// 内部代号（架构代号）：代表本发行版的架构特征主题。
+/// 2026.1 "Harbor 港湾"：首个正式版 = 工具链第一次靠岸停泊。
+const CODENAME: &str = "Harbor";
+
+/// 正式发行版号（年份.修订号）：用于发布产物命名与 git tag，
+/// 与组件版本号（CARGO_PKG_VERSION，x.y.z）相互独立。
+const RELEASE_VERSION: &str = "2026.1";
+
 /// 使用说明。
 const USAGE: &str = "\
 tie 语言总入口（四段式调度器 + REPL）
@@ -60,6 +68,7 @@ tie 语言总入口（四段式调度器 + REPL）
   --keep-ir      保留中间 IR 文件
   --prep-only    只执行预处理并打印识别结果，不编译
   --lsp          以语言服务器模式运行（读 stdin 的 LSP 消息并写 stdout）
+  --version      显示版本号与内部代号（如 2026.1 (Harbor)）
   -h, --help     显示本帮助
 
 单独使用:
@@ -144,6 +153,17 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                // 组件版本号（x.y.z）+ 发行版号（年份.修订号）+ 内部代号
+                // 如: tie 0.1.0 (发行版 2026.1 "Harbor")
+                println!(
+                    "tie {} (发行版 {} \"{}\")",
+                    env!("CARGO_PKG_VERSION"),
+                    RELEASE_VERSION,
+                    CODENAME
+                );
                 std::process::exit(0);
             }
             "-o" => output = Some(PathBuf::from(args.next().ok_or("-o 后缺少输出文件路径")?)),

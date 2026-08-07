@@ -38,8 +38,15 @@ tie 语言编译器（前端自研 + LLVM 中后端）
                  交叉编译目标（如 x86_64-pc-windows-msvc / win-x64，默认: 本机）
   --emit-ir      只生成 LLVM IR（.ll），不继续编译
   --keep-ir      保留中间 IR 文件
+  --version      显示版本号与内部代号
   -h, --help     显示本帮助
 ";
+
+/// 内部代号（架构代号）：与主入口 tie 保持一致。
+const CODENAME: &str = "Harbor";
+
+/// 正式发行版号（年份.修订号）：与主入口 tie 保持一致。
+const RELEASE_VERSION: &str = "2026.1";
 
 /// 手动解析命令行参数（不引入 clap 依赖，保持轻量）。
 fn parse_args() -> Result<Args, String> {
@@ -55,6 +62,16 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                // 组件版本号（x.y.z）+ 发行版号（年份.修订号）+ 内部代号
+                println!(
+                    "tie-llvm {} (发行版 {} \"{}\")",
+                    env!("CARGO_PKG_VERSION"),
+                    RELEASE_VERSION,
+                    CODENAME
+                );
                 std::process::exit(0);
             }
             "-o" => {

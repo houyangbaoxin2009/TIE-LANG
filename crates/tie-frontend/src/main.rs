@@ -39,6 +39,7 @@ tie 语言前端工具（词法 → 语法 → 语义）
   --tokens    只输出 token 流（含 ASI 补全的分号），不继续解析
   --ast       只输出 AST 调试视图，不继续语义分析
   --check     只做语义检查（成功静默；失败打印首个错误）
+  --version   显示版本号与内部代号
   -h, --help  显示本帮助
 
 默认模式（无选项）: 三阶段全跑，输出统计信息；任一出错即打印首个错误。
@@ -62,6 +63,12 @@ enum Mode {
     Check,
 }
 
+/// 内部代号（架构代号）：与主入口 tie 保持一致。
+const CODENAME: &str = "Harbor";
+
+/// 正式发行版号（年份.修订号）：与主入口 tie 保持一致。
+const RELEASE_VERSION: &str = "2026.1";
+
 /// 手动解析命令行参数（不引入 clap 依赖，保持轻量）。
 fn parse_args() -> Result<Args, String> {
     let mut input: Option<String> = None;
@@ -71,6 +78,16 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                // 组件版本号（x.y.z）+ 发行版号（年份.修订号）+ 内部代号
+                println!(
+                    "tie-frontend {} (发行版 {} \"{}\")",
+                    env!("CARGO_PKG_VERSION"),
+                    RELEASE_VERSION,
+                    CODENAME
+                );
                 std::process::exit(0);
             }
             "--tokens" => mode = Mode::Tokens,

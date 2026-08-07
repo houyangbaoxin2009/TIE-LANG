@@ -29,3 +29,7 @@ opencode.json
 
 # 库编译产物
 /examples/*.a
+
+# 发行版打包产物（dist/）与 REPL 自举产物（repl.exe）
+/dist/
+/repl/repl.exe

@@ -1,6 +1,22 @@
 # CHANGELOG
 
-tie 语言项目的变更记录，按里程碑（M0→M4）组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+tie 语言项目的变更记录，按里程碑（M0→M5）组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
+## [M5] 正式发行版 — 2026-08-07
+
+### 新增
+- 版本规则确立：正式发行版号 `年份.修订号`（如 2026.1）；内部代号 `2026.1 "Harbor 港湾"`（首个正式版 = 工具链首次靠岸）
+- 组件版本号独立化：6 个 crate 各自维护 3 段 semver（初始 `0.1.0`，写入各自 Cargo.toml），
+  与发行版号（发布产物/tag 用）分离
+- `tie --version` / `tie -V`：输出组件版本 + 发行版号 + 代号（`tie 0.1.0 (发行版 2026.1 "Harbor")`）；
+  同步支持于 tie-prep / tie-frontend / tie-llvm / tie-lsp
+- 打包脚本 `scripts/package.ps1`：release 构建 → repl.exe 自举 → 组装发行目录
+  （bin/doc/examples/editor）→ 生成 `dist/tie-2026.1-win-x64.zip`（win-x64）
+- 设计文档 `docs/release.md`：版本规则、内部代号、工具链合集组成、工程改造点、发布流程
+
+### 文档
+- README.md：路线图新增 M5（正式发行版）条目
+- docs/release.md：正式发行版设计规划
 
 ## [M4] 运算符扩展 — 2026-08-07
 

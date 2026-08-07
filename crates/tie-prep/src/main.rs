@@ -29,12 +29,19 @@ tie 语言预处理工具（四段式第一段）
 
 选项:
   --info      只打印角色与头部信息，不输出正文
+  --version   显示版本号与内部代号
   -h, --help  显示本帮助
 
 输出约定:
   默认模式  清理后的正文 → stdout；角色信息 → stderr
   --info    角色信息 → stdout
 ";
+
+/// 内部代号（架构代号）：与主入口 tie 保持一致。
+const CODENAME: &str = "Harbor";
+
+/// 正式发行版号（年份.修订号）：与主入口 tie 保持一致。
+const RELEASE_VERSION: &str = "2026.1";
 
 fn main() -> ExitCode {
     let args = env::args().skip(1);
@@ -45,6 +52,16 @@ fn main() -> ExitCode {
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            "-V" | "--version" => {
+                // 组件版本号（x.y.z）+ 发行版号（年份.修订号）+ 内部代号
+                println!(
+                    "tie-prep {} (发行版 {} \"{}\")",
+                    env!("CARGO_PKG_VERSION"),
+                    RELEASE_VERSION,
+                    CODENAME
+                );
                 return ExitCode::SUCCESS;
             }
             "--info" => info_only = true,

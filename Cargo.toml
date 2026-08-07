@@ -14,6 +14,8 @@ members = [
 ]
 
 # workspace 统一编译配置：
+# - 各组件版本号独立维护（3 段 semver x.y.z，初始 0.1.0，各自写在子 crate 的 Cargo.toml）
+# - 正式发行版号（年份.修订号，如 2026.1）仅用于发布产物与 git tag，不进入 Cargo 版本号
 # - 严格警告策略，杜绝被忽略的隐患
 # - 发布构建启用 LTO 与压缩，减小二进制体积
 [workspace.package]
