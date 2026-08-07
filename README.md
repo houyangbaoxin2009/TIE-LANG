@@ -12,7 +12,8 @@ tie 是一门**通用编程语言**：用一门语言写逻辑、写界面、写
 | 文档 | 内容 |
 | --- | --- |
 | [README.md](README.md) | 本文件：工程入口（快速开始、CLI、结构、流水线、路线图） |
-| [docs/language.md](docs/language.md) | 语法规范：文件结构、类型系统、语句/控制流、函数、语法速查表 |
+| [docs/language.md](docs/language.md) | 语法规范：文件结构、类型系统、语句/控制流、函数、面向对象、语法速查表 |
+| [CHANGELOG.md](CHANGELOG.md) | 版本变更记录（按里程碑） |
 
 ## 快速开始
 
@@ -88,7 +89,7 @@ tie/
 │   ├── tie-interp/    解释执行（占位，REPL 用）
 │   └── tie/           CLI 主入口：角色分派调度器 + REPL
 ├── docs/language.md   语法规范
-├── examples/          示例程序（hello.tie / wide.tie / test_wide.tie）
+├── examples/          示例程序（hello / wide / table / tuple / oop / 负例 oop_neg_* 等）
 └── Cargo.toml         workspace（统一 edition/lints/release 配置）
 ```
 
@@ -126,6 +127,6 @@ tie/
 | --- | --- | --- |
 | M0 | 词法（含 ASI）+ 语法 + 语义 + IR 生成 + LLVM 后端打通，跑通 `println`/算术/变量 | ✅ 完成 |
 | M1 | 控制流 if/while/for、函数调用、string 处理 | ✅ 完成 |
-| M2 | 复合类型（表/数组）、`import`、头类型分派（data） | 进行中 |
-| M3 | class/OOP、库编译、`--target` 交叉 | 规划 |
+| M2 | 复合类型（表/数组、元组）、`import`、头类型分派（data） | ✅ 完成 |
+| M3 | class/OOP、库编译、`--target` 交叉 | 进行中（class/OOP ✅，库编译/交叉规划） |
 | M4 | `// tie:ui` 界面、`// tie:db` 数据库、GNU 后端、性能优化 | 规划 |
