@@ -142,7 +142,7 @@ pub struct InitializeResult {
     pub server_info: ServerInfo,
 }
 
-/// 服务器能力声明（v1 子集：全文同步 + hover + 跳转定义 + 补全）。
+/// 服务器能力声明（v1 子集：全文同步 + hover + 跳转定义 + 补全 + 语义高亮）。
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerCapabilities {
     /// 文本同步方式：1 = 全量同步（Full）
@@ -157,6 +157,9 @@ pub struct ServerCapabilities {
     /// 补全能力（`textDocument/completion`），`triggerCharacters: ["."]` 触发成员补全
     #[serde(rename = "completionProvider")]
     pub completion_provider: CompletionOptions,
+    /// 语义高亮能力（`textDocument/semanticTokens/full`）
+    #[serde(rename = "semanticTokensProvider")]
+    pub semantic_tokens_provider: SemanticTokensOptions,
 }
 
 /// 服务器自身信息。
@@ -253,6 +256,50 @@ pub struct CompletionOptions {
     pub trigger_characters: Vec<String>,
 }
 
+/// 语义高亮类型索引声明（LSP `SemanticTokensLegend`）。
+///
+/// 顺序即 `data` 中 tokenType 的数字下标（与 [crate::diagnostics] 的 st 模块
+/// 常量一一对应）。只声明标识符类——关键字/类型由 TextMate 语法着色。
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticTokensLegend {
+    /// token 类型名称列表（按下标 0 起）
+    #[serde(rename = "tokenTypes")]
+    pub token_types: Vec<String>,
+    /// token 修饰符名称列表（v1 恒为空）
+    #[serde(rename = "tokenModifiers")]
+    pub token_modifiers: Vec<String>,
+}
+
+/// 语义高亮能力选项（LSP `SemanticTokensOptions` 子集）。
+///
+/// `full` 为 true 表示支持 `textDocument/semanticTokens/full`（全量请求；
+/// 增量 delta 请求 v1 不做）。
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticTokensOptions {
+    /// 类型图例
+    pub legend: SemanticTokensLegend,
+    /// 是否支持全量请求（true = 支持 `semanticTokens/full`）
+    pub full: bool,
+}
+
+/// `textDocument/semanticTokens/full` 请求参数。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SemanticTokensParams {
+    /// 目标文档
+    #[serde(rename = "textDocument")]
+    pub text_document: TextDocumentIdentifier,
+}
+
+/// `textDocument/semanticTokens/full` 请求的响应 result（LSP `SemanticTokens`）。
+///
+/// `data` 采用增量编码：每 5 个 u32 一组
+/// `(deltaLine, deltaStartChar, length, tokenType, tokenModifiers)`。
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticTokens {
+    /// 编码后的 token 数据
+    pub data: Vec<u32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +313,21 @@ mod tests {
                 hover_provider: true,
                 definition_provider: true,
                 completion_provider: CompletionOptions { trigger_characters: vec![".".into()] },
+                semantic_tokens_provider: SemanticTokensOptions {
+                    legend: SemanticTokensLegend {
+                        token_types: vec![
+                            "namespace".into(),
+                            "class".into(),
+                            "function".into(),
+                            "method".into(),
+                            "property".into(),
+                            "variable".into(),
+                            "parameter".into(),
+                        ],
+                        token_modifiers: Vec::new(),
+                    },
+                    full: true,
+                },
             },
             server_info: ServerInfo {
                 name: "tie-lsp".into(),

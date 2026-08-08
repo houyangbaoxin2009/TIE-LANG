@@ -9,6 +9,7 @@
     { "include": "#keywords" },
     { "include": "#types" },
     { "include": "#functions" },
+    { "include": "#namespaces" },
     { "include": "#identifiers" }
   ],
   "repository": {
@@ -51,12 +52,12 @@
       "patterns": [
         {
           "name": "keyword.control.tie",
-          "match": "\\b(func|var|const|if|else|while|for|return|import|class|method|static|this|extends|switch|case|default|in)\\b"
+          "match": "\\b(func|var|const|if|else|while|for|return|import|class|method|static|this|extends|switch|case|default|in|namespace)\\b"
         },
         { "name": "constant.language.tie", "match": "\\b(true|false)\\b" },
         {
           "name": "keyword.operator.tie",
-          "match": "\\+\\+|--|<<=|>>=|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<|>>|<=|>=|==|!=|&&|\\|\\||->|\\.\\.|[+\\-*/%&|^!<>=?:]"
+          "match": "::|\\+\\+|--|<<=|>>=|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<|>>|<=|>=|==|!=|&&|\\|\\||->|\\.\\.|[+\\-*/%&|^!<>=?:]"
         }
       ]
     },
@@ -77,6 +78,14 @@
         {
           "name": "entity.name.function.tie",
           "match": "\\b[a-zA-Z_][a-zA-Z0-9_]*\\s*(?=\\()"
+        }
+      ]
+    },
+    "namespaces": {
+      "patterns": [
+        {
+          "name": "support.namespace.tie",
+          "match": "\\b[a-zA-Z_][a-zA-Z0-9_]*\\s*(?=\\.)"
         }
       ]
     },

@@ -3,6 +3,31 @@
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库**。
 
+## [Harbor M2.1.4] tie-lsp 语义增强：嵌套命名空间 + 参数跳转 + 语义高亮 — 2026-08-08
+
+### 变更
+- **嵌套命名空间 hover / 跳转 / 补全修复**：`ns_query_name` 改为收集完整命名空间链
+  （`ns_chain` 沿 `.` 反向收集），`tcmsg.error.no_file` 与语义层注册全名
+  `tcmsg::error::no_file` 对齐——hover 命中签名、跳转命中定义、`tcmsg.error.` 补全
+  该层函数、`tcmsg.` 补全子命名空间成员
+- **参数跳转**：`collect_defs` 把函数/方法形参也登记进变量定义表，
+  函数体/方法体内引用形参名可跳转到参数声明处
+- **semanticTokens 语义高亮（新增）**：`textDocument/semanticTokens/full` 返回
+  全量语义 token（14 类标准类型：namespace / class / function / method / property /
+  variable / parameter 等）。分类规则：定义名（func/method/class/namespace 后）、
+  命名空间链段（链首/中间段 → namespace，末段函数 → function）、实例成员访问
+  （`p.dist(` → method、`p.x` → property）、形参声明 → parameter、类引用 → class、
+  函数调用 → function、其余 → variable
+- **VSCode 扩展语法文件**：`namespace` 关键字与 `::` 运算符高亮；
+  命名空间调用链前缀（`tcmsg.` 等）着色为 `support.namespace.tie`
+
+### 测试
+- 全工作区测试通过（lsp 60 → **75**）：嵌套命名空间 hover/跳转/补全（4）、
+  参数/方法参数跳转（2）、语义高亮链段/参数/方法字段分类（3）、
+  semanticTokens legend 等
+- `cargo build --workspace` 零错误；release 构建 + 真实二进制 LSP 冒烟
+  （semanticTokensProvider 声明 / 诊断无错误 / namespace·function 分类）通过
+
 ## [Harbor M2.1.3] import 展开模块化 + tie-lsp 跨文件支持 — 2026-08-08
 
 ### 变更

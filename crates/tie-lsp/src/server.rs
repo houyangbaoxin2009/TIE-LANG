@@ -25,7 +25,9 @@ use crate::diagnostics;
 use crate::lsp::{
     CompletionList, CompletionOptions, CompletionParams, DefinitionParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    HoverParams, InitializeResult, PublishDiagnosticsParams, ServerCapabilities, ServerInfo,
+    HoverParams, InitializeResult, PublishDiagnosticsParams, SemanticTokens,
+    SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams, ServerCapabilities,
+    ServerInfo,
 };
 
 /// JSON-RPC 错误码：方法未找到。
@@ -85,6 +87,7 @@ pub fn handle_message(state: &mut ServerState, msg: Value) -> Vec<Value> {
         "textDocument/hover" => hover(state, id, &params),
         "textDocument/definition" => definition(state, id, &params),
         "textDocument/completion" => completion(state, id, &params),
+        "textDocument/semanticTokens/full" => semantic_tokens_full(state, id, &params),
         _ => vec![error_response(id, ERR_METHOD_NOT_FOUND, &format!("方法未找到：{method}"))],
     }
 }
@@ -99,6 +102,13 @@ fn initialize(state: &mut ServerState, id: Option<Value>) -> Vec<Value> {
             hover_provider: true,
             definition_provider: true,
             completion_provider: CompletionOptions { trigger_characters: vec![".".into()] },
+            semantic_tokens_provider: SemanticTokensOptions {
+                legend: SemanticTokensLegend {
+                    token_types: crate::diagnostics::semantic_token_types(),
+                    token_modifiers: Vec::new(),
+                },
+                full: true,
+            },
         },
         server_info: ServerInfo {
             name: SERVER_NAME.into(),
@@ -270,6 +280,28 @@ fn completion(state: &ServerState, id: Option<Value>, params: &Value) -> Vec<Val
     );
     let list = CompletionList { is_incomplete: false, items };
     let result = serde_json::to_value(list).expect("CompletionList 序列化不应失败");
+    vec![success_response(id, result)]
+}
+
+/// `textDocument/semanticTokens/full`：返回全量语义 token 数据（文档未打开时 data 为空）。
+fn semantic_tokens_full(state: &ServerState, id: Option<Value>, params: &Value) -> Vec<Value> {
+    let Ok(params) = serde_json::from_value::<SemanticTokensParams>(params.clone()) else {
+        return vec![error_response(
+            id,
+            ERR_INVALID_PARAMS,
+            "无效参数：textDocument/semanticTokens/full",
+        )];
+    };
+    let uri = params.text_document.uri;
+    let Some(source) = state.documents.get(&uri) else {
+        // 文档不在内存：返回空 token 数据（客户端保留上一帧高亮）
+        let result = serde_json::to_value(SemanticTokens { data: Vec::new() })
+            .expect("SemanticTokens 序列化不应失败");
+        return vec![success_response(id, result)];
+    };
+    let data = diagnostics::semantic_tokens(source, uri_base_dir(&uri).as_deref());
+    let result =
+        serde_json::to_value(SemanticTokens { data }).expect("SemanticTokens 序列化不应失败");
     vec![success_response(id, result)]
 }
 

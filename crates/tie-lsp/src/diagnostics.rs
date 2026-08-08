@@ -13,7 +13,7 @@
 //! 说明：tie-frontend 不导出 serde 结构，这里统一转换为本 crate 的
 //! [crate::lsp] 类型，不修改 tie-frontend 源码。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use tie_frontend::ast::{Program, Stmt, TypeSpec};
@@ -82,13 +82,30 @@ fn expand_with_base(
 /// 命名空间调用查询名：光标命中的 Ident 若构成 `receiver.name`（其前一个 token
 /// 是 `.`，再前一个是 Ident），返回语义层的全名 `receiver::name`（命名空间函数
 /// 以全名注册）；否则返回裸名。
-fn ns_query_name(tokens: &[Token], idx: usize, name: &str) -> String {
-    if idx >= 2 && matches!(tokens[idx - 1].kind, TokenKind::Dot) {
-        if let TokenKind::Ident(receiver) = &tokens[idx - 2].kind {
-            return format!("{receiver}::{name}");
+/// 从光标 token 向左收集命名空间链段：`Ident (.|::) Ident` 反复出现时拼接。
+/// 如 `tcmsg.error.no_file` → `["tcmsg", "error", "no_file"]`。
+fn ns_chain(tokens: &[Token], idx: usize) -> Vec<String> {
+    let TokenKind::Ident(name) = &tokens[idx].kind else { return Vec::new() };
+    let mut segs = vec![name.clone()];
+    let mut i = idx;
+    // 前一个 token 是 `.` 或 `::`、再前一个是 Ident 时继续向左收集
+    while i >= 2 && matches!(tokens[i - 1].kind, TokenKind::Dot | TokenKind::DoubleColon) {
+        if let TokenKind::Ident(prev) = &tokens[i - 2].kind {
+            segs.push(prev.clone());
+            i -= 2;
+        } else {
+            break;
         }
     }
-    name.to_string()
+    segs.reverse();
+    segs
+}
+
+/// 查询全名：命名空间链（`tcmsg.error.no_file`）→ `tcmsg::error::no_file`；
+/// 无链（裸名）→ 原名。与语义层命名空间函数注册的全名格式一致。
+fn ns_query_name(tokens: &[Token], idx: usize, name: &str) -> String {
+    let _ = name; // 链从 token 流取（与调用方传入的 name 一致），保留参数供调用方语义清晰
+    ns_chain(tokens, idx).join("::")
 }
 
 /// 从程序 AST 查找函数定义（含命名空间内函数），返回参数名列表。
@@ -300,8 +317,15 @@ pub fn definition(
     let program = expand_with_base(program, base_dir).ok()?;
     let defs = collect_defs(&tokens, &program);
 
-    // 场景一：成员访问 `obj.field` / `obj.method()`——光标 token 前一个是 `.`
+    // 场景一：成员访问 `obj.field` / `obj.method()` / `tcmsg.error.no_file(...)`——
+    // 光标 token 前一个是 `.`。命名空间函数调用（链式如 `tcmsg.error.no_file`）
+    // 的完整全名在 funcs 表，先按全名查；方法/字段（裸名）其次。
     if idx > 0 && matches!(tokens[idx - 1].kind, TokenKind::Dot) {
+        // 命名空间函数：`a.b.c` 链拍平为 `a::b::c` 查 funcs（顶层函数裸名不受影响）
+        let full = ns_query_name(&tokens, idx, &word);
+        if let Some(span) = defs.funcs.get(&full) {
+            return Some(name_span_to_range(&tokens, *span));
+        }
         // 方法优先（`.m(...)` 调用），其次字段（`.f` 读取）
         if let Some(span) = defs.methods.get(&word) {
             return Some(name_span_to_range(&tokens, *span));
@@ -350,6 +374,10 @@ fn collect_defs_inner(tokens: &[Token], stmts: &[Stmt], ns_prefix: &[String], ma
                     segs.push(f.name.clone());
                     map.funcs.insert(segs.join("::"), span);
                 }
+                // 参数：跳转场景四（变量引用）可命中参数名
+                for p in &f.params {
+                    map.vars.push((p.name.clone(), p.span));
+                }
                 collect_stmt_defs(tokens, &f.body, map);
             }
             Stmt::Class(c) => {
@@ -367,6 +395,10 @@ fn collect_defs_inner(tokens: &[Token], stmts: &[Stmt], ns_prefix: &[String], ma
                 for m in &c.methods {
                     if let Some(span) = name_span_after(tokens, m.span) {
                         map.methods.insert(m.name.clone(), span);
+                    }
+                    // 方法参数：跳转场景四（变量引用）可命中参数名
+                    for p in &m.params {
+                        map.vars.push((p.name.clone(), p.span));
                     }
                     collect_stmt_defs(tokens, &m.body, map);
                 }
@@ -475,11 +507,13 @@ fn name_span_to_range(tokens: &[Token], span: Span) -> Range {
 
 // ==================== 自动补全（textDocument/completion） ====================
 
-/// 补全项种类（LSP `CompletionItemKind`：2=Method、3=Function、5=Field、7=Class、14=Keyword）。
+/// 补全项种类（LSP `CompletionItemKind`：2=Method、3=Function、5=Field、7=Class、
+/// 9=Namespace、14=Keyword）。
 const KIND_METHOD: u32 = 2;
 const KIND_FUNCTION: u32 = 3;
 const KIND_FIELD: u32 = 5;
 const KIND_CLASS: u32 = 7;
+const KIND_NAMESPACE: u32 = 9;
 const KIND_KEYWORD: u32 = 14;
 
 /// 关键词补全列表（tie 语言关键字）。
@@ -544,14 +578,33 @@ pub fn completion(
     all_completions(source, base_dir)
 }
 
-/// 命名空间成员补全：给定命名空间名（如 `math`），返回该命名空间内全部函数
-/// （label 用裸名，detail 填签名）。用于 `math.` 点场景。
+/// 命名空间成员补全：给定命名空间路径（如 `math` 或 `tcmsg::error`），返回该
+/// 命名空间内的直接成员。label 规则：
+/// - 函数成员（`{ns}::abs`）→ label 裸名 `abs`，detail 填签名；
+/// - 子命名空间（`{ns}::error::no_file`）→ label 只取第一段 `error`，detail 填
+///   `namespace`（选择后继续 `.` 可进入下一级）。
+///
+/// 用于 `math.` / `tcmsg.error.` 点场景。
 fn ns_member_completions(program: &Program, sem: &SemanticResult, ns: &str) -> Vec<CompletionItem> {
     let prefix = format!("{ns}::");
+    // 去重：同一 label（如多个子命名空间函数都映射到 error）只保留一个
+    let mut seen: HashSet<String> = HashSet::new();
     let mut items = Vec::new();
     for (full, sig) in &sem.funcs {
-        if let Some(short) = full.strip_prefix(&prefix) {
-            // 参数名取自 AST（命名空间内函数定义）
+        let Some(rest) = full.strip_prefix(&prefix) else { continue };
+        // 只取直接成员：剩余含 `::` 说明是更深层子命名空间，取第一段
+        let (label, is_ns) = match rest.split_once("::") {
+            Some((seg, _)) => (seg.to_string(), true),
+            None => (rest.to_string(), false),
+        };
+        if !seen.insert(label.clone()) {
+            continue;
+        }
+        let item = if is_ns {
+            // 子命名空间：detail 标 `namespace`，选中后继续 `.` 深入
+            CompletionItem { label, kind: Some(KIND_NAMESPACE), detail: Some("namespace".into()) }
+        } else {
+            // 函数成员：参数名取自 AST（命名空间内函数定义）
             let param_names = func_param_names(program, full);
             let params = sig
                 .param_tys
@@ -566,18 +619,22 @@ fn ns_member_completions(program: &Program, sem: &SemanticResult, ns: &str) -> V
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            items.push(CompletionItem {
-                label: short.to_string(),
+            CompletionItem {
+                label,
                 kind: Some(KIND_FUNCTION),
-                detail: Some(format!("func {short}({params}) -> {}", ty_to_str(&sig.ret_ty))),
-            });
-        }
+                detail: Some(format!("func {}({params}) -> {}", rest, ty_to_str(&sig.ret_ty))),
+            }
+        };
+        items.push(item);
     }
     items
 }
 
 /// 定位光标前的成员访问接收者：源码该位置之前的文本以 `.` 结尾 → 返回 `.` 前
-/// 最后一个标识符（`obj.` → `obj`）；否则返回 `None`。
+/// 的完整链（`obj.` → `obj`；`tcmsg.error.` → `tcmsg::error`，用 `::` 连接以
+/// 匹配语义层命名空间全名）；否则返回 `None`。
+///
+/// 兼容点分命名空间：`math.` / `tcmsg.error.` 都命中（链段均收集）。
 fn member_receiver(source: &str, line: u32, character: u32) -> Option<String> {
     let line_text = source.lines().nth(line as usize)?;
     // 取光标前的字符（按字符数截断，避免 UTF-8 字节切片越界）
@@ -586,20 +643,37 @@ fn member_receiver(source: &str, line: u32, character: u32) -> Option<String> {
     if !prefix.ends_with('.') {
         return None;
     }
-    // 去掉末尾 `.`，再取最后一个标识符（`.` 是 ASCII 单字节，切片安全）
+    // 去掉末尾 `.`，向前收集 `ident(.ident)*` 链（`.` 是 ASCII 单字节，切片安全）
     let before = prefix[..prefix.len() - 1].trim_end();
+    let mut segs: Vec<String> = Vec::new();
     let mut word = String::new();
+    let mut prev_dot = false;
     for ch in before.chars().rev() {
         if ch.is_alphanumeric() || ch == '_' {
             word.push(ch);
+            prev_dot = false;
+        } else if ch == '.' && !prev_dot {
+            // 一次 `.` 结束当前段；`.` 前无段（前一个字符非标识符）时中断
+            if word.is_empty() {
+                break;
+            }
+            segs.push(word.chars().rev().collect());
+            word.clear();
+            prev_dot = true;
         } else {
             break;
         }
     }
-    if word.is_empty() {
+    // 收尾：最后一段（若链仅一层，word 即完整 receiver）
+    if !word.is_empty() {
+        segs.push(word.chars().rev().collect());
+    }
+    if segs.is_empty() {
         None
     } else {
-        Some(word.chars().rev().collect())
+        // 反向收集后反转回源码顺序，再以 `::` 连接成链
+        segs.reverse();
+        Some(segs.join("::"))
     }
 }
 
@@ -717,6 +791,211 @@ fn all_completions(source: &str, base_dir: Option<&Path>) -> Vec<CompletionItem>
     items.sort_by(|a, b| a.label.cmp(&b.label));
     items.dedup_by(|a, b| a.label == b.label);
     items
+}
+
+// ==================== 语义高亮（textDocument/semanticTokens/full） ====================
+
+/// 语义 token 类型索引（对应 [crate::lsp::semantic_token_types] 的下标）。
+///
+/// 关键字/类型关键字由 TextMate 语法着色，这里只覆盖标识符类；
+/// 故 TYPE/KEYWORD 不在其中（避免声明未使用）。
+mod st {
+    /// 命名空间（`tcmsg` / `math`）
+    pub const NAMESPACE: u32 = 0;
+    /// 类名（定义与引用）
+    pub const CLASS: u32 = 1;
+    /// 函数（定义与调用）
+    pub const FUNCTION: u32 = 2;
+    /// 方法（定义与调用）
+    pub const METHOD: u32 = 3;
+    /// 属性/字段（`p.x` 的 x）
+    pub const PROPERTY: u32 = 4;
+    /// 变量（声明与引用）
+    pub const VARIABLE: u32 = 5;
+    /// 参数（形参声明与引用）
+    pub const PARAMETER: u32 = 6;
+}
+
+/// 语义 token 类型名称列表（LSP `SemanticTokensLegend.tokenTypes`）。
+///
+/// 下标与 [st] 模块常量一一对应；供 [crate::server] 构造 initialize 能力声明。
+pub fn semantic_token_types() -> Vec<String> {
+    ["namespace", "class", "function", "method", "property", "variable", "parameter"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// 语义高亮：`textDocument/semanticTokens/full` 请求的结果数据（增量编码）。
+///
+/// 对源码逐 token 分类（仅标识符；关键字/字面量/运算符交给 TextMate 着色）：
+/// - 命名空间声明路径段 / 命名空间调用链段（`tcmsg.error.` 的 tcmsg/error）→ NAMESPACE；
+/// - 函数定义名 / 命名空间函数末段 / 函数调用名 → FUNCTION；
+/// - 方法定义名 / 实例方法调用（`p.dist()`）→ METHOD；
+/// - 类名（定义与引用）→ CLASS；
+/// - 字段访问（`p.x`）→ PROPERTY；
+/// - 形参（声明处 span 精确匹配）→ PARAMETER；
+/// - 其余标识符（局部变量等）→ VARIABLE。
+///
+/// 编码采用 LSP 增量格式：每 5 个 u32 一组
+/// `(deltaLine, deltaStartChar, length, tokenType, tokenModifiers)`，
+/// 相对上一 token 编码（v1 只声明类型，修饰符恒 0）。
+///
+/// `base_dir`：源码所在目录（import 展开用）。展开后命名空间函数全名
+/// （`tcmsg::error::no_file`）参与链段识别。
+pub fn semantic_tokens(source: &str, base_dir: Option<&Path>) -> Vec<u32> {
+    // 词法失败（编辑中途）→ 空结果（客户端保留上一帧）
+    let Ok(tokens) = tokenize(source) else { return Vec::new() };
+
+    // 语义结果（尽力而为：语法/语义失败也能用词法规则分类）
+    let program = parse_program(&tokens).ok();
+    let program = program.and_then(|p| expand_with_base(p, base_dir).ok());
+    let sem = program.as_ref().and_then(|p| analyze(p).ok());
+
+    // 形参声明 span 集合：形参名 token 的精确位置（用于 PARAMETER 分类）
+    let param_spans = program
+        .as_ref()
+        .map(|p| collect_param_spans(&p.stmts))
+        .unwrap_or_default();
+
+    let mut out: Vec<u32> = Vec::new();
+    // 上一 token 的 0-based 行/列（增量编码基准）
+    let mut prev_line = 0u32;
+    let mut prev_char = 0u32;
+
+    for (i, t) in tokens.iter().enumerate() {
+        // 只输出标识符：关键字/类型/字面量/运算符交给 TextMate 语法着色
+        let TokenKind::Ident(name) = &t.kind else { continue };
+        let ty = classify_ident(&tokens, i, name, sem.as_ref(), &param_spans);
+        // 1-based span → 0-based 位置（与 span_to_range 一致）
+        let line = t.span.line.saturating_sub(1);
+        let char = t.span.col.saturating_sub(1);
+        let len = u32::try_from(name.len()).unwrap_or(u32::MAX);
+        out.push(line - prev_line); // deltaLine
+        out.push(if line == prev_line { char - prev_char } else { char }); // deltaStartChar
+        out.push(len);
+        out.push(ty);
+        out.push(0); // tokenModifiers：v1 恒无修饰
+        prev_line = line;
+        prev_char = char;
+    }
+    out
+}
+
+/// 递归收集全部形参声明位置（函数/方法参数名 token 的 span）。
+///
+/// 用 Vec + 线性查找：Span 不实现 Hash（tie-frontend 零侵入设计），
+/// 且参数数量有限，线性扫描开销可忽略。
+fn collect_param_spans(stmts: &[Stmt]) -> Vec<Span> {
+    let mut spans = Vec::new();
+    collect_param_spans_inner(stmts, &mut spans);
+    spans
+}
+
+/// [collect_param_spans] 的递归实现。
+fn collect_param_spans_inner(stmts: &[Stmt], spans: &mut Vec<Span>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::FnDef(f) => {
+                for p in &f.params {
+                    spans.push(p.span);
+                }
+                collect_param_spans_inner(&f.body, spans);
+            }
+            Stmt::Class(c) => {
+                for m in &c.methods {
+                    for p in &m.params {
+                        spans.push(p.span);
+                    }
+                    collect_param_spans_inner(&m.body, spans);
+                }
+            }
+            Stmt::Namespace(ns) => collect_param_spans_inner(&ns.body, spans),
+            Stmt::If(i) => {
+                collect_param_spans_inner(&i.then_branch, spans);
+                collect_param_spans_inner(&i.else_branch, spans);
+            }
+            Stmt::While(w) => collect_param_spans_inner(&w.body, spans),
+            Stmt::For(f) => collect_param_spans_inner(&f.body, spans),
+            Stmt::Switch(s) => {
+                for c in &s.cases {
+                    collect_param_spans_inner(&c.body, spans);
+                }
+                collect_param_spans_inner(&s.default_body, spans);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 单个标识符的语义类型分类（见 [semantic_tokens] 的优先级说明）。
+///
+/// 判定顺序：
+/// 1. 定义名（前面是 func/method/class/namespace）→ 对应类型；
+/// 2. 命名空间链（[ns_chain]）：
+///    - 完整链在语义层 funcs（命名空间函数）→ FUNCTION；
+///    - 当前段前缀存在（`tcmsg::error` 的 tcmsg/error 段）→ NAMESPACE；
+/// 3. 实例成员访问（`p.dist(` 前 `.`）→ 后跟 `(` 为 METHOD，否则 PROPERTY；
+/// 4. 形参声明（span 精确匹配）→ PARAMETER；
+/// 5. 类名（语义表）→ CLASS；
+/// 6. 函数调用（后跟 `(`）→ FUNCTION；
+/// 7. 其余标识符 → VARIABLE。
+fn classify_ident(
+    tokens: &[Token],
+    idx: usize,
+    name: &str,
+    sem: Option<&SemanticResult>,
+    param_spans: &[Span],
+) -> u32 {
+    // 1. 定义名：`func`/`method`/`class`/`namespace` 之后的第一个标识符
+    if idx > 0 {
+        match &tokens[idx - 1].kind {
+            TokenKind::Func => return st::FUNCTION,
+            TokenKind::Method => return st::METHOD,
+            TokenKind::Class => return st::CLASS,
+            TokenKind::Namespace => return st::NAMESPACE,
+            _ => {}
+        }
+    }
+
+    // 2. 命名空间链：完整链在 funcs → 命名空间函数；当前段前缀存在 → 命名空间段
+    if let Some(s) = sem {
+        let chain = ns_chain(tokens, idx);
+        let full = chain.join("::");
+        if s.funcs.contains_key(&full) {
+            return st::FUNCTION;
+        }
+        let prefix = format!("{full}::");
+        if s.funcs.keys().any(|k| k.starts_with(&prefix)) {
+            return st::NAMESPACE;
+        }
+    }
+
+    // 3. 实例成员访问：`p.dist(`（前 `.`）→ 方法；`p.x`（后非 `(`）→ 字段
+    if idx > 0 && matches!(tokens[idx - 1].kind, TokenKind::Dot) {
+        let next_is_lparen = matches!(tokens.get(idx + 1), Some(n) if matches!(n.kind, TokenKind::LParen));
+        return if next_is_lparen { st::METHOD } else { st::PROPERTY };
+    }
+
+    // 4. 形参声明：span 在收集到的形参集合内
+    if param_spans.contains(&tokens[idx].span) {
+        return st::PARAMETER;
+    }
+
+    // 5. 类名（语义表：类定义名已在第 1 步命中，这里是引用）
+    if let Some(s) = sem {
+        if s.classes.contains_key(name) {
+            return st::CLASS;
+        }
+    }
+
+    // 6. 函数调用：后跟 `(`（非方法调用、非定义名）
+    if matches!(tokens.get(idx + 1), Some(n) if matches!(n.kind, TokenKind::LParen)) {
+        return st::FUNCTION;
+    }
+
+    // 7. 其余标识符（局部变量引用/声明）→ VARIABLE
+    st::VARIABLE
 }
 
 #[cfg(test)]
@@ -1152,5 +1431,233 @@ func main() {
         // 命名空间点场景不应含无关内容（如关键词 func）
         assert!(!labels.contains(&"func"), "命名空间点场景不应含关键词：{labels:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ==================== 嵌套命名空间（tcmsg.error.no_file） ====================
+
+    /// 嵌套命名空间源码（`tcmsg` 内嵌 `error`，顶层 `main` 调用链式成员）。
+    ///
+    /// 注意 `r#"` 后直接换行 → 第 1 行为空行；下面注释中的 LSP 行号从 0 计。
+    fn 嵌套命名空间源码() -> &'static str {
+        r#"
+namespace tcmsg {
+    func hello() -> string {
+        return "Hello from tcmsg"
+    }
+    namespace error {
+        func no_file() -> string {
+            return "no file"
+        }
+    }
+}
+func main() {
+    println(tcmsg.hello())
+    println(tcmsg.error.no_file())
+}
+"#
+    }
+
+    /// 嵌套命名空间 hover：`tcmsg.error.no_file` 的 no_file → 命中全名签名。
+    ///
+    /// 旧实现 `ns_query_name` 只取单层链（`error::no_file`），与语义层注册的
+    /// `tcmsg::error::no_file` 对不上而查不到；新实现收集完整链。
+    #[test]
+    fn 嵌套命名空间hover命中函数签名() {
+        let src = 嵌套命名空间源码();
+        // 第 14 行 `    println(tcmsg.error.no_file())`（LSP line 13）：
+        // no_file 起始 character 24（`    println(` 12 字符 + tcmsg.error. 12 字符）
+        let md = hover_markdown(src, 13, 25, None).expect("应命中 no_file 签名");
+        assert!(md.contains("func no_file"), "应命中嵌套命名空间函数：{md}");
+    }
+
+    /// 嵌套命名空间跳转：`tcmsg.error.no_file` 的 no_file → 定义处（error 命名空间内）。
+    ///
+    /// 旧实现场景一（`.` 前）只查 methods/fields 裸名，查不到 funcs 里的全名。
+    #[test]
+    fn 嵌套命名空间跳转命中函数定义() {
+        let src = 嵌套命名空间源码();
+        // no_file 定义在 `        func no_file() -> string {`（LSP line 6，character 13）
+        let range = definition(src, 13, 25, None).expect("应命中 no_file 定义");
+        assert_eq!(range.start.line, 6, "定义应在 LSP line 6");
+        assert_eq!(range.start.character, 13, "定义应从 character 13 开始");
+    }
+
+    /// 嵌套命名空间补全：`tcmsg.error.` 点场景 → 只补该层命名空间函数。
+    ///
+    /// 旧实现 `member_receiver` 只取 `.` 前最后一个标识符（`error`），
+    /// 前缀 `error::` 与注册全名 `tcmsg::error::` 不匹配而查不到。
+    #[test]
+    fn 嵌套命名空间补全点场景() {
+        let src = 嵌套命名空间源码();
+        // 第 14 行 `    println(tcmsg.error.no_file())`（LSP line 13）：
+        // 光标在 `.` 之后（no_file 的 n 之前，character 24）
+        let items = completion(src, 13, 24, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"no_file"), "应补全 error 层函数 no_file：{labels:?}");
+        // 不应补全上层（tcmsg.hello 不属于 error 层）
+        assert!(!labels.contains(&"hello"), "不应补全上层函数 hello：{labels:?}");
+    }
+
+    /// 嵌套命名空间补全：`tcmsg.` 点场景 → 子命名空间 error 作为成员出现。
+    #[test]
+    fn 嵌套命名空间顶层补全子命名空间() {
+        let src = 嵌套命名空间源码();
+        // 第 13 行 `    println(tcmsg.hello())`（LSP line 12）：
+        // 光标在 `tcmsg.` 之后（character 18 = `.` 的后一位）
+        let items = completion(src, 12, 18, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"hello"), "应补全 tcmsg 层函数 hello：{labels:?}");
+        assert!(labels.contains(&"error"), "应补全子命名空间 error：{labels:?}");
+        assert!(!labels.contains(&"no_file"), "不应补全深层函数 no_file：{labels:?}");
+    }
+
+    // ==================== 参数跳转 ====================
+
+    /// 参数跳转：函数体内引用形参名 → 跳到参数声明处。
+    ///
+    /// 旧实现 `collect_stmt_defs` 只收集 VarDecl，形参不在表中。
+    #[test]
+    fn 参数引用跳转命中参数声明() {
+        let src = r#"
+func add(a: i64, b: i64) -> i64 {
+    return a + b
+}
+func main() {
+    println(add(1, 2))
+}
+"#;
+        // 第 3 行 `    return a + b`（LSP line 2）：a 起始 character 11
+        let range = definition(src, 2, 11, None).expect("参数 a 应可跳转");
+        assert_eq!(range.start.line, 1, "参数 a 定义应在 LSP line 1");
+        assert_eq!(range.start.character, 9, "参数 a 定义应从 character 9 开始");
+    }
+
+    /// 方法参数跳转：方法体内引用形参 → 跳到方法签名参数声明处。
+    #[test]
+    fn 方法参数引用跳转命中参数声明() {
+        let src = r#"
+class Point {
+    var x: i64
+    var y: i64
+    method dist(o: Point) -> i64 {
+        return o.x
+    }
+}
+func main() {
+    var p = Point(1, 2)
+    println(p.dist(p))
+}
+"#;
+        // 第 6 行 `        return o.x`（LSP line 5）：参数 o 起始 character 15；
+        // 形参 o 声明在 LSP line 4 `    method dist(o: Point)`，character 16
+        let range = definition(src, 5, 15, None).expect("参数 o 应可跳转");
+        assert_eq!(range.start.line, 4, "参数 o 定义应在 LSP line 4");
+        assert_eq!(range.start.character, 16, "参数 o 定义应从 character 16 开始");
+    }
+
+    // ==================== 语义高亮（semanticTokens） ====================
+
+    /// semanticTokens：把增量编码解码为 (类型, 位置) 列表（测试用辅助）。
+    fn 解码语义token(src: &str, data: &[u32]) -> Vec<(u32, u32, u32, String)> {
+        let mut out = Vec::new();
+        let mut line = 0u32;
+        let mut char = 0u32;
+        for chunk in data.chunks(5) {
+            let (dl, dc, len, ty, _mod) = (chunk[0], chunk[1], chunk[2], chunk[3], chunk[4]);
+            line += dl;
+            if dl == 0 {
+                char += dc;
+            } else {
+                char = dc;
+            }
+            let _ = src;
+            out.push((line, char, len, semantic_token_types()[ty as usize].clone()));
+        }
+        out
+    }
+
+    /// 语义高亮：嵌套命名空间调用的链段分类正确。
+    /// - 链首段（tcmsg）/中间段（error）→ namespace；
+    /// - 末段函数（hello/no_file）→ function；
+    /// - 命名空间声明路径 → namespace。
+    #[test]
+    fn 语义高亮嵌套命名空间链段分类() {
+        let src = 嵌套命名空间源码();
+        let data = semantic_tokens(src, None);
+        assert!(!data.is_empty(), "应产出语义 token");
+        let toks = 解码语义token(src, &data);
+        // 命名空间声明：`namespace tcmsg`（LSP line 1，col 10）
+        let tcmsg_decl = toks.iter().find(|(l, c, _, _)| *l == 1 && *c == 10);
+        assert_eq!(tcmsg_decl.map(|t| t.3.as_str()), Some("namespace"), "声明 tcmsg 应为 namespace");
+        // `namespace error`（LSP line 5，col 14）
+        let error_decl = toks.iter().find(|(l, c, _, _)| *l == 5 && *c == 14);
+        assert_eq!(error_decl.map(|t| t.3.as_str()), Some("namespace"), "声明 error 应为 namespace");
+        // 调用链 `tcmsg.error.no_file`（LSP line 13）：
+        // tcmsg（col 12）→ namespace；error（col 18）→ namespace；no_file（col 24）→ function
+        let chain = toks
+            .iter()
+            .filter(|(l, _, _, _)| *l == 13)
+            .map(|(_, c, _, ty)| (*c, ty.clone()))
+            .collect::<Vec<_>>();
+        assert!(chain.contains(&(12, "namespace".into())), "tcmsg 应为 namespace：{chain:?}");
+        assert!(chain.contains(&(18, "namespace".into())), "error 应为 namespace：{chain:?}");
+        assert!(chain.contains(&(24, "function".into())), "no_file 应为 function：{chain:?}");
+    }
+
+    /// 语义高亮：形参声明 → parameter；变量声明 → variable。
+    #[test]
+    fn 语义高亮参数与变量分类() {
+        let src = r#"
+func add(a: i64, b: i64) -> i64 {
+    var sum = a + b
+    return sum
+}
+"#;
+        let data = semantic_tokens(src, None);
+        let toks = 解码语义token(src, &data);
+        // 形参 a（LSP line 1，col 9）与 b（col 17）→ parameter
+        let a = toks.iter().find(|(l, c, _, _)| *l == 1 && *c == 9);
+        assert_eq!(a.map(|t| t.3.as_str()), Some("parameter"), "形参 a 应为 parameter");
+        let b = toks.iter().find(|(l, c, _, _)| *l == 1 && *c == 17);
+        assert_eq!(b.map(|t| t.3.as_str()), Some("parameter"), "形参 b 应为 parameter");
+        // 变量 sum 声明（LSP line 2，col 8）→ variable
+        let sum = toks.iter().find(|(l, c, _, _)| *l == 2 && *c == 8);
+        assert_eq!(sum.map(|t| t.3.as_str()), Some("variable"), "变量 sum 应为 variable");
+    }
+
+    /// 语义高亮：实例方法调用（`p.dist(`）→ method；字段访问（`p.x`）→ property。
+    #[test]
+    fn 语义高亮方法与字段分类() {
+        let src = r#"
+class Point {
+    var x: i64
+    var y: i64
+    method dist() -> i64 {
+        return this.x
+    }
+    static method create() -> Point {
+        return Point(1, 2)
+    }
+}
+func main() {
+    var p = Point(1, 2)
+    println(p.dist())
+    var q = p.x
+}
+"#;
+        let data = semantic_tokens(src, None);
+        let toks = 解码语义token(src, &data);
+        // 方法定义名 dist（LSP line 4，col 11）→ method
+        let dist_def = toks.iter().find(|(l, c, _, _)| *l == 4 && *c == 11);
+        assert_eq!(dist_def.map(|t| t.3.as_str()), Some("method"), "方法定义 dist 应为 method");
+        // 类名 Point 引用（LSP line 12，col 12）→ class
+        let point_ref = toks.iter().find(|(l, c, _, _)| *l == 12 && *c == 12);
+        assert_eq!(point_ref.map(|t| t.3.as_str()), Some("class"), "类引用 Point 应为 class");
+        // 方法调用 p.dist（LSP line 13，col 14）→ method
+        let dist_call = toks.iter().find(|(l, c, _, _)| *l == 13 && *c == 14);
+        assert_eq!(dist_call.map(|t| t.3.as_str()), Some("method"), "方法调用 dist 应为 method");
+        // 字段访问 p.x（LSP line 14，col 14）→ property
+        let x_field = toks.iter().find(|(l, c, _, _)| *l == 14 && *c == 14);
+        assert_eq!(x_field.map(|t| t.3.as_str()), Some("property"), "字段访问 x 应为 property");
     }
 }
