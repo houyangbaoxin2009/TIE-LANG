@@ -1,6 +1,8 @@
 // tie:library
-// assert.tie：标准库——基础断言函数，失败时打印错误信息并退出进程
+// assert.tie：标准库——基础断言函数（命名空间 assert），失败时打印错误信息并退出进程
+// 调用：import 后 assert.assert(...) / assert.assert_eq(...) / assert.assert_neq(...)
 
+namespace assert {
 // 断言条件为真；条件为假时打印错误并退出（退出码 1）
 func assert(cond: bool) {
     if !cond {
@@ -23,4 +25,5 @@ func assert_neq(a: i64, b: i64) {
         println("assert_neq 失败：" + to_string(a) + " == " + to_string(b))
         exit(1)
     }
+}
 }

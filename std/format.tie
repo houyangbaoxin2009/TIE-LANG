@@ -1,8 +1,10 @@
 // tie:library
-// format.tie：标准库——格式化函数
+// format.tie：标准库——格式化函数（命名空间 format）
 // 全部基于 to_string + str_char + len + 字符串拼接 + 循环/分支实现，不使用下标索引
 // 与字符转换；负数十六进制用「负号前缀 + 绝对值」表示（与常见语言一致）。
+// 调用：import 后 format.format_int(...) / format.format_pad(...)
 
+namespace format {
 // 整数 → 十进制字符串（委托 to_string，与 Rust {} 默认格式一致）
 func format_int(v: i64) -> string {
     return to_string(v)
@@ -53,4 +55,5 @@ func format(b: bool) -> string {
         return "true"
     }
     return "false"
+}
 }

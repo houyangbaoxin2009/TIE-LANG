@@ -1,51 +1,52 @@
 // tie:logic
 // format_demo.tie：格式化标准库演示——导入 format 库，验证全部函数输出
 // 运行：format_demo.exe → 打印各格式化结果，并用断言核对期望值
+// M2.1 起 std 库使用命名空间形式：format.format_int / assert.assert 等。
 
 import "../std/format.tie"
 import "../std/assert.tie"
 
 func main() {
-    // ---- format_int：委托 to_string ----
-    var i1: string = format_int(42)
-    println("format_int(42) = " + i1)
-    assert(i1 == "42")
-    var i2: string = format_int(-7)
-    println("format_int(-7) = " + i2)
-    assert(i2 == "-7")
+    // ---- format.format_int：委托 to_string ----
+    var i1: string = format.format_int(42)
+    println("format.format_int(42) = " + i1)
+    assert.assert(i1 == "42")
+    var i2: string = format.format_int(-7)
+    println("format.format_int(-7) = " + i2)
+    assert.assert(i2 == "-7")
 
-    // ---- format_pad：右对齐、左侧补空格 ----
-    var p1: string = format_pad(42, 6)
-    println("format_pad(42, 6) = [" + p1 + "]")
-    assert(p1 == "    42")
-    var p2: string = format_pad(42, 2)
-    println("format_pad(42, 2) = [" + p2 + "]")
-    assert(p2 == "42")
-    var p3: string = format_pad(42, 0)
-    println("format_pad(42, 0) = [" + p3 + "]")
-    assert(p3 == "42")
+    // ---- format.format_pad：右对齐、左侧补空格 ----
+    var p1: string = format.format_pad(42, 6)
+    println("format.format_pad(42, 6) = [" + p1 + "]")
+    assert.assert(p1 == "    42")
+    var p2: string = format.format_pad(42, 2)
+    println("format.format_pad(42, 2) = [" + p2 + "]")
+    assert.assert(p2 == "42")
+    var p3: string = format.format_pad(42, 0)
+    println("format.format_pad(42, 0) = [" + p3 + "]")
+    assert.assert(p3 == "42")
 
-    // ---- format_int_hex：小写十六进制，负号前置 ----
-    var h1: string = format_int_hex(255)
-    println("format_int_hex(255) = " + h1)
-    assert(h1 == "ff")
-    var h2: string = format_int_hex(0)
-    println("format_int_hex(0) = " + h2)
-    assert(h2 == "0")
-    var h3: string = format_int_hex(16)
-    println("format_int_hex(16) = " + h3)
-    assert(h3 == "10")
-    var h4: string = format_int_hex(-255)
-    println("format_int_hex(-255) = " + h4)
-    assert(h4 == "-ff")
+    // ---- format.format_int_hex：小写十六进制，负号前置 ----
+    var h1: string = format.format_int_hex(255)
+    println("format.format_int_hex(255) = " + h1)
+    assert.assert(h1 == "ff")
+    var h2: string = format.format_int_hex(0)
+    println("format.format_int_hex(0) = " + h2)
+    assert.assert(h2 == "0")
+    var h3: string = format.format_int_hex(16)
+    println("format.format_int_hex(16) = " + h3)
+    assert.assert(h3 == "10")
+    var h4: string = format.format_int_hex(-255)
+    println("format.format_int_hex(-255) = " + h4)
+    assert.assert(h4 == "-ff")
 
-    // ---- format(bool)：true / false ----
-    var b1: string = format(true)
-    println("format(true) = " + b1)
-    assert(b1 == "true")
-    var b2: string = format(false)
-    println("format(false) = " + b2)
-    assert(b2 == "false")
+    // ---- format.format(bool)：true / false ----
+    var b1: string = format.format(true)
+    println("format.format(true) = " + b1)
+    assert.assert(b1 == "true")
+    var b2: string = format.format(false)
+    println("format.format(false) = " + b2)
+    assert.assert(b2 == "false")
 
     println("format 演示全部通过")
 }

@@ -1,7 +1,9 @@
 // tie:library
-// string.tie：标准库——字符串工具函数
+// string.tie：标准库——字符串工具函数（命名空间 str，string 是类型关键字不可用）
 // 全部基于 str_char + len + 字符串拼接 + 循环/分支实现，不使用下标索引与字符转换
+// 调用：import 后 str.str_trim(...) / str.str_split(...)；命名空间内互调为裸调用
 
+namespace str {
 // 判断单字符字符串是否为空白字符（空格、制表符、换行、回车）
 func is_whitespace(c: string) -> bool {
     if c == " " {
@@ -218,4 +220,5 @@ func str_split(s: string, sep: string) -> table {
     // 收尾：最后一段 [start, n)（sep 结尾时 start==n → 空元素）
     table_push(t, str_slice(s, start, n))
     return t
+}
 }

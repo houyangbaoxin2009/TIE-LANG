@@ -3,6 +3,68 @@
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库**。
 
+## [Harbor M2.1.2] std 库与示例统一命名空间语法 — 2026-08-08
+
+### 变更
+- **std 库全面命名空间化**（与 tcmsg 一致的命名空间形式，废弃裸函数调用）：
+  - `std/string.tie` → `namespace str`（`str.str_trim` / `str.str_split` 等；`string` 是类型关键字，命名空间名用 `str`）
+  - `std/math.tie` → `namespace math`（`math.abs` / `math.deg_to_rad` 等）
+  - `std/assert.tie` → `namespace assert`（`assert.assert` / `assert.assert_eq` / `assert.assert_neq`）
+  - `std/format.tie` → `namespace format`（`format.format_int` / `format.format_pad` 等）
+  - `std/csv.tie` → `namespace csv`（`csv.csv_read` / `csv.csv_cells`），内部跨命名空间调用改为 `str.str_split` / `str.str_slice`（`str_char` 是底座原语，保持裸调用）
+  - `std/tcmsg.tie` 内部 `str_starts_with` → `str.str_starts_with`（跨命名空间调用）
+- **examples 全部改用命名空间调用**：`csv_demo` / `format_demo` / `std_demo` / `std_math_demo` /
+  `tcmsg_demo`（`assert.assert`）、`import_main`+`lib_math`（`mathlib.*`）、
+  `import_nested`+`lib_math2`/`lib_util`（`math2.*` / `util.*`，嵌套跨命名空间调用）
+
+### 修复
+- **命名空间函数返回动态表无法推断元素类型**（预存 bug）：语义层
+  `dynamic_table_elem_ty` / `table_arg_elem_ty` 只支持裸调用（`Expr::Call`），
+  `str.str_split` 等命名空间调用（`Expr::MethodCall`）返回表时调用点报
+  「标注 table，初始化必须是表字面量 / table_new_* / 返回表的函数调用」。
+  方案：新增辅助函数 `ns_call_full_name`（Call/MethodCall → 注册全名如 `str::str_split`），
+  两处表元素类型推断统一走该解析；裸调用不做 funcs 校验（内建 `table_new_*` 不注册进 funcs，
+  校验会误杀）
+- **IR 层动态表变量初始化只识别裸调用**：`gen_dyn_table_var` 仅匹配 `Expr::Call`，
+  `var p = str.str_split(...)` 走了新建空表分支（运行返回空表，len=0）。
+  方案：MethodCall 初始化复用 `gen_expr` 调用分发；`dyn_table_elem_ty` 经语义层
+  `resolved_calls`（表达式地址 → 全名）查 `table_ret_elems`
+- tie-interp 测试 `std_format_helpers` 同步为命名空间调用（`format.format_int` 等）
+
+### 测试
+- 全工作区测试通过（frontend 112 / interp 49 / llvm 28 / lsp 53 / prep 4 = **246**）
+- 命名空间返回表链路验证：`str.str_split` 编译 + 运行（len / table_at / 下标 / table_push 全通过）；
+  std 库 6 文件独立编译为 `.a` 全成功；csv/format/std/std_math/tcmsg/import 系列示例编译运行全通过
+
+## [Harbor M2.1.1] Windows 控制台 UTF-8 修复 — 2026-08-08
+
+### 修复
+- **Windows 控制台中文乱码**：工具链全部输出 UTF-8 字节，而控制台默认代码页为 GBK（936），
+  导致中文显示为乱码（如 `REPL�?` = `REPL)。`）。
+  方案：各 CLI 入口（tie / tie-prep / tie-frontend / tie-llvm / tie-lsp）启动时调用
+  `init_console_utf8()`（tie-prep 与 tie-frontend 库各提供一份），通过 Windows API
+  `SetConsoleOutputCP(65001)` / `SetConsoleCP(65001)` 把控制台输入/输出代码页切换为 UTF-8。
+  REPL 场景：tie.exe 先切代码页再启动 repl.exe（子进程继承控制台），同样生效。
+- **直接运行 tie.exe 一闪而过**：`find_repl_exe()` 只查 env / exe 同目录 / 当前目录三处，
+  开发期 repl.exe 位于 `repl\` 子目录找不到，导致无参数运行时立即报错退出。
+  方案：新增第 4 个查找路径（workspace 标准布局 `repl/repl.exe`）。
+- **报错窗口一闪而过**：REPL 外壳缺失等报错路径新增 `pause_before_exit()`，
+  仅当 stdin 是交互式终端时暂停（按任意键退出）；管道/重定向/CI 场景不阻塞。
+- **REPL 输出顺序错乱与提示符不换行**：repl.exe（C 程序）编译路径的 print/println
+  走 C `printf`（C stdio 缓冲），而 eval 解释路径的 print 走 Rust stdout（Rust 缓冲），
+  两套缓冲写同一 fd 顺序错乱（`print("你好")` 的输出跑到欢迎语之前）。
+  方案：编译路径的 `print`（不换行）在 printf 后追加 `fflush(stdout)` 立即刷出；
+  REPL 外壳对无返回值（print 副作用）的输入补一个换行，提示符不再挤在同一行。
+
+### 变更
+- tie-prep 与 tie-frontend 的 Cargo.toml 展开 workspace lints，
+  `unsafe_code` 从 forbid 放宽为 allow（仅用于 `init_console_utf8` 的 Windows API 调用）。
+
+### 测试
+- `cargo build --workspace` 零错误；直接运行 tie/tie-prep/tie-frontend/tie-llvm/tie-lsp
+  中文输出正常；REPL 输出 `你好，世界` UTF-8 字节完整（E4 BD A0 ... E7 95 8C）；
+  管道场景不暂停，交互终端才暂停。
+
 ## [Harbor M2.1] 默认值参数与 tcmsg 控制台信息库 — 2026-08-08
 
 ### 新增

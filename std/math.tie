@@ -1,8 +1,10 @@
 // tie:library
-// math.tie：标准库——数学函数
+// math.tie：标准库——数学函数（命名空间 math）
 // 全部基于 + - * / % 与比较运算实现，不调用任何数学原语（sqrt/sin/cos 等仅由 Rust 层提供）
 // 注意：二元运算两侧类型必须一致，浮点运算一律使用浮点字面量（如 2.0 / 180.0）
+// 调用：import 后 math.abs(...) / math.deg_to_rad(...)
 
+namespace math {
 // 整数绝对值：负数取反，非负数原样返回
 func abs(x: i64) -> i64 {
     if x < 0 {
@@ -107,4 +109,5 @@ func deg_to_rad(deg: f64) -> f64 {
 // 弧度转角度：rad * 180 / π（π 取双精度近似值）
 func rad_to_deg(rad: f64) -> f64 {
     return rad * 180.0 / 3.141592653589793
+}
 }

@@ -634,7 +634,7 @@ impl Analyzer {
                                     .insert((self.cur_fn.clone(), v.name.clone()), info);
                             } else {
                                 // 动态表：table_new_* 或返回表的函数调用（元素类型静态已知）
-                                let elem_ty = self.dynamic_table_elem_ty(&v.init, &v.name)?;
+                                let elem_ty = self.dynamic_table_elem_ty(&v.init, &v.name, scope)?;
                                 let info = TableInfo { elem_ty, len: 0, dynamic: true };
                                 self.table_vars
                                     .insert((self.cur_fn.clone(), v.name.clone()), info.clone());
@@ -668,7 +668,7 @@ impl Analyzer {
                         // 未标注的动态表：`var x = table_new_i64()` / `var x = make_list(5)`
                         // （init_ty 为 Table 标记，元素类型需从调用名/返回表推断）
                         if init_ty == TypeSpec::Named(TyKw::Table) {
-                            let elem_ty = self.dynamic_table_elem_ty(&v.init, &v.name)?;
+                            let elem_ty = self.dynamic_table_elem_ty(&v.init, &v.name, scope)?;
                             let info = TableInfo { elem_ty, len: 0, dynamic: true };
                             self.table_vars
                                 .insert((self.cur_fn.clone(), v.name.clone()), info.clone());
@@ -2246,9 +2246,16 @@ impl Analyzer {
     /// 解析「动态表构造/返回」调用的元素类型。
     ///
     /// 支持：table_new_*（元素类型由名字决定）与返回动态表的用户函数
-    /// （元素类型由 table_ret_elems 推断）。返回 Err 表示该表达式不是合法的动态表来源。
-    fn dynamic_table_elem_ty(&self, expr: &Expr, var_name: &str) -> Result<TypeSpec, SemanticError> {
-        let Expr::Call { name, span, .. } = expr else {
+    /// （元素类型由 table_ret_elems 推断；命名空间函数如 str.str_split 也支持）。
+    /// 返回 Err 表示该表达式不是合法的动态表来源。
+    fn dynamic_table_elem_ty(
+        &self,
+        expr: &Expr,
+        var_name: &str,
+        scope: &HashMap<String, TypeSpec>,
+    ) -> Result<TypeSpec, SemanticError> {
+        // 裸调用：函数名在表达式上；命名空间调用（MethodCall）：用统一解析拿全名
+        let Some(name) = ns_call_full_name(&self.result.funcs, expr, scope) else {
             return Err(SemanticError {
                 span: expr_span_of(expr),
                 message: format!(
@@ -2258,21 +2265,21 @@ impl Analyzer {
             });
         };
         // table_new_*：元素类型由名字决定
-        if let Some(elem) = table_new_elem_ty(name) {
+        if let Some(elem) = table_new_elem_ty(&name) {
             return Ok(elem);
         }
         // 用户函数返回表：查 table_ret_elems
-        match self.result.table_ret_elems.get(name) {
+        match self.result.table_ret_elems.get(&name) {
             Some(Some(elem)) => Ok(elem.clone()),
             Some(None) => Err(SemanticError {
-                span: *span,
+                span: expr_span_of(expr),
                 message: format!(
                     "函数 '{name}' 返回的表元素类型未知，无法确定 '{}' 的元素类型",
                     var_name
                 ),
             }),
             None => Err(SemanticError {
-                span: *span,
+                span: expr_span_of(expr),
                 message: format!("函数 '{name}' 未定义或不是返回表的函数"),
             }),
         }
@@ -2311,17 +2318,21 @@ impl Analyzer {
                     message: format!("'{}' 不是表变量", name),
                 })
             }
-            Expr::Call { name, .. } => match self.result.table_ret_elems.get(name) {
-                Some(Some(elem)) => Ok(elem.clone()),
-                Some(None) => Err(SemanticError {
-                    span: expr_span_of(expr),
-                    message: format!("函数 '{name}' 返回的表元素类型未知"),
-                }),
-                None => Err(SemanticError {
-                    span: expr_span_of(expr),
-                    message: format!("函数 '{name}' 未定义或不是返回表的函数"),
-                }),
-            },
+            Expr::Call { .. } | Expr::MethodCall { .. } => {
+                // 裸调用/命名空间调用（如 str.str_split）：统一解析全名后查 table_ret_elems
+                let full = ns_call_full_name(&self.result.funcs, expr, scope).unwrap_or_default();
+                match self.result.table_ret_elems.get(&full) {
+                    Some(Some(elem)) => Ok(elem.clone()),
+                    Some(None) => Err(SemanticError {
+                        span: expr_span_of(expr),
+                        message: format!("函数 '{full}' 返回的表元素类型未知"),
+                    }),
+                    None => Err(SemanticError {
+                        span: expr_span_of(expr),
+                        message: format!("函数 '{full}' 未定义或不是返回表的函数"),
+                    }),
+                }
+            }
             _ => Err(SemanticError {
                 span: expr_span_of(expr),
                 message: "table_at 第 1 个参数必须是表字面量、表变量或返回表的函数".into(),
@@ -2528,6 +2539,40 @@ fn ns_path_segments(expr: &Expr, scope: &HashMap<String, TypeSpec>) -> Option<Ve
 fn ns_prefix_exists(funcs: &HashMap<String, FuncSig>, segs: &[String]) -> bool {
     let prefix = format!("{}::", segs.join("::"));
     funcs.keys().any(|k| k.starts_with(&prefix))
+}
+
+/// 命名空间调用 → 函数全名解析（表元数据查询用）。
+///
+/// 输入是调用表达式（`Expr::Call` 的裸名或 `Expr::MethodCall` 的 receiver+method），
+/// 输出是注册用的全名（如 "str::str_split"）。规则与 infer_expr 的命名空间调用
+/// 判定一致：receiver 是未绑定 Var（单段）/ FieldAccess 链（点分）/ Path（a::b），
+/// 且 funcs 中存在该前缀 → 全名 = 路径段::方法名。
+fn ns_call_full_name(
+    funcs: &HashMap<String, FuncSig>,
+    expr: &Expr,
+    scope: &HashMap<String, TypeSpec>,
+) -> Option<String> {
+    let (segments, method) = match expr {
+        // 裸调用（顶层函数或内建 table_new_* 等）：直接就是名字。不做 funcs 校验——
+        // 内建函数（table_new_i64 等）不注册进 funcs，校验会误杀；后续查表
+        // table_ret_elems 查不到会由调用方给出正确错误。
+        Expr::Call { name, .. } => return Some(name.clone()),
+        Expr::MethodCall { receiver, method, .. } => {
+            // Path（a::b）→ 段；Var/FieldAccess 链 → 未绑定则视为命名空间形态
+            let segs = match receiver.as_ref() {
+                Expr::Path { segments, .. } => segments.clone(),
+                _ => ns_path_segments(receiver, scope)?,
+            };
+            (segs, method)
+        }
+        _ => return None,
+    };
+    if !ns_prefix_exists(funcs, &segments) {
+        return None;
+    }
+    let mut full = segments;
+    full.push(method.clone());
+    Some(full.join("::"))
 }
 
 /// 从语句中取 span。

@@ -1,9 +1,12 @@
 // lib_util.tie：P6 二级导入验证——被 lib_math2 导入的底层工具函数
+// M2.1 起示例库使用命名空间形式：util.square / util.triple。
 
+namespace util {
 func square(x: i64) -> i64 {
     return x * x
 }
 
 func triple(x: i64) -> i64 {
     return x * 3
+}
 }

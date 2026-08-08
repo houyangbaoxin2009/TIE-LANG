@@ -61,7 +61,7 @@ namespace tcmsg {
                 // 当前语言是基础码（如 "zh"）→ 用前缀匹配（"zh-cn" 以 "zh" 开头）
                 var i: i64 = 0
                 while i < len(langs) {
-                    if str_starts_with(langs[i], msg_get_lang()) {
+                    if str.str_starts_with(langs[i], msg_get_lang()) {
                         return texts[i]
                     }
                     i = i + 1

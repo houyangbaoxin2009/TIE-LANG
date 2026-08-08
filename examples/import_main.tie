@@ -1,16 +1,17 @@
 // import_main.tie：P6 import 验证——导入库文件并调用其函数
+// M2.1 起示例库使用命名空间形式：mathlib.add / mathlib.greet 等。
 
 import "./lib_math.tie"
 
 func main() {
-    var s: i64 = add(3, 4)
+    var s: i64 = mathlib.add(3, 4)
     println(s)               // 7
-    var p: i64 = mul(6, 7)
+    var p: i64 = mathlib.mul(6, 7)
     println(p)               // 42
-    var g: string = greet("tie")
+    var g: string = mathlib.greet("tie")
     println(g)               // Hello, tie
-    var m: i64 = max2(10, 5)
+    var m: i64 = mathlib.max2(10, 5)
     println(m)               // 10
-    var m2: i64 = max2(5, 10)
+    var m2: i64 = mathlib.max2(5, 10)
     println(m2)              // 10
 }

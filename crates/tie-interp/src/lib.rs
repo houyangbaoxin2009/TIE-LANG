@@ -2329,28 +2329,29 @@ to_string(n) + ":" + names"#
     #[test]
     fn std_format_helpers() {
         // 加载 std/format.tie（tie 语言自写库，include_str! 保证测试的就是发行版源码）
+        // M2.1 起 std 库使用命名空间形式：format.format_int 等。
         let lib = include_str!("../../../std/format.tie");
         let mut s = Session::new();
         s.eval(lib).unwrap(); // 注册库函数
         // format_int：委托 to_string
-        assert_eq!(s.eval("format_int(42)").unwrap(), "42");
-        assert_eq!(s.eval("format_int(-7)").unwrap(), "-7");
-        assert_eq!(s.eval("format_int(0)").unwrap(), "0");
+        assert_eq!(s.eval("format.format_int(42)").unwrap(), "42");
+        assert_eq!(s.eval("format.format_int(-7)").unwrap(), "-7");
+        assert_eq!(s.eval("format.format_int(0)").unwrap(), "0");
         // format_pad：右对齐、左侧补空格；宽度不足/相等不截断
-        assert_eq!(s.eval("format_pad(42, 6)").unwrap(), "    42");
-        assert_eq!(s.eval("format_pad(42, 2)").unwrap(), "42");
-        assert_eq!(s.eval("format_pad(42, 0)").unwrap(), "42");
-        assert_eq!(s.eval("format_pad(-7, 4)").unwrap(), "  -7");
+        assert_eq!(s.eval("format.format_pad(42, 6)").unwrap(), "    42");
+        assert_eq!(s.eval("format.format_pad(42, 2)").unwrap(), "42");
+        assert_eq!(s.eval("format.format_pad(42, 0)").unwrap(), "42");
+        assert_eq!(s.eval("format.format_pad(-7, 4)").unwrap(), "  -7");
         // format_int_hex：小写十六进制、无 0x；负数「-」+ 绝对值
-        assert_eq!(s.eval("format_int_hex(255)").unwrap(), "ff");
-        assert_eq!(s.eval("format_int_hex(0)").unwrap(), "0");
-        assert_eq!(s.eval("format_int_hex(16)").unwrap(), "10");
-        assert_eq!(s.eval("format_int_hex(4095)").unwrap(), "fff");
-        assert_eq!(s.eval("format_int_hex(-255)").unwrap(), "-ff");
-        assert_eq!(s.eval("format_int_hex(3735928559)").unwrap(), "deadbeef");
+        assert_eq!(s.eval("format.format_int_hex(255)").unwrap(), "ff");
+        assert_eq!(s.eval("format.format_int_hex(0)").unwrap(), "0");
+        assert_eq!(s.eval("format.format_int_hex(16)").unwrap(), "10");
+        assert_eq!(s.eval("format.format_int_hex(4095)").unwrap(), "fff");
+        assert_eq!(s.eval("format.format_int_hex(-255)").unwrap(), "-ff");
+        assert_eq!(s.eval("format.format_int_hex(3735928559)").unwrap(), "deadbeef");
         // format(bool)：true / false
-        assert_eq!(s.eval("format(true)").unwrap(), "true");
-        assert_eq!(s.eval("format(false)").unwrap(), "false");
+        assert_eq!(s.eval("format.format(true)").unwrap(), "true");
+        assert_eq!(s.eval("format.format(false)").unwrap(), "false");
     }
 
     #[test]

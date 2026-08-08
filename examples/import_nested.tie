@@ -1,14 +1,15 @@
 // import_nested.tie：P6 二级导入验证——导入 lib_math2（其内部又导入 lib_util）
+// M2.1 起示例库使用命名空间形式：math2.add3 / util.square 等。
 
 import "./lib_math2.tie"
 
 func main() {
-    var s: i64 = add3(1, 2, 3)
+    var s: i64 = math2.add3(1, 2, 3)
     println(s)          // 6
-    var q: i64 = square(7)
+    var q: i64 = util.square(7)
     println(q)          // 49
-    var t: i64 = triple(5)
+    var t: i64 = util.triple(5)
     println(t)          // 15
-    var ss: i64 = sqsum(3, 4)
+    var ss: i64 = math2.sqsum(3, 4)
     println(ss)         // 25
 }

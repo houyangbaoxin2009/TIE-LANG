@@ -737,16 +737,27 @@ impl<'p> IrGenerator<'p> {
             _ => 8,
         };
         // 初始化表达式决定表指针来源：
-        // - 返回表的用户函数调用（如 build_numbers(10)）→ 调用该函数取表指针；
+        // - 返回表的函数调用（裸调用 build_numbers(10) 或命名空间调用
+        //   str.str_split(...)）→ 调用该函数取表指针；
         // - 其余（table_new_* 等）→ 直接 tie_table_new 新建空表。
-        let tptr = if let Expr::Call { name: fname, args, .. } = &v.init {
-            let (r, _t) = self.gen_call(fname, args)?;
-            r
-        } else {
-            self.mark_used("tie_table_new");
-            let t = self.new_reg();
-            self.line(&format!("{t} = call ptr @tie_table_new(i64 {elem_size})"));
-            t
+        let tptr = match &v.init {
+            // 裸调用：直接按函数名生成调用
+            Expr::Call { name: fname, args, .. } => {
+                let (r, _t) = self.gen_call(fname, args)?;
+                r
+            }
+            // 命名空间调用（MethodCall）：复用 gen_expr 的调用分发
+            // （Path/Var/FieldAccess → resolved_calls 全名 → gen_call）
+            Expr::MethodCall { .. } => {
+                let (r, _t) = self.gen_expr(&v.init)?;
+                r
+            }
+            _ => {
+                self.mark_used("tie_table_new");
+                let t = self.new_reg();
+                self.line(&format!("{t} = call ptr @tie_table_new(i64 {elem_size})"));
+                t
+            }
         };
         let alloca = self.new_reg();
         self.line(&format!("{alloca} = alloca ptr"));
@@ -2669,6 +2680,14 @@ impl<'p> IrGenerator<'p> {
         };
         let g = self.fmt_global(&format!("{fmt}{nl}"));
         self.line(&format!("call i32 (ptr, ...) @printf(ptr @{g}, {arg_ty} {arg})"));
+        // print（不换行）用于交互提示（如 repl 外壳的 `print("> ")`）：必须立即刷新
+        // stdout，否则 C stdio 缓冲可能不显示提示符；且 repl 中 eval 解释路径的 print
+        // 走 Rust stdout（各自 flush），两套缓冲写同一 fd 会乱序，统一即时刷出可避免。
+        if !newline {
+            self.line("call i32 @fflush(ptr null)");
+            // fflush 返回 i32，LLVM 解析器会分配隐式寄存器号，必须消费掉
+            let _ = self.new_reg();
+        }
         Ok((self.new_reg(), "void"))
     }
 
@@ -2788,17 +2807,33 @@ impl<'p> IrGenerator<'p> {
                         ),
                     })
             }
-            Expr::Call { name, .. } => self
-                .sem
-                .table_ret_elems
-                .get(name)
-                .and_then(|o| o.clone())
-                .ok_or_else(|| IrError {
-                    message: format!(
-                        "内部错误：返回表的函数 '{}' 缺少元素类型元数据（函数 {}）",
-                        name, self.cur_fn
-                    ),
-                }),
+            Expr::Call { .. } | Expr::MethodCall { .. } => {
+                // 裸调用 / 命名空间调用（str.str_split）：统一解析全名后查 table_ret_elems
+                let key = expr as *const Expr as usize;
+                let full = self
+                    .sem
+                    .resolved_calls
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        // 无解析记录（非命名空间裸调用）→ 按表达式名字取
+                        match expr {
+                            Expr::Call { name, .. } => name.clone(),
+                            Expr::MethodCall { method, .. } => method.clone(),
+                            _ => String::new(),
+                        }
+                    });
+                self.sem
+                    .table_ret_elems
+                    .get(&full)
+                    .and_then(|o| o.clone())
+                    .ok_or_else(|| IrError {
+                        message: format!(
+                            "内部错误：返回表的函数 '{full}' 缺少元素类型元数据（函数 {}）",
+                            self.cur_fn
+                        ),
+                    })
+            }
             _ => Err(IrError {
                 message: format!("内部错误：table_at 第 1 个参数不是动态表（函数 {}）", self.cur_fn),
             }),

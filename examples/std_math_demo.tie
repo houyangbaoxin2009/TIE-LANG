@@ -1,6 +1,7 @@
 // tie:logic
 // math_demo.tie：数学标准库演示——导入 assert / math / string 库，
 // 验证 math.tie 全部函数，并直接调用 Rust 层数学原语演示完整数学栈
+// M2.1 起 std 库使用命名空间形式：math.abs / assert.assert_eq 等。
 
 import "../std/assert.tie"
 import "../std/math.tie"
@@ -16,115 +17,115 @@ func bool_str(b: bool) -> string {
 
 func main() {
     // ---- 整数绝对值 ----
-    var a1: i64 = abs(-5)
-    println("abs(-5) = " + to_string(a1))
-    assert_eq(a1, 5)
+    var a1: i64 = math.abs(-5)
+    println("math.abs(-5) = " + to_string(a1))
+    assert.assert_eq(a1, 5)
 
-    var a2: i64 = abs(5)
-    println("abs(5) = " + to_string(a2))
-    assert_eq(a2, 5)
+    var a2: i64 = math.abs(5)
+    println("math.abs(5) = " + to_string(a2))
+    assert.assert_eq(a2, 5)
 
     // ---- 整数最大 / 最小 ----
-    var mx: i64 = max_i(3, 7)
-    println("max_i(3, 7) = " + to_string(mx))
-    assert_eq(mx, 7)
+    var mx: i64 = math.max_i(3, 7)
+    println("math.max_i(3, 7) = " + to_string(mx))
+    assert.assert_eq(mx, 7)
 
-    var mn: i64 = min_i(3, 7)
-    println("min_i(3, 7) = " + to_string(mn))
-    assert_eq(mn, 3)
+    var mn: i64 = math.min_i(3, 7)
+    println("math.min_i(3, 7) = " + to_string(mn))
+    assert.assert_eq(mn, 3)
 
     // ---- 浮点绝对值 ----
-    var af: f64 = abs_f(-3.5)
-    println("abs_f(-3.5) = " + to_string(af))
-    assert(af == 3.5)
+    var af: f64 = math.abs_f(-3.5)
+    println("math.abs_f(-3.5) = " + to_string(af))
+    assert.assert(af == 3.5)
 
     // ---- 浮点最大 / 最小 ----
-    var mxf: f64 = max_f(1.5, 2.5)
-    println("max_f(1.5, 2.5) = " + to_string(mxf))
-    assert(mxf == 2.5)
+    var mxf: f64 = math.max_f(1.5, 2.5)
+    println("math.max_f(1.5, 2.5) = " + to_string(mxf))
+    assert.assert(mxf == 2.5)
 
-    var mnf: f64 = min_f(1.5, 2.5)
-    println("min_f(1.5, 2.5) = " + to_string(mnf))
-    assert(mnf == 1.5)
+    var mnf: f64 = math.min_f(1.5, 2.5)
+    println("math.min_f(1.5, 2.5) = " + to_string(mnf))
+    assert.assert(mnf == 1.5)
 
     // ---- 浮点夹取 ----
-    var c1: f64 = clamp(10.0, 0.0, 5.0)
-    println("clamp(10.0, 0.0, 5.0) = " + to_string(c1))
-    assert(c1 == 5.0)
+    var c1: f64 = math.clamp(10.0, 0.0, 5.0)
+    println("math.clamp(10.0, 0.0, 5.0) = " + to_string(c1))
+    assert.assert(c1 == 5.0)
 
-    var c2: f64 = clamp(-2.0, 0.0, 5.0)
-    println("clamp(-2.0, 0.0, 5.0) = " + to_string(c2))
-    assert(c2 == 0.0)
+    var c2: f64 = math.clamp(-2.0, 0.0, 5.0)
+    println("math.clamp(-2.0, 0.0, 5.0) = " + to_string(c2))
+    assert.assert(c2 == 0.0)
 
-    var c3: f64 = clamp(3.0, 0.0, 5.0)
-    println("clamp(3.0, 0.0, 5.0) = " + to_string(c3))
-    assert(c3 == 3.0)
+    var c3: f64 = math.clamp(3.0, 0.0, 5.0)
+    println("math.clamp(3.0, 0.0, 5.0) = " + to_string(c3))
+    assert.assert(c3 == 3.0)
 
     // ---- 整数夹取 ----
-    var ci: i64 = clamp_i(10, 0, 5)
-    println("clamp_i(10, 0, 5) = " + to_string(ci))
-    assert_eq(ci, 5)
+    var ci: i64 = math.clamp_i(10, 0, 5)
+    println("math.clamp_i(10, 0, 5) = " + to_string(ci))
+    assert.assert_eq(ci, 5)
 
     // ---- 奇偶判断 ----
-    var od: bool = is_odd(7)
-    println("is_odd(7) = " + bool_str(od))
-    assert(od)
+    var od: bool = math.is_odd(7)
+    println("math.is_odd(7) = " + bool_str(od))
+    assert.assert(od)
 
-    var ev: bool = is_even(8)
-    println("is_even(8) = " + bool_str(ev))
-    assert(ev)
+    var ev: bool = math.is_even(8)
+    println("math.is_even(8) = " + bool_str(ev))
+    assert.assert(ev)
 
     // ---- 平均值 ----
-    var av: f64 = avg_f(3.0, 5.0)
-    println("avg_f(3.0, 5.0) = " + to_string(av))
-    assert(av == 4.0)
+    var av: f64 = math.avg_f(3.0, 5.0)
+    println("math.avg_f(3.0, 5.0) = " + to_string(av))
+    assert.assert(av == 4.0)
 
     // ---- 符号 ----
-    var sg1: i64 = sign_i(-5)
-    println("sign_i(-5) = " + to_string(sg1))
-    assert_eq(sg1, -1)
+    var sg1: i64 = math.sign_i(-5)
+    println("math.sign_i(-5) = " + to_string(sg1))
+    assert.assert_eq(sg1, -1)
 
-    var sg2: i64 = sign_i(0)
-    println("sign_i(0) = " + to_string(sg2))
-    assert_eq(sg2, 0)
+    var sg2: i64 = math.sign_i(0)
+    println("math.sign_i(0) = " + to_string(sg2))
+    assert.assert_eq(sg2, 0)
 
-    var sg3: i64 = sign_i(9)
-    println("sign_i(9) = " + to_string(sg3))
-    assert_eq(sg3, 1)
+    var sg3: i64 = math.sign_i(9)
+    println("math.sign_i(9) = " + to_string(sg3))
+    assert.assert_eq(sg3, 1)
 
     // ---- 角度 / 弧度换算（浮点比较用容差）----
-    var pi: f64 = deg_to_rad(180.0)
-    println("deg_to_rad(180.0) = " + to_string(pi))
-    assert(abs_f(pi - 3.141592653589793) < 0.000001)
+    var pi: f64 = math.deg_to_rad(180.0)
+    println("math.deg_to_rad(180.0) = " + to_string(pi))
+    assert.assert(math.abs_f(pi - 3.141592653589793) < 0.000001)
 
-    var back: f64 = rad_to_deg(3.141592653589793)
-    println("rad_to_deg(pi) = " + to_string(back))
-    assert(abs_f(back - 180.0) < 0.000001)
+    var back: f64 = math.rad_to_deg(3.141592653589793)
+    println("math.rad_to_deg(pi) = " + to_string(back))
+    assert.assert(math.abs_f(back - 180.0) < 0.000001)
 
-    // ---- Rust 层数学原语直接演示（完整数学栈）----
+    // ---- Rust 层数学原语直接演示（完整数学栈；sqrt/floor/ceil/round/pow/sin 为原语）----
     var sq: f64 = sqrt(16.0)
     println("sqrt(16.0) = " + to_string(sq))
-    assert(abs_f(sq - 4.0) < 0.000001)
+    assert.assert(math.abs_f(sq - 4.0) < 0.000001)
 
     var fl: f64 = floor(3.7)
     println("floor(3.7) = " + to_string(fl))
-    assert(fl == 3.0)
+    assert.assert(fl == 3.0)
 
     var ce: f64 = ceil(3.2)
     println("ceil(3.2) = " + to_string(ce))
-    assert(ce == 4.0)
+    assert.assert(ce == 4.0)
 
     var rn: f64 = round(3.5)
     println("round(3.5) = " + to_string(rn))
-    assert(rn == 4.0)
+    assert.assert(rn == 4.0)
 
     var pw: f64 = pow(2.0, 10.0)
     println("pow(2.0, 10.0) = " + to_string(pw))
-    assert(pw == 1024.0)
+    assert.assert(pw == 1024.0)
 
     var sn: f64 = sin(0.0)
     println("sin(0.0) = " + to_string(sn))
-    assert(sn == 0.0)
+    assert.assert(sn == 0.0)
 
     println("math 演示全部通过")
 }
