@@ -1,0 +1,35 @@
+// tie:library
+// prep/indent.tie：转换器模块示例（Harbor M3 可扩展性验证）
+//
+// 协议：顶层 `func process(src: string) -> string`——输入源码文本，输出转换后文本。
+// 本模块演示"新增转换器只需写 tie 模块、不改 Rust"：
+//   把源码中所有制表符（\t）替换为 4 个空格（缩进规范化）。
+//
+// 挂载方式：tie-prep --module prep/indent.tie <file>
+// 框架（tie-prep）eval 本文件注册 process，再 eval_call 以字符串值直传源码调用。
+
+// 判断单字符字符串是否为制表符（独立函数，保持模块自包含可读性）
+func is_tab(c: string) -> bool {
+    if c == "\t" {
+        return true
+    }
+    return false
+}
+
+// 模块入口（协议约定）：逐字符扫描，制表符 → 4 空格，其余原样保留。
+// 完全基于语言底座原语 str_char / len / 字符串拼接，不依赖任何 import。
+func process(src: string) -> string {
+    var n: i64 = len(src)
+    var result: string = ""
+    var i: i64 = 0
+    while i < n {
+        var c: string = str_char(src, i)
+        if is_tab(c) {
+            result = result + "    "
+        } else {
+            result = result + c
+        }
+        i = i + 1
+    }
+    return result
+}

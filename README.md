@@ -15,6 +15,7 @@ tie 是一门**通用编程语言**：用一门语言写逻辑、写界面、写
 | [docs/language.md](docs/language.md) | 语法规范：文件结构、类型系统、语句/控制流、函数、面向对象、语法速查表 |
 | [docs/ai-guide.md](docs/ai-guide.md) | AI 教学指南：语言用法 + 负例 + 编译器架构（教 AI 用/开发 tie） |
 | [docs/prompt-pack.md](docs/prompt-pack.md) | 可粘贴 Prompt 包：自包含简介，直接发给任何 AI |
+| [docs/plans/](docs/plans/) | 后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法） |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更记录（按里程碑） |
 
 ## 快速开始
@@ -71,6 +72,7 @@ tie             # 无参数 → 进入 REPL 交互模式（启动 tie 语言自�
 | `--emit-ir` | 只生成 LLVM IR（.ll），不继续编译 |
 | `--keep-ir` | 保留中间 IR 文件 |
 | `--prep-only` | 只做预处理（tie-prep）并打印识别结果 |
+| `--module <file.tie>` | tie-prep：挂载自定义 tie 转换器模块（顶层 `process(src)->string`），输出为模块转换结果（Harbor M3 可扩展性） |
 | `--lsp` | 以语言服务器模式运行（读 stdin 的 LSP 消息、写 stdout，等价于 `tie-lsp`） |
 | `-h, --help` | 显示帮助 |
 
@@ -107,14 +109,18 @@ target/release/tie-llvm.exe repl/repl.tie    # 链接 interp 库生成 repl/repl
 tie/
 ├── crates/
 │   ├── tie-prep/      预处理：清理代码、提取头、识别文件角色（logic/ui/db/data/library）
+│   │                  Harbor M3 自举：核心逻辑由 tie 语言自写（prep/core.tie），Rust 壳解释执行
 │   ├── tie-frontend/  前端：词法（含 ASI）→ 语法 → 语义（符号表/类型检查）+ import 展开（imports 模块，tie-llvm/tie-lsp 共享），自研；独立 CLI 可调试
 │   ├── tie-llvm/      中端+后端驱动：AST → LLVM IR 文本生成；调用 opt/clang/lld
 │   ├── tie-lsp/       语言服务器：JSON-RPC 2.0 over stdio，复用前端三阶段 + import 展开提供诊断 / hover / 跳转定义 / 补全（支持跨文件语义）
 │   ├── tie-interp/    解释执行：树遍历求值 AST + C ABI 桥（staticlib），REPL 自举核心
 │   └── tie/           CLI 主入口：角色分派调度器 + REPL（启动 repl.exe）
 ├── repl/repl.tie     REPL 外壳（tie 语言自写，自举；编译链接 tie-interp 静态库）
+├── prep/core.tie     预处理器核心模块（tie 语言自写：头部提取/角色判定/正文重建；Harbor M3 自举，编译期内嵌 tie-prep）
+├── prep/indent.tie   转换器模块示例（制表符→4 空格；证明扩展性——新增转换器只需写 tie 模块，`tie-prep --module` 挂载）
 ├── std/              标准库（tie 语言自写：assert / string / math / csv / format / tcmsg，均为命名空间形式调用，如 assert.assert / str.str_split，基于语言底座原语）
 ├── docs/language.md   语法规范
+├── docs/plans/        后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法）
 ├── examples/          示例程序（hello / wide / table / tuple / oop / 负例 oop_neg_* 等）
 └── Cargo.toml         workspace（统一 edition/lints/release 配置）
 ```
@@ -173,4 +179,4 @@ tie/
 | M0 | 正式发行版基础：版本规则（年份.修订号）、内部代号（2026.1 "Harbor"）、工具链合集打包（`scripts/package.ps1` → zip） | ✅ 完成 |
 | M1 | VSCode 插件：语法高亮 / 智能缩进 / 代码片段 + LSP 客户端（诊断 / hover / 跳转定义 / 补全），TypeScript 重构 | ✅ 完成 |
 | M2 | 标准库：`std/`（文件 / 字符串 / 断言 / CSV / 格式化）+ `math`（数学函数）+ 20+ 语言底座原语 + **`tcmsg` 控制台信息库（i18n）** + **默认值参数**（可选参数省略时用字面量默认值）；M2.1.2 起 std 库全部采用命名空间形式（`assert.assert` / `str.str_split` / `math.abs`），为自举与生态奠定基础 | ✅ 完成 |
-| M3 | 预处理器自举：完全用 tie 语言重写 `tie-prep`，使其可扩展（编译器自举阶段一） | 规划中 |
+| M3 | 预处理器自举：完全用 tie 语言重写 `tie-prep`，使其可扩展（编译器自举阶段一） | 🔄 阶段一完成（核心逻辑已 tie 语言化，`prep/core.tie`；Rust 壳仅解释执行） |

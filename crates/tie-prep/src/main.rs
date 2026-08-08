@@ -4,6 +4,9 @@
 //! ```text
 //! tie-prep <input.tie>           清理后正文输出到 stdout，角色信息输出到 stderr
 //! tie-prep <input.tie> --info    只输出角色与头部信息（人类可读），不输出正文
+//! tie-prep <input.tie> --module prep/indent.tie
+//!                                 挂载自定义 tie 转换器模块（顶层 process(src)->string），
+//!                                 输出为模块处理后的文本（Harbor M3 可扩展性）
 //! tie-prep -h | --help           显示帮助
 //! ```
 //!
@@ -26,11 +29,14 @@ tie 语言预处理工具（四段式第一段）
   1. 清理代码（去 BOM、统一换行、剥离头部）
   2. 识别文件类型（解析文件头 // tie: 指令）
   3. 判定角色，供调用方自动转交对应工具链
+  4. 挂载 tie 模块（--module）做自定义转换（Harbor M3 可扩展性）
 
 选项:
-  --info      只打印角色与头部信息，不输出正文
-  --version   显示版本号与内部代号
-  -h, --help  显示本帮助
+  --info            只打印角色与头部信息，不输出正文
+  --module <file>   挂载模块：解释执行该 tie 文件，调用其 process(src)->string
+                    输出转换结果（证明新增转换器只需写 tie 模块、不改 Rust）
+  --version         显示版本号与内部代号
+  -h, --help        显示本帮助
 
 输出约定:
   默认模式  清理后的正文 → stdout；角色信息 → stderr
@@ -50,8 +56,11 @@ fn main() -> ExitCode {
     let args = env::args().skip(1);
     let mut input: Option<String> = None;
     let mut info_only = false;
+    let mut module: Option<String> = None;
 
-    for arg in args {
+    // 逐个解析参数（--module 需要吞下一个参数）
+    let mut iter = args.peekable();
+    while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -68,6 +77,18 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--info" => info_only = true,
+            "--module" => {
+                // 下一个参数是模块文件路径
+                let Some(path) = iter.next() else {
+                    eprintln!("错误: --module 需要一个模块文件参数\n\n{USAGE}");
+                    return ExitCode::from(2);
+                };
+                if module.is_some() {
+                    eprintln!("错误: 只能指定一个 --module\n\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+                module = Some(path);
+            }
             other if other.starts_with('-') => {
                 eprintln!("错误: 未知选项 {other}\n\n{USAGE}");
                 return ExitCode::from(2);
@@ -87,6 +108,13 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
 
+    // --module 与 --info 语义冲突：info 展示预处理的头部/角色，模块模式下
+    // 输出的是模块转换结果，无头部/角色概念。
+    if module.is_some() && info_only {
+        eprintln!("错误: --module 不能与 --info 同时使用\n\n{USAGE}");
+        return ExitCode::from(2);
+    }
+
     // 读取源码
     let source = match fs::read_to_string(&input) {
         Ok(s) => s,
@@ -95,6 +123,32 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // 挂载自定义 tie 模块（Harbor M3 可扩展性）：解释执行模块文件，
+    // 调用其顶层 process(src) -> string，原始源码直传，输出转换结果。
+    if let Some(module_path) = module {
+        let module_src = match fs::read_to_string(&module_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("错误: 读取模块 {module_path} 失败: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        // 模块入口约定：顶层 process(src: string) -> string
+        let out = match tie_prep::run_module(&module_src, "process", &source) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("错误: 模块 {module_path} 执行失败: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(e) = io::stdout().write_all(out.as_bytes()) {
+            eprintln!("错误: 写入 stdout 失败: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("[tie-prep] 文件: {input} | 模块: {module_path} | 转换完成");
+        return ExitCode::SUCCESS;
+    }
 
     // 预处理：清理 + 识别文件类型 + 角色判定
     let result = tie_prep::preprocess(&source);

@@ -64,6 +64,33 @@ func main() {
 - `// tie:ui` 文件可含 `view`/`layout` 声明 + 事件处理函数。
 - 内容单文件即可运行（`logic` 含 `func main()`），也可多文件通过 `import` 组合（见 §7）。
 
+### 2.4 预处理（Harbor M3 起：tie 语言自举）
+
+**预处理（tie-prep）** 是四段式流水线的第一段，在源码文本层面工作，职责：
+去 BOM / CRLF→LF 归一（壳层）→ 提取头部 → 判定角色 → 重建正文。
+
+Harbor M3 起，预处理**核心逻辑完全用 tie 语言编写**（`prep/core.tie`），
+Rust 侧仅剩解释执行壳：
+
+1. 字节规范化（去 BOM、`\r\n`→`\n`）留壳层——tie 字符串字面量无法表达 BOM 字符；
+2. 通过 tie-interp `eval` 注册模块，再 `eval_call("prep::process", src)`
+   以**字符串值直传**源码调用（不经源码文本转义，换行/引号原样直传）；
+3. 模块返回**协议文本**，壳层解析还原角色/头部/正文：
+
+```text
+ROLE:logic          ← 角色（logic/ui/db/data/library）
+HEADERS:2           ← 头部指令数量
+H:opt=2             ← 每条头部指令原文（剥离 // tie: 前缀后）
+H:target=win
+BODY:12             ← 正文字节数（tie len 语义）
+<正文恰好 12 字节>   ← 清理后的正文（不含头部行）
+```
+
+**扩展性**：新增转换器/处理器 = 新增一个 tie 模块（约定顶层
+`func process(src: string) -> string`），Rust 侧零改动。
+示例 `prep/indent.tie`（制表符→4 空格）可通过
+`tie-prep <file> --module prep/indent.tie` 挂载执行。
+
 ## 3. 类型系统（静态类型）
 
 tie 采用**静态类型**（编译期类型检查），后端为 LLVM 强类型 IR 服务。

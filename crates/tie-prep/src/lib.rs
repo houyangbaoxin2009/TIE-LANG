@@ -18,7 +18,7 @@
 
 pub mod preprocess;
 
-pub use preprocess::{preprocess, FileRole, Header, PreprocessResult};
+pub use preprocess::{preprocess, run_module, FileRole, Header, PreprocessResult};
 
 /// 在 Windows 上把控制台输入/输出代码页切换为 UTF-8（65001）。
 ///

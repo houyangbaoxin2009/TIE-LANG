@@ -7,8 +7,9 @@ repository.workspace = true
 description = "tie 语言编译器前端：词法分析（含 ASI）→ 语法分析 → 语义分析（符号表/类型检查），全部自研实现"
 
 [dependencies]
-# import 展开（expand_imports）需要读取并预处理被导入文件，复用 tie-prep 的清理逻辑
-tie-prep = { path = "../tie-prep" }
+# 注：Harbor M3 自举后 tie-prep 将依赖 tie-interp（解释执行 tie 语言写的预处理模块），
+# 而 tie-frontend 被 tie-interp 依赖——为保持依赖图无环，import 展开的清理逻辑
+# 已在 imports.rs 本地化（clean_source），此处不再依赖 tie-prep。
 
 [lints]
 # 注意：[lints] workspace = true 与本地覆盖无法共存（Cargo 限制）。

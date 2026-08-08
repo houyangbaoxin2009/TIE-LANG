@@ -3,6 +3,60 @@
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库**。
 
+## [Harbor M3 阶段一] 预处理器自举：核心逻辑 tie 语言化 — 2026-08-08
+
+编译器自举第一阶段：`tie-prep` 的预处理核心逻辑（头部提取 / 角色判定 / 正文重建）
+完全用 tie 语言重写，Rust 侧降为解释执行壳。
+
+### 新增
+- **`prep/core.tie`（tie 语言自写预处理模块）**：`namespace prep` 内含 9 个函数
+  （`is_whitespace` / `slice` / `trim` / `starts_with` / `split_lines` / `join_lines` /
+  `header_kind` / `detect_role` / `process`），完全基于语言底座原语
+  （`str_char` / `len` / 拼接 / `table_new_*`），自包含不依赖任何 import。
+  入口 `func process(src: string) -> string` 输出协议文本
+  （`ROLE:` / `HEADERS:n` / `H:raw`×n / `BODY:m` / 正文 m 字节），
+  与原 Rust 版预处理行为逐条对齐（头部区扫描、角色判定顺序、正文重建）。
+  编译期内嵌进 tie-prep 二进制（`include_str!`），发布无需额外文件。
+- **`tie-prep` 重构为解释执行壳**：字节规范化（去 BOM、CRLF→LF）留壳层
+  → `eval_call("prep::process", src)` → `parse_protocol` 解析协议文本还原
+  `PreprocessResult`。新增协议解析器等；`--prep-only` CLI 行为不变。
+- **`prep/indent.tie`（转换器模块示例，可扩展性证明）**：顶层
+  `func process(src: string) -> string` 把制表符缩进替换为 4 空格，
+  完全基于语言底座原语。tie-prep 新增 `run_module(module, entry, source)`
+  通用入口 + CLI `--module <file.tie>` 挂载选项——**新增转换器只需写一个
+  tie 模块，零 Rust 改动**（M3 目标"使其可扩展"的直接证据）。
+
+### 变更
+- **打破循环依赖（M3 自举的关键）**：tie-prep 新增依赖 tie-interp（解释执行模块）；
+  原 tie-frontend 依赖 tie-prep（import 展开复用其清理逻辑）会形成
+  `frontend → prep → interp → frontend` 环——故 tie-frontend 移除 tie-prep 依赖，
+  import 展开自带轻量 `clean_source`（去 BOM / CRLF 归一 / 剥头部行，语义与
+  原 preprocess 一致）。
+- tie-frontend 语义层：`ns_call_full_name` 支持**裸调用按当前命名空间前缀补全**
+  （命名空间内函数互调返回表时注册键是全名，如 `prep::split_lines`）。
+- tie-interp：**跨函数作用域隔离**（`Env.scope_base`）——函数 A 调用 B 时，
+  B 的局部变量声明不再与 A 的同名局部变量冲突（查找/赋值/声明检查只作用于
+  当前函数的 `scopes[scope_base..]` 段）。此前同名局部变量在嵌套调用下会被
+  误报「变量 'n' 重复声明」。
+
+### 测试
+- 全工作区测试通过（frontend 112 / interp 58 / llvm 31 / lsp 75 / prep 4 → **6**）；
+  prep 4 个既有测试改用新自举实现跑通（无头默认逻辑 / 数据角色 / 双头分离 / 内容区注释），
+  新增 2 个扩展性测试（`run_module` 挂载 indent.tie 转换器验证 tab→4 空格、
+  缺失入口函数报错可读不 panic）
+- 端到端：`examples/hello.tie`（logic 编译运行）、`examples/lib_math.tie`
+  （library 编译静态库）、`tie --prep-only`（角色/头部识别）全部通过
+
+### 规划（后续 M）
+- **新增 `docs/plans/` 设计规划目录**，为阶段一收尾时排定的三个后续里程碑产出设计文档：
+  - `switch-pattern-matching.md`——switch 模式匹配增强（多值 `case 1, 2:` / 区间
+    `case 3..7:` / 守卫 `case 8 when flag:` / 类型匹配 `case string:`），含 AST/语义/
+    IR/解释器四层实现方案与验收标准；
+  - `namespace-single-file.md`——单文件命名空间（命名空间内函数可见性 `func (ns) name`、
+    `import "x.tie" as alias` 前缀重命名、跨文件冲突隔离），语义层解析顺序扩展；
+  - `unified-func-style.md`——统一 func 写法（标准库去 `str_` 冗余前缀、返回类型书写
+    规范、调用写法统一），不含语法破坏性变更。
+
 ## [Harbor M2.2] 正则表达式 + tie:script 模块协议基础 — 2026-08-08
 
 ### 新增

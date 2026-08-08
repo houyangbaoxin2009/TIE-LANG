@@ -7,6 +7,10 @@ repository.workspace = true
 description = "tie 语言预处理工具（四段式第一段）：清理代码 + 识别文件类型（头指令） + 角色判定，供编译器集成或独立 CLI 使用"
 
 [dependencies]
+# Harbor M3 自举：预处理核心逻辑（头部提取/角色判定/正文重建）由 tie 语言
+# 编写（prep/core.tie），本 crate 作为解释执行壳——通过 tie-interp 的
+# eval/eval_call 注册并调用 prep::process，再解析协议文本还原结果。
+tie-interp = { path = "../tie-interp" }
 
 [lints]
 # 注意：[lints] workspace = true 与本地覆盖无法共存（Cargo 限制）。

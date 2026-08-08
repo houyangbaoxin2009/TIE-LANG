@@ -11,7 +11,37 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tie_prep::preprocess;
+
+/// 清理被导入文件源码：去 BOM、CRLF 归一、剥离头部行。
+///
+/// 语义与 tie-prep 的 `preprocess` 一致（正文 = 第一个非头部内容行起）。
+/// 注意：tie-frontend 处于依赖图底层（被 tie-interp 依赖），而 Harbor M3 自举后
+/// tie-prep 将依赖 tie-interp（解释执行 tie 语言编写的预处理模块）——
+/// 若此处复用 tie-prep 会形成 `frontend → prep → interp → frontend` 循环依赖，
+/// 故 import 展开自带轻量清理，不依赖 tie-prep crate。
+fn clean_source(source: &str) -> String {
+    let source = source.trim_start_matches('\u{FEFF}');
+    let source = source.replace("\r\n", "\n");
+    // 剥离头部：文件最前面的连续 `// tie:` 行（允许其间空行）
+    let mut body_start = 0;
+    let mut in_header_zone = true;
+    for (idx, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        if in_header_zone {
+            if trimmed.is_empty() {
+                // 头部区域内的空行：跳过（仍算头部区域）
+                continue;
+            }
+            if trimmed.strip_prefix("// tie:").is_some() {
+                continue;
+            }
+            // 第一个非头部内容行：正文从这里开始
+            body_start = idx;
+            in_header_zone = false;
+        }
+    }
+    source.lines().skip(body_start).collect::<Vec<_>>().join("\n")
+}
 
 /// import 展开错误：携带位置与信息（span 指向 import 语句处）。
 #[derive(Debug, Clone)]
@@ -60,13 +90,13 @@ fn expand_imports_inner(
                         message: format!("循环导入：文件 '{}' 已在导入链中", imp.path),
                     });
                 }
-                // 读取 + 预处理 + 词法 + 语法解析被导入文件
+                // 读取 + 清理（去 BOM/CRLF/剥离头部）+ 词法 + 语法解析被导入文件
                 let source = fs::read_to_string(&import_path).map_err(|e| ImportError {
                     span: imp.span,
                     message: format!("导入文件 {} 读取失败: {e}", import_path.display()),
                 })?;
-                let pre = preprocess::preprocess(&source);
-                let tokens = crate::lexer::tokenize(&pre.cleaned_source).map_err(|e| ImportError {
+                let cleaned = clean_source(&source);
+                let tokens = crate::lexer::tokenize(&cleaned).map_err(|e| ImportError {
                     span: imp.span,
                     message: format!("导入文件 {} 词法错误: {e}", imp.path),
                 })?;

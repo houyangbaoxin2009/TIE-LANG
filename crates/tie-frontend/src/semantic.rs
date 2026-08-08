@@ -2381,7 +2381,7 @@ impl Analyzer {
         scope: &HashMap<String, TypeSpec>,
     ) -> Result<TypeSpec, SemanticError> {
         // 裸调用：函数名在表达式上；命名空间调用（MethodCall）：用统一解析拿全名
-        let Some(name) = ns_call_full_name(&self.result.funcs, expr, scope) else {
+        let Some(name) = ns_call_full_name(&self.result.funcs, expr, scope, &self.ns_stack) else {
             return Err(SemanticError {
                 span: expr_span_of(expr),
                 message: format!(
@@ -2446,7 +2446,7 @@ impl Analyzer {
             }
             Expr::Call { .. } | Expr::MethodCall { .. } => {
                 // 裸调用/命名空间调用（如 str.str_split）：统一解析全名后查 table_ret_elems
-                let full = ns_call_full_name(&self.result.funcs, expr, scope).unwrap_or_default();
+                let full = ns_call_full_name(&self.result.funcs, expr, scope, &self.ns_stack).unwrap_or_default();
                 match self.result.table_ret_elems.get(&full) {
                     Some(Some(elem)) => Ok(elem.clone()),
                     Some(None) => Err(SemanticError {
@@ -2673,16 +2673,32 @@ fn ns_prefix_exists(funcs: &HashMap<String, FuncSig>, segs: &[String]) -> bool {
 /// 输出是注册用的全名（如 "str::str_split"）。规则与 infer_expr 的命名空间调用
 /// 判定一致：receiver 是未绑定 Var（单段）/ FieldAccess 链（点分）/ Path（a::b），
 /// 且 funcs 中存在该前缀 → 全名 = 路径段::方法名。
+/// 裸调用按当前命名空间前缀补全（命名空间内函数互调返回表时，如 prep::split_lines——
+/// table_ret_elems 注册键是全名，见 dynamic_table_elem_ty 的调用约定）。
 fn ns_call_full_name(
     funcs: &HashMap<String, FuncSig>,
     expr: &Expr,
     scope: &HashMap<String, TypeSpec>,
+    ns_stack: &[String],
 ) -> Option<String> {
     let (segments, method) = match expr {
-        // 裸调用（顶层函数或内建 table_new_* 等）：直接就是名字。不做 funcs 校验——
-        // 内建函数（table_new_i64 等）不注册进 funcs，校验会误杀；后续查表
-        // table_ret_elems 查不到会由调用方给出正确错误。
-        Expr::Call { name, .. } => return Some(name.clone()),
+        // 裸调用：先查裸名（顶层函数），未命中再按当前命名空间前缀补全。
+        // 不做 funcs 校验——内建函数（table_new_i64 等）不注册进 funcs，校验会误杀；
+        // 后续查表 table_ret_elems 查不到会由调用方给出正确错误。
+        Expr::Call { name, .. } => {
+            if funcs.contains_key(name) {
+                return Some(name.clone());
+            }
+            if !ns_stack.is_empty() {
+                let mut segs = ns_stack.to_vec();
+                segs.push(name.clone());
+                let full = segs.join("::");
+                if funcs.contains_key(&full) {
+                    return Some(full);
+                }
+            }
+            return Some(name.clone());
+        }
         Expr::MethodCall { receiver, method, .. } => {
             // Path（a::b）→ 段；Var/FieldAccess 链 → 未绑定则视为命名空间形态
             let segs = match receiver.as_ref() {

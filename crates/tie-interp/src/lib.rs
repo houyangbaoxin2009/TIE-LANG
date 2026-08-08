@@ -851,6 +851,8 @@ impl Session {
             };
             env.scopes.last_mut().unwrap().insert(p.name.clone(), v);
         }
+        // 函数作用域从参数作用域开始（被调函数内声明不污染调用者，跨函数隔离）
+        env.scope_base = env.scopes.len() - 1;
         let result = env.exec_block(&f.body);
         env.scopes.pop();
         env.cur_ns = saved_ns;
@@ -925,16 +927,23 @@ struct Env<'a> {
     /// 命名空间内裸调用（如 tcmsg::error 内 helper()）据此补全为全名
     /// （helper → tcmsg::error::helper）；由 call_fn 执行函数体时设置/恢复。
     cur_ns: Vec<String>,
+    /// 当前函数的作用域栈起点（scope_base.. 属于当前函数）。
+    ///
+    /// 为什么需要：函数 A 调用函数 B 时，B 的局部变量声明不应与 A 的同名
+    /// 局部变量冲突（跨函数隔离）。lookup/assign/is_declared 只访问
+    /// `scopes[scope_base..]`，函数调用压参后 base 指向参数作用域。
+    /// REPL 顶层为 0（整个栈都属于顶层）。
+    scope_base: usize,
 }
 
 impl<'a> Env<'a> {
     fn new(session: &'a mut Session) -> Self {
-        Self { session, scopes: Vec::new(), cur_ns: Vec::new() }
+        Self { session, scopes: Vec::new(), cur_ns: Vec::new(), scope_base: 0 }
     }
 
-    /// 变量查找：作用域栈 → 顶层 globals。
+    /// 变量查找：当前函数作用域栈（scope_base 起）→ 顶层 globals。
     fn lookup(&self, name: &str) -> Option<Value> {
-        for scope in self.scopes.iter().rev() {
+        for scope in self.scopes[self.scope_base..].iter().rev() {
             if let Some(v) = scope.get(name) {
                 return Some(v.clone());
             }
@@ -942,9 +951,9 @@ impl<'a> Env<'a> {
         self.session.globals.get(name).cloned()
     }
 
-    /// 变量赋值：作用域栈内找到则改，否则写顶层 globals。
+    /// 变量赋值：当前函数作用域（scope_base 起）内找到则改，否则写顶层 globals。
     fn assign(&mut self, name: &str, value: Value) -> Result<(), String> {
-        for scope in self.scopes.iter_mut().rev() {
+        for scope in self.scopes[self.scope_base..].iter_mut().rev() {
             if scope.contains_key(name) {
                 scope.insert(name.to_string(), value);
                 return Ok(());
@@ -957,9 +966,12 @@ impl<'a> Env<'a> {
         Err(format!("变量 '{name}' 未声明"))
     }
 
-    /// 变量是否已声明（作用域栈或顶层）。
+    /// 变量是否已声明（当前函数作用域 scope_base 起，或顶层）。
     fn is_declared(&self, name: &str) -> bool {
-        self.scopes.iter().any(|s| s.contains_key(name)) || self.session.globals.contains_key(name)
+        self.scopes[self.scope_base..]
+            .iter()
+            .any(|s| s.contains_key(name))
+            || self.session.globals.contains_key(name)
     }
 
     /// 执行一条语句。
@@ -2008,6 +2020,9 @@ impl<'a> Env<'a> {
                         segs.pop(); // 去掉函数名，剩命名空间路径
                         self.cur_ns = segs;
                     }
+                    // 保存调用者的作用域起点，压参后本函数作用域从参数作用域开始
+                    //（被调函数内声明与调用者同名变量不再冲突，跨函数隔离）。
+                    let saved_base = self.scope_base;
                     // 压新作用域绑定参数：实参在前，缺省参数按默认值表达式求值补齐
                     //（默认值限字面量/空表，eval_expr 直接求值，无作用域依赖）。
                     self.scopes.push(std::collections::HashMap::new());
@@ -2024,8 +2039,10 @@ impl<'a> Env<'a> {
                         };
                         self.scopes.last_mut().unwrap().insert(p.name.clone(), v);
                     }
+                    self.scope_base = self.scopes.len() - 1;
                     let result = self.exec_block(&f.body);
                     self.scopes.pop();
+                    self.scope_base = saved_base;
                     self.cur_ns = saved_ns;
                     // 处理 return 传播
                     match result? {
