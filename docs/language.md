@@ -91,6 +91,10 @@ BODY:12             ← 正文字节数（tie len 语义）
 示例 `prep/indent.tie`（制表符→4 空格）可通过
 `tie-prep <file> --module prep/indent.tie` 挂载执行。
 
+> tie:script 是上述机制的一般化协议：模块约定、`eval`/`eval_call` 执行语义、
+> 协议文本格式与三层调用入口（Rust / CLI / tie 程序内）的完整说明见
+> [docs/tie-script.md](tie-script.md)。
+
 ## 3. 类型系统（静态类型）
 
 tie 采用**静态类型**（编译期类型检查），后端为 LLVM 强类型 IR 服务。

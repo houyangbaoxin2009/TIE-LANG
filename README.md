@@ -13,6 +13,7 @@ tie 是一门**通用编程语言**：用一门语言写逻辑、写界面、写
 | --- | --- |
 | [README.md](README.md) | 本文件：工程入口（快速开始、CLI、结构、流水线、路线图） |
 | [docs/language.md](docs/language.md) | 语法规范：文件结构、类型系统、语句/控制流、函数、面向对象、语法速查表 |
+| [docs/tie-script.md](docs/tie-script.md) | tie:script 模块协议：tie 脚本的注册/调用机制、模块约定、协议文本格式、三层调用入口（Rust/CLI/tie 程序内） |
 | [docs/ai-guide.md](docs/ai-guide.md) | AI 教学指南：语言用法 + 负例 + 编译器架构（教 AI 用/开发 tie） |
 | [docs/prompt-pack.md](docs/prompt-pack.md) | 可粘贴 Prompt 包：自包含简介，直接发给任何 AI |
 | [docs/plans/](docs/plans/) | 后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法） |
@@ -144,6 +145,7 @@ tie/
 ├── prep/indent.tie   转换器模块示例（制表符→4 空格；证明扩展性——新增转换器只需写 tie 模块，`tie-prep --module` 挂载）
 ├── std/              标准库（tie 语言自写：assert / string / math / csv / format / tcmsg，均为命名空间形式调用，如 assert.assert / str.str_split，基于语言底座原语）
 ├── docs/language.md   语法规范
+├── docs/tie-script.md tie:script 模块协议（eval/eval_call 机制、模块约定、协议文本、三层调用入口）
 ├── docs/plans/        后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法）
 ├── examples/          示例程序（hello / wide / table / tuple / oop / 负例 oop_neg_* 等）
 └── Cargo.toml         workspace（统一 edition/lints/release 配置）

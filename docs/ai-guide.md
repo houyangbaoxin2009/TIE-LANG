@@ -297,7 +297,7 @@ crates/
 ├── tie-prep/      预处理：清理代码、提取头（// tie:）、识别文件角色（logic/ui/db/data/library）
 ├── tie-frontend/  前端：lexer（含 ASI）→ parser → semantic，自研
 ├── tie-llvm/      中端+后端驱动：AST → LLVM IR 文本；调用 opt/clang/lld
-├── tie-interp/    解释执行（占位，REPL 用）
+├── tie-interp/    解释执行：AST 树遍历求值 + eval/eval_call（tie:script 模块协议）+ C ABI 桥（staticlib），REPL 自举核心
 └── tie/           CLI 主入口：角色分派调度器 + REPL
 ```
 
@@ -389,6 +389,26 @@ pub struct ClassInfo {
 3. import 已在 driver 层递归加载为内联函数（语义分析前）。
 4. 生成 `.ll` → 调用 `opt`（优化）→ `clang`（汇编）→ `lld`（链接）。
 
+### 9.3 tie:script 模块协议（eval / eval_call）
+
+tie:script 是「宿主进程 ↔ tie 脚本」的执行协议：约定 `.tie` 模块文件在
+解释器会话中被 **`eval` 注册 + `eval_call` 字符串值直传调用**。
+完整说明见 [docs/tie-script.md](tie-script.md)，要点：
+
+- **入口约定**：模块顶层定义 `func process(src: string) -> string`
+  （可放命名空间，用全名 `mod::process` 调用；void 入口返回空串）；
+- **执行语义**：`eval(模块源码)` 把顶层定义收进会话函数表（跨调用持久）；
+  `eval_call(全名, 文本)` 以 `Value::Str` **值直传**调用（不经源码文本转义），
+  要求入口恰好 1 个必选字符串参数（可带默认值可选参数）；
+- **三层入口**：Rust 侧 `tie_prep::run_module`（tie-prep 自举）／CLI 侧
+  `tie-prep --module <file.tie>`（转换器扩展）／tie 程序内内置
+  `eval` / `eval_call`（编译与解释双路径，见下）；
+- **编译路径桥**：内置 `eval`/`eval_call` 在 IR 中生成对 tie-interp 静态库
+  C 导出的调用——`tie_eval_expr` / `tie_eval_call`（+ 用后 `tie_free_result`
+  释放堆串），链接 `tie_interp.lib`；
+- **协议文本**：`eval_call` 只能返回一个字符串，跨层结构化数据用文本协议
+  （如 prep/core.tie 的 `ROLE:`/`HEADERS:`/`H:`/`BODY:` 四行前缀 + 字节计数正文）。
+
 ## 10. 给编译器开发 AI 的硬性规则
 
 1. **修改 AST 枚举时**：新增变体会破坏 `semantic.rs` / `ir.rs` 的 `match`——需同步
@@ -412,4 +432,5 @@ pub struct ClassInfo {
 | 修改字段布局 | semantic.rs（field_index）→ ir.rs（gen_class_addr/gen_field_assign） |
 | 新增 CLI 选项 | crates/tie/（主入口）+ README.md CLI 表 |
 | 修改预处理/角色 | crates/tie-prep/ |
+| 修改 tie:script 协议 / eval / eval_call | crates/tie-interp/src/lib.rs（Session::eval/eval_call、call_fn 分发、C ABI 导出）→ crates/tie-llvm/src/ir.rs（内置调用生成）→ prep/（模块）→ docs/tie-script.md |
 

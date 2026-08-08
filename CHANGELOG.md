@@ -3,6 +3,26 @@
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库**。
 
+## [docs] tie:script 模块协议文档 — 2026-08-08
+
+tie:script 是「宿主进程 ↔ tie 脚本」的执行协议（`eval` 注册 + `eval_call`
+字符串值直传调用），此前散见于零散章节，现整理为**独立完整文档**：
+
+### 新增
+- **docs/tie-script.md**：tie:script 模块协议完整说明——核心机制（eval / eval_call
+  / 字符串值直传）、模块约定（`func process(src: string) -> string` 入口 + 自包含
+  约束）、协议文本格式（`ROLE:`/`HEADERS:`/`H:`/`BODY:` 字节计数正文）、三层调用
+  入口（Rust 侧 `run_module` / CLI `--module` / tie 程序内 `eval`/`eval_call`）、
+  编译路径 C ABI 桥（`tie_eval_expr`/`tie_eval_call`/`tie_free_result`）、
+  设计约束与限制、相关文件与文档索引。
+
+### 同步更新
+- README.md：文档目录表加 docs/tie-script.md 条目、工程结构补一行；
+- docs/language.md §2.4：预处理自举一节末尾加 tie:script 引用；
+- docs/ai-guide.md：§7 tie-interp 描述更新（解释执行 + eval/eval_call + C ABI 桥，
+  不再"占位"）；新增 §9.3 tie:script 模块协议小节；§11 任务索引补 tie:script 任务行；
+- docs/prompt-pack.md：新增【tie:script 动态执行】（eval / eval_call 内置函数）小节。
+
 ## [Harbor M2.1.5] switch 模式匹配增强：多值 / 区间 / 守卫 / 类型匹配 — 2026-08-08
 
 switch 语句从「单值字面量比较」升级为**类 Rust match / C# switch 的模式匹配**

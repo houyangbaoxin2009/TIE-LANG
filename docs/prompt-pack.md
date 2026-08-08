@@ -68,6 +68,15 @@ var (q, r) = divmod(17, 5)       // 解构
 【import】
 import "./lib_math.tie" as math   // 已实现：函数递归加载内联
 
+【tie:script 动态执行】（eval / eval_call 内置函数，已实现）
+// tie:script 协议：tie 程序可在运行期加载并调用 tie 脚本模块
+var module = "func process(src: string) -> string {\n    return \"[\" + src + \"]\"\n}\n"
+var reg = eval(module)                     // eval(代码)：注册顶层定义 → "已定义 1 个函数"
+var out = eval_call("process", "hi")       // eval_call(函数全名, 字符串参数)：值直传调用，返回字符串
+// 入口约定 func process(src: string) -> string；可放命名空间（全名 ns::process 调用）；
+// 多行文本原样直传（换行/引号不转义）；void 入口返回空串。
+// 完整协议见 docs/tie-script.md；端到端示例见 examples/script_demo.tie。
+
 【class / OOP】
 class Point {
     var x: i64 = 0                // 字段 var name[: Ty] [= 默认值]
