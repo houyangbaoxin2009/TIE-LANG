@@ -111,6 +111,8 @@ fn initialize(state: &mut ServerState, id: Option<Value>) -> Vec<Value> {
 
 /// 从文档 uri（`file:///...`）提取源码所在目录（import 展开用）。
 ///
+/// - 先做百分号解码（VSCode 等客户端对 Windows 盘符冒号发送 `%3A`，
+///   如 `file:///f%3A/Projects/...`，不解码会得到非法路径 `f%3A/...`）；
 /// - Windows 路径：`file:///C:/dir/file.tie` → `C:/dir`（由 `Path` 统一处理分隔符）；
 /// - 其他平台：`file:///dir/file.tie` → `/dir`；
 /// - 无法解析（非 file 协议 / 无目录部分）返回 `None`，
@@ -119,9 +121,44 @@ fn uri_base_dir(uri: &str) -> Option<PathBuf> {
     // 去掉 `file://` 前缀；Windows 盘符路径多一个前导 `/`（`file:///C:/...`）
     let rest = uri.strip_prefix("file://")?;
     let rest = rest.strip_prefix('/').unwrap_or(rest);
+    // 百分号解码：`%3A` → `:`（VSCode Windows 路径编码盘符冒号）
+    let decoded = percent_decode(rest);
     // 文件 uri 应指向具体文件，取父目录作为 base_dir
-    let path = Path::new(rest);
+    let path = Path::new(&decoded);
     path.parent().map(|p| p.to_path_buf())
+}
+
+/// 解码 URI 百分号编码（`%XX` → 对应字节，UTF-8 还原为字符）。
+///
+/// 覆盖 VSCode 发送的 file:// uri：盘符冒号（`f%3A`）、空格（`%20`）、
+/// 中文等多字节字符均可能被编码。非编码字符原样保留；`%` 后不是合法
+/// 十六进制时也原样保留（防御损坏的 uri）。
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 十六进制字符 → 数值（0-15），非十六进制返回 None。
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// `textDocument/didOpen`：全文存入内存，并立即推送诊断。
@@ -655,6 +692,50 @@ func main() {
 
     // ==================== 真实文件（import 展开端到端） ====================
 
+    /// percent_decode 解码 VSCode 风格的 Windows 盘符冒号（`f%3A` → `f:`）。
+    #[test]
+    fn 百分号解码盘符冒号() {
+        assert_eq!(percent_decode("f%3A/Projects/tie/examples/csv_demo.tie"),
+            "f:/Projects/tie/examples/csv_demo.tie");
+    }
+
+    /// percent_decode 解码中文等多字节 UTF-8 编码。
+    #[test]
+    fn 百分号解码中文路径() {
+        assert_eq!(percent_decode("examples/%E4%B8%AD%E6%96%87.tie"), "examples/中文.tie");
+    }
+
+    /// percent_decode 对无编码字符原样保留；`%` 后非十六进制时原样保留。
+    #[test]
+    fn 百分号解码无编码原样保留() {
+        assert_eq!(percent_decode("C:/dir/a_b.tie"), "C:/dir/a_b.tie");
+        // 损坏的百分号序列（%XY 不是十六进制）应原样保留而非 panic
+        assert_eq!(percent_decode("a%ZZb"), "a%ZZb");
+    }
+
+    /// uri_base_dir：VSCode 编码盘符的 uri → 解码后的父目录（import 展开的 base_dir）。
+    #[test]
+    fn uri_base_dir解码编码盘符() {
+        let dir = uri_base_dir("file:///f%3A/Projects/tie/examples/csv_demo.tie")
+            .expect("应能解析出 base_dir");
+        // Path 在 Windows 下显示为反斜杠；比较时用 PathBuf 相等性
+        assert_eq!(dir, PathBuf::from("f:/Projects/tie/examples"));
+    }
+
+    /// uri_base_dir：未编码的常规 uri 也能解析（兼容其他客户端）。
+    #[test]
+    fn uri_base_dir未编码也可解析() {
+        let dir = uri_base_dir("file:///C:/dir/file.tie").expect("应能解析出 base_dir");
+        assert_eq!(dir, PathBuf::from("C:/dir"));
+    }
+
+    /// uri_base_dir：非 file 协议 / 无目录部分 → None（跳过 import 展开）。
+    #[test]
+    fn uri_base_dir无法解析返回空() {
+        assert!(uri_base_dir("untitled:Untitled-1").is_none(), "非 file 协议应返回 None");
+        assert!(uri_base_dir("file:///").is_none(), "无目录部分应返回 None");
+    }
+
     /// 真实文件端到端：didOpen `examples/csv_demo.tie`（导入 std/csv 等命名空间库），
     /// 诊断应为空——验证跨文件命名空间调用（`str.str_split` / `csv.csv_read` 等）
     /// 经 import 展开后不再误报「未声明变量」。
@@ -673,9 +754,11 @@ func main() {
             return;
         }
         let text = std::fs::read_to_string(&demo).expect("读取示例文件失败");
-        // uri 用绝对路径（Windows 盘符形式 file:///F:/Projects/tie/...）
+        // uri 用绝对路径，且盘符冒号按 VSCode 惯例百分号编码（`f%3A`）——
+        // 回归验证 uri_base_dir 的解码逻辑（不解码会得到非法 base_dir 导致 import 读取失败）
         let path_str = demo.to_string_lossy().replace('\\', "/");
-        let uri = format!("file:///{path_str}");
+        let encoded = path_str.replace(':', "%3A");
+        let uri = format!("file:///{encoded}");
 
         let mut state = ServerState::default();
         let out = handle_message(&mut state, 打开文档(&uri, &text));
@@ -702,8 +785,10 @@ func main() {
             return;
         }
         let text = std::fs::read_to_string(&demo).expect("读取示例文件失败");
+        // 盘符冒号按 VSCode 惯例百分号编码（`f%3A`），回归验证 uri_base_dir 解码
         let path_str = demo.to_string_lossy().replace('\\', "/");
-        let uri = format!("file:///{path_str}");
+        let encoded = path_str.replace(':', "%3A");
+        let uri = format!("file:///{encoded}");
 
         // 找到 `str.str_split(` 实际调用位置（注释里的 `str.str_split 基础` 不参与，
         // 避免命中注释导致无 Ident token）。hover 命中第二个标识符 str_split：
