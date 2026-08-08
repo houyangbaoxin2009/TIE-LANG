@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- 品牌靛蓝圆角背景 -->
+  <rect x="16" y="16" width="224" height="224" rx="60" fill="#2563EB"/>
+  <!-- 左端连接节点：细颈 + 圆头 -->
+  <rect x="40" y="106" width="24" height="12" rx="6" fill="#FFFFFF"/>
+  <circle cx="32" cy="112" r="12" fill="#FFFFFF"/>
+  <!-- 右端连接节点：细颈 + 圆头 -->
+  <rect x="192" y="106" width="24" height="12" rx="6" fill="#FFFFFF"/>
+  <circle cx="224" cy="112" r="12" fill="#FFFFFF"/>
+  <!-- 底部连接节点：细颈 + 圆头 -->
+  <rect x="122" y="192" width="12" height="20" rx="6" fill="#FFFFFF"/>
+  <circle cx="128" cy="228" r="12" fill="#FFFFFF"/>
+  <!-- t 字横笔 -->
+  <rect x="60" y="92" width="136" height="40" rx="20" fill="#FFFFFF"/>
+  <!-- t 字竖笔 -->
+  <rect x="108" y="92" width="40" height="100" rx="20" fill="#FFFFFF"/>
+</svg>
