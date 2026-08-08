@@ -343,11 +343,19 @@ pub struct SwitchStmt {
     pub span: Span,
 }
 
-/// switch 的一个 case 分支：`case 值: 语句…`。
+/// switch 的一个 case 分支：`case 值[, 值]... [when 条件]: 语句…`。
+///
+/// 模式匹配增强（规划 switch-pattern-matching）：
+/// - 多值：`case 1, 2:`（任一相等即命中，逗号分隔）；
+/// - 区间：`case 3..7:`（`Range` 表达式，含 3 不含 7）；
+/// - 守卫：`case 8 when flag:`（值命中 且 守卫为真才进入）；
+/// - 类型匹配：`case string:`（`TypeLit`，匹配 subject 的动态类型）。
 #[derive(Debug, Clone)]
 pub struct SwitchCase {
-    /// case 匹配值（编译期字面量：整数/字符/布尔/字符串）
-    pub value: Expr,
+    /// case 匹配模式列表（多值逗号分隔；每个可为字面量/区间 Range/类型 TypeLit）
+    pub patterns: Vec<Expr>,
+    /// when 守卫条件（可选；值为真才命中，否则落入下一个 case）
+    pub when: Option<Expr>,
     pub body: Vec<Stmt>,
     pub span: Span,
 }
@@ -396,6 +404,11 @@ pub enum Expr {
     /// `MethodCall { receiver: Path(...), method: "no_file", .. }`（`tcmsg::error.no_file()`），
     /// 语义层按 receiver 是 Path 解析为命名空间函数调用。
     Path { segments: Vec<String>, span: Span },
+    /// 类型字面量（switch 类型匹配 pattern：`case string:` / `case i64:`）。
+    ///
+    /// 仅在 switch 的 case pattern 位置出现；普通表达式上下文不存在。
+    /// 语义层校验：subject 为动态类型容器（宽类型/表/元组）才允许，静态类型上报错。
+    TypeLit { ty: TypeSpec, span: Span },
     /// 方法调用 `obj.m(args)`（实例）/ `MyClass.m(args)`（静态）（P8）
     ///
     /// receiver 是变量/this → 实例方法（receiver 地址作隐藏 this 参数）；

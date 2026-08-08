@@ -34,9 +34,13 @@ if c { } else if c2 { } else { }
 while c { }
 for i in 0..10 { }          // 范围：含 0 不含 10
 for item in arr { }         // 遍历表
-switch n {                  // case 值: 后接语句，无 break，无 fallthrough
-    case 1:
-        println("one")
+switch n {                  // case 模式: 后接语句，无 break，无 fallthrough
+    case 1, 2:              // 多值：任一相等即命中
+        println("one or two")
+    case 3..7:              // 区间：3 ≤ n < 7（左闭右开，仅整数/字符）
+        println("three to six")
+    case 8 when flag:       // 守卫：值匹配 且 flag 为真才进入
+        println("eight and flag")
     default:
         println("other")
 }

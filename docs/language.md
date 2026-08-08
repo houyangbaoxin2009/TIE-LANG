@@ -261,6 +261,42 @@ for item in arr { }                         // 集合循环
 return expr                                 // 返回值（可省略分号）
 ```
 
+### 5.1 switch 多分支（M1 已实现；模式匹配增强 M2 后）
+
+```c
+switch n {                                  // 多分支：case 值: 后接语句（无 break，无 fallthrough）
+    case 1, 2:                              // 多值：任一相等即命中（逗号分隔）
+        println("one or two")
+    case 3..7:                              // 区间：3 ≤ n < 7（左闭右开，仅整数/字符）
+        println("three to six")
+    case 8 when flag:                       // 守卫：值匹配 且 flag 为真才进入
+        println("eight and flag")
+    case string:                            // 类型匹配：subject 为动态类型容器时才允许
+        println("a string")
+    default:                                // 可省略；守卫不满足时落入下一个 case
+        println("other")
+}
+```
+
+**语法**：`switch 对象 { case 模式[, 模式]... [when 条件]: 语句… default: 语句… }`。
+
+**case 模式类型**（每个 pattern 须与 switch 对象类型一致）：
+- **字面量**：整数 / 浮点 / 字符 / 布尔 / 负数 / 字符串；
+- **区间**：`case 3..7:`（整数）或 `case 'a'..'e':`（字符）——左闭右开，`start < end`；
+  浮点区间明确不支持；
+- **类型匹配**：`case string:` / `case i64:`——按对象的动态类型匹配，仅在宽类型/动态
+  容器对象（表、元组等）上有意义；普通静态类型对象上报错（类型恒定，恒真/恒假无意义）。
+
+**规则**：
+- **多值** = 多个相等比较的 OR 合并；与区间/守卫可自由组合（`case 1, 3..5 when cond:`）；
+- **守卫** `when`：值为真才进入分支体，守卫不满足时落入下一个 case（顺序匹配）；
+- 无 break、无 fallthrough（一个 case 执行完自动跳出）；
+- `default` 可选且至多一个，全不匹配时执行；
+- 重复的 case 值/区间在语义层报错。
+
+**双路径一致**：编译（IR 展开为比较链：多值 OR、区间 `sge && slt` AND、守卫 AND）与
+解释（tie-interp 按 Value 动态求值）行为一致。
+
 ## 6. 函数
 
 ```c
@@ -418,6 +454,10 @@ class Dog extends Animal {          // 字段拍平：父类字段在前
 | `for`      | 遍历（范围/集合）                   | `for i in 0..10 { }`        |
 | `in`       | `for` 的遍历对象                  | `for item in arr { }`       |
 | `return`   | 函数返回                        | `return a + b`              |
+| `switch`   | 多分支（M1 已实现）                | `switch n { case 1: }`      |
+| `case`     | switch 分支（值/区间/类型匹配，可多值）   | `case 1, 2:` / `case 3..7:` |
+| `default`  | switch 默认分支（可省略）            | `default:`                  |
+| `when`     | switch 守卫条件（模式匹配增强）        | `case 8 when flag:`         |
 | `import`   | 导入其他 tie 文件（M2 已实现）        | `import "./x.tie" as x`     |
 | `as`       | 导入别名（M2 已实现）                | `import "./x.tie" as x`     |
 | `true`     | 布尔真字面量                      | `var b = true`              |
@@ -470,7 +510,7 @@ class Dog extends Animal {          // 字段拍平：父类字段在前
 | `;`        | 分号                   | 显式分隔语句（行尾可省略，见 §4）      |
 | `:`        | 冒号                   | 类型标注 `x: i64`、表 id 与值 `"a":1` |
 | `.`        | 点                    | 元组/类字段访问 `t.x` / `t.Item1` / `t.0` / `obj.field` |
-| `..`       | 范围                   | `0..10`（for 遍历）          |
+| `..`       | 范围                   | `0..10`（for 遍历）；`case 3..7:`（switch 区间匹配，左闭右开） |
 | `->`       | 箭头                   | 函数返回类型 `-> i64`          |
 | `+`        | 加                    | 整数/浮点加法                  |
 | `-`        | 减（或一元负号）             | 整数/浮点减法、取负               |

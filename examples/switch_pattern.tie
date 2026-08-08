@@ -1,0 +1,56 @@
+// switch 模式匹配增强示例：多值 / 区间 / 守卫 / 字符区间 / 字符串
+// 语法：switch 对象 { case 模式[, 模式]... [when 条件]: 语句… default: 语句… }
+// 类型匹配（case string:）仅宽类型/动态容器对象上有意义，这里用静态类型演示前四种。
+
+func main() {
+    // 1. 多值：case 1, 2 —— 任一相等即命中
+    var a: i64 = 2
+    switch a {
+        case 1, 2:
+            println("一或二")
+        default:
+            println("其他")
+    }
+    // 2. 整数区间：case 3..7 —— 3 ≤ n < 7（左闭右开）
+    var b: i64 = 5
+    switch b {
+        case 3..7:
+            println("三到六")
+        default:
+            println("其他")
+    }
+    // 3. 守卫：case 8 when flag —— 值相等 且 flag 为真才进入
+    var c: i64 = 8
+    var flag: bool = true
+    switch c {
+        case 8 when flag:
+            println("八且 flag")
+        default:
+            println("其他")
+    }
+    // 4. 字符区间：case 'a'..'e' —— 'a' ≤ ch < 'e'
+    var ch: char = 'c'
+    switch ch {
+        case 'a'..'e':
+            println("元音前段")
+        default:
+            println("其他")
+    }
+    // 5. 字符串字面量 case（沿用现有能力）
+    var s: string = "hi"
+    switch s {
+        case "hi":
+            println("你好")
+        default:
+            println("其他")
+    }
+    // 6. 组合：多值 + 区间 + 守卫自由组合
+    var d: i64 = 4
+    var ok: bool = true
+    switch d {
+        case 1, 3..5 when ok:
+            println("组合命中")
+        default:
+            println("组合未命中")
+    }
+}

@@ -3,7 +3,57 @@
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库**。
 
-里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库**。
+## [Harbor M2.1.5] switch 模式匹配增强：多值 / 区间 / 守卫 / 类型匹配 — 2026-08-08
+
+switch 语句从「单值字面量比较」升级为**类 Rust match / C# switch 的模式匹配**
+（规划 docs/plans/switch-pattern-matching.md 落地）。
+
+### 语法
+
+```c
+switch n {
+    case 1, 2:              // 多值：任一相等即命中（逗号分隔）
+        println("一二")
+    case 3..7:              // 区间：3 ≤ n < 7（左闭右开，仅整数/字符）
+        println("三四五六")
+    case 8 when flag:       // 守卫：值匹配 且 flag 为真才进入
+        println("八且 flag")
+    case string:            // 类型匹配：subject 为动态类型容器时才允许
+        println("字符串")
+    default:
+        println("其他")
+}
+```
+
+### 四层实现
+- **AST**（ast.rs）：`SwitchCase.value` → `patterns: Vec<Expr>`（多值）+ 新增 `when: Option<Expr>`
+  守卫；新增 `Expr::TypeLit`（类型字面量，仅 case pattern 位置）；
+- **词法**（lexer.rs）：新增关键字 `when`；
+- **语法**（parser.rs）：`case 模式[, 模式]... [when 条件]:`；类型关键字直接生成 TypeLit；
+- **语义**（semantic.rs）：每个 pattern 逐一校验——字面量（类型一致 + 编译期 + 不重复，
+  沿用现状）、区间（两端整数/字符字面量且 `start < end`、与 subject 类型一致、区间去重）、
+  类型匹配（当前 switch 对象为静态类型 → 报错「仅宽类型或动态容器」）、when 守卫
+  （必须布尔表达式）；多值与区间与守卫可自由组合；
+- **IR**（ir.rs）：比较块改写为「多值 icmp eq OR 合并 → 区间 `sge && slt` AND 合并 →
+  when 守卫 AND」的比较链；TypeLit 不应到达 IR（语义层已拦截，加内部错误兜底）；
+- **解释器**（tie-interp）：`Stmt::Switch` 求值对齐——Range 左闭右开数值比较、
+  TypeLit 按 Value 动态变体匹配（`value_matches_ty`）、when 守卫 `is_truthy`，
+  与编译路径语义一致。
+
+### 测试与验证
+- 测试 +16 → **309 全绿**：parser 1（多值/区间/守卫/类型 AST 形态）、semantic 11
+  （通过 5 + 报错 6：浮点区间 / start>end / 区间类型不匹配 / 静态类型上类型匹配 /
+  守卫非布尔 / 多值非字面量 / 多值重复）、IR 3（多值 OR / 区间 AND / 守卫 AND）、
+  interp 1（eval 层行为一致：多值/区间边界/守卫拦截与放行/字符区间/类型匹配/组合/省略 default）；
+- 端到端：`examples/switch_pattern.tie` 编译运行输出全部正确（多值/区间/守卫/字符区间/字符串/组合）；
+- 全工作区 `cargo build --workspace` 零错误。
+
+### 文档与示例
+- docs/language.md：§5.1 新增 switch 模式匹配小节、§9.1 关键词表补 switch/case/default/when、
+  §9.3 符号表补 `..` 区间用法；
+- docs/ai-guide.md §2.3、docs/prompt-pack.md 控制流段同步多值/区间/守卫/类型匹配；
+- 新增 examples/switch_pattern.tie 示例。
+- 顺带修正 CHANGELOG 里程碑命名说明重复一行。
 
 ## [Harbor M3 阶段二] 协调统筹增强：配置文件 + 缓存池 + 并行分片编译 — 2026-08-08
 

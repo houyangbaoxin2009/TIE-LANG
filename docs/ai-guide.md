@@ -70,17 +70,27 @@ while i < 10 { i = i + 1 }                 // 循环
 for i in 0..10 { }                         // 范围循环（含 0 不含 10）
 for item in arr { }                        // 集合循环（遍历表）
 switch n {                                 // 多分支：case 值: 后接语句（无 break，无 fallthrough）
-    case 1:
-        println("one")
-    case 2:
-        println("two")
+    case 1, 2:                             // 多值：任一相等即命中
+        println("one or two")
+    case 3..7:                             // 区间：3 ≤ n < 7（含 3 不含 7，仅整数/字符）
+        println("three to six")
+    case 8 when flag:                      // 守卫：值相等 且 flag 为真才进入
+        println("eight and flag")
+    case string:                           // 类型匹配：subject 为动态类型容器时才允许
+        println("a string")
     default:
         println("other")
 }
 return expr                                // 返回值
 ```
 
-switch 的 `case` 支持整数、字符（`'a'`）、布尔、负数；`default` 可省略。
+switch 的 `case` 支持整数、字符（`'a'`）、布尔、负数、字符串；`default` 可省略。
+
+**模式匹配增强**（`case 值[, 值]... [when 条件]:`）：
+- **多值**：逗号分隔多个值（或区间），任一匹配即命中；
+- **区间**：`case 3..7:` 整数/字符区间，左闭右开（与 `for i in 0..10` 一致）；浮点区间不支持；
+- **守卫**：`case 8 when flag:` 值匹配 **且** 守卫为真才进入，守卫不满足落入下一个 case；
+- **类型匹配**：`case string:` / `case i64:` 按 subject 的动态类型匹配，仅宽类型/动态容器对象（表、元组）上有意义——普通静态类型变量上语义层报错（类型恒定，恒真/恒假无意义）。
 
 ### 2.4 函数
 

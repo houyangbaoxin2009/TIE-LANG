@@ -69,6 +69,8 @@ pub enum TokenKind {
     Case,
     /// switch 默认分支 `default`
     Default,
+    /// switch 守卫条件 `when`（模式匹配增强：`case 8 when flag:`）
+    When,
     Import,
     As,
     /// 类定义 `class`
@@ -674,6 +676,8 @@ impl<'a> Lexer<'a> {
             "switch" => TokenKind::Switch,
             "case" => TokenKind::Case,
             "default" => TokenKind::Default,
+            // switch 模式匹配增强：守卫条件 `case 8 when flag:`
+            "when" => TokenKind::When,
             "import" => TokenKind::Import,
             "as" => TokenKind::As,
             // 面向对象（P8）：class/method/this/static/extends

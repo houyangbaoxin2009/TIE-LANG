@@ -1161,26 +1161,72 @@ impl<'p> IrGenerator<'p> {
                 Some(self.new_label("sw.cmp"))
             };
 
-            // 比较块：subject == case 值
+            // 比较块：subject 与 case 的每个 pattern 比较（模式匹配增强）：
+            // - 多值 → 每个值一个比较，OR 合并（任一命中）；
+            // - 区间 → start ≤ subj < end 两个比较 AND 合并；
+            // - 守卫 → 值比较结果 AND when 条件。
             self.block_start(&cur_cmp);
-            let (case_val, _case_ty) = self.gen_expr(&case.value)?;
-            let cond = if is_str_subj {
-                // 字符串：strcmp(subj, case) == 0 才算匹配
-                let cmp_res = self.new_reg();
-                self.line(&format!("{cmp_res} = call i32 @strcmp(ptr {subj}, ptr {case_val})"));
-                let c = self.new_reg();
-                self.line(&format!("{c} = icmp eq i32 {cmp_res}, 0"));
-                c
-            } else {
-                let c = self.new_reg();
-                self.line(&format!("{c} = {cmp_op} {subj}, {case_val}"));
-                c
-            };
+            let mut conds: Vec<String> = Vec::new();
+            for pat in &case.patterns {
+                match pat {
+                    // 区间 pattern：`case 3..7:` —— start ≤ subj < end（左闭右开）
+                    Expr::Range { start, end, .. } => {
+                        let (sv, _) = self.gen_expr(start)?;
+                        let (ev, _) = self.gen_expr(end)?;
+                        // 区间比较类型：字符用 i32（subject 未扩展），整数用 i64（subject 已扩展）
+                        let cmp_ty = if is_char { "i32" } else { "i64" };
+                        let ge = self.new_reg();
+                        self.line(&format!("{ge} = icmp sge {cmp_ty} {subj}, {sv}"));
+                        let lt = self.new_reg();
+                        self.line(&format!("{lt} = icmp slt {cmp_ty} {subj}, {ev}"));
+                        let and = self.new_reg();
+                        self.line(&format!("{and} = and i1 {ge}, {lt}"));
+                        conds.push(and);
+                    }
+                    // 类型匹配 pattern：语义层已拦截（静态类型 subject 上报错），IR 不应到达
+                    Expr::TypeLit { .. } => {
+                        return Err(IrError {
+                            message: "内部错误：case 类型匹配不应到达 IR 生成（语义层已拦截）".into(),
+                        });
+                    }
+                    // 字面量 pattern：现有比较逻辑（字符串 strcmp / 其余 cmp_op）
+                    _ => {
+                        let (case_val, _case_ty) = self.gen_expr(pat)?;
+                        let cond = if is_str_subj {
+                            // 字符串：strcmp(subj, case) == 0 才算匹配
+                            let cmp_res = self.new_reg();
+                            self.line(&format!("{cmp_res} = call i32 @strcmp(ptr {subj}, ptr {case_val})"));
+                            let c = self.new_reg();
+                            self.line(&format!("{c} = icmp eq i32 {cmp_res}, 0"));
+                            c
+                        } else {
+                            let c = self.new_reg();
+                            self.line(&format!("{c} = {cmp_op} {subj}, {case_val}"));
+                            c
+                        };
+                        conds.push(cond);
+                    }
+                }
+            }
+            // 多值 OR 合并：任一 pattern 命中即整体命中
+            let mut match_cond = conds.remove(0);
+            for c in conds {
+                let or = self.new_reg();
+                self.line(&format!("{or} = or i1 {match_cond}, {c}"));
+                match_cond = or;
+            }
+            // when 守卫：值匹配 且 守卫为真才进入分支体
+            if let Some(w) = &case.when {
+                let (wv, _w_ty) = self.gen_expr(w)?;
+                let and = self.new_reg();
+                self.line(&format!("{and} = and i1 {match_cond}, {wv}"));
+                match_cond = and;
+            }
             let else_target = match &next_cmp {
                 Some(l) => l.clone(),
                 None => def_label.clone().unwrap_or_else(|| exit_label.clone()),
             };
-            self.line(&format!("br i1 {cond}, label %{body_label}, label %{else_target}"));
+            self.line(&format!("br i1 {match_cond}, label %{body_label}, label %{else_target}"));
             self.block_end();
 
             // 体块：case 语句列表
@@ -1237,6 +1283,12 @@ impl<'p> IrGenerator<'p> {
                 // 字符串：返回全局常量指针（ptr 类型，供 %s / 传参直接使用）
                 Ok((format!("@{g}"), "ptr"))
             }
+            Expr::TypeLit { ty, .. } => Err(IrError {
+                message: format!(
+                    "内部错误：case 类型匹配（{}）不应到达 IR 表达式生成（语义层已拦截）",
+                    type_name_of(ty)
+                ),
+            }),
             Expr::Var(name) => {
                 // 克隆绑定以结束对 scopes 的借用，随后可安全调用 &mut 方法
                 let bind = self.lookup_var(name).cloned().ok_or_else(|| IrError {
@@ -3555,6 +3607,35 @@ mod tests {
         assert!(ir.contains("sw.default."));
         assert!(ir.contains("sw.exit."));
         assert!(ir.contains("= icmp eq i64"));
+    }
+
+    #[test]
+    fn switch多值生成OR合并() {
+        // 多值 `case 1, 2:` → 两个 icmp eq 用 or 合并
+        let ir = 编译("func main() {\n    var n: i64 = 2\n    switch n {\n        case 1, 2:\n            println(12)\n        default:\n            println(0)\n    }\n}");
+        assert!(ir.contains("= icmp eq i64"));
+        // 两个比较结果 OR 合并（至少一个 or i1）
+        assert!(ir.contains("= or i1"));
+    }
+
+    #[test]
+    fn switch区间生成AND合并() {
+        // 区间 `case 3..7:` → sge start 与 slt end 两个比较 AND 合并
+        let ir = 编译("func main() {\n    var n: i64 = 5\n    switch n {\n        case 3..7:\n            println(5)\n        default:\n            println(0)\n    }\n}");
+        // 区间：sge 3 && slt 7（左闭右开）
+        assert!(ir.contains("= icmp sge i64"));
+        assert!(ir.contains("= icmp slt i64"));
+        // 两个比较 AND 合并
+        assert!(ir.contains("= and i1"));
+    }
+
+    #[test]
+    fn switch守卫生成AND合并() {
+        // 守卫 `case 8 when flag:` → 值比较结果 AND 守卫条件
+        let ir = 编译("func main() {\n    var n: i64 = 8\n    var flag: bool = true\n    switch n {\n        case 8 when flag:\n            println(8)\n        default:\n            println(0)\n    }\n}");
+        // 值比较 + 守卫求值 + and 合并
+        assert!(ir.contains("= icmp eq i64"));
+        assert!(ir.contains("= and i1"));
     }
 
     #[test]

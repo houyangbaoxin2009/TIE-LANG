@@ -893,39 +893,117 @@ impl Analyzer {
                         ),
                     });
                 }
-                // case 值必须与 subject 类型一致（字面量类型精确匹配；
-                // 整数字面量可适配任意整数，浮点字面量可适配任意浮点）
+                // 每个 case 的每个 pattern 逐一校验（模式匹配增强）：
+                // - 字面量：类型一致 + 编译期字面量 + 不重复（沿用现状）；
+                // - 区间 Range：两端为整数或字符字面量且 start < end，类型与 subject 一致；
+                // - 类型 TypeLit：仅宽类型/动态容器对象上允许（当前 subject 均为静态类型 → 报错）；
+                // - when 守卫：必须为布尔表达式。
                 let mut seen: Vec<String> = Vec::new();
                 for c in &s.cases {
-                    let value_ty = self.infer_expr(&c.value, scope)?;
-                    self.result.expr_types.insert(addr_of(&c.value), value_ty.clone());
-                    // case 值必须是编译期字面量（不允许变量/表达式）
-                    if !is_const_literal(&c.value) {
-                        return Err(SemanticError {
-                            span: c.span,
-                            message: "case 值必须是字面量（整数/浮点/字符/布尔/字符串）".into(),
-                        });
+                    for pat in &c.patterns {
+                        match pat {
+                            // 区间 pattern：`case 3..7:`（整数/字符，start < end）
+                            Expr::Range { start, end, span } => {
+                                // 两端必须是编译期字面量（整数或字符，浮点区间明确不支持）
+                                if !is_int_or_char_literal(start) || !is_int_or_char_literal(end) {
+                                    return Err(SemanticError {
+                                        span: *span,
+                                        message: "case 区间两端必须是整数或字符字面量（浮点区间不支持）".into(),
+                                    });
+                                }
+                                // start < end（字符按 UTF-32 值比较）
+                                if literal_cmp(start, end) >= 0 {
+                                    return Err(SemanticError {
+                                        span: *span,
+                                        message: "case 区间必须 start < end（左闭右开）".into(),
+                                    });
+                                }
+                                // 区间类型与 subject 一致：整数区间对整数 subject，字符区间对字符 subject
+                                let range_is_char = matches!(start.as_ref(), Expr::CharLit(_));
+                                let ok = if range_is_char {
+                                    matches!(&subject_ty, TypeSpec::Named(TyKw::Char))
+                                } else {
+                                    subject_ty.is_int()
+                                };
+                                if !ok {
+                                    return Err(SemanticError {
+                                        span: *span,
+                                        message: format!(
+                                            "case 区间类型与 switch 对象类型 {} 不匹配",
+                                            type_name(&subject_ty)
+                                        ),
+                                    });
+                                }
+                                // 区间去重键（避免重复区间）
+                                let key = literal_key(start) + ".." + &literal_key(end);
+                                if seen.contains(&key) {
+                                    return Err(SemanticError {
+                                        span: *span,
+                                        message: format!("重复的 case 区间 {key}"),
+                                    });
+                                }
+                                seen.push(key);
+                            }
+                            // 类型匹配 pattern：`case string:` —— 仅宽类型/动态容器对象上有意义；
+                            // 当前 switch subject 限定静态类型（上方检查），故一律报错
+                            Expr::TypeLit { ty, span } => {
+                                return Err(SemanticError {
+                                    span: *span,
+                                    message: format!(
+                                        "case 类型匹配（{}）仅支持宽类型或动态容器对象，当前 switch 对象是静态类型 {}",
+                                        type_name(ty),
+                                        type_name(&subject_ty)
+                                    ),
+                                });
+                            }
+                            // 字面量 pattern：类型一致 + 编译期字面量 + 不重复（沿用现状）
+                            _ => {
+                                let value_ty = self.infer_expr(pat, scope)?;
+                                self.result.expr_types.insert(addr_of(pat), value_ty.clone());
+                                // case 值必须是编译期字面量（不允许变量/表达式）
+                                if !is_const_literal(pat) {
+                                    return Err(SemanticError {
+                                        span: c.span,
+                                        message: "case 值必须是字面量（整数/浮点/字符/布尔/字符串）".into(),
+                                    });
+                                }
+                                // case 值类型必须与 subject 类型匹配
+                                if !types_match(&subject_ty, &value_ty, Some(pat)) {
+                                    return Err(SemanticError {
+                                        span: c.span,
+                                        message: format!(
+                                            "case 值类型 {} 与 switch 对象类型 {} 不匹配",
+                                            type_name(&value_ty),
+                                            type_name(&subject_ty)
+                                        ),
+                                    });
+                                }
+                                // 重复 case 检测
+                                let key = literal_key(pat);
+                                if seen.contains(&key) {
+                                    return Err(SemanticError {
+                                        span: c.span,
+                                        message: format!("重复的 case 值 {}", key),
+                                    });
+                                }
+                                seen.push(key);
+                            }
+                        }
                     }
-                    // case 值类型必须与 subject 类型匹配
-                    if !types_match(&subject_ty, &value_ty, Some(&c.value)) {
-                        return Err(SemanticError {
-                            span: c.span,
-                            message: format!(
-                                "case 值类型 {} 与 switch 对象类型 {} 不匹配",
-                                type_name(&value_ty),
-                                type_name(&subject_ty)
-                            ),
-                        });
+                    // when 守卫：必须为布尔表达式（与 if 条件同规则）
+                    if let Some(w) = &c.when {
+                        let wty = self.infer_expr(w, scope)?;
+                        self.result.expr_types.insert(addr_of(w), wty.clone());
+                        if !is_bool_like(&wty) {
+                            return Err(SemanticError {
+                                span: expr_span_of(w),
+                                message: format!(
+                                    "when 守卫必须是布尔表达式，实际是 {}",
+                                    type_name(&wty)
+                                ),
+                            });
+                        }
                     }
-                    // 重复 case 检测
-                    let key = literal_key(&c.value);
-                    if seen.contains(&key) {
-                        return Err(SemanticError {
-                            span: c.span,
-                            message: format!("重复的 case 值 {}", key),
-                        });
-                    }
-                    seen.push(key);
                     self.check_block(&c.body, scope, ret_ty)?;
                 }
                 self.check_block(&s.default_body, scope, ret_ty)?;
@@ -1013,6 +1091,14 @@ impl Analyzer {
             Expr::BoolLit(_) => TypeSpec::Named(TyKw::Bool),
             Expr::StrLit(_) => TypeSpec::Named(TyKw::Str),
             Expr::CharLit(_) => TypeSpec::Named(TyKw::Char),
+            // 类型字面量（case 类型匹配 pattern）：只能出现在 switch 的 case pattern
+            // 位置（语义层 switch 校验已单独处理），普通表达式上下文不应出现
+            Expr::TypeLit { ty, span } => {
+                return Err(SemanticError {
+                    span: *span,
+                    message: format!("类型字面量 {} 只能用作 switch 的 case 类型匹配", type_name(ty)),
+                })
+            }
             Expr::Var(name) => match scope.get(name) {
                 Some(t) => t.clone(),
                 None => {
@@ -2744,7 +2830,8 @@ fn expr_span_of(expr: &Expr) -> Span {
             // 字面量无 span，用 (0,0) 占位（语义错误主要针对变量/调用，已有 span）
             Span { line: 0, col: 0 }
         }
-        Expr::Call { span, .. }
+        Expr::TypeLit { span, .. }
+        | Expr::Call { span, .. }
         | Expr::Unary { span, .. }
         | Expr::Binary { span, .. }
         | Expr::Ternary { span, .. }
@@ -2860,6 +2947,39 @@ fn literal_key(expr: &Expr) -> String {
             _ => "?".into(),
         },
         _ => "?".into(),
+    }
+}
+
+/// 是否为整数或字符字面量（switch 区间 pattern 的两端只允许这两种）。
+///
+/// 支持负数（`-3` 由一元负号包裹）；浮点明确排除（区间语义含入模糊）。
+fn is_int_or_char_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::IntLit(_) | Expr::CharLit(_) => true,
+        Expr::Unary { op: UnaryOp::Neg, operand, .. } => matches!(operand.as_ref(), Expr::IntLit(_)),
+        _ => false,
+    }
+}
+
+/// 比较两个整数/字符字面量的大小（switch 区间 `start < end` 校验）。
+///
+/// 返回负数/零/正数（Rust `cmp` 语义）；负数区间两端均取负后比较。
+fn literal_cmp(a: &Expr, b: &Expr) -> i64 {
+    let av = literal_value(a);
+    let bv = literal_value(b);
+    av - bv
+}
+
+/// 取整数/字符字面量的数值（字符按 UTF-32 值；负数取负）。
+fn literal_value(expr: &Expr) -> i64 {
+    match expr {
+        Expr::IntLit(v) => *v,
+        Expr::CharLit(c) => *c as i64,
+        Expr::Unary { op: UnaryOp::Neg, operand, .. } => match operand.as_ref() {
+            Expr::IntLit(v) => -v,
+            _ => 0,
+        },
+        _ => 0,
     }
 }
 
@@ -3957,6 +4077,226 @@ mod tests {
             func main() {}
             "#,
             "return 类型不匹配",
+        );
+    }
+
+    // ---------- switch 模式匹配增强（规划 switch-pattern-matching） ----------
+
+    #[test]
+    fn switch多值case通过() {
+        // 多值 `case 1, 2:` —— 任一相等即命中，语义层逐个校验
+        analyze_src(
+            r#"
+            func main() {
+                var x: i64 = 2
+                switch x {
+                    case 1, 2:
+                        println("一二")
+                    default:
+                        println("其他")
+                }
+            }
+            "#,
+        )
+        .expect("多值 case 应通过");
+    }
+
+    #[test]
+    fn switch区间case通过() {
+        // 区间 `case 3..7:` —— 整数区间，start < end
+        analyze_src(
+            r#"
+            func main() {
+                var x: i64 = 5
+                switch x {
+                    case 3..7:
+                        println("三四五六")
+                    default:
+                        println("其他")
+                }
+            }
+            "#,
+        )
+        .expect("整数区间 case 应通过");
+    }
+
+    #[test]
+    fn switch字符区间case通过() {
+        // 字符区间 `case 'a'..'e':` —— 字符 subject + 字符区间
+        analyze_src(
+            r#"
+            func main() {
+                var c: char = 'b'
+                switch c {
+                    case 'a'..'e':
+                        println("元音前")
+                    default:
+                        println("其他")
+                }
+            }
+            "#,
+        )
+        .expect("字符区间 case 应通过");
+    }
+
+    #[test]
+    fn switch守卫when通过() {
+        // 守卫 `case 8 when flag:` —— 值匹配且守卫为真才进入
+        analyze_src(
+            r#"
+            func main() {
+                var x: i64 = 8
+                var flag: bool = true
+                switch x {
+                    case 8 when flag:
+                        println("八且 flag")
+                    default:
+                        println("其他")
+                }
+            }
+            "#,
+        )
+        .expect("when 守卫 case 应通过");
+    }
+
+    #[test]
+    fn switch多值与区间与守卫组合通过() {
+        // 多值 + 区间 + 守卫自由组合：`case 1, 3..5 when flag:`
+        analyze_src(
+            r#"
+            func main() {
+                var x: i64 = 4
+                var flag: bool = true
+                switch x {
+                    case 1, 3..5 when flag:
+                        println("命中")
+                    default:
+                        println("其他")
+                }
+            }
+            "#,
+        )
+        .expect("多值+区间+守卫组合应通过");
+    }
+
+    #[test]
+    fn switch浮点区间报错() {
+        // 浮点区间：边界含入语义模糊，明确不支持
+        expect_err(
+            r#"
+            func main() {
+                var x: f64 = 1.5
+                switch x {
+                    case 1.0..2.5:
+                        println("x")
+                }
+            }
+            "#,
+            "区间两端必须是整数或字符字面量",
+        );
+    }
+
+    #[test]
+    fn switch区间start大于end报错() {
+        // start > end：空区间无意义
+        expect_err(
+            r#"
+            func main() {
+                var x: i64 = 5
+                switch x {
+                    case 7..3:
+                        println("x")
+                }
+            }
+            "#,
+            "start < end",
+        );
+    }
+
+    #[test]
+    fn switch区间与subject类型不匹配报错() {
+        // 整数区间用在字符串 subject 上 → 类型不匹配
+        expect_err(
+            r#"
+            func main() {
+                var s: string = "hi"
+                switch s {
+                    case 1..3:
+                        println("x")
+                }
+            }
+            "#,
+            "区间类型与 switch 对象类型",
+        );
+    }
+
+    #[test]
+    fn switch静态类型上类型匹配报错() {
+        // 类型匹配 `case string:` 仅宽类型/动态容器对象上有意义；
+        // 当前 switch 对象是静态类型（i64）→ 报错
+        expect_err(
+            r#"
+            func main() {
+                var x: i64 = 1
+                switch x {
+                    case string:
+                        println("字符串")
+                }
+            }
+            "#,
+            "类型匹配",
+        );
+    }
+
+    #[test]
+    fn switch守卫非布尔报错() {
+        // when 守卫必须是布尔表达式
+        expect_err(
+            r#"
+            func main() {
+                var x: i64 = 8
+                switch x {
+                    case 8 when 42:
+                        println("x")
+                }
+            }
+            "#,
+            "when 守卫必须是布尔表达式",
+        );
+    }
+
+    #[test]
+    fn switch多值中非字面量报错() {
+        // 多值中的每个值都必须是字面量（变量不允许）
+        expect_err(
+            r#"
+            func main() {
+                var x: i64 = 2
+                var y: i64 = 3
+                switch x {
+                    case 1, y:
+                        println("x")
+                }
+            }
+            "#,
+            "case 值必须是字面量",
+        );
+    }
+
+    #[test]
+    fn switch多值重复报错() {
+        // 多值内部重复：`case 1, 1:` → 重复 case 检测
+        expect_err(
+            r#"
+            func main() {
+                var x: i64 = 2
+                switch x {
+                    case 1, 1:
+                        println("x")
+                }
+            }
+            "#,
+            "重复的 case 值",
         );
     }
 }

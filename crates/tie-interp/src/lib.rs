@@ -21,8 +21,8 @@
 use std::ffi::{c_char, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use tie_frontend::ast::{Expr, FnDefStmt, Stmt};
-use tie_frontend::lexer::tokenize;
+use tie_frontend::ast::{BinaryOp, Expr, FnDefStmt, Stmt, TypeSpec};
+use tie_frontend::lexer::{tokenize, TyKw};
 use tie_frontend::parser::parse_program;
 
 /// C ABI 桥：求值一段 tie 代码，返回格式化结果串或错误串（调用方负责 [tie_free_result]）。
@@ -1078,7 +1078,85 @@ impl<'a> Env<'a> {
                 }
                 Ok(Flow::Normal(last))
             }
-            Stmt::Switch(_) => Err("REPL v1 暂不支持 switch".into()),
+            Stmt::Switch(s) => {
+                // switch 模式匹配（与编译路径语义一致）：
+                // 顺序匹配每个 case —— 任一 pattern 命中 且 when 守卫为真才执行；
+                // 全不匹配 → default（可省略）。
+                let subject = self.eval_expr(&s.subject)?;
+                let mut last = None;
+                let mut matched = false;
+                for c in &s.cases {
+                    // 逐个 pattern 匹配（多值：任一命中即本 case 命中）
+                    let mut hit = false;
+                    for pat in &c.patterns {
+                        match pat {
+                            // 区间 pattern：start ≤ subject < end（左闭右开，整数/字符）
+                            Expr::Range { start, end, .. } => {
+                                let sv = match self.eval_expr(start)? {
+                                    Value::Int(n) => n,
+                                    Value::Char(ch) => ch as i64,
+                                    _ => return Err("case 区间起点必须是整数或字符".into()),
+                                };
+                                let ev = match self.eval_expr(end)? {
+                                    Value::Int(n) => n,
+                                    Value::Char(ch) => ch as i64,
+                                    _ => return Err("case 区间终点必须是整数或字符".into()),
+                                };
+                                // subject 转数值比较（整数/字符）
+                                let v = match &subject {
+                                    Value::Int(n) => *n,
+                                    Value::Char(ch) => *ch as i64,
+                                    _ => continue, // 类型不匹配 → 不命中
+                                };
+                                if v >= sv && v < ev {
+                                    hit = true;
+                                    break;
+                                }
+                            }
+                            // 类型匹配 pattern：按 Value 变体匹配（动态类型）
+                            Expr::TypeLit { ty, .. } => {
+                                if value_matches_ty(&subject, ty) {
+                                    hit = true;
+                                    break;
+                                }
+                            }
+                            // 字面量 pattern：== 比较（字符串/数字/字符/布尔）
+                            _ => {
+                                let pv = self.eval_expr(pat)?;
+                                if let Value::Bool(b) = self.eval_binary(BinaryOp::Eq, subject.clone(), pv)? {
+                                    if b {
+                                        hit = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !hit {
+                        continue;
+                    }
+                    // when 守卫：值为真才进入（守卫不满足 → 落入下一个 case）
+                    if let Some(w) = &c.when {
+                        if !self.eval_expr(w)?.is_truthy()? {
+                            continue;
+                        }
+                    }
+                    match self.exec_block(&c.body)? {
+                        Flow::Normal(v) => last = v,
+                        flow @ Flow::Return(_) => return Ok(flow),
+                    }
+                    matched = true;
+                    break;
+                }
+                // 全不匹配 → default 分支（可省略）
+                if !matched {
+                    match self.exec_block(&s.default_body)? {
+                        Flow::Normal(v) => last = v,
+                        flow @ Flow::Return(_) => return Ok(flow),
+                    }
+                }
+                Ok(Flow::Normal(last))
+            }
             Stmt::Import(_) => Err("REPL v1 暂不支持 import".into()),
             Stmt::Class(_) => Err("REPL v1 暂不支持类定义".into()),
             Stmt::FnDef(f) => {
@@ -1182,6 +1260,7 @@ impl<'a> Env<'a> {
                 };
                 Ok(Value::Range(s, e))
             }
+            Expr::TypeLit { .. } => Err("类型字面量只能用作 switch 的 case 类型匹配".into()),
             Expr::Call { name, args, .. } => {
                 // table_push 需要**原地修改**表变量（Value::Table 是 Vec，按值传参
                 // 无法写回作用域），故在 eval_expr 特判：直接对变量做 push 并写回。
@@ -2124,6 +2203,35 @@ impl Value {
     }
 }
 
+/// 类型匹配：Value 的动态类型是否等于 TypeSpec（switch 的 case 类型匹配 pattern）。
+///
+/// 与编译路径的语义对齐：case string: 匹配 Value::Str，case i64: 匹配 Value::Int 等。
+/// 宽类型（num/text/misc）按类别框归属；元组/类类型暂不支持（interp 无对应 Value 变体）。
+fn value_matches_ty(v: &Value, ty: &TypeSpec) -> bool {
+    match ty {
+        // 整数：全部归为 Value::Int（interp 动态值不区分整数位宽）
+        TypeSpec::Named(
+            TyKw::I8 | TyKw::I16 | TyKw::I32 | TyKw::I64 | TyKw::U8 | TyKw::U16 | TyKw::U32 | TyKw::U64,
+        ) => matches!(v, Value::Int(_)),
+        // 浮点：全部归为 Value::Float
+        TypeSpec::Named(TyKw::F32 | TyKw::F64) => matches!(v, Value::Float(_)),
+        TypeSpec::Named(TyKw::Bool) => matches!(v, Value::Bool(_)),
+        TypeSpec::Named(TyKw::Char) => matches!(v, Value::Char(_)),
+        TypeSpec::Named(TyKw::Str) => matches!(v, Value::Str(_)),
+        TypeSpec::Named(TyKw::Table) => matches!(v, Value::Table(_)),
+        TypeSpec::Named(TyKw::Void) => matches!(v, Value::Void),
+        // 宽类型（类别框）：num 接受 Int/Float；text 接受 Str/Char；misc 接受其余
+        TypeSpec::Named(TyKw::Num) => matches!(v, Value::Int(_) | Value::Float(_)),
+        TypeSpec::Named(TyKw::Text) => matches!(v, Value::Str(_) | Value::Char(_)),
+        TypeSpec::Named(TyKw::Misc) => !matches!(
+            v,
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Char(_) | Value::Str(_)
+        ),
+        // code 是编译期概念，interp 无对应值；元组/类暂不支持
+        TypeSpec::Named(TyKw::Code) | TypeSpec::Tuple(_) | TypeSpec::Class(_) => false,
+    }
+}
+
 /// 运算符的可读名称（错误提示用）。
 fn op_display(op: tie_frontend::ast::BinaryOp) -> &'static str {
     use tie_frontend::ast::BinaryOp;
@@ -2475,6 +2583,31 @@ mod tests {
         assert_eq!(ev("if 1 > 2 { 10; } else { 20; }").unwrap(), "20");
         assert_eq!(ev("var i = 0; while i < 3 { i = i + 1; } i").unwrap(), "3");
         assert_eq!(ev("var s = 0; for i in 1..4 { s = s + i; } s").unwrap(), "6");
+    }
+
+    #[test]
+    fn eval_switch_模式匹配() {
+        // switch 模式匹配增强（与编译路径语义一致）：
+        // 多值 case 1, 2 / 区间 case 3..7（左闭右开）/ 守卫 when / 字符区间 / 类型匹配。
+        // 注意：块语句（switch）以 } 结束，后不能加分号；块内语句需分号。
+        // 多值：任一相等即命中
+        assert_eq!(ev("var x = 2; switch x { case 1, 2: 10; default: 0; }").unwrap(), "10");
+        // 区间命中（3 ≤ 5 < 7）
+        assert_eq!(ev("var x = 5; switch x { case 3..7: 20; default: 0; }").unwrap(), "20");
+        // 左闭右开：x = 7 不命中 3..7 → default
+        assert_eq!(ev("var x = 7; switch x { case 3..7: 20; default: 0; }").unwrap(), "0");
+        // 守卫拦截：flag = false → 落入 default
+        assert_eq!(ev("var f = false; var x = 8; switch x { case 8 when f: 30; default: 0; }").unwrap(), "0");
+        // 守卫放行：值匹配 且 守卫为真 → 进入分支
+        assert_eq!(ev("var f = true; var x = 8; switch x { case 8 when f: 30; default: 0; }").unwrap(), "30");
+        // 字符区间：'a' ≤ 'b' < 'e'
+        assert_eq!(ev("var c = 'b'; switch c { case 'a'..'e': 40; default: 0; }").unwrap(), "40");
+        // 类型匹配：interp 动态类型按 Value 变体匹配（语义层拦截静态类型，eval 路径允许）
+        assert_eq!(ev("var s = \"hi\"; switch s { case string: 50; default: 0; }").unwrap(), "50");
+        // 多值 + 区间 + 守卫组合：任一 pattern 命中 且 守卫为真
+        assert_eq!(ev("var f = true; var x = 4; switch x { case 1, 3..5 when f: 60; default: 0; }").unwrap(), "60");
+        // default 省略且全不匹配 → 无输出（switch 返回 None）
+        assert_eq!(ev("var x = 99; switch x { case 1: 1; } 0").unwrap(), "0");
     }
 
     #[test]

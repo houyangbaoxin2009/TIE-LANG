@@ -578,7 +578,13 @@ impl<'a> Parser<'a> {
         Ok(ForStmt { var, iter, body, span })
     }
 
-    /// `switch subject { case 值: 语句… default: 语句… }`。
+    /// `switch subject { case 值[, 值]... [when 条件]: 语句… default: 语句… }`。
+    ///
+    /// 模式匹配增强（规划 switch-pattern-matching）：
+    /// - 多值：`case 1, 2:`（逗号分隔，任一相等即命中）；
+    /// - 区间：`case 3..7:`（Range 表达式，含 3 不含 7）；
+    /// - 守卫：`case 8 when flag:`（值命中且守卫为真才进入）；
+    /// - 类型匹配：`case string:`（TypeKw token → TypeLit）。
     ///
     /// case 分支体以行（ASI）或分号结束，遇到下一个 case/default/右花括号时终止。
     /// default 分支可选且至多一个（语法层不强制顺序，语义层校验）。
@@ -593,10 +599,20 @@ impl<'a> Parser<'a> {
             match self.peek_kind() {
                 TokenKind::Case => {
                     let cspan = self.advance().span; // case
-                    let value = self.parse_case_value()?;
+                    // 模式列表：`值[, 值]...`（至少一个）
+                    let mut patterns = vec![self.parse_case_pattern()?];
+                    while self.eat(&TokenKind::Comma) {
+                        patterns.push(self.parse_case_pattern()?);
+                    }
+                    // 可选守卫：`when 条件`
+                    let when = if self.eat(&TokenKind::When) {
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
                     self.expect(TokenKind::Colon, "':'")?;
                     let body = self.parse_switch_body()?;
-                    cases.push(SwitchCase { value, body, span: cspan });
+                    cases.push(SwitchCase { patterns, when, body, span: cspan });
                 }
                 TokenKind::Default => {
                     let _ = self.advance().span; // default
@@ -623,12 +639,19 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// case 匹配值：编译期字面量（整数/浮点/字符/布尔/字符串/负数字面量）。
-    /// 不支持变量或任意表达式（语义层同样校验）。
-    fn parse_case_value(&mut self) -> Result<Expr, ParseError> {
-        // 负数 case：`case -1:` 由一元负号包裹
-        let expr = self.parse_unary()?;
-        Ok(expr)
+    /// case 匹配模式：类型匹配（`case string:` / `case i64:`）或值/区间表达式。
+    ///
+    /// - 类型关键字（TypeKw）→ `Expr::TypeLit`（类型匹配 pattern）；
+    /// - 其余 → `parse_expr`（字面量 / 负数 / 区间 Range）。
+    fn parse_case_pattern(&mut self) -> Result<Expr, ParseError> {
+        // 类型匹配：case string: / case i64: —— TypeKw token 直接生成 TypeLit
+        if let TokenKind::TypeKw(ty) = self.peek_kind() {
+            let ty = *ty; // TyKw 是 Copy，先取值再消费 token（避免借用冲突）
+            let span = self.advance().span;
+            return Ok(Expr::TypeLit { ty: TypeSpec::Named(ty), span });
+        }
+        // 值/区间：parse_expr 支持字面量、负数、区间（3..7）
+        self.parse_expr()
     }
 
     /// case/default 分支体：连续语句直到下一个 case/default/右花括号/文件结束。
@@ -1207,7 +1230,8 @@ fn expr_span(expr: &Expr) -> Option<Span> {
         | Expr::Index { span, .. }
         | Expr::TupleLit { span, .. }
         | Expr::FieldAccess { span, .. }
-        | Expr::MethodCall { span, .. } => Some(*span),
+        | Expr::MethodCall { span, .. }
+        | Expr::TypeLit { span, .. } => Some(*span),
         _ => None,
     }
 }
@@ -1495,17 +1519,55 @@ mod tests {
         assert!(matches!(&s.subject, Expr::Var(n) if n == "x"));
         assert_eq!(s.cases.len(), 2);
         // case 1 分支
-        assert!(matches!(&s.cases[0].value, Expr::IntLit(1)));
+        assert_eq!(s.cases[0].patterns.len(), 1);
+        assert!(matches!(&s.cases[0].patterns[0], Expr::IntLit(1)));
         assert!(matches!(&s.cases[0].body[0], Stmt::Assign(a) if a.target == "y"));
         // case -1 分支（负数由一元负号包裹）
         assert!(matches!(
-            &s.cases[1].value,
+            &s.cases[1].patterns[0],
             Expr::Unary { op: UnaryOp::Neg, operand, .. }
                 if matches!(operand.as_ref(), Expr::IntLit(1))
         ));
         // default 分支
         assert_eq!(s.default_body.len(), 1);
         assert!(matches!(&s.default_body[0], Stmt::Assign(a) if a.target == "y"));
+    }
+
+    #[test]
+    fn switch多值区间守卫类型匹配解析() {
+        // 模式匹配增强：多值 `case 1, 2:` / 区间 `case 3..7:` / 守卫 `case 8 when flag:`
+        // / 类型匹配 `case string:`——逐一验证 AST 形态
+        let prog = parse(
+            "func main() {\n    switch x {\n        case 1, 2:\n            y = 10\n        case 3..7:\n            y = 20\n        case 8 when flag:\n            y = 30\n        case string:\n            y = 40\n    }\n}",
+        );
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::Switch(s) = &f.body[0] else { panic!("期望 switch 语句") };
+        assert_eq!(s.cases.len(), 4);
+        // case 1, 2：多值（2 个 pattern）
+        assert_eq!(s.cases[0].patterns.len(), 2);
+        assert!(matches!(&s.cases[0].patterns[0], Expr::IntLit(1)));
+        assert!(matches!(&s.cases[0].patterns[1], Expr::IntLit(2)));
+        assert!(s.cases[0].when.is_none());
+        // case 3..7：区间（Range 表达式）
+        assert_eq!(s.cases[1].patterns.len(), 1);
+        assert!(matches!(
+            &s.cases[1].patterns[0],
+            Expr::Range { start, end, .. }
+                if matches!(start.as_ref(), Expr::IntLit(3))
+                    && matches!(end.as_ref(), Expr::IntLit(7))
+        ));
+        assert!(s.cases[1].when.is_none());
+        // case 8 when flag：守卫
+        assert_eq!(s.cases[2].patterns.len(), 1);
+        assert!(matches!(&s.cases[2].patterns[0], Expr::IntLit(8)));
+        assert!(matches!(&s.cases[2].when, Some(Expr::Var(n)) if n == "flag"));
+        // case string：类型匹配（TypeLit）
+        assert_eq!(s.cases[3].patterns.len(), 1);
+        assert!(matches!(
+            &s.cases[3].patterns[0],
+            Expr::TypeLit { ty: TypeSpec::Named(TyKw::Str), .. }
+        ));
+        assert!(s.cases[3].when.is_none());
     }
 
     #[test]
