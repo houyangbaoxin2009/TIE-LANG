@@ -97,6 +97,8 @@ fn repl() -> ExitCode {
              3. 将 repl\\repl.exe 放到当前目录或 tie.exe 同目录\n\
              （或用环境变量 TIE_REPL_EXE 指定路径）"
         );
+        // Windows 下直接运行（如双击）时窗口会一闪而过，暂停以让用户看到提示
+        pause_before_exit();
         return ExitCode::FAILURE;
     };
     // 子进程接管 stdio：REPL 交互（stdin 输入 + stdout 输出）原样透传
@@ -110,7 +112,26 @@ fn repl() -> ExitCode {
     }
 }
 
-/// 查找 REPL 外壳可执行文件（env → exe 同目录 → 当前目录）。
+/// Windows 直接运行（双击）时暂停，防止控制台窗口一闪而过。
+///
+/// 仅当 stdin 是交互式终端时暂停（等待按任意键）；管道/重定向场景
+/// （如 `tie | grep`、CI 脚本）不暂停，保证脚本可自动执行。
+#[cfg(windows)]
+fn pause_before_exit() {
+    use std::io::{IsTerminal, Read};
+    // 交互终端才暂停；stdin 被重定向/管道时不暂停
+    if std::io::stdin().is_terminal() {
+        eprintln!("按任意键退出...");
+        let mut buf = [0u8; 1];
+        let _ = std::io::stdin().read(&mut buf);
+    }
+}
+
+/// 非 Windows 平台：终端行为不同，无需暂停。
+#[cfg(not(windows))]
+fn pause_before_exit() {}
+
+/// 查找 REPL 外壳可执行文件（env → exe 同目录 → 当前目录 → workspace repl/ 目录）。
 fn find_repl_exe() -> Option<PathBuf> {
     // 1. 环境变量显式指定
     if let Some(p) = env::var_os("TIE_REPL_EXE") {
@@ -132,6 +153,11 @@ fn find_repl_exe() -> Option<PathBuf> {
     }
     // 3. 当前工作目录
     let p = PathBuf::from(exe_name);
+    if p.is_file() {
+        return Some(p);
+    }
+    // 4. workspace 标准布局：repl/repl.exe（开发期在仓库根直接运行 tie.exe）
+    let p = PathBuf::from("repl").join(exe_name);
     if p.is_file() {
         return Some(p);
     }
@@ -194,6 +220,9 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() -> ExitCode {
+    // 启动即把 Windows 控制台切到 UTF-8，保证中文输出不乱码
+    tie_prep::init_console_utf8();
+
     // 无参数 → REPL 交互模式
     if env::args().len() == 1 {
         return repl();

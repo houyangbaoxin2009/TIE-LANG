@@ -109,6 +109,9 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() -> ExitCode {
+    // 启动即把 Windows 控制台切到 UTF-8，保证中文输出不乱码
+    tie_prep::init_console_utf8();
+
     // 解析参数（错误直接输出并退出）
     let args = match parse_args() {
         Ok(a) => a,

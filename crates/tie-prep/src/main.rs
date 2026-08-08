@@ -44,6 +44,9 @@ const CODENAME: &str = "Harbor";
 const RELEASE_VERSION: &str = "2026.1";
 
 fn main() -> ExitCode {
+    // 启动即把 Windows 控制台切到 UTF-8，保证中文输出不乱码
+    tie_prep::init_console_utf8();
+
     let args = env::args().skip(1);
     let mut input: Option<String> = None;
     let mut info_only = false;

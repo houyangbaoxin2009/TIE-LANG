@@ -9,4 +9,10 @@ description = "tie 语言预处理工具（四段式第一段）：清理代码 
 [dependencies]
 
 [lints]
-workspace = true
+# 注意：[lints] workspace = true 与本地覆盖无法共存（Cargo 限制）。
+# 手动展开 workspace 的 rust lints（unused），并把 unsafe_code 从 forbid 放宽为 allow：
+# tie-prep 需要调用 Windows API 设置控制台 UTF-8 代码页（init_console_utf8），
+# 这是本 crate 唯一使用 unsafe 的地方。
+[lints.rust]
+unused = { level = "warn", priority = -1 }
+unsafe_code = "allow"

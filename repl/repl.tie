@@ -9,7 +9,7 @@
 func main() -> i64 {
     println("tie REPL（输入 :quit 退出）")
     while true {
-        // 提示符不换行（print 内建；Windows 控制台缓冲由 tie_read_line 内部刷新）
+        // 提示符不换行（print 内建；编译路径 print 已含 fflush，控制台立即显示）
         print("> ")
         var line = read_line()
         if line == ":quit" {
@@ -20,6 +20,10 @@ func main() -> i64 {
             var result = eval(line)
             if result != "" {
                 println(result)
+            } else {
+                // eval 无返回值（如 print 副作用输出）：补一个换行，
+                // 让下一个提示符另起一行（否则 print 输出后提示符挤在同一行）
+                println("")
             }
         }
     }

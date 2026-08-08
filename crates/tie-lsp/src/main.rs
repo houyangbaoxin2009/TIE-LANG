@@ -28,6 +28,9 @@ tie 语言服务器（LSP over stdio，供编辑器接入）
 
 /// 启动语言服务器（stdio 分帧读写），退出码透传库入口结果。
 fn main() -> ExitCode {
+    // 启动即把 Windows 控制台切到 UTF-8，保证中文输出不乱码
+    tie_frontend::init_console_utf8();
+
     // 命令行选项处理（仅 --version / --help，其余一律视为启动 LSP）
     let arg = env::args().nth(1);
     match arg.as_deref() {
