@@ -3,6 +3,24 @@
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库**。
 
+## [Harbor M2.1.3] import 展开模块化 + tie-lsp 跨文件支持 — 2026-08-08
+
+### 变更
+- **import 展开抽离为 tie-frontend 共享模块**：新增 `crates/tie-frontend/src/imports.rs`，
+  把原先内联在 tie-llvm driver 的 import 展开逻辑（递归加载被导入文件 + 循环导入检测）
+  上移到 tie-frontend，供编译器（tie-llvm）与语言服务器（tie-lsp）复用同一实现。
+  tie-llvm driver 删除本地重复实现（-74 行），新增 `CompileError::Import` 错误分支。
+- **tie-lsp 接入 import 展开（跨文件语义）**：诊断 / hover / 跳转定义 / 补全四项能力
+  均按文档所在目录（`uri_base_dir`）展开 import 后再做语义分析——
+  `str.str_split` / `csv.csv_read` / `math.abs` 等跨文件命名空间调用不再误报
+  「未声明变量」，hover 与补全也能命中被导入文件中的函数。
+- tie-frontend 新增依赖 tie-prep（import 展开需要复用其清理逻辑）。
+
+### 测试
+- 全工作区测试通过（frontend 112 / interp 49 / llvm 28 / lsp **60** / prep 4 = **253**）
+- 新增真实文件端到端测试：`examples/csv_demo.tie` didOpen 诊断为空；
+  hover `str.str_split` 返回跨文件函数签名（首个调用位置自动定位）
+
 ## [Harbor M2.1.2] std 库与示例统一命名空间语法 — 2026-08-08
 
 ### 变更

@@ -14,11 +14,13 @@
 //! [crate::lsp] 类型，不修改 tie-frontend 源码。
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use tie_frontend::ast::{Program, Stmt, TypeSpec};
+use tie_frontend::imports::expand_imports;
 use tie_frontend::lexer::{tokenize, Span, Token, TokenKind};
 use tie_frontend::parser::parse_program;
-use tie_frontend::semantic::analyze;
+use tie_frontend::semantic::{SemanticResult, analyze};
 
 use crate::lsp::{CompletionItem, Diagnostic, Position, Range};
 
@@ -33,10 +35,16 @@ const SOURCE_NAME: &str = "tie";
 /// 流程（任一阶段失败即停止收集）：
 /// 1. [tokenize] 词法 → `LexError` 时生成 1 条诊断；
 /// 2. [parse_program] 语法 → `ParseError` 时生成 1 条诊断；
-/// 3. [analyze] 语义 → `SemanticError` 时生成 1 条诊断。
+/// 3. [expand_imports] import 展开 → `ImportError` 时生成 1 条诊断
+///    （`base_dir` 为 None 时跳过展开，仅分析单文件）；
+/// 4. [analyze] 语义 → `SemanticError` 时生成 1 条诊断。
 ///
 /// 全部成功返回空列表（无诊断）。错误消息沿用 tie-frontend 原始 message 文本。
-pub fn diagnostics_for_source(source: &str) -> Vec<Diagnostic> {
+///
+/// `base_dir`：源码所在目录。跨文件命名空间调用（`str.str_split` 等）依赖
+/// import 展开后才能通过语义分析（被导入文件的函数定义已内联进程序），
+/// 否则会误报「未声明变量 'str'」。
+pub fn diagnostics_for_source(source: &str, base_dir: Option<&Path>) -> Vec<Diagnostic> {
     // 阶段一：词法分析
     let tokens = match tokenize(source) {
         Ok(tokens) => tokens,
@@ -47,11 +55,76 @@ pub fn diagnostics_for_source(source: &str) -> Vec<Diagnostic> {
         Ok(program) => program,
         Err(err) => return vec![one_diagnostic(err.span, err.message)],
     };
-    // 阶段三：语义分析
+    // 阶段三：import 展开（有 base_dir 才做；无路径上下文时保持单文件分析）
+    let program = match expand_with_base(program, base_dir) {
+        Ok(program) => program,
+        Err(err) => return vec![one_diagnostic(err.span, err.message)],
+    };
+    // 阶段四：语义分析
     if let Err(err) = analyze(&program) {
         return vec![one_diagnostic(err.span, err.message)];
     }
     // 全部通过：无诊断
+    Vec::new()
+}
+
+/// 按 `base_dir` 展开 import：有目录则递归内联被导入文件，无目录时原样返回。
+fn expand_with_base(
+    program: Program,
+    base_dir: Option<&Path>,
+) -> Result<Program, tie_frontend::imports::ImportError> {
+    match base_dir {
+        Some(dir) => expand_imports(program, dir),
+        None => Ok(program),
+    }
+}
+
+/// 命名空间调用查询名：光标命中的 Ident 若构成 `receiver.name`（其前一个 token
+/// 是 `.`，再前一个是 Ident），返回语义层的全名 `receiver::name`（命名空间函数
+/// 以全名注册）；否则返回裸名。
+fn ns_query_name(tokens: &[Token], idx: usize, name: &str) -> String {
+    if idx >= 2 && matches!(tokens[idx - 1].kind, TokenKind::Dot) {
+        if let TokenKind::Ident(receiver) = &tokens[idx - 2].kind {
+            return format!("{receiver}::{name}");
+        }
+    }
+    name.to_string()
+}
+
+/// 从程序 AST 查找函数定义（含命名空间内函数），返回参数名列表。
+///
+/// `query_name` 为全名（命名空间函数 `math::abs`）或裸名（顶层函数 `add`）。
+/// FuncSig 只携带参数类型，参数名需回 AST 取。
+fn func_param_names(program: &Program, query_name: &str) -> Vec<String> {
+    func_param_names_inner(&program.stmts, &[], query_name)
+}
+
+/// 递归收集函数参数名的实际实现。
+///
+/// `ns_prefix` 是当前遍历所在的命名空间路径段（空 = 顶层），用于拼接全名比对。
+fn func_param_names_inner(stmts: &[Stmt], ns_prefix: &[String], query_name: &str) -> Vec<String> {
+    for stmt in stmts {
+        match stmt {
+            Stmt::FnDef(f) => {
+                // 全名 = 命名空间路径段 + 函数名；顶层函数全名即裸名
+                let mut segs = ns_prefix.to_vec();
+                segs.push(f.name.clone());
+                if segs.join("::") == query_name {
+                    return f.params.iter().map(|p| p.name.clone()).collect();
+                }
+            }
+            Stmt::Namespace(ns) => {
+                // 嵌套命名空间：路径拼接后递归
+                let mut segs = ns_prefix.to_vec();
+                segs.extend(ns.path.iter().cloned());
+                let found = func_param_names_inner(&ns.body, &segs, query_name);
+                if !found.is_empty() {
+                    return found;
+                }
+            }
+            _ => {}
+        }
+    }
     Vec::new()
 }
 
@@ -106,17 +179,24 @@ pub fn ty_to_str(ty: &TypeSpec) -> String {
 /// 流程：
 /// 1. 重新词法分析，找出与位置匹配的 `Ident` token（span 换算回 1-based 比较，
 ///    token 长度取名字的 UTF-8 字节数，v1 接受中文标识符的字节近似）；
-/// 2. 命中后执行语义分析：
+/// 2. 命中后执行语义分析（含 import 展开，跨文件函数/类也能命中）：
 ///    - `sem.funcs` 含该名字 → `**函数签名**：func name(param: Ty, ...) -> Ret`
 ///      （参数名取自 AST 同名函数定义，类型来自 `FuncSig.param_tys`）；
 ///    - `sem.classes` 含该名字 → `**类**：class Name`（有 extends 则追加）；
 ///    - 都没命中返回 `None`（hover result 为 null）。
-pub fn hover_markdown(source: &str, line: u32, character: u32) -> Option<String> {
+///
+/// `base_dir`：源码所在目录（import 展开用），None 时仅分析单文件。
+pub fn hover_markdown(
+    source: &str,
+    line: u32,
+    character: u32,
+    base_dir: Option<&Path>,
+) -> Option<String> {
     // 命中标识符：0-based 位置还原为 1-based 再与 token.span 比较
     let tokens = tokenize(source).ok()?;
     let target_line = line.saturating_add(1);
     let target_col = character.saturating_add(1);
-    let ident = tokens.iter().find(|t| {
+    let (idx, ident) = tokens.iter().enumerate().find(|(_, t)| {
         let TokenKind::Ident(name) = &t.kind else { return false };
         // 字节长度转 u32（64 位平台恒成功；异常时按最大处理）
         let len = u32::try_from(name.len()).unwrap_or(u32::MAX);
@@ -127,20 +207,17 @@ pub fn hover_markdown(source: &str, line: u32, character: u32) -> Option<String>
     let TokenKind::Ident(name) = &ident.kind else { unreachable!() };
     let name = name.clone();
 
-    // 语义查询：函数签名 / 类信息
+    // 语义查询：函数签名 / 类信息（先语法分析，再按 base_dir 展开 import）
     let program = parse_program(&tokens).ok()?;
+    let program = expand_with_base(program, base_dir).ok()?;
     let sem = analyze(&program).ok()?;
 
-    if let Some(sig) = sem.funcs.get(&name) {
-        // 参数名从 AST 同名函数定义取（FuncSig 只携带参数类型）
-        let param_names: Vec<&str> = program
-            .stmts
-            .iter()
-            .find_map(|s| match s {
-                Stmt::FnDef(f) if f.name == name => Some(f.params.iter().map(|p| p.name.as_str()).collect()),
-                _ => None,
-            })
-            .unwrap_or_default();
+    // 查询名：命名空间调用（`math.abs`，token 前是 `.` 且再前是 Ident）→ 全名
+    // `math::abs`；其余场景用裸名。语义层命名空间函数以全名注册。
+    let query_name = ns_query_name(&tokens, idx, &name);
+    if let Some(sig) = sem.funcs.get(&query_name) {
+        // 参数名从 AST 同名函数定义取（FuncSig 只携带参数类型；含命名空间内函数）
+        let param_names = func_param_names(&program, &query_name);
         let params = sig
             .param_tys
             .iter()
@@ -148,14 +225,16 @@ pub fn hover_markdown(source: &str, line: u32, character: u32) -> Option<String>
             .map(|(i, ty)| {
                 // 参数名取自 AST；FuncSig 只带类型，取不到时用占位名 argN
                 let pname = match param_names.get(i) {
-                    Some(n) => (*n).to_string(),
+                    Some(n) => n.clone(),
                     None => format!("arg{i}"),
                 };
                 format!("{pname}: {}", ty_to_str(ty))
             })
             .collect::<Vec<_>>()
             .join(", ");
-        return Some(format!("**函数签名**：func {name}({params}) -> {}", ty_to_str(&sig.ret_ty)));
+        // 显示名用裸名（`math::abs` → `abs`），与源码调用形式一致
+        let display = query_name.rsplit("::").next().unwrap_or(&query_name);
+        return Some(format!("**函数签名**：func {display}({params}) -> {}", ty_to_str(&sig.ret_ty)));
     }
 
     if let Some(cls) = sem.classes.get(&name) {
@@ -201,15 +280,24 @@ struct DefMap {
 ///    - 名字是函数名（调用 `f(...)`）→ 函数定义；
 ///    - 其余 → 最近的同名局部变量声明。
 /// 找不到返回 `None`（响应 result 为 null）。
-pub fn definition(source: &str, line: u32, character: u32) -> Option<Range> {
+///
+/// `base_dir`：源码所在目录（import 展开用）。展开后跨文件函数/类也能跳转
+/// 到定义（定义 span 取自被导入文件的 AST，位置正确）。
+pub fn definition(
+    source: &str,
+    line: u32,
+    character: u32,
+    base_dir: Option<&Path>,
+) -> Option<Range> {
     // 词法定位：命中光标处的 Ident token（并保留其在 token 流中的下标做场景判断）
     let tokens = tokenize(source).ok()?;
     let (ident, idx) = ident_token_at(&tokens, line, character)?;
     let TokenKind::Ident(word) = &ident.kind else { unreachable!() };
     let word = word.clone();
 
-    // 语法分析 → 构建定义表
+    // 语法分析 → 构建定义表（含 import 展开：跨文件定义也可命中）
     let program = parse_program(&tokens).ok()?;
+    let program = expand_with_base(program, base_dir).ok()?;
     let defs = collect_defs(&tokens, &program);
 
     // 场景一：成员访问 `obj.field` / `obj.method()`——光标 token 前一个是 `.`
@@ -245,14 +333,24 @@ pub fn definition(source: &str, line: u32, character: u32) -> Option<Range> {
 /// 遍历程序 AST，收集全部「名字 → 定义位置」映射。
 fn collect_defs(tokens: &[Token], program: &Program) -> DefMap {
     let mut map = DefMap::default();
-    for stmt in &program.stmts {
+    collect_defs_inner(tokens, &program.stmts, &[], &mut map);
+    map
+}
+
+/// 递归收集定义的实现：`ns_prefix` 为当前命名空间路径段（空 = 顶层）。
+///
+/// 命名空间内函数以全名（`math::abs`）为 key 注册，供命名空间调用跳转。
+fn collect_defs_inner(tokens: &[Token], stmts: &[Stmt], ns_prefix: &[String], map: &mut DefMap) {
+    for stmt in stmts {
         match stmt {
             Stmt::FnDef(f) => {
-                // 函数名：`func` 关键字之后的第一个 Ident；函数体内继续收集局部变量
+                // 函数名：`func` 关键字之后的第一个 Ident；key 用全名（顶层即裸名）
                 if let Some(span) = name_span_after(tokens, f.span) {
-                    map.funcs.insert(f.name.clone(), span);
+                    let mut segs = ns_prefix.to_vec();
+                    segs.push(f.name.clone());
+                    map.funcs.insert(segs.join("::"), span);
                 }
-                collect_stmt_defs(tokens, &f.body, &mut map);
+                collect_stmt_defs(tokens, &f.body, map);
             }
             Stmt::Class(c) => {
                 // 类名：`class` 关键字之后的第一个 Ident
@@ -270,14 +368,19 @@ fn collect_defs(tokens: &[Token], program: &Program) -> DefMap {
                     if let Some(span) = name_span_after(tokens, m.span) {
                         map.methods.insert(m.name.clone(), span);
                     }
-                    collect_stmt_defs(tokens, &m.body, &mut map);
+                    collect_stmt_defs(tokens, &m.body, map);
                 }
             }
+            Stmt::Namespace(ns) => {
+                // 命名空间：路径拼接后递归（函数以全名注册）
+                let mut segs = ns_prefix.to_vec();
+                segs.extend(ns.path.iter().cloned());
+                collect_defs_inner(tokens, &ns.body, &segs, map);
+            }
             // 顶层其他语句（import 等）：不产生定义
-            _ => collect_stmt_defs(tokens, std::slice::from_ref(stmt), &mut map),
+            _ => collect_stmt_defs(tokens, std::slice::from_ref(stmt), map),
         }
     }
-    map
 }
 
 /// 递归收集语句列表内的局部变量声明（函数体/方法体/各控制流块）。
@@ -404,23 +507,73 @@ const BUILTIN_FUNCS: &[(&str, &str)] = &[
 ///
 /// 策略：
 /// - `类名.` 场景（光标前是 `.` 且其前是已定义类名）→ 只补该类字段与方法；
+/// - `命名空间名.` 场景（receiver 是命名空间）→ 只补该命名空间内函数（裸名）；
 /// - 其余场景返回全集：关键词 + 类型名 + 内置函数 + 顶层函数（detail 填签名）+
 ///   类名（detail 填 `class`），按 label 排序去重。
-pub fn completion(source: &str, line: u32, character: u32) -> Vec<CompletionItem> {
-    // 点场景：`类名.` → 只补该类成员；receiver 非类名（变量/this）时回退全集
-    if let Some(class_name) = member_receiver(source, line, character) {
+///
+/// `base_dir`：源码所在目录（import 展开用）。展开后跨文件导入的命名空间
+/// 函数（`math.abs` 等）在点场景与全集都能补全。
+pub fn completion(
+    source: &str,
+    line: u32,
+    character: u32,
+    base_dir: Option<&Path>,
+) -> Vec<CompletionItem> {
+    // 点场景：`类名.` / `命名空间名.` → 只补对应成员；receiver 非类/命名空间时回退全集
+    if let Some(receiver) = member_receiver(source, line, character) {
         let tokens = tokenize(source).ok();
         let program = tokens.as_deref().and_then(|t| parse_program(t).ok());
-        if let Some(program) = &program
-            && program
+        let program = program.and_then(|p| expand_with_base(p, base_dir).ok());
+        let sem = program.as_ref().and_then(|p| analyze(p).ok());
+        if let (Some(program), Some(sem)) = (&program, &sem) {
+            // 场景一：类名. → 类成员补全
+            if program
                 .stmts
                 .iter()
-                .any(|s| matches!(s, Stmt::Class(c) if c.name == class_name))
-        {
-            return member_completions(program, &class_name);
+                .any(|s| matches!(s, Stmt::Class(c) if c.name == receiver))
+            {
+                return member_completions(program, &receiver);
+            }
+            // 场景二：命名空间. → 命名空间函数补全（裸名）
+            let ns_items = ns_member_completions(program, sem, &receiver);
+            if !ns_items.is_empty() {
+                return ns_items;
+            }
         }
     }
-    all_completions(source)
+    all_completions(source, base_dir)
+}
+
+/// 命名空间成员补全：给定命名空间名（如 `math`），返回该命名空间内全部函数
+/// （label 用裸名，detail 填签名）。用于 `math.` 点场景。
+fn ns_member_completions(program: &Program, sem: &SemanticResult, ns: &str) -> Vec<CompletionItem> {
+    let prefix = format!("{ns}::");
+    let mut items = Vec::new();
+    for (full, sig) in &sem.funcs {
+        if let Some(short) = full.strip_prefix(&prefix) {
+            // 参数名取自 AST（命名空间内函数定义）
+            let param_names = func_param_names(program, full);
+            let params = sig
+                .param_tys
+                .iter()
+                .enumerate()
+                .map(|(i, ty)| {
+                    let pname = param_names
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("arg{i}"));
+                    format!("{pname}: {}", ty_to_str(ty))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            items.push(CompletionItem {
+                label: short.to_string(),
+                kind: Some(KIND_FUNCTION),
+                detail: Some(format!("func {short}({params}) -> {}", ty_to_str(&sig.ret_ty))),
+            });
+        }
+    }
+    items
 }
 
 /// 定位光标前的成员访问接收者：源码该位置之前的文本以 `.` 结尾 → 返回 `.` 前
@@ -492,9 +645,10 @@ fn member_completions(program: &Program, class_name: &str) -> Vec<CompletionItem
 
 /// 全集补全：关键词 + 类型名 + 内置函数 + 顶层函数 + 类名。
 ///
-/// 顶层函数 / 类名来自语义结果（需源码合法）；关键词、类型名与内置函数
-/// 恒返回（编辑中的半成品源码也能补全）。结果按 label 排序去重。
-fn all_completions(source: &str) -> Vec<CompletionItem> {
+/// 顶层函数 / 类名来自语义结果（需源码合法，含 import 展开后的跨文件定义）；
+/// 关键词、类型名与内置函数恒返回（编辑中的半成品源码也能补全）。
+/// 结果按 label 排序去重。
+fn all_completions(source: &str, base_dir: Option<&Path>) -> Vec<CompletionItem> {
     let mut items: Vec<CompletionItem> = Vec::new();
     // 关键词（无 detail）
     for kw in KEYWORDS {
@@ -520,23 +674,20 @@ fn all_completions(source: &str) -> Vec<CompletionItem> {
             detail: Some((*detail).into()),
         });
     }
-    // 顶层函数与类名：需要语义结果
+    // 顶层函数与类名：需要语义结果（含 import 展开）
     let tokens = tokenize(source).ok();
     let program = tokens.as_deref().and_then(|t| parse_program(t).ok());
+    let program = program.and_then(|p| expand_with_base(p, base_dir).ok());
     let sem = program.as_ref().and_then(|p| analyze(p).ok());
     if let (Some(program), Some(sem)) = (&program, &sem) {
-        // 顶层函数：detail 填签名（参数名取自 AST 同名函数定义，与 hover 一致）
+        // 顶层函数：detail 填签名（参数名取自 AST 同名函数定义，与 hover 一致）。
+        // 跳过命名空间函数全名（含 `::`，如 `math::abs`）——它们只在
+        // `math.` 点场景补全（[ns_member_completions]），全集只列裸名函数。
         for (name, sig) in &sem.funcs {
-            let param_names: Vec<String> = program
-                .stmts
-                .iter()
-                .find_map(|s| match s {
-                    Stmt::FnDef(f) if f.name == *name => {
-                        Some(f.params.iter().map(|p| p.name.clone()).collect())
-                    }
-                    _ => None,
-                })
-                .unwrap_or_default();
+            if name.contains("::") {
+                continue;
+            }
+            let param_names = func_param_names(program, name);
             let params = sig
                 .param_tys
                 .iter()
@@ -583,7 +734,7 @@ func main() {
     println(add(1, 2))
 }
 "#;
-        let diags = diagnostics_for_source(src);
+        let diags = diagnostics_for_source(src, None);
         assert!(diags.is_empty(), "合法源码不应有诊断：{diags:?}");
     }
 
@@ -591,7 +742,7 @@ func main() {
     #[test]
     fn 词法错误生成一条诊断且位置正确() {
         let src = "var x = \"abc"; // 字符串未闭合，引号在 col 9
-        let diags = diagnostics_for_source(src);
+        let diags = diagnostics_for_source(src, None);
         assert_eq!(diags.len(), 1, "词法错误应恰好 1 条诊断");
         let d = &diags[0];
         assert_eq!(d.severity, 1, "严重程度应为错误");
@@ -606,7 +757,7 @@ func main() {
     #[test]
     fn 语法错误生成一条诊断() {
         let src = "var x = 1"; // 顶层只允许函数/import/类
-        let diags = diagnostics_for_source(src);
+        let diags = diagnostics_for_source(src, None);
         assert_eq!(diags.len(), 1, "语法错误应恰好 1 条诊断");
         let d = &diags[0];
         assert!(d.message.contains("顶层只允许"), "消息应沿用原始 message：{}", d.message);
@@ -621,7 +772,7 @@ func main() {
     var x: i64 = "hello"
 }
 "#;
-        let diags = diagnostics_for_source(src);
+        let diags = diagnostics_for_source(src, None);
         assert_eq!(diags.len(), 1, "语义错误应恰好 1 条诊断");
         let d = &diags[0];
         assert!(d.message.contains("类型不匹配"), "消息应沿用原始 message：{}", d.message);
@@ -672,7 +823,7 @@ func main() {
 }
 "#;
         // "func add" 中 add 起始位置：第 2 行（LSP line 1），col 6 → character 5
-        let md = hover_markdown(src, 1, 5).expect("命中 add 应返回签名");
+        let md = hover_markdown(src, 1, 5, None).expect("命中 add 应返回签名");
         assert!(md.contains("**函数签名**"), "应含函数签名标记：{md}");
         assert!(md.contains("func add(a: i64, b: i64) -> i64"), "签名格式不符：{md}");
     }
@@ -696,11 +847,11 @@ func main() {
 }
 "#;
         // "class Animal" 中 Animal 在 LSP line 1、character 6（无继承）
-        let md = hover_markdown(src, 1, 6).expect("命中 Animal 应返回类信息");
+        let md = hover_markdown(src, 1, 6, None).expect("命中 Animal 应返回类信息");
         assert!(md.contains("**类**：class Animal"), "应为类信息：{md}");
         assert!(!md.contains("extends"), "Animal 无父类：{md}");
         // "class Dog extends Animal" 中 Dog 在 LSP line 8、character 6（有继承）
-        let md = hover_markdown(src, 8, 6).expect("命中 Dog 应返回类信息");
+        let md = hover_markdown(src, 8, 6, None).expect("命中 Dog 应返回类信息");
         assert!(md.contains("**类**：class Dog"), "应为类信息：{md}");
         assert!(md.contains("extends Animal"), "应含父类：{md}");
     }
@@ -710,23 +861,23 @@ func main() {
     fn hover未命中返回空() {
         let src = "func main() {\n    println(1)\n}\n";
         // 字符 0 是 `func` 关键字（TokenKind::Func，非 Ident）→ 不命中
-        assert!(hover_markdown(src, 0, 0).is_none(), "关键字不应命中");
+        assert!(hover_markdown(src, 0, 0, None).is_none(), "关键字不应命中");
         // 空白位置也不命中
-        assert!(hover_markdown(src, 1, 0).is_none(), "行首空白不应命中");
+        assert!(hover_markdown(src, 1, 0, None).is_none(), "行首空白不应命中");
     }
 
     /// hover 命中变量名（既非函数也非类）：返回 None。
     #[test]
     fn hover命中普通变量返回空() {
         let src = "func main() {\n    var count = 1\n    println(count)\n}\n";
-        assert!(hover_markdown(src, 1, 8).is_none(), "普通变量不应命中");
+        assert!(hover_markdown(src, 1, 8, None).is_none(), "普通变量不应命中");
     }
 
     /// hover 位置在函数名中间（如 add 的第三个字符）也应命中（长度判断）。
     #[test]
     fn hover命中函数名中间位置() {
         let src = "func add(a: i64, b: i64) -> i64 {\n    return a + b\n}\nfunc main() {\n    println(add(1, 2))\n}\n";
-        let md = hover_markdown(src, 0, 7).expect("add 中间位置应命中");
+        let md = hover_markdown(src, 0, 7, None).expect("add 中间位置应命中");
         assert!(md.contains("func add"), "应命中 add：{md}");
     }
 
@@ -757,7 +908,7 @@ func main() {
     /// 跳转定义：函数调用 `add(...)` → `func add` 定义处名字位置（line 10、character 5）。
     #[test]
     fn 跳转定义函数调用返回函数定义() {
-        let r = definition(定义源码(), 16, 12).expect("add 调用应命中函数定义");
+        let r = definition(定义源码(), 16, 12, None).expect("add 调用应命中函数定义");
         assert_eq!(r.start, Position { line: 10, character: 5 }, "函数名位置");
         assert!(r.end.character > r.start.character, "range 应覆盖整个名字");
     }
@@ -765,35 +916,35 @@ func main() {
     /// 跳转定义：类构造 `Point(0, 0)` → `class Point` 定义处名字位置（line 0、character 6）。
     #[test]
     fn 跳转定义类构造返回类定义() {
-        let r = definition(定义源码(), 4, 15).expect("Point 构造应命中类定义");
+        let r = definition(定义源码(), 4, 15, None).expect("Point 构造应命中类定义");
         assert_eq!(r.start, Position { line: 0, character: 6 }, "类名位置");
     }
 
     /// 跳转定义：实例方法调用 `p.dist()` → `method dist` 定义处名字位置（line 6、character 11）。
     #[test]
     fn 跳转定义方法调用返回方法定义() {
-        let r = definition(定义源码(), 17, 14).expect("dist 调用应命中方法定义");
+        let r = definition(定义源码(), 17, 14, None).expect("dist 调用应命中方法定义");
         assert_eq!(r.start, Position { line: 6, character: 11 }, "方法名位置");
     }
 
     /// 跳转定义：静态方法调用 `Point.create()` → 同名方法定义（line 3、character 18）。
     #[test]
     fn 跳转定义静态方法调用返回方法定义() {
-        let r = definition(定义源码(), 15, 18).expect("create 调用应命中方法定义");
+        let r = definition(定义源码(), 15, 18, None).expect("create 调用应命中方法定义");
         assert_eq!(r.start, Position { line: 3, character: 18 }, "静态方法名位置");
     }
 
     /// 跳转定义：变量引用 `count` → `var count` 声明处名字位置（line 14、character 8）。
     #[test]
     fn 跳转定义变量引用返回声明位置() {
-        let r = definition(定义源码(), 16, 16).expect("count 应命中变量声明");
+        let r = definition(定义源码(), 16, 16, None).expect("count 应命中变量声明");
         assert_eq!(r.start, Position { line: 14, character: 8 }, "变量名位置");
     }
 
     /// 跳转定义：字段访问 `this.x` → `var x` 字段声明处（line 1、character 8）。
     #[test]
     fn 跳转定义字段访问返回字段声明() {
-        let r = definition(定义源码(), 7, 20).expect("x 字段应命中声明");
+        let r = definition(定义源码(), 7, 20, None).expect("x 字段应命中声明");
         assert_eq!(r.start, Position { line: 1, character: 8 }, "字段名位置");
     }
 
@@ -801,15 +952,15 @@ func main() {
     #[test]
     fn 跳转定义未命中返回空() {
         // line 10 的 character 0 是 `func` 关键字（非 Ident）
-        assert!(definition(定义源码(), 10, 0).is_none(), "关键字不应命中");
+        assert!(definition(定义源码(), 10, 0, None).is_none(), "关键字不应命中");
         // 行首空白
-        assert!(definition(定义源码(), 14, 0).is_none(), "行首空白不应命中");
+        assert!(definition(定义源码(), 14, 0, None).is_none(), "行首空白不应命中");
     }
 
     /// 补全全集：包含关键词 func/var、内置函数 println、类型 i64、顶层函数 add、类名 Point。
     #[test]
     fn 补全全集包含关键词类型与函数() {
-        let items = completion(定义源码(), 14, 0);
+        let items = completion(定义源码(), 14, 0, None);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"func"), "应含关键词 func：{labels:?}");
         assert!(labels.contains(&"var"), "应含关键词 var：{labels:?}");
@@ -839,7 +990,7 @@ func main() {
     #[test]
     fn 补全类名点后返回类成员() {
         // line 15 `    var p = Point.create()`：光标在 `Point.` 之后（character 18）
-        let items = completion(定义源码(), 15, 18);
+        let items = completion(定义源码(), 15, 18, None);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"x"), "应含字段 x：{labels:?}");
         assert!(labels.contains(&"y"), "应含字段 y：{labels:?}");
@@ -855,8 +1006,151 @@ func main() {
     #[test]
     fn 补全变量点后回退全集() {
         // line 17 `    println(p.dist())`：光标在 `p.` 之后（character 14）
-        let items = completion(定义源码(), 17, 14);
+        let items = completion(定义源码(), 17, 14, None);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"func"), "变量 p 不是类名，应回退全集：{labels:?}");
+    }
+
+    // ==================== import 展开（base_dir） ====================
+
+    /// 创建唯一临时目录（import 展开测试用），返回目录路径。
+    /// 用进程 id + 纳秒时间戳保证并行测试互不冲突。
+    fn 临时目录() -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("系统时间应晚于 UNIX 纪元")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tie-lsp-test-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("创建临时目录失败");
+        dir
+    }
+
+    /// import 展开后，跨文件命名空间调用（`math.abs`）不再误报「未声明变量」。
+    ///
+    /// 对比：
+    /// - 传 base_dir（import 展开）→ 被导入文件的函数定义内联进程序，0 条诊断；
+    /// - 不传 base_dir（单文件分析）→ 语义层看不到 `math` 命名空间，误报未声明变量。
+    #[test]
+    fn import展开后命名空间调用无误报() {
+        // 被导入库：namespace math + abs 函数（与 examples/lib_math.tie 同形态）
+        let dir = 临时目录();
+        let lib = r#"namespace math {
+    func abs(x: i64) -> i64 {
+        if x < 0 {
+            return -x
+        }
+        return x
+    }
+}
+"#;
+        std::fs::write(dir.join("lib_math.tie"), lib).expect("写被导入文件失败");
+        let main = r#"import "./lib_math.tie"
+func main() {
+    println(math.abs(-5))
+}
+"#;
+
+        // 有 base_dir：import 展开后语义分析通过
+        let diags = diagnostics_for_source(main, Some(&dir));
+        assert!(diags.is_empty(), "import 展开后不应误报：{diags:?}");
+
+        // 无 base_dir：单文件分析，报未声明变量
+        let diags_single = diagnostics_for_source(main, None);
+        assert!(
+            diags_single.iter().any(|d| d.message.contains("未声明的变量")),
+            "单文件模式应误报未声明变量：{diags_single:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// import 被导入文件不存在 → 1 条诊断，消息含「读取失败」与路径。
+    #[test]
+    fn import文件不存在生成诊断() {
+        let dir = 临时目录();
+        let main = r#"import "./no_such_file.tie"
+func main() {
+    println(1)
+}
+"#;
+        let diags = diagnostics_for_source(main, Some(&dir));
+        assert_eq!(diags.len(), 1, "文件缺失应恰好 1 条诊断：{diags:?}");
+        assert!(
+            diags[0].message.contains("读取失败"),
+            "消息应说明读取失败：{}",
+            diags[0].message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// import 循环（a 导 b、b 导 a）→ 1 条诊断，消息含「循环导入」。
+    #[test]
+    fn import循环导入生成诊断() {
+        let dir = 临时目录();
+        // a.tie 导入 b.tie
+        std::fs::write(
+            dir.join("a.tie"),
+            "import \"./b.tie\"\nnamespace ns {\n    func fa() {\n    }\n}\n",
+        )
+        .expect("写 a.tie 失败");
+        // b.tie 导入 a.tie → 构成循环
+        std::fs::write(
+            dir.join("b.tie"),
+            "import \"./a.tie\"\nnamespace ns {\n    func fb() {\n    }\n}\n",
+        )
+        .expect("写 b.tie 失败");
+        let main = r#"import "./a.tie"
+func main() {
+    println(1)
+}
+"#;
+        let diags = diagnostics_for_source(main, Some(&dir));
+        assert_eq!(diags.len(), 1, "循环导入应恰好 1 条诊断：{diags:?}");
+        assert!(
+            diags[0].message.contains("循环导入"),
+            "消息应说明循环导入：{}",
+            diags[0].message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// hover：import 展开后，跨文件命名空间函数（`math.abs`）也能命中签名。
+    #[test]
+    fn import展开后hover命中跨文件函数() {
+        let dir = 临时目录();
+        let lib = r#"namespace math {
+    func abs(x: i64) -> i64 {
+        return x
+    }
+}
+"#;
+        std::fs::write(dir.join("lib_math.tie"), lib).expect("写被导入文件失败");
+        // 第 3 行 `    println(math.abs(-5))`（LSP line 2）：abs 起始 character 17
+        let main = "import \"./lib_math.tie\"\nfunc main() {\n    println(math.abs(-5))\n}\n";
+        let md = hover_markdown(main, 2, 17, Some(&dir)).expect("展开后应命中 abs 签名");
+        assert!(md.contains("func abs"), "应命中跨文件函数：{md}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 补全：`math.` 点场景 → 补全跨文件命名空间函数（裸名 abs）。
+    #[test]
+    fn import展开后补全命名空间成员() {
+        let dir = 临时目录();
+        let lib = r#"namespace math {
+    func abs(x: i64) -> i64 {
+        return x
+    }
+}
+"#;
+        std::fs::write(dir.join("lib_math.tie"), lib).expect("写被导入文件失败");
+        // 第 3 行 `    println(math.abs(-5))`（LSP line 2）：光标在 `math.` 之后
+        // （`.` 在 character 16，其后的 character 17 是 abs 的 a）——源码保持完整
+        // 可解析，模拟用户已在 `.` 后输入首个字符的场景
+        let main = "import \"./lib_math.tie\"\nfunc main() {\n    println(math.abs(-5))\n}\n";
+        let items = completion(main, 2, 17, Some(&dir));
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"abs"), "点场景应补全命名空间函数 abs：{labels:?}");
+        // 命名空间点场景不应含无关内容（如关键词 func）
+        assert!(!labels.contains(&"func"), "命名空间点场景不应含关键词：{labels:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

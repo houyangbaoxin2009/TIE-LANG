@@ -130,7 +130,10 @@ var (q, r) = divmod(17, 5)        // 解构：q=3, r=2（编译期 desugar）
 import "./lib_math.tie" as math   // 导入其他 tie 文件（相对路径字符串）
 ```
 
-- **已实现**（M2）：导入文件中的函数递归加载、内联可用。
+- **已实现**（M2）：导入文件中的函数递归加载、内联可用；import 展开逻辑集中在
+  tie-frontend 的 `imports` 模块（tie-llvm 与 tie-lsp 共享），语言服务器的
+  诊断 / hover / 跳转定义 / 补全同样支持跨文件语义（`str.str_split` 等跨文件
+  命名空间调用不会误报未声明变量）。
 - **未实现**：`data` 文件导入为只读数据表、按角色分派可见符号集。
 
 ### 2.8 class / OOP（P8 新增）

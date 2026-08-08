@@ -87,7 +87,7 @@ tie examples/lib_math.tie          # → examples/lib_math.a（经 clang -c 生�
 
 - `tie-prep <file.tie>` —— 纯预处理
 - `tie-frontend <file.tie>` —— 前端三阶段（词法/语法/语义），带 `--tokens`/`--ast`/`--check` 调试视图
-- `tie-lsp` —— 语言服务器（LSP over stdio），向编辑器提供诊断 / hover / 跳转定义 / 补全，可与 VSCode 等配合（等价于 `tie --lsp`）
+- `tie-lsp` —— 语言服务器（LSP over stdio），向编辑器提供诊断 / hover / 跳转定义 / 补全，支持跨文件 import 语义（可与 VSCode 等配合，等价于 `tie --lsp`）
 - `tie-llvm <file.tie>` —— 直接编译（不经过角色分派）
 - `tie-interp <file.tie>` —— 直接解释执行
 
@@ -107,9 +107,9 @@ target/release/tie-llvm.exe repl/repl.tie    # 链接 interp 库生成 repl/repl
 tie/
 ├── crates/
 │   ├── tie-prep/      预处理：清理代码、提取头、识别文件角色（logic/ui/db/data/library）
-│   ├── tie-frontend/  前端：词法（含 ASI）→ 语法 → 语义（符号表/类型检查），自研；独立 CLI 可调试
+│   ├── tie-frontend/  前端：词法（含 ASI）→ 语法 → 语义（符号表/类型检查）+ import 展开（imports 模块，tie-llvm/tie-lsp 共享），自研；独立 CLI 可调试
 │   ├── tie-llvm/      中端+后端驱动：AST → LLVM IR 文本生成；调用 opt/clang/lld
-│   ├── tie-lsp/       语言服务器：JSON-RPC 2.0 over stdio，复用前端三阶段提供诊断 / hover / 跳转定义 / 补全
+│   ├── tie-lsp/       语言服务器：JSON-RPC 2.0 over stdio，复用前端三阶段 + import 展开提供诊断 / hover / 跳转定义 / 补全（支持跨文件语义）
 │   ├── tie-interp/    解释执行：树遍历求值 AST + C ABI 桥（staticlib），REPL 自举核心
 │   └── tie/           CLI 主入口：角色分派调度器 + REPL（启动 repl.exe）
 ├── repl/repl.tie     REPL 外壳（tie 语言自写，自举；编译链接 tie-interp 静态库）

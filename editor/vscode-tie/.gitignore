@@ -1,5 +1,6 @@
 # 依赖与构建产物
 node_modules/
 out/
+*.vsix
 
 # VS Code 调试配置（launch.json/tasks.json）入库，供 F5 开发调试使用

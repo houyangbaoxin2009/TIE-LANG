@@ -99,6 +99,9 @@ dependencies = [
 [[package]]
 name = "tie-frontend"
 version = "0.1.0"
+dependencies = [
+ "tie-prep",
+]
 
 [[package]]
 name = "tie-interp"

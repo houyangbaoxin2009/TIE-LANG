@@ -7,8 +7,11 @@
 //! - [parser]：语法分析。递归下降解析 token 流生成 AST，
 //!   同时解析文件头部（`// tie:` 指令）并据此分派解析策略。
 //! - [semantic]：语义分析。符号表构建与类型检查。
+//! - [imports]：import 展开。递归加载被导入文件并内联其顶层语句，
+//!   供编译器驱动（tie-llvm）与语言服务器（tie-lsp）共享。
 
 pub mod ast;
+pub mod imports;
 pub mod lexer;
 pub mod parser;
 pub mod semantic;

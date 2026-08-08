@@ -7,6 +7,8 @@ repository.workspace = true
 description = "tie 语言编译器前端：词法分析（含 ASI）→ 语法分析 → 语义分析（符号表/类型检查），全部自研实现"
 
 [dependencies]
+# import 展开（expand_imports）需要读取并预处理被导入文件，复用 tie-prep 的清理逻辑
+tie-prep = { path = "../tie-prep" }
 
 [lints]
 # 注意：[lints] workspace = true 与本地覆盖无法共存（Cargo 限制）。

@@ -17,6 +17,7 @@
 //! 其余方法返回 MethodNotFound（-32601）。
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -108,6 +109,21 @@ fn initialize(state: &mut ServerState, id: Option<Value>) -> Vec<Value> {
     vec![success_response(id, result)]
 }
 
+/// 从文档 uri（`file:///...`）提取源码所在目录（import 展开用）。
+///
+/// - Windows 路径：`file:///C:/dir/file.tie` → `C:/dir`（由 `Path` 统一处理分隔符）；
+/// - 其他平台：`file:///dir/file.tie` → `/dir`；
+/// - 无法解析（非 file 协议 / 无目录部分）返回 `None`，
+///   调用方据此跳过 import 展开（仅做单文件分析）。
+fn uri_base_dir(uri: &str) -> Option<PathBuf> {
+    // 去掉 `file://` 前缀；Windows 盘符路径多一个前导 `/`（`file:///C:/...`）
+    let rest = uri.strip_prefix("file://")?;
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    // 文件 uri 应指向具体文件，取父目录作为 base_dir
+    let path = Path::new(rest);
+    path.parent().map(|p| p.to_path_buf())
+}
+
 /// `textDocument/didOpen`：全文存入内存，并立即推送诊断。
 fn did_open(state: &mut ServerState, params: &Value) -> Vec<Value> {
     let Ok(params) = serde_json::from_value::<DidOpenTextDocumentParams>(params.clone()) else {
@@ -153,7 +169,12 @@ fn hover(state: &ServerState, id: Option<Value>, params: &Value) -> Vec<Value> {
         // 文档不在内存：返回 null
         return vec![success_response(id, Value::Null)];
     };
-    let result = match diagnostics::hover_markdown(source, params.position.line, params.position.character) {
+    let result = match diagnostics::hover_markdown(
+        source,
+        params.position.line,
+        params.position.character,
+        uri_base_dir(&uri).as_deref(),
+    ) {
         Some(value) => {
             // 命中：返回 markdown 内容
             let hover = crate::lsp::Hover {
@@ -176,7 +197,12 @@ fn definition(state: &ServerState, id: Option<Value>, params: &Value) -> Vec<Val
         // 文档不在内存：返回 null
         return vec![success_response(id, Value::Null)];
     };
-    let result = match diagnostics::definition(source, params.position.line, params.position.character) {
+    let result = match diagnostics::definition(
+        source,
+        params.position.line,
+        params.position.character,
+        uri_base_dir(&uri).as_deref(),
+    ) {
         Some(range) => {
             // 定义位置：uri 与请求文档相同（v1 单文档，不做跨文件跳转）
             let loc = crate::lsp::Location { uri: uri.clone(), range };
@@ -199,17 +225,24 @@ fn completion(state: &ServerState, id: Option<Value>, params: &Value) -> Vec<Val
         let result = serde_json::to_value(list).expect("CompletionList 序列化不应失败");
         return vec![success_response(id, result)];
     };
-    let items = diagnostics::completion(source, params.position.line, params.position.character);
+    let items = diagnostics::completion(
+        source,
+        params.position.line,
+        params.position.character,
+        uri_base_dir(&uri).as_deref(),
+    );
     let list = CompletionList { is_incomplete: false, items };
     let result = serde_json::to_value(list).expect("CompletionList 序列化不应失败");
     vec![success_response(id, result)]
 }
 
 /// 构造 `textDocument/publishDiagnostics` 通知（对当前全文跑三阶段诊断）。
+///
+/// 传 base_dir（从 uri 提取）做 import 展开，跨文件命名空间调用不再误报。
 fn publish_diagnostics(uri: &str, source: &str) -> Value {
     let params = PublishDiagnosticsParams {
         uri: uri.into(),
-        diagnostics: diagnostics::diagnostics_for_source(source),
+        diagnostics: diagnostics::diagnostics_for_source(source, uri_base_dir(uri).as_deref()),
     };
     let params = serde_json::to_value(params).expect("诊断通知序列化不应失败");
     json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params})
@@ -618,5 +651,85 @@ func main() {
         assert_eq!(out[0]["result"]["isIncomplete"], json!(false));
         let items = out[0]["result"]["items"].as_array().expect("items 应为数组");
         assert!(items.is_empty(), "文档未打开应返回空列表");
+    }
+
+    // ==================== 真实文件（import 展开端到端） ====================
+
+    /// 真实文件端到端：didOpen `examples/csv_demo.tie`（导入 std/csv 等命名空间库），
+    /// 诊断应为空——验证跨文件命名空间调用（`str.str_split` / `csv.csv_read` 等）
+    /// 经 import 展开后不再误报「未声明变量」。
+    ///
+    /// 路径：`CARGO_MANIFEST_DIR`（crates/tie-lsp）→ 上两级到仓库根 → examples/。
+    #[test]
+    fn 真实文件打开导入库示例诊断为空() {
+        // 定位仓库根：crates/tie-lsp → 上两级
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("CARGO_MANIFEST_DIR 应有父目录");
+        let demo = root.join("examples").join("csv_demo.tie");
+        if !demo.exists() {
+            eprintln!("跳过：示例文件不存在 {demo:?}");
+            return;
+        }
+        let text = std::fs::read_to_string(&demo).expect("读取示例文件失败");
+        // uri 用绝对路径（Windows 盘符形式 file:///F:/Projects/tie/...）
+        let path_str = demo.to_string_lossy().replace('\\', "/");
+        let uri = format!("file:///{path_str}");
+
+        let mut state = ServerState::default();
+        let out = handle_message(&mut state, 打开文档(&uri, &text));
+        assert_eq!(out.len(), 1, "应推送 1 条诊断通知");
+        assert_eq!(out[0]["method"], "textDocument/publishDiagnostics");
+        let diags = out[0]["params"]["diagnostics"].as_array().expect("诊断应为数组");
+        assert!(
+            diags.is_empty(),
+            "csv_demo.tie 经 import 展开后不应有诊断：{diags:?}"
+        );
+    }
+
+    /// hover 端到端：对真实导入库的示例文件，hover 命中 `str.str_split` 的
+    /// 第二个标识符（str_split）→ 应返回签名（跨文件函数可见）。
+    #[test]
+    fn 真实文件hover命名空间函数返回签名() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("CARGO_MANIFEST_DIR 应有父目录");
+        let demo = root.join("examples").join("csv_demo.tie");
+        if !demo.exists() {
+            eprintln!("跳过：示例文件不存在 {demo:?}");
+            return;
+        }
+        let text = std::fs::read_to_string(&demo).expect("读取示例文件失败");
+        let path_str = demo.to_string_lossy().replace('\\', "/");
+        let uri = format!("file:///{path_str}");
+
+        // 找到 `str.str_split(` 实际调用位置（注释里的 `str.str_split 基础` 不参与，
+        // 避免命中注释导致无 Ident token）。hover 命中第二个标识符 str_split：
+        // str 占 3 字符、`.` 占 1，str_split 从 c+4 起
+        let (line, col) = text
+            .lines()
+            .enumerate()
+            .find_map(|(i, l)| {
+                l.find("str.str_split(")
+                    .map(|c| (i as u32, c as u32 + 4))
+            })
+            .unwrap_or((0, 0));
+
+        let mut state = ServerState::default();
+        handle_message(&mut state, 打开文档(&uri, &text));
+        let out = handle_message(
+            &mut state,
+            请求(28, "textDocument/hover", json!({
+                "textDocument": {"uri": uri},
+                "position": {"line": line, "character": col}
+            })),
+        );
+        let value = out[0]["result"]["contents"]["value"].as_str();
+        assert!(
+            value.is_some_and(|v| v.contains("func ")),
+            "hover 应命中跨文件函数签名，实际：{value:?}"
+        );
     }
 }
