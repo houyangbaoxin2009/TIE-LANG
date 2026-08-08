@@ -21,9 +21,14 @@ use tie_prep::preprocess::FileRole;
 use tie_llvm::driver::{CompileOptions, CompileOutcome};
 use tie_llvm::optimizer::OptLevel;
 
+mod cache;
+mod config;
+mod pipeline;
+
 /// 命令行参数（编译类选项透传给 tie-llvm）。
 struct Args {
-    input: Option<PathBuf>,
+    /// 输入文件/目录列表（多文件或目录 = 编译项目；启用高级编译时按文件切片并行）
+    inputs: Vec<PathBuf>,
     output: Option<PathBuf>,
     opt_level: Option<OptLevel>,
     emit_ir_only: bool,
@@ -34,6 +39,8 @@ struct Args {
     target: Option<String>,
     /// 启动语言服务器（LSP over stdio），复用 tie-lsp 主循环
     lsp_mode: bool,
+    /// 协调统筹配置文件（tie:data 格式；缺省时查找当前目录 tie.config）
+    config: Option<PathBuf>,
 }
 
 /// 内部代号（架构代号）：代表本发行版的架构特征主题。
@@ -52,6 +59,7 @@ tie 语言总入口（四段式调度器 + REPL）
   tie                进入 REPL 交互模式（逐行解释执行）
   tie --lsp          启动语言服务器（LSP over stdio，供编辑器接入）
   tie <input.tie> [选项]   编译并执行脚本文件
+  tie <file...|目录> [选项] 编译项目（多文件/目录；需配置文件开启 advanced.enabled）
 
 流程:
   1. tie-prep 预处理（清理代码 + 识别文件类型）
@@ -59,14 +67,20 @@ tie 语言总入口（四段式调度器 + REPL）
      data/ui/db → 对应工具链，后续版本）
 
 选项:
-  -o <file>      指定输出文件路径（默认: 输入同名 .exe；library 角色默认 .a）
+  -o <file>      指定输出文件路径（默认: 输入同名 .exe；library 角色默认 .a；
+                 仅单文件模式生效）
   -O0|-O1|-O2|-O3
                  优化级别（默认: -O2）
   --target <三元组>
                  交叉编译目标（如 win-x64 / x86_64-pc-windows-msvc，默认: 本机）
+  --config <file>
+                 协调统筹配置文件（tie:data 格式；缺省查找当前目录 tie.config，
+                 无则默认全关闭）。开启 advanced.enabled 后，多文件/目录输入
+                 按文件切片、多线程并行编译（每步产物入缓存池，全部切片完成
+                 才进入下一步）；可配置线程数、缓存池大小/位置/存储技术
   --emit-ir      只生成 LLVM IR（.ll），不继续编译
   --keep-ir      保留中间 IR 文件
-  --prep-only    只执行预处理并打印识别结果，不编译
+  --prep-only    只执行预处理并打印识别结果，不编译（仅单文件模式）
   --lsp          以语言服务器模式运行（读 stdin 的 LSP 消息并写 stdout）
   --version      显示版本号与内部代号（如 2026.1 (Harbor)）
   -h, --help     显示本帮助
@@ -166,7 +180,7 @@ fn find_repl_exe() -> Option<PathBuf> {
 
 fn parse_args() -> Result<Args, String> {
     let mut args = env::args().skip(1);
-    let mut input: Option<PathBuf> = None;
+    let mut inputs: Vec<PathBuf> = Vec::new();
     let mut output: Option<PathBuf> = None;
     let mut opt_level: Option<OptLevel> = None;
     let mut emit_ir_only = false;
@@ -174,6 +188,7 @@ fn parse_args() -> Result<Args, String> {
     let mut prep_only = false;
     let mut target: Option<String> = None;
     let mut lsp_mode = false;
+    let mut config: Option<PathBuf> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -202,21 +217,27 @@ fn parse_args() -> Result<Args, String> {
             other if other.starts_with("--target=") => {
                 target = Some(other["--target=".len()..].to_string());
             }
+            "--config" => config = Some(PathBuf::from(args.next().ok_or("--config 后缺少配置文件路径")?)),
             "--emit-ir" => emit_ir_only = true,
             "--keep-ir" => keep_ir = true,
             "--prep-only" => prep_only = true,
             "--lsp" => lsp_mode = true,
             other if other.starts_with('-') => return Err(format!("未知选项: {other}")),
-            other => {
-                if input.is_some() {
-                    return Err("只能指定一个输入文件".into());
-                }
-                input = Some(PathBuf::from(other));
-            }
+            other => inputs.push(PathBuf::from(other)),
         }
     }
 
-    Ok(Args { input, output, opt_level, emit_ir_only, keep_ir, prep_only, target, lsp_mode })
+    Ok(Args {
+        inputs,
+        output,
+        opt_level,
+        emit_ir_only,
+        keep_ir,
+        prep_only,
+        target,
+        lsp_mode,
+        config,
+    })
 }
 
 fn main() -> ExitCode {
@@ -240,10 +261,62 @@ fn main() -> ExitCode {
         return tie_lsp::run_server();
     }
     // 有参数时必须指定输入文件
-    let Some(input) = args.input.as_ref() else {
+    if args.inputs.is_empty() {
         eprintln!("错误: 缺少输入文件，使用 --help 查看用法\n\n{USAGE}");
         return ExitCode::from(2);
+    }
+
+    // ---- 加载协调统筹配置（tie:data；缺省查 tie.config，无则默认全关闭）----
+    let config = match config::load(args.config.as_deref()) {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("错误: {msg}");
+            return ExitCode::FAILURE;
+        }
     };
+
+    // ---- 高级编译（多线程分片 + 缓存池）：配置文件开启后接管全部输入 ----
+    if config.advanced.enabled {
+        // prep-only 在多文件/分片模式下无意义：仅对单文件路径有效，先拒绝
+        if args.prep_only {
+            eprintln!("错误: --prep-only 仅支持单文件模式（高级编译模式下不可用）");
+            return ExitCode::from(2);
+        }
+        return match pipeline::Pipeline::new(
+            &config,
+            &args.inputs,
+            args.output.clone(),
+            args.opt_level,
+            args.emit_ir_only,
+            args.keep_ir,
+            args.target.clone(),
+        ) {
+            Ok(p) => match p.run() {
+                Ok(outcomes) => {
+                    let mut failed = false;
+                    for o in &outcomes {
+                        println!("{}", o.message);
+                    }
+                    // 若存在失败产物（消息含"失败"），以非零退出
+                    if outcomes.iter().any(|o| o.artifact.is_none() && o.message.contains("失败")) {
+                        failed = true;
+                    }
+                    if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+                }
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    ExitCode::FAILURE
+                }
+            },
+            Err(msg) => {
+                eprintln!("错误: {msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // ---- 默认路径：单文件编译（行为与原版本完全一致）----
+    let input = &args.inputs[0];
 
     // ---- 第 1 段：预处理（tie-prep）----
     let source = match fs::read_to_string(input) {

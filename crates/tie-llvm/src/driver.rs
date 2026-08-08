@@ -156,20 +156,6 @@ fn compile_program(
     opts: &CompileOptions,
     pre: &PreprocessResult,
 ) -> Result<CompileOutcome, CompileError> {
-    // 优化级别优先级：CLI 显式指定 > 头部 `opt=N` > 默认 O2
-    let opt_level = opts
-        .opt_level
-        .or_else(|| header_opt_level(&pre.headers))
-        .unwrap_or_default();
-
-    // 目标三元组优先级：CLI 显式指定 > 头部 `target=三元组` > 本机默认（None）
-    // 两者都经过平台别名规范化（win-x64 → x86_64-pc-windows-msvc）
-    let target = opts
-        .target
-        .clone()
-        .map(|t| normalize_target(t.trim()))
-        .or_else(|| header_target(&pre.headers));
-
     // ---- 前端 ----
     // 词法分析（含 ASI 分号补全）
     let tokens = tie_frontend::lexer::tokenize(&pre.cleaned_source).map_err(CompileError::Lex)?;
@@ -212,9 +198,37 @@ fn compile_program(
         });
     }
 
+    // 中端优化 + 后端（opt / 链接 / 归档）
+    compile_from_ir(&ir_path, &ir_out, pre, opts)
+}
+
+/// 从已生成的 IR 文件继续编译：opt 中间优化 → 按角色生成最终产物。
+///
+/// 供 [compile_program]（单文件编译）与 tie 总入口的分片并行流水线
+/// （多线程编译，各切片的前端可并行、后端共享本函数）复用。
+pub fn compile_from_ir(
+    ir_path: &Path,
+    ir_out: &ir::IrOutput,
+    pre: &PreprocessResult,
+    opts: &CompileOptions,
+) -> Result<CompileOutcome, CompileError> {
+    // 优化级别优先级：CLI 显式指定 > 头部 `opt=N` > 默认 O2
+    let opt_level = opts
+        .opt_level
+        .or_else(|| header_opt_level(&pre.headers))
+        .unwrap_or_default();
+
+    // 目标三元组优先级：CLI 显式指定 > 头部 `target=三元组` > 本机默认（None）
+    // 两者都经过平台别名规范化（win-x64 → x86_64-pc-windows-msvc）
+    let target = opts
+        .target
+        .clone()
+        .map(|t| normalize_target(t.trim()))
+        .or_else(|| header_target(&pre.headers));
+
     // opt 中间优化
-    let opt_ir_path = opts.input.with_extension("opt.ll");
-    optimizer::optimize(&ir_path, &opt_ir_path, opt_level).map_err(CompileError::Optimize)?;
+    let opt_ir_path = ir_path.with_extension("opt.ll");
+    optimizer::optimize(ir_path, &opt_ir_path, opt_level).map_err(CompileError::Optimize)?;
 
     // ---- 后端 ----
     // 按角色区分产物：logic → 链接可执行文件；library → 编译目标文件 + 打包静态库
@@ -254,7 +268,7 @@ fn compile_program(
             };
             backend::link(&opt_ir_path, &exe_path, target.as_deref(), &extra_libs)
                 .map_err(CompileError::Backend)?;
-            cleanup_intermediates(&ir_path, &opt_ir_path, opts.keep_intermediate);
+            cleanup_intermediates(ir_path, &opt_ir_path, opts.keep_intermediate);
             Ok(CompileOutcome {
                 message: format!("编译成功: {}", exe_path.display()),
                 artifact: Some(exe_path),
@@ -272,15 +286,15 @@ fn compile_program(
             // 第二步：目标文件 → 静态库（.a）
             backend::archive(&obj_path, &lib_path).map_err(CompileError::Backend)?;
             // 清理中间文件（.ll / .o），除非要求保留
-            cleanup_intermediates(&ir_path, &opt_ir_path, opts.keep_intermediate);
+            cleanup_intermediates(ir_path, &opt_ir_path, opts.keep_intermediate);
             let _ = fs::remove_file(&obj_path);
             Ok(CompileOutcome {
                 message: format!("库编译成功: {}", lib_path.display()),
                 artifact: Some(lib_path),
             })
         }
-        // 理论不可达：compile_program 只由 Dispatch::Compile（logic/library）调用
-        _ => unreachable!("compile_program 仅处理 logic/library 角色"),
+        // 理论不可达：compile_from_ir 只由 logic/library 角色调用
+        _ => unreachable!("compile_from_ir 仅处理 logic/library 角色"),
     }
 }
 

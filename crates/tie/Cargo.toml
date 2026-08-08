@@ -8,6 +8,7 @@ description = "tie 语言总入口（四段式调度器 + REPL）：调用 tie-p
 
 [dependencies]
 tie-prep = { path = "../tie-prep" }
+tie-frontend = { path = "../tie-frontend" }
 tie-llvm = { path = "../tie-llvm" }
 tie-interp = { path = "../tie-interp" }
 tie-lsp = { path = "../tie-lsp" }

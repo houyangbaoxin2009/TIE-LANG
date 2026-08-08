@@ -3,6 +3,52 @@
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库**。
 
+里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库**。
+
+## [Harbor M3 阶段二] 协调统筹增强：配置文件 + 缓存池 + 并行分片编译 — 2026-08-08
+
+多文件编译的协调统筹增强：`tie` 支持通过配置文件（`tie.config`，tie:data 格式）
+开启**多线程分片编译 + 阶段间缓存池**，把「编译一个项目」从单文件串行升级为
+「按文件分片 → 三阶段并行 + 阶段屏障」的流水线。
+
+### 新增
+- **配置文件（`crates/tie/src/config.rs`）**：`tie.config` 使用 tie 语言自己的数据
+  交换格式（tie:data），正文为一个表字面量。复用 `tie_frontend::lexer::tokenize`
+  （词法完全一致、注释自动跳过），对 token 流做表字面量递归下降解析（绕过语义层——
+  语义层目前拒绝字符串 id 表）。配置键：
+  - `advanced.enabled`（bool）：多线程分片编译总开关（默认关闭，保证原有单文件行为不变）
+  - `advanced.threads`（int）：并行线程数（0 = 按 CPU 核数自动）
+  - `cache.size`（字节，默认 256MB）、`cache.storage`（`memory` 进程内 / `file` 磁盘目录）、
+    `cache.path`（缓存目录；memory 存储也用作中间文件工作目录）
+  - 查找顺序：`--config` 显式指定 > 当前目录 `tie.config` > 默认（全关闭，不报错）
+  - 兼容负数（`threads: -1` 报「不能为负数」）、空输入/仅注释返回默认配置
+- **缓存池（`crates/tie/src/cache.rs`）**：`CachePool` 阶段间中转仓库（LRU，
+  容量超限按最久未访问淘汰）。`prep:<名>` 存预处理正文、`ir:<名>` 存 IR 文本——
+  阶段间流转即「所有切片都释放到缓存池后，进行下一步」（与设计图一致）。
+  流水线结束时 `clear()` 清空缓存并删除工作目录。
+- **分片流水线（`crates/tie/src/pipeline.rs`）**：`Pipeline::new` 展开输入（目录输入
+  收集其中全部 `.tie` 文件）→ 每个文件一个切片（去扩展名路径作为切片名）→ 三阶段：
+  - 阶段 1 预处理（并行）→ 阶段 2 前端+IR（并行，logic 无 main 报错、data/ui/db 跳过）→
+    阶段 3 后端（并行：从缓存池取 IR → 写独立工作目录 `.ll` → opt → 链接/归档成 `.exe`）
+  - 每阶段用 `std::thread::scope` + 按线程数分片 spawn 实现**并行屏障**（join 后统一读取
+    结果，任一失败即停止后续阶段）；`--emit-ir` 在阶段 2 后写回输入同名 `.ll` 结束
+  - 单切片时 `-o` 透传、多切片各自默认命名；角色分派与单文件路径一致
+
+### 变更
+- **main.rs**：`--config <file>` 选项 + `config::load` 接管；`advanced.enabled` 时
+  全部输入进入 `Pipeline`（`--prep-only` 在分片模式下拒绝）；USAGE 同步更新
+- **tie-llvm driver**：重构出 `compile_from_ir`（取 IR 路径 + IR 元数据 + 头部信息 +
+  选项 → opt/后端），`compile`（源码完整链路）改为复用其核心，pipeline 阶段 3 直接调用
+- tie/Cargo.toml 新增依赖 tie-frontend（config 复用其 lexer）；Cargo.lock 同步
+
+### 测试
+- 全工作区测试通过（frontend 112 / interp 58 / llvm 31 / lsp 75 / prep 6 / **tie 10**）
+- 新增 config 6 个（空配置返回默认 / 完整配置解析 / 缺省键走默认 / 非法存储技术报错 /
+  负线程数报错 / 注释被词法器跳过）、cache 4 个（put/get 往返、file 落盘与读回、
+  访问刷新 LRU 顺序、超限按 LRU 淘汰）
+- 端到端：临时双文件项目 + `tie.config`（advanced 开启、threads=2）并行编译出 2 个
+  可执行文件、运行输出正确、缓存目录编译后完全清理
+
 ## [Harbor M3 阶段一] 预处理器自举：核心逻辑 tie 语言化 — 2026-08-08
 
 编译器自举第一阶段：`tie-prep` 的预处理核心逻辑（头部提取 / 角色判定 / 正文重建）

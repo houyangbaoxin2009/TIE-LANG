@@ -59,25 +59,48 @@ x 大于 y
 主入口 `tie`（四段式调度器，合并原 tie-cli 职责）：
 
 ```
-tie <input.tie> [-o output] [-O0|-O1|-O2|-O3] [--target <三元组>] [--emit-ir] [--keep-ir] [--prep-only]
+tie <input.tie>... [-o output] [-O0|-O1|-O2|-O3] [--target <三元组>] [--emit-ir] [--keep-ir] [--prep-only] [--config <file>]
 tie --lsp        # 语言服务器模式（LSP over stdio，供编辑器接入）
 tie             # 无参数 → 进入 REPL 交互模式（启动 tie 语言自写的 repl.exe，自举）
 ```
 
 | 选项 | 说明 |
 | --- | --- |
-| `-o <file>` | 指定输出文件路径（logic 默认：输入同名 `.exe`；library 默认：输入同名 `.a`） |
+| `-o <file>` | 指定输出文件路径（logic 默认：输入同名 `.exe`；library 默认：输入同名 `.a`；单文件编译时生效） |
 | `-O0..-O3` | 优化级别（默认 `-O2`），映射到 `opt -O2` |
 | `--target <三元组>` | 交叉编译目标（如 `win-x64` / `x86_64-pc-windows-msvc`，默认本机）。支持平台别名：`win-x64`、`win-x86`、`win-arm64`、`linux-x64`、`linux-arm64`、`macos-x64`、`macos-arm64`，也可直接写 LLVM 三元组 |
 | `--emit-ir` | 只生成 LLVM IR（.ll），不继续编译 |
 | `--keep-ir` | 保留中间 IR 文件 |
 | `--prep-only` | 只做预处理（tie-prep）并打印识别结果 |
+| `--config <file>` | 指定协调统筹配置文件（默认查当前目录 `tie.config`，无则全关闭） |
 | `--module <file.tie>` | tie-prep：挂载自定义 tie 转换器模块（顶层 `process(src)->string`），输出为模块转换结果（Harbor M3 可扩展性） |
 | `--lsp` | 以语言服务器模式运行（读 stdin 的 LSP 消息、写 stdout，等价于 `tie-lsp`） |
 | `-h, --help` | 显示帮助 |
 
 流程：`tie-prep` 预处理（清理代码 + 识别文件类型）→ 按角色自动转交工具链
 （`logic` → 编译为可执行文件；`library` → 编译为静态库 `.a`；`data`/`ui`/`db` → 对应工具链，后续版本）。
+
+**多文件并行编译（Harbor M3 协调统筹增强）**：配置文件（tie:data 格式，键 `advanced` /
+`cache`）开启 `advanced.enabled = true` 后，可一次编译多个输入文件（目录输入自动展开
+其中全部 `.tie` 文件）——按文件分片、三阶段（预处理 → 前端+IR → 后端）并行 + 阶段屏障，
+阶段间用缓存池（LRU，`memory` 进程内 / `file` 磁盘目录）中转中间产物。`threads` 为 0
+时按 CPU 核数自动；单文件编译行为与原版本完全一致。
+
+```tie
+// tie.config
+// tie:data
+[
+    "advanced": [
+        "enabled": true,
+        "threads": 0,        // 0 = 按 CPU 核数自动
+    ],
+    "cache": [
+        "size": 268435456,   // 256MB
+        "storage": "memory", // memory / file
+        "path": ".tie-cache",
+    ],
+]
+```
 
 库编译示例（`// tie:library` 角色，定义函数不定义 main）：
 
@@ -114,7 +137,8 @@ tie/
 │   ├── tie-llvm/      中端+后端驱动：AST → LLVM IR 文本生成；调用 opt/clang/lld
 │   ├── tie-lsp/       语言服务器：JSON-RPC 2.0 over stdio，复用前端三阶段 + import 展开提供诊断 / hover / 跳转定义 / 补全（支持跨文件语义）
 │   ├── tie-interp/    解释执行：树遍历求值 AST + C ABI 桥（staticlib），REPL 自举核心
-│   └── tie/           CLI 主入口：角色分派调度器 + REPL（启动 repl.exe）
+│   └── tie/           CLI 主入口：角色分派调度器 + REPL（启动 repl.exe）+ Harbor M3 协调统筹
+│                      （config 配置文件 / cache 缓存池 / pipeline 三阶段并行分片编译）
 ├── repl/repl.tie     REPL 外壳（tie 语言自写，自举；编译链接 tie-interp 静态库）
 ├── prep/core.tie     预处理器核心模块（tie 语言自写：头部提取/角色判定/正文重建；Harbor M3 自举，编译期内嵌 tie-prep）
 ├── prep/indent.tie   转换器模块示例（制表符→4 空格；证明扩展性——新增转换器只需写 tie 模块，`tie-prep --module` 挂载）
@@ -179,4 +203,4 @@ tie/
 | M0 | 正式发行版基础：版本规则（年份.修订号）、内部代号（2026.1 "Harbor"）、工具链合集打包（`scripts/package.ps1` → zip） | ✅ 完成 |
 | M1 | VSCode 插件：语法高亮 / 智能缩进 / 代码片段 + LSP 客户端（诊断 / hover / 跳转定义 / 补全），TypeScript 重构 | ✅ 完成 |
 | M2 | 标准库：`std/`（文件 / 字符串 / 断言 / CSV / 格式化）+ `math`（数学函数）+ 20+ 语言底座原语 + **`tcmsg` 控制台信息库（i18n）** + **默认值参数**（可选参数省略时用字面量默认值）；M2.1.2 起 std 库全部采用命名空间形式（`assert.assert` / `str.str_split` / `math.abs`），为自举与生态奠定基础 | ✅ 完成 |
-| M3 | 预处理器自举：完全用 tie 语言重写 `tie-prep`，使其可扩展（编译器自举阶段一） | 🔄 阶段一完成（核心逻辑已 tie 语言化，`prep/core.tie`；Rust 壳仅解释执行） |
+| M3 | 预处理器自举：完全用 tie 语言重写 `tie-prep`，使其可扩展（编译器自举阶段一） | 🔄 阶段一完成（核心逻辑已 tie 语言化，`prep/core.tie`；Rust 壳仅解释执行）；阶段二完成（协调统筹增强：`tie.config` 配置文件 + 缓存池 + 多线程并行分片编译） |
