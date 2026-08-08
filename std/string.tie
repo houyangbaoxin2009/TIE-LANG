@@ -106,6 +106,38 @@ func str_contains(s: string, sub: string) -> bool {
     return false
 }
 
+// 返回子串 sub 在 s 中首次出现的位置（字符索引，从 0 起）；未找到返回 -1。
+// 空子串视为在位置 0 命中；子串比主串长必然未找到。
+// 与 str_contains 同扫描模式：从每个起点完整匹配，命中即返回该起点。
+func str_find(s: string, sub: string) -> i64 {
+    var n: i64 = len(s)
+    var m: i64 = len(sub)
+    // 空子串：位置 0 命中
+    if m == 0 {
+        return 0
+    }
+    // 子串比主串长，不可能匹配
+    if m > n {
+        return -1
+    }
+    var i: i64 = 0
+    while i <= n - m {
+        var j: i64 = 0
+        var matched: bool = true
+        while j < m && matched {
+            if str_char(s, i + j) != str_char(sub, j) {
+                matched = false
+            }
+            j = j + 1
+        }
+        if matched {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
 // 判断 s 是否以 prefix 开头；空前缀视为真
 func str_starts_with(s: string, prefix: string) -> bool {
     var n: i64 = len(s)

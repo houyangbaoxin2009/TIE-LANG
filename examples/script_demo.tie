@@ -1,0 +1,44 @@
+// tie:logic
+// P2 eval_call 端到端验证：tie:script 模块协议执行基础
+// 模块协议约定：入口函数 func process(src: string) -> string ——先 eval 注册模块，
+// 再 eval_call 以字符串值直传调用（不经源码文本转义，换行/引号原样直传）。
+// 用法：tie script_demo.tie（编译运行，自动链接 tie-interp 静态库）
+
+func main() -> i64 {
+    // 1. 模拟模块文件内容：约定入口 process(src) → "[src]"
+    var module_code = "func process(src: string) -> string {\n    return \"[\" + src + \"]\"\n}\n"
+    var reg = eval(module_code)
+    if reg != "已定义 1 个函数" {
+        println("FAIL: eval 注册模块应提示已定义 1 个函数，实际 [" + reg + "]")
+        return 1
+    }
+
+    // 2. eval_call 调用模块入口——字符串值直传：多行内容无需转义
+    var multi = "line1\nline2"
+    var out = eval_call("process", multi)
+    if out != "[line1\nline2]" {
+        println("FAIL: eval_call 多行字符串不符，实际 [" + out + "]")
+        return 1
+    }
+
+    // 3. 命名空间全名调用（模块入口可放命名空间内）
+    var ns_code = "namespace mod {\nfunc upper(s: string) -> string {\n    return \"U\" + s\n}\n}\n"
+    eval(ns_code)
+    var up = eval_call("mod::upper", "abc")
+    if up != "Uabc" {
+        println("FAIL: eval_call 命名空间调用不符，实际 [" + up + "]")
+        return 1
+    }
+
+    // 4. void 入口（纯变换不返回值）→ 空串
+    var v_code = "func noop(src: string) {\n}\n"
+    eval(v_code)
+    var vo = eval_call("noop", "x")
+    if vo != "" {
+        println("FAIL: eval_call void 入口应返回空串，实际 [" + vo + "]")
+        return 1
+    }
+
+    println("P2 eval_call 端到端验证全部通过")
+    return 0
+}

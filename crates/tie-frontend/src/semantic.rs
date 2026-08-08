@@ -149,6 +149,11 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
     ctx.result
         .table_ret_elems
         .insert("list_dir".to_string(), Some(TypeSpec::Named(TyKw::Str)));
+    // 内置 regex_find_all（P1）：返回「字符串动态表」（全部匹配片段）。与 list_dir
+    // 同布局（string 元素），使 `for x in regex_find_all(s, p)` 元素类型静态可知。
+    ctx.result
+        .table_ret_elems
+        .insert("regex_find_all".to_string(), Some(TypeSpec::Named(TyKw::Str)));
 
     // 表返回预扫描（fixpoint）：收集「返回动态表」的函数及其元素类型，支持前向引用。
     // 一个函数返回动态表，当且仅当其 return 表达式是 table_new_* 调用、调用另一个
@@ -1239,6 +1244,27 @@ impl Analyzer {
                     }
                     return Ok(TypeSpec::Named(TyKw::Str));
                 }
+                // 内置函数 eval_call：两个字符串参数（函数名, 参数），返回 string
+                //（调用已注册用户函数——tie:script 模块协议执行基础）。
+                if name == "eval_call" {
+                    if args.len() != 2 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("eval_call() 期望 2 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    for a in args {
+                        let at = self.infer_expr(a, scope)?;
+                        self.result.expr_types.insert(addr_of(a), at.clone());
+                        if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!("eval_call() 参数必须是字符串，实际是 {}", type_name(&at)),
+                            });
+                        }
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Str));
+                }
                 // 内置函数 file_read：单字符串参数，返回 string（读取文件内容；失败运行时报错）。
                 // M2 标准库 floor：文件读取是 Rust 层唯一实现，其余 std 库用 tie 语言自写。
                 if name == "file_read" {
@@ -1297,6 +1323,25 @@ impl Analyzer {
                     }
                     return Ok(TypeSpec::Named(TyKw::Bool));
                 }
+                // 内置函数 file_delete：单字符串参数，返回 bool（文件删除成功与否；
+                // 不存在/不可删 → false）。
+                if name == "file_delete" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("file_delete() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("file_delete() 参数必须是字符串，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Bool));
+                }
                 // 内置函数 str_char：字符串 + 整数下标，返回 string（第 i 个 Unicode 码点；越界返回空串）。
                 // i 按字符（码点）计数，非字节。
                 if name == "str_char" {
@@ -1320,6 +1365,87 @@ impl Analyzer {
                         return Err(SemanticError {
                             span: expr_span_of(&args[1]),
                             message: format!("str_char() 第 2 个参数必须是整数，实际是 {}", type_name(&it)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Str));
+                }
+                // ---------- P1 正则表达式内置函数 ----------
+                //
+                // 语义：regex_match 部分匹配即真（RE2 无回溯）；regex_find 返回首个匹配片段；
+                // regex_find_all 返回全部匹配片段（字符串动态表）；regex_replace 全部替换
+                // （to 支持 $1 捕获引用）；regex_group 返回首个匹配的第 i 个捕获组
+                // （i=0 为整个匹配）。模式非法 → 运行时报错（编译/解释两路径一致）。
+                if name == "regex_match" || name == "regex_find" || name == "regex_find_all" {
+                    if args.len() != 2 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("{name}() 期望 2 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    for a in args {
+                        let at = self.infer_expr(a, scope)?;
+                        self.result.expr_types.insert(addr_of(a), at.clone());
+                        if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!("{name}() 参数必须是字符串，实际是 {}", type_name(&at)),
+                            });
+                        }
+                    }
+                    return Ok(match name.as_str() {
+                        "regex_match" => TypeSpec::Named(TyKw::Bool),
+                        "regex_find" => TypeSpec::Named(TyKw::Str),
+                        _ => TypeSpec::Named(TyKw::Table),
+                    });
+                }
+                if name == "regex_replace" {
+                    if args.len() != 3 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("regex_replace() 期望 3 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    for a in args {
+                        let at = self.infer_expr(a, scope)?;
+                        self.result.expr_types.insert(addr_of(a), at.clone());
+                        if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!("regex_replace() 参数必须是字符串，实际是 {}", type_name(&at)),
+                            });
+                        }
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Str));
+                }
+                if name == "regex_group" {
+                    if args.len() != 3 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("regex_group() 期望 3 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let st = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), st.clone());
+                    if !matches!(&st, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("regex_group() 第 1 个参数必须是字符串，实际是 {}", type_name(&st)),
+                        });
+                    }
+                    let pt = self.infer_expr(&args[1], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[1]), pt.clone());
+                    if !matches!(&pt, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[1]),
+                            message: format!("regex_group() 第 2 个参数必须是字符串，实际是 {}", type_name(&pt)),
+                        });
+                    }
+                    let it = self.infer_expr(&args[2], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[2]), it.clone());
+                    if !it.is_int() {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[2]),
+                            message: format!("regex_group() 第 3 个参数必须是整数，实际是 {}", type_name(&it)),
                         });
                     }
                     return Ok(TypeSpec::Named(TyKw::Str));

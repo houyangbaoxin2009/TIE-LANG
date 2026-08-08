@@ -2,7 +2,7 @@
   "name": "vscode-tie",
   "displayName": "tie Language Support",
   "description": "tie 语言支持：语法高亮、智能缩进、代码片段 + 语言服务器（诊断 / hover / 跳转定义 / 补全），启动 tie --lsp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "tie",
   "license": "MIT",
   "icon": "./icon.png",

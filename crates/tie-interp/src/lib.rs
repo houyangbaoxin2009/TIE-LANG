@@ -37,6 +37,20 @@ pub extern "C" fn tie_eval_expr(code: *const c_char) -> *mut c_char {
     })
 }
 
+/// C ABI 桥：调用已注册用户函数（字符串参数），返回结果字符串或错误串
+/// （调用方负责 [tie_free_result]；语义与解释路径 eval_call 一致）。
+///
+/// tie:script 预处理模块协议的执行基础：框架先 eval 模块文件注册 `process` 函数，
+/// 再经本桥以字符串值直传源码调用（不经源码文本转义），拿回处理结果。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_eval_call(name: *const c_char, arg: *const c_char) -> *mut c_char {
+    c_guard(|| {
+        let name = unsafe { c_char_to_string(name)? };
+        let arg = unsafe { c_char_to_string(arg)? };
+        with_session(|session| session.eval_call(&name, &arg))
+    })
+}
+
 /// C ABI 桥：从 stdin 读取一行（去除行尾换行），返回新分配的字符串。
 ///
 /// EOF（Ctrl+Z / Ctrl+D）时直接退出进程（与 Rust REPL 行为一致，规避空串歧义）；
@@ -556,6 +570,144 @@ pub extern "C" fn tie_list_dir(path: *const c_char) -> *mut DynTable {
     t
 }
 
+// ---------- P1 正则表达式 floor 内置函数 C ABI 桥 ----------
+//
+// 设计说明：正则引擎由 Rust regex crate 提供（RE2 风格、无回溯、UTF-8 感知），
+// tie 语言无法自举完整正则引擎，属语言底座原语（与 file_read/str_char 同一层级）。
+// 编译路径（IR 层）与解释路径（tie-interp）**共用同一份 Rust 实现**，行为逐字节一致。
+//
+// 错误约定：模式非法（Regex::new 失败）——
+// - tie_regex_match：置 ok=0（合法时 ok=1，返回匹配结果 0/1）；
+// - 其余返回堆串/表的：返回 NULL，由调用方统一输出错误消息（两路径消息一致）。
+
+/// C ABI 桥：正则匹配（s 中是否存在 pattern 的匹配，部分匹配即可）。
+/// 模式合法 → ok=1 并返回 0/1；模式非法 → ok=0 返回 0。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_regex_match(s: *const c_char, pattern: *const c_char, ok: *mut i8) -> i8 {
+    let s = match unsafe { c_char_to_string(s) } {
+        Ok(v) => v,
+        Err(_) => {
+            unsafe { *ok = 0; }
+            return 0;
+        }
+    };
+    let pattern = match unsafe { c_char_to_string(pattern) } {
+        Ok(v) => v,
+        Err(_) => {
+            unsafe { *ok = 0; }
+            return 0;
+        }
+    };
+    match regex::Regex::new(&pattern) {
+        Ok(re) => {
+            unsafe { *ok = 1; }
+            if re.is_match(&s) { 1 } else { 0 }
+        }
+        Err(_) => {
+            unsafe { *ok = 0; }
+            0
+        }
+    }
+}
+
+/// C ABI 桥：正则查找——返回 s 中第一个匹配片段；无匹配返回空串；模式非法返回 NULL。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_regex_find(s: *const c_char, pattern: *const c_char) -> *mut c_char {
+    let s = match unsafe { c_char_to_string(s) } {
+        Ok(v) => v,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let pattern = match unsafe { c_char_to_string(pattern) } {
+        Ok(v) => v,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match regex::Regex::new(&pattern) {
+        Ok(re) => match re.find(&s) {
+            Some(m) => string_to_c_char(m.as_str().to_string()),
+            None => string_to_c_char(String::new()),
+        },
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// C ABI 桥：正则查找全部——返回所有匹配片段组成的字符串动态表；模式非法返回 NULL。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_regex_find_all(s: *const c_char, pattern: *const c_char) -> *mut DynTable {
+    let s = match unsafe { c_char_to_string(s) } {
+        Ok(v) => v,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let pattern = match unsafe { c_char_to_string(pattern) } {
+        Ok(v) => v,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match regex::Regex::new(&pattern) {
+        Ok(re) => {
+            let t = tie_table_new(8);
+            if t.is_null() {
+                return t;
+            }
+            for m in re.find_iter(&s) {
+                // 泄漏堆串作为表的借用元素（与 tie_list_dir 同一约定，调用方不释放）
+                let c = CString::new(m.as_str()).unwrap_or_default();
+                tie_table_push_string(t, c.into_raw());
+            }
+            t
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// C ABI 桥：正则替换——把 s 中所有 pattern 匹配替换为 to；模式非法返回 NULL。
+/// to 支持捕获引用（$1、$name），与 Rust regex replace_all 语义一致。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_regex_replace(
+    s: *const c_char,
+    pattern: *const c_char,
+    to: *const c_char,
+) -> *mut c_char {
+    let s = match unsafe { c_char_to_string(s) } {
+        Ok(v) => v,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let pattern = match unsafe { c_char_to_string(pattern) } {
+        Ok(v) => v,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let to = match unsafe { c_char_to_string(to) } {
+        Ok(v) => v,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match regex::Regex::new(&pattern) {
+        Ok(re) => string_to_c_char(re.replace_all(&s, to.as_str()).into_owned()),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// C ABI 桥：正则捕获组——返回 s 中第一个匹配的第 i 个捕获组（i=0 为整个匹配）；
+/// 无匹配或组号越界返回空串；模式非法返回 NULL。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_regex_group(s: *const c_char, pattern: *const c_char, i: i64) -> *mut c_char {
+    let s = match unsafe { c_char_to_string(s) } {
+        Ok(v) => v,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let pattern = match unsafe { c_char_to_string(pattern) } {
+        Ok(v) => v,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match regex::Regex::new(&pattern) {
+        Ok(re) => match re.captures(&s) {
+            Some(caps) => match caps.get(i as usize) {
+                Some(m) => string_to_c_char(m.as_str().to_string()),
+                None => string_to_c_char(String::new()),
+            },
+            None => string_to_c_char(String::new()),
+        },
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// 把 C 字符串（NUL 结尾）读为 Rust String。
 unsafe fn c_char_to_string(p: *const c_char) -> Result<String, String> {
     if p.is_null() {
@@ -657,6 +809,57 @@ impl Session {
             Some(v) => v.to_repl_string(),
             None => String::new(),
         })
+    }
+
+    /// 调用已注册的用户函数（顶层裸名或命名空间全名），传入一个字符串参数，返回其返回值字符串。
+    ///
+    /// 设计：tie:script 预处理模块协议的执行基础——模块约定入口函数
+    /// `func process(src: string) -> string`，框架先 eval 模块文件注册函数，
+    /// 再 eval_call 以**字符串值**直传源码（不经源码文本转义），拿回处理结果。
+    /// 无返回值（void）→ 返回空串；函数不存在/参数不符 → 报错。
+    pub fn eval_call(&mut self, name: &str, arg: &str) -> Result<String, String> {
+        let f = self
+            .funcs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("eval_call: 未定义的函数 '{name}'"))?;
+        // 参数检查：期望恰好 1 个参数（模块入口约定），且为字符串
+        let required = f.params.iter().take_while(|p| p.default.is_none()).count();
+        if required > 1 || f.params.len() < 1 {
+            return Err(format!(
+                "eval_call: 函数 '{name}' 必须恰好接收 1 个字符串参数（实际形参 {} 个）",
+                f.params.len()
+            ));
+        }
+        // 函数体执行期间，裸调用按本函数命名空间前缀补全（与 call_fn 用户分支同机制）
+        let mut env = Env::new(self);
+        let saved_ns = std::mem::take(&mut env.cur_ns);
+        if name.contains("::") {
+            let mut segs: Vec<String> = name.split("::").map(|s| s.to_string()).collect();
+            segs.pop(); // 去掉函数名，剩命名空间路径
+            env.cur_ns = segs;
+        }
+        // 压新作用域绑定参数：第一个参数绑定字符串值，其余（可选）用默认值补齐
+        env.scopes.push(std::collections::HashMap::new());
+        for (i, p) in f.params.iter().enumerate() {
+            let v = if i == 0 {
+                Value::Str(arg.to_string())
+            } else if let Some(d) = &p.default {
+                env.eval_expr(d)?
+            } else {
+                return Err(format!("eval_call: 函数 '{name}' 缺少第 {} 个参数且无默认值", i + 1));
+            };
+            env.scopes.last_mut().unwrap().insert(p.name.clone(), v);
+        }
+        let result = env.exec_block(&f.body);
+        env.scopes.pop();
+        env.cur_ns = saved_ns;
+        // 处理 return 传播
+        match result? {
+            Flow::Normal(Some(v)) => Ok(v.to_repl_string()),
+            Flow::Normal(None) => Ok(String::new()),
+            Flow::Return(v) => Ok(v.to_repl_string()),
+        }
     }
 
     /// 注册顶层定义（func → funcs；class/import → v1 暂不支持）。
@@ -1355,6 +1558,18 @@ impl<'a> Env<'a> {
                     _ => Err("eval 需要一个字符串参数".into()),
                 }
             }
+            "eval_call" => {
+                // 调用已注册用户函数（字符串参数）→ 返回值字符串（void → 空串）。
+                // tie:script 模块协议执行基础：与 C ABI 桥 tie_eval_call 同语义。
+                if args.len() != 2 {
+                    return Err("eval_call 需要两个字符串参数（函数名, 参数）".into());
+                }
+                let (Value::Str(name), Value::Str(arg)) = (&args[0], &args[1]) else {
+                    return Err("eval_call 需要两个字符串参数（函数名, 参数）".into());
+                };
+                let result = self.session.eval_call(name, arg)?;
+                Ok(Value::Str(result))
+            }
             // ---------- M2 标准库 floor 内置函数 ----------
             //
             // 文件类：file_read 走 C ABI 桥（与编译路径共用同一份 Rust 实现），
@@ -1407,6 +1622,18 @@ impl<'a> Env<'a> {
                     return Err("file_exists 需要一个字符串参数".into());
                 };
                 Ok(Value::Bool(std::path::Path::new(path).exists()))
+            }
+            "file_delete" => {
+                // 删除文件：成功返回 true，失败（不存在/不可删）返回 false。
+                // 与 file_write/file_append 同模式：解释路径用 std::fs，
+                // 编译路径用 libc remove()，两者行为一致（均返回 bool、无错误消息）。
+                if args.len() != 1 {
+                    return Err("file_delete 需要一个字符串参数".into());
+                }
+                let Value::Str(path) = &args[0] else {
+                    return Err("file_delete 需要一个字符串参数".into());
+                };
+                Ok(Value::Bool(std::fs::remove_file(path).is_ok()))
             }
             // ---------- 消息系统（#25）内置函数 ----------
             //
@@ -1492,6 +1719,109 @@ impl<'a> Env<'a> {
                 // 释放桥表（指针数组 + 结构体；字符串元素按约定泄漏，不重复释放）
                 tie_table_free(t);
                 Ok(Value::Table(cells))
+            }
+            // ---------- P1 正则表达式内置函数 ----------
+            //
+            // 与编译路径一致：走 C ABI 桥（共用 regex crate 实现），保证两路径行为逐字节一致。
+            // 模式非法 → 报错（错误消息与编译路径 printf 文本一致，含非法模式原文）。
+            "regex_match" => {
+                if args.len() != 2 {
+                    return Err("regex_match 需要两个字符串参数".into());
+                }
+                let (Value::Str(s), Value::Str(p)) = (&args[0], &args[1]) else {
+                    return Err("regex_match 需要两个字符串参数".into());
+                };
+                let s = CString::new(s.as_str()).unwrap_or_default();
+                let p = CString::new(p.as_str()).unwrap_or_default();
+                let mut ok: i8 = 0;
+                let r = tie_regex_match(s.as_ptr(), p.as_ptr(), &mut ok);
+                if ok == 0 {
+                    return Err(format!("运行时错误: regex_match 模式 '{p:?}' 非法"));
+                }
+                Ok(Value::Bool(r != 0))
+            }
+            "regex_find" => {
+                if args.len() != 2 {
+                    return Err("regex_find 需要两个字符串参数".into());
+                }
+                let (Value::Str(s), Value::Str(p)) = (&args[0], &args[1]) else {
+                    return Err("regex_find 需要两个字符串参数".into());
+                };
+                let s = CString::new(s.as_str()).unwrap_or_default();
+                let p = CString::new(p.as_str()).unwrap_or_default();
+                let r = tie_regex_find(s.as_ptr(), p.as_ptr());
+                // 模式非法（NULL）→ 报错；无匹配返回空串（非 NULL）
+                if r.is_null() {
+                    return Err(format!("运行时错误: regex_find 模式 '{p:?}' 非法"));
+                }
+                let out = unsafe { c_char_to_string(r).unwrap_or_default() };
+                tie_free_result(r);
+                Ok(Value::Str(out))
+            }
+            "regex_find_all" => {
+                if args.len() != 2 {
+                    return Err("regex_find_all 需要两个字符串参数".into());
+                }
+                let (Value::Str(s), Value::Str(p)) = (&args[0], &args[1]) else {
+                    return Err("regex_find_all 需要两个字符串参数".into());
+                };
+                let s = CString::new(s.as_str()).unwrap_or_default();
+                let p = CString::new(p.as_str()).unwrap_or_default();
+                let t = tie_regex_find_all(s.as_ptr(), p.as_ptr());
+                // 模式非法（NULL）→ 报错
+                if t.is_null() {
+                    return Err(format!("运行时错误: regex_find_all 模式 '{p:?}' 非法"));
+                }
+                // 读出全部匹配片段（元素类型 string，data 缓冲区为 *const c_char 数组）
+                let mut cells: Vec<Value> = Vec::new();
+                unsafe {
+                    let tbl = &*t;
+                    for i in 0..tbl.len {
+                        let ptr = (tbl.data as *const *const c_char).add(i as usize).read();
+                        cells.push(Value::Str(c_char_to_string(ptr).unwrap_or_default()));
+                    }
+                }
+                tie_table_free(t);
+                Ok(Value::Table(cells))
+            }
+            "regex_replace" => {
+                if args.len() != 3 {
+                    return Err("regex_replace 需要三个字符串参数".into());
+                }
+                let (Value::Str(s), Value::Str(p), Value::Str(to)) =
+                    (&args[0], &args[1], &args[2])
+                else {
+                    return Err("regex_replace 需要三个字符串参数".into());
+                };
+                let s = CString::new(s.as_str()).unwrap_or_default();
+                let p = CString::new(p.as_str()).unwrap_or_default();
+                let to = CString::new(to.as_str()).unwrap_or_default();
+                let r = tie_regex_replace(s.as_ptr(), p.as_ptr(), to.as_ptr());
+                if r.is_null() {
+                    return Err(format!("运行时错误: regex_replace 模式 '{p:?}' 非法"));
+                }
+                let out = unsafe { c_char_to_string(r).unwrap_or_default() };
+                tie_free_result(r);
+                Ok(Value::Str(out))
+            }
+            "regex_group" => {
+                if args.len() != 3 {
+                    return Err("regex_group 需要两个字符串参数与一个整数参数".into());
+                }
+                let (Value::Str(s), Value::Str(p), Value::Int(i)) =
+                    (&args[0], &args[1], &args[2])
+                else {
+                    return Err("regex_group 需要两个字符串参数与一个整数参数".into());
+                };
+                let s = CString::new(s.as_str()).unwrap_or_default();
+                let p = CString::new(p.as_str()).unwrap_or_default();
+                let r = tie_regex_group(s.as_ptr(), p.as_ptr(), *i);
+                if r.is_null() {
+                    return Err(format!("运行时错误: regex_group 模式 '{p:?}' 非法"));
+                }
+                let out = unsafe { c_char_to_string(r).unwrap_or_default() };
+                tie_free_result(r);
+                Ok(Value::Str(out))
             }
             // 字符串类：str_char / to_string 走 C ABI 桥（与编译路径共用实现，
             // 保证 UTF-8 码点索引与数字格式化两路径逐字节一致）。
@@ -1820,6 +2150,149 @@ mod tests {
         assert_eq!(ev("7 % 3").unwrap(), "1");
     }
 
+    // ---------- P1 正则表达式内置函数（解释路径） ----------
+
+    #[test]
+    fn eval_regex_match() {
+        // 部分匹配即真（RE2 语义）；不匹配为 false
+        assert_eq!(ev("regex_match(\"hello world\", \"wo\")").unwrap(), "true");
+        assert_eq!(ev("regex_match(\"hello\", \"^h\")").unwrap(), "true");
+        assert_eq!(ev("regex_match(\"hello\", \"^x\")").unwrap(), "false");
+        assert_eq!(ev("regex_match(\"a1b2\", \"\\\\d\")").unwrap(), "true");
+        // 非法模式 → 报错
+        let err = ev("regex_match(\"abc\", \"[\")").unwrap_err();
+        assert!(err.contains("regex_match 模式"), "错误：{err}");
+    }
+
+    #[test]
+    fn eval_regex_find() {
+        // 返回首个匹配片段
+        assert_eq!(ev("regex_find(\"abc123def\", \"\\\\d+\")").unwrap(), "123");
+        assert_eq!(ev("regex_find(\"hello\", \"lo\")").unwrap(), "lo");
+        // 无匹配返回空串
+        assert_eq!(ev("regex_find(\"hello\", \"xyz\")").unwrap(), "");
+        // 非法模式 → 报错
+        let err = ev("regex_find(\"abc\", \"(\")").unwrap_err();
+        assert!(err.contains("regex_find 模式"), "错误：{err}");
+    }
+
+    #[test]
+    fn eval_regex_find_all() {
+        // 返回全部匹配片段组成的字符串表
+        assert_eq!(
+            ev("len(regex_find_all(\"a1b22c333\", \"\\\\d+\"))").unwrap(),
+            "3"
+        );
+        assert_eq!(
+            ev("regex_find_all(\"a1b22c333\", \"\\\\d+\")[0]").unwrap(),
+            "1"
+        );
+        assert_eq!(
+            ev("regex_find_all(\"a1b22c333\", \"\\\\d+\")[1]").unwrap(),
+            "22"
+        );
+        assert_eq!(
+            ev("regex_find_all(\"a1b22c333\", \"\\\\d+\")[2]").unwrap(),
+            "333"
+        );
+        // 无匹配 → 空表
+        assert_eq!(ev("len(regex_find_all(\"abc\", \"\\\\d\"))").unwrap(), "0");
+    }
+
+    #[test]
+    fn eval_regex_replace() {
+        // 全部替换
+        assert_eq!(
+            ev("regex_replace(\"a1b2c3\", \"\\\\d\", \"#\")").unwrap(),
+            "a#b#c#"
+        );
+        // 无匹配 → 原样返回
+        assert_eq!(ev("regex_replace(\"abc\", \"x\", \"y\")").unwrap(), "abc");
+        // 捕获引用 $1
+        assert_eq!(
+            ev("regex_replace(\"2026-08-08\", \"(\\\\d+)-(\\\\d+)-(\\\\d+)\", \"$3/$2/$1\")").unwrap(),
+            "08/08/2026"
+        );
+    }
+
+    #[test]
+    fn eval_regex_group() {
+        // 第 0 组 = 整个匹配；第 1 组起为捕获组
+        assert_eq!(
+            ev("regex_group(\"hello world\", \"(\\\\w+) (\\\\w+)\", 0)").unwrap(),
+            "hello world"
+        );
+        assert_eq!(
+            ev("regex_group(\"hello world\", \"(\\\\w+) (\\\\w+)\", 1)").unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            ev("regex_group(\"hello world\", \"(\\\\w+) (\\\\w+)\", 2)").unwrap(),
+            "world"
+        );
+        // 组号越界 / 无匹配 → 空串
+        assert_eq!(
+            ev("regex_group(\"hello world\", \"(\\\\w+) (\\\\w+)\", 5)").unwrap(),
+            ""
+        );
+        assert_eq!(ev("regex_group(\"abc\", \"(\\\\d)\", 1)").unwrap(), "");
+    }
+
+    // ---------- P2 eval_call（tie:script 模块协议执行基础） ----------
+
+    #[test]
+    fn eval_call_调用已注册函数与命名空间() {
+        // eval_call：调用已注册用户函数（字符串参数）→ 返回值字符串。
+        // tie:script 模块协议：先 eval 模块文件注册入口，再以字符串值直传调用。
+        let mut s = Session::new();
+        // 顶层裸名入口
+        s.eval("func process(src: string) -> string {\n    return \"[\" + src + \"]\"\n}\n")
+            .unwrap();
+        assert_eq!(s.eval_call("process", "hello").unwrap(), "[hello]");
+        // 命名空间全名
+        s.eval(
+            "namespace mod {\n\
+             \x20func upper(src: string) -> string {\n\
+             \x20\x20\x20\x20return src\n\
+             \x20}\n\
+             }\n",
+        )
+        .unwrap();
+        assert_eq!(s.eval_call("mod::upper", "x").unwrap(), "x");
+        // void 函数 → 空串
+        s.eval("func noop(src: string) {\n}\n").unwrap();
+        assert_eq!(s.eval_call("noop", "any").unwrap(), "");
+    }
+
+    #[test]
+    fn eval_call_未定义函数与参数错误() {
+        let mut s = Session::new();
+        s.eval("func f(x: string) -> string {\n    return x\n}\n").unwrap();
+        // 未定义的函数 → 报错
+        let err = s.eval_call("missing", "a").unwrap_err();
+        assert!(err.contains("未定义的函数 'missing'"), "错误：{err}");
+        // 0 参数函数 → 报错（模块入口必须恰好 1 个字符串参数）
+        s.eval("func g() -> string {\n    return \"g\"\n}\n").unwrap();
+        let err = s.eval_call("g", "a").unwrap_err();
+        assert!(err.contains("必须恰好接收 1 个字符串参数"), "错误：{err}");
+    }
+
+    #[test]
+    fn eval_call_表达式级分发() {
+        // 表达式级调用：s.eval("eval_call(...)") 走 call_fn 分发 → 桥 → Session::eval_call，
+        // 与 REPL 内手输 eval_call 的真实路径一致。
+        let mut s = Session::new();
+        s.eval("func process(src: string) -> string {\n    return \"[\" + src + \"]\"\n}\n")
+            .unwrap();
+        assert_eq!(s.eval("eval_call(\"process\", \"hi\")").unwrap(), "[hi]");
+        // 参数个数错误 → 报错
+        let err = s.eval("eval_call(\"process\")").unwrap_err();
+        assert!(err.contains("eval_call 需要两个字符串参数"), "错误：{err}");
+        // 未定义函数 → 报错（错误文本来自 Session::eval_call）
+        let err = s.eval("eval_call(\"nope\", \"x\")").unwrap_err();
+        assert!(err.contains("未定义的函数 'nope'"), "错误：{err}");
+    }
+
     #[test]
     fn eval_namespace_call() {
         // 命名空间函数路径调用：tcmsg.error.hello() → 全名 tcmsg::error::hello。
@@ -2140,6 +2613,25 @@ mod tests {
         );
         assert_eq!(ev(&code).unwrap(), "11");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn builtin_file_delete_removes_and_missing_false() {
+        let p = temp_path("delete.txt");
+        let path = escaped_path(&p);
+        // 写文件 → 删除 → 存在性 false；删除已删除的文件 → false
+        let code = format!(
+            "file_write(\"{path}\", \"x\"); \
+             var a = file_delete(\"{path}\"); \
+             var b = file_exists(\"{path}\"); \
+             var c = file_delete(\"{path}\"); \
+             (a ? \"1\" : \"0\") + (b ? \"1\" : \"0\") + (c ? \"1\" : \"0\")"
+        );
+        assert_eq!(ev(&code).unwrap(), "100");
+        // 删除不存在的文件 → false
+        let p2 = temp_path("never.txt");
+        let path2 = escaped_path(&p2);
+        assert_eq!(ev(&format!("file_delete(\"{path2}\")")).unwrap(), "false");
     }
 
     #[test]

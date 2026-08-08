@@ -45,6 +45,12 @@ func main() {
     println("str.str_replace: " + replaced)
     assert.assert(replaced == "bbb")
 
+    var found: i64 = str.str_find("hello world", "world")
+    println("str.str_find: " + to_string(found))
+    assert.assert_eq(found, 6)
+    var not_found: i64 = str.str_find("hello", "xyz")
+    assert.assert_eq(not_found, -1)
+
     // ---- 文件操作演示 ----
     var path: string = "std_demo_tmp.txt"
     var w1: bool = file_write(path, "line1\n")
@@ -67,6 +73,9 @@ func main() {
     println("file_read(追加后): " + r2)
     assert.assert(r2 == "line1\nline2\n")
 
-    // 无内置删除文件函数，临时文件保留（不清理）
-    println("临时文件保留：" + path)
+    // 清理临时文件（file_delete 为 M2.2 新底座原语）
+    var del: bool = file_delete(path)
+    println("file_delete: " + bool_str(del))
+    assert.assert(del)
+    assert.assert(!file_exists(path))
 }

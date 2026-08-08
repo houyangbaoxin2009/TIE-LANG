@@ -1,0 +1,65 @@
+// tie:logic
+// 正则表达式原语端到端验证（P1）：编译路径 + 解释路径双验证
+// 用法：tie regex_demo.tie（编译运行）；tie-interp.exe regex_demo.tie（解释运行）
+
+func main() -> i64 {
+    // 1. regex_match：部分匹配即真
+    var m1 = regex_match("hello world", "wo")
+    var m2 = regex_match("hello", "^x")
+    if !m1 {
+        println("FAIL: regex_match 部分匹配应为 true")
+        return 1
+    }
+    if m2 {
+        println("FAIL: regex_match 不匹配应为 false")
+        return 1
+    }
+
+    // 2. regex_find：返回首个匹配片段；无匹配返回空串
+    var f1 = regex_find("abc123def", "\\d+")
+    if f1 != "123" {
+        println("FAIL: regex_find 应为 123，实际 " + f1)
+        return 1
+    }
+    var f2 = regex_find("hello", "xyz")
+    if f2 != "" {
+        println("FAIL: regex_find 无匹配应为空串")
+        return 1
+    }
+
+    // 3. regex_find_all：返回全部匹配片段表
+    var all = regex_find_all("a1b22c333", "\\d+")
+    if len(all) != 3 {
+        println("FAIL: regex_find_all 数量应为 3")
+        return 1
+    }
+    if all[0] != "1" || all[1] != "22" || all[2] != "333" {
+        println("FAIL: regex_find_all 元素不符")
+        return 1
+    }
+
+    // 4. regex_replace：全部替换 + 捕获引用
+    var r1 = regex_replace("a1b2c3", "\\d", "#")
+    if r1 != "a#b#c#" {
+        println("FAIL: regex_replace 应为 a#b#c#，实际 " + r1)
+        return 1
+    }
+    var r2 = regex_replace("2026-08-08", "(\\d+)-(\\d+)-(\\d+)", "$3/$2/$1")
+    if r2 != "08/08/2026" {
+        println("FAIL: regex_replace 捕获引用应为 08/08/2026，实际 " + r2)
+        return 1
+    }
+
+    // 5. regex_group：捕获组
+    var g0 = regex_group("hello world", "(\\w+) (\\w+)", 0)
+    var g1 = regex_group("hello world", "(\\w+) (\\w+)", 1)
+    var g2 = regex_group("hello world", "(\\w+) (\\w+)", 2)
+    var gx = regex_group("hello world", "(\\w+) (\\w+)", 5)
+    if g0 != "hello world" || g1 != "hello" || g2 != "world" || gx != "" {
+        println("FAIL: regex_group 捕获组不符")
+        return 1
+    }
+
+    println("P1 正则表达式端到端验证全部通过")
+    return 0
+}

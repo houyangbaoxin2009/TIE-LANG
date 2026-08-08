@@ -18,6 +18,9 @@ crate-type = ["rlib", "staticlib"]
 
 [dependencies]
 tie-frontend = { path = "../tie-frontend" }
+# 正则表达式引擎（P1 语言底座原语）：regex crate 提供 RE2 风格无回溯匹配，
+# 编译/解释两路径共用；tie 语言本身无法自举正则引擎，属 Rust 底座原语。
+regex = "1"
 
 [lints]
 # 注：不能用 [lints] workspace = true + 本地覆盖共存（Cargo 限制）。

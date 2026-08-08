@@ -122,6 +122,9 @@ impl<'p> IrGenerator<'p> {
         self.out.push_str("declare i32 @fclose(ptr)\n");
         self.out.push_str("declare i32 @fflush(ptr)\n");
         self.out.push_str("declare void @exit(i32)\n");
+        // remove：file_delete（编译模式用 libc remove，解释模式用 std::fs::remove_file，
+        // 两者行为一致：成功删除返回 0/true，不存在/不可删返回非 0/false）
+        self.out.push_str("declare i32 @remove(ptr)\n");
         // M2 标准库 floor 的数学原语（libc/libm 符号，MSVC ucrt 提供）：
         // sqrt/sin/cos/tan/exp/log/pow/floor/ceil/round 是纯标量 f64→f64 运算，
         // 编译模式直接声明 libc 符号（解释模式用 Rust f64 方法，两者 IEEE 754 一致）。
@@ -189,6 +192,9 @@ impl<'p> IrGenerator<'p> {
         if self.used_externs.iter().any(|s| s == "tie_eval_expr") {
             self.out.push_str("declare ptr @tie_eval_expr(ptr)\n");
         }
+        if self.used_externs.iter().any(|s| s == "tie_eval_call") {
+            self.out.push_str("declare ptr @tie_eval_call(ptr, ptr)\n");
+        }
         if self.used_externs.iter().any(|s| s == "tie_free_result") {
             self.out.push_str("declare void @tie_free_result(ptr)\n");
         }
@@ -233,6 +239,25 @@ impl<'p> IrGenerator<'p> {
         // 目录不存在/读取失败返回 NULL（调用方统一输出错误消息，两路径文本一致）。
         if self.used_externs.iter().any(|s| s == "tie_list_dir") {
             self.out.push_str("declare ptr @tie_list_dir(ptr)\n");
+        }
+        // P1 正则表达式 floor 的 C ABI 桥（与解释路径共用 regex crate 实现）：
+        // tie_regex_match 带 ok 标志（模式非法置 0，合法置 1 并返回 0/1）；
+        // tie_regex_find / tie_regex_replace / tie_regex_group 返回堆串（模式非法返回 NULL，
+        // 调用方统一输出错误消息）；tie_regex_find_all 返回字符串动态表（模式非法返回 NULL）。
+        if self.used_externs.iter().any(|s| s == "tie_regex_match") {
+            self.out.push_str("declare i8 @tie_regex_match(ptr, ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_regex_find") {
+            self.out.push_str("declare ptr @tie_regex_find(ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_regex_find_all") {
+            self.out.push_str("declare ptr @tie_regex_find_all(ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_regex_replace") {
+            self.out.push_str("declare ptr @tie_regex_replace(ptr, ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_regex_group") {
+            self.out.push_str("declare ptr @tie_regex_group(ptr, ptr, i64)\n");
         }
         // 消息系统 floor（#25）的 C ABI 桥（进程内可变状态由 Rust 层 thread_local 持有）：
         // tie_msg_set_lang 切换当前语言；tie_msg_register 登记 (键,语言) → 文本；
@@ -523,10 +548,14 @@ impl<'p> IrGenerator<'p> {
                     Expr::Call { name, .. }
                         if name == "read_line"
                             || name == "eval"
+                            || name == "eval_call"
                             || name == "file_read"
                             || name == "str_char"
                             || name == "to_string"
                             || name == "arg_string"
+                            || name == "regex_find"
+                            || name == "regex_replace"
+                            || name == "regex_group"
                 ) {
                     self.mark_used("tie_free_result");
                     self.line(&format!("call void @tie_free_result(ptr {v})"));
@@ -1919,6 +1948,18 @@ impl<'p> IrGenerator<'p> {
             self.line(&format!("{tmp} = call ptr @tie_eval_expr(ptr {v})"));
             return Ok((tmp, "ptr"));
         }
+        // 内置 eval_call：两个字符串参数（函数名, 参数），调用已注册用户函数并返回结果字符串。
+        // tie:script 模块协议执行基础：与解释路径同走 C ABI 桥（共享 Session），行为一致。
+        // 返回值是 tie-interp 分配的堆串，调用方用完必须 tie_free_result 释放。
+        if name == "eval_call" {
+            self.mark_used("tie_eval_call");
+            self.mark_used("tie_free_result");
+            let (n, _t) = self.gen_expr(&args[0])?;
+            let (a, _t) = self.gen_expr(&args[1])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_eval_call(ptr {n}, ptr {a})"));
+            return Ok((tmp, "ptr"));
+        }
         // ---------- M2 标准库 floor 内置函数 ----------
         //
         // 设计说明（编译/解释两路径一致性的关键）：
@@ -2029,6 +2070,18 @@ impl<'p> IrGenerator<'p> {
             let res = self.new_reg();
             self.line(&format!("{res} = phi i1 [ false, %{fail_label} ], [ true, %{ok_label} ]"));
             return Ok((res, "i1"));
+        }
+        // 内置 file_delete：单字符串参数，返回 bool（文件是否删除成功）。
+        // 用 libc remove(path)：成功返回 0 → true；失败（不存在/不可删）返回非 0 → false。
+        // 与解释路径 std::fs::remove_file 行为一致（均返回 bool、无错误消息）。
+        if name == "file_delete" {
+            let (p, _t) = self.gen_expr(&args[0])?;
+            let r = self.new_reg();
+            self.line(&format!("{r} = call i32 @remove(ptr {p})"));
+            // remove 返回 0 = 成功
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = icmp eq i32 {r}, 0"));
+            return Ok((ok, "i1"));
         }
         // 内置 str_char：字符串 + 整数下标，返回 string（第 i 个 Unicode 码点）。
         // 走 C ABI 桥（Rust chars().nth 解码 UTF-8），保证多字节字符两路径一致。
@@ -2304,6 +2357,117 @@ impl<'p> IrGenerator<'p> {
             let (k, _t) = self.gen_expr(&args[0])?;
             let tmp = self.new_reg();
             self.line(&format!("{tmp} = call ptr @tie_msg_t(ptr {k})"));
+            return Ok((tmp, "ptr"));
+        }
+        // ---------- P1 正则表达式内置函数 ----------
+        //
+        // 与解释路径一致：走 C ABI 桥（共用 regex crate 实现），保证两路径行为逐字节一致。
+        // 模式非法 → 运行时错误（错误文本与解释路径一致，含非法模式原文）。
+        // regex_match 用 ok 标志（模式非法置 0）；regex_find/regex_replace/regex_group
+        // 返回堆串（模式非法返回 NULL）；regex_find_all 返回字符串动态表（模式非法返回 NULL）。
+        if name == "regex_match" {
+            self.mark_used("tie_regex_match");
+            let (s, _t) = self.gen_expr(&args[0])?;
+            let (p, _t) = self.gen_expr(&args[1])?;
+            // 栈上分配 ok 标志（桥写入 0/1），调用后检查：0 → 模式非法错误
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = alloca i8"));
+            self.line(&format!("store i8 0, ptr {ok}"));
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call i8 @tie_regex_match(ptr {s}, ptr {p}, ptr {ok})"));
+            let okv = self.new_reg();
+            self.line(&format!("{okv} = load i8, ptr {ok}"));
+            let is_zero = self.new_reg();
+            self.line(&format!("{is_zero} = icmp eq i8 {okv}, 0"));
+            let ok_label = self.new_label("regex_match.ok");
+            let err_label = self.new_label("regex_match.err");
+            self.line(&format!("br i1 {is_zero}, label %{err_label}, label %{ok_label}"));
+            // 模式非法 → 运行时错误
+            self.block_start(&err_label);
+            self.gen_runtime_error("运行时错误: regex_match 模式 '%s' 非法", &[("ptr", p)]);
+            self.block_end();
+            // 成功块：i8 → i1（bool）
+            self.block_start(&ok_label);
+            let is_true = self.new_reg();
+            self.line(&format!("{is_true} = icmp ne i8 {tmp}, 0"));
+            return Ok((is_true, "i1"));
+        }
+        if name == "regex_find" {
+            self.mark_used("tie_regex_find");
+            self.mark_used("tie_free_result");
+            let (s, _t) = self.gen_expr(&args[0])?;
+            let (p, _t) = self.gen_expr(&args[1])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_regex_find(ptr {s}, ptr {p})"));
+            // 模式非法（NULL）→ 运行时错误
+            let is_null = self.new_reg();
+            self.line(&format!("{is_null} = icmp eq ptr {tmp}, null"));
+            let ok_label = self.new_label("regex_find.ok");
+            let err_label = self.new_label("regex_find.err");
+            self.line(&format!("br i1 {is_null}, label %{err_label}, label %{ok_label}"));
+            self.block_start(&err_label);
+            self.gen_runtime_error("运行时错误: regex_find 模式 '%s' 非法", &[("ptr", p)]);
+            self.block_end();
+            self.block_start(&ok_label);
+            return Ok((tmp, "ptr"));
+        }
+        if name == "regex_find_all" {
+            self.mark_used("tie_regex_find_all");
+            let (s, _t) = self.gen_expr(&args[0])?;
+            let (p, _t) = self.gen_expr(&args[1])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_regex_find_all(ptr {s}, ptr {p})"));
+            // 模式非法（NULL）→ 运行时错误
+            let is_null = self.new_reg();
+            self.line(&format!("{is_null} = icmp eq ptr {tmp}, null"));
+            let ok_label = self.new_label("regex_find_all.ok");
+            let err_label = self.new_label("regex_find_all.err");
+            self.line(&format!("br i1 {is_null}, label %{err_label}, label %{ok_label}"));
+            self.block_start(&err_label);
+            self.gen_runtime_error("运行时错误: regex_find_all 模式 '%s' 非法", &[("ptr", p)]);
+            self.block_end();
+            // 成功块：返回值即表指针（调用方可用 len/for/table_at 访问）
+            self.block_start(&ok_label);
+            return Ok((tmp, "ptr"));
+        }
+        if name == "regex_replace" {
+            self.mark_used("tie_regex_replace");
+            self.mark_used("tie_free_result");
+            let (s, _t) = self.gen_expr(&args[0])?;
+            let (p, _t) = self.gen_expr(&args[1])?;
+            let (to, _t) = self.gen_expr(&args[2])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_regex_replace(ptr {s}, ptr {p}, ptr {to})"));
+            let is_null = self.new_reg();
+            self.line(&format!("{is_null} = icmp eq ptr {tmp}, null"));
+            let ok_label = self.new_label("regex_replace.ok");
+            let err_label = self.new_label("regex_replace.err");
+            self.line(&format!("br i1 {is_null}, label %{err_label}, label %{ok_label}"));
+            self.block_start(&err_label);
+            self.gen_runtime_error("运行时错误: regex_replace 模式 '%s' 非法", &[("ptr", p)]);
+            self.block_end();
+            self.block_start(&ok_label);
+            return Ok((tmp, "ptr"));
+        }
+        if name == "regex_group" {
+            self.mark_used("tie_regex_group");
+            self.mark_used("tie_free_result");
+            let (s, _t) = self.gen_expr(&args[0])?;
+            let (p, _t) = self.gen_expr(&args[1])?;
+            let (i, i_ty) = self.gen_expr(&args[2])?;
+            // 下标统一扩展到 i64（C ABI 桥的第三个参数类型）
+            let i64 = self.extend_int_to_i64(&i, i_ty, &args[2])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_regex_group(ptr {s}, ptr {p}, i64 {i64})"));
+            let is_null = self.new_reg();
+            self.line(&format!("{is_null} = icmp eq ptr {tmp}, null"));
+            let ok_label = self.new_label("regex_group.ok");
+            let err_label = self.new_label("regex_group.err");
+            self.line(&format!("br i1 {is_null}, label %{err_label}, label %{ok_label}"));
+            self.block_start(&err_label);
+            self.gen_runtime_error("运行时错误: regex_group 模式 '%s' 非法", &[("ptr", p)]);
+            self.block_end();
+            self.block_start(&ok_label);
             return Ok((tmp, "ptr"));
         }
         // 用户函数调用。符号名：命名空间函数全名（含 ::）转 $（与 gen_fn 的
@@ -3246,6 +3410,66 @@ mod tests {
         // 普通程序：used_externs 为空（不链接 interp 库）
         let out5 = 编译_输出("func main() {\n    println(1)\n}");
         assert!(out5.used_externs.is_empty());
+    }
+
+    #[test]
+    fn 正则内置函数生成桥调用与声明() {
+        // regex_match：调用 tie_regex_match（带 ok 标志），收集 used_externs
+        let out = 编译_输出("func main() {\n    var m = regex_match(\"abc\", \"a\")\n    println(m)\n}");
+        assert!(out.ir.contains("call i8 @tie_regex_match(ptr "));
+        assert!(out.ir.contains("declare i8 @tie_regex_match(ptr, ptr, ptr)"));
+        assert!(out.used_externs.contains(&"tie_regex_match".to_string()));
+        // regex_find：调用 tie_regex_find（返回堆串，模式非法分支 + 成功块）
+        let out2 = 编译_输出("func main() {\n    var f = regex_find(\"a1b2\", \"\\\\d\")\n    println(f)\n}");
+        assert!(out2.ir.contains("call ptr @tie_regex_find(ptr "));
+        assert!(out2.ir.contains("declare ptr @tie_regex_find(ptr, ptr)"));
+        assert!(out2.used_externs.contains(&"tie_regex_find".to_string()));
+        // regex_find_all：调用 tie_regex_find_all（返回字符串动态表）
+        let out3 = 编译_输出("func main() {\n    var t = regex_find_all(\"a1b2\", \"\\\\d\")\n    println(len(t))\n}");
+        assert!(out3.ir.contains("call ptr @tie_regex_find_all(ptr "));
+        assert!(out3.ir.contains("declare ptr @tie_regex_find_all(ptr, ptr)"));
+        assert!(out3.used_externs.contains(&"tie_regex_find_all".to_string()));
+        // regex_replace：调用 tie_regex_replace（三个字符串参数）
+        let out4 = 编译_输出("func main() {\n    var r = regex_replace(\"a1b2\", \"\\\\d\", \"#\")\n    println(r)\n}");
+        assert!(out4.ir.contains("call ptr @tie_regex_replace(ptr "));
+        assert!(out4.ir.contains("declare ptr @tie_regex_replace(ptr, ptr, ptr)"));
+        assert!(out4.used_externs.contains(&"tie_regex_replace".to_string()));
+        // regex_group：调用 tie_regex_group（第三个参数整数，扩展为 i64）
+        let out5 = 编译_输出("func main() {\n    var g = regex_group(\"a1\", \"(\\\\d)\", 1)\n    println(g)\n}");
+        assert!(out5.ir.contains("call ptr @tie_regex_group(ptr "));
+        assert!(out5.ir.contains("declare ptr @tie_regex_group(ptr, ptr, i64)"));
+        assert!(out5.used_externs.contains(&"tie_regex_group".to_string()));
+        // 作为独立语句时，返回堆串的正则调用立即释放
+        let out6 = 编译_输出("func main() {\n    regex_find(\"abc\", \"b\")\n}");
+        assert!(out6.ir.contains("call void @tie_free_result(ptr %"));
+    }
+
+    #[test]
+    fn eval_call生成桥调用与声明() {
+        // eval_call：调用 tie_eval_call（两个字符串参数）→ 返回堆串
+        let out = 编译_输出("func main() {\n    var r = eval_call(\"process\", \"src\")\n    println(r)\n}");
+        assert!(out.ir.contains("call ptr @tie_eval_call(ptr "));
+        assert!(out.ir.contains("declare ptr @tie_eval_call(ptr, ptr)"));
+        assert!(out.used_externs.contains(&"tie_eval_call".to_string()));
+        // 未使用 eval_call 时不应输出声明
+        let out2 = 编译_输出("func main() {\n    println(1)\n}");
+        assert!(!out2.ir.contains("tie_eval_call"));
+        // 作为独立语句时，返回堆串的 eval_call 立即释放
+        let out3 = 编译_输出("func main() {\n    eval_call(\"process\", \"src\")\n}");
+        assert!(out3.ir.contains("call void @tie_free_result(ptr %"));
+    }
+
+    #[test]
+    fn file_delete生成remove调用() {
+        // file_delete：调用 libc remove(path)，返回 i1 = (返回码 == 0)
+        let out = 编译_输出("func main() {\n    var ok = file_delete(\"x.txt\")\n    println(ok)\n}");
+        assert!(out.ir.contains("call i32 @remove(ptr "));
+        assert!(out.ir.contains("declare i32 @remove(ptr)"));
+        // 返回值：icmp eq i32 返回码, 0
+        assert!(out.ir.contains("= icmp eq i32 %"));
+        // 独立语句调用也正常（无堆串，不需释放）
+        let out2 = 编译_输出("func main() {\n    file_delete(\"x.txt\")\n}");
+        assert!(out2.ir.contains("call i32 @remove(ptr "));
     }
 
     #[test]

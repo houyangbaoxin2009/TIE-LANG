@@ -3,6 +3,39 @@
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库**。
 
+## [Harbor M2.2] 正则表达式 + tie:script 模块协议基础 — 2026-08-08
+
+### 新增
+- **正则表达式内置函数（双路径）**：`regex_match`（部分匹配即真）/ `regex_find`（首个匹配片段）/
+  `regex_find_all`（全部匹配片段，字符串动态表）/ `regex_replace`（全部替换，to 支持 `$1` 捕获引用）/
+  `regex_group`（首个匹配的第 i 个捕获组，i=0 为整个匹配）。Rust `regex` 引擎（RE2 无回溯），
+  解释路径与编译路径共用同一份 C ABI 桥实现，行为逐字节一致；模式非法 → 运行时错误（两路径文本一致）。
+- **`eval_call(name, arg)`（双路径）**：调用已注册用户函数（顶层裸名或 `命名空间::函数` 全名），
+  字符串值直传（不经源码文本转义，换行/引号原样直传），返回结果字符串（void → 空串）。
+  这是 **tie:script 模块协议的执行基础**——框架先 `eval` 模块文件注册入口
+  `func process(src: string) -> string`，再 `eval_call` 以字符串值直传源码调用，拿回处理结果。
+  编译路径经 C ABI 桥共享同一 thread_local Session，跨 eval 持久。
+- **`file_delete(path)`（双路径）**：删除文件，返回 bool（不存在/不可删 → false）。
+  解释路径 `std::fs::remove_file`，编译路径 libc `remove()`，行为一致。
+- **`str.str_find`（std 库，tie 实现）**：返回子串首次出现的字符索引（从 0 起），未找到返回 -1；
+  空子串命中位置 0。与 `str_contains` 同扫描模式。
+
+### 变更
+- tie-interp 新增 `regex` 依赖（Rust regex 引擎）；C ABI 桥新增 `tie_eval_call` /
+  `tie_regex_match` / `tie_regex_find` / `tie_regex_find_all` / `tie_regex_replace` / `tie_regex_group`
+- tie-llvm IR 层：`regex_find_all` 返回字符串动态表（与 list_dir 同机制）；
+  返回堆串的正则调用与 `eval_call` 独立语句时立即释放（无泄漏）
+- `examples/std_demo.tie`：新增 `str.str_find` 断言与 `file_delete` 清理临时文件
+  （原先"无内置删除文件函数，临时文件保留"）
+
+### 测试
+- 全工作区测试通过（frontend 112 / interp **58** / llvm **31** / lsp 75 / prep 4 = **280**）
+- 新增：interp 正则 5 个 + eval_call 3 个 + file_delete 1 个；llvm 正则生成桥调用与声明、
+  eval_call 生成桥调用与声明、file_delete 生成 remove 调用
+- 端到端：`examples/regex_demo.tie`（P1 正则五原语编译运行全通过）、
+  `examples/script_demo.tie`（eval 注册模块 + eval_call 多行直传/命名空间/void 入口）、
+  `examples/std_demo.tie`（str_find + file_delete）编译运行全通过
+
 ## [Harbor M2.1.4] tie-lsp 语义增强：嵌套命名空间 + 参数跳转 + 语义高亮 — 2026-08-08
 
 ### 变更
