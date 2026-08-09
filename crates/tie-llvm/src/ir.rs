@@ -152,6 +152,8 @@ impl<'p> IrGenerator<'p> {
                         param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
                         param_defaults: f.params.iter().map(|p| p.default.clone()).collect(),
                         ret_ty: f.ret_ty.clone(),
+                        // 顶层函数恒公有（与语义层一致）
+                        is_pub: true,
                     },
                 )),
                 _ => None,
@@ -534,6 +536,7 @@ impl<'p> IrGenerator<'p> {
             }
             Stmt::FnDef(_) => Ok(()), // 顶层函数，不在此生成
             Stmt::Namespace(_) => Ok(()), // 命名空间体内函数由顶层发射循环生成
+            Stmt::Using(_) => Ok(()), // using 引入语句：仅顶层语义作用（可见性/裸调用解析），不生成 IR
             Stmt::Expr(e) => {
                 let (v, _ty) = self.gen_expr(&e.expr)?;
                 // REPL 内置作为独立语句（结果丢弃）：read_line()/eval() 返回

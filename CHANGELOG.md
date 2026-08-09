@@ -3,6 +3,45 @@
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库**。
 
+## [Harbor M2.1.7] 单文件命名空间：pub 可见性 + using 引入 + import 别名唯一入口 — 2026-08-09
+
+落地规划 docs/plans/namespace-single-file.md，让命名空间成为真正的**模块边界**。
+
+### 可见性控制（pub func）
+- 命名空间内函数默认**私有**（仅同命名空间可见），`pub func` 显式导出后跨命名空间/跨文件可调；顶层函数恒公有
+- 四层同步：lexer（Pub 关键字）、parser（parse_fn_def 支持 `[pub] func`，命名空间体/顶层均可）、
+  semantic（FuncSig.is_pub + check_visibility：私有函数跨命名空间调用编译期报错）、
+  IR/interp（无求值变化，is_pub 仅编译期可见性）
+- std 库 37 个公有 API 函数显式加 pub（assert 3 / string 8 / math 13 / csv 2 / format 4 / tcmsg 7；
+  is_whitespace、strip_cr 保持私有作为内部辅助）；examples 库文件同步加 pub
+
+### using 引入语句
+- 语法 `using fmt;` / `using fmt.inner;` / `using f2.inner;`（别名 + 子路径），仅顶层
+- 目标必须是已 import 引入的命名空间前缀或别名；引入后其公有函数可**裸名调用**
+- 裸调用解析升级为三候选：顶层裸名 → 当前命名空间前缀补全 → using 引入命名空间（唯一候选，多候选报歧义）
+- 未导入目标 / 重复 using → 编译期报错
+
+### import 别名唯一入口
+- `import "./x.tie" as f2` 后原命名空间前缀在导入方**不可用**（必须用别名访问），
+  避免同名命名空间跨文件冲突；违规用原前缀 → 报「已被别名取代」
+- 别名 + 嵌套命名空间：`f2.inner.deep()` → `fmt::inner::deep`（imports.rs 展开时收集
+  被导入文件全部命名空间路径填回 import 语句，语义层据此构建导入视图）
+
+### 测试与验证
+- frontend +11（pub 放行/私有拦截/同命名空间互调/using 裸调用/未导入/重复/歧义/别名唯一入口/
+  别名原前缀违规/别名嵌套/using 嵌套路径）→ **136**；workspace 全量 **320 全绿**
+  （136 frontend + 59 interp + 34 llvm + 75 lsp + 6 prep + 10 tie）
+- 端到端：namespace_demo / import_main / import_nested 回归通过；新增
+  examples/lib_ns_tools.tie + examples/ns_import_demo.tie（别名 + using + 私有互调全对）；
+  std 库 6 个 demo（std/csv/tcmsg/format/math/oop）回归通过；私有拦截/唯一入口违规负例报错正确
+
+### 文档与扩展同步
+- docs/language.md：§7.1 单文件命名空间（pub/using/别名规则要点）；§9.1 关键词表补
+  namespace/pub/using 三行
+- README：M2 行补 M2.1.7、docs/plans 列表；CHANGELOG 历史条目保留原样
+- docs/plans/namespace-single-file.md：状态改「已实现」，语法更新为 pub func + using
+- VSCode 语法文件：关键词补 pub/using/when（when 为 M2.1.5 遗漏，一并补齐）
+
 ## [Harbor M2.1.6] 统一 func 写法：str 库去前缀 + method 关键字废弃 — 2026-08-09
 
 按规划 docs/plans/unified-func-style.md 落地「统一函数写法」，标准库成为风格模板：

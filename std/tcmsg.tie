@@ -18,32 +18,32 @@ import "./string.tie"
 
 namespace tcmsg {
     // 打印错误级消息：前缀「错误: 」+ 当前语言翻译（未登记时回退键本身）
-    func error(key: string) {
+    pub func error(key: string) {
         println("错误: " + msg_t(key))
     }
 
     // 打印警告级消息：前缀「警告: 」+ 当前语言翻译（未登记时回退键本身）
-    func warn(key: string) {
+    pub func warn(key: string) {
         println("警告: " + msg_t(key))
     }
 
     // 打印信息级消息：前缀「信息: 」+ 当前语言翻译（未登记时回退键本身）
-    func info(key: string) {
+    pub func info(key: string) {
         println("信息: " + msg_t(key))
     }
 
     // 切换消息系统当前语言（透传内置 msg_set_lang）
-    func set_lang(lang: string) {
+    pub func set_lang(lang: string) {
         msg_set_lang(lang)
     }
 
     // 登记一条消息文本（透传内置 msg_register）
-    func register(key: string, lang: string, content: string) {
+    pub func register(key: string, lang: string, content: string) {
         msg_register(key, lang, content)
     }
 
     // 查询键的翻译（透传内置 msg_t，回退规则一致）
-    func t(key: string) -> string {
+    pub func t(key: string) -> string {
         return msg_t(key)
     }
 
@@ -54,7 +54,7 @@ namespace tcmsg {
         //   → 省略 texts，从字典查当前语言的 no_file 文本（需先 register 登记）
         // 调用形态 2（方案 A）：tcmsg::error.no_file(["zh-cn","en-us"], ["文件不存在","File not found"])
         //   → texts 按 langs 顺序给文本，直接返回当前语言对应文本，调用点自包含
-        func no_file(langs: table, texts: table = []) -> string {
+        pub func no_file(langs: table, texts: table = []) -> string {
             // 方案 A：调用方提供了文本表（非空）→ 按当前语言匹配 langs 取文本
             if len(texts) > 0 {
                 // langs 与 texts 按位置对应；langs[i] 是地区码（如 "zh-cn"），

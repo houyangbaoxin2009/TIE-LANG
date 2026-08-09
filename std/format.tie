@@ -6,12 +6,12 @@
 
 namespace format {
 // 整数 → 十进制字符串（委托 to_string，与 Rust {} 默认格式一致）
-func format_int(v: i64) -> string {
+pub func format_int(v: i64) -> string {
     return to_string(v)
 }
 
 // 整数右对齐格式化：不足 width 位时左侧补空格；宽度不足或相等时原样返回（不截断）
-func format_pad(v: i64, width: i64) -> string {
+pub func format_pad(v: i64, width: i64) -> string {
     var s: string = to_string(v)
     var n: i64 = len(s)
     // 逐字符在左侧补空格，直到长度达到 width
@@ -24,7 +24,7 @@ func format_pad(v: i64, width: i64) -> string {
 
 // 整数转小写十六进制（不带 0x 前缀）；负数输出「-」+ 绝对值十六进制
 // 算法：反复取 n % 16 得最低位数字，用 str_char 从常量串取对应字符，再 n / 16 右移
-func format_int_hex(v: i64) -> string {
+pub func format_int_hex(v: i64) -> string {
     // 零直接返回 "0"（不进循环，避免空串）
     if v == 0 {
         return "0"
@@ -50,7 +50,7 @@ func format_int_hex(v: i64) -> string {
 }
 
 // 布尔格式化：true / false
-func format(b: bool) -> string {
+pub func format(b: bool) -> string {
     if b {
         return "true"
     }

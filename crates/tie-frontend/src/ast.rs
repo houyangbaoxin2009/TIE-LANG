@@ -150,6 +150,9 @@ pub enum Stmt {
     Import(ImportStmt),
     /// 命名空间声明 `namespace tcmsg { ... }`（C# 风格块式；仅顶层，可嵌套/点分）
     Namespace(NamespaceStmt),
+    /// using 引入语句（`using fmt2;`，仅顶层）：把已导入命名空间的公有函数
+    /// 引入当前文件作用域，之后可裸调用（如 `public_api()`）
+    Using(UsingStmt),
     /// 类定义 `class Name [extends Parent] { 字段/方法 }`（P8，仅顶层）
     Class(ClassDefStmt),
     /// 字段赋值 `obj.field = expr`（P8，对已存在实例字段的写入）
@@ -161,8 +164,24 @@ pub enum Stmt {
 pub struct ImportStmt {
     /// 被导入文件的路径（相对当前文件所在目录，如 `"./lib.tie"`）
     pub path: String,
-    /// 可选别名（`as 别名`）；当前阶段仅解析保留，后续版本用于命名空间限定
+    /// 可选别名（`as 别名`）；有别名时**唯一入口**——原命名空间前缀在导入方
+    /// 不可用，必须用别名访问（M2.1.7 单文件命名空间）
     pub alias: Option<String>,
+    /// 被导入文件声明的全部命名空间路径（由 imports.rs 展开时填充；
+    /// parser 阶段为空）。语义层据此把「别名/前缀 → 命名空间」映射到全名。
+    pub ns_paths: Vec<Vec<String>>,
+    pub span: Span,
+}
+
+/// using 引入语句：`using fmt2;`（仅顶层，M2.1.7 单文件命名空间）。
+///
+/// 目标必须是**已通过 import 引入的命名空间前缀或别名**；引入后该命名空间的
+/// 公有函数可裸名调用（`public_api()`，不再写 `fmt2.public_api()`）。
+/// 同名裸名多候选（多个 using 都含该函数）→ 语义层报歧义错误。
+#[derive(Debug, Clone)]
+pub struct UsingStmt {
+    /// 目标命名空间路径（`using fmt.error` 存为 ["fmt", "error"]；别名单段）
+    pub path: Vec<String>,
     pub span: Span,
 }
 
@@ -212,6 +231,9 @@ pub struct FnDefStmt {
     pub params: Vec<Param>,
     /// 返回类型（省略时为 void）
     pub ret_ty: TypeSpec,
+    /// 是否公有（`pub func`，M2.1.7）：命名空间内函数默认私有（仅同命名空间
+    /// 可见）；显式 pub 后跨命名空间/跨文件（import/using）可调。顶层函数恒公有。
+    pub is_pub: bool,
     pub body: Vec<Stmt>,
     pub span: Span,
 }

@@ -3,6 +3,11 @@
 //! 原实现是 tie-llvm 的私有函数（driver.rs 的 `expand_imports`）。LSP 等
 //! 工具也需要跨文件分析（识别 `str.split` 等命名空间调用中被导入文件的
 //! 函数定义），故提炼为本 crate 的公共 API，供 tie-llvm 与 tie-lsp 共享。
+//!
+//! M2.1.7 单文件命名空间：展开时**保留当前文件顶层的 import 语句**（携带
+//! 被导入文件声明的命名空间路径 `ns_paths`），语义层据此构建「导入视图」
+//! （别名唯一入口 / using 引入 / 裸调用补全）；被导入文件自身的 import
+//! 语句则在递归展开中吞掉（其命名空间对当前文件不构成视图）。
 
 use crate::ast::{Program, Stmt};
 use crate::lexer::Span;
@@ -110,6 +115,15 @@ fn expand_imports_inner(
                     .map(|p| p.to_path_buf())
                     .unwrap_or_else(|| PathBuf::from("."));
                 let expanded = expand_imports_inner(sub_program, &sub_dir, chain)?;
+                // M2.1.7：收集被导入文件声明的全部命名空间路径（顶层 + 嵌套），
+                // 填回 import 语句的 ns_paths——语义层据此把别名/前缀映射到全名。
+                // 被导入文件自身的 import 语句已被吞掉（不构成导入方视图）。
+                let mut ns_paths = Vec::new();
+                collect_ns_paths(&expanded.stmts, &mut Vec::new(), &mut ns_paths);
+                let mut imp = imp;
+                imp.ns_paths = ns_paths;
+                // 保留当前文件的 import 语句（携带 ns_paths），其后跟展开的语句
+                out.push(Stmt::Import(imp));
                 out.extend(expanded.stmts);
                 // 弹出当前文件，允许同目录下其他文件再次导入它（非循环）
                 chain.remove(&canon);
@@ -118,4 +132,22 @@ fn expand_imports_inner(
         }
     }
     Ok(Program { stmts: out })
+}
+
+/// 收集一组语句中声明的全部命名空间路径（顶层 + 嵌套递归）。
+///
+/// 结果用于填充 `ImportStmt.ns_paths`：被导入文件声明了哪些命名空间，
+/// 语义层据此把「别名 / 原前缀 → 命名空间全路径」映射到注册键。
+fn collect_ns_paths(stmts: &[Stmt], prefix: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Namespace(ns) => {
+                let mut segs = prefix.clone();
+                segs.extend(ns.path.iter().cloned());
+                out.push(segs.clone());
+                collect_ns_paths(&ns.body, &mut segs, out);
+            }
+            _ => {}
+        }
+    }
 }

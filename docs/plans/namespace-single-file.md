@@ -1,8 +1,11 @@
 # 规划（后续 M）：单文件命名空间
 
-> 状态：**规划**（设计完成，待排期实现）
+> 状态：**已实现**（Harbor M2.1.7，2026-08-09）
 > 所属：tie 语言模块化体系（标准库文档化命名）
-> 依赖：Harbor M3（预处理器自举）完成后排期
+> 落地：pub 可见性 + using 引入 + import 别名唯一入口（实现详见 CHANGELOG [Harbor M2.1.7]）
+> 注：原规划的可见性语法 `func(ns) name` 在实现中改为 **`pub func name`**（更直观的
+> 显式导出标记；命名空间内函数默认私有）；`import ... as` 升级为别名**唯一入口**；
+> 新增 `using` 引入语句支持裸调用。以下正文保留设计背景，语法以 M2.1.7 实际实现为准。
 
 ## 1. 背景与现状
 
@@ -39,33 +42,36 @@ tie 已有命名空间机制（M2 实现）：
 
 ## 3. 设计
 
-### 3.1 语法（保持兼容）
+### 3.1 语法（保持兼容；M2.1.7 实际实现）
 
 ```c
 // 文件 A：tools.tie
 namespace fmt {
-    func pad(n: i64) -> i64 { return n + 1 }   // 私有：仅 fmt 内可见
-    func(fmt) public_api(n: i64) -> i64 { return pad(n) }  // 显式导出
+    func pad(n: i64) -> i64 { return n + 1 }      // 私有：默认，仅 fmt 内可见
+    pub func public_api(n: i64) -> i64 { return pad(n) }  // 显式导出（pub func）
 }
 
 // 文件 B：main.tie
-import "tools.tie" as fmt2          // 导入并重命名前缀
+import "tools.tie" as fmt2          // 导入并重命名前缀（别名唯一入口：fmt 被屏蔽）
+using fmt2;                         // 引入命名空间，公有函数可裸调用
 func main() {
-    println(fmt2.public_api(1))    // 点分调用（现状已支持）
-    println(pad(1))                // 错误：pad 未导出（导入方不可见）
+    println(fmt2.public_api(1))    // 别名点分调用
+    println(public_api(1))         // using 引入后的裸调用
+    // println(pad(1))             // 错误：pad 是私有函数，导入方不可见
 }
 ```
 
 设计要点：
 
-- **可见性标记**：函数定义可加 `(ns)` 前缀标注可见性（`func(fmt)` 表示仅
-  `fmt` 内可见 = 私有；无标记 = 公有，与现状兼容）；
-- **import 带前缀重命名**：`import "tools.tie" as fmt2`——把目标文件的
-  `namespace xyz` **按前缀导入**到 `fmt2` 名下；
-- **路径补全升级**：`ns_call_full_name` 在裸调用时优先查找**导入前缀**，
-  匹配失败再回退同文件 ns_stack；
-- **冲突规则**：不同命名空间的同名函数允许共存（语义表按 `ns::name` 全名
-  注册）；裸调用无导入前缀时按既有规则解析。
+- **可见性标记**：`pub func` 显式导出；无标记 = 私有（仅同命名空间可见）。
+  顶层函数恒公有，与现状兼容；
+- **import 带前缀重命名**：`import "tools.tie" as fmt2`——目标文件的命名空间在导入方
+  以 `fmt2` 为**唯一入口**（原前缀被屏蔽，避免同名命名空间跨文件冲突）；
+- **using 引入**：`using fmt2;` / `using fmt2.inner;` 把该命名空间的公有函数引入当前
+  文件，之后可裸名调用；
+- **裸调用解析升级**：顶层裸名 → 当前文件 ns_stack 补全 → using 引入命名空间（唯一候选，
+  多候选报歧义）；
+- **冲突规则**：不同命名空间的同名函数允许共存（语义表按 `ns::name` 全名注册）。
 
 ### 3.2 与 std/ 的关系
 

@@ -881,7 +881,8 @@ impl Session {
                 }
                 Stmt::Class(_) => return Err("REPL v1 暂不支持类定义".into()),
                 Stmt::Import(_) => return Err("REPL v1 暂不支持 import".into()),
-                _ => return Err("顶层只允许函数/类/import/命名空间定义".into()),
+                Stmt::Using(_) => return Err("REPL v1 暂不支持 using".into()),
+                _ => return Err("顶层只允许函数/类/import/using/命名空间定义".into()),
             }
         }
         Ok(format!("已定义 {count} 个函数"))
@@ -1158,6 +1159,11 @@ impl<'a> Env<'a> {
                 Ok(Flow::Normal(last))
             }
             Stmt::Import(_) => Err("REPL v1 暂不支持 import".into()),
+            Stmt::Using(_) => {
+                // using 引入语句：REPL v1 不支持 import，using 亦无意义；
+                // 顶层注册路径已报错，函数体内（不应出现）防御性空操作。
+                Ok(Flow::Normal(None))
+            }
             Stmt::Class(_) => Err("REPL v1 暂不支持类定义".into()),
             Stmt::FnDef(f) => {
                 // 函数体内的嵌套函数定义 → 注册进 funcs（从简）

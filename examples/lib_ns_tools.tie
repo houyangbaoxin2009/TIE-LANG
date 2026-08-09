@@ -1,0 +1,23 @@
+// tie:library
+// lib_ns_tools.tie——M2.1.7 单文件命名空间示例工具库
+// 演示：pub 导出 / 私有函数（helper 仅 fmt 内可见）/ 嵌套命名空间
+// 配合 examples/ns_import_demo.tie 使用
+
+namespace fmt {
+// 公有导出：跨命名空间/跨文件可调（主文件经别名 f2 访问）
+pub func public_api() -> string {
+    return helper() + " via public_api"
+}
+
+// 私有：仅 fmt 命名空间内可调（public_api 裸调用，同命名空间互调放行）
+func helper() -> string {
+    return "ok"
+}
+
+namespace inner {
+// 嵌套命名空间内公有函数：using f2.inner 后可裸调用 deep()
+pub func deep() -> string {
+    return "deep"
+}
+}
+}

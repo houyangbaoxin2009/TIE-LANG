@@ -1313,7 +1313,7 @@ func main() {
         // 被导入库：namespace math + abs 函数（与 examples/lib_math.tie 同形态）
         let dir = 临时目录();
         let lib = r#"namespace math {
-    func abs(x: i64) -> i64 {
+    pub func abs(x: i64) -> i64 {
         if x < 0 {
             return -x
         }
@@ -1396,7 +1396,7 @@ func main() {
     fn import展开后hover命中跨文件函数() {
         let dir = 临时目录();
         let lib = r#"namespace math {
-    func abs(x: i64) -> i64 {
+    pub func abs(x: i64) -> i64 {
         return x
     }
 }
@@ -1414,7 +1414,7 @@ func main() {
     fn import展开后补全命名空间成员() {
         let dir = 临时目录();
         let lib = r#"namespace math {
-    func abs(x: i64) -> i64 {
+    pub func abs(x: i64) -> i64 {
         return x
     }
 }
@@ -1440,11 +1440,11 @@ func main() {
     fn 嵌套命名空间源码() -> &'static str {
         r#"
 namespace tcmsg {
-    func hello() -> string {
+    pub func hello() -> string {
         return "Hello from tcmsg"
     }
     namespace error {
-        func no_file() -> string {
+        pub func no_file() -> string {
             return "no file"
         }
     }
@@ -1475,10 +1475,10 @@ func main() {
     #[test]
     fn 嵌套命名空间跳转命中函数定义() {
         let src = 嵌套命名空间源码();
-        // no_file 定义在 `        func no_file() -> string {`（LSP line 6，character 13）
+        // no_file 定义在 `        pub func no_file() -> string {`（LSP line 6，character 17）
         let range = definition(src, 13, 25, None).expect("应命中 no_file 定义");
         assert_eq!(range.start.line, 6, "定义应在 LSP line 6");
-        assert_eq!(range.start.character, 13, "定义应从 character 13 开始");
+        assert_eq!(range.start.character, 17, "定义应从 character 17 开始");
     }
 
     /// 嵌套命名空间补全：`tcmsg.error.` 点场景 → 只补该层命名空间函数。

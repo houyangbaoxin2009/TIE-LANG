@@ -52,7 +52,7 @@
       "patterns": [
         {
           "name": "keyword.control.tie",
-          "match": "\\b(func|var|const|if|else|while|for|return|import|class|static|this|extends|switch|case|default|in|namespace)\\b"
+          "match": "\\b(func|var|const|if|else|while|for|return|import|class|static|this|extends|switch|case|default|in|namespace|pub|using|when)\\b"
         },
         { "name": "constant.language.tie", "match": "\\b(true|false)\\b" },
         {

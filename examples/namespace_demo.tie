@@ -6,12 +6,12 @@
 // 期望输出：Hello from tcmsg / Hello from tcmsg.error
 
 namespace tcmsg {
-    func hello() -> string {
+    pub func hello() -> string {
         return "Hello from tcmsg"
     }
 
     namespace error {
-        func hello() -> string {
+        pub func hello() -> string {
             return "Hello from tcmsg.error"
         }
 
@@ -20,7 +20,7 @@ namespace tcmsg {
             return "inner"
         }
 
-        func call_inner() -> string {
+        pub func call_inner() -> string {
             return inner()
         }
     }

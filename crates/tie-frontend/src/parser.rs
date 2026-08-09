@@ -8,8 +8,8 @@
 use super::ast::{
     AssignStmt, BinaryOp, ClassDefStmt, ClassField, Expr, ExprStmt, FieldAssignStmt, FnDefStmt,
     ForStmt, IfStmt, ImportStmt, MethodDefStmt, NamespaceStmt, Param, Program, ReturnStmt, Stmt,
-    SwitchCase, SwitchStmt, TableCell, TableId, TupleField, TypeSpec, UnaryOp, VarDeclStmt,
-    WhileStmt,
+    SwitchCase, SwitchStmt, TableCell, TableId, TupleField, TypeSpec, UnaryOp, UsingStmt,
+    VarDeclStmt, WhileStmt,
 };
 use super::lexer::{Span, Token, TokenKind, TyKw};
 use std::fmt;
@@ -119,16 +119,17 @@ impl<'a> Parser<'a> {
 
     fn parse_program(&mut self) -> Result<Program, ParseError> {
         let mut stmts = Vec::new();
-        // 顶层只允许函数定义、import、类定义与命名空间声明（import 由 driver 递归展开为函数）
+        // 顶层只允许函数定义、import、using、类定义与命名空间声明（import 由 driver 递归展开为函数）
         while !matches!(self.peek_kind(), TokenKind::Eof) {
             match self.peek_kind() {
-                TokenKind::Func => stmts.push(Stmt::FnDef(self.parse_fn_def()?)),
+                TokenKind::Func | TokenKind::Pub => stmts.push(Stmt::FnDef(self.parse_fn_def()?)),
                 TokenKind::Import => stmts.push(Stmt::Import(self.parse_import()?)),
+                TokenKind::Using => stmts.push(Stmt::Using(self.parse_using()?)),
                 TokenKind::Class => stmts.push(Stmt::Class(self.parse_class()?)),
                 TokenKind::Namespace => stmts.push(Stmt::Namespace(self.parse_namespace()?)),
                 other => {
                     return Err(self.err(format!(
-                        "顶层只允许函数定义、import、类定义或命名空间声明，实际是 {}",
+                        "顶层只允许函数定义、import、using、类定义或命名空间声明，实际是 {}",
                         self.describe(other)
                     )))
                 }
@@ -153,7 +154,7 @@ impl<'a> Parser<'a> {
         let mut body = Vec::new();
         while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
             match self.peek_kind() {
-                TokenKind::Func => body.push(Stmt::FnDef(self.parse_fn_def()?)),
+                TokenKind::Func | TokenKind::Pub => body.push(Stmt::FnDef(self.parse_fn_def()?)),
                 TokenKind::Class => body.push(Stmt::Class(self.parse_class()?)),
                 TokenKind::Namespace => body.push(Stmt::Namespace(self.parse_namespace()?)),
                 other => {
@@ -206,7 +207,22 @@ impl<'a> Parser<'a> {
             None
         };
         self.expect(TokenKind::Semi, "import 语句结束的分号")?;
-        Ok(ImportStmt { path, alias, span })
+        // ns_paths 由 imports.rs 展开时填充（parser 阶段未知被导入文件的命名空间）
+        Ok(ImportStmt { path, alias, ns_paths: Vec::new(), span })
+    }
+
+    /// using 引入语句（M2.1.7）：`using fmt2;` 或 `using fmt.error;`（仅顶层）。
+    ///
+    /// 至少一段标识符，可点分（`using fmt.error` 表示命名空间路径）；目标必须是
+    /// 已 import 引入的命名空间前缀或别名（语义层校验）。
+    fn parse_using(&mut self) -> Result<UsingStmt, ParseError> {
+        let span = self.advance().span; // 消费 `using`
+        let mut path = vec![self.expect_ident()?];
+        while self.eat(&TokenKind::Dot) {
+            path.push(self.expect_ident()?);
+        }
+        self.expect(TokenKind::Semi, "using 语句结束的分号")?;
+        Ok(UsingStmt { span, path })
     }
 
     // ---------- 语句解析 ----------
@@ -403,9 +419,13 @@ impl<'a> Parser<'a> {
         Ok(decls)
     }
 
-    /// `func name(params) -> Ty { stmts }`。
+    /// `[pub] func name(params) -> Ty { stmts }`（pub 为 M2.1.7 可见性标记）。
     fn parse_fn_def(&mut self) -> Result<FnDefStmt, ParseError> {
-        let span = self.advance().span; // func
+        let span = self.peek().span; // pub 或 func 所在位置
+        // 可选 pub 标记：`pub func name(...)`。命名空间内默认私有，pub 显式导出；
+        // 顶层函数恒公有（pub 冗余但合法）。
+        let is_pub = self.eat(&TokenKind::Pub);
+        self.expect(TokenKind::Func, "'func'")?;
         let name = self.expect_ident()?;
         self.expect(TokenKind::LParen, "'('")?;
         let mut params = Vec::new();
@@ -437,7 +457,7 @@ impl<'a> Parser<'a> {
             TypeSpec::Named(TyKw::Void)
         };
         let body = self.parse_block()?;
-        Ok(FnDefStmt { name, params, ret_ty, body, span })
+        Ok(FnDefStmt { name, params, ret_ty, is_pub, body, span })
     }
 
     /// `class Name [extends Parent] { 字段… 方法… }`（仅顶层，P8）。

@@ -3,19 +3,19 @@
 // 只定义函数，不定义 main。M2.1 起示例库使用命名空间形式：mathlib.add / mathlib.mul 等。
 
 namespace mathlib {
-func add(a: i64, b: i64) -> i64 {
+pub func add(a: i64, b: i64) -> i64 {
     return a + b
 }
 
-func mul(a: i64, b: i64) -> i64 {
+pub func mul(a: i64, b: i64) -> i64 {
     return a * b
 }
 
-func greet(name: string) -> string {
+pub func greet(name: string) -> string {
     return "Hello, " + name
 }
 
-func max2(a: i64, b: i64) -> i64 {
+pub func max2(a: i64, b: i64) -> i64 {
     if a > b {
         return a
     }

@@ -2,11 +2,11 @@
 // M2.1 起示例库使用命名空间形式：util.square / util.triple。
 
 namespace util {
-func square(x: i64) -> i64 {
+pub func square(x: i64) -> i64 {
     return x * x
 }
 
-func triple(x: i64) -> i64 {
+pub func triple(x: i64) -> i64 {
     return x * 3
 }
 }

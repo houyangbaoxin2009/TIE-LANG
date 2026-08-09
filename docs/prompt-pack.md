@@ -65,8 +65,13 @@ println(t.0)                     // 数字下标，从 0 编号
 var (q, r) = divmod(17, 5)       // 解构
 // 空元组 () 不支持；不支持 println 元组 / 元组比较。
 
-【import】
+【import 与单文件命名空间】（M2.1.7 起：pub / using / 别名唯一入口）
 import "./lib_math.tie" as math   // 已实现：函数递归加载内联
+using math;                       // 引入命名空间，公有函数可裸调用
+// 命名空间内函数默认私有，pub func 显式导出：
+//   namespace fmt { pub func public_api() -> string {...} func helper() {...} }
+//   import "./tools.tie" as f2 后 fmt 前缀被屏蔽（唯一入口），只能 f2.public_api()
+//   私有函数（helper）跨命名空间调用 → 编译期报错；using f2.inner 可裸调 inner 的公有函数
 
 【tie:script 动态执行】（eval / eval_call 内置函数，已实现）
 // tie:script 协议：tie 程序可在运行期加载并调用 tie 脚本模块

@@ -83,6 +83,12 @@ pub enum TokenKind {
     Extends,
     /// 命名空间声明 `namespace tcmsg { }`
     Namespace,
+    /// 公有可见性标记（M2.1.7 单文件命名空间）：`pub func`——命名空间内函数
+    /// 默认私有（仅同命名空间可见），加 pub 后跨命名空间/跨文件可调
+    Pub,
+    /// using 引入语句（M2.1.7）：`using fmt2;` 把已导入命名空间的公有函数
+    /// 引入当前文件，之后可裸调用
+    Using,
     True,
     False,
     /// 类型关键字：i8..u64/f32/f64/bool/char/string/void/code/num/text/misc/table
@@ -685,6 +691,9 @@ impl<'a> Lexer<'a> {
             "extends" => TokenKind::Extends,
             // 命名空间（命名空间语法，C# 风格块式声明）
             "namespace" => TokenKind::Namespace,
+            // M2.1.7 单文件命名空间：pub 可见性标记 + using 引入语句
+            "pub" => TokenKind::Pub,
+            "using" => TokenKind::Using,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             "i8" => TokenKind::TypeKw(TyKw::I8),
@@ -1052,10 +1061,10 @@ mod tests {
 
     // ---------- 关键字与标识符 ----------
 
-    /// 控制流/OOP/字面量关键字逐一识别（func..false 共 20 个）。
+    /// 控制流/OOP/字面量关键字逐一识别（func..false 共 22 个）。
     #[test]
     fn 关键字全部识别() {
-        let src = "func var const if else while for in return switch case default import as class this static extends true false";
+        let src = "func var const if else while for in return switch case default when import as class this static extends namespace pub using true false";
         let toks = tokenize(src).expect("不应报错");
         let expected = [
             TokenKind::Func,
@@ -1070,12 +1079,16 @@ mod tests {
             TokenKind::Switch,
             TokenKind::Case,
             TokenKind::Default,
+            TokenKind::When,
             TokenKind::Import,
             TokenKind::As,
             TokenKind::Class,
             TokenKind::This,
             TokenKind::Static,
             TokenKind::Extends,
+            TokenKind::Namespace,
+            TokenKind::Pub,
+            TokenKind::Using,
             TokenKind::True,
             TokenKind::False,
         ];

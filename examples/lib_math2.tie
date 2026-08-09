@@ -3,11 +3,11 @@
 import "./lib_util.tie"
 
 namespace math2 {
-func add3(a: i64, b: i64, c: i64) -> i64 {
+pub func add3(a: i64, b: i64, c: i64) -> i64 {
     return a + b + c
 }
 
-func sqsum(a: i64, b: i64) -> i64 {
+pub func sqsum(a: i64, b: i64) -> i64 {
     return util.square(a) + util.square(b)
 }
 }

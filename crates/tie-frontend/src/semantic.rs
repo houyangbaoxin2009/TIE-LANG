@@ -75,6 +75,9 @@ pub struct FuncSig {
     /// 调用点省略实参时按此补齐（LLVM 函数签名不变，缺省实参在调用点生成）。
     pub param_defaults: Vec<Option<Expr>>,
     pub ret_ty: TypeSpec,
+    /// 是否公有（M2.1.7 单文件命名空间）：命名空间内函数默认私有（仅同命名
+    /// 空间可见，`pub func` 显式导出）；顶层函数恒为 true。
+    pub is_pub: bool,
 }
 
 /// 类的方法签名（P8）。
@@ -112,7 +115,14 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
         table_vars: HashMap::new(),
         cur_fn: String::new(),
         ns_stack: Vec::new(),
+        import_views: Vec::new(),
+        using_prefixes: Vec::new(),
     };
+
+    // 第零遍：收集顶层 import / using 语句，构建导入视图（M2.1.7）。
+    // import 语句由 imports.rs 展开时保留（携带被导入文件的命名空间路径）；
+    // 语义层据此做：别名唯一入口映射、using 目标校验、裸调用补全。
+    ctx.collect_imports_using(program)?;
 
     // 第一遍：收集所有函数签名（允许前向引用）。
     // 顶层函数以裸名注册；命名空间内函数以全名（"tcmsg::error::no_file"）注册，
@@ -124,6 +134,8 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
                     param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
                     param_defaults: f.params.iter().map(|p| p.default.clone()).collect(),
                     ret_ty: f.ret_ty.clone(),
+                    // 顶层函数恒公有（与现状兼容）
+                    is_pub: true,
                 };
                 if ctx.result.funcs.insert(f.name.clone(), sig).is_some() {
                     return Err(SemanticError {
@@ -211,9 +223,200 @@ struct Analyzer {
     /// 当前命名空间前缀栈（检查命名空间体内的函数时用；空 = 顶层）。
     /// 元素按从外到内排列，如 `namespace tcmsg { namespace error { } }` → ["tcmsg","error"]。
     ns_stack: Vec<String>,
+    /// 导入视图（M2.1.7）：当前文件顶层的 import 语句（展开时保留）。
+    /// 每项含别名与目标文件声明的命名空间路径——调用解析据此做前缀映射
+    /// （别名唯一入口）与裸调用补全。
+    import_views: Vec<ImportView>,
+    /// using 引入的命名空间前缀（M2.1.7）：`using fmt2;` 之后，该命名空间的
+    /// 公有函数可裸名调用（裸调用解析的第三候选）。
+    using_prefixes: Vec<Vec<String>>,
+}
+
+/// 一条 import 引入的视图信息（M2.1.7 单文件命名空间）。
+struct ImportView {
+    /// `as 别名`；Some 时原命名空间前缀在导入方**唯一入口**被别名取代
+    alias: Option<String>,
+    /// 被导入文件声明的命名空间路径（如 tools.tie 的 `namespace fmt` → [["fmt"]]）
+    ns_paths: Vec<Vec<String>>,
 }
 
 impl Analyzer {
+    /// 第零遍：收集顶层 import / using 语句（M2.1.7）。
+    ///
+    /// - import：构建导入视图（别名 → 原命名空间路径映射、using 目标校验依据）；
+    /// - using：目标必须是已导入的命名空间前缀或别名（否则报错），收集其
+    ///   原命名空间路径到 using_prefixes（裸调用补全候选）。
+    fn collect_imports_using(&mut self, program: &Program) -> Result<(), SemanticError> {
+        for stmt in &program.stmts {
+            match stmt {
+                Stmt::Import(imp) => {
+                    self.import_views.push(ImportView {
+                        alias: imp.alias.clone(),
+                        ns_paths: imp.ns_paths.clone(),
+                    });
+                }
+                Stmt::Using(u) => {
+                    // using 目标解析：把「导入侧可见前缀」归一为原命名空间路径。
+                    // 无别名：using fmt / using fmt.inner → 原路径直接匹配；
+                    // 有别名：原前缀被屏蔽（唯一入口），只能用别名——using f2
+                    // 或 using f2.inner（别名 + 子路径，与 map_import_prefix 一致）。
+                    // 命中后存原命名空间全路径到 using_prefixes（裸调用补全候选）。
+                    let mut target: Option<Vec<String>> = None;
+                    for v in &self.import_views {
+                        for ns in &v.ns_paths {
+                            let hit = match &v.alias {
+                                Some(alias) => {
+                                    u.path.first() == Some(alias) && &u.path[1..] == &ns[1..]
+                                }
+                                None => &u.path == ns,
+                            };
+                            if hit {
+                                target = Some(ns.clone());
+                            }
+                        }
+                    }
+                    let resolved = target.ok_or_else(|| SemanticError {
+                        span: u.span,
+                        message: format!(
+                            "using 目标 '{}' 未导入：using 只能引用 import 引入的命名空间前缀或别名",
+                            u.path.join(".")
+                        ),
+                    })?;
+                    if self.using_prefixes.contains(&resolved) {
+                        return Err(SemanticError {
+                            span: u.span,
+                            message: format!("命名空间 '{}' 重复 using", resolved.join("::")),
+                        });
+                    }
+                    self.using_prefixes.push(resolved);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    /// 裸调用名解析（M2.1.7）：返回实际调用的注册键（顶层裸名或命名空间全名）。
+    ///
+    /// 候选顺序（上一候选命中即返回，与旧版前缀补全顺序兼容）：
+    /// 1. 裸名（顶层函数）：funcs 中存在即命中；
+    /// 2. 当前命名空间前缀补全：`ns_stack + name` 全名存在（命名空间内函数互调）；
+    /// 3. using 引入的命名空间：`using_prefixes[i] + name` 全名存在——多候选报歧义，
+    ///    单候选命中（using 裸调用补全）；
+    /// 4. 都不命中：返回裸名（保持原样，由调用方按「未定义函数」报错）。
+    fn resolve_bare_call(&mut self, name: &str, span: &Span) -> Result<String, SemanticError> {
+        // 候选 1：顶层裸名
+        if self.result.funcs.contains_key(name) {
+            return Ok(name.to_string());
+        }
+        // 候选 2：当前命名空间前缀补全（命名空间内函数互调）
+        if !self.ns_stack.is_empty() {
+            let mut segs = self.ns_stack.clone();
+            segs.push(name.to_string());
+            let full = segs.join("::");
+            if self.result.funcs.contains_key(&full) {
+                return Ok(full);
+            }
+        }
+        // 候选 3：using 引入的命名空间（裸调用补全；多候选报歧义）
+        let mut hit: Option<String> = None;
+        for prefix in &self.using_prefixes {
+            let mut segs = prefix.clone();
+            segs.push(name.to_string());
+            let full = segs.join("::");
+            if self.result.funcs.contains_key(&full) {
+                if hit.is_some() {
+                    return Err(SemanticError {
+                        span: *span,
+                        message: format!(
+                            "裸调用 '{name}' 有歧义：多个 using 引入的命名空间都包含该函数，请改用命名空间前缀调用"
+                        ),
+                    });
+                }
+                hit = Some(full);
+            }
+        }
+        if let Some(full) = hit {
+            return Ok(full);
+        }
+        // 都不命中：保持裸名（下方按未定义报错）
+        Ok(name.to_string())
+    }
+    /// 导入前缀映射（M2.1.7）：把 receiver 路径段映射到被导入文件的命名空间全路径。
+    ///
+    /// 返回：
+    /// - `Ok(Some(ns))`：命中导入视图（别名或原名），ns 是被导入文件的原命名空间路径；
+    /// - `Ok(None)`：不涉及导入视图（调用方按 funcs 前缀原判定）；
+    /// - `Err`：**唯一入口违规**——import 声明了别名，调用方却仍用原前缀访问。
+    fn map_import_prefix(
+        &mut self,
+        segs: &[String],
+        span: &Span,
+    ) -> Result<Option<Vec<String>>, SemanticError> {
+        for view in &self.import_views {
+            for ns in &view.ns_paths {
+                match &view.alias {
+                    // 有别名：原前缀被屏蔽（唯一入口），别名是唯一可用前缀
+                    Some(alias) => {
+                        // 违规：调用方用原前缀（ns 或其子路径）
+                        if segs.len() >= ns.len() && &segs[..ns.len()] == &ns[..] {
+                            return Err(SemanticError {
+                                span: *span,
+                                message: format!(
+                                    "命名空间前缀 '{}' 已被别名 '{}' 取代（import as 唯一入口），请改用别名访问",
+                                    ns.join("::"),
+                                    alias
+                                ),
+                            });
+                        }
+                        // 别名命中：segs[0] == alias 且其余段 == ns 的后续段
+                        if segs[0] == *alias && &segs[1..] == &ns[1..] {
+                            return Ok(Some(ns.clone()));
+                        }
+                    }
+                    // 无别名：原前缀可用（确认是导入视图的命名空间）
+                    None => {
+                        if segs == ns {
+                            return Ok(Some(ns.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+    /// 可见性校验（M2.1.7）：命名空间内函数默认私有（仅同命名空间可调），
+    /// `pub func` 显式导出后跨命名空间/跨文件可调。
+    ///
+    /// - 顶层函数（call_name 不含 `::`）恒公有（FuncSig.is_pub 恒 true）；
+    /// - 命名空间函数：is_pub 为 true，或调用者所在命名空间（ns_stack）与
+    ///   函数前缀一致（同命名空间互调）→ 放行；否则报私有调用错误。
+    fn check_visibility(
+        &mut self,
+        call_name: &str,
+        sig: &FuncSig,
+        span: &Span,
+    ) -> Result<(), SemanticError> {
+        // 显式 pub：跨命名空间/跨文件可调
+        if sig.is_pub {
+            return Ok(());
+        }
+        // 顶层函数恒公有；只有命名空间函数（含 ::）才需要私有校验
+        let Some((prefix, _)) = call_name.rsplit_once("::") else {
+            return Ok(());
+        };
+        let own: Vec<&str> = prefix.split("::").collect();
+        let same_ns = self.ns_stack.len() == own.len()
+            && self.ns_stack.iter().zip(own.iter()).all(|(a, b)| a == b);
+        if same_ns {
+            return Ok(());
+        }
+        Err(SemanticError {
+            span: *span,
+            message: format!(
+                "函数 '{call_name}' 是命名空间 '{prefix}' 的私有函数（默认私有，`pub func` 显式导出），不可在命名空间之外调用"
+            ),
+        })
+    }
     /// 命名空间内函数收集（第一遍）：递归注册全名（路径段::函数名），支持嵌套命名空间。
     ///
     /// - 函数以全名进 funcs 表（如 "tcmsg::error::no_file"），供命名空间路径调用解析；
@@ -231,6 +434,8 @@ impl Analyzer {
                         param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
                         param_defaults: f.params.iter().map(|p| p.default.clone()).collect(),
                         ret_ty: f.ret_ty.clone(),
+                        // 命名空间内函数默认私有；`pub func` 显式导出（M2.1.7）
+                        is_pub: f.is_pub,
                     };
                     if self.result.funcs.insert(full.clone(), sig).is_some() {
                         return Err(SemanticError {
@@ -714,6 +919,13 @@ impl Analyzer {
                 Err(SemanticError {
                     span: stmt_span(stmt),
                     message: "import 语句只能出现在文件顶层".into(),
+                })
+            }
+            Stmt::Using(_) => {
+                // using 只允许出现在文件顶层（第零遍收集；函数体内无意义）
+                Err(SemanticError {
+                    span: stmt_span(stmt),
+                    message: "using 语句只能出现在文件顶层".into(),
                 })
             }
             Stmt::Namespace(ns) => {
@@ -1801,29 +2013,18 @@ impl Analyzer {
                     return Ok(TypeSpec::Named(TyKw::F64));
                 }
                 // 用户函数：校验参数个数与类型。
-                // 裸名解析顺序：先查裸名（顶层函数），再按当前命名空间前缀补全
-                // （命名空间内函数互调，如 tcmsg::error 内 error_guard() 裸调）。
-                // 若补全命中，记录调用表达式 → 全名映射（IR/解释层生成调用目标）。
-                let call_name = if self.result.funcs.contains_key(name) {
-                    name.clone()
-                } else if !self.ns_stack.is_empty() {
-                    let mut segs = self.ns_stack.clone();
-                    segs.push(name.clone());
-                    let full = segs.join("::");
-                    if self.result.funcs.contains_key(&full) {
-                        full
-                    } else {
-                        name.clone() // 前缀补全未命中：保持裸名，下方按未定义报错
-                    }
-                } else {
-                    name.clone()
-                };
+                // 裸名解析顺序（M2.1.7 升级）：先查裸名（顶层函数），再按当前
+                // 命名空间前缀补全（命名空间内函数互调），再查 using 引入的命名
+                // 空间（唯一候选）；命中命名空间函数则记录调用表达式 → 全名映射。
+                let call_name = self.resolve_bare_call(name, span)?;
                 let sig = self.result.funcs.get(&call_name).cloned().ok_or_else(|| {
                     SemanticError {
                         span: *span,
                         message: format!("未定义的函数 '{name}'"),
                     }
                 })?;
+                // 可见性校验（M2.1.7）：私有函数仅同命名空间内可调
+                self.check_visibility(&call_name, &sig, span)?;
                 // 裸调用命中命名空间函数 → 记录全名（IR/解释层据此生成调用）
                 if call_name != *name {
                     self.result.resolved_calls.insert(addr_of(expr), call_name.clone());
@@ -2205,45 +2406,47 @@ impl Analyzer {
             Expr::MethodCall { receiver, method, args, span } => {
                 // 方法调用：receiver 是变量/this → 实例方法（receiver 类型必须是类）；
                 // receiver 是类名 → 静态方法（无 this）；
-                // receiver 是命名空间路径（a::b）→ 命名空间函数调用（无 this）。
+                // receiver 是命名空间路径（a::b / a.b / 导入别名）→ 命名空间函数调用。
                 // 同一变体多种语义，此处分发。
                 //
-                // 命名空间函数：receiver 是 Expr::Path（a::b）、未绑定 Var（a）或
-                // FieldAccess 链（a.b，即 tcmsg.error.no_file 的 tcmsg.error）——
-                // 后两者是点分/单段命名空间的语法形态。全名 = 路径段::方法名
-                // （如 tcmsg::error.no_file() → "tcmsg::error::no_file"）。
-                // 记录调用表达式 → 全名映射，IR/解释层据此生成调用目标。
-                // 注意：Var/FieldAccess 只在「未绑定变量（非类实例/非变量）」时按
-                // 命名空间试探——绑定变量走实例方法，类名走静态方法。
-                let ns_prefix: Option<Vec<String>> = match receiver.as_ref() {
+                // 命名空间调用判定（M2.1.7 升级）：除了 funcs 前缀存在（原逻辑），
+                // 命中「导入视图」（别名可用前缀 / 原前缀）也算命名空间形态——
+                // 别名对应的前缀不在 funcs 表中（funcs 键是原路径全名），必须由
+                // 视图映射后才能查到。
+                let ns_segs: Option<Vec<String>> = match receiver.as_ref() {
                     Expr::Path { segments, .. } => Some(segments.clone()),
-                    Expr::Var(rname) if !scope.contains_key(rname) => {
-                        // 单段命名空间：funcs 中存在 `rname::` 前缀键即视为命名空间，
-                        // 全名缺失时由下方 get().ok_or_else 报"命名空间函数未定义"。
-                        if ns_prefix_exists(&self.result.funcs, &[rname.clone()]) {
-                            Some(vec![rname.clone()])
-                        } else {
-                            None
-                        }
-                    }
-                    // 点分命名空间链（tcmsg.error.no_file）：拍平 FieldAccess → 路径段
-                    Expr::FieldAccess { .. }
-                        if ns_path_segments(receiver, scope).is_some() =>
-                    {
-                        let segs = ns_path_segments(receiver, scope).expect("上面已确认 Some");
-                        // 存在该前缀的命名空间函数即视为命名空间调用
-                        if ns_prefix_exists(&self.result.funcs, &segs) {
-                            Some(segs)
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
+                    // Var/FieldAccess 链未绑定（非类实例/非变量）→ 命名空间形态
+                    _ => ns_path_segments(receiver, scope),
                 };
-                if let Some(segs) = ns_prefix {
-                    let mut segs = segs;
-                    segs.push(method.clone());
-                    let full = segs.join("::");
+                let import_mapped: Result<Option<Vec<String>>, SemanticError> =
+                    match &ns_segs {
+                        Some(segs) => self.map_import_prefix(segs, span),
+                        None => Ok(None),
+                    };
+                // `a::b` 路径语法本身就是命名空间形态（无歧义，无需 funcs 前缀佐证）；
+                // 点分/单段形态需要 funcs 前缀存在或命中导入视图，避免误判实例方法。
+                let is_path_form = matches!(receiver.as_ref(), Expr::Path { .. });
+                let is_ns_call = match &import_mapped {
+                    Ok(Some(_)) => true,
+                    Ok(None) => match &ns_segs {
+                        Some(segs) => is_path_form || ns_prefix_exists(&self.result.funcs, segs),
+                        None => false,
+                    },
+                    // 唯一入口违规（原前缀被别名取代）：视为命名空间调用 → 报错
+                    Err(_) => true,
+                };
+                if is_ns_call {
+                    let segs = ns_segs.expect("is_ns_call 为真时 ns_segs 必为 Some");
+                    // 导入前缀映射（别名 → 原路径；唯一入口违规在此传播报错）
+                    let mapped = match import_mapped {
+                        Ok(Some(p)) => p,
+                        Ok(None) => segs.clone(),
+                        Err(e) => return Err(e),
+                    };
+                    // 全名 = 映射后路径::方法名（如 fmt2.public_api → fmt::public_api）
+                    let mut full = mapped;
+                    full.push(method.clone());
+                    let full = full.join("::");
                     let sig = self
                         .result
                         .funcs
@@ -2253,6 +2456,8 @@ impl Analyzer {
                             span: *span,
                             message: format!("命名空间函数 '{full}' 未定义"),
                         })?;
+                    // 可见性校验（M2.1.7）：私有函数仅同命名空间内可调
+                    self.check_visibility(&full, &sig, span)?;
                     // 参数个数区间检查（默认值参数）：实参数必须在 [必选数, 总形参数] 内。
                     let required = sig
                         .param_defaults
@@ -2817,6 +3022,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::Switch(s) => s.span,
         Stmt::Import(i) => i.span,
         Stmt::Namespace(n) => n.span,
+        Stmt::Using(u) => u.span,
         Stmt::Class(c) => c.span,
         Stmt::FieldAssign(f) => f.span,
     }
@@ -3054,7 +3260,7 @@ mod tests {
         let sem = analyze_src(
             "namespace tcmsg {\n\
              \x20   namespace error {\n\
-             \x20       func no_file(langs: table) -> string {\n\
+             \x20       pub func no_file(langs: table) -> string {\n\
              \x20           return \"file not found\"\n\
              \x20       }\n\
              \x20   }\n\
@@ -3079,7 +3285,7 @@ mod tests {
         // tcmsg::error 内两个函数互调：helper() 裸调用 → 解析为 tcmsg::error::helper
         let sem = analyze_src(
             "namespace tcmsg.error {\n\
-             \x20   func no_file(langs: table) -> string {\n\
+             \x20   pub func no_file(langs: table) -> string {\n\
              \x20       return helper()\n\
              \x20   }\n\
              \x20   func helper() -> string {\n\
@@ -3200,7 +3406,7 @@ mod tests {
         // 语义层应把未绑定 Var + funcs 前缀命中识别为命名空间调用 → tcmsg::hello。
         let sem = analyze_src(
             "namespace tcmsg {\n\
-             \x20   func hello() -> string {\n\
+             \x20   pub func hello() -> string {\n\
              \x20       return \"x\"\n\
              \x20   }\n\
              }\n\
@@ -3224,7 +3430,7 @@ mod tests {
         let sem = analyze_src(
             "namespace tcmsg {\n\
              \x20   namespace error {\n\
-             \x20       func no_file() -> string {\n\
+             \x20       pub func no_file() -> string {\n\
              \x20           return \"x\"\n\
              \x20       }\n\
              \x20   }\n\
@@ -4297,6 +4503,312 @@ mod tests {
             }
             "#,
             "重复的 case 值",
+        );
+    }
+
+    // ==================== M2.1.7 单文件命名空间（pub/using/别名） ====================
+
+    /// M2.1.7 辅助：写临时文件 + import 展开 + 语义分析。
+    /// `files` 是被导入文件（名 → 内容），主源码作为 `main` 传入。
+    /// 目录用 pid + 纳秒时间戳，保证并行测试互不冲突。
+    fn expand_analyze(main: &str, files: &[(&str, &str)]) -> Result<SemanticResult, String> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("系统时间应晚于 UNIX 纪元")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tie-ns-test-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("创建临时目录失败");
+        for (name, src) in files {
+            std::fs::write(dir.join(name), src).expect("写被导入文件失败");
+        }
+        let tokens = tokenize(main).expect("词法分析失败");
+        let program = parse_program(&tokens).expect("语法分析失败");
+        let expanded = crate::imports::expand_imports(program, &dir).map_err(|e| e.message)?;
+        let result = analyze(&expanded).map_err(|e| e.message)?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(result)
+    }
+
+    #[test]
+    fn pub函数跨命名空间调用放行() {
+        // pub func：顶层 main 跨命名空间调用通过（M2.1.7 显式导出）
+        let sem = expand_analyze(
+            "import \"./tools.tie\"\n\
+             func main() {\n\
+             \x20   var s = fmt.public_api()\n\
+             \x20   println(s)\n\
+             }\n",
+            &[(
+                "tools.tie",
+                "namespace fmt {\n\
+                 \x20   pub func public_api() -> string {\n\
+                 \x20       return \"ok\"\n\
+                 \x20   }\n\
+                 }\n",
+            )],
+        )
+        .expect("pub 函数跨命名空间调用应通过");
+        assert!(sem.funcs.contains_key("fmt::public_api"));
+        assert!(
+            sem.resolved_calls.values().any(|v| v == "fmt::public_api"),
+            "调用应记录全名 fmt::public_api"
+        );
+    }
+
+    #[test]
+    fn 私有函数跨命名空间调用拦截() {
+        // 默认私有：顶层 main 跨命名空间调用命名空间内私有函数 → 报错
+        let err = expand_analyze(
+            "import \"./tools.tie\"\n\
+             func main() {\n\
+             \x20   var s = fmt.secret()\n\
+             }\n",
+            &[(
+                "tools.tie",
+                "namespace fmt {\n\
+                 \x20   func secret() -> string {\n\
+                 \x20       return \"x\"\n\
+                 \x20   }\n\
+                 }\n",
+            )],
+        )
+        .expect_err("私有函数跨命名空间调用应报错");
+        assert!(
+            err.contains("私有函数") && err.contains("fmt::secret"),
+            "错误应说明私有函数：{err}"
+        );
+    }
+
+    #[test]
+    fn 同命名空间私有互调放行() {
+        // 命名空间内私有函数互调（裸调用）：同一命名空间内不拦截
+        expand_analyze(
+            "import \"./tools.tie\"\n\
+             func main() {\n\
+             \x20   var s = fmt.entry()\n\
+             \x20   println(s)\n\
+             }\n",
+            &[(
+                "tools.tie",
+                "namespace fmt {\n\
+                 \x20   pub func entry() -> string {\n\
+                 \x20       return helper()\n\
+                 \x20   }\n\
+                 \x20   func helper() -> string {\n\
+                 \x20       return \"h\"\n\
+                 \x20   }\n\
+                 }\n",
+            )],
+        )
+        .expect("同命名空间私有互调应放行");
+    }
+
+    #[test]
+    fn using引入后裸调用补全() {
+        // using fmt; 之后 fmt 的公有函数可裸名调用（第三候选）
+        let sem = expand_analyze(
+            "import \"./tools.tie\"\n\
+             using fmt;\n\
+             func main() {\n\
+             \x20   var s = public_api()\n\
+             \x20   println(s)\n\
+             }\n",
+            &[(
+                "tools.tie",
+                "namespace fmt {\n\
+                 \x20   pub func public_api() -> string {\n\
+                 \x20       return \"ok\"\n\
+                 \x20   }\n\
+                 }\n",
+            )],
+        )
+        .expect("using 引入后裸调用应补全");
+        assert!(
+            sem.resolved_calls.values().any(|v| v == "fmt::public_api"),
+            "裸调用应记录全名 fmt::public_api"
+        );
+    }
+
+    #[test]
+    fn using目标未导入报错() {
+        // using 目标不是任何 import 引入的命名空间/别名 → 报错
+        let err = expand_analyze(
+            "import \"./tools.tie\"\n\
+             using unknown;\n\
+             func main() {\n\
+             \x20   println(1)\n\
+             }\n",
+            &[(
+                "tools.tie",
+                "namespace fmt {\n\
+                 \x20   pub func public_api() -> string {\n\
+                 \x20       return \"ok\"\n\
+                 \x20   }\n\
+                 }\n",
+            )],
+        )
+        .expect_err("using 目标未导入应报错");
+        assert!(err.contains("using 目标 'unknown' 未导入"), "错误消息：{err}");
+    }
+
+    #[test]
+    fn using重复引入报错() {
+        // 同一命名空间重复 using → 报错
+        let err = expand_analyze(
+            "import \"./tools.tie\"\n\
+             using fmt;\n\
+             using fmt;\n\
+             func main() {\n\
+             \x20   println(1)\n\
+             }\n",
+            &[(
+                "tools.tie",
+                "namespace fmt {\n\
+                 \x20   pub func public_api() -> string {\n\
+                 \x20       return \"ok\"\n\
+                 \x20   }\n\
+                 }\n",
+            )],
+        )
+        .expect_err("重复 using 应报错");
+        assert!(err.contains("重复 using"), "错误消息：{err}");
+    }
+
+    #[test]
+    fn using多候选歧义报错() {
+        // 两个 using 命名空间都含同名函数 → 裸调用歧义报错
+        let err = expand_analyze(
+            "import \"./a.tie\"\n\
+             import \"./b.tie\"\n\
+             using fa;\n\
+             using fb;\n\
+             func main() {\n\
+             \x20   var s = greet()\n\
+             }\n",
+            &[
+                (
+                    "a.tie",
+                    "namespace fa {\n\
+                     \x20   pub func greet() -> string {\n\
+                     \x20       return \"a\"\n\
+                     \x20   }\n\
+                     }\n",
+                ),
+                (
+                    "b.tie",
+                    "namespace fb {\n\
+                     \x20   pub func greet() -> string {\n\
+                     \x20       return \"b\"\n\
+                     \x20   }\n\
+                     }\n",
+                ),
+            ],
+        )
+        .expect_err("裸调用歧义应报错");
+        assert!(err.contains("有歧义"), "错误消息：{err}");
+    }
+
+    #[test]
+    fn import别名唯一入口() {
+        // import as 别名：原前缀被屏蔽（唯一入口），必须用别名访问
+        let sem = expand_analyze(
+            "import \"./tools.tie\" as f2;\n\
+             func main() {\n\
+             \x20   var s = f2.public_api()\n\
+             \x20   println(s)\n\
+             }\n",
+            &[(
+                "tools.tie",
+                "namespace fmt {\n\
+                 \x20   pub func public_api() -> string {\n\
+                 \x20       return \"ok\"\n\
+                 \x20   }\n\
+                 }\n",
+            )],
+        )
+        .expect("别名访问应通过");
+        assert!(
+            sem.resolved_calls.values().any(|v| v == "fmt::public_api"),
+            "别名调用应映射回全名 fmt::public_api"
+        );
+    }
+
+    #[test]
+    fn import别名原前缀调用报错() {
+        // 声明别名后仍用原前缀 → 唯一入口违规报错
+        let err = expand_analyze(
+            "import \"./tools.tie\" as f2;\n\
+             func main() {\n\
+             \x20   var s = fmt.public_api()\n\
+             }\n",
+            &[(
+                "tools.tie",
+                "namespace fmt {\n\
+                 \x20   pub func public_api() -> string {\n\
+                 \x20       return \"ok\"\n\
+                 \x20   }\n\
+                 }\n",
+            )],
+        )
+        .expect_err("原前缀调用应报唯一入口违规");
+        assert!(
+            err.contains("已被别名") && err.contains("f2"),
+            "错误应说明唯一入口与别名：{err}"
+        );
+    }
+
+    #[test]
+    fn import别名嵌套命名空间访问() {
+        // 别名 + 嵌套命名空间：f2.inner.deep() → fmt::inner::deep
+        let sem = expand_analyze(
+            "import \"./tools.tie\" as f2;\n\
+             func main() {\n\
+             \x20   var s = f2.inner.deep()\n\
+             \x20   println(s)\n\
+             }\n",
+            &[(
+                "tools.tie",
+                "namespace fmt {\n\
+                 \x20   namespace inner {\n\
+                 \x20       pub func deep() -> string {\n\
+                 \x20           return \"d\"\n\
+                 \x20       }\n\
+                 \x20   }\n\
+                 }\n",
+            )],
+        )
+        .expect("别名 + 嵌套命名空间调用应通过");
+        assert!(
+            sem.resolved_calls.values().any(|v| v == "fmt::inner::deep"),
+            "应映射回全名 fmt::inner::deep"
+        );
+    }
+
+    #[test]
+    fn using嵌套命名空间路径() {
+        // using fmt.inner; → inner 命名空间公有函数可裸调用
+        let sem = expand_analyze(
+            "import \"./tools.tie\"\n\
+             using fmt.inner;\n\
+             func main() {\n\
+             \x20   var s = deep()\n\
+             \x20   println(s)\n\
+             }\n",
+            &[(
+                "tools.tie",
+                "namespace fmt {\n\
+                 \x20   namespace inner {\n\
+                 \x20       pub func deep() -> string {\n\
+                 \x20           return \"d\"\n\
+                 \x20       }\n\
+                 \x20   }\n\
+                 }\n",
+            )],
+        )
+        .expect("using 嵌套命名空间裸调用应通过");
+        assert!(
+            sem.resolved_calls.values().any(|v| v == "fmt::inner::deep"),
+            "裸调用应记录全名 fmt::inner::deep"
         );
     }
 }

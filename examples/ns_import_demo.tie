@@ -1,0 +1,17 @@
+// tie:logic
+// tie:opt=2
+
+// ns_import_demo.tie——M2.1.7 单文件命名空间演示
+// - import as 别名（f2）：原前缀 fmt 被屏蔽（唯一入口），必须用别名访问
+// - using f2.inner：引入嵌套命名空间，其公有函数可裸调用
+// 运行：tie examples/ns_import_demo.tie
+
+import "./lib_ns_tools.tie" as f2
+using f2.inner;
+
+func main() {
+    // 别名访问：f2.public_api() → fmt::public_api（内部 helper 为私有互调）
+    println(f2.public_api())
+    // using 裸调用：deep() → fmt::inner::deep
+    println(deep())
+}

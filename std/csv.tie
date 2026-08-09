@@ -15,7 +15,7 @@ namespace csv {
 // - 空行保留为空字符串元素；文件以 \n 结尾时末尾会产生一个空元素
 //   （与 split 语义一致），调用方可按需过滤。
 // 每行内的单元格由调用方用 csv_cells(row, ",") 切分（支持任意分隔符）。
-func csv_read(path: string) -> table {
+pub func csv_read(path: string) -> table {
     var content: string = file_read(path)
     var raw = str.split(content, "\n")
     var lines = table_new_string()
@@ -30,7 +30,7 @@ func csv_read(path: string) -> table {
 
 // 把一行 CSV 文本按分隔符切分为单元格表（str.split 的别名，直接委托）；
 // sep 为空串时返回单元素 [line]。
-func csv_cells(line: string, sep: string) -> table {
+pub func csv_cells(line: string, sep: string) -> table {
     return str.split(line, sep)
 }
 
