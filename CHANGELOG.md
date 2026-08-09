@@ -3,6 +3,61 @@
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库、M3 = 预处理器自举、M4 = 标准库重构**。
 
+## [自举准备] 语言能力补足（E1/E5 + F1 + A1/A6 + C5 + D3）— 2026-08-10
+
+自举前置方案落地（见 docs/plans/self-hosting.md）：六个障碍逐个解决，
+为「前端 + IR 生成用 tie 语言重写」铺路。
+
+### 新增：循环控制 break/continue + 标签跳转（E1 + E5）
+- **词法**：`break` / `continue` 关键字（crates/tie-frontend/src/lexer.rs）；
+- **语法**：`Stmt::Break` / `Stmt::Continue` + 循环标签前缀 `L: while / L: for`
+  （parser.rs）；
+- **语义**：循环上下文栈校验——循环外 break/continue 报错、标签未匹配报错
+  （semantic.rs）；
+- **IR**：循环跳转上下文（break → exit、continue → cond/step）；for 自增抽为
+  独立 step 块（ir.rs）；
+- **解释**：Flow::Break/Continue 携带标签，循环层消费/传播（tie-interp）；
+- 示例 `examples/loop_control_demo.tie`；frontend 153 / interp 77 / llvm 38 全绿。
+
+### 修复：LLVM 后端 alloca 栈溢出（F1，0xC00000FD）
+- **根因**：循环体内生成的 alloca 指令每次迭代分配新栈空间（表读 ok 标志、
+  临时变量等），总执行量约 5-9 万次时爆 1MB 栈；
+- **修复**：`emit_alloca` 统一收集，函数体生成后拼接到 entry block（LLVM 规范）；
+  配套全局重编号 pass（编号倒挂修复：按行重映射 %N、变参 call 占 2 编号槽、
+  void 指令不编号、按函数重置编号）；
+- 验证：1000 万次循环内表读压力测试 2.2s 无栈溢出；zstd/brotli 长文本回归 PASS。
+
+### 新增：table\<T\> 类型参数（A1）+ 表实参动态表化（A6）
+- **`table<T>` 语法**：`func sum(t: table<i64>)`——函数内 `t[i]` 下标访问、
+  `len(t)`、`for x in t` 遍历的元素类型静态确定（ast/parser/semantic/ir 四层）；
+- **实参校验**：表字面量/动态表变量元素类型与 `table<T>` 一致（编译期报错）；
+- **A6 修复**：表字面量实参展开为 `tie_table_new + push` 序列再传指针——
+  消除编译路径「表参数拼接 UB（段错误）」；
+- 跨函数传表不再需要「逗号分隔字符串序列」规避（自举编译器 AST 传递基础）；
+- 示例 `examples/table_param_demo.tie`；frontend 156 / interp 78 全绿。
+
+### 优化：switch 整数 case 生成 LLVM 跳转表（C5）
+- 整数 subject + 全单值整数常量 case（无守卫）→ `switch i64 ... [ i64 v, label ]`
+  （O(1) 分派）；字符串/区间/多值/守卫保留逐 case 比较链；
+- 示例 `examples/switch_table_demo.tie`；llvm 41 测试全绿。
+
+### 新增：std/sort.tie 排序数组 + 二分查找（D3）
+- `insert_sorted_i64/string`（插入保持升序）、`contains_i64/string`（二分）、
+  `index_of_i64`、`sort_i64/string`（迭代冒泡）；
+- 示例 `examples/sort_demo.tie` 全 PASS。
+
+### 修复：中文编码缺陷（len 字节数 vs str_char 码点索引）
+- std/string.tie 的 trim/slice 边界改用 `str_len`（码点数）——中文等多字节字符
+  下尾随空白无法去除、子串错位；prep/core.tie 与 tie-prep 协议解析同步；
+- 新增 prep/test_*.tie 中文回归用例；tie-prep 12 测试全绿。
+
+### 文档
+- **docs/plans/self-hosting.md**：自举现状盘点（已自举 4 组件 vs 未自举 15.4k 行
+  Rust）+ 六个障碍决策记录 + B1 AST tag 编码规范 + C1 字符串分派模式 +
+  四阶段路线图（阶段 0：E1/E5+F1 → 阶段 1：A1/A6+D3 → 阶段 2：核心重写 →
+  阶段 3：enum+函数类型反哺）；
+- README 开发路线图更新（自举里程碑规划）。
+
 ## [Harbor M6] 包管理器 E3/E4：git/registry 源 + tie.lock + 发布/搜索 — 2026-08-09
 
 ### 目标

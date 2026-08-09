@@ -247,3 +247,20 @@ tie/
 | M4 | 标准库重构 + 扩展库分层：补全常用函数（str 大小写/join/repeat/trim_start/trim_end、math gcd/lcm/pow_i、format sprintf 占位符、csv_write、assert 浮点与字符串断言）+ 内部 using 简化 + **顶层持久变量**（var/const 全局，纯 tie 表达消息状态）+ log 增强（带参消息/级别/stderr/批量登记/多级回退，移入 **ext/** 扩展库）+ 修复 using 表元素解析/调用结果下标等编译器边界 | ✅ 完成 |
 | M5 | 动态库编译：`// tie:library` 输出 `.dll`（win）/ `.so`（linux）——库公有函数 `dllexport` 导出、跨语言调用约定（标量直传/字符串 C ABI 桥）、C 程序 LoadLibrary/dlopen 消费示例（见 docs/plans/dynamic-library.md） | 📋 规划 |
 | M6 | 包管理器（E1/E2 ✅ + E3/E4 ✅）：tie 语言自写 CLI（`pkg/main.tie` → `pkg.exe`，自举）+ tie.pkg 清单解析（`manifest.tie`）+ 三源安装（path 复制 / git 浅克隆 / registry 下载解压，`deps.tie` + `fetch.tie`）+ tie.lock 锁文件幂等恢复（`lock.tie`）+ 递归依赖解析（去重/冲突检测）+ `tie update`/`publish`（打包 tar.gz + git tag/push，`publish.tie`）/`search`/`info`（注册表查询，`search.tie`）；Rust 入口 `crates/tie` 识别 11 个子命令并转发；`init → add（path/git/registry）→ install → build/run` 端到端跑通（见 examples/pkg_demo.md） | ✅ 完成（E1–E4） |
+
+### 自举（Self-hosting，规划中）
+
+**目标**：前端（词法/语法/语义）+ IR 生成完全用 tie 语言重写，tie 编译器能编译自身。
+规划见 [docs/plans/self-hosting.md](docs/plans/self-hosting.md)。
+
+**前置能力已落地（2026-08-10）**：
+
+| 障碍 | 方案 | 状态 |
+| --- | --- | --- |
+| 无 continue/break | E1 continue/break 语句 + E5 循环标签（`L: while` / `break L`） | ✅ 完成 |
+| LLVM alloca 栈溢出（0xC00000FD） | F1 alloca 提升到 entry block + 全局重编号 | ✅ 完成 |
+| 表参数元素类型静态未知 | A1 `table<T>` 类型参数（四层支持 + 实参校验） | ✅ 完成 |
+| 表参数拼接 UB（段错误） | A6 表实参展开为动态表再传指针 | ✅ 完成 |
+| switch 线性比较链 | C5 整数 case 生成 LLVM switch 跳转表 | ✅ 完成 |
+| 字符串 id 表不可用（符号表） | D3 std/sort.tie 排序数组 + 二分查找（过渡） | ✅ 完成 |
+| 无 enum / 无函数指针 | B1 tag 表 AST + C1 字符串分派（自举期兜底，规划见文档） | 📋 规划 |
