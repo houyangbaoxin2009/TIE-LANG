@@ -151,6 +151,31 @@ pub extern "C" fn tie_parse_int(s: *const c_char, ok: *mut i8) -> i64 {
     }
 }
 
+/// C ABI 桥：解析 trit 字符串（"-1"/"0"/"1"）。成功置 ok=1 返回 -1/0/1；失败置 ok=0 返回 0。
+/// 与 parse_int 同模式（编译/解释两路径共用，保证错误文本一致）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_parse_trit(s: *const c_char, ok: *mut i8) -> i8 {
+    let parsed = match unsafe { c_char_to_string(s) } {
+        Ok(s) => match s.as_str() {
+            "-1" => Some(-1),
+            "0" => Some(0),
+            "1" => Some(1),
+            _ => None,
+        },
+        Err(_) => None,
+    };
+    match parsed {
+        Some(v) => {
+            unsafe { *ok = 1; }
+            v
+        }
+        None => {
+            unsafe { *ok = 0; }
+            0
+        }
+    }
+}
+
 /// C ABI 桥：解析 f64。成功置 `ok=1` 并返回解析值；失败置 `ok=0` 返回 0.0。
 // 解析语义与 Rust `str::parse::<f64>` 完全一致。
 #[unsafe(no_mangle)]
@@ -566,6 +591,69 @@ pub extern "C" fn tie_table_at_bool(t: *mut DynTable, i: i64, ok: *mut i8) -> i8
     }
 }
 
+// ---------- M4 补齐：动态表写入（下标赋值 t[i] = v）C ABI 桥 ----------
+//
+// 与读取桥（tie_table_at_*）对称：按元素类型写入第 i 个槽位。
+// 越界（负数或 >= len）置 ok=0 不写入（由调用方输出与读取一致的越界错误）；
+// 合法则置 ok=1 并原地写入（动态表是可变堆结构，写后表自洽）。
+
+/// C ABI 桥：写动态表第 i 个 i64 元素。越界置 ok=0，不写入。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_table_set_i64(t: *mut DynTable, i: i64, x: i64, ok: *mut i8) {
+    unsafe {
+        let tbl = &mut *t;
+        if i < 0 || i >= tbl.len {
+            *ok = 0;
+            return;
+        }
+        *ok = 1;
+        (tbl.data as *mut i64).add(i as usize).write(x);
+    }
+}
+
+/// C ABI 桥：写动态表第 i 个 f64 元素。越界置 ok=0，不写入。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_table_set_f64(t: *mut DynTable, i: i64, x: f64, ok: *mut i8) {
+    unsafe {
+        let tbl = &mut *t;
+        if i < 0 || i >= tbl.len {
+            *ok = 0;
+            return;
+        }
+        *ok = 1;
+        (tbl.data as *mut f64).add(i as usize).write(x);
+    }
+}
+
+/// C ABI 桥：写动态表第 i 个字符串元素（存借用指针，不复制——与 table_push_string
+/// 同一约定：调用方保证指针比表存活更久）。越界置 ok=0，不写入。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_table_set_string(t: *mut DynTable, i: i64, x: *const c_char, ok: *mut i8) {
+    unsafe {
+        let tbl = &mut *t;
+        if i < 0 || i >= tbl.len {
+            *ok = 0;
+            return;
+        }
+        *ok = 1;
+        (tbl.data as *mut *const c_char).add(i as usize).write(x);
+    }
+}
+
+/// C ABI 桥：写动态表第 i 个 bool 元素（C 侧按 i8）。越界置 ok=0，不写入。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_table_set_bool(t: *mut DynTable, i: i64, x: i8, ok: *mut i8) {
+    unsafe {
+        let tbl = &mut *t;
+        if i < 0 || i >= tbl.len {
+            *ok = 0;
+            return;
+        }
+        *ok = 1;
+        (tbl.data as *mut i8).add(i as usize).write(x);
+    }
+}
+
 /// C ABI 桥：列出目录中的文件名（仅文件名，不含路径），返回字符串动态表；失败返回 NULL。
 ///
 /// 实现：`std::fs::read_dir` 枚举目录（条目顺序由文件系统给出，不排序），
@@ -597,6 +685,405 @@ pub extern "C" fn tie_list_dir(path: *const c_char) -> *mut DynTable {
         tie_table_push_string(t, c.into_raw());
     }
     t
+}
+
+// ---------- M4 补齐：系统能力 floor 内置函数 C ABI 桥 ----------
+//
+// 设计说明（M6 包管理器前置）：包管理器需要「路径/环境/文件/目录/进程/网络/解压」
+// 系统能力，tie 语言自身无法自举（操作系统 API 属语言底座原语），Rust 层唯一实现，
+// 编译路径（IR 层）与解释路径（tie-interp）共用，行为逐字节一致。
+// 返回堆串的桥（string 类）沿用 read_line 模式：CString::into_raw，调用方 tie_free_result；
+// 返回 bool 的桥按 i8（0/1）传递；返回动态表的桥复用 DynTable（字符串表）约定。
+
+/// C ABI 桥：HTTP GET 指定 URL，返回响应正文（新分配堆串）；请求失败返回 NULL。
+///
+/// 首版实现：Rust std TcpStream 手写最小 HTTP/1.1 GET（零新依赖），仅支持 http://；
+/// https（TLS）留待后续（可换 reqwest）。失败（连接/解析/非 200）→ NULL，
+/// 由调用方统一输出错误消息（两路径消息一致）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_http_get(url: *const c_char) -> *mut c_char {
+    let url = match unsafe { c_char_to_string(url) } {
+        Ok(u) => u,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match http_get_impl(&url) {
+        Ok(body) => string_to_c_char(body),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// C ABI 桥：HTTP GET 下载到本地文件，成功返回 1（bool true），失败返回 0。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_http_get_file(url: *const c_char, path: *const c_char) -> i8 {
+    let url = match unsafe { c_char_to_string(url) } {
+        Ok(u) => u,
+        Err(_) => return 0,
+    };
+    let path = match unsafe { c_char_to_string(path) } {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    match http_get_impl(&url) {
+        Ok(body) => std::fs::write(&path, body).is_ok() as i8,
+        Err(_) => 0,
+    }
+}
+
+/// C ABI 桥：执行命令（整条命令行），返回退出码（启动失败返回 -1）。
+/// 跨平台：Windows 用 `cmd /C`，其他平台用 `sh -c` 包装整条命令行。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_exec_code(cmd: *const c_char) -> i64 {
+    let cmd = match unsafe { c_char_to_string(cmd) } {
+        Ok(c) => c,
+        Err(_) => return -1,
+    };
+    exec_cmd(&cmd)
+        .map(|s| s.code().unwrap_or(-1) as i64)
+        .unwrap_or(-1)
+}
+
+/// C ABI 桥：执行命令并捕获 stdout（返回新分配堆串；stderr 透传；启动失败返回空串）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_exec_output(cmd: *const c_char) -> *mut c_char {
+    let cmd = match unsafe { c_char_to_string(cmd) } {
+        Ok(c) => c,
+        Err(_) => return string_to_c_char(String::new()),
+    };
+    string_to_c_char(exec_output_impl(&cmd))
+}
+
+/// C ABI 桥：解压 tar.gz 归档到 dest 目录，成功返回 1（bool true），失败返回 0。
+/// 实现：flate2 GzDecoder 解 gzip 层 → tar Archive::unpack 解 tar 层（自动建目录）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_untar_gz(file: *const c_char, dest: *const c_char) -> i8 {
+    let file = match unsafe { c_char_to_string(file) } {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    let dest = match unsafe { c_char_to_string(dest) } {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+    let result: std::io::Result<()> = (|| {
+        // 目标目录需先存在（tar 解包不自动建根目录）；不存在则创建
+        std::fs::create_dir_all(&dest)?;
+        let f = std::fs::File::open(&file)?;
+        let gz = flate2::read::GzDecoder::new(f);
+        let mut ar = tar::Archive::new(gz);
+        ar.unpack(&dest)
+    })();
+    result.is_ok() as i8
+}
+
+/// C ABI 桥：解压 zip 归档到 dest 目录，成功返回 1（bool true），失败返回 0。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_unzip(file: *const c_char, dest: *const c_char) -> i8 {
+    let file = match unsafe { c_char_to_string(file) } {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    let dest = match unsafe { c_char_to_string(dest) } {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+    let result: Result<(), Box<dyn std::error::Error>> = (|| {
+        // 目标目录需先存在（zip extract 不自动建根目录）；不存在则创建
+        std::fs::create_dir_all(&dest)?;
+        let f = std::fs::File::open(&file)?;
+        let mut zip = zip::ZipArchive::new(f)?;
+        zip.extract(&dest)?;
+        Ok(())
+    })();
+    result.is_ok() as i8
+}
+
+/// C ABI 桥：递归创建多级目录，成功返回 1（bool true），失败返回 0。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_mkdir_all(path: *const c_char) -> i8 {
+    let path = match unsafe { c_char_to_string(path) } {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    std::fs::create_dir_all(&path).is_ok() as i8
+}
+
+/// C ABI 桥：递归删除目录（含内容），成功返回 1（bool true），失败返回 0。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_remove_dir_all(path: *const c_char) -> i8 {
+    let path = match unsafe { c_char_to_string(path) } {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    std::fs::remove_dir_all(&path).is_ok() as i8
+}
+
+/// C ABI 桥：递归复制目录（src → dest，自动建 dest），成功返回 1（bool true），失败返回 0。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_copy_dir(src: *const c_char, dest: *const c_char) -> i8 {
+    let src = match unsafe { c_char_to_string(src) } {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let dest = match unsafe { c_char_to_string(dest) } {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+    copy_dir_impl(std::path::Path::new(&src), std::path::Path::new(&dest)).is_ok() as i8
+}
+
+/// C ABI 桥：递归列出目录下全部**文件**的相对路径（字符串动态表）；目录无效返回 NULL。
+/// 复用 tie_list_dir 的字符串动态表约定（泄漏堆串作为借用元素）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_walk_dir(path: *const c_char) -> *mut DynTable {
+    let path = match unsafe { c_char_to_string(path) } {
+        Ok(p) => p,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let base = std::path::Path::new(&path);
+    let mut out: Vec<String> = Vec::new();
+    walk_dir_impl(base, base, &mut out);
+    // 目录无效（read_dir 失败 → out 为空）与空目录无法区分：用 read_dir 探测一次
+    if out.is_empty() && std::fs::read_dir(base).is_err() {
+        return std::ptr::null_mut();
+    }
+    let t = tie_table_new(8);
+    if t.is_null() {
+        return t;
+    }
+    for name in out {
+        let c = CString::new(name).unwrap_or_default();
+        tie_table_push_string(t, c.into_raw());
+    }
+    t
+}
+
+/// C ABI 桥：拼接两个路径（a + 分隔符 + b），返回新分配堆串。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_path_join(a: *const c_char, b: *const c_char) -> *mut c_char {
+    let a = unsafe { c_char_to_string(a).unwrap_or_default() };
+    let b = unsafe { c_char_to_string(b).unwrap_or_default() };
+    let p = std::path::Path::new(&a).join(&b);
+    string_to_c_char(p.to_string_lossy().into_owned())
+}
+
+/// C ABI 桥：取路径的最后一段（文件名/目录名），返回新分配堆串；无父段返回原串。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_path_basename(p: *const c_char) -> *mut c_char {
+    let p = unsafe { c_char_to_string(p).unwrap_or_default() };
+    let s = std::path::Path::new(&p)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or(p);
+    string_to_c_char(s)
+}
+
+/// C ABI 桥：取路径的父目录，返回新分配堆串；无父目录返回空串。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_path_dirname(p: *const c_char) -> *mut c_char {
+    let p = unsafe { c_char_to_string(p).unwrap_or_default() };
+    let s = std::path::Path::new(&p)
+        .parent()
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    string_to_c_char(s)
+}
+
+/// C ABI 桥：把路径转绝对路径（基于当前工作目录），返回新分配堆串；失败返回原串。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_path_abs(p: *const c_char) -> *mut c_char {
+    let p = unsafe { c_char_to_string(p).unwrap_or_default() };
+    let s = std::path::absolute(&p)
+        .map(|a| a.to_string_lossy().into_owned())
+        .unwrap_or(p);
+    string_to_c_char(s)
+}
+
+/// C ABI 桥：规范化路径（解析 . 与 .. 、合并重复分隔符），返回新分配堆串。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_path_normalize(p: *const c_char) -> *mut c_char {
+    let p = unsafe { c_char_to_string(p).unwrap_or_default() };
+    string_to_c_char(normalize_path(&p))
+}
+
+/// C ABI 桥：返回当前工作目录（新分配堆串）；获取失败返回空串。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_cwd() -> *mut c_char {
+    let s = std::env::current_dir()
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    string_to_c_char(s)
+}
+
+/// C ABI 桥：读取环境变量，返回新分配堆串；变量不存在返回空串。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_get_env(name: *const c_char) -> *mut c_char {
+    let name = unsafe { c_char_to_string(name).unwrap_or_default() };
+    let s = std::env::var(&name).unwrap_or_default();
+    string_to_c_char(s)
+}
+
+/// C ABI 桥：设置环境变量（透传给本进程与后续子进程）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_set_env(name: *const c_char, val: *const c_char) {
+    let name = unsafe { c_char_to_string(name).unwrap_or_default() };
+    let val = unsafe { c_char_to_string(val).unwrap_or_default() };
+    // 2024 edition 下 set_var 为 unsafe（多线程环境写环境变量需调用方保证单线程）
+    unsafe { std::env::set_var(name, val) };
+}
+
+/// C ABI 桥：复制文件（src → dest），成功返回 1（bool true），失败返回 0。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_file_copy(src: *const c_char, dest: *const c_char) -> i8 {
+    let src = match unsafe { c_char_to_string(src) } {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let dest = match unsafe { c_char_to_string(dest) } {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+    std::fs::copy(&src, &dest).is_ok() as i8
+}
+
+/// C ABI 桥：移动/重命名文件（src → dest），成功返回 1（bool true），失败返回 0。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_file_move(src: *const c_char, dest: *const c_char) -> i8 {
+    let src = match unsafe { c_char_to_string(src) } {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let dest = match unsafe { c_char_to_string(dest) } {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+    std::fs::rename(&src, &dest).is_ok() as i8
+}
+
+// ---------- HTTP/进程/目录/路径 内部实现（两路径共用） ----------
+
+/// 手写 HTTP/1.1 GET：仅 http://（https 留待 reqwest）。返回正文或 Err。
+fn http_get_impl(url: &str) -> Result<String, ()> {
+    use std::io::{Read, Write};
+    if !url.starts_with("http://") {
+        return Err(());
+    }
+    let rest = &url["http://".len()..];
+    // 拆 host[:port] 与 path
+    let (host_port, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match host_port.find(':') {
+        Some(i) => (
+            &host_port[..i],
+            host_port[i + 1..].parse::<u16>().unwrap_or(80),
+        ),
+        None => (host_port, 80),
+    };
+    let mut stream = std::net::TcpStream::connect((host, port)).map_err(|_| ())?;
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).map_err(|_| ())?;
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).map_err(|_| ())?;
+    let text = String::from_utf8_lossy(&resp).into_owned();
+    // 状态行需为 200（HTTP/1.1 200 / HTTP/1.0 200）
+    if !(text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200")) {
+        return Err(());
+    }
+    // 取响应头之后的正文字节（\r\n\r\n 分隔）
+    match text.find("\r\n\r\n") {
+        Some(i) => Ok(text[i + 4..].to_string()),
+        None => Err(()),
+    }
+}
+
+/// 跨平台执行命令：Windows 用 cmd /C，其他平台用 sh -c。
+#[cfg(windows)]
+fn exec_cmd(cmd: &str) -> Option<std::process::ExitStatus> {
+    std::process::Command::new("cmd").args(["/C", cmd]).status().ok()
+}
+#[cfg(not(windows))]
+fn exec_cmd(cmd: &str) -> Option<std::process::ExitStatus> {
+    std::process::Command::new("sh").args(["-c", cmd]).status().ok()
+}
+
+/// 跨平台执行命令并捕获 stdout（stderr 透传；启动失败返回空串）。
+#[cfg(windows)]
+fn exec_output_impl(cmd: &str) -> String {
+    std::process::Command::new("cmd")
+        .args(["/C", cmd])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+#[cfg(not(windows))]
+fn exec_output_impl(cmd: &str) -> String {
+    std::process::Command::new("sh")
+        .args(["-c", cmd])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+/// 递归复制目录（src 的全部内容 → dest；自动创建 dest 与子目录）。
+fn copy_dir_impl(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let src_p = entry.path();
+        let dest_p = dest.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_impl(&src_p, &dest_p)?;
+        } else if ty.is_file() {
+            std::fs::copy(&src_p, &dest_p)?;
+        }
+    }
+    Ok(())
+}
+
+/// 递归收集目录下全部文件的相对路径（相对于 base）。
+fn walk_dir_impl(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<String>) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                walk_dir_impl(&p, base, out);
+            } else if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                if let Ok(rel) = p.strip_prefix(base) {
+                    out.push(rel.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+}
+
+/// 规范化路径：解析 . 与 ..、合并重复分隔符、Windows 反斜杠统一为系统分隔符。
+fn normalize_path(p: &str) -> String {
+    let path = std::path::Path::new(p);
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // 忽略「根/前缀上的 ..」；否则弹出一段（若存在非 .. 段）
+                if matches!(
+                    parts.last(),
+                    Some(_) if !parts.last().unwrap().to_string_lossy().eq("..")
+                ) {
+                    parts.pop();
+                }
+            }
+            _ => parts.push(comp.as_os_str().to_os_string()),
+        }
+    }
+    if parts.is_empty() {
+        return ".".to_string();
+    }
+    let joined: std::path::PathBuf = parts.iter().collect();
+    joined.to_string_lossy().into_owned()
 }
 
 // ---------- P1 正则表达式 floor 内置函数 C ABI 桥 ----------
@@ -1015,7 +1502,14 @@ impl<'a> Env<'a> {
     fn exec_stmt(&mut self, stmt: &Stmt) -> Result<Flow, String> {
         match stmt {
             Stmt::VarDecl(v) => {
-                let val = self.eval_expr(&v.init)?;
+                let mut val = self.eval_expr(&v.init)?;
+                // 平衡三进制字面量适配（M4 补齐）：标注 trit 且初始化是 bool 字面量时
+                // 转换为 trit（true→+1 / false→-1）——与编译路径的字面量适配语义一致。
+                if matches!(v.ty, Some(TypeSpec::Named(TyKw::Trit)))
+                    && let Value::Bool(b) = &val
+                {
+                    val = Value::Trit(if *b { 1 } else { -1 });
+                }
                 if self.is_declared(&v.name) {
                     return Err(format!("变量 '{}' 重复声明", v.name));
                 }
@@ -1212,7 +1706,59 @@ impl<'a> Env<'a> {
                 Ok(Flow::Normal(None))
             }
             Stmt::FieldAssign(_) => Err("REPL v1 暂不支持字段赋值（类）".into()),
+            // 表下标赋值（M4 补齐）：`t[i] = v` / `t[i] += v`。
+            // target 是 Index 链：从最外层表变量逐层下钻到目标元素，写回。
+            Stmt::IndexAssign(ia) => {
+                let (target_name, mut cells, idx) = self.resolve_index_target(&ia.target)?;
+                // 越界写：负数或超出长度 → 报错（与读取越界同文本）
+                if idx < 0 || idx as usize >= cells.len() {
+                    return Err(format!(
+                        "运行时错误: table_at 下标越界：索引 {idx} 超出长度 {}",
+                        cells.len()
+                    ));
+                }
+                let ui = idx as usize;
+                // 读旧值（复合赋值用）；普通赋值直接求新值
+                let new_val = match ia.op {
+                    Some(op) => {
+                        let old = cells[ui].clone();
+                        let rv = self.eval_expr(&ia.value)?;
+                        self.eval_binary(op, old, rv)?
+                    }
+                    None => self.eval_expr(&ia.value)?,
+                };
+                cells[ui] = new_val;
+                self.assign(&target_name, Value::Table(cells))?;
+                Ok(Flow::Normal(None))
+            }
         }
+    }
+
+    /// 解析下标赋值目标 `t[i]`（M4 补齐）：返回 (表变量名, 表元素 Vec, 下标 i64)。
+    ///
+    /// 首版支持单层 `t[i]`（target 是 Index{base: Var(t), index: i}）。
+    fn resolve_index_target(
+        &mut self,
+        target: &Expr,
+    ) -> Result<(String, Vec<Value>, i64), String> {
+        let Expr::Index { base, index, .. } = target else {
+            return Err("下标赋值的目标必须是表元素访问（t[i]）".into());
+        };
+        // base 必须是表变量（单层）
+        let Expr::Var(name) = base.as_ref() else {
+            return Err("下标赋值暂只支持单层表变量（t[i]）；二维表元素暂不支持写".into());
+        };
+        let cur = self
+            .lookup(name)
+            .ok_or_else(|| format!("变量 '{name}' 未声明"))?;
+        let Value::Table(cells) = cur else {
+            return Err(format!("下标赋值的对象必须是表，实际是 {}", cur.type_name()));
+        };
+        let idx_val = self.eval_expr(index)?;
+        let Value::Int(idx) = idx_val else {
+            return Err("下标必须是整数".into());
+        };
+        Ok((name.clone(), cells, idx))
     }
 
     /// 执行语句块（压一层作用域），return 向上传播。
@@ -1240,6 +1786,8 @@ impl<'a> Env<'a> {
             Expr::StrLit(s) => Ok(Value::Str(s.clone())),
             Expr::CharLit(c) => Ok(Value::Char(*c)),
             Expr::BoolLit(b) => Ok(Value::Bool(*b)),
+            // 平衡三进制 trit 字面量（M4 补齐）
+            Expr::TritLit(v) => Ok(Value::Trit(*v)),
             Expr::Var(name) => self
                 .lookup(name)
                 .ok_or_else(|| format!("变量 '{name}' 未声明")),
@@ -1264,6 +1812,8 @@ impl<'a> Env<'a> {
                     },
                     tie_frontend::ast::UnaryOp::Not => match v {
                         Value::Bool(b) => Ok(Value::Bool(!b)),
+                        // 平衡三值逻辑非（M4 补齐）：-1↔1，0 保持
+                        Value::Trit(t) => Ok(Value::Trit(-t)),
                         _ => Err("逻辑非只能作用于布尔".into()),
                     },
                     // 自增/自减已在上方 eval_inc_dec 提前返回，此处不可达
@@ -1611,6 +2161,34 @@ impl<'a> Env<'a> {
                 | BinaryOp::Shr => Err("位运算/移位只支持整数".into()),
                 _ => Err("布尔只能做逻辑运算与相等比较".into()),
             },
+            // ---------- M4 补齐：平衡三进制 trit 运算 ----------
+            //
+            // Kleene 三值逻辑（-1=false, 0=unknown, +1=true）：
+            //   &&  = min（任一 false 则 false，否则都非 false 时取较小真值）
+            //   ||  = max（任一 true 则 true）
+            //   !   = 取反（-1↔1，0 保持）——见 eval_unary
+            // 算术（饱和/clamp 到 [-1,1]）：trit ± * trit → trit；
+            // 混合 trit × i64 → i64（sext 提升）；比较 trit vs trit/i64 → bool。
+            (Value::Trit(a), Value::Trit(b)) => match op {
+                BinaryOp::And => Ok(Value::Trit(a.min(b))),
+                BinaryOp::Or => Ok(Value::Trit(a.max(b))),
+                // i8 算术会溢出（debug panic），提升 i64 再饱和截断
+                BinaryOp::Add => Ok(Value::Trit(clamp_trit(a as i64 + b as i64))),
+                BinaryOp::Sub => Ok(Value::Trit(clamp_trit(a as i64 - b as i64))),
+                BinaryOp::Mul => Ok(Value::Trit(clamp_trit(a as i64 * b as i64))),
+                BinaryOp::Eq => Ok(Value::Bool(a == b)),
+                BinaryOp::NotEq => Ok(Value::Bool(a != b)),
+                BinaryOp::Lt => Ok(Value::Bool(a < b)),
+                BinaryOp::Gt => Ok(Value::Bool(a > b)),
+                BinaryOp::Le => Ok(Value::Bool(a <= b)),
+                BinaryOp::Ge => Ok(Value::Bool(a >= b)),
+                BinaryOp::Div | BinaryOp::Mod => Err("trit 不支持除/取模运算（三值无除法）".into()),
+                BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::Shl
+                | BinaryOp::Shr => Err("位运算/移位只支持整数".into()),
+            },
+            // trit × i64 混合：提升为 i64 算术（与编译路径 sext 一致）
+            (Value::Trit(a), Value::Int(b)) => eval_trit_int(op, a, b),
+            (Value::Int(a), Value::Trit(b)) => eval_trit_int_rev(op, a, b),
             _ => Err(format!(
                 "类型不匹配: {} {} {}",
                 l.type_name(),
@@ -1883,6 +2461,265 @@ impl<'a> Env<'a> {
                 tie_table_free(t);
                 Ok(Value::Table(cells))
             }
+            // ---------- M4 补齐：系统能力内置函数（M6 包管理器前置） ----------
+            //
+            // 与编译路径一致：走 C ABI 桥（共用同一份 Rust 实现），保证两路径行为逐字节一致。
+            // 分类：返回堆串（http_get/exec_output/path_*/cwd/get_env）调用后释放；
+            // 返回 bool（i8：http_get_file/untar_gz/unzip/mkdir_all/remove_dir_all/
+            // copy_dir/file_copy/file_move）；返回 i64（exec_code）；void（set_env）；
+            // 字符串动态表（walk_dir，复用 list_dir 的表读出模式）。
+            "http_get" => {
+                if args.len() != 1 {
+                    return Err("http_get 需要一个字符串参数".into());
+                }
+                let Value::Str(url) = &args[0] else {
+                    return Err("http_get 需要一个字符串参数".into());
+                };
+                let p = CString::new(url.as_str()).unwrap_or_default();
+                let r = tie_http_get(p.as_ptr());
+                // 失败（NULL）→ 报错（错误消息与编译路径一致）
+                if r.is_null() {
+                    return Err(format!("运行时错误: http_get 无法访问 URL '{url}'"));
+                }
+                let s = unsafe { c_char_to_string(r).unwrap_or_default() };
+                tie_free_result(r);
+                Ok(Value::Str(s))
+            }
+            "http_get_file" => {
+                if args.len() != 2 {
+                    return Err("http_get_file 需要两个字符串参数".into());
+                }
+                let (Value::Str(url), Value::Str(path)) = (&args[0], &args[1]) else {
+                    return Err("http_get_file 需要两个字符串参数".into());
+                };
+                let u = CString::new(url.as_str()).unwrap_or_default();
+                let p = CString::new(path.as_str()).unwrap_or_default();
+                Ok(Value::Bool(tie_http_get_file(u.as_ptr(), p.as_ptr()) != 0))
+            }
+            "exec_code" => {
+                if args.len() != 1 {
+                    return Err("exec_code 需要一个字符串参数".into());
+                }
+                let Value::Str(cmd) = &args[0] else {
+                    return Err("exec_code 需要一个字符串参数".into());
+                };
+                let c = CString::new(cmd.as_str()).unwrap_or_default();
+                Ok(Value::Int(tie_exec_code(c.as_ptr())))
+            }
+            "exec_output" => {
+                if args.len() != 1 {
+                    return Err("exec_output 需要一个字符串参数".into());
+                }
+                let Value::Str(cmd) = &args[0] else {
+                    return Err("exec_output 需要一个字符串参数".into());
+                };
+                let c = CString::new(cmd.as_str()).unwrap_or_default();
+                let r = tie_exec_output(c.as_ptr());
+                let s = unsafe { c_char_to_string(r).unwrap_or_default() };
+                tie_free_result(r);
+                Ok(Value::Str(s))
+            }
+            "untar_gz" => {
+                if args.len() != 2 {
+                    return Err("untar_gz 需要两个字符串参数".into());
+                }
+                let (Value::Str(file), Value::Str(dest)) = (&args[0], &args[1]) else {
+                    return Err("untar_gz 需要两个字符串参数".into());
+                };
+                let f = CString::new(file.as_str()).unwrap_or_default();
+                let d = CString::new(dest.as_str()).unwrap_or_default();
+                Ok(Value::Bool(tie_untar_gz(f.as_ptr(), d.as_ptr()) != 0))
+            }
+            "unzip" => {
+                if args.len() != 2 {
+                    return Err("unzip 需要两个字符串参数".into());
+                }
+                let (Value::Str(file), Value::Str(dest)) = (&args[0], &args[1]) else {
+                    return Err("unzip 需要两个字符串参数".into());
+                };
+                let f = CString::new(file.as_str()).unwrap_or_default();
+                let d = CString::new(dest.as_str()).unwrap_or_default();
+                Ok(Value::Bool(tie_unzip(f.as_ptr(), d.as_ptr()) != 0))
+            }
+            "mkdir_all" => {
+                if args.len() != 1 {
+                    return Err("mkdir_all 需要一个字符串参数".into());
+                }
+                let Value::Str(p) = &args[0] else {
+                    return Err("mkdir_all 需要一个字符串参数".into());
+                };
+                let p = CString::new(p.as_str()).unwrap_or_default();
+                Ok(Value::Bool(tie_mkdir_all(p.as_ptr()) != 0))
+            }
+            "remove_dir_all" => {
+                if args.len() != 1 {
+                    return Err("remove_dir_all 需要一个字符串参数".into());
+                }
+                let Value::Str(p) = &args[0] else {
+                    return Err("remove_dir_all 需要一个字符串参数".into());
+                };
+                let p = CString::new(p.as_str()).unwrap_or_default();
+                Ok(Value::Bool(tie_remove_dir_all(p.as_ptr()) != 0))
+            }
+            "copy_dir" => {
+                if args.len() != 2 {
+                    return Err("copy_dir 需要两个字符串参数".into());
+                }
+                let (Value::Str(src), Value::Str(dest)) = (&args[0], &args[1]) else {
+                    return Err("copy_dir 需要两个字符串参数".into());
+                };
+                let s = CString::new(src.as_str()).unwrap_or_default();
+                let d = CString::new(dest.as_str()).unwrap_or_default();
+                Ok(Value::Bool(tie_copy_dir(s.as_ptr(), d.as_ptr()) != 0))
+            }
+            "walk_dir" => {
+                if args.len() != 1 {
+                    return Err("walk_dir 需要一个字符串参数".into());
+                }
+                let Value::Str(path) = &args[0] else {
+                    return Err("walk_dir 需要一个字符串参数".into());
+                };
+                let p = CString::new(path.as_str()).unwrap_or_default();
+                let t = tie_walk_dir(p.as_ptr());
+                // 失败（NULL）→ 报错（错误消息与编译路径一致）
+                if t.is_null() {
+                    return Err(format!("运行时错误: walk_dir 无法读取目录 '{path}'"));
+                }
+                // 读出全部条目（元素类型 string，data 缓冲区为 *const c_char 数组）
+                let mut cells: Vec<Value> = Vec::new();
+                unsafe {
+                    let tbl = &*t;
+                    for i in 0..tbl.len {
+                        let ptr = (tbl.data as *const *const c_char).add(i as usize).read();
+                        cells.push(Value::Str(c_char_to_string(ptr).unwrap_or_default()));
+                    }
+                }
+                // 释放桥表（指针数组 + 结构体；字符串元素按约定泄漏，不重复释放）
+                tie_table_free(t);
+                Ok(Value::Table(cells))
+            }
+            "path_join" => {
+                if args.len() != 2 {
+                    return Err("path_join 需要两个字符串参数".into());
+                }
+                let (Value::Str(a), Value::Str(b)) = (&args[0], &args[1]) else {
+                    return Err("path_join 需要两个字符串参数".into());
+                };
+                let a = CString::new(a.as_str()).unwrap_or_default();
+                let b = CString::new(b.as_str()).unwrap_or_default();
+                let r = tie_path_join(a.as_ptr(), b.as_ptr());
+                let s = unsafe { c_char_to_string(r).unwrap_or_default() };
+                tie_free_result(r);
+                Ok(Value::Str(s))
+            }
+            "path_basename" => {
+                if args.len() != 1 {
+                    return Err("path_basename 需要一个字符串参数".into());
+                }
+                let Value::Str(p) = &args[0] else {
+                    return Err("path_basename 需要一个字符串参数".into());
+                };
+                let p = CString::new(p.as_str()).unwrap_or_default();
+                let r = tie_path_basename(p.as_ptr());
+                let s = unsafe { c_char_to_string(r).unwrap_or_default() };
+                tie_free_result(r);
+                Ok(Value::Str(s))
+            }
+            "path_dirname" => {
+                if args.len() != 1 {
+                    return Err("path_dirname 需要一个字符串参数".into());
+                }
+                let Value::Str(p) = &args[0] else {
+                    return Err("path_dirname 需要一个字符串参数".into());
+                };
+                let p = CString::new(p.as_str()).unwrap_or_default();
+                let r = tie_path_dirname(p.as_ptr());
+                let s = unsafe { c_char_to_string(r).unwrap_or_default() };
+                tie_free_result(r);
+                Ok(Value::Str(s))
+            }
+            "path_abs" => {
+                if args.len() != 1 {
+                    return Err("path_abs 需要一个字符串参数".into());
+                }
+                let Value::Str(p) = &args[0] else {
+                    return Err("path_abs 需要一个字符串参数".into());
+                };
+                let p = CString::new(p.as_str()).unwrap_or_default();
+                let r = tie_path_abs(p.as_ptr());
+                let s = unsafe { c_char_to_string(r).unwrap_or_default() };
+                tie_free_result(r);
+                Ok(Value::Str(s))
+            }
+            "path_normalize" => {
+                if args.len() != 1 {
+                    return Err("path_normalize 需要一个字符串参数".into());
+                }
+                let Value::Str(p) = &args[0] else {
+                    return Err("path_normalize 需要一个字符串参数".into());
+                };
+                let p = CString::new(p.as_str()).unwrap_or_default();
+                let r = tie_path_normalize(p.as_ptr());
+                let s = unsafe { c_char_to_string(r).unwrap_or_default() };
+                tie_free_result(r);
+                Ok(Value::Str(s))
+            }
+            "cwd" => {
+                if !args.is_empty() {
+                    return Err("cwd 不需要参数".into());
+                }
+                let r = tie_cwd();
+                let s = unsafe { c_char_to_string(r).unwrap_or_default() };
+                tie_free_result(r);
+                Ok(Value::Str(s))
+            }
+            "get_env" => {
+                if args.len() != 1 {
+                    return Err("get_env 需要一个字符串参数".into());
+                }
+                let Value::Str(n) = &args[0] else {
+                    return Err("get_env 需要一个字符串参数".into());
+                };
+                let n = CString::new(n.as_str()).unwrap_or_default();
+                let r = tie_get_env(n.as_ptr());
+                let s = unsafe { c_char_to_string(r).unwrap_or_default() };
+                tie_free_result(r);
+                Ok(Value::Str(s))
+            }
+            "set_env" => {
+                if args.len() != 2 {
+                    return Err("set_env 需要两个字符串参数".into());
+                }
+                let (Value::Str(n), Value::Str(v)) = (&args[0], &args[1]) else {
+                    return Err("set_env 需要两个字符串参数".into());
+                };
+                let n = CString::new(n.as_str()).unwrap_or_default();
+                let v = CString::new(v.as_str()).unwrap_or_default();
+                tie_set_env(n.as_ptr(), v.as_ptr());
+                Ok(Value::Void)
+            }
+            "file_copy" => {
+                if args.len() != 2 {
+                    return Err("file_copy 需要两个字符串参数".into());
+                }
+                let (Value::Str(src), Value::Str(dest)) = (&args[0], &args[1]) else {
+                    return Err("file_copy 需要两个字符串参数".into());
+                };
+                let s = CString::new(src.as_str()).unwrap_or_default();
+                let d = CString::new(dest.as_str()).unwrap_or_default();
+                Ok(Value::Bool(tie_file_copy(s.as_ptr(), d.as_ptr()) != 0))
+            }
+            "file_move" => {
+                if args.len() != 2 {
+                    return Err("file_move 需要两个字符串参数".into());
+                }
+                let (Value::Str(src), Value::Str(dest)) = (&args[0], &args[1]) else {
+                    return Err("file_move 需要两个字符串参数".into());
+                };
+                let s = CString::new(src.as_str()).unwrap_or_default();
+                let d = CString::new(dest.as_str()).unwrap_or_default();
+                Ok(Value::Bool(tie_file_move(s.as_ptr(), d.as_ptr()) != 0))
+            }
             // ---------- P1 正则表达式内置函数 ----------
             //
             // 与编译路径一致：走 C ABI 桥（共用 regex crate 实现），保证两路径行为逐字节一致。
@@ -2006,9 +2843,11 @@ impl<'a> Env<'a> {
                     return Err("to_string 需要一个数字参数".into());
                 }
                 // 数字重载：整数走 i64 桥，浮点走 f64 桥（与编译路径按实参类型分派一致）
+                // 平衡三进制（M4 补齐）：trit → "-1"/"0"/"1"（与编译路径 i8 格式化一致）
                 let r = match &args[0] {
                     Value::Int(n) => tie_to_string_i64(*n),
                     Value::Float(f) => tie_to_string_f64(*f),
+                    Value::Trit(t) => string_to_c_char(t.to_string()),
                     _ => return Err("to_string 需要一个数字参数".into()),
                 };
                 let s = unsafe { c_char_to_string(r).unwrap_or_default() };
@@ -2046,6 +2885,25 @@ impl<'a> Env<'a> {
                     return Err(format!("运行时错误: parse_float 参数 '{s}' 不是合法的浮点数"));
                 }
                 Ok(Value::Float(v))
+            }
+            // 平衡三进制解析（M4 补齐）：接受 "-1"/"0"/"1"，非法输入报错
+            //（走 C ABI 桥，与编译路径共用同一份 Rust 实现，错误文本一致）。
+            "parse_trit" => {
+                if args.len() != 1 {
+                    return Err("parse_trit 需要一个字符串参数".into());
+                }
+                let Value::Str(s) = &args[0] else {
+                    return Err("parse_trit 需要一个字符串参数".into());
+                };
+                let mut ok: i8 = 0;
+                let p = CString::new(s.as_str()).unwrap_or_default();
+                let v = tie_parse_trit(p.as_ptr(), &mut ok);
+                if ok == 0 {
+                    return Err(format!(
+                        "运行时错误: parse_trit 参数 '{s}' 不是合法的 trit（期望 -1/0/1）"
+                    ));
+                }
+                Ok(Value::Trit(v))
             }
             // 进程控制：exit 刷新 stdout 后终止进程（编译路径：fflush + libc exit）。
             "exit" => {
@@ -2215,6 +3073,8 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Bool(bool),
+    /// 平衡三进制 trit（M4 补齐）：值域 -1/0/+1
+    Trit(i8),
     Char(char),
     Str(String),
     /// 范围 `start..end`（for 迭代用）
@@ -2232,6 +3092,7 @@ impl Value {
             Value::Int(_) => "整数",
             Value::Float(_) => "浮点数",
             Value::Bool(_) => "布尔",
+            Value::Trit(_) => "trit",
             Value::Char(_) => "字符",
             Value::Str(_) => "字符串",
             Value::Range(_, _) => "范围",
@@ -2254,6 +3115,8 @@ impl Value {
             Value::Int(n) => n.to_string(),
             Value::Float(f) => f.to_string(),
             Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+            // 平衡三进制：-1/0/1（编译路径 i8 格式化一致）
+            Value::Trit(t) => t.to_string(),
             Value::Char(c) => c.to_string(),
             Value::Str(s) => s.clone(),
             Value::Range(s, e) => format!("{s}..{e}"),
@@ -2288,6 +3151,8 @@ fn value_matches_ty(v: &Value, ty: &TypeSpec) -> bool {
         // 浮点：全部归为 Value::Float
         TypeSpec::Named(TyKw::F32 | TyKw::F64) => matches!(v, Value::Float(_)),
         TypeSpec::Named(TyKw::Bool) => matches!(v, Value::Bool(_)),
+        // 平衡三进制 trit（M4 补齐）：switch 的 case trit: 匹配 Value::Trit
+        TypeSpec::Named(TyKw::Trit) => matches!(v, Value::Trit(_)),
         TypeSpec::Named(TyKw::Char) => matches!(v, Value::Char(_)),
         TypeSpec::Named(TyKw::Str) => matches!(v, Value::Str(_)),
         TypeSpec::Named(TyKw::Table) => matches!(v, Value::Table(_)),
@@ -2302,6 +3167,75 @@ fn value_matches_ty(v: &Value, ty: &TypeSpec) -> bool {
         // code 是编译期概念，interp 无对应值；元组/类暂不支持
         TypeSpec::Named(TyKw::Code) | TypeSpec::Tuple(_) | TypeSpec::Struct(_) => false,
     }
+}
+
+/// 把 i64 运算结果饱和截断到 trit 值域 [-1, 1]（Kleene 饱和算术）。
+fn clamp_trit(v: i64) -> i8 {
+    if v < -1 {
+        -1
+    } else if v > 1 {
+        1
+    } else {
+        v as i8
+    }
+}
+
+/// trit 与 i64 的混合运算（M4 补齐）：trit 提升为 i64（sext）后做整数运算。
+///
+/// 参数顺序：`trit` 值在前（a 是 trit，b 是 i64）。交换律运算符（+ * == !=）
+/// 对顺序无感；非交换（- < > <= >=）由调用方按「trit op i64 / i64 op trit」
+/// 调整实参顺序后调用。
+fn eval_trit_int(
+    op: tie_frontend::ast::BinaryOp,
+    a: i8,
+    b: i64,
+) -> Result<Value, String> {
+    use tie_frontend::ast::BinaryOp;
+    let ai = a as i64;
+    Ok(match op {
+        BinaryOp::Add => Value::Int(ai + b),
+        BinaryOp::Sub => Value::Int(ai - b),
+        BinaryOp::Mul => Value::Int(ai * b),
+        BinaryOp::Eq => Value::Bool(ai == b),
+        BinaryOp::NotEq => Value::Bool(ai != b),
+        BinaryOp::Lt => Value::Bool(ai < b),
+        BinaryOp::Gt => Value::Bool(ai > b),
+        BinaryOp::Le => Value::Bool(ai <= b),
+        BinaryOp::Ge => Value::Bool(ai >= b),
+        _ => {
+            return Err(format!(
+                "trit 与 i64 不支持该运算: {}",
+                op_display(op)
+            ))
+        }
+    })
+}
+
+/// i64 与 trit 的混合运算（i64 在前，如 `5 - trit`）：按 i64 op trit 语义计算。
+fn eval_trit_int_rev(
+    op: tie_frontend::ast::BinaryOp,
+    a: i64,
+    b: i8,
+) -> Result<Value, String> {
+    use tie_frontend::ast::BinaryOp;
+    let bi = b as i64;
+    Ok(match op {
+        BinaryOp::Add => Value::Int(a + bi),
+        BinaryOp::Sub => Value::Int(a - bi),
+        BinaryOp::Mul => Value::Int(a * bi),
+        BinaryOp::Eq => Value::Bool(a == bi),
+        BinaryOp::NotEq => Value::Bool(a != bi),
+        BinaryOp::Lt => Value::Bool(a < bi),
+        BinaryOp::Gt => Value::Bool(a > bi),
+        BinaryOp::Le => Value::Bool(a <= bi),
+        BinaryOp::Ge => Value::Bool(a >= bi),
+        _ => {
+            return Err(format!(
+                "i64 与 trit 不支持该运算: {}",
+                op_display(op)
+            ))
+        }
+    })
 }
 
 /// 运算符的可读名称（错误提示用）。
@@ -2635,6 +3569,25 @@ mod tests {
         assert_eq!(ev("\"foo\" + \"bar\"").unwrap(), "foobar");
     }
 
+    // ---------- M4 补齐：表下标赋值测试 ----------
+
+    #[test]
+    fn 表下标赋值动态表读写() {
+        // 动态表：table_new + push → 下标赋值 → 读取
+        assert_eq!(
+            ev("var t = table_new_i64(); table_push(t, 10); table_push(t, 20); t[0] = 99; t[0]").unwrap(),
+            "99"
+        );
+        // 复合下标赋值 t[i] += v
+        assert_eq!(
+            ev("var t = table_new_i64(); table_push(t, 5); t[0] += 3; t[0]").unwrap(),
+            "8"
+        );
+        // 越界写 → 运行时错误
+        let err = ev("var t = table_new_i64(); table_push(t, 1); t[5] = 9").unwrap_err();
+        assert!(err.contains("下标越界"), "错误消息：{err}");
+    }
+
     #[test]
     fn eval_compare() {
         assert_eq!(ev("1 < 2").unwrap(), "true");
@@ -2794,6 +3747,58 @@ mod tests {
         p.to_str().unwrap().replace('\\', "\\\\")
     }
 
+    // ---------- M4 补齐：trit 平衡三进制测试 ----------
+
+    #[test]
+    fn trit字面量与格式化() {
+        // zero → trit 0；to_print_string → "0"；to_string(trit) → "-1"/"0"/"1"
+        assert_eq!(ev("zero").unwrap(), "0");
+        assert_eq!(ev("to_string(zero)").unwrap(), "0");
+        assert_eq!(ev("to_string(parse_trit(\"1\"))").unwrap(), "1");
+        assert_eq!(ev("to_string(parse_trit(\"-1\"))").unwrap(), "-1");
+        // parse_trit 非法输入 → 运行时错误
+        let err = ev("parse_trit(\"2\")").unwrap_err();
+        assert!(err.contains("不是合法的 trit"), "错误消息：{err}");
+    }
+
+    #[test]
+    fn tritKleene三值逻辑真值表() {
+        // Kleene && = min，|| = max；! = 取反
+        // true(1)/zero(0)/false(-1) 全 9 组验证
+        // &&：1&&1=1, 1&&0=0, 1&&-1=-1, 0&&0=0, 0&&-1=-1, -1&&-1=-1
+        assert_eq!(ev("var a: trit = true; var b: trit = true; to_string(a && b)").unwrap(), "1");
+        assert_eq!(ev("var a: trit = true; var b: trit = zero; to_string(a && b)").unwrap(), "0");
+        assert_eq!(ev("var a: trit = true; var b: trit = false; to_string(a && b)").unwrap(), "-1");
+        assert_eq!(ev("var a: trit = zero; var b: trit = false; to_string(a && b)").unwrap(), "-1");
+        // ||：1||-1=1, 0||-1=0（max），-1||-1=-1
+        assert_eq!(ev("var a: trit = false; var b: trit = true; to_string(a || b)").unwrap(), "1");
+        assert_eq!(ev("var a: trit = false; var b: trit = zero; to_string(a || b)").unwrap(), "0");
+        assert_eq!(ev("var a: trit = false; var b: trit = false; to_string(a || b)").unwrap(), "-1");
+        // !：!1=-1, !-1=1, !0=0
+        assert_eq!(ev("var a: trit = true; to_string(!a)").unwrap(), "-1");
+        assert_eq!(ev("var a: trit = false; to_string(!a)").unwrap(), "1");
+        assert_eq!(ev("var a: trit = zero; to_string(!a)").unwrap(), "0");
+    }
+
+    #[test]
+    fn trit算术饱和与i64混合() {
+        // trit 饱和算术：1+1=1（clamp）、1+0=1、1-1=0、1*1=1
+        assert_eq!(ev("var a: trit = true; var b: trit = true; to_string(a + b)").unwrap(), "1");
+        assert_eq!(ev("var a: trit = true; var b: trit = false; to_string(a - b)").unwrap(), "1");
+        assert_eq!(ev("var a: trit = true; var b: trit = true; to_string(a * b)").unwrap(), "1");
+        assert_eq!(ev("var a: trit = true; var b: trit = true; to_string(a - b)").unwrap(), "0");
+        // trit + i64 → i64（sext 提升）
+        assert_eq!(ev("var a: trit = true; to_string(a + 5)").unwrap(), "6");
+        assert_eq!(ev("var a: trit = false; to_string(5 + a)").unwrap(), "4");
+        // 比较：trit vs trit / i64 → bool
+        assert_eq!(ev("var a: trit = true; var b: trit = false; (a > b) ? \"1\" : \"0\"").unwrap(), "1");
+        assert_eq!(ev("var a: trit = true; (a == 1) ? \"1\" : \"0\"").unwrap(), "1");
+        assert_eq!(ev("var a: trit = false; (a == 1) ? \"1\" : \"0\"").unwrap(), "0");
+        // trit 除法 → 错误
+        let err = ev("var a: trit = true; var b: trit = true; to_string(a / b)").unwrap_err();
+        assert!(err.contains("trit 不支持除"), "错误消息：{err}");
+    }
+
     #[test]
     fn builtin_file_write_read_roundtrip() {
         let p = temp_path("roundtrip.txt");
@@ -2911,6 +3916,173 @@ to_string(n) + ":" + names"#
         let path = escaped_path(&dir);
         let err = ev(&format!("list_dir(\"{path}\")")).unwrap_err();
         assert!(err.contains("运行时错误: list_dir 无法读取目录"));
+    }
+
+    // ---------- M4 补齐：系统能力内置函数测试 ----------
+
+    #[test]
+    fn builtin_path_join_basename_dirname() {
+        // 拼接路径：a + 分隔符 + b（平台分隔符由 Rust Path::join 决定）
+        let p = ev("path_join(\"a\", \"b\")").unwrap();
+        assert!(p == "a\\b" || p == "a/b");
+        // 空段拼接
+        let p2 = ev("path_join(\"a\", \"\")").unwrap();
+        assert!(p2 == "a\\" || p2 == "a/");
+        // basename：取最后一段
+        assert_eq!(ev("path_basename(\"a/b/c.txt\")").unwrap(), "c.txt");
+        assert_eq!(ev("path_basename(\"c.txt\")").unwrap(), "c.txt");
+        // dirname：取父目录
+        let d = ev("path_dirname(\"a/b/c.txt\")").unwrap();
+        assert!(d == "a\\b" || d == "a/b");
+        // dirname 无父段 → 空串
+        assert_eq!(ev("path_dirname(\"c.txt\")").unwrap(), "");
+    }
+
+    #[test]
+    fn builtin_path_abs_normalize_cwd() {
+        // 绝对化：相对路径 → 以当前工作目录为基的绝对路径
+        let abs = ev("path_abs(\"x.txt\")").unwrap();
+        let cwd = ev("cwd()").unwrap();
+        assert!(abs.starts_with(&cwd));
+        // cwd 非空且含路径分隔符（Windows 含盘符）
+        assert!(!cwd.is_empty());
+        // normalize：解析 . 与 ..
+        let n = ev("path_normalize(\"a/./b/../c\")").unwrap();
+        assert!(n == "a\\c" || n == "a/c");
+        // normalize 已规范化路径保持不变
+        let n2 = ev("path_normalize(\"abc\")").unwrap();
+        assert_eq!(n2, "abc");
+    }
+
+    #[test]
+    fn builtin_env_get_set() {
+        // set 后 get 立即读到（同一进程内）
+        let code = "set_env(\"TIE_TEST_VAR\", \"hello\"); get_env(\"TIE_TEST_VAR\")";
+        assert_eq!(ev(code).unwrap(), "hello");
+        // 不存在的变量 → 空串
+        assert_eq!(ev("get_env(\"TIE_NO_SUCH_VAR_XYZ\")").unwrap(), "");
+        // set 空值 → 读取空串（非删除）
+        let code2 = "set_env(\"TIE_TEST_VAR\", \"\"); get_env(\"TIE_TEST_VAR\")";
+        assert_eq!(ev(code2).unwrap(), "");
+    }
+
+    #[test]
+    fn builtin_exec_code_output() {
+        // 执行命令取退出码：平台无关的无操作命令（Windows cmd /C exit /b 0）
+        let ok = if cfg!(windows) {
+            ev("exec_code(\"exit /b 0\")").unwrap()
+        } else {
+            ev("exec_code(\"true\")").unwrap()
+        };
+        assert_eq!(ok, "0");
+        // exec_output 捕获 stdout：Windows 用 cmd echo，其他平台用 sh echo
+        let out = ev("exec_output(\"echo hello\")").unwrap();
+        assert!(out.contains("hello"));
+    }
+
+    #[test]
+    fn builtin_file_copy_move_delete() {
+        let src = temp_path("copy_src.txt");
+        let dst = temp_path("copy_dst.txt");
+        let src_s = escaped_path(&src);
+        let dst_s = escaped_path(&dst);
+        // 写源文件 → 复制 → 目标内容一致
+        let code = format!(
+            "file_write(\"{src_s}\", \"abc\"); file_copy(\"{src_s}\", \"{dst_s}\"); file_read(\"{dst_s}\")"
+        );
+        assert_eq!(ev(&code).unwrap(), "abc");
+        // 移动：源消失、目标存在
+        let moved = temp_path("move_dst.txt");
+        let moved_s = escaped_path(&moved);
+        let code2 = format!("file_move(\"{dst_s}\", \"{moved_s}\"); (file_exists(\"{dst_s}\") ? \"0\" : \"1\") + (file_exists(\"{moved_s}\") ? \"1\" : \"0\")");
+        assert_eq!(ev(&code2).unwrap(), "11");
+        let _ = std::fs::remove_file(&moved);
+    }
+
+    #[test]
+    fn builtin_dir_operations_and_walk() {
+        // 建多级目录 → 存在；写文件 → walk_dir 递归列出相对路径
+        let dir = temp_dir_path("walk");
+        let sub = dir.join("a").join("b");
+        let sub_s = escaped_path(&sub);
+        let code = format!(
+            "var m = mkdir_all(\"{sub_s}\"); var f = file_write(path_join(\"{sub_s}\", \"x.txt\"), \"1\"); var w = walk_dir(\"{sub_s}\"); (m ? \"1\" : \"0\") + (f ? \"1\" : \"0\") + \":\" + to_string(len(w))"
+        );
+        let out = ev(&code).unwrap();
+        assert!(out.starts_with("11:1"), "实际输出: {out}");
+        // walk_dir 无效目录 → 运行时错误
+        let missing = temp_dir_path("walk_missing");
+        let missing_s = escaped_path(&missing);
+        let err = ev(&format!("walk_dir(\"{missing_s}\")")).unwrap_err();
+        assert!(err.contains("运行时错误: walk_dir 无法读取目录"));
+        // remove_dir_all 递归删除
+        let del = format!("remove_dir_all(\"{sub_s}\")");
+        assert_eq!(ev(&del).unwrap(), "true");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_untar_gz_roundtrip() {
+        // 构造 tar.gz 归档（Rust 侧）→ untar_gz 解压 → 文件内容一致
+        let dir = temp_dir_path("tar");
+        // 先建归档目录（inner.txt 与 a.tar.gz 均在 dir 下）
+        std::fs::create_dir_all(&dir).unwrap();
+        let inner = dir.join("inner.txt");
+        std::fs::write(&inner, "tar-content").unwrap();
+        let tar_path = dir.join("a.tar.gz");
+        let tar_s = escaped_path(&tar_path);
+        let dest = temp_dir_path("tar_out");
+        let dest_s = escaped_path(&dest);
+        // 生成 tar.gz
+        let file = std::fs::File::create(&tar_path).unwrap();
+        let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut ar = tar::Builder::new(enc);
+        ar.append_path_with_name(&inner, "inner.txt").unwrap();
+        ar.into_inner().unwrap().finish().unwrap();
+        // untar_gz 解压到 dest
+        let code = format!("untar_gz(\"{tar_s}\", \"{dest_s}\")");
+        assert_eq!(ev(&code).unwrap(), "true");
+        // 解压后文件内容一致
+        let out = dest.join("inner.txt");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "tar-content");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn builtin_unzip_roundtrip() {
+        // 构造 zip 归档（Rust 侧）→ unzip 解压 → 文件内容一致
+        let dir = temp_dir_path("zip");
+        // 先建归档目录（z.txt 与 a.zip 均在 dir 下）
+        std::fs::create_dir_all(&dir).unwrap();
+        let inner = dir.join("z.txt");
+        std::fs::write(&inner, "zip-content").unwrap();
+        let zip_path = dir.join("a.zip");
+        let zip_s = escaped_path(&zip_path);
+        let dest = temp_dir_path("zip_out");
+        let dest_s = escaped_path(&dest);
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut w = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default();
+            w.start_file("z.txt", opts).unwrap();
+            std::io::Write::write_all(&mut w, b"zip-content").unwrap();
+            w.finish().unwrap();
+        }
+        let code = format!("unzip(\"{zip_s}\", \"{dest_s}\")");
+        assert_eq!(ev(&code).unwrap(), "true");
+        let out = dest.join("z.txt");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "zip-content");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn builtin_http_get_failure_errors() {
+        // 无网络依赖的可测路径：非法协议 / 连接失败 → 运行时错误
+        // （http_get 仅支持 http://；https 与无法连接均报错，文本与编译路径一致）
+        let err = ev("http_get(\"https://example.com\")").unwrap_err();
+        assert!(err.contains("运行时错误: http_get 无法访问 URL"));
     }
 
     #[test]

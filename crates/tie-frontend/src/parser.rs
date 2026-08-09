@@ -7,9 +7,9 @@
 
 use super::ast::{
     AssignStmt, BinaryOp, ClassField, Expr, ExprStmt, FieldAssignStmt, FnDefStmt, ForStmt,
-    IfStmt, ImportStmt, NamespaceStmt, Param, Program, ReturnStmt, Stmt, StructDefStmt,
-    SwitchCase, SwitchStmt, TableCell, TableId, TupleField, TypeSpec, UnaryOp, UsingStmt,
-    VarDeclStmt, WhileStmt,
+    IfStmt, ImportStmt, IndexAssignStmt, NamespaceStmt, Param, Program, ReturnStmt, Stmt,
+    StructDefStmt, SwitchCase, SwitchStmt, TableCell, TableId, TupleField, TypeSpec, UnaryOp,
+    UsingStmt, VarDeclStmt, WhileStmt,
 };
 use super::lexer::{Span, Token, TokenKind, TyKw};
 use std::fmt;
@@ -281,6 +281,19 @@ impl<'a> Parser<'a> {
         let expr = self.parse_expr()?;
         if let Some(op) = self.eat_assign_op() {
             match &expr {
+                // 表下标赋值（M4 补齐）：`t[i] op= v` / `t[i][j] op= v`（target 是 Index 链）。
+                // 语义层校验 base 是表变量且可寻址；此处语法层放行任意 Index 链。
+                Expr::Index { .. } => {
+                    let value = self.parse_expr()?;
+                    let ispan = expr_span(&expr).unwrap_or(self.peek().span);
+                    self.expect(TokenKind::Semi, "语句结束符")?;
+                    return Ok(Stmt::IndexAssign(IndexAssignStmt {
+                        target: Box::new(expr),
+                        op,
+                        value,
+                        span: ispan,
+                    }));
+                }
                 // base 必须可寻址：变量/this 或 FieldAccess 链（`obj.a.b = v`）
                 Expr::FieldAccess { base, field, span } if is_addressable_base(base) => {
                     let value = self.parse_expr()?;
@@ -1025,6 +1038,12 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(Expr::BoolLit(false))
             }
+            // 平衡三进制 trit 零值（M4 补齐）：zero → TritLit(0)。
+            // 正/负值由语义层把 true/false 适配为 TritLit(±1)（按目标类型）。
+            TokenKind::Zero => {
+                self.advance();
+                Ok(Expr::TritLit(0))
+            }
             TokenKind::Ident(name) => {
                 self.advance();
                 // 命名空间路径：`a::b::c`（`::` 分隔，C#/Rust 风格）。
@@ -1266,6 +1285,54 @@ mod tests {
     fn parse_err(src: &str) -> ParseError {
         let tokens = tokenize(src).expect("词法分析应成功");
         parse_program(&tokens).expect_err("语法分析应失败")
+    }
+
+    // ---------- M4 补齐：trit 字面量解析 ----------
+
+    /// `zero` → TritLit(0)；true/false 仍为 BoolLit；trit 类型标注可解析。
+    #[test]
+    fn trit字面量zero解析为TritLit() {
+        let prog = parse("func main() {\n    var t = zero\n}\n");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::VarDecl(v) = &f.body[0] else { panic!("期望变量声明") };
+        assert!(matches!(v.init, Expr::TritLit(0)), "zero 应解析为 TritLit(0)");
+    }
+
+    /// `var t: trit = true` 语法层面可解析（字面量适配由语义层完成）。
+    #[test]
+    fn trit类型标注与true赋值解析() {
+        let prog = parse("func main() {\n    var t: trit = true\n}\n");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::VarDecl(v) = &f.body[0] else { panic!("期望变量声明") };
+        // true 仍是 BoolLit（语义层按目标类型 trit 适配为 +1）
+        assert!(matches!(v.init, Expr::BoolLit(true)));
+        // 显式类型标注保留 trit
+        let ty = v.ty.as_ref().expect("应有类型标注");
+        assert_eq!(ty, &TypeSpec::Named(TyKw::Trit));
+    }
+
+    // ---------- M4 补齐：表下标赋值解析 ----------
+
+    /// `t[0] = v` / `t[i] += v` / `t[i][j] = v` 解析为 IndexAssign。
+    #[test]
+    fn 表下标赋值解析为IndexAssign() {
+        let prog = parse("func main() {\n    t[0] = 9\n}\n");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::IndexAssign(ia) = &f.body[0] else { panic!("期望 IndexAssign，实际 {:#?}", f.body[0]) };
+        assert!(ia.op.is_none(), "普通赋值 op 为 None");
+        assert!(matches!(ia.target.as_ref(), Expr::Index { .. }));
+
+        // 复合赋值
+        let prog = parse("func main() {\n    t[i] += 1\n}\n");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::IndexAssign(ia) = &f.body[0] else { panic!("期望 IndexAssign") };
+        assert!(ia.op.is_some(), "复合赋值 op 为 Some");
+
+        // 二维下标
+        let prog = parse("func main() {\n    m[i][j] = 1\n}\n");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::IndexAssign(ia) = &f.body[0] else { panic!("期望 IndexAssign") };
+        assert!(matches!(ia.target.as_ref(), Expr::Index { .. }));
     }
 
     #[test]

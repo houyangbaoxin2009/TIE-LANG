@@ -21,6 +21,13 @@ tie-frontend = { path = "../tie-frontend" }
 # 正则表达式引擎（P1 语言底座原语）：regex crate 提供 RE2 风格无回溯匹配，
 # 编译/解释两路径共用；tie 语言本身无法自举正则引擎，属 Rust 底座原语。
 regex = "1"
+# M4 补齐（M6 包管理器前置）语言底座原语：
+# - flate2：gzip 解压（untar_gz 的 .gz 层）；
+# - tar：tar 归档解包（untar_gz 的 .tar 层）；
+# - zip：zip 归档解压（unzip）。
+flate2 = "1"
+tar = "0.4"
+zip = "8"
 
 [lints]
 # 注：不能用 [lints] workspace = true + 本地覆盖共存（Cargo 限制）。

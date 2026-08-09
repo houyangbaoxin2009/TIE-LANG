@@ -87,7 +87,9 @@ pub enum TokenKind {
     Using,
     True,
     False,
-    /// 类型关键字：i8..u64/f32/f64/bool/char/string/void/code/num/text/misc/table
+    /// 平衡三进制 trit 的零值字面量（M4 补齐）：`zero`——trit 三值 true(+1)/zero(0)/false(-1)
+    Zero,
+    /// 类型关键字：i8..u64/f32/f64/bool/trit/char/string/void/code/num/text/misc/table
     TypeKw(TyKw),
 
     // ---- 符号 ----
@@ -165,6 +167,8 @@ pub enum TyKw {
     F64,
     /// 布尔
     Bool,
+    /// 平衡三进制 trit（三值逻辑：-1/0/+1，数论常用；M4 补齐）
+    Trit,
     /// 字符
     Char,
     /// 字符串
@@ -198,6 +202,7 @@ impl TyKw {
             TyKw::F32 => "f32",
             TyKw::F64 => "f64",
             TyKw::Bool => "bool",
+            TyKw::Trit => "trit",
             TyKw::Char => "char",
             TyKw::Str => "string",
             TyKw::Void => "void",
@@ -595,11 +600,21 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// 数字字面量：十进制整数或浮点数（含小数点与指数）。
+    /// 数字字面量：整数（十进制/十六进制/二进制/八进制/三进制）或浮点数（含小数点与指数）。
+    ///
+    /// 进制前缀（M4 补齐，C 风格）：
+    /// - `0x` / `0X` → 十六进制（`0xFF` = 255，数字 0-9 与字母 a-f/A-F）；
+    /// - `0b` / `0B` → 二进制（`0b1010` = 10，仅 0/1）；
+    /// - `0o` / `0O` → 八进制（`0o17` = 15，仅 0-7）；
+    /// - `0t` / `0T` → 三进制（`0t210` = 21，仅 0-2；t = ternary，数论常用）；
+    /// - 无前缀 → 十进制整数或浮点数（`42` / `3.14` / `1e5`，行为与历史一致）。
+    /// 进制字面量恒为整数（不支持小数）；解析失败（如 `0x` 后无数字）回退为 0。
     fn scan_number(&mut self) -> Token {
         let (line, col) = (self.line, self.col);
         let mut text = String::new();
         let mut is_float = false;
+        // 进制前缀检测：以 0 开头且下一字符是 x/b/o/t（大小写均可）
+        let mut radix: i64 = 10;
         while let Some(&c) = self.chars.peek() {
             if c.is_ascii_digit() {
                 text.push(c);
@@ -643,12 +658,100 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
+        // 进制前缀处理（在文本已收齐后判断）：0x/0b/0o/0t 前缀 → 按对应进制解析。
+        // 注意：必须在主循环结束后处理——主循环只收数字，`0x` 的 `x` 会在
+        // else 分支停下，此时 text 为 "0"；这里补扫进制的数字与字母。
+        if text == "0" {
+            // 窥探下一字符决定进制（不消费——由下面分支统一消费）
+            match self.chars.peek().copied() {
+                Some('x') | Some('X') => {
+                    self.consume_char(); // 吃掉 'x'
+                    radix = 16;
+                    // 十六进制数字：0-9 + a-f + A-F
+                    while let Some(&d) = self.chars.peek() {
+                        if d.is_ascii_hexdigit() {
+                            text.push(d);
+                            self.consume_char();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                Some('b') | Some('B') => {
+                    self.consume_char(); // 吃掉 'b'
+                    radix = 2;
+                    while let Some(&d) = self.chars.peek() {
+                        if matches!(d, '0' | '1') {
+                            text.push(d);
+                            self.consume_char();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                Some('o') | Some('O') => {
+                    self.consume_char(); // 吃掉 'o'
+                    radix = 8;
+                    while let Some(&d) = self.chars.peek() {
+                        if matches!(d, '0'..='7') {
+                            text.push(d);
+                            self.consume_char();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                Some('t') | Some('T') => {
+                    self.consume_char(); // 吃掉 't'
+                    radix = 3;
+                    while let Some(&d) = self.chars.peek() {
+                        if matches!(d, '0'..='2') {
+                            text.push(d);
+                            self.consume_char();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         let kind = if is_float {
             TokenKind::Float(text.parse::<f64>().unwrap_or(0.0))
+        } else if radix != 10 {
+            // 进制整数：按对应进制解析（i64 溢出回绕为 0——与十进制 parse 一致防御）
+            TokenKind::Int(Self::parse_radix(&text, radix))
         } else {
             TokenKind::Int(text.parse::<i64>().unwrap_or(0))
         };
         Token::new(kind, line, col)
+    }
+
+    /// 按指定进制（2/3/8/16）解析整数字面量文本（含 a-f/A-F 字母；非法输入回退 0）。
+    ///
+    /// 与 Rust `i64::from_str_radix` 语义一致但**不报错**——词法阶段对非法/溢出
+    /// 输入回退 0（与十进制 `text.parse::<i64>().unwrap_or(0)` 的防御约定一致）。
+    fn parse_radix(text: &str, radix: i64) -> i64 {
+        let mut result: i64 = 0;
+        for c in text.chars() {
+            // 数字 0-9 与字母 a-f/A-F → 值 0..15（进制数字超过 9 的部分由调用方保证合法）
+            let digit = match c {
+                '0'..='9' => c as i64 - '0' as i64,
+                'a'..='f' => c as i64 - 'a' as i64 + 10,
+                'A'..='F' => c as i64 - 'A' as i64 + 10,
+                _ => return 0, // 非法字符 → 整体回退 0
+            };
+            if digit >= radix {
+                return 0; // 超出该进制数字范围 → 回退 0
+            }
+            // 溢出防护：进位前检查——若 result 已超过 (i64::MAX - digit) / radix，
+            // 下一次进位必溢出（debug 构建乘法溢出会 panic，必须显式拦截）→ 回退 0
+            if result > (i64::MAX - digit) / radix {
+                return 0;
+            }
+            result = result * radix + digit;
+        }
+        result
     }
 
     /// 标识符 / 关键字。
@@ -690,6 +793,8 @@ impl<'a> Lexer<'a> {
             "using" => TokenKind::Using,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
+            // 平衡三进制 trit 零值（M4 补齐）：zero 是保留字
+            "zero" => TokenKind::Zero,
             "i8" => TokenKind::TypeKw(TyKw::I8),
             "i16" => TokenKind::TypeKw(TyKw::I16),
             "i32" => TokenKind::TypeKw(TyKw::I32),
@@ -701,6 +806,7 @@ impl<'a> Lexer<'a> {
             "f32" => TokenKind::TypeKw(TyKw::F32),
             "f64" => TokenKind::TypeKw(TyKw::F64),
             "bool" => TokenKind::TypeKw(TyKw::Bool),
+            "trit" => TokenKind::TypeKw(TyKw::Trit),
             "char" => TokenKind::TypeKw(TyKw::Char),
             "string" => TokenKind::TypeKw(TyKw::Str),
             "void" => TokenKind::TypeKw(TyKw::Void),
@@ -914,6 +1020,92 @@ mod tests {
         let toks = tokenize("x = 1;\ny = 2\n").expect("不应报错");
         let n = toks.iter().filter(|t| t.kind == TokenKind::Semi).count();
         assert_eq!(n, 2, "第一行显式 1 个，第二行补全 1 个，共 2 个");
+    }
+
+    // ---------- M4 补齐：trit 关键字 + 多进制字面量 ----------
+
+    /// trit 类型关键字与 zero 字面量：`trit` → TypeKw(Trit)，`zero` → Zero。
+    /// `zero1`/`tritx` 是普通标识符（保留字只精确匹配整词）。
+    #[test]
+    fn trit与zero关键字() {
+        let toks = tokenize("var t: trit = zero\n").expect("不应报错");
+        let ty = toks.iter().find(|t| matches!(t.kind, TokenKind::TypeKw(TyKw::Trit)));
+        assert!(ty.is_some(), "trit 应识别为类型关键字");
+        let z = toks.iter().find(|t| t.kind == TokenKind::Zero);
+        assert!(z.is_some(), "zero 应识别为保留字");
+        // 整词边界：zero1 是标识符不是 Zero
+        let toks2 = tokenize("zero1\n").expect("不应报错");
+        assert!(matches!(&toks2[0].kind, TokenKind::Ident(s) if s == "zero1"));
+        // tritx 是标识符不是类型
+        let toks3 = tokenize("tritx\n").expect("不应报错");
+        assert!(matches!(&toks3[0].kind, TokenKind::Ident(s) if s == "tritx"));
+        // trit 的 as_str 正确
+        assert_eq!(TyKw::Trit.as_str(), "trit");
+        // trit 不是整数/浮点/宽类型
+        assert!(!TyKw::Trit.is_int());
+        assert!(!TyKw::Trit.is_float());
+        assert!(!TyKw::Trit.is_wide());
+    }
+
+    /// 多进制整数字面量（M4 补齐）：0x 十六进制 / 0b 二进制 / 0o 八进制 / 0t 三进制。
+    #[test]
+    fn 多进制整数字面量() {
+        // 十六进制：0xFF = 255（大小写前缀均可）
+        let toks = tokenize("0xFF\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(255)));
+        let toks = tokenize("0x2a\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(42)));
+        let toks = tokenize("0X1F\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(31)));
+        // 二进制：0b1010 = 10
+        let toks = tokenize("0b1010\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(10)));
+        let toks = tokenize("0B11111111\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(255)));
+        // 八进制：0o17 = 15
+        let toks = tokenize("0o17\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(15)));
+        let toks = tokenize("0O10\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(8)));
+        // 三进制：0t210 = 2*9 + 1*3 + 0 = 21（数论常用进制）
+        let toks = tokenize("0t210\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(21)));
+        let toks = tokenize("0T12\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(5)));
+        // 十进制行为不变：0 / 42 / 0.5（0 后跟非进制字母）
+        let toks = tokenize("0\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(0)));
+        let toks = tokenize("42\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(42)));
+        let toks = tokenize("0.5\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Float(0.5)));
+        // 0 后跟其他字母：0a → 整数 0 + 标识符 a（不是进制前缀）
+        let toks = tokenize("0a\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(0)));
+    }
+
+    /// 多进制字面量非法输入防御：空进制（0x 后无数字）/ 越进制数字（0b2）/ 非法字符。
+    /// 全部回退为 0（与十进制 parse 失败 unwrap_or(0) 的防御约定一致）。
+    #[test]
+    fn 多进制字面量非法回退零() {
+        // 0x 后无数字 → 0
+        let toks = tokenize("0x\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(0)));
+        // 二进制中出现 2 → 整体回退 0（0b2 解析失败）
+        let toks = tokenize("0b2\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(0)));
+        // 八进制中出现 8 → 回退 0
+        let toks = tokenize("0o8\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(0)));
+        // 三进制中出现 3 → 回退 0
+        let toks = tokenize("0t3\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(0)));
+        // 十六进制中出现 g（不在 a-f）→ 回退 0
+        let toks = tokenize("0xg\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(0)));
+        // 溢出：0xFFFFFFFFFFFFFFFF（> i64::MAX）→ 回退 0（防御）
+        let toks = tokenize("0xffffffffffffffff\n").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Int(0)));
     }
 
     // ---------- 注释 ----------

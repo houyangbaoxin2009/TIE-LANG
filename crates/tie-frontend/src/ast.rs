@@ -53,6 +53,8 @@ impl TypeSpec {
             TypeSpec::Named(TyKw::F32) => "float",
             TypeSpec::Named(TyKw::F64) => "double",
             TypeSpec::Named(TyKw::Bool) => "i1",
+            // 平衡三进制 trit：i8 存储 -1/0/1（三值逻辑；M4 补齐）
+            TypeSpec::Named(TyKw::Trit) => "i8",
             TypeSpec::Named(TyKw::Char) => "i32",
             TypeSpec::Named(TyKw::Str) => "ptr",
             TypeSpec::Named(TyKw::Void) => "void",
@@ -157,6 +159,8 @@ pub enum Stmt {
     Struct(StructDefStmt),
     /// 字段赋值 `obj.field = expr`（P8，对已存在实例字段的写入）
     FieldAssign(FieldAssignStmt),
+    /// 表下标赋值 `t[i] = expr`（M4 补齐：对表/数组元素的写入，含复合赋值）
+    IndexAssign(IndexAssignStmt),
 }
 
 /// import 语句：把其他 tie 文件的顶层函数并入当前文件。
@@ -297,6 +301,21 @@ pub struct FieldAssignStmt {
     pub span: Span,
 }
 
+/// 表下标赋值语句（M4 补齐）：`t[i] = expr`——对表/数组元素的写入。
+///
+/// 与 [AssignStmt]（target 是 String）分开：base 是下标链（`t[i]` / `t[i][j]`），
+/// 需按元素类型与可寻址性单独校验。支持复合赋值（`t[i] += v`）。
+#[derive(Debug, Clone)]
+pub struct IndexAssignStmt {
+    /// 被赋值元素的下标访问表达式（限 Index 链：`t[i]` / `t[i][j]`，base 是表变量）
+    pub target: Box<Expr>,
+    /// 赋值运算符：`None` 为普通赋值 `=`；`Some(op)` 为复合赋值 `+=`/`-=` 等
+    pub op: Option<BinaryOp>,
+    /// 新值表达式
+    pub value: Expr,
+    pub span: Span,
+}
+
 /// 表达式语句。
 #[derive(Debug, Clone)]
 pub struct ExprStmt {
@@ -381,6 +400,10 @@ pub enum Expr {
     CharLit(char),
     /// 布尔
     BoolLit(bool),
+    /// 平衡三进制 trit 字面量（M4 补齐）：值域 -1/0/+1。
+    /// parser 只产生 TritLit(0)（`zero`）；语义层把 `true`/`false` 按目标类型
+    /// 适配为 TritLit(1)/TritLit(-1)（字面量适配，与元组字段字面量适配同机制）。
+    TritLit(i8),
     /// 变量引用
     Var(String),
     /// 函数调用 `name(args)`

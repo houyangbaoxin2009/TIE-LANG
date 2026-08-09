@@ -225,6 +225,11 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
     ctx.result
         .table_ret_elems
         .insert("list_dir".to_string(), Some(TypeSpec::Named(TyKw::Str)));
+    // 内置 walk_dir（M4 补齐）：返回「字符串动态表」（目录下全部文件相对路径）。
+    // 与 list_dir 同布局（string 元素），使 `for x in walk_dir(p)` 元素类型静态可知。
+    ctx.result
+        .table_ret_elems
+        .insert("walk_dir".to_string(), Some(TypeSpec::Named(TyKw::Str)));
     // 内置 regex_find_all（P1）：返回「字符串动态表」（全部匹配片段）。与 list_dir
     // 同布局（string 元素），使 `for x in regex_find_all(s, p)` 元素类型静态可知。
     ctx.result
@@ -236,19 +241,49 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
     // 已知返回动态表的函数，或返回本函数内声明的动态表变量。反复扫描直到不再新增。
     loop {
         let mut changed = false;
-        for stmt in &program.stmts {
-            if let Stmt::FnDef(f) = stmt {
-                if ctx.result.table_ret_elems.contains_key(&f.name) {
-                    continue;
-                }
-                // 先收集本函数内声明的动态表变量 → 元素类型（供 return 变量解析）
-                let mut local: HashMap<String, TypeSpec> = HashMap::new();
-                ctx.collect_local_dyn_tables(&f.body, &mut local);
-                if let Some(te) = ctx.scan_return_table_elem(&f.body, &local) {
-                    ctx.result.table_ret_elems.insert(f.name.clone(), Some(te));
-                    changed = true;
+        // 递归扫描顶层与命名空间体内的函数（返回表 fixpoint）。
+        // 命名空间函数以全名登记（ns::name），与调用解析一致。
+        fn scan_tables(
+            ctx: &mut Analyzer,
+            stmts: &[Stmt],
+            ns_prefix: &[String],
+        ) -> bool {
+            let mut changed = false;
+            for stmt in stmts {
+                match stmt {
+                    Stmt::FnDef(f) => {
+                        let full = if ns_prefix.is_empty() {
+                            f.name.clone()
+                        } else {
+                            let mut p = ns_prefix.to_vec();
+                            p.push(f.name.clone());
+                            p.join("::")
+                        };
+                        if ctx.result.table_ret_elems.contains_key(&full) {
+                            continue;
+                        }
+                        let mut local: HashMap<String, TypeSpec> = HashMap::new();
+                        ctx.collect_local_dyn_tables(&f.body, &mut local);
+                        if let Some(te) = ctx.scan_return_table_elem(&f.body, &local) {
+                            ctx.result.table_ret_elems.insert(full, Some(te));
+                            changed = true;
+                        }
+                    }
+                    Stmt::Namespace(ns) => {
+                        // 递归：路径 = ns_prefix + ns.path
+                        let mut p = ns_prefix.to_vec();
+                        p.extend(ns.path.clone());
+                        if scan_tables(ctx, &ns.body, &p) {
+                            changed = true;
+                        }
+                    }
+                    _ => {}
                 }
             }
+            changed
+        }
+        if scan_tables(&mut ctx, &program.stmts, &[]) {
+            changed = true;
         }
         if !changed {
             break;
@@ -878,6 +913,17 @@ impl Analyzer {
                         } else {
                             scope.insert(v.name.clone(), d.clone());
                         }
+                        // 平衡三进制字面量适配（M4 补齐）：标注 trit 且初始化是
+                        // BoolLit/TritLit 时，把初始化表达式的类型改写为 Trit——
+                        // IR 层据此生成 i8 常量（true→1 / false→-1 / zero→0）。
+                        if matches!(d, TypeSpec::Named(TyKw::Trit))
+                            && matches!(v.init, Expr::BoolLit(_) | Expr::TritLit(_))
+                        {
+                            self.result.expr_types.insert(
+                                addr_of(&v.init),
+                                TypeSpec::Named(TyKw::Trit),
+                            );
+                        }
                     }
                     None => {
                         if init_ty.is_void() {
@@ -891,6 +937,22 @@ impl Analyzer {
                         if init_ty == TypeSpec::Named(TyKw::Table) {
                             let elem_ty = self.dynamic_table_elem_ty(&v.init, &v.name, scope)?;
                             let info = TableInfo { elem_ty, len: 0, dynamic: true };
+                            self.table_vars
+                                .insert((self.cur_fn.clone(), v.name.clone()), info.clone());
+                            self.result
+                                .table_vars
+                                .insert((self.cur_fn.clone(), v.name.clone()), info);
+                        } else if let Expr::TableLit { cells, .. } = &v.init {
+                            // 未标注表字面量：`var arr = [1,2,3]`（init_ty 是元素类型）。
+                            // 登记 table_vars 元数据（定长、元素类型 = 首个元素类型），
+                            // 使下标访问/下标赋值（t[i]=v）能定位表身份与元素类型。
+                            // scope 存元素类型（既有行为，保持 IR 定长表布局一致）。
+                            let elem_ty = if cells.is_empty() {
+                                TypeSpec::Named(TyKw::I64)
+                            } else {
+                                init_ty.clone()
+                            };
+                            let info = TableInfo { elem_ty, len: cells.len(), dynamic: false };
                             self.table_vars
                                 .insert((self.cur_fn.clone(), v.name.clone()), info.clone());
                             self.result
@@ -1293,6 +1355,67 @@ impl Analyzer {
                 }
                 Ok(())
             }
+            Stmt::IndexAssign(ia) => {
+                // 表下标赋值（M4 补齐）：`t[i] = v`——target 是 Index 链
+                //（`t[i]` / `t[i][j]`）。校验：base 是表、下标是整数、
+                // 值类型与表元素类型匹配、复合赋值按运算符规则。
+                let Expr::Index { base, index, .. } = ia.target.as_ref() else {
+                    return Err(SemanticError {
+                        span: ia.span,
+                        message: "下标赋值的目标必须是表元素访问（t[i]）".into(),
+                    });
+                };
+                // 1) base 必须是表（查 table_vars 元数据；非表 → 报错）。
+                // 注：未标注表字面量变量（var arr = [1,2,3]）在 scope 推导为元素类型
+                //（既有行为），表身份由 table_vars 元数据决定——以此为准。
+                let base_ty = self.infer_expr(base, scope)?;
+                self.result.expr_types.insert(addr_of(base), base_ty.clone());
+                let is_table = if let Expr::Var(vn) = base.as_ref() {
+                    self.table_vars.contains_key(&(self.cur_fn.clone(), vn.clone()))
+                        || matches!(&base_ty, TypeSpec::Named(TyKw::Table))
+                } else {
+                    matches!(&base_ty, TypeSpec::Named(TyKw::Table))
+                };
+                let elem_ty = if is_table {
+                    match self.table_arg_elem_ty(base, scope) {
+                        Ok(et) => et,
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    return Err(SemanticError {
+                        span: ia.span,
+                        message: format!(
+                            "下标赋值的对象必须是表，实际是 {}",
+                            type_name(&base_ty)
+                        ),
+                    });
+                };
+                // 2) 下标必须是整数
+                let idx_ty = self.infer_expr(index, scope)?;
+                self.result.expr_types.insert(addr_of(index), idx_ty.clone());
+                if !idx_ty.is_int() {
+                    return Err(SemanticError {
+                        span: expr_span_of(index),
+                        message: format!("下标必须是整数，实际是 {}", type_name(&idx_ty)),
+                    });
+                }
+                // 3) 值类型与元素类型匹配（复合赋值走 check_compound_assign）
+                let value_ty = self.infer_expr(&ia.value, scope)?;
+                self.result.expr_types.insert(addr_of(&ia.value), value_ty.clone());
+                if let Some(op) = ia.op {
+                    self.check_compound_assign(&elem_ty, op, &value_ty, &ia.value, ia.span)?;
+                } else if !types_match(&elem_ty, &value_ty, Some(&ia.value)) {
+                    return Err(SemanticError {
+                        span: ia.span,
+                        message: format!(
+                            "下标赋值类型不匹配：表元素类型为 {}，表达式为 {}",
+                            type_name(&elem_ty),
+                            type_name(&value_ty)
+                        ),
+                    });
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1318,6 +1441,8 @@ impl Analyzer {
             Expr::IntLit(_) => TypeSpec::Named(TyKw::I64),
             Expr::FloatLit(_) => TypeSpec::Named(TyKw::F64),
             Expr::BoolLit(_) => TypeSpec::Named(TyKw::Bool),
+            // 平衡三进制 trit 字面量（M4 补齐）：zero → trit 类型
+            Expr::TritLit(_) => TypeSpec::Named(TyKw::Trit),
             Expr::StrLit(_) => TypeSpec::Named(TyKw::Str),
             Expr::CharLit(_) => TypeSpec::Named(TyKw::Char),
             // 类型字面量（case 类型匹配 pattern）：只能出现在 switch 的 case pattern
@@ -1661,6 +1786,162 @@ impl Analyzer {
                     }
                     return Ok(TypeSpec::Named(TyKw::Bool));
                 }
+                // ---------- M4 补齐：系统能力内置函数（M6 包管理器前置） ----------
+                //
+                // 签名校验（参数个数 + 字符串类型），返回类型按原语映射。
+                // 分组：单字符串参 → string（http_get/exec_output/path_* 单参/get_env）；
+                // 单字符串参 → bool/i64/table（mkdir_all/remove_dir_all、exec_code、walk_dir）；
+                // 双字符串参 → bool/string/void（http_get_file/untar_gz/unzip/copy_dir/
+                // file_copy/file_move、path_join、set_env）；零参 → string（cwd）。
+                if matches!(
+                    name.as_str(),
+                    "http_get" | "exec_output" | "path_basename" | "path_dirname" | "path_abs"
+                        | "path_normalize" | "get_env"
+                ) {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("{name}() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("{name}() 参数必须是字符串，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Str));
+                }
+                // 单字符串参数 → bool（mkdir_all 建多级目录 / remove_dir_all 递归删目录）
+                if name == "mkdir_all" || name == "remove_dir_all" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("{name}() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("{name}() 参数必须是字符串，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Bool));
+                }
+                // 单字符串参数 → i64（exec_code 执行命令返回退出码）
+                if name == "exec_code" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("exec_code() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("exec_code() 参数必须是字符串，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::I64));
+                }
+                // 单字符串参数 → table（walk_dir 递归列出全部文件相对路径，字符串动态表）
+                if name == "walk_dir" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("walk_dir() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("walk_dir() 参数必须是字符串，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Table));
+                }
+                // 双字符串参数 → bool（http_get_file/untar_gz/unzip/copy_dir/file_copy/file_move）
+                if matches!(
+                    name.as_str(),
+                    "http_get_file" | "untar_gz" | "unzip" | "copy_dir" | "file_copy"
+                        | "file_move"
+                ) {
+                    if args.len() != 2 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("{name}() 期望 2 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    for a in args {
+                        let at = self.infer_expr(a, scope)?;
+                        self.result.expr_types.insert(addr_of(a), at.clone());
+                        if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!("{name}() 参数必须是字符串，实际是 {}", type_name(&at)),
+                            });
+                        }
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Bool));
+                }
+                // 双字符串参数 → string（path_join 拼接路径）
+                if name == "path_join" {
+                    if args.len() != 2 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("path_join() 期望 2 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    for a in args {
+                        let at = self.infer_expr(a, scope)?;
+                        self.result.expr_types.insert(addr_of(a), at.clone());
+                        if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!("path_join() 参数必须是字符串，实际是 {}", type_name(&at)),
+                            });
+                        }
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Str));
+                }
+                // 双字符串参数 → void（set_env 设置环境变量）
+                if name == "set_env" {
+                    if args.len() != 2 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("set_env() 期望 2 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    for a in args {
+                        let at = self.infer_expr(a, scope)?;
+                        self.result.expr_types.insert(addr_of(a), at.clone());
+                        if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!("set_env() 参数必须是字符串，实际是 {}", type_name(&at)),
+                            });
+                        }
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Void));
+                }
+                // 零参数 → string（cwd 当前工作目录）
+                if name == "cwd" {
+                    if !args.is_empty() {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("cwd() 期望 0 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Str));
+                }
                 // 内置函数 str_char：字符串 + 整数下标，返回 string（第 i 个 Unicode 码点；越界返回空串）。
                 // i 按字符（码点）计数，非字节。
                 if name == "str_char" {
@@ -1780,6 +2061,10 @@ impl Analyzer {
                     }
                     let at = self.infer_expr(&args[0], scope)?;
                     self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    // 平衡三进制（M4 补齐）：to_string(trit) → "-1"/"0"/"1"
+                    if matches!(&at, TypeSpec::Named(TyKw::Trit)) {
+                        return Ok(TypeSpec::Named(TyKw::Str));
+                    }
                     if !is_number(&at) {
                         return Err(SemanticError {
                             span: expr_span_of(&args[0]),
@@ -1823,6 +2108,25 @@ impl Analyzer {
                         });
                     }
                     return Ok(TypeSpec::Named(TyKw::F64));
+                }
+                // 内置函数 parse_trit（M4 补齐）：字符串参数，返回 trit。
+                // 接受 "-1"/"0"/"1"（非法输入 → 运行时错误，两路径一致）。
+                if name == "parse_trit" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("parse_trit() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("parse_trit() 参数必须是字符串，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Trit));
                 }
                 // 内置函数 exit：整数参数，void（刷新 stdout 后终止进程）。
                 if name == "exit" {
@@ -2141,6 +2445,10 @@ impl Analyzer {
                         ot
                     }
                     UnaryOp::Not => {
+                        // 平衡三值逻辑非（M4 补齐）：!trit → trit（-1↔1，0 保持）
+                        if matches!(&ot, TypeSpec::Named(TyKw::Trit)) {
+                            return Ok(TypeSpec::Named(TyKw::Trit));
+                        }
                         if !is_bool_like(&ot) {
                             return Err(SemanticError {
                                 span: *span,
@@ -2182,8 +2490,14 @@ impl Analyzer {
                 let rt = self.infer_expr(rhs, scope)?;
                 self.result.expr_types.insert(addr_of(lhs), lt.clone());
                 self.result.expr_types.insert(addr_of(rhs), rt.clone());
-                // 左右类型必须一致（int 与 float 不隐式转换）
-                if !types_compatible(&lt, &rt) {
+                // 左右类型必须一致（int 与 float 不隐式转换）。
+                // 例外（M4 补齐）：trit 与 i64 的混合运算由下方分支放行
+                //（算术提升 i64、比较允许），此处兼容检查跳过 trit×i64 组合。
+                let is_trit = |t: &TypeSpec| matches!(t, TypeSpec::Named(TyKw::Trit));
+                if !types_compatible(&lt, &rt)
+                    && !(is_trit(&lt) && matches!(&rt, TypeSpec::Named(TyKw::I64)))
+                    && !(is_trit(&rt) && matches!(&lt, TypeSpec::Named(TyKw::I64)))
+                {
                     return Err(SemanticError {
                         span: *span,
                         message: format!(
@@ -2204,6 +2518,34 @@ impl Analyzer {
                             && matches!(&lt, TypeSpec::Named(TyKw::Str))
                         {
                             return Ok(TypeSpec::Named(TyKw::Str));
+                        }
+                        // 平衡三进制算术（M4 补齐）：trit ± * trit → trit（值域 clamp 到
+                        // [-1,1]，Kleene 风格饱和算术）；trit 与 i64 混合 → i64（sext 提升）。
+                        // div/mod 不允许 trit（三值除法无意义）。
+                        let is_trit = |t: &TypeSpec| matches!(t, TypeSpec::Named(TyKw::Trit));
+                        if is_trit(&lt) || is_trit(&rt) {
+                            if matches!(op, BinaryOp::Div | BinaryOp::Mod) {
+                                return Err(SemanticError {
+                                    span: *span,
+                                    message: "trit 不支持除/取模运算（三值无除法）".into(),
+                                });
+                            }
+                            if is_trit(&lt) && is_trit(&rt) {
+                                return Ok(TypeSpec::Named(TyKw::Trit));
+                            }
+                            // 一侧 trit 一侧 i64（或反之）→ 提升为 i64
+                            if (is_trit(&lt) && matches!(&rt, TypeSpec::Named(TyKw::I64)))
+                                || (is_trit(&rt) && matches!(&lt, TypeSpec::Named(TyKw::I64)))
+                            {
+                                return Ok(TypeSpec::Named(TyKw::I64));
+                            }
+                            return Err(SemanticError {
+                                span: *span,
+                                message: format!(
+                                    "trit 只能与 trit 或 i64 做算术，不能与 {}",
+                                    type_name(if is_trit(&lt) { &rt } else { &lt })
+                                ),
+                            });
                         }
                         if !is_number(&lt) {
                             return Err(SemanticError {
@@ -2237,6 +2579,12 @@ impl Analyzer {
                                 message: "元组暂不支持比较运算（逐字段比较留待后续版本）".into(),
                             });
                         }
+                        // 平衡三进制比较（M4 补齐）：trit 可比较（==/!=/</>/<=/>=），
+                        // 与 trit 或与 i64（数值序 -1 < 0 < 1）→ bool
+                        let is_trit = |t: &TypeSpec| matches!(t, TypeSpec::Named(TyKw::Trit));
+                        if is_trit(&lt) && (is_trit(&rt) || matches!(&rt, TypeSpec::Named(TyKw::I64))) {
+                            return Ok(TypeSpec::Named(TyKw::Bool));
+                        }
                         if !is_number(&lt) && !matches!(&lt, TypeSpec::Named(TyKw::Bool)) {
                             return Err(SemanticError {
                                 span: *span,
@@ -2246,10 +2594,17 @@ impl Analyzer {
                         TypeSpec::Named(TyKw::Bool)
                     }
                     BinaryOp::And | BinaryOp::Or => {
+                        // 平衡三值逻辑（Kleene 语义，M4 补齐）：trit && trit → trit
+                        //（min/max 规则：&& 取较小者，|| 取较大者）；bool 保持原逻辑。
+                        if matches!(&lt, TypeSpec::Named(TyKw::Trit))
+                            && matches!(&rt, TypeSpec::Named(TyKw::Trit))
+                        {
+                            return Ok(TypeSpec::Named(TyKw::Trit));
+                        }
                         if !is_bool_like(&lt) {
                             return Err(SemanticError {
                                 span: *span,
-                                message: "逻辑运算符两侧必须是 bool".into(),
+                                message: "逻辑运算符两侧必须是 bool（或两侧同为 trit）".into(),
                             });
                         }
                         TypeSpec::Named(TyKw::Bool)
@@ -2351,7 +2706,16 @@ impl Analyzer {
                 if matches!(&base_ty, TypeSpec::Named(TyKw::Str)) {
                     return Ok(TypeSpec::Named(TyKw::Char));
                 }
-                if base_ty != TypeSpec::Named(TyKw::Table) {
+                // 表身份判定：base_ty 是 Table，或 base 是登记过 table_vars 的变量
+                //（未标注表字面量变量 var arr = [1,2,3] 的 base_ty 是元素类型——既有行为，
+                // 表身份由 table_vars 元数据决定）。
+                let is_table = if let Expr::Var(name) = base.as_ref() {
+                    self.table_vars.contains_key(&(self.cur_fn.clone(), name.clone()))
+                        || base_ty == TypeSpec::Named(TyKw::Table)
+                } else {
+                    base_ty == TypeSpec::Named(TyKw::Table)
+                };
+                if !is_table {
                     return Err(SemanticError {
                         span: *span,
                         message: format!(
@@ -2861,8 +3225,37 @@ impl Analyzer {
                     message: format!("'{}' 不是表变量", name),
                 })
             }
-            Expr::Call { .. } | Expr::MethodCall { .. } => {
-                // 裸调用/命名空间调用（如 str.split）：统一解析全名后查 table_ret_elems
+            Expr::Call { name, .. } => {
+                // 裸调用/命名空间调用（如 str.split）：统一解析全名后查 table_ret_elems。
+                // 内置 table_new_* 也在此识别（与 scan_return_table_elem 的预扫描对齐）：
+                // `return table_new_string()` / `table_at(table_new_i64(), 0)` 等
+                // 内联调用可直接确定元素类型，无需走用户函数表。
+                if let Some(elem) = table_new_elem_ty(name) {
+                    return Ok(elem);
+                }
+                let full = ns_call_full_name(
+                    &self.result.funcs,
+                    expr,
+                    scope,
+                    &self.ns_stack,
+                    &self.using_prefixes,
+                    &self.result.globals,
+                )
+                .unwrap_or_default();
+                match self.result.table_ret_elems.get(&full) {
+                    Some(Some(elem)) => Ok(elem.clone()),
+                    Some(None) => Err(SemanticError {
+                        span: expr_span_of(expr),
+                        message: format!("函数 '{full}' 返回的表元素类型未知"),
+                    }),
+                    None => Err(SemanticError {
+                        span: expr_span_of(expr),
+                        message: format!("函数 '{full}' 未定义或不是返回表的函数"),
+                    }),
+                }
+            }
+            Expr::MethodCall { .. } => {
+                // 命名空间方法调用（如 str.split 经 obj.split 形态）：查 table_ret_elems
                 let full = ns_call_full_name(
                     &self.result.funcs,
                     expr,
@@ -3149,6 +3542,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::Using(u) => u.span,
         Stmt::Struct(c) => c.span,
         Stmt::FieldAssign(f) => f.span,
+        Stmt::IndexAssign(i) => i.span,
     }
 }
 
@@ -3156,7 +3550,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
 fn expr_span_of(expr: &Expr) -> Span {
     match expr {
         Expr::IntLit(_) | Expr::FloatLit(_) | Expr::StrLit(_) | Expr::CharLit(_) | Expr::BoolLit(_)
-        | Expr::Var(_) => {
+        | Expr::TritLit(_) | Expr::Var(_) => {
             // 字面量无 span，用 (0,0) 占位（语义错误主要针对变量/调用，已有 span）
             Span { line: 0, col: 0 }
         }
@@ -3249,6 +3643,12 @@ fn types_match(want: &TypeSpec, got: &TypeSpec, init: Option<&Expr>) -> bool {
     match init {
         Some(Expr::IntLit(_)) => want.is_int() && got.is_int(),
         Some(Expr::FloatLit(_)) => want.is_float() && got.is_float(),
+        // 平衡三进制 trit 字面量适配（M4 补齐）：
+        // - `var t: trit = zero` → TritLit(0) 直接匹配；
+        // - `var t: trit = true` / `= false` → BoolLit 按目标类型适配为 TritLit(+1)/(-1)；
+        // - 裸 `true`（无 trit 标注）保持 bool。
+        Some(Expr::TritLit(_)) => matches!(want, TypeSpec::Named(TyKw::Trit)),
+        Some(Expr::BoolLit(_)) => matches!(want, TypeSpec::Named(TyKw::Trit)),
         // 表字面量可传给 table 参数（元素类型与长度由字面量布局元数据记录，
         // IR/解释路径按布局访问；如 tcmsg::error.no_file(["zh-cn","en-us"])）
         Some(Expr::TableLit { .. }) => matches!(want, TypeSpec::Named(TyKw::Table)),
@@ -4291,6 +4691,194 @@ mod tests {
         );
     }
 
+    // ---------- M4 补齐：trit 平衡三进制类型规则 ----------
+
+    #[test]
+    fn trit字面量与类型标注() {
+        // zero → trit；true/false 适配 trit（标注场景）；裸 true 保持 bool
+        analyze_src(
+            r#"
+            func main() {
+                var t: trit = zero
+                var p: trit = true
+                var n: trit = false
+                var b = true
+            }
+            "#,
+        )
+        .expect("trit 字面量与标注应通过");
+    }
+
+    #[test]
+    fn trit与bool互不混淆() {
+        // 裸 true 仍是 bool：bool 变量不能赋 trit 值
+        analyze_src(
+            r#"
+            func main() {
+                var t: trit = zero
+                var b: bool = t
+            }
+            "#,
+        )
+        .expect_err("bool 变量不能赋 trit 值（类型不匹配）");
+        // trit 变量不能赋 bool 值
+        analyze_src(
+            r#"
+            func main() {
+                var b: bool = true
+                var t: trit = b
+            }
+            "#,
+        )
+        .expect_err("trit 变量不能赋 bool 值（类型不匹配）");
+    }
+
+    #[test]
+    fn trit三值逻辑运算() {
+        // Kleene 三值逻辑：trit && trit → trit；trit || trit → trit；!trit → trit
+        analyze_src(
+            r#"
+            func main() {
+                var a: trit = true
+                var b: trit = zero
+                var c = a && b
+                var d = a || b
+                var e = !a
+                var eq = (a == b)
+                var lt = (a < b)
+            }
+            "#,
+        )
+        .expect("trit 三值逻辑/比较应通过");
+        // trit && bool 不允许（两侧必须同为 trit 或同为 bool）
+        analyze_src(
+            r#"
+            func main() {
+                var a: trit = true
+                var b = true
+                var c = a && b
+            }
+            "#,
+        )
+        .expect_err("trit 与 bool 混合逻辑运算应报错");
+    }
+
+    #[test]
+    fn trit算术与i64互转() {
+        // trit ± * trit → trit；trit + i64 → i64；比较 trit vs i64 → bool
+        analyze_src(
+            r#"
+            func main() {
+                var a: trit = true
+                var b: trit = zero
+                var c = a + b
+                var d: trit = a * b
+                var e = a + 5
+                var f = (a == 1)
+                var s = to_string(a)
+                var p: trit = parse_trit("-1")
+            }
+            "#,
+        )
+        .expect("trit 算术/混合/转换应通过");
+        // trit 除法不允许
+        analyze_src(
+            r#"
+            func main() {
+                var a: trit = true
+                var b: trit = zero
+                var c = a / b
+            }
+            "#,
+        )
+        .expect_err("trit 除法应报错");
+        // to_string(bool) 仍报错（不因 trit 放宽）
+        analyze_src(
+            r#"
+            func main() {
+                var b = true
+                var s = to_string(b)
+            }
+            "#,
+        )
+        .expect_err("to_string(bool) 应报错（trit 放宽不影响 bool）");
+    }
+
+    // ---------- M4 补齐：表下标赋值类型校验 ----------
+
+    #[test]
+    fn 表下标赋值类型匹配() {
+        // 定长表字面量 + 下标赋值（元素类型 i64）
+        analyze_src(
+            r#"
+            func main() {
+                var arr = [1, 2, 3]
+                arr[0] = 9
+                arr[1] += 1
+            }
+            "#,
+        )
+        .expect("定长表下标赋值应通过");
+        // 动态表 + 下标赋值
+        analyze_src(
+            r#"
+            func main() {
+                var t = table_new_i64()
+                table_push(t, 1)
+                t[0] = 5
+            }
+            "#,
+        )
+        .expect("动态表下标赋值应通过");
+        // 字符串表 + 字符串元素
+        analyze_src(
+            r#"
+            func main() {
+                var t = table_new_string()
+                table_push(t, "a")
+                t[0] = "b"
+            }
+            "#,
+        )
+        .expect("字符串表下标赋值应通过");
+    }
+
+    #[test]
+    fn 表下标赋值类型不匹配报错() {
+        // 元素类型不匹配：i64 表赋 string
+        analyze_src(
+            r#"
+            func main() {
+                var t = table_new_i64()
+                table_push(t, 1)
+                t[0] = "x"
+            }
+            "#,
+        )
+        .expect_err("i64 表赋 string 应报错");
+        // 下标非整数
+        analyze_src(
+            r#"
+            func main() {
+                var t = table_new_i64()
+                table_push(t, 1)
+                t["x"] = 1
+            }
+            "#,
+        )
+        .expect_err("非整数下标应报错");
+        // 非表对象下标赋值
+        analyze_src(
+            r#"
+            func main() {
+                var x = 5
+                x[0] = 1
+            }
+            "#,
+        )
+        .expect_err("非表对象下标赋值应报错");
+    }
+
     #[test]
     fn 动态表table_new零参数返回table() {
         // table_new_*：零参数创建空动态表，返回 table 类型
@@ -4306,6 +4894,24 @@ mod tests {
         let info = sem.table_vars.get(&("main".to_string(), "t".to_string())).expect("应有表元数据");
         assert_eq!(info.elem_ty, TypeSpec::Named(TyKw::I64));
         assert!(info.dynamic, "table_new 创建的是动态表");
+    }
+
+    #[test]
+    fn return内联table_new识别元素类型() {
+        // M4 补齐回归：`return table_new_string()` 内联调用应被 table_arg_elem_ty 识别
+        //（此前只覆盖预扫描路径，第二遍检查缺 table_new_* 分支报"未定义或不是返回表的函数"）
+        analyze_src(
+            r#"
+            func make() -> table {
+                return table_new_string()
+            }
+            func main() {
+                var t = make()
+                var n = len(t)
+            }
+            "#,
+        )
+        .expect("return table_new_string() 应通过");
     }
 
     #[test]

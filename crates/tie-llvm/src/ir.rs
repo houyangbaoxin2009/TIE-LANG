@@ -9,7 +9,8 @@
 //! - 函数入口块命名为 `entry`，控制流块命名为 `if.then`/`if.else`/`loop.cond` 等
 
 use tie_frontend::ast::{
-    BinaryOp, Expr, FieldAssignStmt, FnDefStmt, Program, Stmt, TableCell, TypeSpec, UnaryOp,
+    BinaryOp, Expr, FieldAssignStmt, FnDefStmt, IndexAssignStmt, Program, Stmt, TableCell,
+    TypeSpec, UnaryOp,
 };
 use tie_frontend::lexer::TyKw;
 use tie_frontend::semantic::{ClassInfo, FuncSig, SemanticResult};
@@ -217,6 +218,10 @@ impl<'p> IrGenerator<'p> {
         if self.used_externs.iter().any(|s| s == "tie_parse_float") {
             self.out.push_str("declare double @tie_parse_float(ptr, ptr)\n");
         }
+        // 平衡三进制解析（M4 补齐）：tie_parse_trit 返回 i8（-1/0/1），带 ok 标志。
+        if self.used_externs.iter().any(|s| s == "tie_parse_trit") {
+            self.out.push_str("declare i8 @tie_parse_trit(ptr, ptr)\n");
+        }
         // M2 标准库 floor 的时间/随机原语（C ABI 桥，与解释路径共用实现）：
         // tie_time_now 返回 Unix 秒；tie_rand_range 带 ok 标志（max<=min 时置 0）。
         if self.used_externs.iter().any(|s| s == "tie_time_now") {
@@ -316,6 +321,19 @@ impl<'p> IrGenerator<'p> {
         }
         if self.used_externs.iter().any(|s| s == "tie_table_at_bool") {
             self.out.push_str("declare i1 @tie_table_at_bool(ptr, i64, ptr)\n");
+        }
+        // M4 补齐：动态表写入桥（下标赋值 t[i] = v）——与读取桥对称，带 ok 标志
+        if self.used_externs.iter().any(|s| s == "tie_table_set_i64") {
+            self.out.push_str("declare void @tie_table_set_i64(ptr, i64, i64, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_table_set_f64") {
+            self.out.push_str("declare void @tie_table_set_f64(ptr, i64, double, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_table_set_string") {
+            self.out.push_str("declare void @tie_table_set_string(ptr, i64, ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_table_set_bool") {
+            self.out.push_str("declare void @tie_table_set_bool(ptr, i64, i1, ptr)\n");
         }
         Ok(())
     }
@@ -487,8 +505,38 @@ impl<'p> IrGenerator<'p> {
                 }
                 // 表变量：直接生成定长数组布局（alloca [N x T] + 逐元素 store），
                 // 长度与元素类型来自语义层 tables 元数据（键 = init 表达式地址）。
-                if v.ty.as_ref().map(|t| t.is_table()).unwrap_or(false) {
+                // 未标注表字面量（var arr = [1,2,3]，M4 补齐支持下标访问/赋值）也走此路径。
+                // 标注了非 table 类型（var x: i64 = [1,2]）不在此——语义层已拦截报错。
+                if v.ty.as_ref().map(|t| t.is_table()).unwrap_or(false)
+                    || (v.ty.is_none() && matches!(v.init, Expr::TableLit { .. }))
+                {
                     return self.gen_table_var(v);
+                }
+                // 平衡三进制字面量适配（M4 补齐）：`var t: trit = true/false` 时
+                // 直接生成 i8 值（true→1 / false→-1）——语义层无法可靠改写
+                // expr_types（跨路径 AST 地址一致性脆弱），在 IR 声明处按标注处理。
+                if matches!(v.ty, Some(TypeSpec::Named(TyKw::Trit))) {
+                    if let Expr::BoolLit(b) = &v.init {
+                        let val: i8 = if *b { 1 } else { -1 };
+                        let alloca = self.new_reg();
+                        self.line(&format!("{alloca} = alloca i8"));
+                        self.line(&format!("store i8 {val}, ptr {alloca}"));
+                        self.cur_scope_mut().insert(
+                            v.name.clone(),
+                            VarBind { value: alloca, ty: "i8", by_ptr: false },
+                        );
+                        return Ok(());
+                    }
+                    if let Expr::TritLit(t) = &v.init {
+                        let alloca = self.new_reg();
+                        self.line(&format!("{alloca} = alloca i8"));
+                        self.line(&format!("store i8 {t}, ptr {alloca}"));
+                        self.cur_scope_mut().insert(
+                            v.name.clone(),
+                            VarBind { value: alloca, ty: "i8", by_ptr: false },
+                        );
+                        return Ok(());
+                    }
                 }
                 let (val, ty) = self.gen_expr(&v.init)?;
                 // 声明类型以语义为准
@@ -601,11 +649,24 @@ impl<'p> IrGenerator<'p> {
             }
             Stmt::Return(r) => match &r.expr {
                 Some(e) => {
+                    // 平衡三进制字面量适配（M4 补齐）：函数返回 trit 且 return 表达式
+                    // 是 bool 字面量时（`return true/false`），直接按 trit 写出 i8 值。
+                    let ret_ty = self.current_ret_ty();
+                    if matches!(ret_ty, TypeSpec::Named(TyKw::Trit)) {
+                        if let Expr::BoolLit(b) = e {
+                            let v: i8 = if *b { 1 } else { -1 };
+                            self.line(&format!("ret i8 {v}"));
+                            return Ok(());
+                        }
+                        if let Expr::TritLit(t) = e {
+                            self.line(&format!("ret i8 {t}"));
+                            return Ok(());
+                        }
+                    }
                     let (val, _ty) = self.gen_expr(e)?;
                     // 返回类型以当前函数/方法签名为准：字面量可能被语义适配
                     // （如返回 i32 的函数 `return 42`，字面量推导为 i64）。
                     // 方法名形如 `类$方法`，从 classes 表查签名（不在 funcs 表）。
-                    let ret_ty = self.current_ret_ty();
                     let ret_llvm = self.llvm_ty(&ret_ty);
                     // 非字面量场景语义已保证类型一致；字面量直接按签名类型写出常量
                     self.line(&format!("ret {ret_llvm} {val}"));
@@ -625,6 +686,8 @@ impl<'p> IrGenerator<'p> {
                 Ok(())
             }
             Stmt::FieldAssign(fa) => self.gen_field_assign(fa),
+            // 表下标赋值（M4 补齐）：`t[i] = v` / `t[i] += v`（定长 GEP store / 动态表 set 桥）
+            Stmt::IndexAssign(ia) => self.gen_index_assign(ia),
             Stmt::Import(_) => {
                 // import 已在 driver 层展开为函数（语义分析前），IR 阶段不应出现
                 Ok(())
@@ -705,17 +768,152 @@ impl<'p> IrGenerator<'p> {
         Ok(())
     }
 
+    /// 表下标赋值（M4 补齐）：`t[i] = v` / `t[i] += v`。
+    ///
+    /// 目标 t[i] 的定位与读取（gen_index）对称：
+    /// - 动态表（table_new_*）：t 是 alloca ptr → load 表指针 → tie_table_set_* 桥写入；
+    /// - 定长表（字面量 [N x T]）：GEP 定位 + store；
+    /// - 复合赋值（+= 等）：先读旧值 → 运算 → 写回。
+    /// 越界由 set 桥 ok 标志拦截 → 运行时错误（文本与读取越界一致）。
+    fn gen_index_assign(&mut self, ia: &IndexAssignStmt) -> Result<(), IrError> {
+        let Expr::Index { base, index, .. } = ia.target.as_ref() else {
+            return Err(IrError {
+                message: "内部错误：下标赋值的目标不是 Index（函数 {}）".into(),
+            });
+        };
+        // 下标值：i64
+        let (idx_val, idx_ty) = self.gen_expr(index)?;
+        let idx_val = self.extend_int_to_i64(&idx_val, idx_ty, index)?;
+        // base 必须是表变量（单层；二维 t[i][j] 赋值留待 set 桥递归）
+        let Expr::Var(name) = base.as_ref() else {
+            return Err(IrError {
+                message: "下标赋值暂只支持单层表变量（t[i]）".into(),
+            });
+        };
+        let bind = self.lookup_var(name).cloned().ok_or_else(|| IrError {
+            message: format!("内部错误：下标赋值的变量 '{name}' 未入作用域（函数 {}）", self.cur_fn),
+        })?;
+        let base_ptr = bind.value;
+        let base_ty = bind.ty;
+        // 动态表：tie_table_set_* 桥写入
+        let is_dynamic = self
+            .sem
+            .table_vars
+            .get(&(self.cur_fn.clone(), name.clone()))
+            .map(|info| info.dynamic)
+            .unwrap_or(false);
+        if is_dynamic {
+            // 元素类型
+            let elem_ty = self.dyn_table_elem_ty(base)?;
+            let elem_llvm = self.llvm_ty(&elem_ty);
+            let suffix = table_elem_suffix(elem_llvm);
+            self.mark_used(&format!("tie_table_set_{suffix}"));
+            // t 是 alloca ptr → load 表指针
+            let tptr = self.new_reg();
+            self.line(&format!("{tptr} = load ptr, ptr {base_ptr}"));
+            // 求右值（普通或复合）
+            let new_val = match ia.op {
+                None => {
+                    let (v, _t) = self.gen_expr(&ia.value)?;
+                    v
+                }
+                Some(op) => {
+                    // 读旧值（tie_table_at_* 带 ok 标志）
+                    self.mark_used(&format!("tie_table_at_{suffix}"));
+                    let ok = self.new_reg();
+                    self.line(&format!("{ok} = alloca i1"));
+                    self.line(&format!("store i1 1, ptr {ok}"));
+                    let old = self.new_reg();
+                    self.line(&format!(
+                        "{old} = call {elem_llvm} @tie_table_at_{suffix}(ptr {tptr}, i64 {idx_val}, ptr {ok})"
+                    ));
+                    let (rv, _rty) = self.gen_expr(&ia.value)?;
+                    let lhs_is_str = elem_llvm == "ptr";
+                    let rhs_unsigned = matches!(
+                        self.sem_ty_of(&ia.value),
+                        Some(TypeSpec::Named(TyKw::U8 | TyKw::U16 | TyKw::U32 | TyKw::U64))
+                    );
+                    let (res, _t) = self.gen_binary_on_regs(
+                        op,
+                        lhs_is_str,
+                        old,
+                        elem_llvm,
+                        rv,
+                        rhs_unsigned,
+                    )?;
+                    res
+                }
+            };
+            // 写入（set 桥带 ok 标志，越界 → 运行时错误）
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = alloca i1"));
+            self.line(&format!("store i1 0, ptr {ok}"));
+            self.line(&format!(
+                "call void @tie_table_set_{suffix}(ptr {tptr}, i64 {idx_val}, {elem_llvm} {new_val}, ptr {ok})"
+            ));
+            let okv = self.new_reg();
+            self.line(&format!("{okv} = load i1, ptr {ok}"));
+            let ok_label = self.new_label("index_assign.ok");
+            let err_label = self.new_label("index_assign.err");
+            self.line(&format!("br i1 {okv}, label %{ok_label}, label %{err_label}"));
+            self.block_start(&err_label);
+            let tlen = self.table_len_reg(&tptr)?;
+            self.gen_runtime_error(
+                "运行时错误: table_at 下标越界：索引 %lld 超出长度 %lld",
+                &[("i64", idx_val.clone()), ("i64", tlen)],
+            );
+            self.block_end();
+            self.block_start(&ok_label);
+            return Ok(());
+        }
+        // 定长表：数组类型必须可解析 → GEP + store（普通/复合）
+        let Some(elem_ty) = parse_array_elem_ty(base_ty) else {
+            return Err(IrError {
+                message: format!("内部错误：下标赋值的对象不是数组类型（{}）", base_ty),
+            });
+        };
+        let ptr = self.new_reg();
+        self.line(&format!("{ptr} = getelementptr {base_ty}, ptr {base_ptr}, i64 0, i64 {idx_val}"));
+        match ia.op {
+            None => {
+                let (val, _t) = self.gen_expr(&ia.value)?;
+                self.line(&format!("store {elem_ty} {val}, ptr {ptr}"));
+            }
+            Some(op) => {
+                let (rv, _rty) = self.gen_expr(&ia.value)?;
+                let cur = self.new_reg();
+                self.line(&format!("{cur} = load {elem_ty}, ptr {ptr}"));
+                let lhs_is_str = elem_ty == "ptr";
+                let rhs_unsigned = matches!(
+                    self.sem_ty_of(&ia.value),
+                    Some(TypeSpec::Named(TyKw::U8 | TyKw::U16 | TyKw::U32 | TyKw::U64))
+                );
+                let (res, _t) = self.gen_binary_on_regs(op, lhs_is_str, cur, elem_ty, rv, rhs_unsigned)?;
+                self.line(&format!("store {elem_ty} {res}, ptr {ptr}"));
+            }
+        }
+        Ok(())
+    }
+
     /// 表变量声明：生成定长数组布局。
     ///
     /// 布局：`alloca [N x T]`，随后对每个元素 store 到数组内偏移（GEP）。
     /// 长度与元素类型取自语义层 tables 元数据（键 = init 表达式地址）。
     fn gen_table_var(&mut self, v: &tie_frontend::ast::VarDeclStmt) -> Result<(), IrError> {
         let key = &v.init as *const Expr as usize;
+        // 布局元数据：标注 table 时在 sem.tables（键 = init 地址）；
+        // 未标注表字面量（var arr = [1,2,3]，M4 补齐）在 table_vars（键 = 函数+变量名）。
         let info = self
             .sem
             .tables
             .get(&key)
             .cloned()
+            .or_else(|| {
+                self.sem
+                    .table_vars
+                    .get(&(self.cur_fn.clone(), v.name.clone()))
+                    .cloned()
+            })
             .ok_or_else(|| IrError {
                 message: format!("内部错误：表变量 '{}' 缺少布局元数据", v.name),
             })?;
@@ -1279,7 +1477,19 @@ impl<'p> IrGenerator<'p> {
         match expr {
             Expr::IntLit(v) => Ok((v.to_string(), "i64")),
             Expr::FloatLit(v) => Ok((format_float(*v), "double")),
-            Expr::BoolLit(b) => Ok((if *b { "true".into() } else { "false".into() }, "i1")),
+            Expr::BoolLit(b) => {
+                // 平衡三进制字面量适配（M4 补齐）：语义层把 trit 上下文的
+                // true/false 改写为 expr_types=Trit（`var t: trit = true`），
+                // 此处按语义类型生成 i8 值（true→1 / false→-1）；否则 i1。
+                if matches!(self.sem_ty_of(expr), Some(TypeSpec::Named(TyKw::Trit))) {
+                    let v: i8 = if *b { 1 } else { -1 };
+                    Ok((v.to_string(), "i8"))
+                } else {
+                    Ok((if *b { "true".into() } else { "false".into() }, "i1"))
+                }
+            }
+            // 平衡三进制 trit 字面量（M4 补齐）：i8 常量 -1/0/1
+            Expr::TritLit(v) => Ok((v.to_string(), "i8")),
             Expr::CharLit(c) => Ok(((*c as i32).to_string(), "i32")),
             Expr::StrLit(s) => {
                 let g = self.string_global(s);
@@ -1349,9 +1559,17 @@ impl<'p> IrGenerator<'p> {
                         Ok((tmp, ty))
                     }
                     UnaryOp::Not => {
-                        let tmp = self.new_reg();
-                        self.line(&format!("{tmp} = xor i1 {val}, true"));
-                        Ok((tmp, "i1"))
+                        // 平衡三值逻辑非（M4 补齐）：trit 是 i8，取反 = 0 - val
+                        //（-1↔1，0 保持）；bool 保持 xor true。
+                        if ty == "i8" {
+                            let tmp = self.new_reg();
+                            self.line(&format!("{tmp} = sub i8 0, {val}"));
+                            Ok((tmp, "i8"))
+                        } else {
+                            let tmp = self.new_reg();
+                            self.line(&format!("{tmp} = xor i1 {val}, true"));
+                            Ok((tmp, "i1"))
+                        }
                     }
                     // 自增/自减已在上方 gen_inc_dec 提前返回，此处不可达
                     UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::PostInc | UnaryOp::PostDec => {
@@ -1678,6 +1896,139 @@ impl<'p> IrGenerator<'p> {
         }
     }
 
+    /// 平衡三进制 trit 二元运算生成（M4 补齐）。
+    ///
+    /// trit 以 i8 存储（值域 -1/0/1）。规则：
+    /// - Kleene 逻辑：`&&` = min、`||` = max（icmp + select 实现，与解释路径一致）；
+    /// - 饱和算术：`+ - *` 用 i8 运算后 clamp 到 [-1,1]（比较 + select 夹取）；
+    /// - 比较：`== != < > <= >=` → icmp i8 → i1；
+    /// - 混合：trit × i64 → sext i8→i64 后整数运算（返回 i64）。
+    /// `lhs_is_trit`：左侧是否 trit（混合运算时决定 sext 方向与结果类型）。
+    fn gen_binary_trit(
+        &mut self,
+        op: BinaryOp,
+        lhs_is_trit: bool,
+        lv: String,
+        lt: &'static str,
+        rv: String,
+        rt: &'static str,
+    ) -> Result<(String, &'static str), IrError> {
+        // 混合 trit×i64：trit 侧 sext 到 i64 后走常规整数运算。
+        // 两侧同为 trit（lt=="i8" 且 rt=="i8"）时无需提升。
+        let mixed = !(lt == "i8" && rt == "i8");
+        // trit 侧寄存器（需 sext 的一侧）与 i64 侧寄存器
+        let (trit_reg, int_reg, trit_first) = if lt == "i8" {
+            (lv.clone(), rv.clone(), true)
+        } else {
+            (rv.clone(), lv.clone(), false)
+        };
+        if mixed {
+            // trit sext i8→i64
+            let sext = self.new_reg();
+            self.line(&format!("{sext} = sext i8 {trit_reg} to i64"));
+            let tmp = self.new_reg();
+            // 交换律（+ * == !=）顺序无感；非交换（- < > <= >=）按 trit op i64 语义
+            let (a, b) = if trit_first {
+                (sext.clone(), int_reg.clone())
+            } else {
+                (int_reg.clone(), sext.clone())
+            };
+            let instr = match op {
+                BinaryOp::Add => format!("add i64 {a}, {b}"),
+                BinaryOp::Sub => format!("sub i64 {a}, {b}"),
+                BinaryOp::Mul => format!("mul i64 {a}, {b}"),
+                BinaryOp::Eq => format!("icmp eq i64 {a}, {b}"),
+                BinaryOp::NotEq => format!("icmp ne i64 {a}, {b}"),
+                BinaryOp::Lt => format!("icmp slt i64 {a}, {b}"),
+                BinaryOp::Gt => format!("icmp sgt i64 {a}, {b}"),
+                BinaryOp::Le => format!("icmp sle i64 {a}, {b}"),
+                BinaryOp::Ge => format!("icmp sge i64 {a}, {b}"),
+                _ => {
+                    return Err(IrError {
+                        message: format!("trit 与 i64 不支持运算 {:?}", op),
+                    })
+                }
+            };
+            self.line(&format!("{tmp} = {instr}"));
+            // 算术返回 i64，比较返回 i1
+            let res_ty = if matches!(
+                op,
+                BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge
+            ) {
+                "i1"
+            } else {
+                "i64"
+            };
+            return Ok((tmp, res_ty));
+        }
+        // ---- 两侧同为 trit（i8 × i8）----
+        // Kleene 逻辑（And/Or）与饱和算术（Add/Sub/Mul）生成多指令后直接返回
+        // 结果寄存器；比较类生成单条 icmp 指令写入 tmp 后返回。
+        match op {
+            // Kleene 逻辑：min（&&）/ max（||）——icmp + select
+            BinaryOp::And | BinaryOp::Or => {
+                let cmp_op = if op == BinaryOp::And { "slt" } else { "sgt" };
+                let c = self.new_reg();
+                self.line(&format!("{c} = icmp {cmp_op} i8 {lv}, {rv}"));
+                let s = self.new_reg();
+                // min 时 c 真选 lv（lv<rv），max 时 c 真选 lv（lv>rv）
+                self.line(&format!("{s} = select i1 {c}, i8 {lv}, i8 {rv}"));
+                return Ok((s, "i8"));
+            }
+            // 饱和算术：运算后 clamp 到 [-1,1]
+            BinaryOp::Add => return Ok(self.trit_arith("add", &lv, &rv)),
+            BinaryOp::Sub => return Ok(self.trit_arith("sub", &lv, &rv)),
+            BinaryOp::Mul => return Ok(self.trit_arith("mul", &lv, &rv)),
+            _ => {}
+        }
+        // 比较类：单条 icmp 指令
+        let tmp = self.new_reg();
+        let instr: String = match op {
+            BinaryOp::Eq => format!("icmp eq i8 {lv}, {rv}"),
+            BinaryOp::NotEq => format!("icmp ne i8 {lv}, {rv}"),
+            BinaryOp::Lt => format!("icmp slt i8 {lv}, {rv}"),
+            BinaryOp::Gt => format!("icmp sgt i8 {lv}, {rv}"),
+            BinaryOp::Le => format!("icmp sle i8 {lv}, {rv}"),
+            BinaryOp::Ge => format!("icmp sge i8 {lv}, {rv}"),
+            BinaryOp::Div | BinaryOp::Mod => {
+                return Err(IrError {
+                    message: "trit 不支持除/取模运算（三值无除法）".into(),
+                })
+            }
+            _ => {
+                return Err(IrError {
+                    message: format!("trit 不支持位运算 {:?}", op),
+                })
+            }
+        };
+        self.line(&format!("{tmp} = {instr}"));
+        Ok((tmp, "i1"))
+    }
+
+    /// trit 饱和算术辅助：`{opcode} i8 lv, rv` 后 clamp 到 [-1,1]。
+    /// 返回 (结果寄存器, "i8")。
+    fn trit_arith(&mut self, opcode: &str, lv: &str, rv: &str) -> (String, &'static str) {
+        // 原始运算（i8 可能溢出，先 sext 到 i64 运算再 clamp，与解释路径一致）
+        let sext_l = self.new_reg();
+        self.line(&format!("{sext_l} = sext i8 {lv} to i64"));
+        let sext_r = self.new_reg();
+        self.line(&format!("{sext_r} = sext i8 {rv} to i64"));
+        let raw = self.new_reg();
+        self.line(&format!("{raw} = {opcode} i64 {sext_l}, {sext_r}"));
+        // clamp：raw < -1 → -1；raw > 1 → 1；否则 raw
+        let lo = self.new_reg();
+        self.line(&format!("{lo} = icmp slt i64 {raw}, -1"));
+        let hi = self.new_reg();
+        self.line(&format!("{hi} = icmp sgt i64 {raw}, 1"));
+        let cl = self.new_reg();
+        self.line(&format!("{cl} = select i1 {lo}, i64 -1, i64 {raw}"));
+        let ch = self.new_reg();
+        self.line(&format!("{ch} = select i1 {hi}, i64 1, i64 {cl}"));
+        let trunc = self.new_reg();
+        self.line(&format!("{trunc} = trunc i64 {ch} to i8"));
+        (trunc, "i8")
+    }
+
     /// 二元运算生成：两侧表达式求值后交给 [gen_binary_on_regs] 统一生成指令。
     fn gen_binary(
         &mut self,
@@ -1686,7 +2037,7 @@ impl<'p> IrGenerator<'p> {
         rhs: &Expr,
     ) -> Result<(String, &'static str), IrError> {
         let (lv, lt) = self.gen_expr(lhs)?;
-        let (rv, _rt) = self.gen_expr(rhs)?;
+        let (rv, rt) = self.gen_expr(rhs)?;
         // 字符串操作：拼接（+）与比较（== != < > <= >=）走运行时函数。
         // 通过语义类型判断（LLVM 类型名 "ptr" 无法区分字符串与裸指针）。
         let lhs_is_str = matches!(self.sem_ty_of(lhs), Some(TypeSpec::Named(TyKw::Str)));
@@ -1697,6 +2048,13 @@ impl<'p> IrGenerator<'p> {
             lhs_sem,
             Some(TypeSpec::Named(TyKw::U8 | TyKw::U16 | TyKw::U32 | TyKw::U64))
         );
+        // 平衡三进制 trit（M4 补齐）：走专门的 trit 运算生成
+        //（Kleene 逻辑 min/max、饱和算术 clamp、trit×i64 sext 混合）。
+        let lhs_is_trit = matches!(lhs_sem, Some(TypeSpec::Named(TyKw::Trit)));
+        let rhs_is_trit = matches!(self.sem_ty_of(rhs), Some(TypeSpec::Named(TyKw::Trit)));
+        if lhs_is_trit || rhs_is_trit {
+            return self.gen_binary_trit(op, lhs_is_trit, lv, lt, rv, rt);
+        }
         self.gen_binary_on_regs(op, lhs_is_str || rhs_is_str, lv, lt, rv, is_unsigned)
     }
 
@@ -2273,6 +2631,34 @@ impl<'p> IrGenerator<'p> {
             self.block_start(&ok_label);
             return Ok((tmp, "double"));
         }
+        // 内置 parse_trit（M4 补齐）：字符串参数，返回 trit（i8）。
+        // 走 C ABI 桥（非法输入 → 运行时错误，文本与解释路径一致）。
+        if name == "parse_trit" {
+            self.mark_used("tie_parse_trit");
+            let (s, _t) = self.gen_expr(&args[0])?;
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = alloca i8"));
+            self.line(&format!("store i8 0, ptr {ok}"));
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call i8 @tie_parse_trit(ptr {s}, ptr {ok})"));
+            let okv = self.new_reg();
+            self.line(&format!("{okv} = load i8, ptr {ok}"));
+            let is_zero = self.new_reg();
+            self.line(&format!("{is_zero} = icmp eq i8 {okv}, 0"));
+            let ok_label = self.new_label("parse_trit.ok");
+            let err_label = self.new_label("parse_trit.err");
+            self.line(&format!("br i1 {is_zero}, label %{err_label}, label %{ok_label}"));
+            // 解析失败 → 运行时错误
+            self.block_start(&err_label);
+            self.gen_runtime_error(
+                "运行时错误: parse_trit 参数 '%s' 不是合法的 trit（期望 -1/0/1）",
+                &[("ptr", s)],
+            );
+            self.block_end();
+            // 成功块：返回解析值（i8 = trit）
+            self.block_start(&ok_label);
+            return Ok((tmp, "i8"));
+        }
         // 内置 exit：整数参数，void（刷新 stdout 后终止进程）。
         // 编译路径：fflush(NULL) 刷新全部流 → libc exit；解释路径：stdout().flush() + exit。
         if name == "exit" {
@@ -2412,6 +2798,172 @@ impl<'p> IrGenerator<'p> {
             // 成功块：返回值即表指针（调用方可用 len/for/table_at 访问）
             self.block_start(&ok_label);
             return Ok((tmp, "ptr"));
+        }
+        // ---------- M4 补齐：系统能力内置函数（M6 包管理器前置） ----------
+        //
+        // 设计说明（编译/解释两路径一致性的关键）：全部走 tie-interp 的 C ABI 桥
+        // （与解释路径共用同一份 Rust 实现，行为逐字节一致）：
+        // - 返回堆串（http_get/exec_output/path_*/cwd/get_env）：堆串机制，用完 tie_free_result；
+        // - 返回 bool（i8：http_get_file/untar_gz/unzip/mkdir_all/remove_dir_all/copy_dir/
+        //   file_copy/file_move）：i8 → icmp ne 0 → i1；
+        // - 返回 i64（exec_code）：直接 i64；
+        // - void（set_env）：调用后无返回；
+        // - 字符串动态表（walk_dir）：与 list_dir 同模式（ptr 表指针 + NULL 错误分支）。
+
+        // 内置 http_get：单字符串参数（URL），返回 string（响应正文）。
+        // 失败（桥返回 NULL）→ 运行时错误，文本与解释路径一致。
+        if name == "http_get" {
+            self.mark_used("tie_http_get");
+            self.mark_used("tie_free_result");
+            let (u, _t) = self.gen_expr(&args[0])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_http_get(ptr {u})"));
+            let is_null = self.new_reg();
+            self.line(&format!("{is_null} = icmp eq ptr {tmp}, null"));
+            let ok_label = self.new_label("http_get.ok");
+            let err_label = self.new_label("http_get.err");
+            self.line(&format!("br i1 {is_null}, label %{err_label}, label %{ok_label}"));
+            self.block_start(&err_label);
+            self.gen_runtime_error("运行时错误: http_get 无法访问 URL '%s'", &[("ptr", u)]);
+            self.block_end();
+            self.block_start(&ok_label);
+            return Ok((tmp, "ptr"));
+        }
+        // 内置 http_get_file：两个字符串参数（URL, 路径），返回 bool（下载成功与否）。
+        if name == "http_get_file" {
+            self.mark_used("tie_http_get_file");
+            let (u, _t) = self.gen_expr(&args[0])?;
+            let (p, _t) = self.gen_expr(&args[1])?;
+            let r = self.new_reg();
+            self.line(&format!("{r} = call i8 @tie_http_get_file(ptr {u}, ptr {p})"));
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = icmp ne i8 {r}, 0"));
+            return Ok((ok, "i1"));
+        }
+        // 内置 exec_code：单字符串参数（命令行），返回 i64（退出码；启动失败 -1）。
+        if name == "exec_code" {
+            self.mark_used("tie_exec_code");
+            let (c, _t) = self.gen_expr(&args[0])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call i64 @tie_exec_code(ptr {c})"));
+            return Ok((tmp, "i64"));
+        }
+        // 内置 exec_output：单字符串参数（命令行），返回 string（捕获 stdout；启动失败空串）。
+        if name == "exec_output" {
+            self.mark_used("tie_exec_output");
+            self.mark_used("tie_free_result");
+            let (c, _t) = self.gen_expr(&args[0])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_exec_output(ptr {c})"));
+            return Ok((tmp, "ptr"));
+        }
+        // 内置 untar_gz / unzip：两个字符串参数（归档, 目标目录），返回 bool（解压成功与否）。
+        if name == "untar_gz" || name == "unzip" {
+            self.mark_used(&format!("tie_{name}"));
+            let (f, _t) = self.gen_expr(&args[0])?;
+            let (d, _t) = self.gen_expr(&args[1])?;
+            let r = self.new_reg();
+            self.line(&format!("{r} = call i8 @tie_{name}(ptr {f}, ptr {d})"));
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = icmp ne i8 {r}, 0"));
+            return Ok((ok, "i1"));
+        }
+        // 内置 mkdir_all / remove_dir_all：单字符串参数（路径），返回 bool（成功与否）。
+        if name == "mkdir_all" || name == "remove_dir_all" {
+            self.mark_used(&format!("tie_{name}"));
+            let (p, _t) = self.gen_expr(&args[0])?;
+            let r = self.new_reg();
+            self.line(&format!("{r} = call i8 @tie_{name}(ptr {p})"));
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = icmp ne i8 {r}, 0"));
+            return Ok((ok, "i1"));
+        }
+        // 内置 copy_dir：两个字符串参数（源, 目标目录），返回 bool（复制成功与否）。
+        if name == "copy_dir" {
+            self.mark_used("tie_copy_dir");
+            let (s, _t) = self.gen_expr(&args[0])?;
+            let (d, _t) = self.gen_expr(&args[1])?;
+            let r = self.new_reg();
+            self.line(&format!("{r} = call i8 @tie_copy_dir(ptr {s}, ptr {d})"));
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = icmp ne i8 {r}, 0"));
+            return Ok((ok, "i1"));
+        }
+        // 内置 walk_dir：单字符串参数（目录），返回字符串动态表（全部文件相对路径）。
+        // 与 list_dir 同模式：桥返回 NULL → 运行时错误。
+        if name == "walk_dir" {
+            self.mark_used("tie_walk_dir");
+            let (p, _t) = self.gen_expr(&args[0])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_walk_dir(ptr {p})"));
+            let is_null = self.new_reg();
+            self.line(&format!("{is_null} = icmp eq ptr {tmp}, null"));
+            let ok_label = self.new_label("walk_dir.ok");
+            let err_label = self.new_label("walk_dir.err");
+            self.line(&format!("br i1 {is_null}, label %{err_label}, label %{ok_label}"));
+            self.block_start(&err_label);
+            self.gen_runtime_error("运行时错误: walk_dir 无法读取目录 '%s'", &[("ptr", p)]);
+            self.block_end();
+            self.block_start(&ok_label);
+            return Ok((tmp, "ptr"));
+        }
+        // 内置 path_join：两个字符串参数，返回 string（拼接路径）。
+        if name == "path_join" {
+            self.mark_used("tie_path_join");
+            self.mark_used("tie_free_result");
+            let (a, _t) = self.gen_expr(&args[0])?;
+            let (b, _t) = self.gen_expr(&args[1])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_path_join(ptr {a}, ptr {b})"));
+            return Ok((tmp, "ptr"));
+        }
+        // 内置 path_basename / path_dirname / path_abs / path_normalize：单字符串参数，返回 string。
+        if matches!(
+            name,
+            "path_basename" | "path_dirname" | "path_abs" | "path_normalize"
+        ) {
+            self.mark_used(&format!("tie_{name}"));
+            self.mark_used("tie_free_result");
+            let (p, _t) = self.gen_expr(&args[0])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_{name}(ptr {p})"));
+            return Ok((tmp, "ptr"));
+        }
+        // 内置 cwd：零参数，返回 string（当前工作目录）。
+        if name == "cwd" {
+            self.mark_used("tie_cwd");
+            self.mark_used("tie_free_result");
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_cwd()"));
+            return Ok((tmp, "ptr"));
+        }
+        // 内置 get_env：单字符串参数（变量名），返回 string（值；不存在空串）。
+        if name == "get_env" {
+            self.mark_used("tie_get_env");
+            self.mark_used("tie_free_result");
+            let (n, _t) = self.gen_expr(&args[0])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_get_env(ptr {n})"));
+            return Ok((tmp, "ptr"));
+        }
+        // 内置 set_env：两个字符串参数（变量名, 值），void（设置环境变量）。
+        if name == "set_env" {
+            self.mark_used("tie_set_env");
+            let (n, _t) = self.gen_expr(&args[0])?;
+            let (v, _t) = self.gen_expr(&args[1])?;
+            self.line(&format!("call void @tie_set_env(ptr {n}, ptr {v})"));
+            return Ok((String::new(), "void"));
+        }
+        // 内置 file_copy / file_move：两个字符串参数（源, 目标），返回 bool（成功与否）。
+        if name == "file_copy" || name == "file_move" {
+            self.mark_used(&format!("tie_{name}"));
+            let (s, _t) = self.gen_expr(&args[0])?;
+            let (d, _t) = self.gen_expr(&args[1])?;
+            let r = self.new_reg();
+            self.line(&format!("{r} = call i8 @tie_{name}(ptr {s}, ptr {d})"));
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = icmp ne i8 {r}, 0"));
+            return Ok((ok, "i1"));
         }
         // 内置 msg_set_lang：单字符串参数，void（切换消息系统当前语言）。
         // 走 C ABI 桥（与解释路径共用 thread_local 状态）。
