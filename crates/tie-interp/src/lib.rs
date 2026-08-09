@@ -654,6 +654,130 @@ pub extern "C" fn tie_table_set_bool(t: *mut DynTable, i: i64, x: i8, ok: *mut i
     }
 }
 
+// ---------- D7：字节流 / 位操作原语（M4 补齐延伸） C ABI 桥 ----------
+//
+// 设计说明（编解码器底座）：JPEG/MP3/LZ4 等多媒体/压缩算法需要**逐字节文件 IO**
+// 与**位级打包**。tie 语言无法自举文件字节级读写（文本 file_read 不适用），
+// 且表参数元素类型静态未知（tie 侧无法遍历字节表）——因此：
+// - 表参数（字节表）的**遍历在 Rust 桥层完成**（tie 侧只传表指针）；
+// - byte_read 返回 i64 动态表（0..255）；byte_write 接收 i64 表写文件；
+// - bit_read/bit_write 在**调用方用表操作**实现（见 eval 分支），桥只做字节级 IO。
+// 两路径一致：编译（IR）走桥，解释（interp）走同一桥。
+
+/// C ABI 桥：读取文件全部字节，返回 i64 动态表（每个元素 0..255）；失败返回 NULL。
+///
+/// 表元素：i64（字节值），调用方用 table_at/下标读取（table_ret_elems 记录 i64）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_byte_read(path: *const c_char) -> *mut DynTable {
+    let path = match unsafe { c_char_to_string(path) } {
+        Ok(p) => p,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let t = tie_table_new(8); // i64 元素
+    if t.is_null() {
+        return t;
+    }
+    for b in bytes {
+        tie_table_push_i64(t, b as i64);
+    }
+    t
+}
+
+/// C ABI 桥：把 i64 动态表（元素 0..255）写入文件；成功返回 1（bool true），失败返回 0。
+///
+/// 表元素读取在桥层完成（tie 侧只传表指针——规避表参数元素类型未知限制）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_byte_write(path: *const c_char, bytes: *mut DynTable) -> i8 {
+    let path = match unsafe { c_char_to_string(path) } {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    if bytes.is_null() {
+        return 0;
+    }
+    unsafe {
+        let tbl = &*bytes;
+        let mut buf: Vec<u8> = Vec::with_capacity(tbl.len as usize);
+        for i in 0..tbl.len {
+            let v = (tbl.data as *const i64).add(i as usize).read();
+            buf.push(v.clamp(0, 255) as u8);
+        }
+        match std::fs::write(&path, &buf) {
+            Ok(_) => 1,
+            Err(_) => 0,
+        }
+    }
+}
+
+/// C ABI 桥：读字节表第 pos 位（LSB 序：第 pos 位 = byte[pos/8] 的 (pos%8) 位）。
+/// 越界返回 0。返回 0/1。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_bit_read(bytes: *mut DynTable, pos: i64) -> i64 {
+    if bytes.is_null() || pos < 0 {
+        return 0;
+    }
+    unsafe {
+        let tbl = &*bytes;
+        let byte_idx = pos / 8;
+        if byte_idx >= tbl.len {
+            return 0;
+        }
+        let v = (tbl.data as *const i64).add(byte_idx as usize).read();
+        let bit = pos % 8;
+        ((v >> bit) & 1)
+    }
+}
+
+/// C ABI 桥：写字节表第 pos 位（LSB 序）为 bit（0/1）；越界返回 0（失败），成功返回 1。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_bit_write(bytes: *mut DynTable, pos: i64, bit: i64) -> i8 {
+    if bytes.is_null() || pos < 0 {
+        return 0;
+    }
+    unsafe {
+        let tbl = &mut *bytes;
+        let byte_idx = pos / 8;
+        if byte_idx >= tbl.len {
+            return 0;
+        }
+        let cur = (tbl.data as *mut i64).add(byte_idx as usize).read();
+        let bit_idx = pos % 8;
+        let new = if bit != 0 {
+            cur | (1 << bit_idx)
+        } else {
+            cur & !(1 << bit_idx)
+        };
+        (tbl.data as *mut i64).add(byte_idx as usize).write(new);
+        1
+    }
+}
+
+/// C ABI 桥：拼接两个字节表，返回新 i64 动态表。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_byte_concat(a: *mut DynTable, b: *mut DynTable) -> *mut DynTable {
+    let t = tie_table_new(8);
+    if t.is_null() {
+        return t;
+    }
+    unsafe {
+        for tbl in [a, b] {
+            if tbl.is_null() {
+                continue;
+            }
+            let tb = &*tbl;
+            for i in 0..tb.len {
+                let v = (tb.data as *const i64).add(i as usize).read();
+                tie_table_push_i64(t, v);
+            }
+        }
+    }
+    t
+}
+
 /// C ABI 桥：列出目录中的文件名（仅文件名，不含路径），返回字符串动态表；失败返回 NULL。
 ///
 /// 实现：`std::fs::read_dir` 枚举目录（条目顺序由文件系统给出，不排序），
@@ -2595,6 +2719,140 @@ impl<'a> Env<'a> {
                     }
                 }
                 // 释放桥表（指针数组 + 结构体；字符串元素按约定泄漏，不重复释放）
+                tie_table_free(t);
+                Ok(Value::Table(cells))
+            }
+            // ---------- D7：字节流 / 位操作原语（编解码器底座） ----------
+            // 与编译路径一致：走 C ABI 桥（共用同一份 Rust 实现）。
+            // byte_read 返回 i64 动态表（0..255）；byte_write 收 i64 表写文件；
+            // bit_read/bit_write 直接操作字节表（i64 表元素按位读写）；
+            // byte_concat 拼接两个字节表。
+            "byte_read" => {
+                if args.len() != 1 {
+                    return Err("byte_read 需要一个字符串参数".into());
+                }
+                let Value::Str(path) = &args[0] else {
+                    return Err("byte_read 需要一个字符串参数".into());
+                };
+                let p = CString::new(path.as_str()).unwrap_or_default();
+                let t = tie_byte_read(p.as_ptr());
+                // 失败（NULL）→ 报错
+                if t.is_null() {
+                    return Err(format!("运行时错误: byte_read 无法读取文件 '{path}'"));
+                }
+                // 读出全部字节（元素类型 i64）
+                let mut cells: Vec<Value> = Vec::new();
+                unsafe {
+                    let tbl = &*t;
+                    for i in 0..tbl.len {
+                        let v = (tbl.data as *const i64).add(i as usize).read();
+                        cells.push(Value::Int(v));
+                    }
+                }
+                tie_table_free(t);
+                Ok(Value::Table(cells))
+            }
+            "byte_write" => {
+                if args.len() != 2 {
+                    return Err("byte_write 需要两个参数（路径, 字节表）".into());
+                }
+                let Value::Str(path) = &args[0] else {
+                    return Err("byte_write 第 1 个参数必须是字符串".into());
+                };
+                // 构造字节表（Value::Table 的元素为 Int，逐个 push 到桥表）
+                let t = tie_table_new(8);
+                let Value::Table(cells) = &args[1] else {
+                    return Err("byte_write 第 2 个参数必须是字节表".into());
+                };
+                for cell in cells {
+                    if let Value::Int(v) = cell {
+                        tie_table_push_i64(t, *v);
+                    }
+                }
+                let p = CString::new(path.as_str()).unwrap_or_default();
+                let ok = tie_byte_write(p.as_ptr(), t);
+                tie_table_free(t);
+                Ok(Value::Bool(ok != 0))
+            }
+            "bit_read" => {
+                if args.len() != 2 {
+                    return Err("bit_read 需要两个参数（字节表, 位置）".into());
+                }
+                let Value::Table(cells) = &args[0] else {
+                    return Err("bit_read 第 1 个参数必须是字节表".into());
+                };
+                let Value::Int(pos) = args[1] else {
+                    return Err("bit_read 第 2 个参数必须是整数".into());
+                };
+                let t = tie_table_new(8);
+                for cell in cells {
+                    if let Value::Int(v) = cell {
+                        tie_table_push_i64(t, *v);
+                    }
+                }
+                let r = tie_bit_read(t, pos);
+                tie_table_free(t);
+                Ok(Value::Int(r))
+            }
+            "bit_write" => {
+                if args.len() != 3 {
+                    return Err("bit_write 需要三个参数（字节表, 位置, 位值）".into());
+                }
+                let Value::Table(cells) = &args[0] else {
+                    return Err("bit_write 第 1 个参数必须是字节表".into());
+                };
+                let Value::Int(pos) = args[1] else {
+                    return Err("bit_write 第 2 个参数必须是整数".into());
+                };
+                let Value::Int(bit) = args[2] else {
+                    return Err("bit_write 第 3 个参数必须是整数".into());
+                };
+                let t = tie_table_new(8);
+                for cell in cells {
+                    if let Value::Int(v) = cell {
+                        tie_table_push_i64(t, *v);
+                    }
+                }
+                let ok = tie_bit_write(t, pos, bit);
+                tie_table_free(t);
+                Ok(Value::Bool(ok != 0))
+            }
+            "byte_concat" => {
+                if args.len() != 2 {
+                    return Err("byte_concat 需要两个字节表参数".into());
+                }
+                let Value::Table(cells_a) = &args[0] else {
+                    return Err("byte_concat 第 1 个参数必须是字节表".into());
+                };
+                let Value::Table(cells_b) = &args[1] else {
+                    return Err("byte_concat 第 2 个参数必须是字节表".into());
+                };
+                let ta = tie_table_new(8);
+                for cell in cells_a {
+                    if let Value::Int(v) = cell {
+                        tie_table_push_i64(ta, *v);
+                    }
+                }
+                let tb = tie_table_new(8);
+                for cell in cells_b {
+                    if let Value::Int(v) = cell {
+                        tie_table_push_i64(tb, *v);
+                    }
+                }
+                let t = tie_byte_concat(ta, tb);
+                tie_table_free(ta);
+                tie_table_free(tb);
+                if t.is_null() {
+                    return Err("byte_concat 拼接失败".into());
+                }
+                let mut cells: Vec<Value> = Vec::new();
+                unsafe {
+                    let tbl = &*t;
+                    for i in 0..tbl.len {
+                        let v = (tbl.data as *const i64).add(i as usize).read();
+                        cells.push(Value::Int(v));
+                    }
+                }
                 tie_table_free(t);
                 Ok(Value::Table(cells))
             }

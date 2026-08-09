@@ -1,0 +1,222 @@
+// tie:library
+// lz4.tie：扩展库——LZ4 块压缩（命名空间 lz4，D7b）
+// 内容：LZ4 压缩/解压（滑窗匹配，匹配长度 ≥ 4 用引用，否则字面量）。
+// 接口：输入为逗号分隔**字节序列**字符串（0..255，配合 D7 字节流原语
+// byte_read/byte_write 使用）；输出为**压缩 token 序列**字符串：
+// "L,码点"（字面量）与 "M,dist,len"（匹配引用）交错。
+// 表参数元素类型静态未知 → 全部局部表 + 字符串序列（同 std/enl 库模式）。
+
+namespace lz4 {
+// LZ4 压缩：s 为字节序列字符串（逗号分隔 0..255），返回 token 序列字符串。
+pub func compress(s: string) -> string {
+    var data = parse_i64(s)
+    var n: i64 = len(data)
+    var out = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        // 滑窗：前 255 字节内找最长匹配（LZ4 偏移上限 65535，简化用 255）
+        var best_dist: i64 = 0
+        var best_len: i64 = 0
+        var w_start: i64 = i - 255
+        if w_start < 0 {
+            w_start = 0
+        }
+        var d: i64 = 1
+        while d <= i - w_start {
+            // 从 s[i-d] 与 s[i] 对齐匹配。
+            // 注意：tie 的 && 非短路（IR 用 and 指令，两侧先求值）——
+            // `i+len < n && data[i+len]` 在 i+len==n 时 data[n] 会越界，
+            // 必须用嵌套 if 保证只在边界内访问。
+            var len: i64 = 0
+            var mismatch: bool = false
+            while i + len < n && !mismatch {
+                if data[i - d + len] == data[i + len] {
+                    len = len + 1
+                } else {
+                    mismatch = true
+                }
+            }
+            if len > best_len {
+                best_len = len
+                best_dist = d
+            }
+            d = d + 1
+        }
+        // LZ4 规则：匹配长度 >= 4 用引用
+        if best_len >= 4 {
+            table_push(out, 77) // 'M' 标记匹配
+            table_push(out, best_dist)
+            table_push(out, best_len)
+            i = i + best_len
+        } else {
+            table_push(out, 76) // 'L' 标记字面量
+            table_push(out, data[i])
+            i = i + 1
+        }
+    }
+    // 内联拼接（局部表，元素类型已知；series 表参数受限不能用）
+    var res: string = ""
+    var ri: i64 = 0
+    while ri < len(out) {
+        if ri > 0 {
+            res = res + ","
+        }
+        res = res + to_string(out[ri])
+        ri = ri + 1
+    }
+    return res
+}
+
+// LZ4 解压：token 序列还原为字节序列字符串。
+pub func decompress(seq_s: string) -> string {
+    var seq = parse_i64(seq_s)
+    var out = table_new_i64()
+    var pos: i64 = 0
+    while pos < len(seq) {
+        var marker = seq[pos]
+        if marker == 76 {
+            // 字面量
+            table_push(out, seq[pos + 1])
+            pos = pos + 2
+        } else {
+            // 匹配：dist, len
+            var dist = seq[pos + 1]
+            var len = seq[pos + 2]
+            var start = len(out) - dist
+            var k: i64 = 0
+            while k < len {
+                table_push(out, out[start + k])
+                k = k + 1
+            }
+            pos = pos + 3
+        }
+    }
+    // 内联拼接（局部表，元素类型已知；series 表参数受限不能用）
+    var res: string = ""
+    var ri: i64 = 0
+    while ri < len(out) {
+        if ri > 0 {
+            res = res + ","
+        }
+        res = res + to_string(out[ri])
+        ri = ri + 1
+    }
+    return res
+}
+
+// 字符串 → 字节序列（ASCII 码点表）。
+// 仅支持可打印 ASCII + 常见字符（编码层约定）。
+pub func to_bytes(s: string) -> string {
+    var out = table_new_i64()
+    var i: i64 = 0
+    while i < len(s) {
+        table_push(out, code_point(str_char(s, i)))
+        i = i + 1
+    }
+    // 内联拼接（局部表，元素类型已知；series 表参数受限不能用）
+    var res: string = ""
+    var ri: i64 = 0
+    while ri < len(out) {
+        if ri > 0 {
+            res = res + ","
+        }
+        res = res + to_string(out[ri])
+        ri = ri + 1
+    }
+    return res
+}
+
+// 字节序列 → 字符串（ASCII）。
+pub func from_bytes(seq_s: string) -> string {
+    var seq = parse_i64(seq_s)
+    var out: string = ""
+    var i: i64 = 0
+    while i < len(seq) {
+        out = out + from_code(seq[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ================= 内部工具 =================
+
+
+// 解析逗号分隔 i64 序列。
+func parse_i64(s: string) -> table {
+    var result = table_new_i64()
+    var n: i64 = len(s)
+    if n == 0 {
+        return result
+    }
+    var start: i64 = 0
+    var i: i64 = 0
+    while i <= n {
+        var at_end: bool = (i == n)
+        var is_comma: bool = !at_end && str_char(s, i) == ","
+        if at_end || is_comma {
+            var seg = slice(s, start, i)
+            if len(seg) > 0 {
+                table_push(result, parse_int(seg))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// 单字符 → 码点（ASCII 查表；未收录字符 → 空格 32）。
+func code_point(ch: string) -> i64 {
+    var chars = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+    var i: i64 = 0
+    while i < len(chars) {
+        if str_char(chars, i) == ch {
+            return i + 32
+        }
+        i = i + 1
+    }
+    return 32
+}
+
+// 码点 → 单字符（32..127 ASCII 查表）。
+func from_code(cp: i64) -> string {
+    // 可打印 ASCII 32..126
+    var chars = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+    if cp < 32 || cp > 126 {
+        return " "
+    }
+    return str_char(chars, cp - 32)
+}
+
+// 截取 s 的 [start, end) 子串。
+func slice(s: string, start: i64, end: i64) -> string {
+    var n: i64 = len(s)
+    var lo: i64 = start
+    if lo < 0 {
+        lo = 0
+    }
+    if lo > n {
+        lo = n
+    }
+    var hi: i64 = end
+    if hi < 0 {
+        hi = 0
+    }
+    if hi > n {
+        hi = n
+    }
+    var result: string = ""
+    var i: i64 = lo
+    while i < hi {
+        result = result + str_char(s, i)
+        i = i + 1
+    }
+    return result
+}
+}
+
+
+
+
+
+

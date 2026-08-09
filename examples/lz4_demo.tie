@@ -1,0 +1,38 @@
+// tie:logic
+// lz4_demo.tie：D7b LZ4 压缩演示（roundtrip 验证）
+// 编译运行：cargo run -p tie -- examples/lz4_demo.tie
+
+import "../enl/codec/lz4.tie"
+
+func main() {
+    // ---- LZ4 roundtrip：重复文本压缩 ----
+    var msg = "abcabcabcabcabcabcabcabc"
+    var bytes = lz4.to_bytes(msg)
+    var comp = lz4.compress(bytes)
+    var decomp = lz4.decompress(comp)
+    var back = lz4.from_bytes(decomp)
+    println("orig: " + msg)
+    println("compressed: " + comp)
+    println("roundtrip: " + (back == msg ? "OK" : "FAIL"))
+
+    println("---")
+
+    // ---- 混合内容（含匹配与字面量）----
+    var msg2 = "hello world hello world hello"
+    var b2 = lz4.to_bytes(msg2)
+    var c2 = lz4.compress(b2)
+    var d2 = lz4.decompress(c2)
+    var back2 = lz4.from_bytes(d2)
+    println("orig2: " + msg2)
+    println("roundtrip2: " + (back2 == msg2 ? "OK" : "FAIL"))
+
+    println("---")
+    var pass: bool = true
+    pass = pass && back == msg
+    pass = pass && back2 == msg2
+    if pass {
+        println("PASS")
+    } else {
+        println("FAIL")
+    }
+}

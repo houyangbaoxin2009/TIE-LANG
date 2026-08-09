@@ -230,6 +230,14 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
     ctx.result
         .table_ret_elems
         .insert("walk_dir".to_string(), Some(TypeSpec::Named(TyKw::Str)));
+    // 内置 byte_read / byte_concat（D7）：返回「i64 字节表」（元素 0..255）。
+    // 与 list_dir 同布局但元素类型 i64，使 `var b = byte_read(p)` 下标读取得 i64。
+    ctx.result
+        .table_ret_elems
+        .insert("byte_read".to_string(), Some(TypeSpec::Named(TyKw::I64)));
+    ctx.result
+        .table_ret_elems
+        .insert("byte_concat".to_string(), Some(TypeSpec::Named(TyKw::I64)));
     // 内置 regex_find_all（P1）：返回「字符串动态表」（全部匹配片段）。与 list_dir
     // 同布局（string 元素），使 `for x in regex_find_all(s, p)` 元素类型静态可知。
     ctx.result
@@ -1865,6 +1873,127 @@ impl Analyzer {
                             span: expr_span_of(&args[0]),
                             message: format!("walk_dir() 参数必须是字符串，实际是 {}", type_name(&at)),
                         });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Table));
+                }
+                // ---------- D7：字节流 / 位操作原语（编解码器底座） ----------
+                // byte_read(path) -> table（i64 字节表）；byte_write(path, bytes: table) -> bool；
+                // bit_read(bytes: table, pos: i64) -> i64；bit_write(bytes: table, pos: i64, bit: i64) -> bool；
+                // byte_concat(a: table, b: table) -> table。
+                if name == "byte_read" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("byte_read() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("byte_read() 参数必须是字符串，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Table));
+                }
+                // byte_write(path: string, bytes: table) -> bool
+                if name == "byte_write" {
+                    if args.len() != 2 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("byte_write() 期望 2 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let p = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), p.clone());
+                    if !matches!(&p, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("byte_write() 第 1 个参数必须是字符串，实际是 {}", type_name(&p)),
+                        });
+                    }
+                    let b = self.infer_expr(&args[1], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[1]), b.clone());
+                    if !matches!(&b, TypeSpec::Named(TyKw::Table)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[1]),
+                            message: format!("byte_write() 第 2 个参数必须是字节表，实际是 {}", type_name(&b)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Bool));
+                }
+                // bit_read(bytes: table, pos: i64) -> i64
+                if name == "bit_read" {
+                    if args.len() != 2 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("bit_read() 期望 2 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let b = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), b.clone());
+                    if !matches!(&b, TypeSpec::Named(TyKw::Table)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("bit_read() 第 1 个参数必须是字节表，实际是 {}", type_name(&b)),
+                        });
+                    }
+                    let q = self.infer_expr(&args[1], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[1]), q.clone());
+                    if !q.is_int() {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[1]),
+                            message: format!("bit_read() 第 2 个参数必须是整数，实际是 {}", type_name(&q)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::I64));
+                }
+                // bit_write(bytes: table, pos: i64, bit: i64) -> bool
+                if name == "bit_write" {
+                    if args.len() != 3 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("bit_write() 期望 3 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let b = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), b.clone());
+                    if !matches!(&b, TypeSpec::Named(TyKw::Table)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("bit_write() 第 1 个参数必须是字节表，实际是 {}", type_name(&b)),
+                        });
+                    }
+                    for a in &args[1..] {
+                        let t = self.infer_expr(a, scope)?;
+                        self.result.expr_types.insert(addr_of(a), t.clone());
+                        if !t.is_int() {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!("bit_write() 位置/位值必须是整数，实际是 {}", type_name(&t)),
+                            });
+                        }
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Bool));
+                }
+                // byte_concat(a: table, b: table) -> table
+                if name == "byte_concat" {
+                    if args.len() != 2 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("byte_concat() 期望 2 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    for a in args {
+                        let t = self.infer_expr(a, scope)?;
+                        self.result.expr_types.insert(addr_of(a), t.clone());
+                        if !matches!(&t, TypeSpec::Named(TyKw::Table)) {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!("byte_concat() 参数必须是字节表，实际是 {}", type_name(&t)),
+                            });
+                        }
                     }
                     return Ok(TypeSpec::Named(TyKw::Table));
                 }

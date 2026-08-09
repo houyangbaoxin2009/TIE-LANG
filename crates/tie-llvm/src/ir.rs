@@ -335,6 +335,85 @@ impl<'p> IrGenerator<'p> {
         if self.used_externs.iter().any(|s| s == "tie_table_set_bool") {
             self.out.push_str("declare void @tie_table_set_bool(ptr, i64, i1, ptr)\n");
         }
+        // ---------- M4 补齐：系统能力原语 C ABI 桥声明 ----------
+        // 与 crates/tie-interp/src/lib.rs 的 #[unsafe(no_mangle)] 导出一一对应。
+        // 此前 demo 未实际调用这些原语，extern 声明缺失未暴露；D7 补全。
+        if self.used_externs.iter().any(|s| s == "tie_http_get") {
+            self.out.push_str("declare ptr @tie_http_get(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_http_get_file") {
+            self.out.push_str("declare i8 @tie_http_get_file(ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_exec_code") {
+            self.out.push_str("declare i64 @tie_exec_code(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_exec_output") {
+            self.out.push_str("declare ptr @tie_exec_output(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_untar_gz") {
+            self.out.push_str("declare i8 @tie_untar_gz(ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_unzip") {
+            self.out.push_str("declare i8 @tie_unzip(ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_mkdir_all") {
+            self.out.push_str("declare i8 @tie_mkdir_all(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_remove_dir_all") {
+            self.out.push_str("declare i8 @tie_remove_dir_all(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_copy_dir") {
+            self.out.push_str("declare i8 @tie_copy_dir(ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_walk_dir") {
+            self.out.push_str("declare ptr @tie_walk_dir(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_path_join") {
+            self.out.push_str("declare ptr @tie_path_join(ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_path_basename") {
+            self.out.push_str("declare ptr @tie_path_basename(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_path_dirname") {
+            self.out.push_str("declare ptr @tie_path_dirname(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_path_abs") {
+            self.out.push_str("declare ptr @tie_path_abs(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_path_normalize") {
+            self.out.push_str("declare ptr @tie_path_normalize(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_cwd") {
+            self.out.push_str("declare ptr @tie_cwd()\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_get_env") {
+            self.out.push_str("declare ptr @tie_get_env(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_set_env") {
+            self.out.push_str("declare void @tie_set_env(ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_file_copy") {
+            self.out.push_str("declare i8 @tie_file_copy(ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_file_move") {
+            self.out.push_str("declare i8 @tie_file_move(ptr, ptr)\n");
+        }
+        // ---------- D7：字节流 / 位操作原语 C ABI 桥声明 ----------
+        if self.used_externs.iter().any(|s| s == "tie_byte_read") {
+            self.out.push_str("declare ptr @tie_byte_read(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_byte_write") {
+            self.out.push_str("declare i8 @tie_byte_write(ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_bit_read") {
+            self.out.push_str("declare i64 @tie_bit_read(ptr, i64)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_bit_write") {
+            self.out.push_str("declare i8 @tie_bit_write(ptr, i64, i64)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_byte_concat") {
+            self.out.push_str("declare ptr @tie_byte_concat(ptr, ptr)\n");
+        }
         Ok(())
     }
 
@@ -2905,6 +2984,71 @@ impl<'p> IrGenerator<'p> {
             self.gen_runtime_error("运行时错误: walk_dir 无法读取目录 '%s'", &[("ptr", p)]);
             self.block_end();
             self.block_start(&ok_label);
+            return Ok((tmp, "ptr"));
+        }
+        // ---------- D7：字节流 / 位操作原语（编解码器底座） ----------
+        // 与解释路径一致：走 C ABI 桥（共用同一份 Rust 实现）。
+        // 字节表是 i64 动态表（DynTable 指针）；bit_read/bit_write 在桥层按位读写。
+        // 内置 byte_read：单字符串参数（路径），返回 i64 字节表；失败 → 运行时错误。
+        if name == "byte_read" {
+            self.mark_used("tie_byte_read");
+            let (p, _t) = self.gen_expr(&args[0])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_byte_read(ptr {p})"));
+            let is_null = self.new_reg();
+            self.line(&format!("{is_null} = icmp eq ptr {tmp}, null"));
+            let ok_label = self.new_label("byte_read.ok");
+            let err_label = self.new_label("byte_read.err");
+            self.line(&format!("br i1 {is_null}, label %{err_label}, label %{ok_label}"));
+            self.block_start(&err_label);
+            self.gen_runtime_error("运行时错误: byte_read 无法读取文件 '%s'", &[("ptr", p)]);
+            self.block_end();
+            self.block_start(&ok_label);
+            return Ok((tmp, "ptr"));
+        }
+        // 内置 byte_write：两个参数（路径, 字节表），返回 bool（写成功与否）。
+        if name == "byte_write" {
+            self.mark_used("tie_byte_write");
+            let (p, _t) = self.gen_expr(&args[0])?;
+            // 字节表变量是 alloca ptr → load 出表指针
+            let (tbl, _tt) = self.gen_expr(&args[1])?;
+            let r = self.new_reg();
+            self.line(&format!("{r} = call i8 @tie_byte_write(ptr {p}, ptr {tbl})"));
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = icmp ne i8 {r}, 0"));
+            return Ok((ok, "i1"));
+        }
+        // 内置 bit_read：两个参数（字节表, 位置），返回 i64（第 pos 位 0/1；越界 0）。
+        if name == "bit_read" {
+            self.mark_used("tie_bit_read");
+            let (tbl, _tt) = self.gen_expr(&args[0])?;
+            let (pos, pos_ty) = self.gen_expr(&args[1])?;
+            let pos64 = self.extend_int_to_i64(&pos, pos_ty, &args[1])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call i64 @tie_bit_read(ptr {tbl}, i64 {pos64})"));
+            return Ok((tmp, "i64"));
+        }
+        // 内置 bit_write：三个参数（字节表, 位置, 位值），返回 bool（越界 false）。
+        if name == "bit_write" {
+            self.mark_used("tie_bit_write");
+            let (tbl, _tt) = self.gen_expr(&args[0])?;
+            let (pos, pos_ty) = self.gen_expr(&args[1])?;
+            let pos64 = self.extend_int_to_i64(&pos, pos_ty, &args[1])?;
+            let (bit, bit_ty) = self.gen_expr(&args[2])?;
+            let bit64 = self.extend_int_to_i64(&bit, bit_ty, &args[2])?;
+            let r = self.new_reg();
+            self.line(&format!("{r} = call i8 @tie_bit_write(ptr {tbl}, i64 {pos64}, i64 {bit64})"));
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = icmp ne i8 {r}, 0"));
+            return Ok((ok, "i1"));
+        }
+        // 内置 byte_concat：两个字节表参数，返回拼接后的 i64 字节表。
+        if name == "byte_concat" {
+            self.mark_used("tie_byte_concat");
+            let (a, _at) = self.gen_expr(&args[0])?;
+            let (b, _bt) = self.gen_expr(&args[1])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_byte_concat(ptr {a}, ptr {b})"));
             return Ok((tmp, "ptr"));
         }
         // 内置 path_join：两个字符串参数，返回 string（拼接路径）。
