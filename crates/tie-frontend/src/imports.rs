@@ -1,7 +1,7 @@
 //! import 展开模块：递归加载被导入文件，把其顶层语句内联进当前程序。
 //!
 //! 原实现是 tie-llvm 的私有函数（driver.rs 的 `expand_imports`）。LSP 等
-//! 工具也需要跨文件分析（识别 `str.str_split` 等命名空间调用中被导入文件的
+//! 工具也需要跨文件分析（识别 `str.split` 等命名空间调用中被导入文件的
 //! 函数定义），故提炼为本 crate 的公共 API，供 tie-llvm 与 tie-lsp 共享。
 
 use crate::ast::{Program, Stmt};

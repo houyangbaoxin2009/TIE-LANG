@@ -1,9 +1,9 @@
 // tie:library
 // csv.tie：标准库——CSV 读取（命名空间 csv；纯 tie 实现，基于 file_read + str 命名空间切分）
-// 本文件 import string.tie（str.str_split / str.str_slice / str.str_char）：
+// 本文件 import string.tie（str.split / str.slice / str_char）：
 // 注意——当前 import 展开不做去重，调用方只需导入 csv.tie（string.tie 会随
 // 之展开）；若再重复导入 string.tie，会导致 str 命名空间内函数重复定义。
-// csv_cells 直接委托 str.str_split，保证与 string.tie 的语义逐字符一致。
+// csv_cells 直接委托 str.split，保证与 string.tie 的语义逐字符一致。
 // 调用：import 后 csv.csv_read(...) / csv.csv_cells(...)
 
 import "./string.tie"
@@ -17,7 +17,7 @@ namespace csv {
 // 每行内的单元格由调用方用 csv_cells(row, ",") 切分（支持任意分隔符）。
 func csv_read(path: string) -> table {
     var content: string = file_read(path)
-    var raw = str.str_split(content, "\n")
+    var raw = str.split(content, "\n")
     var lines = table_new_string()
     var n: i64 = len(raw)
     var i: i64 = 0
@@ -28,10 +28,10 @@ func csv_read(path: string) -> table {
     return lines
 }
 
-// 把一行 CSV 文本按分隔符切分为单元格表（str.str_split 的别名，直接委托）；
+// 把一行 CSV 文本按分隔符切分为单元格表（str.split 的别名，直接委托）；
 // sep 为空串时返回单元素 [line]。
 func csv_cells(line: string, sep: string) -> table {
-    return str.str_split(line, sep)
+    return str.split(line, sep)
 }
 
 // 去掉字符串末尾的一个回车符 "\r"（Windows 换行残留）；无 \r 时原样返回
@@ -39,7 +39,7 @@ func csv_cells(line: string, sep: string) -> table {
 func strip_cr(s: string) -> string {
     var n: i64 = len(s)
     if n > 0 && str_char(s, n - 1) == "\r" {
-        return str.str_slice(s, 0, n - 1)
+        return str.slice(s, 0, n - 1)
     }
     return s
 }

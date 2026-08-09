@@ -3,7 +3,7 @@
 
 class Counter {
     var count: i64
-    static method make() -> i64 {
+    static func make() -> i64 {
         return 1
     }
 }

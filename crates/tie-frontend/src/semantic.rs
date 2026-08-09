@@ -2458,7 +2458,7 @@ impl Analyzer {
     /// 解析「动态表构造/返回」调用的元素类型。
     ///
     /// 支持：table_new_*（元素类型由名字决定）与返回动态表的用户函数
-    /// （元素类型由 table_ret_elems 推断；命名空间函数如 str.str_split 也支持）。
+    /// （元素类型由 table_ret_elems 推断；命名空间函数如 str.split 也支持）。
     /// 返回 Err 表示该表达式不是合法的动态表来源。
     fn dynamic_table_elem_ty(
         &self,
@@ -2531,7 +2531,7 @@ impl Analyzer {
                 })
             }
             Expr::Call { .. } | Expr::MethodCall { .. } => {
-                // 裸调用/命名空间调用（如 str.str_split）：统一解析全名后查 table_ret_elems
+                // 裸调用/命名空间调用（如 str.split）：统一解析全名后查 table_ret_elems
                 let full = ns_call_full_name(&self.result.funcs, expr, scope, &self.ns_stack).unwrap_or_default();
                 match self.result.table_ret_elems.get(&full) {
                     Some(Some(elem)) => Ok(elem.clone()),
@@ -2756,7 +2756,7 @@ fn ns_prefix_exists(funcs: &HashMap<String, FuncSig>, segs: &[String]) -> bool {
 /// 命名空间调用 → 函数全名解析（表元数据查询用）。
 ///
 /// 输入是调用表达式（`Expr::Call` 的裸名或 `Expr::MethodCall` 的 receiver+method），
-/// 输出是注册用的全名（如 "str::str_split"）。规则与 infer_expr 的命名空间调用
+/// 输出是注册用的全名（如 "str::split"）。规则与 infer_expr 的命名空间调用
 /// 判定一致：receiver 是未绑定 Var（单段）/ FieldAccess 链（点分）/ Path（a::b），
 /// 且 funcs 中存在该前缀 → 全名 = 路径段::方法名。
 /// 裸调用按当前命名空间前缀补全（命名空间内函数互调返回表时，如 prep::split_lines——
@@ -3455,16 +3455,16 @@ mod tests {
             class Animal {
                 var name: string
                 var age: i64
-                method speak() -> string {
+                func speak() -> string {
                     return this.name + " makes a sound"
                 }
             }
             class Dog extends Animal {
                 var breed: string
-                method speak() -> string {
+                func speak() -> string {
                     return this.name + " barks"
                 }
-                method info() -> string {
+                func info() -> string {
                     return "I am a " + this.breed
                 }
             }
@@ -3495,8 +3495,8 @@ mod tests {
         expect_err(
             r#"
             class A {
-                method f() {}
-                method f() {}
+                func f() {}
+                func f() {}
             }
             func main() {
                 println(1)
@@ -3512,10 +3512,10 @@ mod tests {
             r#"
             class Counter {
                 var count: i64
-                method inc() {
+                func inc() {
                     this.count = this.count + 1
                 }
-                method get() -> i64 {
+                func get() -> i64 {
                     return this.count
                 }
             }
@@ -3543,7 +3543,7 @@ mod tests {
             r#"
             class Counter {
                 var count: i64
-                static method bad() {
+                static func bad() {
                     println(this.count)
                 }
             }
@@ -3732,7 +3732,7 @@ mod tests {
             r#"
             class Counter {
                 var count: i64
-                static method make() -> i64 {
+                static func make() -> i64 {
                     return 1
                 }
             }

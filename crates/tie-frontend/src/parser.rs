@@ -443,7 +443,7 @@ impl<'a> Parser<'a> {
     /// `class Name [extends Parent] { 字段… 方法… }`（仅顶层，P8）。
     ///
     /// 类体由字段声明（`var name[: Ty] [= 默认值]`）与方法定义
-    /// （`[static] method name(params) -> Ty { body }`）交错组成。
+    /// （`[static] func name(params) -> Ty { body }`）交错组成。
     fn parse_class(&mut self) -> Result<ClassDefStmt, ParseError> {
         let span = self.advance().span; // class
         let name = self.expect_ident()?;
@@ -475,13 +475,13 @@ impl<'a> Parser<'a> {
                     self.expect(TokenKind::Semi, "字段声明结束符")?;
                     fields.push(ClassField { name: fname, ty, init, span: fspan });
                 }
-                // 方法：`[static] method ...`
-                TokenKind::Method | TokenKind::Static => {
+                // 方法：`[static] func ...`（类内函数定义即方法）
+                TokenKind::Func | TokenKind::Static => {
                     methods.push(self.parse_method()?);
                 }
                 other => {
                     return Err(self.err(format!(
-                        "类体内只允许字段(var)或方法(method/static method)，实际是 {}",
+                        "类体内只允许字段(var)或方法(func/static func)，实际是 {}",
                         self.describe(other)
                     )))
                 }
@@ -491,13 +491,13 @@ impl<'a> Parser<'a> {
         Ok(ClassDefStmt { name, parent, fields, methods, span })
     }
 
-    /// `[static] method name(params) -> Ty { body }`（P8）。
+    /// `[static] func name(params) -> Ty { body }`（P8，类内函数定义即方法）。
     ///
-    /// 与 parse_fn_def 结构相同，多一个可选 `static` 前缀与 `method` 关键字。
+    /// 与 parse_fn_def 结构相同，多一个可选 `static` 前缀；`func` 在类体内即方法。
     fn parse_method(&mut self) -> Result<MethodDefStmt, ParseError> {
         let span = self.peek().span;
         let is_static = self.eat(&TokenKind::Static);
-        self.expect(TokenKind::Method, "'method'")?;
+        self.expect(TokenKind::Func, "'func'")?;
         let name = self.expect_ident()?;
         self.expect(TokenKind::LParen, "'('")?;
         let mut params = Vec::new();
@@ -1589,7 +1589,7 @@ mod tests {
     #[test]
     fn 类定义解析出字段方法与继承() {
         let prog = parse(
-            "class Point extends Base {\n    var x: i64 = 0\n    var y: i64\n    static method origin() -> Point {\n        return 0\n    }\n    method move(dx: i64) -> void {\n        this.x = dx\n    }\n}",
+            "class Point extends Base {\n    var x: i64 = 0\n    var y: i64\n    static func origin() -> Point {\n        return 0\n    }\n    func move(dx: i64) -> void {\n        this.x = dx\n    }\n}",
         );
         let Stmt::Class(c) = &prog.stmts[0] else { panic!("期望类定义") };
         assert_eq!(c.name, "Point");

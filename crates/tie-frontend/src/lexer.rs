@@ -75,8 +75,6 @@ pub enum TokenKind {
     As,
     /// 类定义 `class`
     Class,
-    /// 方法定义 `method`
-    Method,
     /// 当前实例 `this`
     This,
     /// 静态 `static`
@@ -680,9 +678,8 @@ impl<'a> Lexer<'a> {
             "when" => TokenKind::When,
             "import" => TokenKind::Import,
             "as" => TokenKind::As,
-            // 面向对象（P8）：class/method/this/static/extends
+            // 面向对象（P8）：class/this/static/extends（方法定义统一用 func）
             "class" => TokenKind::Class,
-            "method" => TokenKind::Method,
             "this" => TokenKind::This,
             "static" => TokenKind::Static,
             "extends" => TokenKind::Extends,
@@ -1055,10 +1052,10 @@ mod tests {
 
     // ---------- 关键字与标识符 ----------
 
-    /// 控制流/OOP/字面量关键字逐一识别（func..false 共 21 个）。
+    /// 控制流/OOP/字面量关键字逐一识别（func..false 共 20 个）。
     #[test]
     fn 关键字全部识别() {
-        let src = "func var const if else while for in return switch case default import as class method this static extends true false";
+        let src = "func var const if else while for in return switch case default import as class this static extends true false";
         let toks = tokenize(src).expect("不应报错");
         let expected = [
             TokenKind::Func,
@@ -1076,7 +1073,6 @@ mod tests {
             TokenKind::Import,
             TokenKind::As,
             TokenKind::Class,
-            TokenKind::Method,
             TokenKind::This,
             TokenKind::Static,
             TokenKind::Extends,

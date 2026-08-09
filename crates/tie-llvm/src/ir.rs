@@ -767,7 +767,7 @@ impl<'p> IrGenerator<'p> {
         };
         // 初始化表达式决定表指针来源：
         // - 返回表的函数调用（裸调用 build_numbers(10) 或命名空间调用
-        //   str.str_split(...)）→ 调用该函数取表指针；
+        //   str.split(...)）→ 调用该函数取表指针；
         // - 其余（table_new_* 等）→ 直接 tie_table_new 新建空表。
         let tptr = match &v.init {
             // 裸调用：直接按函数名生成调用
@@ -3024,7 +3024,7 @@ impl<'p> IrGenerator<'p> {
                     })
             }
             Expr::Call { .. } | Expr::MethodCall { .. } => {
-                // 裸调用 / 命名空间调用（str.str_split）：统一解析全名后查 table_ret_elems
+                // 裸调用 / 命名空间调用（str.split）：统一解析全名后查 table_ret_elems
                 let key = expr as *const Expr as usize;
                 let full = self
                     .sem
@@ -3688,7 +3688,7 @@ mod tests {
 
     #[test]
     fn 类实例方法生成this参数与字段gep() {
-        let ir = 编译("class Point {\n    var x: i64\n    var y: i64\n    method area() -> i64 {\n        return this.x * this.y\n    }\n}\nfunc main() {\n    var p = Point(3, 4)\n    println(p.area())\n}");
+        let ir = 编译("class Point {\n    var x: i64\n    var y: i64\n    func area() -> i64 {\n        return this.x * this.y\n    }\n}\nfunc main() {\n    var p = Point(3, 4)\n    println(p.area())\n}");
         // 实例方法签名：隐藏 this 首参（ptr %this）
         assert!(ir.contains("define i64 @Point$area(ptr %this) {"));
         // 字段访问：按拍平偏移 GEP（x→0，y→1）
@@ -3701,7 +3701,7 @@ mod tests {
 
     #[test]
     fn 类静态方法不接收this() {
-        let ir = 编译("class Point {\n    var x: i64\n    var y: i64\n    static method create(x: i64, y: i64) -> i64 {\n        return x + y\n    }\n}\nfunc main() {\n    println(Point.create(1, 2))\n}");
+        let ir = 编译("class Point {\n    var x: i64\n    var y: i64\n    static func create(x: i64, y: i64) -> i64 {\n        return x + y\n    }\n}\nfunc main() {\n    println(Point.create(1, 2))\n}");
         // 静态方法签名与普通函数一致：无 this 首参
         assert!(ir.contains("define i64 @Point$create(i64 %x, i64 %y) {"));
         assert!(!ir.contains("Point$create(ptr"));

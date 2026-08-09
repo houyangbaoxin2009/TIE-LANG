@@ -1,5 +1,5 @@
 // tie:logic
-// csv_demo.tie：CSV 标准库演示——str.str_split（string.tie）+ csv.csv_read / csv.csv_cells（csv.tie）
+// csv_demo.tie：CSV 标准库演示——str.split（string.tie）+ csv.csv_read / csv.csv_cells（csv.tie）
 // 自动生成临时 CSV 文件（file_write），读取后用 csv.csv_cells 切分单元格并断言核对。
 // 注意：csv.tie 内部已展开 string.tie，本文件不要再重复导入 string.tie
 // （当前 import 展开不做去重，重复导入会导致 str 命名空间内函数重复定义）。
@@ -8,25 +8,25 @@ import "../std/csv.tie"
 import "../std/assert.tie"
 
 func main() {
-    // ---- str.str_split 基础（string.tie，随 csv.tie 展开）----
-    var parts = str.str_split("a,b,c", ",")
+// ---- str.split 基础（string.tie，随 csv.tie 展开）----
+var parts = str.split("a,b,c", ",")
     assert.assert_eq(len(parts), 3)
     assert.assert(parts[0] == "a")
     assert.assert(parts[1] == "b")
     assert.assert(parts[2] == "c")
-    println("str.str_split(\"a,b,c\", \",\") → 3 个元素 ✓")
+    println("str.split(\"a,b,c\", \",\") → 3 个元素 ✓")
 
     // 连续分隔符 → 空字符串元素
-    var gap = str.str_split("a,,b", ",")
+    var gap = str.split("a,,b", ",")
     assert.assert_eq(len(gap), 3)
     assert.assert(gap[1] == "")
-    println("str.str_split(\"a,,b\", \",\") → 中间空元素 ✓")
+    println("str.split(\"a,,b\", \",\") → 中间空元素 ✓")
 
     // 空分隔符 → 单元素表 [s]
-    var none = str.str_split("hello", "")
+    var none = str.split("hello", "")
     assert.assert_eq(len(none), 1)
     assert.assert(none[0] == "hello")
-    println("str.str_split(..., \"\") → 单元素 ✓")
+    println("str.split(..., \"\") → 单元素 ✓")
 
     // ---- CSV 写入 + 读取（含 \r\n 与中文 UTF-8）----
     var path: string = "csv_demo_tmp.csv"

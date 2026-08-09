@@ -383,10 +383,10 @@ import "./config.tie" as cfg     // 导入 data 文件 → 类型化为只读数
 class Point {
     var x: i64 = 0        // 字段：var name[: Ty] [= 默认值]；默认值可省略（缺省为类型零值）
     var y: i64 = 0
-    method dist() -> i64 {          // 实例方法：首参自动绑定 this
+    func dist() -> i64 {          // 实例方法：func 定义（类内即方法），首参自动绑定 this
         return this.x * this.x + this.y * this.y
     }
-    static method origin() -> Point {   // 静态方法：无 this
+    static func origin() -> Point {   // 静态方法：无 this
         return Point(0, 0)
     }
 }
@@ -411,17 +411,19 @@ var r = Point(1)           // 部分实参：缺省字段用默认值
 - 实例方法：`obj.method(...)`，方法体内 `this` 绑定调用对象。
 - 静态方法：`类名.method(...)`，无 `this`。
 - 方法内 `this` 字段可读可写：`this.x = this.x + 1`。
+- 方法定义统一使用 `func` 关键字（类内 `func` 即方法；`static func` 为静态方法）——
+  语言只有一种函数定义写法，不再有 `method` 关键字。
 
 ### 8.4 继承（复用式）
 
 ```c
 class Animal {
-    var name: str
-    method sound() -> str { return "..." }
+    var name: string
+    func sound() -> string { return "..." }
 }
 class Dog extends Animal {          // 字段拍平：父类字段在前
-    var breed: str
-    method sound() -> str { return "Woof" }   // 遮蔽父类同名方法
+    var breed: string
+    func sound() -> string { return "Woof" }   // 遮蔽父类同名方法
 }
 ```
 
@@ -468,8 +470,7 @@ class Dog extends Animal {          // 字段拍平：父类字段在前
 | `false`    | 布尔假字面量                      | `var b = false`             |
 | `class`    | 类定义（值类型对象，P8）             | `class Point { }`           |
 | `extends`  | 继承父类（P8）                   | `class Dog extends Animal`  |
-| `method`   | 方法定义（实例/静态，P8）            | `method dist() -> i64 { }`  |
-| `static`   | 静态方法标记（P8）                | `static method origin()`    |
+| `static`   | 静态方法标记（P8）                | `static func origin()`      |
 | `this`     | 实例方法内当前对象（P8）             | `this.x = 1`                |
 
 > `let`/`fn` 为 v0.1 早期名称，已分别由 `var`/`const` 与 `func` 取代，不再支持。

@@ -3,6 +3,38 @@
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库**。
 
+## [Harbor M2.1.6] 统一 func 写法：str 库去前缀 + method 关键字废弃 — 2026-08-09
+
+按规划 docs/plans/unified-func-style.md 落地「统一函数写法」，标准库成为风格模板：
+
+### 命名空间内函数去前缀（std/string.tie 8 个函数重命名）
+- `str_trim`→`trim`、`str_slice`→`slice`、`str_contains`→`contains`、`str_find`→`find`、
+  `str_starts_with`→`starts_with`、`str_ends_with`→`ends_with`、`str_replace`→`replace`、
+  `str_split`→`split`（v1 前无外部用户，旧名直接删除不保留别名）
+- 调用处全量同步：std/csv.tie（str.split / str.slice）、std/tcmsg.tie（str.starts_with）、
+  examples/std_demo.tie、examples/csv_demo.tie、prep/core.tie 注释、crates 注释与测试代码
+- 外部形态：`str.trim(...)` / `str.split(...)`；命名空间内互调保持裸调用
+
+### method 关键字废弃，类内方法统一 func 定义
+- 语法：`func dist() -> i64 { }`（实例方法，this 绑定）/ `static func origin()`（静态方法）；
+  `method` 不再是关键字（普通标识符），调用语法 `obj.method(...)` / `类名.method(...)` 不变
+- 四层同步：lexer（删除 Method token 与关键字映射）、parser（parse_class/parse_method
+  改认 Func）、semantic/IR/interp 无求值变化（MethodDefStmt 内部结构保留）
+- LSP 同步：语义高亮方法定义名归类 function（func 关键字后）、补全 detail 签名前缀
+  `func name(...)`、关键字列表移除 method、跳转定义列号随 `func`（4 字符）校正
+- 示例 oop.tie / oop_neg_a/b/c.tie 全部改为 func 写法
+
+### 验证
+- workspace 全量 **309 测试全绿**（frontend 125 / interp 59 / llvm 34 / lsp 75 / prep 6 / tie 10）；
+  lsp 3 个跳转定义测试列号随 func 校正
+- `cargo build --workspace` 零错误
+
+### 文档同步
+- docs/language.md：§8 面向对象方法定义示例与说明、§9.1 关键字速查表（删 method 行）
+- docs/ai-guide.md、docs/prompt-pack.md：class/OOP 示例全部 func 写法
+- README.md：M2 行补充 M2.1.6 说明；std/ 结构行示例更新
+- docs/plans/unified-func-style.md：状态改为「已实现」
+
 ## [docs] tie:script 模块协议文档 — 2026-08-08
 
 tie:script 是「宿主进程 ↔ tie 脚本」的执行协议（`eval` 注册 + `eval_call`

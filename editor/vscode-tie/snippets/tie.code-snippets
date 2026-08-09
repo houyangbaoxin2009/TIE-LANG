@@ -23,7 +23,7 @@
       "class ${1:Name} {",
       "\tvar ${2:field}: ${3:i64}",
       "",
-      "\tmethod ${4:methodName}(${5:params}) -> ${6:ret} {",
+      "\tfunc ${4:methodName}(${5:params}) -> ${6:ret} {",
       "\t\t${0:// 方法体}",
       "\t}",
       "}"
@@ -80,19 +80,19 @@
     ],
     "description": "switch 多分支选择"
   },
-  "method": {
-    "prefix": "method",
+  "func-method": {
+    "prefix": "func",
     "body": [
-      "method ${1:name}(${2:params}) -> ${3:ret} {",
+      "func ${1:name}(${2:params}) -> ${3:ret} {",
       "\t${0:// 方法体}",
       "}"
     ],
-    "description": "定义实例方法（可访问 this）"
+    "description": "定义实例方法（类内 func，可访问 this）"
   },
-  "static-method": {
+  "static-func": {
     "prefix": "static",
     "body": [
-      "static method ${1:name}(${2:params}) -> ${3:ret} {",
+      "static func ${1:name}(${2:params}) -> ${3:ret} {",
       "\t${0:// 静态方法体（无 this，通过类名调用）}",
       "}"
     ],

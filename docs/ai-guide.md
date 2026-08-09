@@ -142,7 +142,7 @@ import "./lib_math.tie" as math   // 导入其他 tie 文件（相对路径字�
 
 - **已实现**（M2）：导入文件中的函数递归加载、内联可用；import 展开逻辑集中在
   tie-frontend 的 `imports` 模块（tie-llvm 与 tie-lsp 共享），语言服务器的
-  诊断 / hover / 跳转定义 / 补全同样支持跨文件语义（`str.str_split` 等跨文件
+  诊断 / hover / 跳转定义 / 补全同样支持跨文件语义（`str.split` 等跨文件
   命名空间调用不会误报未声明变量）。
 - **未实现**：`data` 文件导入为只读数据表、按角色分派可见符号集。
 
@@ -152,10 +152,10 @@ import "./lib_math.tie" as math   // 导入其他 tie 文件（相对路径字�
 class Point {
     var x: i64 = 0                // 字段：var name[: Ty] [= 默认值]
     var y: i64 = 0
-    method dist() -> i64 {        // 实例方法：体内 this 绑定当前对象
+    func dist() -> i64 {        // 实例方法：func 定义（类内即方法），体内 this 绑定当前对象
         return this.x * this.x + this.y * this.y
     }
-    static method origin() -> Point {   // 静态方法：无 this
+    static func origin() -> Point {   // 静态方法：无 this
         return Point(0, 0)
     }
 }
@@ -179,11 +179,11 @@ func main() {
 ```c
 class Animal {
     var name: string
-    method sound() -> string { return "..." }
+    func sound() -> string { return "..." }
 }
 class Dog extends Animal {
     var breed: string
-    method sound() -> string { return "Woof" }   // 遮蔽父类方法
+    func sound() -> string { return "Woof" }   // 遮蔽父类方法
 }
 // Dog 实例布局 = Animal 字段（在前） + 自身字段（拍平）
 // 方法解析：自身 → 父类逐级；子类同名遮蔽父类
@@ -239,13 +239,13 @@ class Dog extends Animal {
 // tie:logic
 class Animal {
     var name: string
-    method sound() -> string {
+    func sound() -> string {
         return "..."
     }
 }
 class Dog extends Animal {
     var breed: string
-    method sound() -> string {
+    func sound() -> string {
         return "Woof"
     }
 }
@@ -316,8 +316,8 @@ tie-llvm 内部：AST → `.ll` 文本 → `opt` 优化 → `clang` 汇编 → `
 
 - 递归下降解析器 `Parser`，入口 `parse_program`。
 - 顶层只允许三种语句：`Stmt::FnDef` / `Stmt::Import` / `Stmt::Class`，其他 → 语法错误。
-- 关键函数：`parse_fn_def`、`parse_class`（含 `extends`）、`parse_method`（含 `static`）、
-  `parse_var_decl`（含元组解构 desugar 为临时变量 + 字段访问）、`parse_expr_or_assign`
+- 关键函数：`parse_fn_def`、`parse_class`（含 `extends`）、`parse_method`（类内 `func` 定义，
+  含 `static`）、`parse_var_decl`（含元组解构 desugar 为临时变量 + 字段访问）、`parse_expr_or_assign`
   （`Ident = ...` → Assign；`obj.field = ...` → FieldAssign）。
 - `is_addressable_base`：判断表达式是否可寻址（Var 或 FieldAccess 链）。
 

@@ -256,7 +256,7 @@ pub struct ClassField {
     pub span: Span,
 }
 
-/// 类的一个方法定义（P8）：`[static] method name(params) -> Ty { body }`。
+/// 类的一个方法定义（P8）：`[static] func name(params) -> Ty { body }`（类内 func 即方法）。
 ///
 /// 与 [FnDefStmt] 同构 + `is_static`；不复用 FnDefStmt 以免污染顶层函数构造点。
 /// 实例方法体内 `this` 绑定当前实例（语义层处理）。

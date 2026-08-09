@@ -3,7 +3,7 @@
 
 class Counter {
     var count: i64
-    method inc() {
+    func inc() {
         this.count = this.count + 1
     }
 }

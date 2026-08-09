@@ -12,7 +12,7 @@
 // - 字典集中登记（方案 B）：err(langs) —— 省略 texts，从 msg_t 字典查，单一事实来源
 // 两形态共用同一函数：texts 有默认值空表 []，函数体内用 len(texts) > 0 区分。
 
-// 依赖 string.tie（str_starts_with 语言前缀匹配）：
+// 依赖 string.tie（str.starts_with 语言前缀匹配）：
 // 注意——当前 import 展开不做去重，调用方只需导入 tcmsg.tie（string.tie 会随同展开）。
 import "./string.tie"
 
@@ -61,7 +61,7 @@ namespace tcmsg {
                 // 当前语言是基础码（如 "zh"）→ 用前缀匹配（"zh-cn" 以 "zh" 开头）
                 var i: i64 = 0
                 while i < len(langs) {
-                    if str.str_starts_with(langs[i], msg_get_lang()) {
+                    if str.starts_with(langs[i], msg_get_lang()) {
                         return texts[i]
                     }
                     i = i + 1

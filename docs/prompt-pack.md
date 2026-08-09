@@ -80,10 +80,10 @@ var out = eval_call("process", "hi")       // eval_call(函数全名, 字符串�
 【class / OOP】
 class Point {
     var x: i64 = 0                // 字段 var name[: Ty] [= 默认值]
-    method dist() -> i64 {        // 实例方法：体内 this 绑定当前对象
+    func dist() -> i64 {        // 实例方法：func 定义（类内即方法），体内 this 绑定当前对象
         return this.x * this.x + this.y * this.y
     }
-    static method origin() -> Point {   // 静态方法：无 this
+    static func origin() -> Point {   // 静态方法：无 this
         return Point(0, 0)
     }
 }
@@ -116,13 +116,13 @@ println(o.x)
 // tie:logic
 class Animal {
     var name: string
-    method sound() -> string {
+    func sound() -> string {
         return "..."
     }
 }
 class Dog extends Animal {
     var breed: string
-    method sound() -> string {
+    func sound() -> string {
         return "Woof"
     }
 }

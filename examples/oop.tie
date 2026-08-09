@@ -1,13 +1,14 @@
 // oop.tie：P8 class/OOP 功能演示
 // 覆盖：类定义、构造（字段位置初始化 + 缺省默认值）、字段读写、
 //       实例方法（this）、静态方法（类名调用）、继承（字段拍平 + 方法遮蔽）
+// 方法定义统一使用 func 关键字（类内 func 即方法）：func / static func
 
 // 静态方法：通过类名调用，无 this
 class MathHelper {
-    static method twice(x: i64) -> i64 {
+    static func twice(x: i64) -> i64 {
         return x * 2
     }
-    static method greet(name: string) -> string {
+    static func greet(name: string) -> string {
         return "Hello, " + name + "!"
     }
 }
@@ -15,10 +16,10 @@ class MathHelper {
 // 计数器：实例方法 this 字段读写
 class Counter {
     var count: i64
-    method inc() {
+    func inc() {
         this.count = this.count + 1
     }
-    method get() -> i64 {
+    func get() -> i64 {
         return this.count
     }
 }
@@ -27,7 +28,7 @@ class Counter {
 class Animal {
     var name: string
     var age: i64
-    method speak() -> string {
+    func speak() -> string {
         return this.name + " makes a sound"
     }
 }
@@ -35,10 +36,10 @@ class Animal {
 class Dog extends Animal {
     var breed: string
     // 遮蔽父类方法
-    method speak() -> string {
+    func speak() -> string {
         return this.name + " barks"
     }
-    method info() -> string {
+    func info() -> string {
         return "I am a " + this.breed
     }
 }

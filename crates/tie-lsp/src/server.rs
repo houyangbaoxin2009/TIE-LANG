@@ -558,10 +558,10 @@ mod tests {
         r#"class Point {
     var x: i64
     var y: i64
-    static method create() -> Point {
+    static func create() -> Point {
         return Point(0, 0)
     }
-    method dist() -> i64 {
+    func dist() -> i64 {
         return this.x
     }
 }
@@ -769,7 +769,7 @@ func main() {
     }
 
     /// 真实文件端到端：didOpen `examples/csv_demo.tie`（导入 std/csv 等命名空间库），
-    /// 诊断应为空——验证跨文件命名空间调用（`str.str_split` / `csv.csv_read` 等）
+    /// 诊断应为空——验证跨文件命名空间调用（`str.split` / `csv.csv_read` 等）
     /// 经 import 展开后不再误报「未声明变量」。
     ///
     /// 路径：`CARGO_MANIFEST_DIR`（crates/tie-lsp）→ 上两级到仓库根 → examples/。
@@ -803,8 +803,8 @@ func main() {
         );
     }
 
-    /// hover 端到端：对真实导入库的示例文件，hover 命中 `str.str_split` 的
-    /// 第二个标识符（str_split）→ 应返回签名（跨文件函数可见）。
+    /// hover 端到端：对真实导入库的示例文件，hover 命中 `str.split` 的
+    /// 第二个标识符（split）→ 应返回签名（跨文件函数可见）。
     #[test]
     fn 真实文件hover命名空间函数返回签名() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -822,14 +822,14 @@ func main() {
         let encoded = path_str.replace(':', "%3A");
         let uri = format!("file:///{encoded}");
 
-        // 找到 `str.str_split(` 实际调用位置（注释里的 `str.str_split 基础` 不参与，
-        // 避免命中注释导致无 Ident token）。hover 命中第二个标识符 str_split：
-        // str 占 3 字符、`.` 占 1，str_split 从 c+4 起
+        // 找到 `str.split(` 实际调用位置（注释里的 `str.split 基础` 不参与，
+        // 避免命中注释导致无 Ident token）。hover 命中第二个标识符 split：
+        // str 占 3 字符、`.` 占 1，split 从 c+4 起
         let (line, col) = text
             .lines()
             .enumerate()
             .find_map(|(i, l)| {
-                l.find("str.str_split(")
+                l.find("str.split(")
                     .map(|c| (i as u32, c as u32 + 4))
             })
             .unwrap_or((0, 0));

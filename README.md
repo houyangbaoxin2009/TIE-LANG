@@ -143,7 +143,7 @@ tie/
 ├── repl/repl.tie     REPL 外壳（tie 语言自写，自举；编译链接 tie-interp 静态库）
 ├── prep/core.tie     预处理器核心模块（tie 语言自写：头部提取/角色判定/正文重建；Harbor M3 自举，编译期内嵌 tie-prep）
 ├── prep/indent.tie   转换器模块示例（制表符→4 空格；证明扩展性——新增转换器只需写 tie 模块，`tie-prep --module` 挂载）
-├── std/              标准库（tie 语言自写：assert / string / math / csv / format / tcmsg，均为命名空间形式调用，如 assert.assert / str.str_split，基于语言底座原语）
+├── std/              标准库（tie 语言自写：assert / string / math / csv / format / tcmsg，均为命名空间形式调用，如 assert.assert / str.split，基于语言底座原语）
 ├── docs/language.md   语法规范
 ├── docs/tie-script.md tie:script 模块协议（eval/eval_call 机制、模块约定、协议文本、三层调用入口）
 ├── docs/plans/        后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法）
@@ -204,5 +204,5 @@ tie/
 | --- | --- | --- |
 | M0 | 正式发行版基础：版本规则（年份.修订号）、内部代号（2026.1 "Harbor"）、工具链合集打包（`scripts/package.ps1` → zip） | ✅ 完成 |
 | M1 | VSCode 插件：语法高亮 / 智能缩进 / 代码片段 + LSP 客户端（诊断 / hover / 跳转定义 / 补全），TypeScript 重构 | ✅ 完成 |
-| M2 | 标准库：`std/`（文件 / 字符串 / 断言 / CSV / 格式化）+ `math`（数学函数）+ 20+ 语言底座原语 + **`tcmsg` 控制台信息库（i18n）** + **默认值参数**（可选参数省略时用字面量默认值）；M2.1.2 起 std 库全部采用命名空间形式（`assert.assert` / `str.str_split` / `math.abs`），为自举与生态奠定基础 | ✅ 完成 |
+| M2 | 标准库：`std/`（文件 / 字符串 / 断言 / CSV / 格式化）+ `math`（数学函数）+ 20+ 语言底座原语 + **`tcmsg` 控制台信息库（i18n）** + **默认值参数**（可选参数省略时用字面量默认值）；M2.1.2 起 std 库全部采用命名空间形式（`assert.assert` / `str.split` / `math.abs`）；M2.1.6 起命名空间内函数去 `str_` 前缀（`str.split` / `str.trim`）且方法定义统一 `func` 关键字（`static func`），为自举与生态奠定基础 | ✅ 完成 |
 | M3 | 预处理器自举：完全用 tie 语言重写 `tie-prep`，使其可扩展（编译器自举阶段一） | 🔄 阶段一完成（核心逻辑已 tie 语言化，`prep/core.tie`；Rust 壳仅解释执行）；阶段二完成（协调统筹增强：`tie.config` 配置文件 + 缓存池 + 多线程并行分片编译） |

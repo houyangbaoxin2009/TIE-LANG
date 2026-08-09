@@ -48,7 +48,7 @@ func is_whitespace(c: string) -> bool {
 }
 
 // 截取字符串 [start, end) 区间的子串；越界自动收敛到边界；空串或 start>=end 返回空串。
-// （与 std/string.tie 的 str_slice 逐字符语义一致，但模块自包含不能依赖 import）
+// （与 std/string.tie 的 slice 逐字符语义一致，但模块自包含不能依赖 import）
 func slice(s: string, start: i64, end: i64) -> string {
     var n: i64 = len(s)
     if n == 0 {

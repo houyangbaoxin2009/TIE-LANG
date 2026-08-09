@@ -41,7 +41,7 @@ const SOURCE_NAME: &str = "tie";
 ///
 /// 全部成功返回空列表（无诊断）。错误消息沿用 tie-frontend 原始 message 文本。
 ///
-/// `base_dir`：源码所在目录。跨文件命名空间调用（`str.str_split` 等）依赖
+/// `base_dir`：源码所在目录。跨文件命名空间调用（`str.split` 等）依赖
 /// import 展开后才能通过语义分析（被导入文件的函数定义已内联进程序），
 /// 否则会误报「未声明变量 'str'」。
 pub fn diagnostics_for_source(source: &str, base_dir: Option<&Path>) -> Vec<Diagnostic> {
@@ -278,7 +278,7 @@ struct DefMap {
     funcs: HashMap<String, Span>,
     /// 类名 → 定义处名字位置（顶层 `class Name`）
     classes: HashMap<String, Span>,
-    /// 方法名 → 定义处名字位置（`method name(...)` / `static method name(...)`）
+    /// 方法名 → 定义处名字位置（`func name(...)` / `static func name(...)`）
     methods: HashMap<String, Span>,
     /// 类字段名 → 定义处名字位置（`var field`）
     fields: HashMap<String, Span>,
@@ -518,7 +518,7 @@ const KIND_KEYWORD: u32 = 14;
 
 /// 关键词补全列表（tie 语言关键字）。
 const KEYWORDS: &[&str] = &[
-    "func", "var", "const", "if", "else", "while", "for", "return", "import", "class", "method",
+    "func", "var", "const", "if", "else", "while", "for", "return", "import", "class",
     "static", "extends", "switch", "case", "default", "in", "this",
 ];
 
@@ -700,7 +700,7 @@ fn member_completions(program: &Program, class_name: &str) -> Vec<CompletionItem
             detail: Some(detail),
         });
     }
-    // 方法：detail 填签名 `method name(params) -> Ret`
+    // 方法：detail 填签名 `func name(params) -> Ret`
     for m in &class_def.methods {
         let params = m
             .params
@@ -711,7 +711,7 @@ fn member_completions(program: &Program, class_name: &str) -> Vec<CompletionItem
         items.push(CompletionItem {
             label: m.name.clone(),
             kind: Some(KIND_METHOD),
-            detail: Some(format!("method {}({params}) -> {}", m.name, ty_to_str(&m.ret_ty))),
+            detail: Some(format!("func {}({params}) -> {}", m.name, ty_to_str(&m.ret_ty))),
         });
     }
     items
@@ -947,11 +947,10 @@ fn classify_ident(
     sem: Option<&SemanticResult>,
     param_spans: &[Span],
 ) -> u32 {
-    // 1. 定义名：`func`/`method`/`class`/`namespace` 之后的第一个标识符
+    // 1. 定义名：`func`/`class`/`namespace` 之后的第一个标识符
     if idx > 0 {
         match &tokens[idx - 1].kind {
             TokenKind::Func => return st::FUNCTION,
-            TokenKind::Method => return st::METHOD,
             TokenKind::Class => return st::CLASS,
             TokenKind::Namespace => return st::NAMESPACE,
             _ => {}
@@ -1114,7 +1113,7 @@ func main() {
 class Animal {
     var name: string
     var age: i64
-    method speak() -> string {
+    func speak() -> string {
         return this.name + " makes a sound"
     }
 }
@@ -1165,10 +1164,10 @@ func main() {
         r#"class Point {
     var x: i64
     var y: i64
-    static method create() -> Point {
+    static func create() -> Point {
         return Point(0, 0)
     }
-    method dist() -> i64 {
+    func dist() -> i64 {
         return this.x
     }
 }
@@ -1199,18 +1198,18 @@ func main() {
         assert_eq!(r.start, Position { line: 0, character: 6 }, "类名位置");
     }
 
-    /// 跳转定义：实例方法调用 `p.dist()` → `method dist` 定义处名字位置（line 6、character 11）。
+    /// 跳转定义：实例方法调用 `p.dist()` → `func dist` 定义处名字位置（line 6、character 9）。
     #[test]
     fn 跳转定义方法调用返回方法定义() {
         let r = definition(定义源码(), 17, 14, None).expect("dist 调用应命中方法定义");
-        assert_eq!(r.start, Position { line: 6, character: 11 }, "方法名位置");
+        assert_eq!(r.start, Position { line: 6, character: 9 }, "方法名位置");
     }
 
-    /// 跳转定义：静态方法调用 `Point.create()` → 同名方法定义（line 3、character 18）。
+    /// 跳转定义：静态方法调用 `Point.create()` → 同名方法定义（line 3、character 16）。
     #[test]
     fn 跳转定义静态方法调用返回方法定义() {
         let r = definition(定义源码(), 15, 18, None).expect("create 调用应命中方法定义");
-        assert_eq!(r.start, Position { line: 3, character: 18 }, "静态方法名位置");
+        assert_eq!(r.start, Position { line: 3, character: 16 }, "静态方法名位置");
     }
 
     /// 跳转定义：变量引用 `count` → `var count` 声明处名字位置（line 14、character 8）。
@@ -1278,7 +1277,7 @@ func main() {
         assert!(!labels.contains(&"func"), "点场景不应含关键词：{labels:?}");
         // 方法 detail 填签名
         let dist = items.iter().find(|i| i.label == "dist").expect("应有 dist");
-        assert_eq!(dist.detail.as_deref(), Some("method dist() -> i64"));
+        assert_eq!(dist.detail.as_deref(), Some("func dist() -> i64"));
     }
 
     /// 补全点场景：receiver 是变量（非类名）→ 回退全集。
@@ -1539,7 +1538,7 @@ func main() {
 class Point {
     var x: i64
     var y: i64
-    method dist(o: Point) -> i64 {
+    func dist(o: Point) -> i64 {
         return o.x
     }
 }
@@ -1549,10 +1548,10 @@ func main() {
 }
 "#;
         // 第 6 行 `        return o.x`（LSP line 5）：参数 o 起始 character 15；
-        // 形参 o 声明在 LSP line 4 `    method dist(o: Point)`，character 16
+        // 形参 o 声明在 LSP line 4 `    func dist(o: Point)`，character 14
         let range = definition(src, 5, 15, None).expect("参数 o 应可跳转");
         assert_eq!(range.start.line, 4, "参数 o 定义应在 LSP line 4");
-        assert_eq!(range.start.character, 16, "参数 o 定义应从 character 16 开始");
+        assert_eq!(range.start.character, 14, "参数 o 定义应从 character 14 开始");
     }
 
     // ==================== 语义高亮（semanticTokens） ====================
@@ -1632,10 +1631,10 @@ func add(a: i64, b: i64) -> i64 {
 class Point {
     var x: i64
     var y: i64
-    method dist() -> i64 {
+    func dist() -> i64 {
         return this.x
     }
-    static method create() -> Point {
+    static func create() -> Point {
         return Point(1, 2)
     }
 }
@@ -1647,9 +1646,9 @@ func main() {
 "#;
         let data = semantic_tokens(src, None);
         let toks = 解码语义token(src, &data);
-        // 方法定义名 dist（LSP line 4，col 11）→ method
-        let dist_def = toks.iter().find(|(l, c, _, _)| *l == 4 && *c == 11);
-        assert_eq!(dist_def.map(|t| t.3.as_str()), Some("method"), "方法定义 dist 应为 method");
+        // 方法定义名 dist（LSP line 4，col 9）→ function（func 关键字后定义名）
+        let dist_def = toks.iter().find(|(l, c, _, _)| *l == 4 && *c == 9);
+        assert_eq!(dist_def.map(|t| t.3.as_str()), Some("function"), "方法定义 dist 应为 function");
         // 类名 Point 引用（LSP line 12，col 12）→ class
         let point_ref = toks.iter().find(|(l, c, _, _)| *l == 12 && *c == 12);
         assert_eq!(point_ref.map(|t| t.3.as_str()), Some("class"), "类引用 Point 应为 class");
