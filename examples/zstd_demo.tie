@@ -1,0 +1,35 @@
+// tie:logic
+// zstd_demo.tie：D7d Zstd 简化实现（LZ77 + 规范霍夫曼熵编码）roundtrip 演示。
+// 运行：cargo run -p tie -- examples/zstd_demo.tie
+
+import "../enl/codec/zstd.tie"
+
+func main() {
+    // ---- 重复文本：LZ77 匹配 + 霍夫曼，压缩效果应明显 ----
+    var msg = "abcabcabcabcabcabcabcabcabcabcabcabcabcabc"
+    var comp = zstd.compress(msg)
+    var back = zstd.decompress(comp)
+    println("orig: " + msg)
+    println("compressed: " + comp)
+    println("roundtrip: " + (back == msg ? "OK" : "FAIL"))
+
+    println("---")
+
+    // ---- 混合文本：字母 + 空格 + 标点，含重复短语 ----
+    var msg2 = "hello zstd world! hello zstd world! the quick brown fox jumps over the lazy dog"
+    var comp2 = zstd.compress(msg2)
+    var back2 = zstd.decompress(comp2)
+    println("orig2: " + msg2)
+    println("compressed2: " + comp2)
+    println("roundtrip2: " + (back2 == msg2 ? "OK" : "FAIL"))
+
+    println("---")
+    var pass: bool = true
+    pass = pass && back == msg
+    pass = pass && back2 == msg2
+    if pass {
+        println("PASS")
+    } else {
+        println("FAIL")
+    }
+}

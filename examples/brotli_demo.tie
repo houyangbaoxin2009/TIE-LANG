@@ -1,0 +1,35 @@
+// tie:logic
+// brotli_demo.tie：D7d Brotli 简化实现（LZ77 + 静态霍夫曼码表）roundtrip 演示。
+// 运行：cargo run -p tie -- examples/brotli_demo.tie
+
+import "../enl/codec/brotli.tie"
+
+func main() {
+    // ---- 重复文本：LZ77 匹配 + 静态码表，压缩效果应明显 ----
+    var msg = "banana banana banana banana banana banana"
+    var comp = brotli.compress(msg)
+    var back = brotli.decompress(comp)
+    println("orig: " + msg)
+    println("compressed: " + comp)
+    println("roundtrip: " + (back == msg ? "OK" : "FAIL"))
+
+    println("---")
+
+    // ---- 混合文本：字母 + 空格 + 标点，含重复短语 ----
+    var msg2 = "to be or not to be that is the question whether tis nobler in the mind to suffer"
+    var comp2 = brotli.compress(msg2)
+    var back2 = brotli.decompress(comp2)
+    println("orig2: " + msg2)
+    println("compressed2: " + comp2)
+    println("roundtrip2: " + (back2 == msg2 ? "OK" : "FAIL"))
+
+    println("---")
+    var pass: bool = true
+    pass = pass && back == msg
+    pass = pass && back2 == msg2
+    if pass {
+        println("PASS")
+    } else {
+        println("FAIL")
+    }
+}

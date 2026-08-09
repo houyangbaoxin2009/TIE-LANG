@@ -1,0 +1,541 @@
+// tie:library
+// jpeg.tie：扩展库——灰度 JPEG 简化编码器（命名空间 jpeg，D7c）
+// 内容：8×8 分块 → 电平移位（-128）→ 二维 DCT → 常数步长量化 →
+//       ZigZag 重排 → 有符号 16 位小端字节流（自描述格式）。
+// 说明：本实现为**自描述格式**，不是真实 JPEG 文件格式（无 Huffman 熵编码、
+//       JFIF 头等），但核心数学与 JPEG 一致（DCT/量化/反量化/roundtrip）。
+// 接口：
+//   jpeg.encode_pixels(pixels_s, width, height) -> string
+//     灰度像素（0..255，逗号分隔序列）→ JPEG 字节序列字符串（0..255，可 byte_write 落盘）。
+//   jpeg.decode_pixels(enc_s, width, height) -> string
+//     JPEG 字节序列 → 还原像素（有损，容差内）。
+//   jpeg.parse_bytes(seq_s) -> table
+//     把逗号分隔字节序列字符串解析为 i64 字节表（供 byte_write 落盘等）。
+// 约束（tie 语言）：表参数元素类型静态未知 → 函数参数一律用逗号分隔字符串序列，
+// 函数内部 parse 到局部表；表只在函数内部局部使用，不跨函数传递。
+
+namespace jpeg {
+// =====================================================================
+// 自描述字节流格式（全部字节 0..255，小端）
+//   字节 0-1  魔数 'T' (84) 'J' (74)
+//   字节 2    格式版本号（当前 1）
+//   字节 3    量化步长 step（1..255；本库固定用 16）
+//   字节 4-5  图像宽度 width（16 位小端）
+//   字节 6-7  图像高度 height（16 位小端）
+//   字节 8-9  8×8 块总数 num_blocks（16 位小端）
+//   块数据    每块 128 字节 = 64 个量化系数 × 2 字节（有符号 16 位小端，
+//             ZigZag 顺序）。系数 = round(DCT / step)，反量化 = 系数 × step。
+// =====================================================================
+
+// ---- 公开入口：像素 → JPEG 字节序列 ----
+
+// 灰度像素序列（逗号分隔 0..255，长度 = width*height，行优先）
+// → 自描述 JPEG 字节序列字符串（逗号分隔 0..255）。
+// 要求 width/height 均为 8 的倍数（图像按 8×8 块编码）。
+pub func encode_pixels(pixels_s: string, width: i64, height: i64) -> string {
+    var pixels = parse_i64(pixels_s)
+    var w: i64 = width
+    var h: i64 = height
+    var bw: i64 = w / 8      // 每行块数
+    var bh: i64 = h / 8      // 每列块数
+    var step = quant_step()
+    var out = table_new_i64()
+    // 写头部：魔数 TJ、版本 1、量化步长、宽高、块数
+    table_push(out, 84)            // 'T'
+    table_push(out, 74)            // 'J'
+    table_push(out, 1)             // 格式版本号
+    table_push(out, step)          // 量化步长
+    table_push(out, w & 255)
+    table_push(out, (w >> 8) & 255)
+    table_push(out, h & 255)
+    table_push(out, (h >> 8) & 255)
+    var nb: i64 = bw * bh          // 8×8 块总数
+    table_push(out, nb & 255)
+    table_push(out, (nb >> 8) & 255)
+    // 逐块处理（块行优先：先 bx 后 by 与像素行优先一致）
+    var by: i64 = 0
+    while by < bh {
+        var bx: i64 = 0
+        while bx < bw {
+            // 提取 8×8 块并做电平移位：pixel - 128（使值域居中于 0）
+            var block = table_new_i64()
+            var py: i64 = 0
+            while py < 8 {
+                var px: i64 = 0
+                while px < 8 {
+                    var gi = (by * 8 + py) * w + (bx * 8 + px)
+                    var pv = pixels[gi]
+                    // 输入像素夹取到 [0,255]（鲁棒性）
+                    if pv < 0 {
+                        pv = 0
+                    }
+                    if pv > 255 {
+                        pv = 255
+                    }
+                    table_push(block, pv - 128)
+                    px = px + 1
+                }
+                py = py + 1
+            }
+            // 内联拼接块序列（局部表元素类型已知；表参数受限不能用）
+            var block_s: string = ""
+            var bi: i64 = 0
+            while bi < 64 {
+                if bi > 0 {
+                    block_s = block_s + ","
+                }
+                block_s = block_s + to_string(block[bi])
+                bi = bi + 1
+            }
+            // 编码本块 → 128 字节，追加到输出
+            var bd = encode_block(block_s, step)
+            var ki: i64 = 0
+            while ki < len(bd) {
+                table_push(out, bd[ki])
+                ki = ki + 1
+            }
+            bx = bx + 1
+        }
+        by = by + 1
+    }
+    // 内联拼接输出字节序列
+    var res: string = ""
+    var ri: i64 = 0
+    while ri < len(out) {
+        if ri > 0 {
+            res = res + ","
+        }
+        res = res + to_string(out[ri])
+        ri = ri + 1
+    }
+    return res
+}
+
+// ---- 公开入口：JPEG 字节序列 → 像素 ----
+
+// 自描述 JPEG 字节序列字符串 → 灰度像素序列（0..255，逗号分隔）。
+// width/height 需与编码时一致（格式头也携带，用于校验与取量化步长）。
+pub func decode_pixels(enc_s: string, width: i64, height: i64) -> string {
+    var bytes = parse_i64(enc_s)
+    var w: i64 = width
+    var h: i64 = height
+    var bw: i64 = w / 8
+    var bh: i64 = h / 8
+    var step = bytes[3]            // 从头部读量化步长
+    // 像素表预填 0，之后按全局坐标下标赋值（多块图像时块数据按行交错）
+    var pixels = table_new_i64()
+    var pz: i64 = 0
+    while pz < w * h {
+        table_push(pixels, 0)
+        pz = pz + 1
+    }
+    var pos: i64 = 10              // 头部 10 字节之后是块数据
+    var by: i64 = 0
+    while by < bh {
+        var bx: i64 = 0
+        while bx < bw {
+            // 读本块 64 个系数：每系数 2 字节，有符号 16 位小端
+            var coeffs = table_new_i64()
+            var k: i64 = 0
+            while k < 64 {
+                var lo = bytes[pos]
+                var hi = bytes[pos + 1]
+                var u = lo + (hi << 8)
+                var q: i64 = u
+                // 无符号 16 位 → 有符号：高位 ≥ 0x8000 时减去 65536
+                if u >= 32768 {
+                    q = u - 65536
+                }
+                table_push(coeffs, q)
+                pos = pos + 2
+                k = k + 1
+            }
+            // 内联拼接系数序列（ZigZag 顺序）
+            var coeff_s: string = ""
+            var ci: i64 = 0
+            while ci < 64 {
+                if ci > 0 {
+                    coeff_s = coeff_s + ","
+                }
+                coeff_s = coeff_s + to_string(coeffs[ci])
+                ci = ci + 1
+            }
+            // 反量化 + 逆 DCT + 去电平移位 + 夹取 → 64 个像素
+            var vd = decode_block(coeff_s, step)
+            // 按全局坐标写回：块 (bx,by) 覆盖 [by*8, by*8+8) 行、[bx*8, bx*8+8) 列，
+            // 全局像素下标 gi = (by*8+py)*w + (bx*8+px)，与编码端提取完全对称。
+            var py: i64 = 0
+            while py < 8 {
+                var px: i64 = 0
+                while px < 8 {
+                    var gi = (by * 8 + py) * w + (bx * 8 + px)
+                    pixels[gi] = vd[py * 8 + px]
+                    px = px + 1
+                }
+                py = py + 1
+            }
+            bx = bx + 1
+        }
+        by = by + 1
+    }
+    // 内联拼接像素序列
+    var res: string = ""
+    var ri: i64 = 0
+    while ri < len(pixels) {
+        if ri > 0 {
+            res = res + ","
+        }
+        res = res + to_string(pixels[ri])
+        ri = ri + 1
+    }
+    return res
+}
+
+// ---- 公开工具：字节序列 → 字节表（配合 byte_write 落盘） ----
+
+// 把逗号分隔的字节序列字符串解析为 i64 字节表（0..255），供 byte_write 等使用。
+pub func parse_bytes(seq_s: string) -> table {
+    return parse_i64(seq_s)
+}
+
+// =====================================================================
+// 内部：单块编码 / 解码
+// =====================================================================
+
+// 编码单个 8×8 块：DCT → 量化 → ZigZag → 128 字节表。
+// block_s 为 64 个电平移位后像素值（逗号分隔，可为负）。
+func encode_block(block_s: string, step: i64) -> table {
+    var dct = dct_forward(block_s)       // f64 系数表（行优先 u,v）
+    var zz = zigzag_table()              // ZigZag 顺序表（64 个平铺下标）
+    var out = table_new_i64()
+    var k: i64 = 0
+    while k < 64 {
+        // 量化：q = round(DCT / step)，按 ZigZag 顺序输出
+        var q = quantize_val(dct[zz[k]], step)
+        // 有符号 → 无符号 16 位（两字节小端）
+        var u = q & 65535
+        table_push(out, u & 255)
+        table_push(out, (u >> 8) & 255)
+        k = k + 1
+    }
+    return out
+}
+
+// 解码单个 8×8 块：系数（ZigZag 序，逗号分隔）→ 反量化 → IDCT → 去电平移位
+// → 夹取到 [0,255] → 64 个像素的 i64 表。
+func decode_block(coeff_s: string, step: i64) -> table {
+    var vals = dct_inverse(coeff_s, step) // f64 像素值（电平移位域）
+    var out = table_new_i64()
+    var i: i64 = 0
+    while i < 64 {
+        // 去电平移位：+128，四舍五入，夹取 [0,255]
+        var pv: f64 = vals[i] + 128.0
+        var iv = parse_int(to_string(round(pv)))
+        if iv < 0 {
+            iv = 0
+        }
+        if iv > 255 {
+            iv = 255
+        }
+        table_push(out, iv)
+        i = i + 1
+    }
+    return out
+}
+
+// =====================================================================
+// 内部：二维 DCT / IDCT（8×8，正交归一化 JPEG 约定）
+// =====================================================================
+//
+// 正变换（编码）：F(u,v) = (1/4)·C(u)·C(v)·Σ_x Σ_y f(x,y)·cos((2x+1)uπ/16)·cos((2y+1)vπ/16)
+// 逆变换（解码）：f(x,y) = (1/4)·Σ_u Σ_v C(u)·C(v)·F(u,v)·cos((2x+1)uπ/16)·cos((2y+1)vπ/16)
+// 其中 C(0) = 1/√2，C(n>0) = 1。这对变换为互逆正交对（无量化时精确重建）。
+
+// 前向 DCT：输入 64 个电平移位像素（逗号分隔 i64），返回 64 个 f64 系数表。
+func dct_forward(block_s: string) -> table {
+    var pix = parse_i64(block_s)
+    // 电平移位值转 f64（i64 → f64 用 parse_float(to_string(v))）
+    var f = table_new_f64()
+    var i: i64 = 0
+    while i < 64 {
+        table_push(f, parse_float(to_string(pix[i])))
+        i = i + 1
+    }
+    var dct = table_new_f64()
+    var u: i64 = 0
+    while u < 8 {
+        var cu = c_scale(u)
+        var v: i64 = 0
+        while v < 8 {
+            var cv = c_scale(v)
+            // Σ_x Σ_y f(x,y)·cos_x·cos_y
+            var sum: f64 = 0.0
+            var x: i64 = 0
+            while x < 8 {
+                var cxu = dct_cos(x, u)
+                var y: i64 = 0
+                while y < 8 {
+                    var cyv = dct_cos(y, v)
+                    sum = sum + f[x * 8 + y] * cxu * cyv
+                    y = y + 1
+                }
+                x = x + 1
+            }
+            // 乘 (1/4)·C(u)·C(v)
+            var fv: f64 = 0.25 * cu * cv * sum
+            table_push(dct, fv)
+            v = v + 1
+        }
+        u = u + 1
+    }
+    return dct
+}
+
+// 逆 DCT：输入 64 个量化系数（ZigZag 序，逗号分隔 i64）+ 量化步长，
+// 返回 64 个 f64 电平移位像素值表。
+func dct_inverse(coeff_s: string, step: i64) -> table {
+    var q = parse_i64(coeff_s)
+    var zz = zigzag_table()
+    var sf: f64 = parse_float(to_string(step))
+    // 反量化：F[平铺下标] = q[k] * step，先把表填 0 再按 ZigZag 置位
+    var F = table_new_f64()
+    var i: i64 = 0
+    while i < 64 {
+        table_push(F, 0.0)
+        i = i + 1
+    }
+    var k: i64 = 0
+    while k < 64 {
+        // i64 → f64（量化系数为整数，乘 f64 步长得精确 f64）
+        F[zz[k]] = parse_float(to_string(q[k])) * sf
+        k = k + 1
+    }
+    var out = table_new_f64()
+    var x: i64 = 0
+    while x < 8 {
+        var y: i64 = 0
+        while y < 8 {
+            // Σ_u Σ_v C(u)·C(v)·F(u,v)·cos_x·cos_y
+            var sum: f64 = 0.0
+            var u: i64 = 0
+            while u < 8 {
+                var cu = c_scale(u)
+                var v: i64 = 0
+                while v < 8 {
+                    var cv = c_scale(v)
+                    sum = sum + cu * cv * F[u * 8 + v] * dct_cos(x, u) * dct_cos(y, v)
+                    v = v + 1
+                }
+                u = u + 1
+            }
+            table_push(out, 0.25 * sum)
+            y = y + 1
+        }
+        x = x + 1
+    }
+    return out
+}
+
+// =====================================================================
+// 内部：数学工具（cos 常量表、DCT 基、量化、ZigZag）
+// =====================================================================
+
+// cos(k·π/16) 预计算常量表，k = 0..8（DCT 基只需这 9 个值）。
+func cos_tab(k: i64) -> f64 {
+    if k == 0 {
+        return 1.0
+    }
+    if k == 1 {
+        return 0.9807852804032304
+    }
+    if k == 2 {
+        return 0.9238795325112867
+    }
+    if k == 3 {
+        return 0.8314696123025452
+    }
+    if k == 4 {
+        return 0.7071067811865476
+    }
+    if k == 5 {
+        return 0.5555702330196022
+    }
+    if k == 6 {
+        return 0.38268343236508984
+    }
+    if k == 7 {
+        return 0.19509032201612825
+    }
+    return 0.0   // k == 8 → cos(π/2) = 0
+}
+
+// 计算 cos((2x+1)·u·π/16)：令 n = (2x+1)·u，利用 cos 周期/对称性归约到 [0,8]。
+func dct_cos(x: i64, u: i64) -> f64 {
+    var n = (2 * x + 1) * u
+    // 归约到 [0,32)：cos(nπ/16) 以 32 为周期
+    n = n % 32
+    if n < 0 {
+        n = n + 32
+    }
+    // 对称性：
+    //   [0,8]   →  cos(nπ/16)
+    //   (8,16]  → -cos((16-n)π/16)   （cos(π-a) = -cos(a)）
+    //   (16,24] → -cos((n-16)π/16)   （cos(π+a) = -cos(a)）
+    //   (24,32) →  cos((32-n)π/16)   （cos(2π-a) = cos(a)）
+    if n <= 8 {
+        return cos_tab(n)
+    }
+    if n <= 16 {
+        return -cos_tab(16 - n)
+    }
+    if n <= 24 {
+        return -cos_tab(n - 16)
+    }
+    return cos_tab(32 - n)
+}
+
+// JPEG DCT 归一化系数：C(0) = 1/√2，C(n>0) = 1。
+func c_scale(u: i64) -> f64 {
+    if u == 0 {
+        return 0.7071067811865476
+    }
+    return 1.0
+}
+
+// 量化：q = round(v / step)，返回整数（f64 → i64 用 parse_int(to_string(...))）。
+func quantize_val(v: f64, step: i64) -> i64 {
+    var sf: f64 = parse_float(to_string(step))
+    var rnd: f64 = round(v / sf)
+    return parse_int(to_string(rnd))
+}
+
+// 量化步长（本库常量；写入格式头供解码端读取）。
+func quant_step() -> i64 {
+    return 16
+}
+
+// 8×8 标准 JPEG ZigZag 扫描顺序表（64 个平铺下标，行优先 index = y*8+x）。
+// 单独函数返回局部表，避免「返回 parse 调用」链导致元素类型推断失效。
+func zigzag_table() -> table {
+    var zz = table_new_i64()
+    table_push(zz, 0)
+    table_push(zz, 1)
+    table_push(zz, 8)
+    table_push(zz, 16)
+    table_push(zz, 9)
+    table_push(zz, 2)
+    table_push(zz, 3)
+    table_push(zz, 10)
+    table_push(zz, 17)
+    table_push(zz, 24)
+    table_push(zz, 32)
+    table_push(zz, 25)
+    table_push(zz, 18)
+    table_push(zz, 11)
+    table_push(zz, 4)
+    table_push(zz, 5)
+    table_push(zz, 12)
+    table_push(zz, 19)
+    table_push(zz, 26)
+    table_push(zz, 33)
+    table_push(zz, 40)
+    table_push(zz, 48)
+    table_push(zz, 41)
+    table_push(zz, 34)
+    table_push(zz, 27)
+    table_push(zz, 20)
+    table_push(zz, 13)
+    table_push(zz, 6)
+    table_push(zz, 7)
+    table_push(zz, 14)
+    table_push(zz, 21)
+    table_push(zz, 28)
+    table_push(zz, 35)
+    table_push(zz, 42)
+    table_push(zz, 49)
+    table_push(zz, 56)
+    table_push(zz, 57)
+    table_push(zz, 50)
+    table_push(zz, 43)
+    table_push(zz, 36)
+    table_push(zz, 29)
+    table_push(zz, 22)
+    table_push(zz, 15)
+    table_push(zz, 23)
+    table_push(zz, 30)
+    table_push(zz, 37)
+    table_push(zz, 44)
+    table_push(zz, 51)
+    table_push(zz, 58)
+    table_push(zz, 59)
+    table_push(zz, 52)
+    table_push(zz, 45)
+    table_push(zz, 38)
+    table_push(zz, 31)
+    table_push(zz, 39)
+    table_push(zz, 46)
+    table_push(zz, 53)
+    table_push(zz, 60)
+    table_push(zz, 61)
+    table_push(zz, 54)
+    table_push(zz, 47)
+    table_push(zz, 55)
+    table_push(zz, 62)
+    table_push(zz, 63)
+    return zz
+}
+
+// =====================================================================
+// 内部工具：逗号分隔 i64 序列解析
+// =====================================================================
+
+// 解析逗号分隔 i64 序列 → 局部 i64 表（表参数元素类型静态未知，输入走字符串）。
+func parse_i64(s: string) -> table {
+    var result = table_new_i64()
+    var n: i64 = len(s)
+    if n == 0 {
+        return result
+    }
+    var start: i64 = 0
+    var i: i64 = 0
+    while i <= n {
+        var at_end: bool = (i == n)
+        var is_comma: bool = !at_end && str_char(s, i) == ","
+        if at_end || is_comma {
+            var seg = slice(s, start, i)
+            if len(seg) > 0 {
+                table_push(result, parse_int(seg))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// 截取 s 的 [start, end) 子串（越界安全）。
+func slice(s: string, start: i64, end: i64) -> string {
+    var n: i64 = len(s)
+    var lo: i64 = start
+    if lo < 0 {
+        lo = 0
+    }
+    if lo > n {
+        lo = n
+    }
+    var hi: i64 = end
+    if hi < 0 {
+        hi = 0
+    }
+    if hi > n {
+        hi = n
+    }
+    var result: string = ""
+    var i: i64 = lo
+    while i < hi {
+        result = result + str_char(s, i)
+        i = i + 1
+    }
+    return result
+}
+}

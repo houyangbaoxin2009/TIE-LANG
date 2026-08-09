@@ -1,0 +1,204 @@
+// tie:logic
+// jpeg_demo.tie：D7c JPEG 简化编码器演示（roundtrip 验证）
+// 编译运行：cargo run -p tie -- examples/jpeg_demo.tie
+// 验证：渐变 / 棋盘 / 8×8 三种灰度图 encode → decode 像素近似还原（有损量化容差内），
+//      并演示 byte_write 落盘 → byte_read 读回 → decode 的 D7 字节流闭环。
+
+import "../enl/codec/jpeg.tie"
+
+func main() {
+    // ---- 图案 1：16×16 斜向渐变（低频，应还原非常接近）----
+    var gw: i64 = 16
+    var gh: i64 = 16
+    var grad_s = make_gradient(gw, gh)
+    var enc1 = jpeg.encode_pixels(grad_s, gw, gh)
+    var dec1 = jpeg.decode_pixels(enc1, gw, gh)
+    println("渐变 16×16: 原始像素=" + to_string(count(grad_s)) + " 编码字节=" + to_string(count(enc1)))
+    var m1 = verify("渐变 16×16", grad_s, dec1, 8, 1400)
+
+    // ---- 图案 2：16×16 棋盘（4×4 黑白方格，含高频，误差应略大）----
+    var chk_s = make_checker(gw, gh)
+    var enc2 = jpeg.encode_pixels(chk_s, gw, gh)
+    var dec2 = jpeg.decode_pixels(enc2, gw, gh)
+    println("棋盘 16×16: 原始像素=" + to_string(count(chk_s)) + " 编码字节=" + to_string(count(enc2)))
+    var m2 = verify("棋盘 16×16", chk_s, dec2, 8, 2200)
+
+    // ---- 图案 3：8×8 单块渐变（单块边界）----
+    var s8 = make_gradient(8, 8)
+    var enc3 = jpeg.encode_pixels(s8, 8, 8)
+    var dec3 = jpeg.decode_pixels(enc3, 8, 8)
+    println("渐变 8×8:   原始像素=" + to_string(count(s8)) + " 编码字节=" + to_string(count(enc3)))
+    var m3 = verify("渐变 8×8", s8, dec3, 4, 200)
+
+    // ---- D7 字节流闭环：byte_write 落盘 → byte_read 读回 → decode ----
+    var bt = jpeg.parse_bytes(enc1)
+    var ok = byte_write("examples/jpeg_tmp.bin", bt)
+    var rb = byte_read("examples/jpeg_tmp.bin")
+    // 字节表 → 序列字符串（rb 为局部表，元素类型已知，可内联拼接）
+    var rb_s: string = ""
+    var ri: i64 = 0
+    while ri < len(rb) {
+        if ri > 0 {
+            rb_s = rb_s + ","
+        }
+        rb_s = rb_s + to_string(rb[ri])
+        ri = ri + 1
+    }
+    var dec_f = jpeg.decode_pixels(rb_s, gw, gh)
+    println("文件闭环:   write=" + (ok ? "true" : "false") + " 磁盘字节=" + to_string(len(rb))
+        + " 头部字节=" + to_string(rb[0]) + "," + to_string(rb[1]) + "," + to_string(rb[2]) + "," + to_string(rb[3]))
+    var mf = verify("文件闭环", grad_s, dec_f, 8, 1400)
+
+    // ---- 汇总断言 ----
+    var pass: bool = true
+    pass = pass && m1
+    pass = pass && m2
+    pass = pass && m3
+    pass = pass && mf
+    pass = pass && ok
+    if pass {
+        println("PASS")
+    } else {
+        println("FAIL")
+    }
+    file_delete("examples/jpeg_tmp.bin")
+}
+
+// 校验：orig_s 与 dec_s 逐像素比较，打印最大误差与 SSD，
+// 返回是否在容差内（max_err ≤ tol 且 ssd ≤ ssd_tol）。
+func verify(name: string, orig_s: string, dec_s: string, tol: i64, ssd_tol: i64) -> bool {
+    var orig = parse_seq(orig_s)
+    var dec = parse_seq(dec_s)
+    var n: i64 = len(orig)
+    var max_err: i64 = 0
+    var ssd: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var d = orig[i] - dec[i]
+        if d < 0 {
+            d = -d
+        }
+        if d > max_err {
+            max_err = d
+        }
+        ssd = ssd + d * d
+        i = i + 1
+    }
+    println("  → 像素数=" + to_string(n) + " 最大误差=" + to_string(max_err)
+        + " SSD=" + to_string(ssd) + " 容差=(≤" + to_string(tol) + "," + to_string(ssd_tol) + ")")
+    var ok: bool = max_err <= tol && ssd <= ssd_tol
+    if ok {
+        println("  ✓ 容差内")
+    } else {
+        println("  ✗ 超出容差")
+    }
+    return ok
+}
+
+// 逗号分隔序列的元素个数。
+func count(s: string) -> i64 {
+    var c: i64 = 0
+    var i: i64 = 0
+    while i < len(s) {
+        if str_char(s, i) == "," {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c + 1
+}
+
+// 渐变图：像素 = clamp(x*16 + y*16, 0, 255)，斜向斜坡。
+func make_gradient(w: i64, h: i64) -> string {
+    var s: string = ""
+    var y: i64 = 0
+    while y < h {
+        var x: i64 = 0
+        while x < w {
+            if len(s) > 0 {
+                s = s + ","
+            }
+            var v = x * 16 + y * 16
+            if v > 255 {
+                v = 255
+            }
+            s = s + to_string(v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return s
+}
+
+// 棋盘图：4×4 像素一格，(x/4 + y/4) 为偶数 → 白 255，奇数 → 黑 0。
+func make_checker(w: i64, h: i64) -> string {
+    var s: string = ""
+    var y: i64 = 0
+    while y < h {
+        var x: i64 = 0
+        while x < w {
+            if len(s) > 0 {
+                s = s + ","
+            }
+            var v: i64 = 0
+            var cell = x / 4 + y / 4
+            if cell % 2 == 0 {
+                v = 255
+            }
+            s = s + to_string(v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return s
+}
+
+// 解析逗号分隔 i64 序列 → 局部 i64 表。
+func parse_seq(s: string) -> table {
+    var result = table_new_i64()
+    var n: i64 = len(s)
+    if n == 0 {
+        return result
+    }
+    var start: i64 = 0
+    var i: i64 = 0
+    while i <= n {
+        var at_end: bool = (i == n)
+        var is_comma: bool = !at_end && str_char(s, i) == ","
+        if at_end || is_comma {
+            var seg = slice(s, start, i)
+            if len(seg) > 0 {
+                table_push(result, parse_int(seg))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// 截取 s 的 [start, end) 子串（越界安全）。
+func slice(s: string, start: i64, end: i64) -> string {
+    var n: i64 = len(s)
+    var lo: i64 = start
+    if lo < 0 {
+        lo = 0
+    }
+    if lo > n {
+        lo = n
+    }
+    var hi: i64 = end
+    if hi < 0 {
+        hi = 0
+    }
+    if hi > n {
+        hi = n
+    }
+    var result: string = ""
+    var i: i64 = lo
+    while i < hi {
+        result = result + str_char(s, i)
+        i = i + 1
+    }
+    return result
+}

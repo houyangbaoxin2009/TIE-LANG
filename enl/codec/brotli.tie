@@ -1,0 +1,317 @@
+// tie:library
+// brotli.tie：扩展库——Brotli 压缩算法简化教学实现（命名空间 brotli，D7d）
+//
+// 内容：Brotli 核心机制的两阶段组合——
+//   ① LZ77 滑窗匹配：前 255 字节窗口找最长匹配（匹配长度上限 255，token 域 0..256）；
+//   ② **静态霍夫曼熵编码**：预定义码表（不依赖数据频率）——匹配标记 256 用 1 位码
+//      "0"；其余符号（字面量 0..255 / 偏移 / 长度）用 9 位码 "1"+8bit(v)。
+// 与 zstd 的动态码表（随数据传码表）形成对比：静态码表**无需随数据传输**，
+// 这是静态码与动态码的本质区别。
+// 压缩输出为**逗号分隔数字序列字符串**：
+//   "tokenCount, bitLen, byte0, byte1, ..."
+// 接口：brotli.compress(s) -> 序列串；brotli.decompress(seq) -> 原字符串。
+// 表约束：全部局部表 + 逗号分隔字符串序列传参（同 std/enl 库模式）；
+// tie 的 && 非短路，凡「判越界 + 下标访问」组合一律嵌套 if / 布尔标志。
+// 说明：教学实现，机制等价（LZ77 + 静态熵编码）可无损 roundtrip，
+// **非 Brotli 二进制格式兼容**（真实 Brotli 用上下文建模 + 多棵静态/动态码表
+// + 更复杂的 LZ77 变体：复制命令、距离编码、块分割等）。
+
+namespace brotli {
+// ================= 对外接口 =================
+
+// 压缩：s 为 ASCII 字符串，返回压缩序列字符串。
+// 流程：ASCII → 字节序列 → LZ77 token（len ≤ 255）→ 静态霍夫曼编码 → 打包。
+pub func compress(s: string) -> string {
+    var data = parse_i64(to_bytes(s))
+    var n: i64 = len(data)
+    var toks = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        // 在窗口 [max(0, i-255), i) 内找最长匹配（长度上限 255，保证 token ≤ 256）
+        var best_dist: i64 = 0
+        var best_len: i64 = 0
+        var w_start: i64 = i - 255
+        if w_start < 0 {
+            w_start = 0
+        }
+        var d: i64 = 1
+        while d <= i - w_start {
+            // 对齐匹配；条件用 mismatch 标志避免 && 非短路越界
+            var mlen: i64 = 0
+            var mismatch: bool = false
+            while i + mlen < n && !mismatch {
+                if data[i - d + mlen] == data[i + mlen] {
+                    mlen = mlen + 1
+                } else {
+                    mismatch = true
+                }
+            }
+            if mlen > best_len && mlen <= 255 {
+                best_len = mlen
+                best_dist = d
+            }
+            d = d + 1
+        }
+        if best_len >= 3 {
+            table_push(toks, 256)  // 匹配标记
+            table_push(toks, best_dist)
+            table_push(toks, best_len)
+            i = i + best_len
+        } else {
+            table_push(toks, data[i])
+            i = i + 1
+        }
+    }
+    var tn: i64 = len(toks)
+    // ---- 静态霍夫曼编码：256 → "0"；v → "1" + 8bit(v)（高位在前）----
+    var p2 = build_pow2()
+    var bits: string = ""
+    var ti: i64 = 0
+    while ti < tn {
+        var tv = toks[ti]
+        if tv == 256 {
+            bits = bits + "0"
+        } else {
+            bits = bits + "1"
+            var b: i64 = 7
+            while b >= 0 {
+                if (tv / p2[b]) % 2 == 1 {
+                    bits = bits + "1"
+                } else {
+                    bits = bits + "0"
+                }
+                b = b - 1
+            }
+        }
+        ti = ti + 1
+    }
+    // ---- 位串打包为字节表（每字节高位在前，末字节零填充）----
+    var bitlen: i64 = len(bits)
+    var nbytes: i64 = (bitlen + 7) / 8
+    var bytes = table_new_i64()
+    var bi: i64 = 0
+    while bi < nbytes {
+        var bval: i64 = 0
+        var bj: i64 = 0
+        while bj < 8 {
+            bval = bval * 2
+            var pos2 = bi * 8 + bj
+            if pos2 < bitlen {
+                if str_char(bits, pos2) == "1" {
+                    bval = bval + 1
+                }
+            }
+            bj = bj + 1
+        }
+        table_push(bytes, bval)
+        bi = bi + 1
+    }
+    // ---- 拼接输出："tokenCount, bitLen, bytes..." ----
+    var res: string = ""
+    res = res + to_string(tn)
+    res = res + "," + to_string(bitlen)
+    var bj2: i64 = 0
+    while bj2 < len(bytes) {
+        res = res + "," + to_string(bytes[bj2])
+        bj2 = bj2 + 1
+    }
+    return res
+}
+
+// 解压：压缩序列字符串 → 原字符串。
+pub func decompress(seq_s: string) -> string {
+    var seq = parse_i64(seq_s)
+    if len(seq) < 2 {
+        return ""
+    }
+    var tc: i64 = seq[0]      // token 总数
+    var bitlen: i64 = seq[1]  // 位流位数
+    var bytes = table_new_i64()
+    var pos: i64 = 2
+    while pos < len(seq) {
+        table_push(bytes, seq[pos])
+        pos = pos + 1
+    }
+    var p2 = build_pow2()
+    // ---- 静态霍夫曼解码：1 位 "0" → 256；"1"+8 位 → 数值 ----
+    var toks = table_new_i64()
+    var bitpos: i64 = 0
+    while len(toks) < tc {
+        // 读首比特
+        var b: i64 = 0
+        if bitpos < bitlen {
+            var byte_idx = bitpos / 8
+            var bit_idx = bitpos % 8
+            b = (bytes[byte_idx] / p2[7 - bit_idx]) % 2
+            bitpos = bitpos + 1
+        }
+        if b == 0 {
+            table_push(toks, 256)
+        } else {
+            // 再读 8 位组成符号值
+            var v: i64 = 0
+            var k: i64 = 0
+            while k < 8 {
+                var bb: i64 = 0
+                if bitpos < bitlen {
+                    var bi2 = bitpos / 8
+                    var bj2 = bitpos % 8
+                    bb = (bytes[bi2] / p2[7 - bj2]) % 2
+                    bitpos = bitpos + 1
+                }
+                v = v * 2 + bb
+                k = k + 1
+            }
+            table_push(toks, v)
+        }
+    }
+    // ---- LZ77 还原：token 序列 → 字节序列 ----
+    var out = table_new_i64()
+    pos = 0
+    while pos < len(toks) {
+        var t = toks[pos]
+        if t == 256 {
+            var dist = toks[pos + 1]
+            var mlen = toks[pos + 2]
+            var start = len(out) - dist
+            var k: i64 = 0
+            while k < mlen {
+                table_push(out, out[start + k])
+                k = k + 1
+            }
+            pos = pos + 3
+        } else {
+            table_push(out, t)
+            pos = pos + 1
+        }
+    }
+    // ---- 字节序列 → ASCII 字符串 ----
+    var res: string = ""
+    var i: i64 = 0
+    while i < len(out) {
+        res = res + from_code(out[i])
+        i = i + 1
+    }
+    return res
+}
+
+// 字节化：ASCII 字符串 → 逗号分隔码点序列字符串（0..255）。
+pub func to_bytes(s: string) -> string {
+    var out = table_new_i64()
+    var i: i64 = 0
+    while i < len(s) {
+        table_push(out, code_point(str_char(s, i)))
+        i = i + 1
+    }
+    // 内联拼接（局部表，元素类型已知；表参数受限不能用 series 工具）
+    var res: string = ""
+    var ri: i64 = 0
+    while ri < len(out) {
+        if ri > 0 {
+            res = res + ","
+        }
+        res = res + to_string(out[ri])
+        ri = ri + 1
+    }
+    return res
+}
+
+// 还原：码点序列字符串 → ASCII 字符串。
+pub func from_bytes(seq_s: string) -> string {
+    var seq = parse_i64(seq_s)
+    var res: string = ""
+    var i: i64 = 0
+    while i < len(seq) {
+        res = res + from_code(seq[i])
+        i = i + 1
+    }
+    return res
+}
+
+// ================= 内部：字节/字符工具 =================
+
+// 解析逗号分隔 i64 序列 → 局部表。
+func parse_i64(s: string) -> table {
+    var result = table_new_i64()
+    var n: i64 = len(s)
+    if n == 0 {
+        return result
+    }
+    var start: i64 = 0
+    var i: i64 = 0
+    while i <= n {
+        var at_end: bool = (i == n)
+        var is_comma: bool = !at_end && str_char(s, i) == ","
+        if at_end || is_comma {
+            var seg = slice(s, start, i)
+            if len(seg) > 0 {
+                table_push(result, parse_int(seg))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// 单字符 → 码点（ASCII 查表；未收录字符 → 空格 32）。
+func code_point(ch: string) -> i64 {
+    var chars = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+    var i: i64 = 0
+    while i < len(chars) {
+        if str_char(chars, i) == ch {
+            return i + 32
+        }
+        i = i + 1
+    }
+    return 32
+}
+
+// 码点 → 单字符（32..126 ASCII 查表）。
+func from_code(cp: i64) -> string {
+    var chars = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+    if cp < 32 || cp > 126 {
+        return " "
+    }
+    return str_char(chars, cp - 32)
+}
+
+// 截取 s 的 [start, end) 子串。
+func slice(s: string, start: i64, end: i64) -> string {
+    var n: i64 = len(s)
+    var lo: i64 = start
+    if lo < 0 {
+        lo = 0
+    }
+    if lo > n {
+        lo = n
+    }
+    var hi: i64 = end
+    if hi < 0 {
+        hi = 0
+    }
+    if hi > n {
+        hi = n
+    }
+    var result: string = ""
+    var i: i64 = lo
+    while i < hi {
+        result = result + str_char(s, i)
+        i = i + 1
+    }
+    return result
+}
+
+// 2 的幂表（2^0..2^7 足够本模块使用，统一建 2^0..2^62）。
+func build_pow2() -> table {
+    var t = table_new_i64()
+    var v: i64 = 1
+    var i: i64 = 0
+    while i < 63 {
+        table_push(t, v)
+        v = v * 2
+        i = i + 1
+    }
+    return t
+}
+}

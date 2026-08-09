@@ -1,0 +1,701 @@
+// tie:library
+// zstd.tie：扩展库——Zstd 压缩算法简化教学实现（命名空间 zstd，D7d）
+//
+// 内容：Zstd 核心机制的两阶段组合——
+//   ① LZ77 滑窗匹配：在前 255 字节窗口内找最长匹配，匹配长度 ≥ 3 输出引用 token；
+//   ② 霍夫曼熵编码：对 token 流统计出现频率建霍夫曼树，生成**规范霍夫曼码**
+//      （逐符号传码长，解码端按 (码长,符号) 序重建同一码表）并打包为位流。
+// 压缩输出为**逗号分隔数字序列字符串**，格式：
+//   "codeCount, tokenCount, sym0, len0, sym1, len1, ..., bitLen, byte0, byte1, ..."
+//   前段 = 码表（符号值 + 码长），后段 = 打包后的位流字节。
+// 接口：zstd.compress(s) -> 序列串；zstd.decompress(seq) -> 原字符串。
+// 表约束：表参数元素类型静态未知 → 全部局部表 + 逗号分隔字符串序列传参
+// （同 std/enl 库模式）；tie 的 && 非短路，凡「判越界 + 下标访问」组合一律
+// 用嵌套 if / 布尔标志，避免越界读。
+// 说明：教学实现，机制等价（LZ77 + 熵编码）可无损 roundtrip，
+// **非 Zstd 二进制格式兼容**。
+
+namespace zstd {
+// ================= 对外接口 =================
+
+// 压缩：s 为 ASCII 字符串，返回压缩序列字符串。
+pub func compress(s: string) -> string {
+    return huff_compress(lz77_tokens(s))
+}
+
+// 解压：压缩序列字符串 → 原字符串。
+pub func decompress(seq_s: string) -> string {
+    return unlz(huff_decompress(seq_s))
+}
+
+// 字节化：ASCII 字符串 → 逗号分隔码点序列字符串（0..255）。
+pub func to_bytes(s: string) -> string {
+    var out = table_new_i64()
+    var i: i64 = 0
+    while i < len(s) {
+        table_push(out, code_point(str_char(s, i)))
+        i = i + 1
+    }
+    // 内联拼接（局部表，元素类型已知；表参数受限不能用 series 工具）
+    var res: string = ""
+    var ri: i64 = 0
+    while ri < len(out) {
+        if ri > 0 {
+            res = res + ","
+        }
+        res = res + to_string(out[ri])
+        ri = ri + 1
+    }
+    return res
+}
+
+// 还原：码点序列字符串 → ASCII 字符串。
+pub func from_bytes(seq_s: string) -> string {
+    var seq = parse_i64(seq_s)
+    var res: string = ""
+    var i: i64 = 0
+    while i < len(seq) {
+        res = res + from_code(seq[i])
+        i = i + 1
+    }
+    return res
+}
+
+// ================= 内部：LZ77 阶段 =================
+
+// LZ77 token 化：字符串 → token 序列字符串。
+// token 格式：字面量 = 字节值 0..255；匹配引用 = 256, dist, len。
+// 256 为匹配标记——字节值域是 0..255，不可能取到 256，天然无歧义。
+func lz77_tokens(s: string) -> string {
+    var data = parse_i64(to_bytes(s))
+    var n: i64 = len(data)
+    var toks = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        // 在窗口 [max(0, i-255), i) 内找最长匹配
+        var best_dist: i64 = 0
+        var best_len: i64 = 0
+        var w_start: i64 = i - 255
+        if w_start < 0 {
+            w_start = 0
+        }
+        var d: i64 = 1
+        while d <= i - w_start {
+            // 与偏移 d 对齐匹配：data[i-d+mlen] == data[i+mlen]
+            // 注意：匹配条件不能写成 `i+mlen<n && data[i+mlen]==...`——
+            // tie 的 && 非短路，i+mlen==n 时 data[n] 会越界；改用
+            // 嵌套 if + mismatch 布尔标志（mismatch 变量求值无副作用）。
+            var mlen: i64 = 0
+            var mismatch: bool = false
+            while i + mlen < n && !mismatch {
+                if data[i - d + mlen] == data[i + mlen] {
+                    mlen = mlen + 1
+                } else {
+                    mismatch = true
+                }
+            }
+            if mlen > best_len {
+                best_len = mlen
+                best_dist = d
+            }
+            d = d + 1
+        }
+        if best_len >= 3 {
+            table_push(toks, 256)
+            table_push(toks, best_dist)
+            table_push(toks, best_len)
+            i = i + best_len
+        } else {
+            table_push(toks, data[i])
+            i = i + 1
+        }
+    }
+    // 内联拼接（同 to_bytes 模式）
+    var res: string = ""
+    var ri: i64 = 0
+    while ri < len(toks) {
+        if ri > 0 {
+            res = res + ","
+        }
+        res = res + to_string(toks[ri])
+        ri = ri + 1
+    }
+    return res
+}
+
+// LZ77 还原：token 序列字符串 → 原字符串。
+// 重叠匹配（len > dist）由「先推后读」保证正确：读下标 start+k 时
+// 该位置必已在前 k 次迭代中推入 out（len(out) = start + dist + k > start + k）。
+func unlz(tokens_s: string) -> string {
+    var toks = parse_i64(tokens_s)
+    var out = table_new_i64()
+    var pos: i64 = 0
+    while pos < len(toks) {
+        var t = toks[pos]
+        if t == 256 {
+            // 匹配引用：dist, len
+            var dist = toks[pos + 1]
+            var mlen = toks[pos + 2]
+            var start = len(out) - dist
+            var k: i64 = 0
+            while k < mlen {
+                table_push(out, out[start + k])
+                k = k + 1
+            }
+            pos = pos + 3
+        } else {
+            // 字面量
+            table_push(out, t)
+            pos = pos + 1
+        }
+    }
+    var res: string = ""
+    var i: i64 = 0
+    while i < len(out) {
+        res = res + from_code(out[i])
+        i = i + 1
+    }
+    return res
+}
+
+// ================= 内部：霍夫曼熵编码阶段 =================
+
+// 霍夫曼压缩：token 序列字符串 → 完整压缩序列字符串。
+// 输出："codeCount, tokenCount, sym, len, ..., bitLen, byte0, ..."
+func huff_compress(tokens_s: string) -> string {
+    var toks = parse_i64(tokens_s)
+    var tn: i64 = len(toks)
+    // 空输入：codeCount=0, tokenCount=0, bitLen=0
+    if tn == 0 {
+        return "0,0,0"
+    }
+    // ---- 1. 统计频率：唯一符号表 + 计数表（线性查重，无哈希表）----
+    var syms = table_new_i64()
+    var cnts = table_new_i64()
+    var k: i64 = 0
+    while k < tn {
+        var tv = toks[k]
+        var found: i64 = -1
+        var q: i64 = 0
+        while q < len(syms) {
+            if syms[q] == tv {
+                found = q
+            }
+            q = q + 1
+        }
+        if found < 0 {
+            table_push(syms, tv)
+        }
+        k = k + 1
+    }
+    var m: i64 = len(syms)
+    k = 0
+    while k < m {
+        var c: i64 = 0
+        var j: i64 = 0
+        while j < tn {
+            if toks[j] == syms[k] {
+                c = c + 1
+            }
+            j = j + 1
+        }
+        table_push(cnts, c)
+        k = k + 1
+    }
+    // ---- 2. 按 (频率, 符号) 升序排序（选择排序，原地下标赋值）----
+    // 说明：排序后得到「频率升序」的叶子序列 ss/sc，供两队列合并直接取队首。
+    var ss = table_new_i64()  // 排序后的符号
+    var sc = table_new_i64()  // 排序后的频率
+    k = 0
+    while k < m {
+        table_push(ss, syms[k])
+        table_push(sc, cnts[k])
+        k = k + 1
+    }
+    var si: i64 = 0
+    while si < m {
+        var best: i64 = si
+        var j2: i64 = si + 1
+        while j2 < m {
+            if sc[j2] < sc[best] {
+                best = j2
+            } else if sc[j2] == sc[best] && ss[j2] < ss[best] {
+                best = j2
+            }
+            j2 = j2 + 1
+        }
+        // 交换 ss[si] 与 ss[best]（sc 同步）
+        var ts = ss[si]
+        var tc = sc[si]
+        ss[si] = ss[best]
+        sc[si] = sc[best]
+        ss[best] = ts
+        sc[best] = tc
+        si = si + 1
+    }
+    // ---- 3. 两队列合并建霍夫曼树（O(m)，无内层扫描）----
+    // 叶队列 = 已排序的 (ss, sc)，队头 head1；内部队列 = 新建内部节点，队头 head2。
+    // 节点表：叶子下标 0..m-1（与 ss/sc 同序），内部节点下标 m..m+internal_count-1。
+    // 选两队列法而非「线性扫描找最小」：tie 编译后端存在循环内地址逃逸 alloca
+    // 逐次迭代累积栈的缺陷（std/exmath 同受其害），O(n²) 内层扫描在约 35+ 符号时
+    // 触发 1MB 栈溢出；两队列法每次合并只做常数次表读，安全。
+    var nw = table_new_i64()  // 节点权重
+    var ns = table_new_i64()  // 节点符号值（内部节点 -1）
+    var nln = table_new_i64() // 左子节点下标（叶子 -1）
+    var nrn = table_new_i64() // 右子节点下标（叶子 -1）
+    k = 0
+    while k < m {
+        table_push(nw, sc[k])
+        table_push(ns, ss[k])
+        table_push(nln, -1)
+        table_push(nrn, -1)
+        k = k + 1
+    }
+    var head1: i64 = 0          // 叶队列头
+    var head2: i64 = 0          // 内部队列头
+    var internal_count: i64 = 0 // 内部节点数
+    while (m - head1) + (internal_count - head2) > 1 {
+        // 取第一个最小：比较两队列队首
+        var i1: i64 = 0
+        var w1: i64 = 0
+        var leaf_avail: bool = head1 < m
+        var int_avail: bool = head2 < internal_count
+        if !int_avail {
+            i1 = head1
+            w1 = sc[head1]
+            head1 = head1 + 1
+        } else if !leaf_avail {
+            i1 = m + head2
+            w1 = nw[i1]
+            head2 = head2 + 1
+        } else if sc[head1] <= nw[m + head2] {
+            i1 = head1
+            w1 = sc[head1]
+            head1 = head1 + 1
+        } else {
+            i1 = m + head2
+            w1 = nw[i1]
+            head2 = head2 + 1
+        }
+        // 取第二个最小：重新比较队首
+        var i2: i64 = 0
+        var w2: i64 = 0
+        leaf_avail = head1 < m
+        int_avail = head2 < internal_count
+        if !int_avail {
+            i2 = head1
+            w2 = sc[head1]
+            head1 = head1 + 1
+        } else if !leaf_avail {
+            i2 = m + head2
+            w2 = nw[i2]
+            head2 = head2 + 1
+        } else if sc[head1] <= nw[m + head2] {
+            i2 = head1
+            w2 = sc[head1]
+            head1 = head1 + 1
+        } else {
+            i2 = m + head2
+            w2 = nw[i2]
+            head2 = head2 + 1
+        }
+        // 合并为一个内部节点（追加到内部队列）
+        table_push(nw, w1 + w2)
+        table_push(ns, -1)
+        table_push(nln, i1)
+        table_push(nrn, i2)
+        internal_count = internal_count + 1
+    }
+    var root: i64 = m + internal_count - 1
+    // ---- 4. BFS 求叶深（= 码长）：队头指针只增模拟队列（无 pop）----
+    var nq = table_new_i64()  // 节点队列
+    var dq = table_new_i64()  // 深度队列
+    var os = table_new_i64()  // 输出符号（叶子）
+    var ol = table_new_i64()  // 输出码长
+    table_push(nq, root)
+    table_push(dq, 0)
+    var head: i64 = 0
+    while head < len(nq) {
+        var node = nq[head]
+        var dep = dq[head]
+        head = head + 1
+        if nln[node] < 0 && nrn[node] < 0 {
+            table_push(os, ns[node])
+            table_push(ol, dep)
+        } else {
+            table_push(nq, nln[node])
+            table_push(dq, dep + 1)
+            table_push(nq, nrn[node])
+            table_push(dq, dep + 1)
+        }
+    }
+    var mm: i64 = len(os)
+    // ---- 5. 按 (码长, 符号) 升序排序（选择排序，原地下标赋值 M4 支持）----
+    var si: i64 = 0
+    while si < mm {
+        var best: i64 = si
+        var j2: i64 = si + 1
+        while j2 < mm {
+            if ol[j2] < ol[best] {
+                best = j2
+            } else if ol[j2] == ol[best] && os[j2] < os[best] {
+                best = j2
+            }
+            j2 = j2 + 1
+        }
+        // 交换 os[si] 与 os[best]（ol 同步）
+        var ts = os[si]
+        var tl = ol[si]
+        os[si] = os[best]
+        ol[si] = ol[best]
+        os[best] = ts
+        ol[best] = tl
+        si = si + 1
+    }
+    // ---- 6. 规范霍夫曼码赋值：逐码长段连续分配 ----
+    var p2 = build_pow2()
+    var oc = table_new_i64()  // 规范码值（与 os/ol 一一对应）
+    var cval: i64 = 0
+    var i5: i64 = 0
+    while i5 < mm {
+        var L = ol[i5]
+        // 同码长段 [i5, j3)：段内连续赋码
+        var j3: i64 = i5
+        var run: i64 = 0
+        var go: bool = true
+        while j3 < mm && go {
+            if ol[j3] == L {
+                table_push(oc, cval + run)
+                run = run + 1
+                j3 = j3 + 1
+            } else {
+                go = false
+            }
+        }
+        // 下一长度段起始码 = (本段末尾码 + 1) << (下段长度差)
+        if j3 < mm {
+            cval = (cval + run) * p2[ol[j3] - L]
+        }
+        i5 = j3
+    }
+    // ---- 7. 编码：逐 token 查码并拼位串（高位在前）----
+    var bits: string = ""
+    var ti: i64 = 0
+    while ti < tn {
+        var tv = toks[ti]
+        var cd: i64 = 0
+        var cl: i64 = 0
+        var q2: i64 = 0
+        while q2 < mm {
+            if os[q2] == tv {
+                cd = oc[q2]
+                cl = ol[q2]
+            }
+            q2 = q2 + 1
+        }
+        // 以 cl 位写出 cd，MSB 优先
+        var b2 = cl - 1
+        while b2 >= 0 {
+            if (cd / p2[b2]) % 2 == 1 {
+                bits = bits + "1"
+            } else {
+                bits = bits + "0"
+            }
+            b2 = b2 - 1
+        }
+        ti = ti + 1
+    }
+    // ---- 8. 位串打包为字节表（每字节高位在前，末字节零填充）----
+    var bitlen: i64 = len(bits)
+    var nbytes: i64 = (bitlen + 7) / 8
+    var bytes = table_new_i64()
+    var bi: i64 = 0
+    while bi < nbytes {
+        var bval: i64 = 0
+        var bj: i64 = 0
+        while bj < 8 {
+            bval = bval * 2
+            var pos2 = bi * 8 + bj
+            if pos2 < bitlen {
+                if str_char(bits, pos2) == "1" {
+                    bval = bval + 1
+                }
+            }
+            bj = bj + 1
+        }
+        table_push(bytes, bval)
+        bi = bi + 1
+    }
+    // ---- 9. 拼接输出序列 ----
+    var res: string = ""
+    res = res + to_string(m)
+    res = res + "," + to_string(tn)
+    var q3: i64 = 0
+    while q3 < mm {
+        res = res + "," + to_string(os[q3])
+        res = res + "," + to_string(ol[q3])
+        q3 = q3 + 1
+    }
+    res = res + "," + to_string(bitlen)
+    var bj2: i64 = 0
+    while bj2 < len(bytes) {
+        res = res + "," + to_string(bytes[bj2])
+        bj2 = bj2 + 1
+    }
+    return res
+}
+
+// 霍夫曼解压：压缩序列字符串 → token 序列字符串。
+func huff_decompress(seq_s: string) -> string {
+    var seq = parse_i64(seq_s)
+    var pos: i64 = 0
+    var cc: i64 = seq[pos]      // 码表符号数 codeCount
+    var tc: i64 = seq[pos + 1]  // token 总数 tokenCount
+    pos = pos + 2
+    if cc == 0 {
+        return ""
+    }
+    // ---- 读码表 (sym, len) 到并行表 ----
+    var ds = table_new_i64()
+    var dl = table_new_i64()
+    var i: i64 = 0
+    while i < cc {
+        table_push(ds, seq[pos])
+        table_push(dl, seq[pos + 1])
+        pos = pos + 2
+        i = i + 1
+    }
+    var m: i64 = cc
+    // ---- 排序（与编码端相同：(len, sym) 升序）----
+    var si: i64 = 0
+    while si < m {
+        var best: i64 = si
+        var j: i64 = si + 1
+        while j < m {
+            if dl[j] < dl[best] {
+                best = j
+            } else if dl[j] == dl[best] && ds[j] < ds[best] {
+                best = j
+            }
+            j = j + 1
+        }
+        var ts = ds[si]
+        var tl = dl[si]
+        ds[si] = ds[best]
+        dl[si] = dl[best]
+        ds[best] = ts
+        dl[best] = tl
+        si = si + 1
+    }
+    // ---- 重建规范码（算法与编码端一致）----
+    var p2 = build_pow2()
+    var dc = table_new_i64()
+    var cval: i64 = 0
+    var i5: i64 = 0
+    while i5 < m {
+        var L = dl[i5]
+        var j3: i64 = i5
+        var run: i64 = 0
+        var go: bool = true
+        while j3 < m && go {
+            if dl[j3] == L {
+                table_push(dc, cval + run)
+                run = run + 1
+                j3 = j3 + 1
+            } else {
+                go = false
+            }
+        }
+        if j3 < m {
+            cval = (cval + run) * p2[dl[j3] - L]
+        }
+        i5 = j3
+    }
+    // ---- 读位流：bitlen 之后全是打包字节 ----
+    var bitlen: i64 = seq[pos]
+    pos = pos + 1
+    var bytes = table_new_i64()
+    while pos < len(seq) {
+        table_push(bytes, seq[pos])
+        pos = pos + 1
+    }
+    // ---- 规范解码（字典树 trie 快速匹配，总工作量 O(位数)）----
+    // 说明：不用「每 token 线性扫 m 个符号」——tie 编译后端在循环内嵌表读的
+    // 内层循环上有栈累积缺陷，m 较大（≥ ~35）时 O(token×m) 扫描会栈溢出。
+    // 改建 trie：每位只沿 1 个子节点走 1 次表读，完全规避。
+    // 节点表：tn_left/tn_right 存子节点下标（-1 无），tn_sym 存叶子符号（非叶子 -1）。
+    var tn_left = table_new_i64()
+    var tn_right = table_new_i64()
+    var tn_sym = table_new_i64()
+    table_push(tn_left, -1)
+    table_push(tn_right, -1)
+    table_push(tn_sym, -1)
+    var ins: i64 = 0
+    while ins < m {
+        var sym = ds[ins]
+        var L = dl[ins]
+        var cdv = dc[ins]
+        if L == 0 {
+            // 码长 0（单符号情形）：根即叶子
+            tn_sym[0] = sym
+        } else {
+            // 按位插入：0 走左，1 走右，缺则新建节点
+            var node: i64 = 0
+            var b: i64 = L - 1
+            while b >= 0 {
+                var bit = (cdv / p2[b]) % 2
+                var next: i64 = -1
+                if bit == 0 {
+                    next = tn_left[node]
+                } else {
+                    next = tn_right[node]
+                }
+                if next < 0 {
+                    // 新建子节点并回填父指针
+                    table_push(tn_left, -1)
+                    table_push(tn_right, -1)
+                    table_push(tn_sym, -1)
+                    next = len(tn_left) - 1
+                    if bit == 0 {
+                        tn_left[node] = next
+                    } else {
+                        tn_right[node] = next
+                    }
+                }
+                node = next
+                b = b - 1
+            }
+            // 到达叶子：登记符号
+            tn_sym[node] = sym
+        }
+        ins = ins + 1
+    }
+    // 走树解码：叶子节点输出并回根，否则读 1 位沿树下行
+    var toks = table_new_i64()
+    var node: i64 = 0
+    var bitpos: i64 = 0
+    while len(toks) < tc {
+        if tn_sym[node] >= 0 {
+            table_push(toks, tn_sym[node])
+            node = 0
+        } else {
+            // 读 1 位（高位在前）
+            var bit: i64 = 0
+            if bitpos < bitlen {
+                var byte_idx = bitpos / 8
+                var bit_idx = bitpos % 8
+                bit = (bytes[byte_idx] / p2[7 - bit_idx]) % 2
+                bitpos = bitpos + 1
+            }
+            if bit == 0 {
+                node = tn_left[node]
+            } else {
+                node = tn_right[node]
+            }
+        }
+    }
+    // ---- 拼接 token 序列 ----
+    var res: string = ""
+    var ri: i64 = 0
+    while ri < len(toks) {
+        if ri > 0 {
+            res = res + ","
+        }
+        res = res + to_string(toks[ri])
+        ri = ri + 1
+    }
+    return res
+}
+
+// ================= 内部：字节/字符工具 =================
+
+// 解析逗号分隔 i64 序列 → 局部表。
+func parse_i64(s: string) -> table {
+    var result = table_new_i64()
+    var n: i64 = len(s)
+    if n == 0 {
+        return result
+    }
+    var start: i64 = 0
+    var i: i64 = 0
+    while i <= n {
+        var at_end: bool = (i == n)
+        var is_comma: bool = !at_end && str_char(s, i) == ","
+        if at_end || is_comma {
+            var seg = slice(s, start, i)
+            if len(seg) > 0 {
+                table_push(result, parse_int(seg))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// 单字符 → 码点（ASCII 查表；未收录字符 → 空格 32）。
+func code_point(ch: string) -> i64 {
+    var chars = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+    var i: i64 = 0
+    while i < len(chars) {
+        if str_char(chars, i) == ch {
+            return i + 32
+        }
+        i = i + 1
+    }
+    return 32
+}
+
+// 码点 → 单字符（32..126 ASCII 查表）。
+func from_code(cp: i64) -> string {
+    var chars = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+    if cp < 32 || cp > 126 {
+        return " "
+    }
+    return str_char(chars, cp - 32)
+}
+
+// 截取 s 的 [start, end) 子串。
+func slice(s: string, start: i64, end: i64) -> string {
+    var n: i64 = len(s)
+    var lo: i64 = start
+    if lo < 0 {
+        lo = 0
+    }
+    if lo > n {
+        lo = n
+    }
+    var hi: i64 = end
+    if hi < 0 {
+        hi = 0
+    }
+    if hi > n {
+        hi = n
+    }
+    var result: string = ""
+    var i: i64 = lo
+    while i < hi {
+        result = result + str_char(s, i)
+        i = i + 1
+    }
+    return result
+}
+
+// 2 的幂表（2^0..2^62），用于位打包/拆包与规范码移位。
+// 教学实现：符号数 ≤ 62 时码长 ≤ 62，索引恒在界内。
+func build_pow2() -> table {
+    var t = table_new_i64()
+    var v: i64 = 1
+    var i: i64 = 0
+    while i < 63 {
+        table_push(t, v)
+        v = v * 2
+        i = i + 1
+    }
+    return t
+}
+}
+
+
+
+
