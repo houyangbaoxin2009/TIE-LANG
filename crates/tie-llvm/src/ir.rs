@@ -1485,6 +1485,38 @@ impl<'p> IrGenerator<'p> {
         // 也用于 default 体块生成（保证同一标签只定义一次）
         let def_label = if has_default { Some(self.new_label("sw.default")) } else { None };
 
+        // C5：整数 subject + 全单值整数常量 case（无区间/守卫/字符串）→ 生成
+        // LLVM switch 指令（跳转表，O(1) 分派）。否则走下方逐 case 比较链。
+        if self.can_emit_switch_table(&s.cases, &is_str_subj, is_char) {
+            let default_label = def_label.clone().unwrap_or_else(|| exit_label.clone());
+            // 先收集 case 值 → body label 映射（body 块 label 前向引用，后生成）
+            let mut table_entries: Vec<String> = Vec::new();
+            let mut body_labels: Vec<String> = Vec::new();
+            for case in &s.cases {
+                let Expr::IntLit(v) = case.patterns[0] else {
+                    unreachable!("C5 前置检查已保证整数常量 case");
+                };
+                let body_label = self.new_label("sw.body");
+                table_entries.push(format!("i64 {v}, label %{body_label}"));
+                body_labels.push(body_label);
+            }
+            // switch 指令（当前块内；default 目标：有 default 体 → def_label，否则 exit）
+            self.line(&format!(
+                "switch i64 {subj}, label %{default_label} [\n    {}]",
+                table_entries.join("\n    ")
+            ));
+            // case 体块（逐个生成，内部自动跳 exit）
+            for (case, body_label) in s.cases.iter().zip(body_labels.iter()) {
+                self.gen_switch_body(&case.body, body_label, &exit_label)?;
+            }
+            // default 体块（可选）
+            if let Some(def) = &def_label {
+                self.gen_switch_body(&s.default_body, def, &exit_label)?;
+            }
+            self.block_start(&exit_label);
+            return Ok(());
+        }
+
         // 无 case 分支：直接跳 default 或 exit
         if s.cases.is_empty() {
             match &def_label {
@@ -1621,6 +1653,27 @@ impl<'p> IrGenerator<'p> {
         }
         self.block_end();
         Ok(())
+    }
+
+    /// C5：能否生成 LLVM switch 跳转表（O(1) 分派）。
+    ///
+    /// 条件：整数 subject（非字符串/字符/浮点）+ 每个 case 恰一个整数常量字面量
+    /// pattern + 无 when 守卫。区间/多值/守卫/字符串走逐 case 比较链（原逻辑）。
+    fn can_emit_switch_table(
+        &self,
+        cases: &[tie_frontend::ast::SwitchCase],
+        is_str_subj: &bool,
+        is_char: bool,
+    ) -> bool {
+        if *is_str_subj || is_char {
+            return false;
+        }
+        !cases.is_empty()
+            && cases.iter().all(|c| {
+                c.when.is_none()
+                    && c.patterns.len() == 1
+                    && matches!(c.patterns[0], Expr::IntLit(_))
+            })
     }
 
     // ---------- 表达式生成 ----------
@@ -4563,19 +4616,32 @@ mod tests {
     }
 
     #[test]
-    fn switch生成比较链与各分支块() {
+    fn switch生成跳转表() {
+        // C5：整数 subject + 全整数常量 case → LLVM switch 跳转表（O(1) 分派）
         let ir = 编译("func main() {\n    var n: i64 = 2\n    switch n {\n        case 1:\n            println(1)\n        case 2:\n            println(2)\n        default:\n            println(0)\n    }\n}");
-        // switch 展开为比较链：sw.cmp 比较块 → sw.body 体块 → sw.default → sw.exit
-        assert!(ir.contains("sw.cmp."));
-        assert!(ir.contains("sw.body."));
-        assert!(ir.contains("sw.default."));
-        assert!(ir.contains("sw.exit."));
+        // switch 指令 + 跳转表条目（i64 值, label）
+        assert!(ir.contains("switch i64 %"), "应生成 switch 指令");
+        assert!(ir.contains("i64 1, label %sw.body."), "case 1 跳转条目");
+        assert!(ir.contains("i64 2, label %sw.body."), "case 2 跳转条目");
+        assert!(ir.contains("sw.default."), "default 标签");
+        assert!(ir.contains("sw.exit."), "exit 标签");
+        // 不再生成逐 case 比较链（整数常量 case 走跳转表）
+        assert!(!ir.contains("sw.cmp."), "整数常量 case 不应生成比较链");
+    }
+
+    #[test]
+    fn switch守卫走比较链() {
+        // 带 when 守卫的 case：不走跳转表（C5 前置检查排除），保留逐 case 比较链
+        let ir = 编译("func main() {\n    var n: i64 = 8\n    var flag = true\n    switch n {\n        case 8 when flag:\n            println(8)\n        default:\n            println(0)\n    }\n}");
+        assert!(ir.contains("sw.cmp."), "守卫场景应保留比较链");
         assert!(ir.contains("= icmp eq i64"));
+        // 值匹配 AND 守卫条件
+        assert!(ir.contains("= and i1"));
     }
 
     #[test]
     fn switch多值生成OR合并() {
-        // 多值 `case 1, 2:` → 两个 icmp eq 用 or 合并
+        // 多值 `case 1, 2:` → 两个 icmp eq 用 or 合并（多值不走跳转表）
         let ir = 编译("func main() {\n    var n: i64 = 2\n    switch n {\n        case 1, 2:\n            println(12)\n        default:\n            println(0)\n    }\n}");
         assert!(ir.contains("= icmp eq i64"));
         // 两个比较结果 OR 合并（至少一个 or i1）
