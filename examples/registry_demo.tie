@@ -1,9 +1,9 @@
 // tie:logic
-// registry_demo.tie：enl/registry + enl/cache 扩展库演示（M6 包管理器前置）
+// registry_demo.tie：ext/registry + ext/cache 扩展库演示（M6 包管理器前置）
 // 编译运行：cargo run -p tie -- examples/registry_demo.tie
 
-import "../enl/registry.tie"
-import "../enl/cache.tie"
+import "../ext/registry.tie"
+import "../ext/cache.tie"
 
 func main() {
     // ---- 注册表客户端 ----

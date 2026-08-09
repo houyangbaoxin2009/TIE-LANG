@@ -2,7 +2,7 @@
 // lz4_demo.tie：D7b LZ4 压缩演示（roundtrip 验证）
 // 编译运行：cargo run -p tie -- examples/lz4_demo.tie
 
-import "../enl/codec/lz4.tie"
+import "../ext/codec/lz4.tie"
 
 func main() {
     // ---- LZ4 roundtrip：重复文本压缩 ----

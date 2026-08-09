@@ -159,9 +159,9 @@ tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Chan
 - 命名空间裸调用补全升级：**逐级外层**（log::error 内裸调 log 的 lookup）；
   check_visibility 子命名空间可访问父命名空间私有函数（与逐级补全配套）
 
-### log 增强（M4，移入 enl/ 扩展库）
-- **enl/ 扩展库（Enlargement）**：log 从 std/ 移入 enl/——有状态/应用级能力分层
-  （std = 无状态纯函数工具；enl = 依赖 std 与语言底座的扩展，随发行版内置）
+### log 增强（M4，移入 ext/ 扩展库）
+- **ext/ 扩展库（Extension）**：log 从 std/ 移入 ext/——有状态/应用级能力分层
+  （std = 无状态纯函数工具；ext = 依赖 std 与语言底座的扩展，随发行版内置）
 - 状态纯 tie 化：消息级别（msg_level 全局变量）与回退语言链（msg_fallbacks 全局变量）
 - 带参消息：error_f/warn_f/info_f/debug_f（msg_t 模板 + format.sprintf 填充 {}）
 - 级别体系：debug(0) < info(1) < warn(2) < error(3)，set_level/level 控制只输出 >= 阈值
@@ -210,8 +210,8 @@ tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Chan
 
 ### 文档
 - README：M3 里程碑更正为 **✅ 完成**（预处理器自举阶段一/二已全部落地）；
-  新增 Harbor M4 行；工程结构补 **enl/** 扩展库目录；std/ 结构描述同步
-- scripts/package.ps1：发行版打包补录 std/ 与 enl/（用户程序 import 依赖本地库目录）
+  新增 Harbor M4 行；工程结构补 **ext/** 扩展库目录；std/ 结构描述同步
+- scripts/package.ps1：发行版打包补录 std/ 与 ext/（用户程序 import 依赖本地库目录）
 - 新增 examples/std_refactor_demo.tie、examples/log_enhance_demo.tie；
   CHANGELOG 历史条目保留原样
 

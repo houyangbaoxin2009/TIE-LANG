@@ -1,0 +1,41 @@
+// tie:logic
+// tie:opt=2
+//
+// prep/rename_enl_to_ext_prog.tie —— enl → ext 改名转换程序（Harbor M6）
+//
+// 用法：target/release/tie.exe prep/rename_enl_to_ext_prog.tie <文件路径>
+// 对指定文件做 enl → ext / Enlargement → Extension 全局替换并写回。
+//
+// 设计说明：转换逻辑用 tie 语言实现（regex_replace 正则替换），但**编译执行**
+// （tie.exe 编译运行）而非 tie-prep 解释模块——tie-prep 的 eval_call 文本通道
+// 对 UTF-8 中文存在编码缺陷（逐字节处理导致乱码），编译路径无此问题
+// （已实测：编译版 regex_replace 中文安全）。
+//
+// 替换规则：
+//   1. "Enlargement" → "Extension"（全称；先替换长串）
+//   2. "enl"         → "ext"      （目录路径、import 引用、脚本收录）
+// 大小写区分：Enlargement 大写 E 不与全小写 enl 冲突；剩余 enl 均为路径引用。
+
+func main() -> i64 {
+    // 参数 0 = 待转换文件路径
+    if arg_count() < 1 {
+        print_err("[rename] 用法: tie prep/rename_enl_to_ext_prog.tie <文件路径>\n")
+        return 1
+    }
+    var path = arg_string(0)
+    if !file_exists(path) {
+        print_err("[rename] 文件不存在: " + path + "\n")
+        return 1
+    }
+    // 读取 → 转换 → 写回（转换逻辑全 tie：regex_replace）
+    var src = file_read(path)
+    var out = src
+    out = regex_replace(out, "Enlargement", "Extension")
+    out = regex_replace(out, "enl", "ext")
+    if file_write(path, out) {
+        println("[rename] 已转换: " + path)
+        return 0
+    }
+    print_err("[rename] 写回失败: " + path + "\n")
+    return 1
+}

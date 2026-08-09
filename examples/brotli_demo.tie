@@ -2,7 +2,7 @@
 // brotli_demo.tie：D7d Brotli 简化实现（LZ77 + 静态霍夫曼码表）roundtrip 演示。
 // 运行：cargo run -p tie -- examples/brotli_demo.tie
 
-import "../enl/codec/brotli.tie"
+import "../ext/codec/brotli.tie"
 
 func main() {
     // ---- 重复文本：LZ77 匹配 + 静态码表，压缩效果应明显 ----

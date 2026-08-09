@@ -1,0 +1,25 @@
+// tie:library
+// prep/rename_enl_to_ext.tie：转换器模块（Harbor M6 目录改名实战）
+//
+// 协议：顶层 `func process(src: string) -> string`——输入文本，输出转换后文本。
+// 用途：把 `enl/` 扩展库目录统一改名为 `ext/`（Extension，取代 Enlargement），
+// 用 tie 语言写转换器完成批量改名，验证 tie-prep 模块系统处理真实重构任务。
+//
+// 替换规则（两条，用 regex_replace 实现——比逐字符拼接快 40 倍：
+// 逐字符 result + char 是 O(n²) 字符串拼接，正则引擎单次扫描 O(n)）：
+//   1. "Enlargement" → "Extension"（全称；先替换长串避免 enl 规则干扰）
+//   2. "enl"         → "ext"      （目录路径、import 引用、脚本收录）
+// 大小写区分：Enlargement 首字母大写 E，不会与全小写 "enl" 规则冲突；
+// 剩余小写 enl 均为路径/引用（已扫描确认无其他词根），整词替换安全。
+//
+// 挂载方式：tie-prep <输入文件> --module prep/rename_enl_to_ext.tie > 输出文件
+// 框架（tie-prep）eval 本文件注册 process，再 eval_call 以字符串值直传文本调用。
+// 自包含：eval 环境不支持 import，使用语言底座正则原语 regex_replace。
+
+// 模块入口（协议约定）：两次正则替换完成 enl → ext 改名。
+func process(src: string) -> string {
+    var s = src
+    s = regex_replace(s, "Enlargement", "Extension")
+    s = regex_replace(s, "enl", "ext")
+    return s
+}

@@ -2,7 +2,7 @@
 // zstd_demo.tie：D7d Zstd 简化实现（LZ77 + 规范霍夫曼熵编码）roundtrip 演示。
 // 运行：cargo run -p tie -- examples/zstd_demo.tie
 
-import "../enl/codec/zstd.tie"
+import "../ext/codec/zstd.tie"
 
 func main() {
     // ---- 重复文本：LZ77 匹配 + 霍夫曼，压缩效果应明显 ----

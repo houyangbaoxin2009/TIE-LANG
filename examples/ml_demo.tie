@@ -1,9 +1,9 @@
 // tie:logic
-// ml_demo.tie：enl/ml 机器学习演示（D6）
+// ml_demo.tie：ext/ml 机器学习演示（D6）
 // 编译运行：cargo run -p tie -- examples/ml_demo.tie
 // 验证线性 SVM（感知机）对 AND 门分类 + 决策树对简单模式分类。
 
-import "../enl/ml.tie"
+import "../ext/ml.tie"
 
 func main() {
     // ---- 线性 SVM：AND 门（线性可分）----

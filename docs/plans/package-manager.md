@@ -15,7 +15,7 @@
 | --- | --- | --- |
 | M2.2/M3 | `prep/core.tie` 预处理器核心 tie 语言化，Rust 壳解释执行（tie:script 协议） | tie 写核心逻辑 + Rust 薄壳 |
 | M3 | REPL 外壳 `repl/repl.tie` 用 tie 语言自写，编译链接 interp 静态库生成 `repl.exe` | tie 写完整程序 + 编译执行 |
-| M4 | 标准库/扩展库全 tie 写（`std/` + `enl/`），语言自身成为自举工具库 | tie 写库 |
+| M4 | 标准库/扩展库全 tie 写（`std/` + `ext/`），语言自身成为自举工具库 | tie 写库 |
 
 ### 1.2 缺口：包管理能力为零
 
@@ -107,10 +107,10 @@ M6 包管理器需要的新能力**按分层补齐**，不全部堆成 Rust 原�
 | --- | --- | --- | --- |
 | 语言底座原语 | interp eval + C ABI + IR + semantic | 必须碰系统底层（进程/网络/文件系统深度操作/解压） | 网络、进程、解压、目录递归、路径、环境变量 |
 | 标准库 | `std/`（tie 写） | 无状态纯逻辑工具，用现有原语可表达 | semver 版本比较、路径字符串规范化、清单文本处理等 |
-| 扩展库 | `enl/`（tie 写） | 有状态/应用级，依赖 std 或原语组合 | 注册表客户端封装、包缓存管理等 |
+| 扩展库 | `ext/`（tie 写） | 有状态/应用级，依赖 std 或原语组合 | 注册表客户端封装、包缓存管理等 |
 
 **分层顺序**：先补语言底座原语（Rust）→ 再用 tie 把可表达的工具写进 `std/` →
-有状态应用封装进 `enl/`。凡是「改进 std 的进 std，改进 enl 的进 enl」，tie 能写的不进 Rust。
+有状态应用封装进 `ext/`。凡是「改进 std 的进 std，改进 ext 的进 ext」，tie 能写的不进 Rust。
 
 #### 语言底座原语（Rust，M4 补齐阶段一）
 
@@ -188,7 +188,7 @@ tie 语言天然的数据交换格式就是清单格式——**tie:data**，无�
 └── tmp/              解压临时区
 
 <project>/.tie/       项目本地
-├── deps/             已安装依赖（import 路径指向这里，含 std/enl 语义）
+├── deps/             已安装依赖（import 路径指向这里，含 std/ext 语义）
 └── bin/              构建产物（tie build 输出）
 
 <project>/tie.pkg     项目清单
@@ -229,7 +229,7 @@ tie 语言天然的数据交换格式就是清单格式——**tie:data**，无�
 
 > 用户决策：M6 缺的语言能力**归入 M4 补齐**，分层处理——
 > 系统底层 → 语言底座原语（Rust）；纯逻辑工具 → `std/`（tie 写）；
-> 有状态应用 → `enl/`（tie 写）。tie 能写的不进 Rust。
+> 有状态应用 → `ext/`（tie 写）。tie 能写的不进 Rust。
 
 - **4.0.1 底座原语（Rust）**：interp + llvm + frontend + semantic 新增 §3.3 全部原语
   （网络 http_get/http_get_file、进程 exec_code/exec_output、解压 untar_gz/unzip、
@@ -247,11 +247,11 @@ tie 语言天然的数据交换格式就是清单格式——**tie:data**，无�
   清单文本处理（`str.lines` / `str.split_lines` 等）；全部 `pub func` 导出；
   高级数学算法库 `std/exmath.tie` 已新增（霍夫曼编码/解码 + 素数筛/快速幂/斐波那契/
   阶乘/组合数），完整算法路线图见 docs/plans/algorithm-library.md；
-- **4.0.3 enl/ 扩展（tie 写）**：注册表客户端封装（`enl/registry.tie`——HTTP 索引拉取、
+- **4.0.3 ext/ 扩展（tie 写）**：注册表客户端封装（`ext/registry.tie`——HTTP 索引拉取、
   包 URL 拼接、缓存路径计算，有状态：本地缓存目录 + 已下载集合）；
-  包缓存管理（`enl/cache.tie`——校验/复用/清理）；
+  包缓存管理（`ext/cache.tie`——校验/复用/清理）；
 - **4.0.4 验收**：原语两路径行为一致（interp 测试 + 编译 demo）；
-  std/enl 新库有 demo 示例（examples/）与测试；workspace 全绿。
+  std/ext 新库有 demo 示例（examples/）与测试；workspace 全绿。
 
 ### 阶段一：pkg 骨架 + 本地 path 源
 - `pkg/main.tie` + `pkg/cli.tie`（子命令解析/帮助，纯 tie）；
@@ -303,7 +303,7 @@ tie 语言天然的数据交换格式就是清单格式——**tie:data**，无�
 | Cargo.toml | workspace 增 crates/tie-pkg；根依赖增 flate2/zip |
 | std/（可选） | 若 tie.pkg 解析抽象为通用 tie:data 解析函数，可入 std |
 | docs/ | README CLI/路线图、docs/plans/package-manager.md（本文件）、docs/ai-guide、docs/prompt-pack、CHANGELOG |
-| scripts/package.ps1 | 发行版收录 pkg.exe 与 std/enl |
+| scripts/package.ps1 | 发行版收录 pkg.exe 与 std/ext |
 
 ## 8. 风险与对策
 

@@ -1,9 +1,9 @@
 // tie:logic
-// compress_demo.tie：enl/compress 数据压缩演示（D5）
+// compress_demo.tie：ext/compress 数据压缩演示（D5）
 // 编译运行：cargo run -p tie -- examples/compress_demo.tie
 // 验证 LZ77/LZW 压缩 → 解压 roundtrip 还原。
 
-import "../enl/compress.tie"
+import "../ext/compress.tie"
 
 func main() {
     // ---- LZ77：重复文本压缩 + roundtrip ----

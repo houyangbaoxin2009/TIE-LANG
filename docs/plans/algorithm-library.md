@@ -1,8 +1,8 @@
-# 规划（M4 补齐）：算法库分类——std 与 enl 分层
+# 规划（M4 补齐）：算法库分类——std 与 ext 分层
 
 > 状态：**规划**（分类已定，按序实现）
 > 所属：Harbor（2026.1）架构 M4 补齐（语言能力分层扩展的一部分）
-> 背景：用户提出用 tie 语言实现一批经典算法，需按「改进 std 的进 std，改进 enl 的进 enl」
+> 背景：用户提出用 tie 语言实现一批经典算法，需按「改进 std 的进 std，改进 ext 的进 ext」
 > 原则分类。本文件给出 38 个算法的完整分类 + 可行性评估 + 实现优先级。
 
 ## 0. tie 语言能力边界（决定可行性）
@@ -34,9 +34,9 @@ H.264/H.265/AVC 视频编解码已排除（用户决策）。
 | 线性代数 | **std/linalg.tie**（新） | 高斯消元、LU 分解、矩阵乘法/转置/行列式/逆、特征值（幂法） |
 | 图算法 | **std/graph.tie**（新） | Dijkstra、Floyd、Prim、Bellman-Ford、最大流、二分匹配 |
 | 搜索/规划 | **std/optsearch.tie**（新） | 回溯搜索、分治算法、分支限界、常见规划算法（贪心/动态规划） |
-| 数据压缩 | **enl/compress.tie**（新） | 霍夫曼（已在 exmath）、LZ77/LZSS、LZW、算术编码 |
-| 机器学习 | **enl/ml.tie**（新） | 决策树、支持向量机（SVM） |
-| 现代压缩/多媒体 | **enl/codec/**（tie 实现，前置字节流原语） | Zstandard、Brotli、LZ4、JPEG、MP3 |
+| 数据压缩 | **ext/compress.tie**（新） | 霍夫曼（已在 exmath）、LZ77/LZSS、LZW、算术编码 |
+| 机器学习 | **ext/ml.tie**（新） | 决策树、支持向量机（SVM） |
+| 现代压缩/多媒体 | **ext/codec/**（tie 实现，前置字节流原语） | Zstandard、Brotli、LZ4、JPEG、MP3 |
 
 ## 2. 分层原则（为什么这样分）
 
@@ -45,10 +45,10 @@ H.264/H.265/AVC 视频编解码已排除（用户决策）。
 - 同一命名空间函数可相互调用（如 exmath.is_prime 供 sieve 内部使用）；
 - 与现有 std 风格一致（assert/string/math/csv/format/exmath）。
 
-### 进 enl/ 的标准：有状态 / 应用级 / 依赖 std，贴近具体应用场景
+### 进 ext/ 的标准：有状态 / 应用级 / 依赖 std，贴近具体应用场景
 - **压缩**：需要维护编码表/字典等运行状态，且压缩率依赖上下文 → 应用级；
 - **机器学习**：训练过程有模型状态（树结构/支持向量），推理依赖训练产物 → 有状态；
-- 与现有 enl/log（控制台信息库，有状态 i18n）定位一致。
+- 与现有 ext/log（控制台信息库，有状态 i18n）定位一致。
 
 ### 留在 Rust 底座原语的标准：tie 语言表达不了
 - 逐字节位流解析（JPEG 的熵编码、压缩算法的位流打包）——**仅指字节/位级系统原语**，
@@ -121,7 +121,7 @@ H.264/H.265/AVC 视频编解码已排除（用户决策）。
 | 规划（贪心） | `activity_select(starts: 表, ends: 表) -> i64` / `huffman`（已在 exmath） | 活动选择/哈夫曼贪心 |
 | 规划（DP） | `knapsack_dp(items: 表, cap: i64) -> i64` / `lis(xs: 表) -> i64` | 背包 DP/最长递增子序列 |
 
-### 3.5 enl/compress.tie（新：数据压缩，命名空间 compress）
+### 3.5 ext/compress.tie（新：数据压缩，命名空间 compress）
 
 | 算法 | 函数签名 | 说明 |
 | --- | --- | --- |
@@ -130,17 +130,17 @@ H.264/H.265/AVC 视频编解码已排除（用户决策）。
 | 算术编码 | `arith_encode(s: string) -> 表` / `arith_decode(表) -> string` | 区间划分（用 i64 定点避免浮点精度） |
 | 霍夫曼 | `huffman_build/encode/decode`（已在 std/exmath） | 已实现，compress 可引用 |
 
-> 为何 enl：压缩需维护编码表/字典/窗口等运行状态，属应用级；且这些算法输出
+> 为何 ext：压缩需维护编码表/字典/窗口等运行状态，属应用级；且这些算法输出
 > 是「压缩数据表」（自定义格式），贴近具体应用而非纯数学工具。
 
-### 3.6 enl/ml.tie（新：机器学习，命名空间 ml）
+### 3.6 ext/ml.tie（新：机器学习，命名空间 ml）
 
 | 算法 | 函数签名 | 说明 |
 | --- | --- | --- |
 | 决策树 | `tree_train(xs: 表, ys: 表) -> 表` / `tree_predict(tree: 表, x: 表) -> i64` | ID3（信息增益）；树用 struct/并行表存储 |
 | 支持向量机 | `svm_train(xs: 表, ys: 表) -> (w: 表, b: f64)` / `svm_predict(w: 表, b: f64, x: 表) -> i64` | 线性 SVM（感知机/梯度下降；核函数留后续） |
 
-> 为何 enl：训练产生模型状态（树结构/权重向量），推理依赖该状态 → 有状态应用。
+> 为何 ext：训练产生模型状态（树结构/权重向量），推理依赖该状态 → 有状态应用。
 > 首版做**线性可分**场景（感知机式 SVM）；核方法/软间隔留后续。
 
 ### 3.7 现代压缩与多媒体（tie 实现，前置字节流底座原语）
@@ -156,8 +156,8 @@ Rust 只补「语言底座原语」中**语言层无法自举**的系统能力�
 | JPEG | 字节流 IO + 位流 + 余弦变换 | tie 实现 DCT（或整数近似）、量化、ZigZag、霍夫曼/算术熵编码 |
 | MP3 | 字节流 IO + 位流 | tie 实现 MDCT 变换、心理声学模型简化版、哈夫曼熵编码 |
 
-> 处置：**算法本体全部用 tie 语言编写**，放入 enl/（有状态编解码器）或独立
-> `enl/codec/` 子目录。Rust 侧仅新增语言底座原语：
+> 处置：**算法本体全部用 tie 语言编写**，放入 ext/（有状态编解码器）或独立
+> `ext/codec/` 子目录。Rust 侧仅新增语言底座原语：
 > `byte_read(file) / byte_write(file, bytes) / bit_stream_new / bit_read / bit_write` 等
 > （系统级字节/位操作，语言层表达不了的才是原语）。
 > 阶段划分：先补字节流原语 → 实现 LZ4（相对简单，验证完整链路）→ JPEG →
@@ -217,13 +217,13 @@ workspace 测试全绿。**此阶段完成后，阶段一至四的算法全部�
 ### 第四批（std/optsearch，递归能力）
   merge_sort / quick_sort / max_subarray / n_queens / subset_sum / knapsack / lis
 
-### 第五批（enl/compress，字节位运算 M4 已备）
+### 第五批（ext/compress，字节位运算 M4 已备）
   lz77 / lzss / lzw / arith
 
-### 第六批（enl/ml，依赖 linalg）
+### 第六批（ext/ml，依赖 linalg）
   决策树（ID3）→ 线性 SVM
 
-### 第七批（enl/codec/，前置阶段 0b 字节流原语）
+### 第七批（ext/codec/，前置阶段 0b 字节流原语）
   字节流原语落地后：LZ4（编解码首个里程碑，验证完整链路）→ JPEG（DCT+霍夫曼）→
   MP3（MDCT+心理声学简化版）→ Zstd/Brotli（FSE/静态霍夫曼熵编码后端，最后攻坚）。
   全部 tie 实现，不调任何 Rust 编解码 crate。
@@ -232,7 +232,7 @@ workspace 测试全绿。**此阶段完成后，阶段一至四的算法全部�
 
 - 每个算法有独立 demo（examples/alg_*.tie）验证正确性（已知输入 → 已知输出）；
 - std 库算法纯函数（同输入同输出，无全局状态）；
-- enl 库算法有状态但接口清晰（训练/推理分离）；
+- ext 库算法有状态但接口清晰（训练/推理分离）；
 - 编解码器端到端：tie 压缩 → tie 解压 → 内容一致（roundtrip 验收）；
 - 全部 workspace 测试全绿、编译零错误；
 - 分类文档（本文件）与 README 标准库/扩展库章节同步更新。
@@ -253,8 +253,8 @@ workspace 测试全绿。**此阶段完成后，阶段一至四的算法全部�
 | std/linalg.tie | 线性代数（新建） |
 | std/graph.tie | 图算法（新建） |
 | std/optsearch.tie | 搜索与规划（新建） |
-| enl/compress.tie | 数据压缩（新建） |
-| enl/ml.tie | 机器学习（新建） |
+| ext/compress.tie | 数据压缩（新建） |
+| ext/ml.tie | 机器学习（新建） |
 | examples/alg_*.tie | 每算法一个演示 |
 | docs/plans/package-manager.md | M4 补齐阶段零引用本文件 |
 | README.md / CHANGELOG.md | 标准库/扩展库清单更新 |

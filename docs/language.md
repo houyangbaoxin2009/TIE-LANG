@@ -388,7 +388,7 @@ func main() {
   直接按字面量求值即可；
 - 解释器（tie-interp）与编译器（IR 层）行为一致：省略可选参数 → 默认值，显式传参 → 覆盖。
 
-**标准库示例**（`enl/log.tie` 综合方案，空表 `[]` 作「未提供」信号）：
+**标准库示例**（`ext/log.tie` 综合方案，空表 `[]` 作「未提供」信号）：
 
 ```c
 func no_file(langs: table, texts: table = []) -> string {

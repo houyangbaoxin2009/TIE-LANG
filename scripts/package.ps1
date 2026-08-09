@@ -153,9 +153,9 @@ if (Test-Path $ExamplesSrc) {
     Write-Host "  examples/ ✔" -ForegroundColor DarkGray
 }
 
-# std/ 与 enl/：标准库与扩展库（tie 语言自写，随发行版内置；
-# 用户程序 import "../std/..." 或 "../enl/..." 依赖本地库目录）
-foreach ($lib in @("std", "enl")) {
+# std/ 与 ext/：标准库与扩展库（tie 语言自写，随发行版内置；
+# 用户程序 import "../std/..." 或 "../ext/..." 依赖本地库目录）
+foreach ($lib in @("std", "ext")) {
     $LibSrc = Join-Path $Root $lib
     if (Test-Path $LibSrc) {
         $LibTarget = Join-Path $DistDir $lib

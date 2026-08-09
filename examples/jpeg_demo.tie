@@ -4,7 +4,7 @@
 // 验证：渐变 / 棋盘 / 8×8 三种灰度图 encode → decode 像素近似还原（有损量化容差内），
 //      并演示 byte_write 落盘 → byte_read 读回 → decode 的 D7 字节流闭环。
 
-import "../enl/codec/jpeg.tie"
+import "../ext/codec/jpeg.tie"
 
 func main() {
     // ---- 图案 1：16×16 斜向渐变（低频，应还原非常接近）----

@@ -7,7 +7,7 @@
 // 注意：log.tie 已随同展开 string.tie + format.tie，本文件不再重复导入
 // 运行：tie examples/log_enhance_demo.tie
 
-import "../enl/log.tie"
+import "../ext/log.tie"
 import "../std/assert.tie"
 
 func main() {
