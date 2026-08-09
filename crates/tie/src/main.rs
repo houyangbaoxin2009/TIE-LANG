@@ -28,10 +28,21 @@ mod pipeline;
 /// 包管理器子命令名（M6）：首个参数命中（且非 .tie 文件）→ 转交 pkg.exe。
 ///
 /// pkg.exe 是 tie 语言自写的包管理器（pkg/main.tie 经 tie-llvm 编译，
-/// 链接 tie-interp 静态库），完整 CLI（init/add/remove/install/build/run/help）
+/// 链接 tie-interp 静态库），完整 CLI
+/// （init/add/remove/install/update/build/run/publish/search/info/help）
 /// 的解析与执行逻辑全部在 tie 侧；本入口只做「子命令识别 + exec 转发」。
-const PKG_SUBCOMMANDS: [&str; 7] = [
-    "init", "add", "remove", "install", "build", "run", "help",
+const PKG_SUBCOMMANDS: [&str; 11] = [
+    "init",
+    "add",
+    "remove",
+    "install",
+    "update",
+    "build",
+    "run",
+    "publish",
+    "search",
+    "info",
+    "help",
 ];
 
 /// 命令行参数（编译类选项透传给 tie-llvm）。
@@ -69,7 +80,8 @@ tie 语言总入口（四段式调度器 + REPL）
   tie --lsp          启动语言服务器（LSP over stdio，供编辑器接入）
   tie <input.tie> [选项]   编译并执行脚本文件
   tie <file...|目录> [选项] 编译项目（多文件/目录；需配置文件开启 advanced.enabled）
-  tie init|add|remove|install|build|run|help   包管理器（M6，tie 语言自写）
+  tie init|add|remove|install|update|build|run|publish|search|info|help
+                 包管理器（M6，tie 语言自写；更多见 tie help）
 
 流程:
   1. tie-prep 预处理（清理代码 + 识别文件类型）

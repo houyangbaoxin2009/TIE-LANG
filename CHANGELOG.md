@@ -3,6 +3,71 @@
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库、M3 = 预处理器自举、M4 = 标准库重构**。
 
+## [Harbor M6] 包管理器 E3/E4：git/registry 源 + tie.lock + 发布/搜索 — 2026-08-09
+
+### 目标
+在 E1/E2 骨架（tie 自写 CLI + path 源）之上补齐包管理器的完整能力：
+**三种依赖源（path / git / HTTP 注册表）、tie.lock 锁文件幂等恢复、
+递归依赖解析（去重 + 冲突检测）、发布（打包 tar.gz + git tag/push）与
+注册表搜索/信息查询**。全部逻辑仍 100% 用 tie 语言编写（`pkg/` 目录）。
+
+### 新增：pkg/ 模块（tie 语言自写）
+- **`pkg/fetch.tie`**（命名空间 `fetch`）——包源拉取：
+  - git 源识别（`git+https://...` / `git+ssh://...` / `git@host:...` / 裸 https 含 `.git`）
+    + `fetch_git` 浅克隆（`git clone --depth 1 [--branch <tag>]`，克隆后清 `.git` 子目录）；
+  - registry 基址管理（`TIE_REGISTRY` 环境变量覆盖，默认 `https://pkg.tie-lang.org`）、
+    包/索引 URL 约定（`<base>/packages/<name>/<version>.tar.gz` + `<base>/index.tie`）、
+    版本选择（精确版本直用；`^x.y`/`>=x.y`/`*` 约束经 http_get 拉 index 筛最高满足）、
+    `fetch_registry` 下载解压、`resolve_from_constraints` 多约束重选；
+- **`pkg/lock.tie`**（命名空间 `lock`）——tie.lock 锁文件：
+  生成（tie:data 文本：包名/解析版本/来源/原 spec）、解析（names/versions/sources/specs）、
+  校验（`valid`：tie.pkg 每个直接依赖须能在锁中命中同名同 spec）、exists/read/write；
+- **`pkg/deps.tie`** 扩展——三源安装（install_one：path 复制 / git 克隆 / registry
+  下载解压）+ `resolve`（BFS + 队头指针递归读依赖 tie.pkg → 去重 → 冲突检测，
+  深度限制 3 防环；registry 冲突按全部约束集重选最高版本）+ `install_from_lock`
+  （按锁条目落地 `.tie/deps/`，`.tie/cache/` 缓存命中不重复拉取）；
+- **`pkg/publish.tie`**（命名空间 `publish`）——`tie publish`：校验 tie.pkg 的
+  name/version/main → 收集项目文件（排除 .tie/.git/target/pkg/dist 与产物）→
+  系统 tar 打 `.tie/dist/<name>-<version>.tar.gz`（首层为项目文件，registry 解压直落）
+  → `git tag v<version>` + `git push --tags`（best-effort；HTTP 上传接口留占位）；
+- **`pkg/search.tie`**（命名空间 `search`）——`tie search <query>`（index.tie 逐行
+  匹配包名）/ `tie info <pkg>`（取最高版本），行格式 `包名|版本|描述`。
+
+### 新增：CLI 子命令（pkg/main.tie + crates/tie 转发）
+- `tie update [包名]`——重新解析依赖并更新 tie.lock（可选包名参数当前版本
+  重新解析全部依赖）；`tie publish` / `tie search <关键字>` / `tie info <包名>`；
+- `tie install` 改为「解析 + 生成/校验 tie.lock」流程：锁存在且未变 → 按锁幂等恢复；
+  锁缺失/失效 → 递归解析三源生成锁并落地；
+- `tie add` 支持 git 源整体形式（`git+...`/`git@...`）与 `name@约束`
+  （精确 `1.0.0` / 区间 `^1.2` / `*`）；帮助文本、依赖写法说明更新；
+- Rust 侧 `PKG_SUBCOMMANDS` 扩为 11 个（init/add/remove/install/update/build/run/
+  publish/search/info/help）。
+
+### 修复：http_get_file 二进制下载损坏（crates/tie-interp）
+- `http_get_impl` 原用 `String::from_utf8_lossy` 取正文，非法 UTF-8 字节被替换为
+  U+FFFD，导致 registry 下载 tar.gz/zip 二进制包损坏（实测 15 字节变 27 字节）；
+  改为**字节级切分**（响应按字节找 `\r\n\r\n` 取正文），http_get 文本接口照旧
+  lossy 转字符串，http_get_file 原样写盘；新增回归测试
+  `builtin_http_get_file_binary_preserved`（73 测试全绿）。
+
+### 端到端验收（实测记录）
+- registry 源：本地 `python -m http.server` 静态注册表（index.tie +
+  packages/demo2lib/{1.0.0,1.1.0}.tar.gz）+ `TIE_REGISTRY` → `tie add demo2lib@1.0.0`
+  → `tie install` → `.tie/deps/demo2lib/` 生成 + tie.lock 正确；`^1.0` 约束自动选
+  1.1.0；import 依赖编译运行正常；再次 install 走锁文件幂等恢复（不重新拉取）；
+- git 源：本地裸仓库（`git init --bare` + tag v1.0.0）→ `tie add gitdemo@git+file:///...#v1.0.0`
+  → install 克隆 1 次、锁恢复 0 次、无 `.git` 残留；
+- `tie search demo` / `tie info demo2lib` 查询本地 index 正确（info 取最高版本）；
+- `tie publish`：打 `.tie/dist/pubtest-2.0.0.tar.gz` + `git tag v2.0.0`（无 remote 时
+  push best-effort 提示）；发布产物放入注册表后另一项目 add/install 成功（发布闭环）。
+
+### 说明
+- 锁文件幂等：缓存（`.tie/cache/`）命中不重复拉取；git 克隆后清理 `.git`，
+  缓存存在性以 `tie.pkg` 文件探测（编译路径 file_exists 对目录恒 false，fopen 不可读目录）；
+- `http_get` 首版仅支持 http://，默认注册表基址 https://pkg.tie-lang.org 需经
+  TIE_REGISTRY 指向 http:// 服务才可实际下载（本地/内网静态注册表即满足）；
+- 包签名/鉴权、npm 式全局安装不在本次范围（见 docs/plans/package-manager.md §5）。
+
 ## [Harbor M6] 包管理器骨架（E1/E2）：tie 语言自写 CLI — 2026-08-09
 
 ### 目标

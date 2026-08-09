@@ -831,12 +831,13 @@ pub extern "C" fn tie_http_get(url: *const c_char) -> *mut c_char {
         Err(_) => return std::ptr::null_mut(),
     };
     match http_get_impl(&url) {
-        Ok(body) => string_to_c_char(body),
+        Ok(body) => string_to_c_char(String::from_utf8_lossy(&body).into_owned()),
         Err(_) => std::ptr::null_mut(),
     }
 }
 
 /// C ABI 桥：HTTP GET 下载到本地文件，成功返回 1（bool true），失败返回 0。
+/// 正文按原始字节写入（不经过有损转换，二进制包 tar.gz/zip 可完整下载）。
 #[unsafe(no_mangle)]
 pub extern "C" fn tie_http_get_file(url: *const c_char, path: *const c_char) -> i8 {
     let url = match unsafe { c_char_to_string(url) } {
@@ -848,7 +849,7 @@ pub extern "C" fn tie_http_get_file(url: *const c_char, path: *const c_char) -> 
         Err(_) => return 0,
     };
     match http_get_impl(&url) {
-        Ok(body) => std::fs::write(&path, body).is_ok() as i8,
+        Ok(body) => std::fs::write(&path, &body).is_ok() as i8,
         Err(_) => 0,
     }
 }
@@ -1085,8 +1086,11 @@ pub extern "C" fn tie_file_move(src: *const c_char, dest: *const c_char) -> i8 {
 
 // ---------- HTTP/进程/目录/路径 内部实现（两路径共用） ----------
 
-/// 手写 HTTP/1.1 GET：仅 http://（https 留待 reqwest）。返回正文或 Err。
-fn http_get_impl(url: &str) -> Result<String, ()> {
+/// 手写 HTTP/1.1 GET：仅 http://（https 留待 reqwest）。返回正文**原始字节**或 Err。
+///
+/// 正文按字节切分返回（不经过 UTF-8 有损转换）——http_get_file 下载二进制包
+/// （tar.gz/zip）依赖这一点；http_get（文本接口）由调用方再转字符串。
+fn http_get_impl(url: &str) -> Result<Vec<u8>, ()> {
     use std::io::{Read, Write};
     if !url.starts_with("http://") {
         return Err(());
@@ -1111,14 +1115,13 @@ fn http_get_impl(url: &str) -> Result<String, ()> {
     stream.write_all(req.as_bytes()).map_err(|_| ())?;
     let mut resp = Vec::new();
     stream.read_to_end(&mut resp).map_err(|_| ())?;
-    let text = String::from_utf8_lossy(&resp).into_owned();
-    // 状态行需为 200（HTTP/1.1 200 / HTTP/1.0 200）
-    if !(text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200")) {
+    // 状态行需为 200（HTTP/1.1 200 / HTTP/1.0 200）：按字节读 ASCII 状态行
+    if !(resp.starts_with(b"HTTP/1.1 200") || resp.starts_with(b"HTTP/1.0 200")) {
         return Err(());
     }
-    // 取响应头之后的正文字节（\r\n\r\n 分隔）
-    match text.find("\r\n\r\n") {
-        Some(i) => Ok(text[i + 4..].to_string()),
+    // 取响应头之后的正文字节（\r\n\r\n 分隔；字节级定位，正文原样返回）
+    match resp.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(i) => Ok(resp[i + 4..].to_vec()),
         None => Err(()),
     }
 }
@@ -4341,6 +4344,65 @@ to_string(n) + ":" + names"#
         // （http_get 仅支持 http://；https 与无法连接均报错，文本与编译路径一致）
         let err = ev("http_get(\"https://example.com\")").unwrap_err();
         assert!(err.contains("运行时错误: http_get 无法访问 URL"));
+    }
+
+    #[test]
+    fn builtin_http_get_file_binary_preserved() {
+        // 回归测试（M6 E4）：http_get_file 下载二进制正文必须**逐字节一致**。
+        // 此前 http_get_impl 用 from_utf8_lossy 取正文，非法 UTF-8 字节被替换为
+        // U+FFFD（3 字节），下载 tar.gz/zip 包会损坏。修复后按原始字节切分返回。
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // 非 UTF-8 二进制正文（0x00/0xff 等无效字节 + 一段 ASCII）
+        let payload: Vec<u8> = vec![
+            0x1f, 0x8b, 0x08, 0x00, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xff, 0x00,
+            0x7f, b'a', b'b', b'c',
+        ];
+        // 后台线程响应一次 HTTP 200（Connection: close）；只读请求头即回应，
+        // 避免 read_to_end 等客户端关写（客户端读完响应前不会关）造成死锁
+        let expected = payload.clone();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let mut head = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let resp = [
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n",
+                "Content-Length: ",
+                &expected.len().to_string(),
+                "\r\nConnection: close\r\n\r\n",
+            ]
+            .concat()
+            .into_bytes();
+            let mut all = resp;
+            all.extend_from_slice(&expected);
+            sock.write_all(&all).unwrap();
+        });
+        let dir = std::env::temp_dir().join(format!("tie_http_bin_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("pkg.tar.gz");
+        // Windows 路径含反斜杠：tie 字符串字面量需转义为 \\（否则 \U 等被当转义）
+        let out_s = out.to_str().unwrap().replace('\\', "\\\\");
+        let code = format!(
+            "http_get_file(\"http://{addr}/packages/demo/1.0.0.tar.gz\", \"{out_s}\")",
+        );
+        assert_eq!(ev(&code).unwrap(), "true");
+        handle.join().unwrap();
+        let written = std::fs::read(&out).unwrap();
+        assert_eq!(written, payload, "下载的二进制正文必须与源逐字节一致");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

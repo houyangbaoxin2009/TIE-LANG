@@ -1,22 +1,32 @@
 // tie:logic
 // tie:opt=2
 //
-// main.tie —— tie 语言自写的包管理器 CLI 入口（Harbor M6 骨架 E1/E2）
+// main.tie —— tie 语言自写的包管理器 CLI 入口（Harbor M6 骨架 E1/E2 + E3/E4）
 //
 // 使用（由 Rust 侧 crates/tie/src/main.rs 识别子命令后编译执行本入口）：
 //   tie init <项目名>     初始化项目（生成 tie.pkg + main.tie 模板）
-//   tie add <依赖>        添加依赖（path 源: `tie add path:./lib_math`）
+//   tie add <依赖>        添加依赖（path 源 / git 源 / registry 版本约束）
 //   tie remove <包名>     移除依赖
-//   tie install           按 tie.pkg 安装依赖到 .tie/deps/（首版 path 源）
+//   tie install           安装全部依赖（解析 + 拉取 + 生成/校验 tie.lock）
+//   tie update [包名]     重新解析依赖并更新 tie.lock
 //   tie build             编译项目（调用 tie 编译器）
 //   tie run               运行项目
+//   tie publish           打包发布（tar.gz + git tag/push）
+//   tie search <关键字>   搜索注册表 index.tie
+//   tie info <包名>       查询注册表包信息
 //   tie help              显示帮助
 //
 // 架构：本文件只做「CLI 子命令分派 + 编排」，具体能力按模块分工——
-//   manifest（./mf.tie）  tie.pkg 清单解析（tie:data 文本 → 依赖项）
-//   deps（./dp.tie）          依赖安装（path 源复制到 .tie/deps/）
-//   version（../std/version.tie）semver 版本比较（复用标准库，add 时校验版本）
+//   manifest（./mf.tie）   tie.pkg 清单解析（tie:data 文本 → 依赖项）
+//   deps（./dp.tie）       依赖安装/解析（path/git/registry 三源 + 锁文件落地）
+//   publish（./pb.tie）    打包发布（tar.gz + git tag/push）
+//   search（./sr.tie）     注册表搜索/信息查询
 // Rust 侧只做两件事：子命令识别 + exec pkg.exe（自举：包管理器 100% tie 写）。
+//
+// import 约束（M6 E3/E4 起）：tie 的 import 是文本内联，同一命名空间被两个
+// 模块同时 import 会重复定义。本文件的 import 树如下（每文件只被导入一次）：
+//   main → manifest / deps（→ fetch → version / lock）/ publish / search；
+// 故版本校验与 git 源判定等经 dp.* 透传（dp 内部 import fetch/lock）。
 //
 // tie 约束处理（重要）：
 // - **表参数元素类型静态未知**：跨模块传参一律用逗号分隔字符串序列
@@ -29,9 +39,10 @@
 // - 命令行参数经 arg_string(i) 读取（0 = 子命令名，1.. = 子命令参数），
 //   越界返回空串。
 
-import "../std/version.tie"
 import "./manifest.tie" as mf
 import "./deps.tie" as dp
+import "./publish.tie" as pb
+import "./search.tie" as sr
 
 // ================= 入口：子命令分派 =================
 
@@ -59,11 +70,23 @@ func main() -> i64 {
     if cmd == "install" {
         return cmd_install()
     }
+    if cmd == "update" {
+        return cmd_update()
+    }
     if cmd == "build" {
         return cmd_build()
     }
     if cmd == "run" {
         return cmd_run()
+    }
+    if cmd == "publish" {
+        return cmd_publish()
+    }
+    if cmd == "search" {
+        return cmd_search()
+    }
+    if cmd == "info" {
+        return cmd_info()
     }
     // 未知命令：报错并给帮助
     print_err("[pkg] 未知命令: " + cmd + "\n")
@@ -80,20 +103,29 @@ func cmd_help() -> i64 {
 
 // 帮助文本（拼接待转义字符串；命令用法一目了然）。
 func help_text() -> string {
-    return "tie 包管理器（M6 骨架，tie 语言自写）\n" +
+    return "tie 包管理器（Harbor M6，tie 语言自写）\n" +
            "\n" +
            "用法:\n" +
            "  tie init <项目名>      初始化项目（生成 tie.pkg + main.tie 模板）\n" +
            "  tie add <依赖>         添加依赖\n" +
            "  tie remove <包名>      移除依赖\n" +
-           "  tie install            安装全部依赖到 .tie/deps/\n" +
+           "  tie install            安装全部依赖到 .tie/deps/（解析 + 生成 tie.lock）\n" +
+           "  tie update [包名]      重新解析依赖并更新 tie.lock\n" +
            "  tie build              编译项目（调用 tie 编译器）\n" +
            "  tie run                运行项目（tie <main 文件>）\n" +
+           "  tie publish            打包发布（tar.gz + git tag/push）\n" +
+           "  tie search <关键字>    搜索注册表（TIE_REGISTRY 可指定基址）\n" +
+           "  tie info <包名>        查询注册表包信息\n" +
            "  tie help               显示本帮助\n" +
            "\n" +
            "依赖写法:\n" +
-           "  path:./lib_math        本地路径源（install 时复制目录到 .tie/deps/lib_math/）\n" +
-           "  name@version           版本约束（如 log@1.0.0；registry/git 源后续阶段）\n"
+           "  path:./lib_math                 本地路径源（复制目录到 .tie/deps/lib_math/）\n" +
+           "  git+https://host/repo.git        git 源（https；#v1.0.0 后缀指定 tag）\n" +
+           "  git@host:repo.git                git 源（ssh；认证走用户密钥）\n" +
+           "  name@1.0.0                       注册表精确版本\n" +
+           "  name@^1.2 / name@*               注册表版本约束（^1.2 或最新）\n" +
+           "\n" +
+           "注册表: 默认 https://pkg.tie-lang.org，可用环境变量 TIE_REGISTRY 覆盖\n"
 }
 
 // ================= tie init：初始化项目 =================
@@ -179,8 +211,10 @@ func cmd_add() -> i64 {
     var spec_arg = arg_string(1)
     if spec_arg == "" {
         print_err("[pkg] 用法: tie add <依赖>\n")
-        print_err("[pkg]   示例: tie add path:./lib_math   （本地 path 源）\n")
-        print_err("[pkg]         tie add log@1.0.0        （版本约束，registry 源占位）\n")
+        print_err("[pkg]   示例: tie add path:./lib_math                 （本地 path 源）\n")
+        print_err("[pkg]         tie add log@1.0.0                       （注册表精确版本）\n")
+        print_err("[pkg]         tie add log@^1.2                        （注册表版本约束）\n")
+        print_err("[pkg]         tie add demo@git+https://host/repo.git  （git 源）\n")
         return 1
     }
     if !file_exists("tie.pkg") {
@@ -194,12 +228,12 @@ func cmd_add() -> i64 {
         return 1
     }
     var spec = add_spec(spec_arg)
-    // registry 版本约束格式校验：复用 std/version.tie 的 compare
-    // （compare 对非法版本串返回 0；"0.0.0" 本身合法，排除它做启发式判断）
+    // registry 版本约束格式校验：path/git 源跳过；约束须合法
+    // （x.y.z 精确 / ^x.y 区间 / >=x.y 下界 / * 最新）
     if !mf.starts_with(spec_arg, "path:") {
-        if spec != "0.0.0" {
-            if version.compare(spec, "0.0.0") == 0 {
-                print_err("[pkg] 警告: 版本 \"" + spec + "\" 格式非法（期望 x.y.z）\n")
+        if !dp.is_git(spec_arg) {
+            if !dp.valid_version(spec) {
+                print_err("[pkg] 警告: 版本 \"" + spec + "\" 格式非法（期望 x.y.z / ^x.y / >=x.y / *）\n")
             }
         }
     }
@@ -227,31 +261,59 @@ func cmd_add() -> i64 {
     return 1
 }
 
-// 从 add 参数解析包名：path:./lib_math → "lib_math"（路径 basename）；
-// name@version → "name"；裸 name → "name"。
+// 从 add 参数解析包名：
+//   path:./lib_math                     → "lib_math"（路径 basename）
+//   git+https://host/repo.git#v1        → "repo"（git 整体形式，取仓库名）
+//   git@host:repo.git                   → "repo"（同上）
+//   name@version / name@git+...         → "name"（第一个 @ 前；@ 是名字/约束分隔符）
+//   https://host/repo.git               → "repo"（无 @ 的裸 git URL）
+//   裸 name                             → "name"
 func add_name(spec_arg: string) -> string {
     if mf.starts_with(spec_arg, "path:") {
         var p = mf.slice(spec_arg, 5, len(spec_arg))
         return path_basename(p)
     }
-    var at = mf.find(spec_arg, "@")
-    if at < 0 {
-        return spec_arg
+    // git 整体形式（git+ / git@ 开头）：@ 是 URL 的一部分，整串即 git 源
+    if mf.starts_with(spec_arg, "git+") {
+        return dp.git_name(spec_arg)
     }
-    return mf.slice(spec_arg, 0, at)
+    if mf.starts_with(spec_arg, "git@") {
+        return dp.git_name(spec_arg)
+    }
+    // 第一个 @ 是「名字@约束」分隔符（log@1.0.0 / demo@git+...）
+    var at = mf.find(spec_arg, "@")
+    if at >= 0 {
+        return mf.slice(spec_arg, 0, at)
+    }
+    // 无 @：裸 git URL（含 .git）→ 取仓库名；否则裸名字
+    if dp.is_git(spec_arg) {
+        return dp.git_name(spec_arg)
+    }
+    return spec_arg
 }
 
-// 从 add 参数解析 spec：path:./lib_math → "path:./lib_math"；
+// 从 add 参数解析 spec：path/git 整体保留；
 // name@1.0.0 → "1.0.0"；裸 name → "*"（任意版本）。
 func add_spec(spec_arg: string) -> string {
     if mf.starts_with(spec_arg, "path:") {
         return spec_arg
     }
-    var at = mf.find(spec_arg, "@")
-    if at < 0 {
-        return "*"
+    if mf.starts_with(spec_arg, "git+") {
+        return spec_arg
     }
-    return mf.slice(spec_arg, at + 1, len(spec_arg))
+    if mf.starts_with(spec_arg, "git@") {
+        return spec_arg
+    }
+    // 第一个 @ 是「名字@约束」分隔符：取其后的部分（版本或 git 源 spec）
+    var at = mf.find(spec_arg, "@")
+    if at >= 0 {
+        return mf.slice(spec_arg, at + 1, len(spec_arg))
+    }
+    // 无 @：裸 git URL → 整体作为 spec；裸名字 → 任意版本
+    if dp.is_git(spec_arg) {
+        return spec_arg
+    }
+    return "*"
 }
 
 // ================= tie remove：移除依赖 =================
@@ -302,13 +364,119 @@ func cmd_install() -> i64 {
         return 1
     }
     println("[pkg] 安装依赖到 .tie/deps/ ...")
-    var failed = dp.install(names, specs)
+    var lock_text: string = ""
+    var from_lock: bool = false
+    // 幂等：tie.lock 存在且与当前 tie.pkg 直接依赖一致 → 直接按锁文件恢复（不重新拉取）
+    if dp.lock_exists() {
+        var lt = dp.lock_read()
+        if dp.lock_valid(lt, src) {
+            lock_text = lt
+            from_lock = true
+        }
+    }
+    var failed: i64 = 0
+    if from_lock {
+        println("[pkg] tie.lock 有效，按锁文件恢复（幂等）")
+        failed = dp.install_from_lock(lock_text)
+    } else {
+        // 无锁/锁失效：重新解析（三源递归 + 去重 + 冲突检测）→ 生成锁 → 安装
+        var pkg_name = mf.field(src, "name")
+        var pkg_ver = mf.field(src, "version")
+        lock_text = dp.resolve(names, specs, pkg_name, pkg_ver)
+        if lock_text == "" {
+            print_err("[pkg] 依赖解析失败\n")
+            return 1
+        }
+        if dp.lock_write(lock_text) {
+            println("[pkg] 已生成 tie.lock")
+        } else {
+            print_err("[pkg] 写入 tie.lock 失败\n")
+        }
+        failed = dp.install_from_lock(lock_text)
+    }
     if failed > 0 {
         print_err("[pkg] 安装完成，失败 " + to_string(failed) + " 项\n")
         return 1
     }
     println("[pkg] 全部依赖安装完成")
     return 0
+}
+
+// ================= tie update：重新解析依赖并更新 tie.lock =================
+
+func cmd_update() -> i64 {
+    var pkg = arg_string(1)
+    if !file_exists("tie.pkg") {
+        print_err("[pkg] 未找到 tie.pkg（请先 tie init <项目名>）\n")
+        return 1
+    }
+    var src = file_read("tie.pkg")
+    var names = mf.dep_names(src)
+    if names == "" {
+        println("[pkg] 无依赖，无需更新")
+        return 0
+    }
+    var specs = mf.dep_specs(src)
+    if !mkdir_all(".tie/deps") {
+        print_err("[pkg] 创建 .tie/deps 失败\n")
+        return 1
+    }
+    // 可选包名参数：当前版本无论是否指定都重新解析全部依赖
+    if pkg != "" {
+        println("[pkg] 更新 " + pkg + "（当前版本重新解析全部依赖）")
+    } else {
+        println("[pkg] 重新解析全部依赖 ...")
+    }
+    var pkg_name = mf.field(src, "name")
+    var pkg_ver = mf.field(src, "version")
+    var lock_text = dp.resolve(names, specs, pkg_name, pkg_ver)
+    if lock_text == "" {
+        print_err("[pkg] 依赖解析失败\n")
+        return 1
+    }
+    if dp.lock_write(lock_text) {
+        println("[pkg] 已更新 tie.lock")
+    } else {
+        print_err("[pkg] 写入 tie.lock 失败\n")
+    }
+    var failed = dp.install_from_lock(lock_text)
+    if failed > 0 {
+        print_err("[pkg] 安装完成，失败 " + to_string(failed) + " 项\n")
+        return 1
+    }
+    println("[pkg] 更新完成")
+    return 0
+}
+
+// ================= tie publish / search / info =================
+
+func cmd_publish() -> i64 {
+    if !file_exists("tie.pkg") {
+        print_err("[pkg] 未找到 tie.pkg（请先 tie init <项目名>）\n")
+        return 1
+    }
+    var src = file_read("tie.pkg")
+    var name = mf.field(src, "name")
+    var version = mf.field(src, "version")
+    var main_file = mf.field(src, "main")
+    if main_file == "" {
+        main_file = "main.tie"
+    }
+    return pb.publish(name, version, main_file)
+}
+
+func cmd_search() -> i64 {
+    var query = arg_string(1)
+    return sr.search(query)
+}
+
+func cmd_info() -> i64 {
+    var pkg = arg_string(1)
+    if pkg == "" {
+        print_err("[pkg] 用法: tie info <包名>\n")
+        return 1
+    }
+    return sr.info(pkg)
 }
 
 // ================= tie build / tie run =================

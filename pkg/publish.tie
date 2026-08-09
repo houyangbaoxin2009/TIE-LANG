@@ -1,0 +1,253 @@
+// tie:library
+// publish.tie —— 发布模块（Harbor M6 包管理器 E4）
+//
+// 职责：`tie publish` 把当前项目打包为 tar.gz 并打 git tag / push：
+//   1. 读 tie.pkg（由 main 读好 name/version/main 传入，本模块不重复解析清单）；
+//   2. 收集项目文件（walk_dir 递归相对路径，排除 .tie/.git/target/pkg/dist 与
+//      .exe/.tar.gz 产物）复制到 staging 目录；
+//   3. 用系统 tar（exec_code `tar -czf <out> -C <staging> .`）打 tar.gz 到
+//      `.tie/dist/<name>-<version>.tar.gz`（首层为项目文件，registry 解压直落）；
+//   4. git tag v<version> + git push --tags（best-effort，非 git 仓库时提示跳过）；
+//      HTTP 注册表上传接口留占位（见 docs/plans/package-manager.md §3.9）。
+//
+// tie 约束处理（重要）：
+// - 本模块**无 import**（独立成文件，避免多模块重复内联同一命名空间）；
+//   字符串工具自备；walk_dir 返回的局部表可下标读写；
+// - **tie 的 && 非短路**：边界判断与下标不写进同一条件，用嵌套 if；
+// - 无 continue/break：迭代 + return 提前退出。
+
+namespace publish {
+    // ================= 通用字符串工具（自备） =================
+
+    func slice(s: string, start: i64, end: i64) -> string {
+        var n: i64 = len(s)
+        var lo: i64 = start
+        if lo < 0 {
+            lo = 0
+        }
+        if lo > n {
+            lo = n
+        }
+        var hi: i64 = end
+        if hi < 0 {
+            hi = 0
+        }
+        if hi > n {
+            hi = n
+        }
+        var result: string = ""
+        var i: i64 = lo
+        while i < hi {
+            result = result + str_char(s, i)
+            i = i + 1
+        }
+        return result
+    }
+
+    func find(s: string, sub: string) -> i64 {
+        var n: i64 = len(s)
+        var m: i64 = len(sub)
+        if m == 0 {
+            return 0
+        }
+        if m > n {
+            return -1
+        }
+        var i: i64 = 0
+        while i <= n - m {
+            var j: i64 = 0
+            var matched: bool = true
+            while j < m && matched {
+                if str_char(s, i + j) != str_char(sub, j) {
+                    matched = false
+                }
+                j = j + 1
+            }
+            if matched {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    func starts_with(s: string, prefix: string) -> bool {
+        var n: i64 = len(s)
+        var m: i64 = len(prefix)
+        if m > n {
+            return false
+        }
+        var i: i64 = 0
+        while i < m {
+            if str_char(s, i) != str_char(prefix, i) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+
+    func ends_with(s: string, suffix: string) -> bool {
+        var n: i64 = len(s)
+        var m: i64 = len(suffix)
+        if m > n {
+            return false
+        }
+        var i: i64 = 0
+        while i < m {
+            if str_char(s, n - m + i) != str_char(suffix, i) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+
+    // 是否合法的 x.y.z 版本串（纯数字与点、首尾数字、无连续点）。
+    func is_semver(s: string) -> bool {
+        var n: i64 = len(s)
+        if n == 0 {
+            return false
+        }
+        var digits = "0123456789"
+        if find(digits, str_char(s, 0)) < 0 {
+            return false
+        }
+        if find(digits, str_char(s, n - 1)) < 0 {
+            return false
+        }
+        var prev_dot: bool = false
+        var i: i64 = 0
+        while i < n {
+            var c = str_char(s, i)
+            if c == "." {
+                if prev_dot {
+                    return false
+                }
+                prev_dot = true
+            } else if find(digits, c) >= 0 {
+                prev_dot = false
+            } else {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+
+    // ================= 发布主流程 =================
+
+    // 执行发布：打 tar.gz + git tag/push。name/version/main 由 main 从 tie.pkg 读出传入。
+    pub func publish(name: string, version: string, main_file: string) -> i64 {
+        // 1) 校验清单字段
+        if name == "" {
+            print_err("[pkg] tie.pkg 缺少 name 字段\n")
+            return 1
+        }
+        if version == "" {
+            print_err("[pkg] tie.pkg 缺少 version 字段\n")
+            return 1
+        }
+        if main_file == "" {
+            print_err("[pkg] tie.pkg 缺少 main 字段\n")
+            return 1
+        }
+        if !is_semver(version) {
+            print_err("[pkg] 版本必须是 x.y.z 形式（当前: " + version + "）\n")
+            return 1
+        }
+
+        // 2) 重建 staging 目录（无条件清旧：编译路径 file_exists 对目录恒 false）
+        var staging = ".tie/dist-stage"
+        remove_dir_all(staging)
+        if !mkdir_all(staging) {
+            print_err("[pkg] 创建 staging 失败: " + staging + "\n")
+            return 1
+        }
+
+        // 3) 收集项目文件并复制到 staging（排除 .tie/.git/target/pkg/dist 与产物）
+        var files = walk_dir(".")
+        var fi: i64 = 0
+        var copied: i64 = 0
+        while fi < len(files) {
+            var rel = files[fi]
+            if keep_for_publish(rel) {
+                var dest = path_join(staging, rel)
+                var parent = path_dirname(dest)
+                if parent == "" {
+                    parent = staging
+                }
+                if !mkdir_all(parent) {
+                    print_err("[pkg] 创建目录失败: " + parent + "\n")
+                    return 1
+                }
+                if !file_copy(rel, dest) {
+                    print_err("[pkg] 复制失败: " + rel + "\n")
+                    return 1
+                }
+                copied = copied + 1
+            }
+            fi = fi + 1
+        }
+        println("[pkg] 收集文件 " + to_string(copied) + " 个")
+
+        // 4) 打 tar.gz（首层为项目文件；registry 解压后直接落到 .tie/deps/<name>/）
+        if !mkdir_all(".tie/dist") {
+            print_err("[pkg] 创建 .tie/dist 失败\n")
+            return 1
+        }
+        var out = ".tie/dist/" + name + "-" + version + ".tar.gz"
+        if file_exists(out) {
+            file_delete(out)
+        }
+        var rc = exec_code("tar -czf " + out + " -C " + staging + " .")
+        // 清理 staging（无论成败；无条件删）
+        remove_dir_all(staging)
+        if rc != 0 {
+            print_err("[pkg] tar 打包失败（退出码 " + to_string(rc) + "，请确认系统 tar 可用）\n")
+            return 1
+        }
+        println("[pkg] 已打包: " + out)
+
+        // 5) git tag + push（best-effort；HTTP 注册表上传接口留占位）
+        var tg = exec_code("git tag v" + version)
+        if tg != 0 {
+            println("[pkg] git tag v" + version + " 已存在或当前目录非 git 仓库（跳过 tag/push）")
+        } else {
+            println("[pkg] 已打 tag: v" + version)
+            var ps = exec_code("git push --tags")
+            if ps != 0 {
+                println("[pkg] git push --tags 失败（可稍后手动执行）")
+            }
+        }
+        println("[pkg] 发布完成。HTTP 注册表上传接口为占位（见 docs/plans/package-manager.md）")
+        return 0
+    }
+
+    // 文件是否纳入发布包：排除工作区缓存/构建产物目录与生成文件。
+    // 用前缀匹配（同时兼容 / 与 \ 分隔符），保守排除。
+    func keep_for_publish(rel: string) -> bool {
+        if starts_with(rel, ".tie") {
+            return false
+        }
+        if starts_with(rel, ".git") {
+            return false
+        }
+        if starts_with(rel, "target") {
+            return false
+        }
+        if starts_with(rel, "pkg") {
+            return false
+        }
+        if starts_with(rel, "dist") {
+            return false
+        }
+        if ends_with(rel, ".exe") {
+            return false
+        }
+        if ends_with(rel, ".tar.gz") {
+            return false
+        }
+        return true
+    }
+}

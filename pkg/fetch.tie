@@ -1,0 +1,470 @@
+// tie:library
+// fetch.tie —— 包源拉取模块（Harbor M6 包管理器 E3/E4）
+//
+// 职责：识别并拉取 **git 源** 与 **registry（HTTP 注册表）源**：
+//   - git 源 spec 形式：`git+https://host/repo.git`、`git+ssh://git@host/repo.git`、
+//     `git@host:repo.git`、裸 `https://host/repo.git`（含 .git 或 host:path 即视为
+//     git）。拉取用系统 git（exec_code 执行 `git clone --depth 1 [--branch <tag>]`），
+//     认证走用户 ssh 密钥，tie 不碰凭据；
+//   - registry 源 spec：裸版本（"1.0.0"）或约束（"^1.2" / ">=1.0" / "*"）。URL 约定
+//     `<registry_base>/packages/<name>/<version>.tar.gz`，registry_base 默认
+//     https://pkg.tie-lang.org，可用环境变量 TIE_REGISTRY 覆盖。区间约束用 http_get
+//     拉 `<base>/index.tie` 筛出满足条件的最高版本；包文件用 http_get_file 下载 +
+//     untar_gz 解压。
+//
+// tie 约束处理（重要）：
+// - 本模块全部对外函数只收/返**字符串**（跨模块传参规范，规避表参数限制）；
+//   函数内新建的局部表（split 结果）可下标读写；
+// - **tie 的 && 非短路**：边界判断与下标/取字符不写进同一条件，用嵌套 if；
+// - 无 continue/break：迭代 + return 提前退出。
+//
+// 说明：http_get 原语首版仅支持 http://（https 留待后续），故默认注册表基址
+// （https://pkg.tie-lang.org）需通过 TIE_REGISTRY 指向 http:// 服务才可实际
+// 下载（本地/内网静态注册表即满足，M6 验收路径）。
+//
+// import 约定（重要，与 tie 的 import 展开机制绑定）：
+// - version 库经**别名 ver** 引入（import as 唯一入口），本文件内以 ver.* 调用；
+// - import 语句必须放在**文件末尾**（命名空间声明之后）——import 展开时按
+//   语句顺序把被导入文件的命名空间内联进本文件，collect_ns_paths 按此顺序收集
+//   命名空间路径；只有「自身命名空间在前、被导入的在后」，导入方用别名（如
+//   deps 的 ft）时才会正确映射到本文件的命名空间（映射取首个命中）。
+//   若把 import 放在文件头，本文件将被收集为 ["version", "fetch"]，别名 ft
+//   会错误地映射到 version（version::is_git 未定义）。
+
+namespace fetch {
+    // ================= 通用字符串工具（自备，不依赖 std 库） =================
+
+    // 截取 s 的 [start, end) 子串；越界自动收敛；start>=end 返回空串。
+    func slice(s: string, start: i64, end: i64) -> string {
+        var n: i64 = len(s)
+        var lo: i64 = start
+        if lo < 0 {
+            lo = 0
+        }
+        if lo > n {
+            lo = n
+        }
+        var hi: i64 = end
+        if hi < 0 {
+            hi = 0
+        }
+        if hi > n {
+            hi = n
+        }
+        var result: string = ""
+        var i: i64 = lo
+        while i < hi {
+            result = result + str_char(s, i)
+            i = i + 1
+        }
+        return result
+    }
+
+    // 查找 sub 在 s 中首次出现的位置（0 起字符索引）；未找到返回 -1。
+    func find(s: string, sub: string) -> i64 {
+        var n: i64 = len(s)
+        var m: i64 = len(sub)
+        if m == 0 {
+            return 0
+        }
+        if m > n {
+            return -1
+        }
+        var i: i64 = 0
+        while i <= n - m {
+            var j: i64 = 0
+            var matched: bool = true
+            while j < m && matched {
+                if str_char(s, i + j) != str_char(sub, j) {
+                    matched = false
+                }
+                j = j + 1
+            }
+            if matched {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    // 判断 s 是否以 prefix 开头。
+    func starts_with(s: string, prefix: string) -> bool {
+        var n: i64 = len(s)
+        var m: i64 = len(prefix)
+        if m > n {
+            return false
+        }
+        var i: i64 = 0
+        while i < m {
+            if str_char(s, i) != str_char(prefix, i) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+
+    // 判断 s 是否以 suffix 结尾。
+    func ends_with(s: string, suffix: string) -> bool {
+        var n: i64 = len(s)
+        var m: i64 = len(suffix)
+        if m > n {
+            return false
+        }
+        var i: i64 = 0
+        while i < m {
+            if str_char(s, n - m + i) != str_char(suffix, i) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+
+    // s 是否包含子串 sub。
+    func contains(s: string, sub: string) -> bool {
+        return find(s, sub) >= 0
+    }
+
+    // 从右往左找字符 ch 在 s 中的位置（0 起）；未找到返回 -1。
+    func last_index_of(s: string, ch: string) -> i64 {
+        var n: i64 = len(s)
+        var i: i64 = n - 1
+        while i >= 0 {
+            if str_char(s, i) == ch {
+                return i
+            }
+            i = i - 1
+        }
+        return -1
+    }
+
+    // 拆 s 为字符串动态表（与 deps.split 同语义：连续分隔符产生空元素）。
+    func split(s: string, sep: string) -> table {
+        var tbl = table_new_string()
+        var m: i64 = len(sep)
+        if m == 0 {
+            table_push(tbl, s)
+            return tbl
+        }
+        var n: i64 = len(s)
+        var start: i64 = 0
+        var i: i64 = 0
+        while i < n {
+            var matched: bool = true
+            var j: i64 = 0
+            while j < m && matched {
+                if i + j >= n {
+                    matched = false
+                } else if str_char(s, i + j) != str_char(sep, j) {
+                    matched = false
+                }
+                j = j + 1
+            }
+            if matched {
+                table_push(tbl, slice(s, start, i))
+                i = i + m
+                start = i
+            } else {
+                i = i + 1
+            }
+        }
+        table_push(tbl, slice(s, start, n))
+        return tbl
+    }
+
+    // ================= git 源识别与拉取 =================
+
+    // 判断 spec 是否为 git 源：
+    // - "git+..." / "git@..." 前缀；
+    // - 含 ".git"；
+    // - 无协议前缀的 host:path（ssh 省略 git@ 的形态）。
+    pub func is_git(spec: string) -> bool {
+        if starts_with(spec, "git+") {
+            return true
+        }
+        if starts_with(spec, "git@") {
+            return true
+        }
+        if contains(spec, ".git") {
+            return true
+        }
+        if starts_with(spec, "http://") {
+            return false
+        }
+        if starts_with(spec, "https://") {
+            return false
+        }
+        // host:path 形式（如 git@host:repo / host:repo）
+        if contains(spec, ":") {
+            return true
+        }
+        return false
+    }
+
+    // git clone 用的 URL：去掉 "git+" 前缀与 "#tag" 后缀。
+    pub func git_url(spec: string) -> string {
+        var u = spec
+        if starts_with(u, "git+") {
+            u = slice(u, 4, len(u))
+        }
+        var h = find(u, "#")
+        if h >= 0 {
+            u = slice(u, 0, h)
+        }
+        return u
+    }
+
+    // git tag：spec 中 "#" 之后的部分（无则空串 = 拉默认分支/HEAD）。
+    pub func git_tag(spec: string) -> string {
+        var h = find(spec, "#")
+        if h < 0 {
+            return ""
+        }
+        return slice(spec, h + 1, len(spec))
+    }
+
+    // 由 git spec 推导仓库名（tie add 解析包名用）：去协议/路径/端口，
+    // 再去 ".git" 后缀。如 "git+https://host/repo.git" → "repo"。
+    pub func git_name(spec: string) -> string {
+        var u = git_url(spec)
+        // 取最后一个 '/' 之后（https/ssh 路径形式）
+        var slash = last_index_of(u, "/")
+        var base = u
+        if slash >= 0 {
+            base = slice(u, slash + 1, len(u))
+        }
+        // 若还含 ':'（ssh 省略斜杠形式 host:path），取最后一个 ':' 之后
+        var colon = last_index_of(base, ":")
+        if colon >= 0 {
+            base = slice(base, colon + 1, len(base))
+        }
+        // 去 ".git" 后缀
+        if ends_with(base, ".git") {
+            base = slice(base, 0, len(base) - 4)
+        }
+        // 兜底：解析不出则用固定名
+        if base == "" {
+            base = "repo"
+        }
+        return base
+    }
+
+    // git clone 到 dest（先无条件清旧目录再克隆，保证幂等）。
+    // 带 tag → `git clone --depth 1 --branch <tag>`；无 tag → `git clone --depth 1`。
+    // 成功返回 true（exec_code 退出码 0）。
+    // 注：dest 为目录，不能靠 file_exists 判断（编译路径 fopen 打不开目录，
+    // 目录恒返回 false）——直接无条件 remove_dir_all（不存在时返回 false 无害）。
+    pub func fetch_git(url: string, tag: string, dest: string) -> bool {
+        // 清旧目录（clone 目标必须不存在或为空；目录存在与否都删，幂等）
+        remove_dir_all(dest)
+        var parent = path_dirname(dest)
+        if parent == "" {
+            parent = "."
+        }
+        if !mkdir_all(parent) {
+            print_err("[pkg]  创建目录失败: " + parent + "\n")
+            return false
+        }
+        var cmd: string = "git clone --depth 1 " + url + " " + dest
+        if tag != "" {
+            cmd = "git clone --depth 1 --branch " + tag + " " + url + " " + dest
+        }
+        var rc = exec_code(cmd)
+        if rc != 0 {
+            return false
+        }
+        // 克隆成功后清掉 .git 子目录：包内容不含版本库元数据，
+        // 也避免后续复制到 .tie/deps/ 时带入 .git（目录删除无条件，幂等）
+        remove_dir_all(dest + "/.git")
+        return true
+    }
+
+    // ================= registry（HTTP 注册表）源 =================
+
+    // 注册表基址：环境变量 TIE_REGISTRY 覆盖，缺省 https://pkg.tie-lang.org。
+    pub func registry_base() -> string {
+        var base = get_env("TIE_REGISTRY")
+        if base == "" {
+            return "https://pkg.tie-lang.org"
+        }
+        return base
+    }
+
+    // 包文件下载 URL：基址 + /packages/<name>/<version>.tar.gz。
+    pub func pkg_url(name: string, ver: string) -> string {
+        return registry_base() + "/packages/" + name + "/" + ver + ".tar.gz"
+    }
+
+    // 注册表索引 URL：基址 + /index.tie。
+    pub func index_url() -> string {
+        return registry_base() + "/index.tie"
+    }
+
+    // 是否为版本约束（非精确版本）：^x.y / >=x.y / *。
+    pub func is_constraint(spec: string) -> bool {
+        if spec == "*" {
+            return true
+        }
+        if starts_with(spec, "^") {
+            return true
+        }
+        if starts_with(spec, ">=") {
+            return true
+        }
+        return false
+    }
+
+    // 是否为合法的 x.y.z 版本串（纯数字与点；首尾是数字、不含连续点）。
+    // 用于区分 registry 版本与 git tag（"v1.0.0" 等非 semver 形态）。
+    pub func is_semver(s: string) -> bool {
+        var n: i64 = len(s)
+        if n == 0 {
+            return false
+        }
+        var digits = "0123456789"
+        var i: i64 = 0
+        // 首尾必须是数字
+        if find(digits, str_char(s, 0)) < 0 {
+            return false
+        }
+        if find(digits, str_char(s, n - 1)) < 0 {
+            return false
+        }
+        var prev_dot: bool = false
+        i = 0
+        while i < n {
+            var c = str_char(s, i)
+            if c == "." {
+                // 连续点 → 非法
+                if prev_dot {
+                    return false
+                }
+                prev_dot = true
+            } else if find(digits, c) >= 0 {
+                prev_dot = false
+            } else {
+                // 非数字非点 → 非法
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+
+    // 版本约束合法性（tie add 时校验）：
+    // "*" / "^x.y" / ">=x.y" 视为合法约束；其余须为 x.y.z 形式。
+    pub func valid_version(spec: string) -> bool {
+        if is_constraint(spec) {
+            return true
+        }
+        return is_semver(spec)
+    }
+
+    // 版本满足约束判定（透传 std/version.satisfies；deps 等模块经此调用，
+    // 避免多模块重复 import version 导致重复内联）。
+    pub func version_ok(v: string, constraint: string) -> bool {
+        return ver.satisfies(v, constraint)
+    }
+
+    // 解析注册表版本：spec 为精确版本 → 原样返回；为约束 → 拉 index 选最高满足。
+    // 返回空串 = 无满足版本（调用方报错）。
+    pub func resolve_registry_version(name: string, spec: string) -> string {
+        if !is_constraint(spec) {
+            return spec
+        }
+        return highest_matching(name, spec)
+    }
+
+    // 从 index.tie 选满足**单个约束**的最高版本。
+    func highest_matching(name: string, spec: string) -> string {
+        var best: string = ""
+        var index = http_get(index_url())
+        var lines = split(index, "\n")
+        var i: i64 = 0
+        while i < len(lines) {
+            // index.tie 行格式：包名|版本|描述
+            var parts = split(lines[i], "|")
+            if len(parts) >= 2 {
+                if parts[0] == name {
+                    var v = parts[1]
+                    if ver.satisfies(v, spec) {
+                        if best == "" || ver.compare(v, best) > 0 {
+                            best = v
+                        }
+                    }
+                }
+            }
+            i = i + 1
+        }
+        return best
+    }
+
+    // 从 index.tie 选满足**全部约束**（逗号分隔序列）的最高版本。
+    // 用于同名依赖多约束冲突时的重新解析；返回空串 = 无满足版本。
+    pub func resolve_from_constraints(name: string, specs_seq: string) -> string {
+        var best: string = ""
+        var index = http_get(index_url())
+        var lines = split(index, "\n")
+        var i: i64 = 0
+        while i < len(lines) {
+            var parts = split(lines[i], "|")
+            if len(parts) >= 2 {
+                if parts[0] == name {
+                    var v = parts[1]
+                    // 逐一核对全部约束
+                    var all: bool = true
+                    var cs = split(specs_seq, ",")
+                    var k: i64 = 0
+                    while k < len(cs) {
+                        if !ver.satisfies(v, cs[k]) {
+                            all = false
+                        }
+                        k = k + 1
+                    }
+                    if all {
+                        if best == "" || ver.compare(v, best) > 0 {
+                            best = v
+                        }
+                    }
+                }
+            }
+            i = i + 1
+        }
+        return best
+    }
+
+    // 下载并解压注册表包到 dest（先清旧目录再下载解压，保证幂等）。
+    // dest 不含包文件本身（下载文件放在 dest 的父目录缓存）。
+    pub func fetch_registry(name: string, ver: string, dest: string) -> bool {
+        var dir = path_dirname(dest)
+        if dir == "" {
+            dir = "."
+        }
+        if !mkdir_all(dir) {
+            print_err("[pkg]  创建目录失败: " + dir + "\n")
+            return false
+        }
+        var url = pkg_url(name, ver)
+        // 下载文件暂存到缓存目录（与解压目标同父目录）
+        var tmp = dir + "/" + ver + ".tar.gz"
+        if !http_get_file(url, tmp) {
+            print_err("[pkg]  下载失败: " + url + "\n")
+            return false
+        }
+        // 无条件清旧目标再解压（目录存在与否都删，幂等）
+        remove_dir_all(dest)
+        if !untar_gz(tmp, dest) {
+            print_err("[pkg]  解压失败: " + tmp + "\n")
+            return false
+        }
+        return true
+    }
+}
+
+// 见文件头「import 约定」：import 必须位于文件末尾（自身命名空间在前），
+// 使 collect_ns_paths 收集的命名空间顺序为 [fetch, version]，
+// 保证导入方别名（如 deps 的 ft）正确映射到本文件的 fetch 命名空间。
+// 注：文件末尾的 import 无后续语句，ASI 不触发，须显式加分号。
+import "../std/version.tie" as ver;

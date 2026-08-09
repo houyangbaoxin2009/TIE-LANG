@@ -1,0 +1,262 @@
+// tie:library
+// search.tie —— 注册表搜索/信息模块（Harbor M6 包管理器 E4）
+//
+// 职责：`tie search <query>` / `tie info <pkg>` 查询注册表索引 index.tie。
+// index.tie 为文本行，每行格式 `包名|版本|描述`（发布方生成，本地 HTTP 静态站
+// 或任何 http 服务均可承载）：
+//   - search：逐行匹配包名包含 query（query 为空列出全部），打印 name@version 描述；
+//   - info：取指定包的最高版本并打印 name@version 描述。
+//
+// tie 约束处理（重要）：
+// - 本模块**无 import**（独立成文件，避免多模块重复内联同一命名空间）；
+//   字符串工具与轻量 semver 比较自备；split 的局部表可下标读写；
+// - **tie 的 && 非短路**：边界判断与下标不写进同一条件，用嵌套 if；
+// - 无 continue/break：迭代 + return 提前退出。
+
+namespace search {
+    // ================= 通用字符串工具（自备） =================
+
+    func slice(s: string, start: i64, end: i64) -> string {
+        var n: i64 = len(s)
+        var lo: i64 = start
+        if lo < 0 {
+            lo = 0
+        }
+        if lo > n {
+            lo = n
+        }
+        var hi: i64 = end
+        if hi < 0 {
+            hi = 0
+        }
+        if hi > n {
+            hi = n
+        }
+        var result: string = ""
+        var i: i64 = lo
+        while i < hi {
+            result = result + str_char(s, i)
+            i = i + 1
+        }
+        return result
+    }
+
+    func find(s: string, sub: string) -> i64 {
+        var n: i64 = len(s)
+        var m: i64 = len(sub)
+        if m == 0 {
+            return 0
+        }
+        if m > n {
+            return -1
+        }
+        var i: i64 = 0
+        while i <= n - m {
+            var j: i64 = 0
+            var matched: bool = true
+            while j < m && matched {
+                if str_char(s, i + j) != str_char(sub, j) {
+                    matched = false
+                }
+                j = j + 1
+            }
+            if matched {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    func starts_with(s: string, prefix: string) -> bool {
+        var n: i64 = len(s)
+        var m: i64 = len(prefix)
+        if m > n {
+            return false
+        }
+        var i: i64 = 0
+        while i < m {
+            if str_char(s, i) != str_char(prefix, i) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+
+    func contains(s: string, sub: string) -> bool {
+        return find(s, sub) >= 0
+    }
+
+    // 拆 s 为字符串动态表（连续分隔符产生空元素）。
+    func split(s: string, sep: string) -> table {
+        var tbl = table_new_string()
+        var m: i64 = len(sep)
+        if m == 0 {
+            table_push(tbl, s)
+            return tbl
+        }
+        var n: i64 = len(s)
+        var start: i64 = 0
+        var i: i64 = 0
+        while i < n {
+            var matched: bool = true
+            var j: i64 = 0
+            while j < m && matched {
+                if i + j >= n {
+                    matched = false
+                } else if str_char(s, i + j) != str_char(sep, j) {
+                    matched = false
+                }
+                j = j + 1
+            }
+            if matched {
+                table_push(tbl, slice(s, start, i))
+                i = i + m
+                start = i
+            } else {
+                i = i + 1
+            }
+        }
+        table_push(tbl, slice(s, start, n))
+        return tbl
+    }
+
+    // ================= 注册表基址（与 fetch/registry 约定一致） =================
+
+    func registry_base() -> string {
+        var base = get_env("TIE_REGISTRY")
+        if base == "" {
+            return "https://pkg.tie-lang.org"
+        }
+        return base
+    }
+
+    func index_url() -> string {
+        return registry_base() + "/index.tie"
+    }
+
+    // ================= 轻量 semver 比较（自备，选最高版本用） =================
+
+    // 取版本串第 idx 段（1 起）数值；缺段视为 0；非法返回 -1。
+    func seg(s: string, idx: i64) -> i64 {
+        var n: i64 = len(s)
+        var seg_start: i64 = 0
+        var seg_no: i64 = 1
+        var i: i64 = 0
+        while i <= n {
+            var at_end: bool = (i == n)
+            var is_dot: bool = false
+            if !at_end {
+                if str_char(s, i) == "." {
+                    is_dot = true
+                }
+            }
+            if at_end || is_dot {
+                if seg_no == idx {
+                    var seg_text = slice(s, seg_start, i)
+                    if len(seg_text) == 0 {
+                        return -1
+                    }
+                    return parse_int(seg_text)
+                }
+                seg_no = seg_no + 1
+                seg_start = i + 1
+            }
+            i = i + 1
+        }
+        if seg_no <= idx {
+            return 0
+        }
+        return -1
+    }
+
+    // 版本比较：a<b → -1，a==b → 0，a>b → 1；非法返回 0。
+    func compare(a: string, b: string) -> i64 {
+        var a1 = seg(a, 1)
+        var a2 = seg(a, 2)
+        var a3 = seg(a, 3)
+        var b1 = seg(b, 1)
+        var b2 = seg(b, 2)
+        var b3 = seg(b, 3)
+        if a1 < 0 || a2 < 0 || a3 < 0 || b1 < 0 || b2 < 0 || b3 < 0 {
+            return 0
+        }
+        if a1 < b1 {
+            return -1
+        }
+        if a1 > b1 {
+            return 1
+        }
+        if a2 < b2 {
+            return -1
+        }
+        if a2 > b2 {
+            return 1
+        }
+        if a3 < b3 {
+            return -1
+        }
+        if a3 > b3 {
+            return 1
+        }
+        return 0
+    }
+
+    // ================= search / info =================
+
+    // 搜索注册表：包名包含 query 的行全部打印（query 为空列出全部）。
+    // 输出格式：name@version  description
+    pub func search(query: string) -> i64 {
+        var index = http_get(index_url())
+        var lines = split(index, "\n")
+        var i: i64 = 0
+        while i < len(lines) {
+            var parts = split(lines[i], "|")
+            if len(parts) >= 2 {
+                var nm = parts[0]
+                if query == "" || contains(nm, query) {
+                    var desc: string = ""
+                    if len(parts) >= 3 {
+                        desc = parts[2]
+                    }
+                    println(nm + "@" + parts[1] + "  " + desc)
+                }
+            }
+            i = i + 1
+        }
+        return 0
+    }
+
+    // 查询包信息：打印指定包的最高版本与描述；未找到返回 1。
+    pub func info(pkg: string) -> i64 {
+        var index = http_get(index_url())
+        var lines = split(index, "\n")
+        var best: string = ""
+        var desc: string = ""
+        var i: i64 = 0
+        while i < len(lines) {
+            var parts = split(lines[i], "|")
+            if len(parts) >= 2 {
+                if parts[0] == pkg {
+                    var ver = parts[1]
+                    var d: string = ""
+                    if len(parts) >= 3 {
+                        d = parts[2]
+                    }
+                    if best == "" || compare(ver, best) > 0 {
+                        best = ver
+                        desc = d
+                    }
+                }
+            }
+            i = i + 1
+        }
+        if best == "" {
+            print_err("[pkg] 未找到包: " + pkg + "\n")
+            return 1
+        }
+        println(pkg + "@" + best + "  " + desc)
+        return 0
+    }
+}

@@ -64,7 +64,7 @@ x 大于 y
 tie <input.tie>... [-o output] [-O0|-O1|-O2|-O3] [--target <三元组>] [--emit-ir] [--keep-ir] [--prep-only] [--config <file>]
 tie --lsp        # 语言服务器模式（LSP over stdio，供编辑器接入）
 tie             # 无参数 → 进入 REPL 交互模式（启动 tie 语言自写的 repl.exe，自举）
-tie init|add|remove|install|build|run|help   # 包管理器（M6，tie 语言自写）
+tie init|add|remove|install|update|build|run|publish|search|info|help   # 包管理器（M6，tie 语言自写）
 ```
 
 | 选项 | 说明 |
@@ -80,18 +80,22 @@ tie init|add|remove|install|build|run|help   # 包管理器（M6，tie 语言自
 | `--lsp` | 以语言服务器模式运行（读 stdin 的 LSP 消息、写 stdout，等价于 `tie-lsp`） |
 | `-h, --help` | 显示帮助 |
 
-**包管理器子命令（Harbor M6 骨架）**：Rust 入口识别首个参数为子命令
+**包管理器子命令（Harbor M6，tie 语言自写）**：Rust 入口识别首个参数为子命令
 （且非 `.tie` 文件）后，转交 tie 语言自写的 `pkg.exe`（`pkg/main.tie` 经
 tie-llvm 编译链接 interp 库生成），完整 CLI 逻辑全部在 tie 侧：
 
 | 子命令 | 说明 |
 | --- | --- |
 | `tie init <项目名>` | 初始化项目（生成 tie.pkg 清单 + main.tie 模板） |
-| `tie add <依赖>` | 添加依赖（`path:./lib_math` 本地目录源 / `log@1.0.0` 版本约束占位） |
+| `tie add <依赖>` | 添加依赖（`path:./lib_math` 本地源 / `git+https://...` git 源 / `log@1.0.0` 或 `log@^1.2` registry 约束） |
 | `tie remove <包名>` | 移除依赖 |
-| `tie install` | 安装依赖到 `.tie/deps/`（首版 path 源：`copy_dir` 复制目录） |
+| `tie install` | 解析 + 拉取全部依赖到 `.tie/deps/`，生成/校验 tie.lock（三源：path/git/registry） |
+| `tie update [包名]` | 重新解析依赖并更新 tie.lock |
 | `tie build` | 编译项目（调用 tie 编译器） |
 | `tie run` | 编译并运行项目 |
+| `tie publish` | 打包发布（`.tie/dist/<name>-<version>.tar.gz` + `git tag v<version>` + push） |
+| `tie search <关键字>` | 搜索注册表 index.tie（`TIE_REGISTRY` 可指定基址） |
+| `tie info <包名>` | 查询注册表包的最高版本与描述 |
 | `tie help` | 显示包管理器帮助 |
 
 端到端演示见 [examples/pkg_demo.md](examples/pkg_demo.md) 与 `examples/demo_pkg/`。
@@ -170,11 +174,14 @@ tie/
 ├── prep/rename_tcmsg_to_log.tie  转换器模块实战（tcmsg → log 批量改名，tie 语言自写完成真实重构任务）
 ├── std/              标准库（tie 语言自写：assert / string / math / csv / format / exmath / radix，均为命名空间形式调用，如 assert.assert / str.split / format.sprintf / csv.csv_write / exmath.huffman_encode / radix.to_str，基于语言底座原语；M4 补全大小写转换/join/repeat/trim 拆分/gcd/lcm/pow_i/sprintf 占位符/csv_write/浮点与字符串断言；M4 补齐新增 exmath 高级数学算法库——霍夫曼编码/解码、素数判定/筛法、快速幂、斐波那契、阶乘、组合数，与 radix 通用进制转换库——任意进制 2..36 双向转换）
 ├── enl/              扩展库（Enlargement，tie 语言自写，随发行版内置：log 控制台信息库——i18n 消息系统，依赖 std 与语言底座 msg_* 原语；M4 增强带参消息/级别体系/stderr 通道/批量登记/多级回退）
-├── pkg/              包管理器（tie 语言自写，M6 骨架 E1/E2）：main.tie CLI 入口
-│                     （init/add/remove/install/build/run/help 子命令分派）+
-│                     manifest.tie（tie.pkg 清单解析）+ deps.tie（path 源安装），
-│                     经 tie-llvm 编译链接 interp 库生成 pkg.exe，Rust 侧只做
-│                     子命令识别转发；registry/git 源为后续阶段
+├── pkg/              包管理器（tie 语言自写，M6 E1/E2 + E3/E4）：main.tie CLI 入口
+│                     （init/add/remove/install/update/build/run/publish/search/info/help
+│                     子命令分派）+ manifest.tie（tie.pkg 清单解析）+ deps.tie（path/git/
+│                     registry 三源安装 + 递归依赖解析 + 锁文件落地）+ fetch.tie（git
+│                     拉取 + registry 基址/版本选择/下载解压）+ lock.tie（tie.lock 生成/
+│                     解析/校验）+ publish.tie（打包 tar.gz + git tag/push）+ search.tie
+│                     （注册表搜索/信息查询），经 tie-llvm 编译链接 interp 库生成 pkg.exe，
+│                     Rust 侧只做子命令识别转发
 ├── docs/language.md   语法规范
 ├── docs/tie-script.md tie:script 模块协议（eval/eval_call 机制、模块约定、协议文本、三层调用入口）
 ├── docs/plans/        后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法 / 动态库编译）
@@ -239,4 +246,4 @@ tie/
 | M3 | 预处理器自举 + 协调统筹：完全用 tie 语言重写 `tie-prep`（编译器自举），并增强为多文件并行编译（配置文件 + 缓存池 + 三阶段并行分片） | ✅ 完成（阶段一：预处理器自举——核心逻辑 tie 语言化 `prep/core.tie`，Rust 壳仅解释执行；阶段二：协调统筹增强——`tie.config` 配置文件 + 缓存池 + 多线程并行分片编译） |
 | M4 | 标准库重构 + 扩展库分层：补全常用函数（str 大小写/join/repeat/trim_start/trim_end、math gcd/lcm/pow_i、format sprintf 占位符、csv_write、assert 浮点与字符串断言）+ 内部 using 简化 + **顶层持久变量**（var/const 全局，纯 tie 表达消息状态）+ log 增强（带参消息/级别/stderr/批量登记/多级回退，移入 **enl/** 扩展库）+ 修复 using 表元素解析/调用结果下标等编译器边界 | ✅ 完成 |
 | M5 | 动态库编译：`// tie:library` 输出 `.dll`（win）/ `.so`（linux）——库公有函数 `dllexport` 导出、跨语言调用约定（标量直传/字符串 C ABI 桥）、C 程序 LoadLibrary/dlopen 消费示例（见 docs/plans/dynamic-library.md） | 📋 规划 |
-| M6 | 包管理器（骨架 E1/E2 ✅）：tie 语言自写 CLI（`pkg/main.tie` → `pkg.exe`，自举）+ tie.pkg 清单解析（`manifest.tie`）+ path 源安装（`deps.tie`，`copy_dir` 到 `.tie/deps/`）；Rust 入口 `crates/tie` 识别 `init/add/remove/install/build/run/help` 子命令并转发；`tie init → add → install → run` 端到端跑通（见 examples/pkg_demo.md）；registry/git 源 + 锁文件 + 依赖图为后续阶段 | ✅ 完成（骨架） |
+| M6 | 包管理器（E1/E2 ✅ + E3/E4 ✅）：tie 语言自写 CLI（`pkg/main.tie` → `pkg.exe`，自举）+ tie.pkg 清单解析（`manifest.tie`）+ 三源安装（path 复制 / git 浅克隆 / registry 下载解压，`deps.tie` + `fetch.tie`）+ tie.lock 锁文件幂等恢复（`lock.tie`）+ 递归依赖解析（去重/冲突检测）+ `tie update`/`publish`（打包 tar.gz + git tag/push，`publish.tie`）/`search`/`info`（注册表查询，`search.tie`）；Rust 入口 `crates/tie` 识别 11 个子命令并转发；`init → add（path/git/registry）→ install → build/run` 端到端跑通（见 examples/pkg_demo.md） | ✅ 完成（E1–E4） |

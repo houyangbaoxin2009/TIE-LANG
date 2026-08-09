@@ -1,0 +1,428 @@
+// tie:library
+// lock.tie —— tie.lock 锁文件模块（Harbor M6 包管理器 E3）
+//
+// 职责：生成/解析/校验 tie.lock 锁文件。锁文件用 tie:data 文本记录**解析后的**
+// 每个依赖的精确版本与来源，保证可复现构建：
+//   [
+//       "name": "demo_pkg",          // 项目名
+//       "version": "0.1.0",          // 项目版本
+//       "deps": [
+//           "lib_colors": {
+//               "version": "path",                          // 解析后版本
+//               "source": "path:../lib_colors",             // 来源（path 路径 / git url / registry url）
+//               "spec": "path:../lib_colors",               // 原 spec（tie.pkg 中写的形式）
+//           },
+//       ],
+//   ]
+//
+// 幂等约定：install 时若 tie.lock 存在且与当前 tie.pkg 直接依赖一致（valid），
+// 则直接按锁文件恢复（不再重新解析/拉取）；否则重新解析并覆盖写入。
+//
+// tie 约束处理（重要）：
+// - 本模块独立成文件、无 import（避免多模块重复内联同一命名空间导致重复定义）；
+//   字符串工具自备；跨函数传参一律用逗号分隔字符串序列；
+// - **tie 的 && 非短路**：边界判断与取字符不写进同一条件，用嵌套 if；
+// - 无 continue/break：迭代 + return 提前退出。
+
+namespace lock {
+    // ================= 通用字符串工具（自备） =================
+
+    func slice(s: string, start: i64, end: i64) -> string {
+        var n: i64 = len(s)
+        var lo: i64 = start
+        if lo < 0 {
+            lo = 0
+        }
+        if lo > n {
+            lo = n
+        }
+        var hi: i64 = end
+        if hi < 0 {
+            hi = 0
+        }
+        if hi > n {
+            hi = n
+        }
+        var result: string = ""
+        var i: i64 = lo
+        while i < hi {
+            result = result + str_char(s, i)
+            i = i + 1
+        }
+        return result
+    }
+
+    func find(s: string, sub: string) -> i64 {
+        var n: i64 = len(s)
+        var m: i64 = len(sub)
+        if m == 0 {
+            return 0
+        }
+        if m > n {
+            return -1
+        }
+        var i: i64 = 0
+        while i <= n - m {
+            var j: i64 = 0
+            var matched: bool = true
+            while j < m && matched {
+                if str_char(s, i + j) != str_char(sub, j) {
+                    matched = false
+                }
+                j = j + 1
+            }
+            if matched {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    // 从 pos 起查找 sub（含 pos）；未找到返回 -1。
+    func find_from(s: string, sub: string, pos: i64) -> i64 {
+        if pos < 0 {
+            return -1
+        }
+        var n: i64 = len(s)
+        var m: i64 = len(sub)
+        if m == 0 {
+            return pos
+        }
+        if pos + m > n {
+            return -1
+        }
+        var i: i64 = pos
+        while i <= n - m {
+            var j: i64 = 0
+            var matched: bool = true
+            while j < m && matched {
+                if str_char(s, i + j) != str_char(sub, j) {
+                    matched = false
+                }
+                j = j + 1
+            }
+            if matched {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    // 按逗号分隔取序列 seq 的第 i 段（0 起；越界返回空串）。
+    func segment(seq: string, i: i64) -> string {
+        var n: i64 = len(seq)
+        var seg_no: i64 = 0
+        var start: i64 = 0
+        var p: i64 = 0
+        while p <= n {
+            var at_end: bool = (p == n)
+            var is_comma: bool = false
+            if !at_end {
+                if str_char(seq, p) == "," {
+                    is_comma = true
+                }
+            }
+            if at_end || is_comma {
+                if seg_no == i {
+                    return slice(seq, start, p)
+                }
+                seg_no = seg_no + 1
+                start = p + 1
+            }
+            p = p + 1
+        }
+        return ""
+    }
+
+    // ================= 文件操作 =================
+
+    // tie.lock 是否已存在。
+    pub func exists() -> bool {
+        return file_exists("tie.lock")
+    }
+
+    // 读取 tie.lock（不存在返回空串）。
+    pub func read() -> string {
+        if !file_exists("tie.lock") {
+            return ""
+        }
+        return file_read("tie.lock")
+    }
+
+    // 写入 tie.lock，成功返回 true。
+    pub func write(lock_text: string) -> bool {
+        return file_write("tie.lock", lock_text)
+    }
+
+    // ================= 锁文件生成 =================
+
+    // 生成锁文件文本：根项目名/版本 + 各依赖（名字/解析版本/来源/原 spec 序列）。
+    pub func make(root_name: string, root_ver: string, names_seq: string, vers_seq: string, srcs_seq: string, specs_seq: string) -> string {
+        var cnt: i64 = 0
+        if names_seq != "" {
+            cnt = 1
+            var i: i64 = 0
+            var n: i64 = len(names_seq)
+            while i < n {
+                if str_char(names_seq, i) == "," {
+                    cnt = cnt + 1
+                }
+                i = i + 1
+            }
+        }
+        var out: string = "// tie.lock\n" +
+                          "// tie:data\n" +
+                          "[\n" +
+                          "    \"name\": \"" + root_name + "\",\n" +
+                          "    \"version\": \"" + root_ver + "\",\n" +
+                          "    \"deps\": [\n"
+        var i: i64 = 0
+        while i < cnt {
+            out = out +
+                  "        \"" + segment(names_seq, i) + "\": {\n" +
+                  "            \"version\": \"" + segment(vers_seq, i) + "\",\n" +
+                  "            \"source\": \"" + segment(srcs_seq, i) + "\",\n" +
+                  "            \"spec\": \"" + segment(specs_seq, i) + "\",\n" +
+                  "        },\n"
+            i = i + 1
+        }
+        out = out +
+              "    ],\n" +
+              "]\n"
+        return out
+    }
+
+    // ================= 锁文件解析 =================
+
+    // deps 数组起始（'[' 之后的字符索引）；未找到返回 -1。
+    func deps_start(src: string) -> i64 {
+        var p = find(src, "\"deps\":")
+        if p < 0 {
+            return -1
+        }
+        var lb = find_from(src, "[", p)
+        if lb < 0 {
+            return -1
+        }
+        return lb + 1
+    }
+
+    // 扫描 deps 数组：逐条目取给定 key 对应的值。
+    // key == "" → 条目键名（包名）；key == "version"/"source"/"spec" → 条目内字段。
+    func scan_entries(src: string, key: string) -> string {
+        var out: string = ""
+        var dstart = deps_start(src)
+        if dstart < 0 {
+            return ""
+        }
+        var dend = find_from(src, "]", dstart)
+        if dend < 0 {
+            return ""
+        }
+        var pos = dstart
+        while pos < dend {
+            // 条目键名：pos 起第一对引号
+            var q1 = find_from(src, "\"", pos)
+            if q1 < 0 {
+                return out
+            }
+            if q1 >= dend {
+                return out
+            }
+            var q2 = find_from(src, "\"", q1 + 1)
+            if q2 < 0 {
+                return out
+            }
+            var name = slice(src, q1 + 1, q2)
+            // 拼接所选字段
+            if out != "" {
+                out = out + ","
+            }
+            if key == "" {
+                out = out + name
+            } else {
+                // 条目内 "key": "value"（从 q2 起找，必在条目闭括号前）
+                var marker = "\"" + key + "\": \""
+                var ks = find_from(src, marker, q2)
+                if ks < 0 {
+                    out = out + ""
+                } else {
+                    var vstart = ks + len(marker)
+                    var qv = find_from(src, "\"", vstart)
+                    if qv < 0 {
+                        out = out + ""
+                    } else {
+                        out = out + slice(src, vstart, qv)
+                    }
+                }
+            }
+            // 跳到条目闭括号 '}' 之后
+            var close = find_from(src, "}", q2)
+            if close < 0 {
+                return out
+            }
+            pos = close + 1
+        }
+        return out
+    }
+
+    // 全部依赖包名的逗号分隔序列。
+    pub func names(lock_text: string) -> string {
+        return scan_entries(lock_text, "")
+    }
+
+    // 全部依赖解析版本的逗号分隔序列。
+    pub func versions(lock_text: string) -> string {
+        return scan_entries(lock_text, "version")
+    }
+
+    // 全部依赖来源的逗号分隔序列。
+    pub func sources(lock_text: string) -> string {
+        return scan_entries(lock_text, "source")
+    }
+
+    // 全部依赖原 spec 的逗号分隔序列。
+    pub func specs(lock_text: string) -> string {
+        return scan_entries(lock_text, "spec")
+    }
+
+    // 依赖条目个数。
+    pub func count(lock_text: string) -> i64 {
+        var seq = names(lock_text)
+        if seq == "" {
+            return 0
+        }
+        var c: i64 = 0
+        var i: i64 = 0
+        var n: i64 = len(seq)
+        while i < n {
+            if str_char(seq, i) == "," {
+                c = c + 1
+            }
+            i = i + 1
+        }
+        return c + 1
+    }
+
+    // 第 i 个依赖的名字/解析版本/来源/原 spec（0 起；越界返回空串）。
+    pub func dep_name(lock_text: string, i: i64) -> string {
+        return segment(names(lock_text), i)
+    }
+    pub func dep_version(lock_text: string, i: i64) -> string {
+        return segment(versions(lock_text), i)
+    }
+    pub func dep_source(lock_text: string, i: i64) -> string {
+        return segment(sources(lock_text), i)
+    }
+    pub func dep_spec(lock_text: string, i: i64) -> string {
+        return segment(specs(lock_text), i)
+    }
+
+    // ================= 锁文件校验 =================
+
+    // 解析 tie.pkg 的依赖名序列（自备轻量扫描；tie.pkg 与锁文件格式同族）。
+    // want_name = true 取名字，false 取 spec。
+    func pkg_scan(src: string, want_name: bool) -> string {
+        var out: string = ""
+        var p = find(src, "\"dependencies\":")
+        if p < 0 {
+            return ""
+        }
+        var lb = find_from(src, "[", p)
+        if lb < 0 {
+            return ""
+        }
+        var dstart = lb + 1
+        var dend = find_from(src, "]", dstart)
+        if dend < 0 {
+            return ""
+        }
+        var pos = dstart
+        while pos < dend {
+            var q1 = find_from(src, "\"", pos)
+            if q1 < 0 {
+                return out
+            }
+            if q1 >= dend {
+                return out
+            }
+            var q2 = find_from(src, "\"", q1 + 1)
+            if q2 < 0 {
+                return out
+            }
+            var name = slice(src, q1 + 1, q2)
+            var q3 = find_from(src, "\"", q2 + 1)
+            if q3 < 0 {
+                return out
+            }
+            if q3 >= dend {
+                return out
+            }
+            var q4 = find_from(src, "\"", q3 + 1)
+            if q4 < 0 {
+                return out
+            }
+            var spec = slice(src, q3 + 1, q4)
+            if name != "" {
+                if out != "" {
+                    out = out + ","
+                }
+                if want_name {
+                    out = out + name
+                } else {
+                    out = out + spec
+                }
+            }
+            pos = q4 + 1
+        }
+        return out
+    }
+
+    // tie.pkg 直接依赖个数。
+    func pkg_dep_count(src: string) -> i64 {
+        var seq = pkg_scan(src, true)
+        if seq == "" {
+            return 0
+        }
+        var c: i64 = 0
+        var i: i64 = 0
+        var n: i64 = len(seq)
+        while i < n {
+            if str_char(seq, i) == "," {
+                c = c + 1
+            }
+            i = i + 1
+        }
+        return c + 1
+    }
+
+    // 校验锁文件与当前 tie.pkg（pkg_src 为其文本）是否一致：
+    // tie.pkg 的每个直接依赖都须在锁中找到同名同 spec 条目（锁含传递依赖，
+    // 条目数 >= 直接依赖数）。一致 → true（幂等恢复前提）。
+    pub func valid(lock_text: string, pkg_src: string) -> bool {
+        var pcnt = pkg_dep_count(pkg_src)
+        var lcnt = count(lock_text)
+        var i: i64 = 0
+        while i < pcnt {
+            var pname = segment(pkg_scan(pkg_src, true), i)
+            var pspec = segment(pkg_scan(pkg_src, false), i)
+            var found: bool = false
+            var j: i64 = 0
+            while j < lcnt {
+                if dep_name(lock_text, j) == pname {
+                    if dep_spec(lock_text, j) == pspec {
+                        found = true
+                    }
+                }
+                j = j + 1
+            }
+            if !found {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+}
