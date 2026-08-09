@@ -1,0 +1,60 @@
+// tie:logic
+// trit_demo.tie：平衡三进制 trit 类型演示（M4 补齐）
+// 三值逻辑（Kleene 语义）：-1=false / 0=unknown / +1=true
+// 编译运行：cargo run -p tie -- examples/trit_demo.tie
+
+func main() {
+    // ---- 三值字面量与存储 ----
+    var t: trit = true      // +1（true 适配 trit）
+    var z: trit = zero      //  0
+    var f: trit = false     // -1（false 适配 trit）
+    println("true  = " + to_string(t))
+    println("zero  = " + to_string(z))
+    println("false = " + to_string(f))
+
+    // ---- Kleene 三值逻辑真值表（&& = min，|| = max，! = 取反）----
+    println("---")
+    println("1 && 1 = " + to_string(t && t))
+    println("1 && 0 = " + to_string(t && z))
+    println("1 && -1 = " + to_string(t && f))
+    println("0 && -1 = " + to_string(z && f))
+    println("-1 && -1 = " + to_string(f && f))
+    println("1 || -1 = " + to_string(t || f))
+    println("0 || -1 = " + to_string(z || f))
+    println("!1 = " + to_string(!t))
+    println("!0 = " + to_string(!z))
+    println("!-1 = " + to_string(!f))
+
+    // ---- 饱和算术（clamp 到 [-1,1]）----
+    println("---")
+    println("1 + 1 = " + to_string(t + t) + "（饱和）")
+    println("1 + 0 = " + to_string(t + z))
+    println("1 - 1 = " + to_string(t - t))
+    println("1 * 1 = " + to_string(t * t))
+
+    // ---- 与 i64 互转 ----
+    println("---")
+    println("1 + 5 = " + to_string(t + 5))
+    println("5 - 1 = " + to_string(5 - t))
+    println("1 == 1 = " + (t == 1 ? "true" : "false"))
+    println("1 > 0 = " + (t > z ? "true" : "false"))
+    println("parse_trit(\"-1\") = " + to_string(parse_trit("-1")))
+
+    // ---- 平衡三进制实际应用：三路比较（数论常用）----
+    println("---")
+    var cmp = compare(7, 3)
+    println("compare(7, 3) = " + to_string(cmp))
+    var cmp2 = compare(3, 7)
+    println("compare(3, 7) = " + to_string(cmp2))
+}
+
+// 三路比较：返回 trit（a<b → -1，a==b → 0，a>b → +1）
+func compare(a: i64, b: i64) -> trit {
+    if a < b {
+        return false
+    }
+    if a > b {
+        return true
+    }
+    return zero
+}

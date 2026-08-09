@@ -1,0 +1,31 @@
+// tie:library
+// registry.tie：扩展库——注册表客户端（命名空间 registry，M6 包管理器前置）
+// 内容：注册表基址管理 + 包文件/索引 URL 拼接。有状态（M4 顶层持久变量）：
+// 基址可 set/查询，跨函数共享。
+// 仅用字符串拼接/字面量/顶层 var（纯 tie，不依赖网络原语——首版只算路径）。
+// 调用：import 后 registry.set_registry(...) / registry.pkg_url("log", "1.0.0")
+
+// 顶层持久变量：注册表基址（字面量初始化；set_registry 改写）
+var registry_root: string = "https://pkg.tie-lang.org"
+
+namespace registry {
+// 设置注册表基址（如 "https://example.com" / "http://localhost:8080"）。
+pub func set_registry(url: string) {
+    registry_root = url
+}
+
+// 读取当前注册表基址。
+pub func get_registry() -> string {
+    return registry_root
+}
+
+// 包文件下载 URL：基址 + "/packages/" + name + "/" + version + ".tar.gz"
+pub func pkg_url(name: string, version: string) -> string {
+    return registry_root + "/packages/" + name + "/" + version + ".tar.gz"
+}
+
+// 注册表索引 URL：基址 + "/index.tie"
+pub func index_url() -> string {
+    return registry_root + "/index.tie"
+}
+}

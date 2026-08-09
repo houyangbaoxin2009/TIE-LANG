@@ -1,0 +1,37 @@
+// tie:logic
+// radix_demo.tie：std/radix 通用进制转换库演示
+// 编译运行：cargo run -p tie -- examples/radix_demo.tie
+
+import "../std/radix.tie"
+
+func main() {
+    // 整数 → 各进制字符串
+    println("255 十进制: " + radix.to_str(255, 10))
+    println("255 二进制: " + radix.to_str(255, 2))
+    println("255 八进制: " + radix.to_str(255, 8))
+    println("255 十六进制: " + radix.to_str(255, 16))
+    println("255 三十六进制: " + radix.to_str(255, 36))
+    // 负数
+    println("-255 十六进制: " + radix.to_str(-255, 16))
+    // 零
+    println("0 十六进制: " + radix.to_str(0, 16))
+
+    println("---")
+
+    // 进制字符串 → 整数
+    println("'ff' 十六进制: " + to_string(radix.parse("ff", 16)))
+    println("'FF' 十六进制(大写): " + to_string(radix.parse("FF", 16)))
+    println("'11111111' 二进制: " + to_string(radix.parse("11111111", 2)))
+    println("'377' 八进制: " + to_string(radix.parse("377", 8)))
+    println("'73' 三十六进制: " + to_string(radix.parse("73", 36)))
+
+    println("---")
+
+    // 双向往返验证：n → 进制串 → n
+    var v: i64 = 20260809
+    println("往返 " + to_string(v) + " → " + radix.to_str(v, 16) + " → " + to_string(radix.parse(radix.to_str(v, 16), 16)))
+
+    // 非法输入防御
+    println("'zz' 按十进制: " + to_string(radix.parse("zz", 10)))
+    println("进制越界(99): " + radix.to_str(255, 99))
+}

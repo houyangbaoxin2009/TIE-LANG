@@ -1,0 +1,72 @@
+// tie:logic
+// index_assign_demo.tie：表下标赋值 t[i] = v 演示（M4 补齐）
+// 编译运行：cargo run -p tie -- examples/index_assign_demo.tie
+
+func main() {
+    // ---- 定长表下标赋值 ----
+    var arr = [1, 2, 3]
+    arr[0] = 9
+    println("arr[0] = " + to_string(arr[0]))
+    println("arr[1] = " + to_string(arr[1]))
+    println("arr = " + to_string(arr[0]) + "," + to_string(arr[1]) + "," + to_string(arr[2]))
+
+    println("---")
+
+    // ---- 动态表下标赋值 ----
+    var dyn = table_new_i64()
+    table_push(dyn, 10)
+    table_push(dyn, 20)
+    table_push(dyn, 30)
+    dyn[1] = 99
+    println("dyn[0] = " + to_string(dyn[0]))
+    println("dyn[1] = " + to_string(dyn[1]))
+    println("dyn[2] = " + to_string(dyn[2]))
+
+    println("---")
+
+    // ---- 复合下标赋值 t[i] += v ----
+    var scores = [5, 10, 15]
+    scores[1] += 5
+    println("scores[1] += 5 → " + to_string(scores[1]))
+    scores[2] = scores[2] * 2
+    println("scores[2] *= 2 → " + to_string(scores[2]))
+
+    // ---- 循环内下标赋值（算法场景：高斯消元/图算法的基础）----
+    println("---")
+    var data = table_new_i64()
+    var i: i64 = 0
+    while i < 5 {
+        table_push(data, i * i)
+        i = i + 1
+    }
+    // 原地修改：每个元素 += 10
+    i = 0
+    while i < len(data) {
+        data[i] = data[i] + 10
+        i = i + 1
+    }
+    var out: string = ""
+    i = 0
+    while i < len(data) {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + to_string(data[i])
+        i = i + 1
+    }
+    println("data(每个+10): " + out)
+
+    println("---")
+    // 断言汇总
+    var pass: bool = true
+    pass = pass && arr[0] == 9
+    pass = pass && dyn[1] == 99
+    pass = pass && scores[1] == 15
+    pass = pass && scores[2] == 30
+    pass = pass && data[0] == 10 && data[4] == 26
+    if pass {
+        println("PASS")
+    } else {
+        println("FAIL")
+    }
+}

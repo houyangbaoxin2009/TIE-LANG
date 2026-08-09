@@ -1,0 +1,49 @@
+// tie:logic
+// exmath_demo.tie：std/exmath 高级数学算法库演示（霍夫曼编码/解码 + 数论/组合）
+// 编译运行：cargo run -p tie -- examples/exmath_demo.tie
+
+import "../std/exmath.tie"
+
+// 打印字符串动态表（"字符|编码" 条目）
+func dump_table(t: table) -> string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < len(t) {
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + t[i]
+        i = i + 1
+    }
+    return out
+}
+
+func main() {
+    // ---- 霍夫曼编码：构建编码表 → 编码 → 解码还原 ----
+    var msg = "hello huffman!"
+    println("原文: " + msg)
+    var codes = exmath.huffman_build(msg)
+    println("编码表: " + dump_table(codes))
+    var bits = exmath.huffman_encode(msg, codes)
+    println("编码: " + bits)
+    println("解码: " + exmath.huffman_decode(bits, codes))
+
+    // 重复字符多的文本压缩效果更明显
+    var msg2 = "aaaaabbbcccdde"
+    var codes2 = exmath.huffman_build(msg2)
+    var bits2 = exmath.huffman_encode(msg2, codes2)
+    println("---")
+    println("高频文本: " + msg2)
+    println("编码(" + to_string(len(bits2)) + "位): " + bits2)
+    println("还原: " + exmath.huffman_decode(bits2, codes2))
+
+    // ---- 数论 / 组合 ----
+    println("---")
+    println("is_prime(97): " + (exmath.is_prime(97) ? "true" : "false"))
+    println("is_prime(91): " + (exmath.is_prime(91) ? "true" : "false"))
+    println("sieve(30): " + exmath.sieve_to_string(30))
+    println("pow_mod(2, 10, 1000): " + to_string(exmath.pow_mod(2, 10, 1000)))
+    println("fib(10): " + to_string(exmath.fib(10)))
+    println("factorial(6): " + to_string(exmath.factorial(6)))
+    println("binom(10, 3): " + to_string(exmath.binom(10, 3)))
+}

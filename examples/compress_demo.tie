@@ -1,0 +1,37 @@
+// tie:logic
+// compress_demo.tie：enl/compress 数据压缩演示（D5）
+// 编译运行：cargo run -p tie -- examples/compress_demo.tie
+// 验证 LZ77/LZW 压缩 → 解压 roundtrip 还原。
+
+import "../enl/compress.tie"
+
+func main() {
+    // ---- LZ77：重复文本压缩 + roundtrip ----
+    var msg = "abracadabra abracadabra abracadabra"
+    var lz = compress.lz77(msg)
+    println("lz77 encoded: " + lz)
+    var back = compress.lz77_decode(lz, len(msg))
+    println("lz77 decoded: " + back)
+    println("lz77 roundtrip: " + (back == msg ? "OK" : "FAIL"))
+
+    println("---")
+
+    // ---- LZW：动态字典压缩 + roundtrip ----
+    var text2 = "banana banana banana banana"
+    var lzw_enc = compress.lzw(text2)
+    println("lzw encoded: " + lzw_enc)
+    var lzw_back = compress.lzw_decode(lzw_enc)
+    println("lzw decoded: " + lzw_back)
+    println("lzw roundtrip: " + (lzw_back == text2 ? "OK" : "FAIL"))
+
+    println("---")
+    var pass: bool = true
+    pass = pass && back == msg
+    pass = pass && lzw_back == text2
+    if pass {
+        println("PASS")
+    } else {
+        println("FAIL")
+    }
+}
+

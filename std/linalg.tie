@@ -1,0 +1,450 @@
+// tie:library
+// linalg.tie：标准库——线性代数（命名空间 linalg，D2）
+// 内容：矩阵乘法/转置/行列式/线性方程组/求逆/LU 分解/幂法特征值。
+// 接口约定：矩阵用**逗号分隔字符串序列**按行拼接传参（如 2×2 [[1,2],[3,4]]
+// 传 "1.0,2.0,3.0,4.0" + n=2），返回同样为序列字符串——tie 表参数元素类型
+// 静态未知（无法下标读取），序列字符串 + 局部表（parse 产物）是自洽接口。
+// 消元过程用**局部 f64 表 + 下标赋值**（M4 表下标赋值已支持 t[i]=v）。
+// 数值用 f64 字面量（tie 二元运算两侧类型必须一致）。
+
+namespace linalg {
+// 解析逗号分隔 f64 序列 → 局部 f64 动态表（空串 → 空表）。
+func parse_series(s: string) -> table {
+    var result = table_new_f64()
+    var n: i64 = len(s)
+    if n == 0 {
+        return result
+    }
+    var start: i64 = 0
+    var i: i64 = 0
+    while i <= n {
+        var at_end: bool = (i == n)
+        var is_comma: bool = !at_end && str_char(s, i) == ","
+        if at_end || is_comma {
+            var seg = slice(s, start, i)
+            if len(seg) > 0 {
+                table_push(result, parse_float(seg))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// i64 → f64（tie 无隐式转换）。
+func to_f64(v: i64) -> f64 {
+    return parse_float(to_string(v))
+}
+
+// 矩阵乘法 C = A×B（n×n，f64）。A/B 为序列字符串，n 为阶数。
+// 返回**局部 f64 表**（table_ret_elems 记录元素类型，调用方下标读取合法）。
+pub func mat_mul(a_s: string, b_s: string, n: i64) -> table {
+    var a = parse_series(a_s)
+    var b = parse_series(b_s)
+    var c = table_new_f64()
+    // c[i*n+j] = Σ_k a[i*n+k] * b[k*n+j]
+    var i: i64 = 0
+    while i < n {
+        var j: i64 = 0
+        while j < n {
+            var acc: f64 = 0.0
+            var k: i64 = 0
+            while k < n {
+                acc = acc + a[i * n + k] * b[k * n + j]
+                k = k + 1
+            }
+            table_push(c, acc)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// 矩阵转置：B[i*n+j] = A[j*n+i]。返回局部 f64 表。
+pub func mat_trans(a_s: string, n: i64) -> table {
+    var a = parse_series(a_s)
+    var b = table_new_f64()
+    var i: i64 = 0
+    while i < n {
+        var j: i64 = 0
+        while j < n {
+            table_push(b, a[j * n + i])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return b
+}
+
+// 行列式（高斯消元，列主元）：把矩阵消成上三角，对角线乘积 × 行交换符号。
+pub func det(a_s: string, n: i64) -> f64 {
+    // 复制到局部表（消元破坏性修改）
+    var m = parse_series(a_s)
+    var det_v: f64 = 1.0
+    var sign: i64 = 1
+    var col: i64 = 0
+    while col < n {
+        // 列主元：找 [col..n) 中第 col 列绝对值最大的行
+        var pivot: i64 = col
+        var best: f64 = abs_f(m[col * n + col])
+        var r: i64 = col + 1
+        while r < n {
+            var v = abs_f(m[r * n + col])
+            if v > best {
+                best = v
+                pivot = r
+            }
+            r = r + 1
+        }
+        // 主元为 0 → 奇异矩阵，det = 0
+        if m[pivot * n + col] == 0.0 {
+            return 0.0
+        }
+        // 行交换（改变符号）
+        if pivot != col {
+            var k: i64 = 0
+            while k < n {
+                var tmp = m[col * n + k]
+                m[col * n + k] = m[pivot * n + k]
+                m[pivot * n + k] = tmp
+                k = k + 1
+            }
+            sign = -sign
+        }
+        // 消去下方行
+        det_v = det_v * m[col * n + col]
+        var i: i64 = col + 1
+        while i < n {
+            var factor = m[i * n + col] / m[col * n + col]
+            var j: i64 = col
+            while j < n {
+                m[i * n + j] = m[i * n + j] - factor * m[col * n + j]
+                j = j + 1
+            }
+            i = i + 1
+        }
+        col = col + 1
+    }
+    if sign < 0 {
+        return -det_v
+    }
+    return det_v
+}
+
+// 解线性方程组 Ax=b（高斯消元 + 回代），返回解向量**局部 f64 表**（无解返回空表）。
+pub func gauss(a_s: string, b_s: string, n: i64) -> table {
+    // 增广矩阵 [A | b]，复制到局部表（消元破坏性修改）
+    var aug = table_new_f64()
+    var a = parse_series(a_s)
+    var b = parse_series(b_s)
+    var i: i64 = 0
+    while i < n {
+        var j: i64 = 0
+        while j < n {
+            table_push(aug, a[i * n + j])
+            j = j + 1
+        }
+        table_push(aug, b[i])
+        i = i + 1
+    }
+    // 前向消元（列主元）
+    var col: i64 = 0
+    while col < n {
+        // 列主元
+        var pivot: i64 = col
+        var best: f64 = abs_f(aug[col * (n + 1) + col])
+        var r: i64 = col + 1
+        while r < n {
+            var v = abs_f(aug[r * (n + 1) + col])
+            if v > best {
+                best = v
+                pivot = r
+            }
+            r = r + 1
+        }
+        // 主元为 0 → 无解/无穷解（返回空串标记）
+        if aug[pivot * (n + 1) + col] == 0.0 {
+            return table_new_f64()
+        }
+        if pivot != col {
+            var k: i64 = 0
+            while k <= n {
+                var tmp = aug[col * (n + 1) + k]
+                aug[col * (n + 1) + k] = aug[pivot * (n + 1) + k]
+                aug[pivot * (n + 1) + k] = tmp
+                k = k + 1
+            }
+        }
+        var i2: i64 = col + 1
+        while i2 < n {
+            var factor = aug[i2 * (n + 1) + col] / aug[col * (n + 1) + col]
+            var j2: i64 = col
+            while j2 <= n {
+                aug[i2 * (n + 1) + j2] = aug[i2 * (n + 1) + j2] - factor * aug[col * (n + 1) + j2]
+                j2 = j2 + 1
+            }
+            i2 = i2 + 1
+        }
+        col = col + 1
+    }
+    // 回代：x[i] = (b[i] - Σ_{j>i} A[i][j]x[j]) / A[i][i]
+    var x = table_new_f64()
+    var idx: i64 = 0
+    while idx < n {
+        table_push(x, 0.0)
+        idx = idx + 1
+    }
+    var row: i64 = n - 1
+    while row >= 0 {
+        var acc: f64 = aug[row * (n + 1) + n]
+        var j3: i64 = row + 1
+        while j3 < n {
+            acc = acc - aug[row * (n + 1) + j3] * x[j3]
+            j3 = j3 + 1
+        }
+        x[row] = acc / aug[row * (n + 1) + row]
+        row = row - 1
+    }
+    return x
+}
+
+// 矩阵求逆（高斯-约当消元）：[A | I] → [I | A⁻¹]。奇异返回空串。
+pub func mat_inv(a_s: string, n: i64) -> table {
+    // 增广 [A | I]
+    var aug = table_new_f64()
+    var a = parse_series(a_s)
+    var i: i64 = 0
+    while i < n {
+        var j: i64 = 0
+        while j < n {
+            table_push(aug, a[i * n + j])
+            j = j + 1
+        }
+        var k: i64 = 0
+        while k < n {
+            if k == i {
+                table_push(aug, 1.0)
+            } else {
+                table_push(aug, 0.0)
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    // 高斯-约当：每列选主元 → 归一化 → 消去其他行
+    var col: i64 = 0
+    while col < n {
+        // 列主元
+        var pivot: i64 = col
+        var best: f64 = abs_f(aug[col * (2 * n) + col])
+        var r: i64 = col + 1
+        while r < n {
+            var v = abs_f(aug[r * (2 * n) + col])
+            if v > best {
+                best = v
+                pivot = r
+            }
+            r = r + 1
+        }
+        if aug[pivot * (2 * n) + col] == 0.0 {
+            return table_new_f64()
+        }
+        if pivot != col {
+            var k: i64 = 0
+            while k < 2 * n {
+                var tmp = aug[col * (2 * n) + k]
+                aug[col * (2 * n) + k] = aug[pivot * (2 * n) + k]
+                aug[pivot * (2 * n) + k] = tmp
+                k = k + 1
+            }
+        }
+        // 归一化主元行
+        var pivot_val = aug[col * (2 * n) + col]
+        var k2: i64 = 0
+        while k2 < 2 * n {
+            aug[col * (2 * n) + k2] = aug[col * (2 * n) + k2] / pivot_val
+            k2 = k2 + 1
+        }
+        // 消去其他行的 col 列
+        var i2: i64 = 0
+        while i2 < n {
+            if i2 != col {
+                var factor = aug[i2 * (2 * n) + col]
+                var j2: i64 = 0
+                while j2 < 2 * n {
+                    aug[i2 * (2 * n) + j2] = aug[i2 * (2 * n) + j2] - factor * aug[col * (2 * n) + j2]
+                    j2 = j2 + 1
+                }
+            }
+            i2 = i2 + 1
+        }
+        col = col + 1
+    }
+    // 提取右半部分 A⁻¹
+    var inv = table_new_f64()
+    var i3: i64 = 0
+    while i3 < n {
+        var j3: i64 = 0
+        while j3 < n {
+            table_push(inv, aug[i3 * (2 * n) + n + j3])
+            j3 = j3 + 1
+        }
+        i3 = i3 + 1
+    }
+    return inv
+}
+
+// LU 分解（Doolittle）：A = L×U。返回扁平序列 [L 的 n*n 个, U 的 n*n 个]。
+// 文档：调用方按「前 n*n 是 L（下三角，含单位对角 1），后 n*n 是 U（上三角）」解析。
+pub func lu_decompose(a_s: string, n: i64) -> table {
+    var a = parse_series(a_s)
+    // L（下三角）与 U（上三角）复制到局部表
+    var l = table_new_f64()
+    var u = table_new_f64()
+    var i: i64 = 0
+    while i < n {
+        var j: i64 = 0
+        while j < n {
+            table_push(l, 0.0)
+            table_push(u, 0.0)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // Doolittle：逐行算 U、逐列算 L
+    var k: i64 = 0
+    while k < n {
+        // U[k][j] = A[k][j] - Σ_{m<k} L[k][m]*U[m][j]  (j >= k)
+        var j: i64 = k
+        while j < n {
+            var acc: f64 = a[k * n + j]
+            var m: i64 = 0
+            while m < k {
+                acc = acc - l[k * n + m] * u[m * n + j]
+                m = m + 1
+            }
+            u[k * n + j] = acc
+            j = j + 1
+        }
+        // L[i][k] = (A[i][k] - Σ_{m<k} L[i][m]*U[m][k]) / U[k][k]  (i > k)
+        var i2: i64 = k + 1
+        while i2 < n {
+            var acc2: f64 = a[i2 * n + k]
+            var m2: i64 = 0
+            while m2 < k {
+                acc2 = acc2 - l[i2 * n + m2] * u[m2 * n + k]
+                m2 = m2 + 1
+            }
+            if u[k * n + k] == 0.0 {
+                return table_new_f64()
+            }
+            l[i2 * n + k] = acc2 / u[k * n + k]
+            i2 = i2 + 1
+        }
+        // L 对角为 1
+        l[k * n + k] = 1.0
+        k = k + 1
+    }
+    // 拼接 [L, U]
+    var out = table_new_f64()
+    var idx: i64 = 0
+    while idx < n * n {
+        table_push(out, l[idx])
+        idx = idx + 1
+    }
+    idx = 0
+    while idx < n * n {
+        table_push(out, u[idx])
+        idx = idx + 1
+    }
+    return out
+}
+
+// 幂法求最大特征值：迭代 v_{k+1} = A·v_k / ||A·v_k||，收敛到主特征值。
+pub func eigen_power(a_s: string, n: i64, iter: i64) -> f64 {
+    var a = parse_series(a_s)
+    // 初始向量 v = [1,1,...,1]
+    var v = table_new_f64()
+    var i: i64 = 0
+    while i < n {
+        table_push(v, 1.0)
+        i = i + 1
+    }
+    var lambda: f64 = 0.0
+    var it: i64 = 0
+    while it < iter {
+        // v' = A·v
+        var vp = table_new_f64()
+        var r: i64 = 0
+        while r < n {
+            var acc: f64 = 0.0
+            var c: i64 = 0
+            while c < n {
+                acc = acc + a[r * n + c] * v[c]
+                c = c + 1
+            }
+            table_push(vp, acc)
+            r = r + 1
+        }
+        // 归一化：||v'||∞ = max |v'|
+        var norm: f64 = 0.0
+        var r2: i64 = 0
+        while r2 < n {
+            if abs_f(vp[r2]) > norm {
+                norm = abs_f(vp[r2])
+            }
+            r2 = r2 + 1
+        }
+        if norm == 0.0 {
+            return 0.0
+        }
+        // 更新 v 与 lambda（Rayleigh 商近似：norm 即主特征值）
+        lambda = norm
+        var r3: i64 = 0
+        while r3 < n {
+            v[r3] = vp[r3] / norm
+            r3 = r3 + 1
+        }
+        it = it + 1
+    }
+    return lambda
+}
+
+// f64 绝对值。
+func abs_f(v: f64) -> f64 {
+    if v < 0.0 {
+        return -v
+    }
+    return v
+}
+
+// 截取 s 的 [start, end) 子串（越界收敛）。
+func slice(s: string, start: i64, end: i64) -> string {
+    var n: i64 = len(s)
+    var lo: i64 = start
+    if lo < 0 {
+        lo = 0
+    }
+    if lo > n {
+        lo = n
+    }
+    var hi: i64 = end
+    if hi < 0 {
+        hi = 0
+    }
+    if hi > n {
+        hi = n
+    }
+    var result: string = ""
+    var i: i64 = lo
+    while i < hi {
+        result = result + str_char(s, i)
+        i = i + 1
+    }
+    return result
+}
+}
+
+

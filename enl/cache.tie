@@ -1,0 +1,31 @@
+// tie:library
+// cache.tie：扩展库——包缓存管理（命名空间 cache，M6 包管理器前置）
+// 内容：缓存根目录管理 + 包缓存路径计算 + 命中判断。有状态（顶层持久变量）。
+// 首版用字面量根目录（"~/.tie" 的简化——tie 无主目录展开，默认 ".tie-cache"）；
+// 真网络/目录操作（file_exists 判断命中）在底座原语落地后接通。
+// 调用：import 后 cache.set_root(...) / cache.pkg_path("log", "1.0.0") / cache.hit(...)
+
+// 顶层持久变量：缓存根目录
+var cache_root: string = ".tie-cache"
+
+namespace cache {
+// 设置缓存根目录。
+pub func set_root(path: string) {
+    cache_root = path
+}
+
+// 读取当前缓存根目录。
+pub func get_root() -> string {
+    return cache_root
+}
+
+// 包缓存路径：根 + "/packages/" + name + "/" + version
+pub func pkg_path(name: string, version: string) -> string {
+    return cache_root + "/packages/" + name + "/" + version
+}
+
+// 命中判断：pkg_path 目录/文件是否存在（file_exists 底座原语）。
+pub func hit(name: string, version: string) -> bool {
+    return file_exists(pkg_path(name, version))
+}
+}

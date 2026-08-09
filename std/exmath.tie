@@ -1,0 +1,711 @@
+// tie:library
+// exmath.tie：标准库——高级数学算法（命名空间 exmath）
+// 内容：霍夫曼编码/解码（无损压缩）、素数筛、快速幂、斐波那契、阶乘、组合数等
+// 全部基于基础原语（len/str_char/表/算术）+ 字符串表（table_new_string/table_push/下标读取）
+// 实现。注意 tie 表的约束：只追加（table_push）与下标读取，不支持下标赋值/弹出，
+// 因此树/表结构用「并行表 + 数字索引」模拟，节点修改用「追加新版本」方式表达。
+// 调用：import 后 exmath.huffman_encode(...) / exmath.is_prime(...) 等
+
+namespace exmath {
+// ================= 霍夫曼编码 / 解码（无损压缩） =================
+//
+// 原理：统计输入各字符频率 → 构造霍夫曼树（频率小的在深位）→ 生成变长编码表
+//（高频字符编码短）→ 编码/解码。编码表返回为字符串动态表，每项 "字符|编码串"，
+// 解码时按表逐字符匹配。tie 表只追加：树节点用 4 张并行表（weight/char/left/right）
+// 模拟，每次合并追加新节点（left/right 指向被合并节点索引）。
+
+// 生成霍夫曼编码表：输入字符串 → "字符|编码串" 字符串动态表。
+// 表内每项 = 单字符 + "|" + 0/1 编码串；解码时按表逐位匹配还原。
+// 算法：频率统计（并行 char/weight 表）→ 反复取两个最小权重节点合并成新节点
+//（追加）→ 新节点 weight=两者和、left/right=被合并节点索引 → 直到只剩根；
+// 然后从根 DFS（左 0 右 1）收集叶子字符的编码路径。节点用 4 张并行表：
+// w[]（权重）、c[]（字符，叶子才有）、l[]（左子索引，叶子 -1）、r[]（右子索引，叶子 -1）。
+pub func huffman_build(s: string) -> table {
+    var n: i64 = len(s)
+    // 空串：返回空编码表（无可编码字符）
+    if n == 0 {
+        return table_new_string()
+    }
+    // ---- 第 1 步：统计频率（先收集唯一字符，再二次扫描计数） ----
+    // 说明：tie 表参数的元素类型静态未知（表参数只能做 string 拼接等弱操作），
+    // 因此这里不把「频率表」作为参数传递，而是全部用**局部动态表**：
+    // chars = table_new_string()、counts = table_new_i64()（局部表元素类型已知，
+    // 下标读取 counts[i] 合法）。唯一字符收集一次 + 全串再扫描计数一次。
+    var chars = table_new_string()
+    var counts = table_new_i64()
+    var i: i64 = 0
+    // 1a. 收集唯一字符（顺序扫描去重）
+    while i < n {
+        var c = str_char(s, i)
+        var idx = index_of(chars, c)
+        if idx < 0 {
+            table_push(chars, c)
+        }
+        i = i + 1
+    }
+    // 1b. 二次扫描：逐字符计数（对每个唯一字符统计出现次数）
+    var m: i64 = len(chars)
+    i = 0
+    while i < m {
+        var cnt: i64 = 0
+        var k: i64 = 0
+        while k < n {
+            if str_char(s, k) == chars[i] {
+                cnt = cnt + 1
+            }
+            k = k + 1
+        }
+        table_push(counts, cnt)
+        i = i + 1
+    }
+    // ---- 第 2 步：建霍夫曼树（并行表模拟节点，全追加） ----
+    var w = table_new_i64()
+    var c = table_new_string()
+    var l = table_new_i64()
+    var r = table_new_i64()
+    // 叶子节点：每个唯一字符一个（权重 = 出现次数）
+    // 注：m 已在 1b 声明（唯一字符数），此处复用不重复声明（tie 对重复 var 行为未定义）
+    i = 0
+    while i < m {
+        table_push(w, counts[i])
+        table_push(c, chars[i])
+        table_push(l, -1)
+        table_push(r, -1)
+        i = i + 1
+    }
+    // 合并循环：只要还有 2 个以上未合并节点（节点总数 - 已合并对数 > 1）
+    // 已合并节点：作为某内部节点的子节点（用 l/r 指向）。维护一个「已使用」标记表。
+    // 注意：used 表是本函数局部动态表（不跨函数传参——tie 表参数的元素类型
+    // 静态未知，只能弱操作；is_used 线性扫描内联在循环里）。
+    var used = table_new_i64()
+    var total: i64 = m
+    while total - len(used) > 1 {
+        // 找两个最小权重未使用节点（used 中的索引已合并，跳过）
+        var min1: i64 = -1
+        var min2: i64 = -1
+        var j: i64 = 0
+        while j < total {
+            // 检查 j 是否在 used 中（局部表下标读取合法）
+            var is_used: bool = false
+            var u: i64 = 0
+            while u < len(used) {
+                if used[u] == j {
+                    is_used = true
+                }
+                u = u + 1
+            }
+            if !is_used {
+                // 注意：tie 的 && / || 不是短路求值（IR 用 and/or 指令，两侧先求值），
+                // 因此不能用 `min1 < 0 || w[j] < w[min1]`（min1=-1 时 w[min1] 会越界）。
+                // 必须用嵌套 if 保证 w[min1] 只在 min1 已设置时访问。
+                if min1 < 0 {
+                    min1 = j
+                } else if w[j] < w[min1] {
+                    min2 = min1
+                    min1 = j
+                } else if min2 < 0 {
+                    min2 = j
+                } else if w[j] < w[min2] {
+                    min2 = j
+                }
+            }
+            j = j + 1
+        }
+        // 合并 min1/min2 → 追加新内部节点
+        table_push(w, w[min1] + w[min2])
+        table_push(c, "")
+        table_push(l, min1)
+        table_push(r, min2)
+        // 标记 min1/min2 已使用
+        table_push(used, min1)
+        table_push(used, min2)
+        total = total + 1
+    }
+    // 根节点 = 最后一个节点（索引 total-1；单字符输入时即唯一的叶子）
+    var root: i64 = total - 1
+    // ---- 第 3 步：BFS 生成编码表（并行队列：node 队列 + bin 队列） ----
+    // tie 表无 pop/下标赋值：用「追加 + 队头指针 head」模拟——读取恒用 queue[head]，
+    // head 只增不减（BFS 天然不会重复读），push 追加到队尾。
+    var node_queue = table_new_i64()
+    var code_queue = table_new_string()
+    table_push(node_queue, root)
+    table_push(code_queue, "")
+    var result = table_new_string()
+    var head: i64 = 0
+    while head < len(node_queue) {
+        var node = node_queue[head]
+        var bin = code_queue[head]
+        head = head + 1
+        // 叶子：字符 + 编码路径 → 结果表
+        if l[node] < 0 && r[node] < 0 {
+            table_push(result, c[node] + "|" + bin)
+        } else {
+            // 内部节点：左子编码 + "0"，右子编码 + "1"（BFS 顺序生成，编码正确）
+            table_push(node_queue, l[node])
+            table_push(code_queue, bin + "0")
+            table_push(node_queue, r[node])
+            table_push(code_queue, bin + "1")
+        }
+    }
+    return result
+}
+
+// 用霍夫曼编码表把字符串编码为 0/1 串（逐字符查表拼接）。
+// tbl：huffman_build 返回的 "字符|编码" 表。输入含未登记字符 → 报错（无法编码）。
+pub func huffman_encode(s: string, tbl: table) -> string {
+    var out: string = ""
+    var n: i64 = len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        var bin = lookup_code(tbl, c)
+        if bin == "" {
+            return "??"
+        }
+        out = out + bin
+        i = i + 1
+    }
+    return out
+}
+
+// 用霍夫曼编码表把 0/1 串解码回原字符串。
+// 贪心匹配：从当前位置开始逐字符累积，查编码表中是否有前缀匹配——霍夫曼码是
+// 前缀码，任一合法编码串有唯一解码。非法编码 → 返回空串。
+pub func huffman_decode(bits: string, tbl: table) -> string {
+    var out: string = ""
+    var n: i64 = len(bits)
+    var i: i64 = 0
+    while i < n {
+        // 从 i 开始尝试前缀匹配
+        var matched: bool = false
+        var j: i64 = 0
+        var m: i64 = len(tbl)
+        while j < m && !matched {
+            var item = tbl[j]
+            var sep = find_char(item, "|")
+            var sym = slice(item, 0, sep)
+            var bin = slice(item, sep + 1, len(item))
+            if starts_with(bits, i, bin) {
+                out = out + sym
+                i = i + len(bin)
+                matched = true
+            }
+            j = j + 1
+        }
+        if !matched {
+            return ""
+        }
+    }
+    return out
+}
+
+// ================= 数论 / 组合 =================
+
+// 素数判定：试除法（2..sqrt(n)，跳过偶数）。n < 2 → false。
+pub func is_prime(n: i64) -> bool {
+    if n < 2 {
+        return false
+    }
+    if n == 2 {
+        return true
+    }
+    if n % 2 == 0 {
+        return false
+    }
+    var i: i64 = 3
+    while i * i <= n {
+        if n % i == 0 {
+            return false
+        }
+        i = i + 2
+    }
+    return true
+}
+
+// 埃氏筛：返回 [2, n] 内全部素数（i64 动态表，升序）。
+// 实现：标记表用「并行表 + 只追加」受限，改用逐数试除收集（对 n ≤ 10^6 可接受）。
+pub func sieve(n: i64) -> table {
+    var result = table_new_i64()
+    var i: i64 = 2
+    while i <= n {
+        if is_prime(i) {
+            table_push(result, i)
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// 埃氏筛的字符串形式：返回 "[2, n] 内全部素数" 的逗号分隔串（无参数表问题，
+// 供 demo 直接 println）。内部调 sieve 拿局部表逐元素 to_string。
+pub func sieve_to_string(n: i64) -> string {
+    var primes = sieve(n)
+    var out: string = ""
+    var m: i64 = len(primes)
+    var i: i64 = 0
+    while i < m {
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + to_string(primes[i])
+        i = i + 1
+    }
+    return out
+}
+
+// 快速幂：base^exp mod mod（二分求幂，防溢出用 i64 中间值；大数场景留后续）。
+pub func pow_mod(base: i64, exp: i64, mod: i64) -> i64 {
+    var b: i64 = base
+    var e: i64 = exp
+    var m: i64 = mod
+    var result: i64 = 1
+    // 模为 0 非法：返回 0（防御，与多数实现一致）
+    if m <= 0 {
+        return 0
+    }
+    b = b % m
+    if b < 0 {
+        b = b + m
+    }
+    while e > 0 {
+        if e % 2 == 1 {
+            result = (result * b) % m
+        }
+        b = (b * b) % m
+        e = e / 2
+    }
+    return result
+}
+
+// 斐波那契第 n 项（迭代：f(0)=0, f(1)=1）。n < 0 → 0（防御）。
+pub func fib(n: i64) -> i64 {
+    if n < 0 {
+        return 0
+    }
+    if n <= 1 {
+        return n
+    }
+    var a: i64 = 0
+    var b: i64 = 1
+    var i: i64 = 2
+    while i <= n {
+        var t: i64 = a + b
+        a = b
+        b = t
+        i = i + 1
+    }
+    return b
+}
+
+// 阶乘 n!（迭代累乘）。n < 0 → 0；n 过大溢出 i64 时结果不可靠（文档注明）。
+pub func factorial(n: i64) -> i64 {
+    if n < 0 {
+        return 0
+    }
+    var result: i64 = 1
+    var i: i64 = 2
+    while i <= n {
+        result = result * i
+        i = i + 1
+    }
+    return result
+}
+
+// 组合数 C(n, k)（乘法公式逐步约分，减小溢出风险）。k 越界 → 0。
+pub func binom(n: i64, k: i64) -> i64 {
+    if k < 0 || k > n {
+        return 0
+    }
+    // C(n,k) = C(n,n-k)：取较小者减少循环
+    var kk: i64 = k
+    if kk > n - kk {
+        kk = n - kk
+    }
+    var result: i64 = 1
+    var i: i64 = 1
+    while i <= kk {
+        result = result * (n - kk + i) / i
+        i = i + 1
+    }
+    return result
+}
+
+// ================= 内部工具（私有） =================
+
+// 在字符串表中查找字符 c 的索引，未找到返回 -1。
+// 注意：tie 表参数的元素类型静态未知，但字符串表的元素在 string 上下文
+//（比较 items[i] == c）中可用（与 std/format.sprintf 的 args[k] 拼接同理）。
+func index_of(items: table, c: string) -> i64 {
+    var n: i64 = len(items)
+    var i: i64 = 0
+    while i < n {
+        if items[i] == c {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 在编码表中查找字符 c 的编码串；未找到返回空串。
+func lookup_code(tbl: table, c: string) -> string {
+    var n: i64 = len(tbl)
+    var i: i64 = 0
+    while i < n {
+        var item = tbl[i]
+        var sep = find_char(item, "|")
+        var sym = slice(item, 0, sep)
+        if sym == c {
+            return slice(item, sep + 1, len(item))
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 判断 s 从 pos 位置开始是否以 prefix 开头（用于解码前缀匹配）。
+func starts_with(s: string, pos: i64, prefix: string) -> bool {
+    var m: i64 = len(prefix)
+    var i: i64 = 0
+    while i < m {
+        if pos + i >= len(s) {
+            return false
+        }
+        if str_char(s, pos + i) != str_char(prefix, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 截取 s 的 [start, end) 子串（越界自动收敛；start>=end 返回空串）。
+func slice(s: string, start: i64, end: i64) -> string {
+    var n: i64 = len(s)
+    var lo: i64 = start
+    if lo < 0 {
+        lo = 0
+    }
+    if lo > n {
+        lo = n
+    }
+    var hi: i64 = end
+    if hi < 0 {
+        hi = 0
+    }
+    if hi > n {
+        hi = n
+    }
+    var result: string = ""
+    var i: i64 = lo
+    while i < hi {
+        result = result + str_char(s, i)
+        i = i + 1
+    }
+    return result
+}
+
+// 查找单字符 sym 在 s 中的位置，未找到返回 -1（分隔符 '|' 定位用）。
+func find_char(s: string, sym: string) -> i64 {
+    var n: i64 = len(s)
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == sym {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ================= 数值分析（D1：均值/方差/插值/微分/积分/MC/拟合/ODE） =================
+//
+// 说明：tie 表参数的元素类型静态未知（表参数下标读取被语义层统一当 string，
+// f64 表参数无法读元素）。因此数值函数改用**逗号分隔字符串序列**传采样数据
+//（如 "1.0,2.0,3.0"），函数内部用 parse_series 解析到**局部 f64 表**（局部表
+// 元素类型已知，下标读取合法）。序列接口与 tie 语言约束自洽。
+
+// 解析逗号分隔的 f64 序列 → 局部 f64 动态表（空串 → 空表）。
+func parse_series(s: string) -> table {
+    var result = table_new_f64()
+    var n: i64 = len(s)
+    if n == 0 {
+        return result
+    }
+    var start: i64 = 0
+    var i: i64 = 0
+    while i <= n {
+        var at_end: bool = (i == n)
+        var is_comma: bool = !at_end && str_char(s, i) == ","
+        if at_end || is_comma {
+            // 提取段并解析（跳过空段——连续逗号）
+            var seg = slice(s, start, i)
+            if len(seg) > 0 {
+                table_push(result, parse_float(seg))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// 算术平均：sum / n。空序列返回 0（防御）。
+pub func mean(s: string) -> f64 {
+    var xs = parse_series(s)
+    var n: i64 = len(xs)
+    if n == 0 {
+        return 0.0
+    }
+    var sum: f64 = 0.0
+    var i: i64 = 0
+    while i < n {
+        sum = sum + xs[i]
+        i = i + 1
+    }
+    return sum / to_f64(n)
+}
+
+// 方差（总体方差：Σ(x-mean)²/n）。
+pub func variance(s: string) -> f64 {
+    var xs = parse_series(s)
+    var n: i64 = len(xs)
+    if n == 0 {
+        return 0.0
+    }
+    var m = mean(s)
+    var acc: f64 = 0.0
+    var i: i64 = 0
+    while i < n {
+        var d = xs[i] - m
+        acc = acc + d * d
+        i = i + 1
+    }
+    return acc / to_f64(n)
+}
+
+// 线性插值：过 (x0,y0) 与 (x1,y1) 的直线在 x 处的值（x0≠x1）。
+pub func lerp(x0: f64, y0: f64, x1: f64, y1: f64, x: f64) -> f64 {
+    if x1 == x0 {
+        return y0
+    }
+    var t = (x - x0) / (x1 - x0)
+    return y0 + t * (y1 - y0)
+}
+
+// 拉格朗日插值：过 (xs, ys) 的多项式在 x 处的值（xs 须互异，逗号分隔序列）。
+pub func lagrange(xs_s: string, ys_s: string, x: f64) -> f64 {
+    var xs = parse_series(xs_s)
+    var ys = parse_series(ys_s)
+    var n: i64 = len(xs)
+    if n == 0 {
+        return 0.0
+    }
+    var result: f64 = 0.0
+    var i: i64 = 0
+    while i < n {
+        // 基多项式 Li(x) = Π(j≠i) (x - xs[j]) / (xs[i] - xs[j])
+        var li: f64 = 1.0
+        var j: i64 = 0
+        while j < n {
+            if j != i {
+                li = li * (x - xs[j]) / (xs[i] - xs[j])
+            }
+            j = j + 1
+        }
+        result = result + ys[i] * li
+        i = i + 1
+    }
+    return result
+}
+
+// 数值微分（中心差分）：f'(x) ≈ (f(x+h) - f(x-h)) / 2h。
+pub func diff(xs_s: string, ys_s: string, x: f64, h: f64) -> f64 {
+    if h == 0.0 {
+        return 0.0
+    }
+    var fp = interp_at(xs_s, ys_s, x + h)
+    var fm = interp_at(xs_s, ys_s, x - h)
+    return (fp - fm) / (2.0 * h)
+}
+
+// 数值积分（梯形法）：∫_a^b f(x) dx ≈ Σ h*(f_i+f_{i+1})/2。
+pub func integrate(xs_s: string, ys_s: string, a: f64, b: f64, n: i64) -> f64 {
+    if n <= 0 {
+        return 0.0
+    }
+    var h = (b - a) / to_f64(n)
+    var sum: f64 = 0.0
+    var i: i64 = 0
+    while i <= n {
+        var x = a + to_f64(i) * h
+        var y = interp_at(xs_s, ys_s, x)
+        // 端点权重 0.5，内部点 1
+        if i == 0 || i == n {
+            sum = sum + y * 0.5
+        } else {
+            sum = sum + y
+        }
+        i = i + 1
+    }
+    return sum * h
+}
+
+// Monte-Carlo 估 π：正方形 [0,1]² 内撒 n 点，命中单位圆内比例 × 4。
+pub func monte_carlo_pi(n: i64) -> f64 {
+    if n <= 0 {
+        return 0.0
+    }
+    var hit: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var x = to_f64(rand_range(0, 1000000)) / 1000000.0
+        var y = to_f64(rand_range(0, 1000000)) / 1000000.0
+        if x * x + y * y <= 1.0 {
+            hit = hit + 1
+        }
+        i = i + 1
+    }
+    return 4.0 * to_f64(hit) / to_f64(n)
+}
+
+// 欧拉法：一阶 ODE y' = f(x)，y(x0)=y0，步长 h，求 y(x1)。
+// f 用「均匀斜率采样」字符串传参（第 i 个点对应 x = i）。
+pub func euler(ys_s: string, y0: f64, x0: f64, x1: f64, h: f64) -> f64 {
+    if h == 0.0 {
+        return y0
+    }
+    var y: f64 = y0
+    var x: f64 = x0
+    var step = h
+    if x1 < x0 {
+        step = -h
+    }
+    while (step > 0.0 && x < x1) || (step < 0.0 && x > x1) {
+        // f(x) ≈ 采样序列在 x 处的插值
+        var slope = interp_at_table(ys_s, x)
+        y = y + step * slope
+        x = x + step
+    }
+    return y
+}
+
+// 龙格-库塔四阶（RK4）：更精确的 ODE 数值解。导数用均匀采样序列（只依赖 x）。
+pub func rk4(ys_s: string, y0: f64, x0: f64, x1: f64, h: f64) -> f64 {
+    if h == 0.0 {
+        return y0
+    }
+    var y: f64 = y0
+    var x: f64 = x0
+    var step = h
+    if x1 < x0 {
+        step = -h
+    }
+    while (step > 0.0 && x < x1) || (step < 0.0 && x > x1) {
+        var k1 = interp_at_table(ys_s, x)
+        var k2 = interp_at_table(ys_s, x + step * 0.5)
+        var k3 = interp_at_table(ys_s, x + step * 0.5)
+        var k4 = interp_at_table(ys_s, x + step)
+        y = y + step * (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
+        x = x + step
+    }
+    return y
+}
+
+// 最小二乘线性拟合：y = a*x + b（正规方程）。xs/ys 为逗号分隔序列。
+pub func fit_line(xs_s: string, ys_s: string) -> (a: f64, b: f64) {
+    var xs = parse_series(xs_s)
+    var ys = parse_series(ys_s)
+    var n: i64 = len(xs)
+    if n == 0 {
+        return (0.0, 0.0)
+    }
+    var sx: f64 = 0.0
+    var sy: f64 = 0.0
+    var sxx: f64 = 0.0
+    var sxy: f64 = 0.0
+    var i: i64 = 0
+    while i < n {
+        var x = xs[i]
+        var y = ys[i]
+        sx = sx + x
+        sy = sy + y
+        sxx = sxx + x * x
+        sxy = sxy + x * y
+        i = i + 1
+    }
+    var denom = to_f64(n) * sxx - sx * sx
+    if denom == 0.0 {
+        return (0.0, sy / to_f64(n))
+    }
+    var a = (to_f64(n) * sxy - sx * sy) / denom
+    var b = (sy - a * sx) / to_f64(n)
+    return (a, b)
+}
+
+// ================= 内部工具（数值） =================
+
+// i64 → f64（tie 无隐式转换，显式辅助）。
+func to_f64(v: i64) -> f64 {
+    return parse_float(to_string(v))
+}
+
+// f64 → i64（截断取整）。
+func to_int64(v: f64) -> i64 {
+    return parse_int(to_string(v))
+}
+
+// 在采样序列 (xs_s, ys_s) 中插值求 x 处的 y（线性插值；x 越界取端点）。
+// 接收逗号分隔序列字符串，内部 parse_series 到局部表（表参数元素类型未知，
+// 不能下标读取，故用序列字符串接口）。
+func interp_at(xs_s: string, ys_s: string, x: f64) -> f64 {
+    var xs = parse_series(xs_s)
+    var ys = parse_series(ys_s)
+    var n: i64 = len(xs)
+    if n == 0 {
+        return 0.0
+    }
+    if n == 1 {
+        return ys[0]
+    }
+    // x 在范围外：取端点
+    if x <= xs[0] {
+        return ys[0]
+    }
+    if x >= xs[n - 1] {
+        return ys[n - 1]
+    }
+    // 找区间 [i, i+1] 使 xs[i] <= x <= xs[i+1]
+    var i: i64 = 0
+    while i < n - 1 {
+        if x >= xs[i] && x <= xs[i + 1] {
+            return lerp(xs[i], ys[i], xs[i + 1], ys[i + 1], x)
+        }
+        i = i + 1
+    }
+    return ys[n - 1]
+}
+
+// 单表插值：把 ys_s 序列视为「均匀采样」（i 对应 x = 0,1,2,...）在 x 处求值。
+func interp_at_table(ys_s: string, x: f64) -> f64 {
+    var ys = parse_series(ys_s)
+    var n: i64 = len(ys)
+    if n == 0 {
+        return 0.0
+    }
+    var xf = x
+    if xf < 0.0 {
+        xf = 0.0
+    }
+    if xf >= to_f64(n) {
+        xf = to_f64(n - 1)
+    }
+    var i = floor(xf)
+    var frac = xf - i
+    var i64v = to_int64(i)
+    if i64v >= n - 1 {
+        return ys[n - 1]
+    }
+    return ys[i64v] + frac * (ys[i64v + 1] - ys[i64v])
+}
+}

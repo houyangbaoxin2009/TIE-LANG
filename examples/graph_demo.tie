@@ -1,0 +1,63 @@
+// tie:logic
+// graph_demo.tie：std/graph 图算法库演示（D3）
+// 编译运行：cargo run -p tie -- examples/graph_demo.tie
+// 图用逗号分隔序列传参（邻接矩阵/边表）；距离等返回表，main 内联下标读取。
+
+import "../std/graph.tie"
+
+func main() {
+    // ---- Dijkstra：4 顶点图，src=0 ----
+    //   0-1(1) 0-2(4) 1-2(2) 1-3(5) 2-3(1)；无边=999
+    var d = graph.dijkstra("0,1,4,999,1,0,2,5,4,2,0,1,999,5,1,0", 4, 0)
+    println("dijkstra dist: " + to_string(d[0]) + " " + to_string(d[1]) + " " + to_string(d[2]) + " " + to_string(d[3]))
+    // 期望 0,1,3,4
+
+    println("---")
+
+    // ---- Floyd：3 顶点 ----
+    var f = graph.floyd("0,1,999,1,0,2,999,2,0", 3)
+    println("floyd[0][2] = " + to_string(f[2]))
+    // 期望 3（0→1→2）
+
+    println("---")
+
+    // ---- Prim MST：4 顶点无向图 ----
+    // 边权：0-1(1) 0-2(4) 1-2(2) 1-3(5) 2-3(1) → MST = 1+2+1 = 4
+    var mst = graph.prim_mst("0,1,4,999,1,0,2,5,4,2,0,1,999,5,1,0", 4)
+    println("prim_mst = " + to_string(mst))
+
+    println("---")
+
+    // ---- Bellman-Ford：3 顶点带负权边 ----
+    // 边：0→1(2) 1→2(-3) 0→2(5) → dist = 0,2,-1
+    var bf = graph.bellman_ford("0,1,2,1,2,-3,0,2,5", 3, 0)
+    println("bellman_ford dist: " + to_string(bf[0]) + " " + to_string(bf[1]) + " " + to_string(bf[2]) + " neg=" + to_string(bf[3]))
+
+    println("---")
+
+    // ---- 最大流：4 顶点网络 ----
+    // 容量：0→1(3) 0→2(2) 1→2(1) 1→3(2) 2→3(3) → 最大流 0→3 = 5
+    var mf = graph.max_flow("0,3,2,0,0,0,1,2,0,0,0,3,0,0,0,0", 4, 0, 3)
+    println("max_flow = " + to_string(mf))
+
+    println("---")
+
+    // ---- 二分匹配：3 左 × 3 右 ----
+    // 左0→右0,右1；左1→右1；左2→右2 → 最大匹配 3
+    var bm = graph.bipartite_match("1,1,0,0,1,0,0,0,1", 3, 3)
+    println("bipartite_match = " + to_string(bm))
+
+    println("---")
+    var pass: bool = true
+    pass = pass && d[0] == 0 && d[1] == 1 && d[2] == 3 && d[3] == 4
+    pass = pass && f[2] == 3
+    pass = pass && mst == 4
+    pass = pass && bf[0] == 0 && bf[1] == 2 && bf[2] == -1 && bf[3] == 0
+    pass = pass && mf == 5
+    pass = pass && bm == 3
+    if pass {
+        println("PASS")
+    } else {
+        println("FAIL")
+    }
+}

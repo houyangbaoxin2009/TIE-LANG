@@ -1,0 +1,39 @@
+// tie:logic
+// registry_demo.tie：enl/registry + enl/cache 扩展库演示（M6 包管理器前置）
+// 编译运行：cargo run -p tie -- examples/registry_demo.tie
+
+import "../enl/registry.tie"
+import "../enl/cache.tie"
+
+func main() {
+    // ---- 注册表客户端 ----
+    println("默认注册表: " + registry.get_registry())
+    registry.set_registry("https://example.com")
+    println("设置后: " + registry.get_registry())
+    println("pkg_url(log, 1.0.0): " + registry.pkg_url("log", "1.0.0"))
+    println("index_url(): " + registry.index_url())
+
+    println("---")
+
+    // ---- 包缓存管理 ----
+    println("默认缓存根: " + cache.get_root())
+    cache.set_root(".tie-cache")
+    println("设置后: " + cache.get_root())
+    println("pkg_path(log, 1.0.0): " + cache.pkg_path("log", "1.0.0"))
+    println("hit(log, 1.0.0): " + (cache.hit("log", "1.0.0") ? "true" : "false"))
+
+    println("---")
+    // 断言汇总
+    var pass: bool = true
+    pass = pass && registry.get_registry() == "https://example.com"
+    pass = pass && registry.pkg_url("log", "1.0.0") == "https://example.com/packages/log/1.0.0.tar.gz"
+    pass = pass && registry.index_url() == "https://example.com/index.tie"
+    pass = pass && cache.get_root() == ".tie-cache"
+    pass = pass && cache.pkg_path("log", "1.0.0") == ".tie-cache/packages/log/1.0.0"
+    pass = pass && !cache.hit("log", "1.0.0")
+    if pass {
+        println("PASS")
+    } else {
+        println("FAIL")
+    }
+}

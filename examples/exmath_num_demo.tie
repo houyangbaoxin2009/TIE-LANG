@@ -1,0 +1,71 @@
+// tie:logic
+// exmath_num_demo.tie：exmath 数值分析方法演示（D1：均值/方差/插值/微分/积分/MC/拟合/ODE）
+// 编译运行：cargo run -p tie -- examples/exmath_num_demo.tie
+// 注：tie 表参数元素类型静态未知，数值函数用逗号分隔字符串序列传采样数据。
+
+import "../std/exmath.tie"
+
+func main() {
+    // ---- 均值/方差 ----
+    println("mean(1..5) = " + to_string(exmath.mean("1.0,2.0,3.0,4.0,5.0")))
+    println("variance(1..5) = " + to_string(exmath.variance("1.0,2.0,3.0,4.0,5.0")))
+
+    println("---")
+
+    // ---- 线性插值 ----
+    println("lerp(0,0, 10,100, 5) = " + to_string(exmath.lerp(0.0, 0.0, 10.0, 100.0, 5.0)))
+
+    // ---- 拉格朗日插值：f(x)=x² 的三个点 ----
+    println("lagrange x² @1.5 = " + to_string(exmath.lagrange("0.0,1.0,2.0", "0.0,1.0,4.0", 1.5)))
+
+    println("---")
+
+    // ---- 数值微分/积分：f(x)=x²（采样 0..10 每格 1）----
+    println("diff(x²)@3 ≈ " + to_string(exmath.diff("0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0", "0.0,1.0,4.0,9.0,16.0,25.0,36.0,49.0,64.0,81.0,100.0", 3.0, 0.1)))
+    println("integrate(x²,0..1) ≈ " + to_string(exmath.integrate("0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0", "0.0,1.0,4.0,9.0,16.0,25.0,36.0,49.0,64.0,81.0,100.0", 0.0, 1.0, 100)))
+
+    // ---- Monte-Carlo 估 π ----
+    println("monte_carlo_pi(10000) ≈ " + to_string(exmath.monte_carlo_pi(10000)))
+
+    println("---")
+
+    // ---- 线性拟合：y = 2x + 1（采样点 0,1,2）----
+    var fit = exmath.fit_line("0.0,1.0,2.0", "1.0,3.0,5.0")
+    println("fit_line y=2x+1 → a=" + to_string(fit.a) + " b=" + to_string(fit.b))
+
+    println("---")
+
+    // ---- 欧拉法/RK4：dy/dx = x（解 y = x²/2），从 y(0)=0 到 y(2) ----
+    // 均匀采样：第 i 个点对应 x=i，斜率 f(i)=i → "0,1,2"
+    println("euler(dy/dx=x)@2 ≈ " + to_string(exmath.euler("0.0,1.0,2.0", 0.0, 0.0, 2.0, 0.1)))
+    println("rk4(dy/dx=x)@2 ≈ " + to_string(exmath.rk4("0.0,1.0,2.0", 0.0, 0.0, 2.0, 0.1)))
+
+    println("---")
+    // 断言汇总（宽松容差：数值方法有舍入误差）
+    var pass: bool = true
+    pass = pass && exmath.mean("1.0,2.0,3.0,4.0,5.0") == 3.0
+    pass = pass && abs_f(exmath.variance("1.0,2.0,3.0,4.0,5.0") - 2.0) < 0.01
+    pass = pass && abs_f(exmath.lerp(0.0, 0.0, 10.0, 100.0, 5.0) - 50.0) < 0.01
+    pass = pass && abs_f(exmath.lagrange("0.0,1.0,2.0", "0.0,1.0,4.0", 1.5) - 2.25) < 0.01
+    pass = pass && abs_f(exmath.diff("0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0", "0.0,1.0,4.0,9.0,16.0,25.0,36.0,49.0,64.0,81.0,100.0", 3.0, 0.1) - 6.0) < 0.1
+    // 梯形法对「线性插值」的积分：采样点 0,1 处 x² → 线段下面积 = 0.5（非真实 0.333）
+    pass = pass && abs_f(exmath.integrate("0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0", "0.0,1.0,4.0,9.0,16.0,25.0,36.0,49.0,64.0,81.0,100.0", 0.0, 1.0, 100) - 0.5) < 0.01
+    pass = pass && abs_f(exmath.monte_carlo_pi(10000) - 3.14159) < 0.1
+    pass = pass && abs_f(fit.a - 2.0) < 0.01 && abs_f(fit.b - 1.0) < 0.01
+    // ODE：y=x²/2 在 x=2 处 = 2；欧拉（步 0.1）≈ 1.95，RK4 ≈ 2.0（容差放宽）
+    pass = pass && abs_f(exmath.euler("0.0,1.0,2.0", 0.0, 0.0, 2.0, 0.1) - 2.0) < 0.1
+    pass = pass && abs_f(exmath.rk4("0.0,1.0,2.0", 0.0, 0.0, 2.0, 0.1) - 2.0) < 0.05
+    if pass {
+        println("PASS")
+    } else {
+        println("FAIL")
+    }
+}
+
+// f64 绝对值
+func abs_f(v: f64) -> f64 {
+    if v < 0.0 {
+        return -v
+    }
+    return v
+}

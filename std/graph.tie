@@ -1,0 +1,340 @@
+// tie:library
+// graph.tie：标准库——图算法（命名空间 graph，D3）
+// 内容：Dijkstra（单源最短路）、Floyd（全源最短路）、Prim（最小生成树）、
+// Bellman-Ford（负权最短路 + 负环检测）、最大流（Ford-Fulkerson）、二分匹配（匈牙利）。
+// 接口约定：图用**逗号分隔字符串序列**传参（邻接矩阵按行拼接，如 3×3 权矩阵
+// "0,1,5,1,0,2,5,2,0" + n=3；无边用一个大数如 999 表示）。返回距离/路径/匹配
+// 结果为**局部 i64/f64 表**（table_ret_elems 记录元素类型，调用方下标读取合法）。
+// 表参数元素类型静态未知 → 图数据一律序列字符串 + 局部表解析（与 linalg 同模式）。
+
+namespace graph {
+// 解析逗号分隔 i64 序列 → 局部 i64 动态表。
+func parse_i64(s: string) -> table {
+    var result = table_new_i64()
+    var n: i64 = len(s)
+    if n == 0 {
+        return result
+    }
+    var start: i64 = 0
+    var i: i64 = 0
+    while i <= n {
+        var at_end: bool = (i == n)
+        var is_comma: bool = !at_end && str_char(s, i) == ","
+        if at_end || is_comma {
+            var seg = slice(s, start, i)
+            if len(seg) > 0 {
+                table_push(result, parse_int(seg))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// Dijkstra 单源最短路：返回 dist 表（src 到各点最短距离，i64）。
+// adj_s：n×n 邻接矩阵序列（i64，无边用 999）；n：顶点数；src：源点。
+pub func dijkstra(adj_s: string, n: i64, src: i64) -> table {
+    var adj = parse_i64(adj_s)
+    // dist[i]：src 到 i 的距离；visited[i]：是否已确定
+    var dist = table_new_i64()
+    var visited = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(dist, adj[src * n + i])
+        table_push(visited, 0)
+        i = i + 1
+    }
+    dist[src] = 0
+    var count: i64 = 0
+    while count < n {
+        // 找未访问中 dist 最小者
+        var u: i64 = -1
+        var best: i64 = 999999
+        var j: i64 = 0
+        while j < n {
+            if visited[j] == 0 && dist[j] < best {
+                best = dist[j]
+                u = j
+            }
+            j = j + 1
+        }
+        if u < 0 {
+            // 剩余不可达
+            count = n
+        } else {
+            visited[u] = 1
+            // 松弛
+            var k: i64 = 0
+            while k < n {
+                var w = adj[u * n + k]
+                if visited[k] == 0 && w < 999 && dist[u] + w < dist[k] {
+                    dist[k] = dist[u] + w
+                }
+                k = k + 1
+            }
+            count = count + 1
+        }
+    }
+    return dist
+}
+
+// Floyd 全源最短路：返回扁平 dist 表（dist[i*n+j] = i 到 j 最短路，i64）。
+pub func floyd(adj_s: string, n: i64) -> table {
+    var dist = parse_i64(adj_s)
+    var k: i64 = 0
+    while k < n {
+        var i: i64 = 0
+        while i < n {
+            var j: i64 = 0
+            while j < n {
+                var via = dist[i * n + k] + dist[k * n + j]
+                if dist[i * n + k] < 999 && dist[k * n + j] < 999 && via < dist[i * n + j] {
+                    dist[i * n + j] = via
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+        k = k + 1
+    }
+    return dist
+}
+
+// Prim 最小生成树：返回 MST 总权重（i64）。adj_s：无向加权邻接矩阵。
+pub func prim_mst(adj_s: string, n: i64) -> i64 {
+    var adj = parse_i64(adj_s)
+    if n == 0 {
+        return 0
+    }
+    // key[i]：到已选集合的最小边；in_mst[i]：是否已选
+    var key = table_new_i64()
+    var in_mst = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(key, 999999)
+        table_push(in_mst, 0)
+        i = i + 1
+    }
+    key[0] = 0
+    var total: i64 = 0
+    var count: i64 = 0
+    while count < n {
+        // 找 key 最小未选
+        var u: i64 = -1
+        var best: i64 = 999999
+        var j: i64 = 0
+        while j < n {
+            if in_mst[j] == 0 && key[j] < best {
+                best = key[j]
+                u = j
+            }
+            j = j + 1
+        }
+        if u < 0 {
+            return total
+        }
+        in_mst[u] = 1
+        total = total + key[u]
+        // 更新邻接点 key
+        var k: i64 = 0
+        while k < n {
+            var w = adj[u * n + k]
+            if in_mst[k] == 0 && w < 999 && w < key[k] {
+                key[k] = w
+            }
+            k = k + 1
+        }
+        count = count + 1
+    }
+    return total
+}
+
+// Bellman-Ford：单源最短路（支持负权）。返回 (dist 表, 是否有负环的编码串)。
+// 返回格式：前 n 个是 dist，最后 1 个是标志（1 = 有负环，0 = 无）。
+pub func bellman_ford(edges_s: string, n: i64, src: i64) -> table {
+    // 边表：每 3 个数一条边 (u, v, w)，序列 "u,v,w,u,v,w,..."
+    var edges = parse_i64(edges_s)
+    var dist = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(dist, 999999)
+        i = i + 1
+    }
+    dist[src] = 0
+    var e_count: i64 = len(edges) / 3
+    var iter: i64 = 0
+    while iter < n - 1 {
+        var e: i64 = 0
+        while e < e_count {
+            var u = edges[e * 3]
+            var v = edges[e * 3 + 1]
+            var w = edges[e * 3 + 2]
+            if dist[u] < 999999 && dist[u] + w < dist[v] {
+                dist[v] = dist[u] + w
+            }
+            e = e + 1
+        }
+        iter = iter + 1
+    }
+    // 第 n 次松弛检测负环
+    var neg_cycle: i64 = 0
+    var e2: i64 = 0
+    while e2 < e_count {
+        var u = edges[e2 * 3]
+        var v = edges[e2 * 3 + 1]
+        var w = edges[e2 * 3 + 2]
+        if dist[u] < 999999 && dist[u] + w < dist[v] {
+            neg_cycle = 1
+        }
+        e2 = e2 + 1
+    }
+    table_push(dist, neg_cycle)
+    return dist
+}
+
+// 最大流（Ford-Fulkerson，DFS 增广）：返回最大流量（i64）。
+// cap_s：n×n 容量矩阵序列；s：源点；t：汇点。
+// 表参数元素类型未知 → 全程内联（不跨函数传表）：DFS 用局部表模拟栈。
+pub func max_flow(cap_s: string, n: i64, s: i64, t: i64) -> i64 {
+    var cap = parse_i64(cap_s)
+    var flow: i64 = 0
+    // 反复 DFS 找增广路（限制最多 n*n 轮防止无限循环）
+    var round: i64 = 0
+    var augmented: bool = true
+    while augmented && round < n * n {
+        augmented = false
+        // 路径栈：stack_node 存路径顶点，回溯用 prev 数组
+        var prev = table_new_i64()
+        var i: i64 = 0
+        while i < n {
+            table_push(prev, -1)
+            i = i + 1
+        }
+        var visited = table_new_i64()
+        i = 0
+        while i < n {
+            table_push(visited, 0)
+            i = i + 1
+        }
+        // BFS 找增广路（队列 + head 指针只增，不重读；prev 记录前驱）
+        var queue = table_new_i64()
+        table_push(queue, s)
+        visited[s] = 1
+        var head: i64 = 0
+        while head < len(queue) && prev[t] < 0 {
+            var u = queue[head]
+            head = head + 1
+            var v: i64 = 0
+            while v < n {
+                if visited[v] == 0 && cap[u * n + v] > 0 {
+                    visited[v] = 1
+                    prev[v] = u
+                    table_push(queue, v)
+                }
+                v = v + 1
+            }
+        }
+        // 找到增广路：计算瓶颈容量
+        if prev[t] >= 0 {
+            var bottleneck: i64 = 999999
+            var v2 = t
+            while v2 != s {
+                var u2 = prev[v2]
+                if cap[u2 * n + v2] < bottleneck {
+                    bottleneck = cap[u2 * n + v2]
+                }
+                v2 = u2
+            }
+            // 更新容量
+            var v3 = t
+            while v3 != s {
+                var u3 = prev[v3]
+                cap[u3 * n + v3] = cap[u3 * n + v3] - bottleneck
+                cap[v3 * n + u3] = cap[v3 * n + u3] + bottleneck
+                v3 = u3
+            }
+            flow = flow + bottleneck
+            augmented = true
+        }
+        round = round + 1
+    }
+    return flow
+}
+
+// 二分匹配（匈牙利算法）：返回最大匹配数（i64）。
+// adj_s：n 个左顶点 × m 个右顶点的邻接（0/1，1 = 有边）；n：左点数；m：右点数。
+// 序列长度 = n*m，行优先（左点 i 连右点 j 则 adj[i*m+j] = 1）。
+// 表参数元素类型未知 → 腾挪逻辑内联：右点被占时尝试为其原配找新右点（一轮腾挪）。
+pub func bipartite_match(adj_s: string, n: i64, m: i64) -> i64 {
+    var adj = parse_i64(adj_s)
+    // match_r[j]：右点 j 匹配的左点（-1 未匹配）
+    var match_r = table_new_i64()
+    var j: i64 = 0
+    while j < m {
+        table_push(match_r, -1)
+        j = j + 1
+    }
+    var result: i64 = 0
+    var u: i64 = 0
+    while u < n {
+        var matched: bool = false
+        var v: i64 = 0
+        while v < m && !matched {
+            if adj[u * m + v] == 1 {
+                if match_r[v] < 0 {
+                    // 右点空闲：直接匹配
+                    match_r[v] = u
+                    matched = true
+                } else {
+                    // 右点被占：尝试为原配 match_r[v] 找新右点（跳过 v）
+                    var old = match_r[v]
+                    var found: bool = false
+                    var w: i64 = 0
+                    while w < m && !found {
+                        if w != v && adj[old * m + w] == 1 && match_r[w] < 0 {
+                            match_r[w] = old
+                            match_r[v] = u
+                            found = true
+                            matched = true
+                        }
+                        w = w + 1
+                    }
+                }
+            }
+            v = v + 1
+        }
+        if matched {
+            result = result + 1
+        }
+        u = u + 1
+    }
+    return result
+}
+
+// 截取 s 的 [start, end) 子串。
+func slice(s: string, start: i64, end: i64) -> string {
+    var n: i64 = len(s)
+    var lo: i64 = start
+    if lo < 0 {
+        lo = 0
+    }
+    if lo > n {
+        lo = n
+    }
+    var hi: i64 = end
+    if hi < 0 {
+        hi = 0
+    }
+    if hi > n {
+        hi = n
+    }
+    var result: string = ""
+    var i: i64 = lo
+    while i < hi {
+        result = result + str_char(s, i)
+        i = i + 1
+    }
+    return result
+}
+}

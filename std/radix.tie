@@ -1,0 +1,111 @@
+// tie:library
+// radix.tie：标准库——通用进制转换（命名空间 radix）
+// 内容：任意进制（2..36）的双向转换——整数 → 进制字符串 / 进制字符串 → 整数。
+// 与 format.format_int_hex（仅十进制→十六进制单向）互补；本库通用化。
+// 数字字符集：0-9 然后 a-z（36 进制封顶；大小写均可读，输出用小写）。
+// 全部基于基础原语（to_string/parse_int/str_char/len/字符串拼接/循环）实现，
+// 无状态纯函数（同输入同输出），符合 std 定位。
+// 调用：import 后 radix.to_str(255, 16) / radix.parse("ff", 16)
+
+namespace radix {
+// 返回 base 进制的数字字符集（0..base-1 的字符拼接，0-9a-z）。
+// 供内部逐位转换使用；教学/调试也可直接调用。
+pub func digits(base: i64) -> string {
+    var chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+    var out: string = ""
+    var i: i64 = 0
+    while i < base {
+        out = out + str_char(chars, i)
+        i = i + 1
+    }
+    return out
+}
+
+// 整数 → 任意进制字符串（base ∈ [2, 36]；base 越界返回空串）。
+// 负数输出「-」前缀 + 绝对值（与 format_int_hex 一致）；0 → "0"。
+pub func to_str(v: i64, base: i64) -> string {
+    // 进制越界防御：2..36 之外返回空串
+    if base < 2 || base > 36 {
+        return ""
+    }
+    // 零直接返回 "0"（不进循环，避免空串）
+    if v == 0 {
+        return "0"
+    }
+    var neg: bool = false
+    var n: i64 = v
+    // 负数：记录负号，取绝对值（i64::MIN 取反回绕为自身，输出补码形式，与 format 一致）
+    if n < 0 {
+        neg = true
+        n = -n
+    }
+    var charset = digits(base)
+    var result: string = ""
+    while n > 0 {
+        // 取最低位数字字符，拼到结果前部
+        result = str_char(charset, n % base) + result
+        n = n / base
+    }
+    if neg {
+        return "-" + result
+    }
+    return result
+}
+
+// 进制字符串 → 整数（base ∈ [2, 36]）。非法输入返回 0（防御性约定）：
+// - base 越界（<2 或 >36）→ 0；
+// - 字符串含该进制之外的字符（如 "ff" 按 10 进制）→ 0；
+// - 空串 → 0。
+// 大小写均可：'A'-'Z' 与 'a'-'z' 同值（按字符值规范化）。
+// 注意：负数前缀 "-" 不支持（parse_int 也仅十进制无负号？——按纯数字约定）。
+pub func parse(s: string, base: i64) -> i64 {
+    if base < 2 || base > 36 {
+        return 0
+    }
+    var n: i64 = len(s)
+    if n == 0 {
+        return 0
+    }
+    var charset = digits(base)
+    var result: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        // 定位 c 在字符集中的索引（大小写归一：大写转小写）
+        var idx = index_in(charset, to_lower(c))
+        if idx < 0 || idx >= base {
+            // 非法字符（不在 base 进制字符集内）→ 整体失败返回 0
+            return 0
+        }
+        // 逐位累加：result = result * base + idx（溢出时 i64 回绕，文档注明）
+        result = result * base + idx
+        i = i + 1
+    }
+    return result
+}
+
+// 把单个字符转小写（'A'-'Z' → 'a'-'z'；其余原样）。
+// 内部工具：parse 读入大写字母时归一（"FF" == "ff"）。
+func to_lower(c: string) -> string {
+    var upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    var lower = "abcdefghijklmnopqrstuvwxyz"
+    var idx = index_in(upper, c)
+    if idx >= 0 {
+        return str_char(lower, idx)
+    }
+    return c
+}
+
+// 查找字符 c 在字符串 charset 中的位置；未找到返回 -1。
+func index_in(charset: string, c: string) -> i64 {
+    var n: i64 = len(charset)
+    var i: i64 = 0
+    while i < n {
+        if str_char(charset, i) == c {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+}

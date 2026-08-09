@@ -1,0 +1,41 @@
+// tie:logic
+// optsearch_demo.tie：std/optsearch 搜索与规划算法演示（D4）
+// 编译运行：cargo run -p tie -- examples/optsearch_demo.tie
+// 注：tie 编译期对超长表达式链（如 10 段 to_string 拼接）有栈深度限制，
+// 打印用短拼接；断言用下标读取。
+
+import "../std/optsearch.tie"
+
+func main() {
+    var ms = opt.merge_sort("5,2,8,1,9,3,7,4,6,0")
+    println("merge_sort: " + to_string(ms[0]) + " " + to_string(ms[5]) + " " + to_string(ms[9]))
+
+    var qs = opt.quick_sort("5,2,8,1,9,3,7,4,6,0")
+    println("quick_sort: " + to_string(qs[0]) + " " + to_string(qs[5]) + " " + to_string(qs[9]))
+
+    println("---")
+
+    println("max_subarray: " + to_string(opt.max_subarray("-2,1,-3,4,-1,2,1,-5,4")))
+    println("n_queens(7): " + to_string(opt.n_queens(7)))
+    println("n_queens(4): " + to_string(opt.n_queens(4)))
+    println("subset_sum(9): " + to_string(opt.subset_sum("3,34,4,12,5,2", 9)))
+    println("subset_sum(30): " + to_string(opt.subset_sum("3,34,4,12,5,2", 30)))
+    println("knapsack(50): " + to_string(opt.knapsack("10,60,20,100,30,120", 50)))
+    println("lis: " + to_string(opt.lis("10,9,2,5,3,7,101,18")))
+
+    println("---")
+    var pass: bool = true
+    pass = pass && ms[0] == 0 && ms[9] == 9 && ms[5] == 5
+    pass = pass && qs[0] == 0 && qs[9] == 9
+    pass = pass && opt.max_subarray("-2,1,-3,4,-1,2,1,-5,4") == 6
+    pass = pass && opt.n_queens(7) == 40 && opt.n_queens(4) == 2
+    pass = pass && opt.subset_sum("3,34,4,12,5,2", 9) == 1
+    pass = pass && opt.subset_sum("3,34,4,12,5,2", 30) == 0
+    pass = pass && opt.knapsack("10,60,20,100,30,120", 50) == 220
+    pass = pass && opt.lis("10,9,2,5,3,7,101,18") == 4
+    if pass {
+        println("PASS")
+    } else {
+        println("FAIL")
+    }
+}

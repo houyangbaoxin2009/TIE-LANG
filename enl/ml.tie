@@ -1,0 +1,363 @@
+// tie:library
+// ml.tie：扩展库——机器学习（命名空间 ml，D6）
+// 内容：线性 SVM（感知机式，二分类）+ 决策树（ID3 简化版，二分类）。
+// 接口：训练数据用**逗号分隔字符串序列**传参（特征与标签），模型用局部
+// 表存储（感知机权重表 / 决策树节点表）。有状态应用层（训练产生模型）。
+// 表参数元素类型静态未知 → 全部局部表 + 字符串序列（同 std/enl 库模式）。
+
+namespace ml {
+// ================= 线性 SVM（感知机式，二分类） =================
+//
+// 训练：权重 w + 偏置 b 迭代更新——对每个误分类样本 w += η*y*x, b += η*y。
+// 特征 x 为 f64 序列；标签 y ∈ {-1, +1}。迭代 n 轮收敛。
+// 模型：返回权重序列字符串（w1,w2,...,wn,b）。
+
+// 感知机训练：xs（特征序列，每行 n 个特征逗号分隔，共 m 行）、
+// ys（标签序列，±1 共 m 个）、n（特征数）、m（样本数）、iters（迭代轮数）、
+// lr（学习率）。返回模型串 "w1,w2,...,wn,b"。
+pub func svm_train(xs_s: string, ys_s: string, n: i64, m: i64, iters: i64, lr: f64) -> string {
+    var xs = parse_f64(xs_s)
+    var ys = parse_i64(ys_s)
+    // 权重 w[0..n-1] + 偏置 b（索引 n）
+    var w = table_new_f64()
+    var i: i64 = 0
+    while i <= n {
+        table_push(w, 0.0)
+        i = i + 1
+    }
+    var it: i64 = 0
+    while it < iters {
+        var s: i64 = 0
+        while s < m {
+            // 计算决策：y*(w·x + b)
+            var dot: f64 = w[n]
+            var f: i64 = 0
+            while f < n {
+                dot = dot + w[f] * xs[s * n + f]
+                f = f + 1
+            }
+            var label = ys[s]
+            // 误分类：label * dot <= 0 → 更新
+            if to_f64(label) * dot <= 0.0 {
+                // w += lr * label * x；b += lr * label
+                var f2: i64 = 0
+                while f2 < n {
+                    w[f2] = w[f2] + lr * to_f64(label) * xs[s * n + f2]
+                    f2 = f2 + 1
+                }
+                w[n] = w[n] + lr * to_f64(label)
+            }
+            s = s + 1
+        }
+        it = it + 1
+    }
+    // 序列化模型（内联拼接）
+    var res: string = ""
+    var ri: i64 = 0
+    while ri <= n {
+        if ri > 0 {
+            res = res + ","
+        }
+        res = res + to_string(w[ri])
+        ri = ri + 1
+    }
+    return res
+}
+
+// 感知机预测：model（svm_train 返回的模型串）、x（特征序列 n 个）。
+// 返回 +1 / -1。
+pub func svm_predict(model_s: string, x_s: string, n: i64) -> i64 {
+    var model = parse_f64(model_s)
+    var x = parse_f64(x_s)
+    var dot: f64 = model[n]
+    var f: i64 = 0
+    while f < n {
+        dot = dot + model[f] * x[f]
+        f = f + 1
+    }
+    if dot >= 0.0 {
+        return 1
+    }
+    return -1
+}
+
+// ================= 决策树（ID3 简化版，二分类） =================
+//
+// 训练：逐特征找信息增益最大的切分点（二分裂），递归构建——tie 递归受限，
+// 用迭代 + 节点表存储：node_feat（特征索引）、node_thresh（阈值）、
+// node_left/node_right（子节点索引）、node_label（叶标签 -2 非叶）。
+// 数据：m 行 × n 维特征 + m 个标签（±1）。
+// 简化：单特征二分裂（阈值 = 特征均值附近），深度限制防过度。
+
+// 决策树训练：返回模型串（节点表序列化）。
+// 格式："feat1,thresh1,left1,right1,label1,feat2,..." 每个节点 5 个数。
+pub func tree_train(xs_s: string, ys_s: string, n: i64, m: i64, depth: i64) -> string {
+    var xs = parse_f64(xs_s)
+    var ys = parse_i64(ys_s)
+    // 节点表（并行）
+    var node_feat = table_new_i64()
+    var node_thresh = table_new_f64()
+    var node_left = table_new_i64()
+    var node_right = table_new_i64()
+    var node_label = table_new_i64()
+    // 节点 0：根（初始 label = 多数类）
+    table_push(node_feat, 0)
+    table_push(node_thresh, 0.0)
+    table_push(node_left, -1)
+    table_push(node_right, -1)
+    table_push(node_label, majority_vote(ys_s, m))
+    // 迭代建树：队列（节点索引 + 样本范围 + 深度）——用「样本子集」近似：
+    // 简化实现：贪心单层分割（选信息增益最大特征），递归用节点表模拟。
+    // 首版：构建深度 1 的桩树（stump）+ 叶标签。
+    // —— 更实用：用「多数投票 + 单特征阈值」的简单决策桩，深度由调用方控制。
+    // 这里实现完整 ID3（递归用显式栈）：
+    var stack = table_new_i64()
+    // 栈元素：节点索引（处理顺序），样本集合用「范围」表示（简化：全体样本）
+    // —— 简化：每次分裂用全部样本（非精确 ID3 子集），深度限制控制。
+    table_push(stack, 0)
+    var depth_map = table_new_i64()
+    table_push(depth_map, 0)
+    var head: i64 = 0
+    while head < len(stack) && head < 100 {
+        var node = stack[head]
+        var d = depth_map[head]
+        head = head + 1
+        // 达到深度限制 → 叶（跳过分裂）
+        if d < depth {
+            // 找最佳分裂特征（简化增益 = 分类正确率提升）
+            var best_feat: i64 = -1
+            var best_gain: f64 = -1.0
+            var best_thresh: f64 = 0.0
+            var f: i64 = 0
+            while f < n {
+                // 阈值 = 特征均值
+                var sum: f64 = 0.0
+                var s: i64 = 0
+                while s < m {
+                    sum = sum + xs[s * n + f]
+                    s = s + 1
+                }
+                var thresh = sum / to_f64(m)
+                // 简化增益：按阈值二分后，正确分类数 / m（越大越好）
+                var correct: i64 = 0
+                var s2: i64 = 0
+                while s2 < m {
+                    var pred: i64 = -1
+                    if xs[s2 * n + f] <= thresh {
+                        pred = -1
+                    } else {
+                        pred = 1
+                    }
+                    if pred == ys[s2] {
+                        correct = correct + 1
+                    }
+                    s2 = s2 + 1
+                }
+                var gain = to_f64(correct) / to_f64(m)
+                if gain > best_gain {
+                    best_gain = gain
+                    best_feat = f
+                    best_thresh = thresh
+                }
+                f = f + 1
+            }
+            if best_feat >= 0 {
+                // 更新当前节点为分裂节点
+                node_feat[node] = best_feat
+                node_thresh[node] = best_thresh
+                // 创建左右子节点
+                var l_idx = len(node_feat)
+        table_push(node_feat, 0)
+        table_push(node_thresh, 0.0)
+        table_push(node_left, -1)
+        table_push(node_right, -1)
+        table_push(node_label, 0)
+        var r_idx = len(node_feat)
+        table_push(node_feat, 0)
+        table_push(node_thresh, 0.0)
+        table_push(node_left, -1)
+        table_push(node_right, -1)
+        table_push(node_label, 0)
+        // 左右子节点 label = 各自多数类（按阈值划分样本）
+                var lc: i64 = 0
+                var rc: i64 = 0
+                var s2: i64 = 0
+                while s2 < m {
+                    if xs[s2 * n + best_feat] <= best_thresh {
+                        if ys[s2] == 1 {
+                            lc = lc + 1
+                        } else {
+                            lc = lc - 1
+                        }
+                    } else {
+                        if ys[s2] == 1 {
+                            rc = rc + 1
+                        } else {
+                            rc = rc - 1
+                        }
+                    }
+                    s2 = s2 + 1
+                }
+                node_label[l_idx] = majority_sign(lc)
+                node_label[r_idx] = majority_sign(rc)
+                node_left[node] = l_idx
+                node_right[node] = r_idx
+                // 入队子节点（深度+1）
+                table_push(stack, l_idx)
+                table_push(depth_map, d + 1)
+                table_push(stack, r_idx)
+                table_push(depth_map, d + 1)
+            }
+        }
+    }
+    // 序列化节点表："feat,thresh,left,right,label" 每节点 5 值
+    var res: string = ""
+    var ri: i64 = 0
+    while ri < len(node_feat) {
+        if ri > 0 {
+            res = res + ","
+        }
+        res = res + to_string(node_feat[ri]) + "," + to_string(node_thresh[ri]) + "," + to_string(node_left[ri]) + "," + to_string(node_right[ri]) + "," + to_string(node_label[ri])
+        ri = ri + 1
+    }
+    return res
+}
+
+// 决策树预测：model（tree_train 返回）、x（特征序列 n 个）。返回 ±1。
+pub func tree_predict(model_s: string, x_s: string, n: i64) -> i64 {
+    var model = parse_f64(model_s)
+    var x = parse_f64(x_s)
+    // 从根（节点 0）沿树下降
+    var node: i64 = 0
+    var guard: i64 = 0
+    while guard < 100 {
+        var base = node * 5
+        var feat = to_i64(model[base])
+        var thresh = model[base + 1]
+        var left = to_i64(model[base + 2])
+        var right = to_i64(model[base + 3])
+        var label = to_i64(model[base + 4])
+        if left < 0 {
+            // 叶节点
+            return label
+        }
+        if x[feat] <= thresh {
+            node = left
+        } else {
+            node = right
+        }
+        guard = guard + 1
+    }
+    return 0
+}
+
+// ================= 内部工具 =================
+
+
+
+// 多数符号：lc 累加（+1 计 +1，-1 计 -1），正 → +1，否则 -1。
+func majority_sign(lc: i64) -> i64 {
+    if lc >= 0 {
+        return 1
+    }
+    return -1
+}
+
+// 多数类投票：ys_s 为 ±1 标签序列，返回多数类（+1 或 -1）。
+func majority_vote(ys_s: string, m: i64) -> i64 {
+    var ys = parse_i64(ys_s)
+    var acc: i64 = 0
+    var i: i64 = 0
+    while i < m {
+        acc = acc + ys[i]
+        i = i + 1
+    }
+    return majority_sign(acc)
+}
+
+// 解析逗号分隔 f64 序列。
+pub func parse_f64(s: string) -> table {
+    var result = table_new_f64()
+    var n: i64 = len(s)
+    if n == 0 {
+        return result
+    }
+    var start: i64 = 0
+    var i: i64 = 0
+    while i <= n {
+        var at_end: bool = (i == n)
+        var is_comma: bool = !at_end && str_char(s, i) == ","
+        if at_end || is_comma {
+            var seg = slice(s, start, i)
+            if len(seg) > 0 {
+                table_push(result, parse_float(seg))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// 解析逗号分隔 i64 序列。
+pub func parse_i64(s: string) -> table {
+    var result = table_new_i64()
+    var n: i64 = len(s)
+    if n == 0 {
+        return result
+    }
+    var start: i64 = 0
+    var i: i64 = 0
+    while i <= n {
+        var at_end: bool = (i == n)
+        var is_comma: bool = !at_end && str_char(s, i) == ","
+        if at_end || is_comma {
+            var seg = slice(s, start, i)
+            if len(seg) > 0 {
+                table_push(result, parse_int(seg))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// i64 → f64。
+func to_f64(v: i64) -> f64 {
+    return parse_float(to_string(v))
+}
+
+// f64 → i64（截断）。
+func to_i64(v: f64) -> i64 {
+    return parse_int(to_string(v))
+}
+
+// 截取 s 的 [start, end) 子串。
+func slice(s: string, start: i64, end: i64) -> string {
+    var n: i64 = len(s)
+    var lo: i64 = start
+    if lo < 0 {
+        lo = 0
+    }
+    if lo > n {
+        lo = n
+    }
+    var hi: i64 = end
+    if hi < 0 {
+        hi = 0
+    }
+    if hi > n {
+        hi = n
+    }
+    var result: string = ""
+    var i: i64 = lo
+    while i < hi {
+        result = result + str_char(s, i)
+        i = i + 1
+    }
+    return result
+}
+}
+
+

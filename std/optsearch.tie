@@ -1,0 +1,373 @@
+// tie:library
+// optsearch.tie：标准库——搜索与规划算法（命名空间 opt，D4）
+// 内容：归并排序、快速排序、最大子段和、八皇后、子集和、0-1 背包（DP）、
+// 最长递增子序列（LIS）。
+// 接口约定：序列数据用**逗号分隔字符串**传参（同 linalg/graph 模式，规避
+// tie 表参数元素类型未知）；返回结果为局部 i64/f64 表或标量。
+// 排序用「局部表 + 下标赋值」原地操作（M4 表下标赋值已支持）。
+
+namespace opt {
+// 解析逗号分隔 i64 序列 → 局部 i64 动态表。
+func parse_i64(s: string) -> table {
+    var result = table_new_i64()
+    var n: i64 = len(s)
+    if n == 0 {
+        return result
+    }
+    var start: i64 = 0
+    var i: i64 = 0
+    while i <= n {
+        var at_end: bool = (i == n)
+        var is_comma: bool = !at_end && str_char(s, i) == ","
+        if at_end || is_comma {
+            var seg = slice(s, start, i)
+            if len(seg) > 0 {
+                table_push(result, parse_int(seg))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// 归并排序：返回排序后的 i64 表（升序）。自底向上迭代实现（tie 递归受限）。
+pub func merge_sort(s: string) -> table {
+    var a = parse_i64(s)
+    var n: i64 = len(a)
+    if n <= 1 {
+        return a
+    }
+    // 辅助表（复制一份）
+    var tmp = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(tmp, a[i])
+        i = i + 1
+    }
+    // 自底向上：宽度 1,2,4,... 合并相邻区间
+    var width: i64 = 1
+    while width < n {
+        var lo: i64 = 0
+        while lo < n {
+            var mid = lo + width
+            var hi = lo + 2 * width
+            if mid > n {
+                mid = n
+            }
+            if hi > n {
+                hi = n
+            }
+            // 合并 [lo,mid) 与 [mid,hi) 到 tmp
+            var p: i64 = lo
+            var q: i64 = mid
+            var k: i64 = lo
+            while p < mid && q < hi {
+                if a[p] <= a[q] {
+                    tmp[k] = a[p]
+                    p = p + 1
+                } else {
+                    tmp[k] = a[q]
+                    q = q + 1
+                }
+                k = k + 1
+            }
+            while p < mid {
+                tmp[k] = a[p]
+                p = p + 1
+                k = k + 1
+            }
+            while q < hi {
+                tmp[k] = a[q]
+                q = q + 1
+                k = k + 1
+            }
+            // 复制回 a
+            var c: i64 = lo
+            while c < hi {
+                a[c] = tmp[c]
+                c = c + 1
+            }
+            lo = lo + 2 * width
+        }
+        width = width * 2
+    }
+    return a
+}
+
+// 快速排序（Lomuto 分区，迭代栈模拟）：返回排序后的 i64 表。
+pub func quick_sort(s: string) -> table {
+    var a = parse_i64(s)
+    var n: i64 = len(a)
+    if n <= 1 {
+        return a
+    }
+    // 显式栈（区间 [l,r]）：栈表存 l 和 r 交错
+    var stack = table_new_i64()
+    table_push(stack, 0)
+    table_push(stack, n - 1)
+    // 栈顶指针（head 只增，BFS 式处理）
+    var head: i64 = 0
+    while head < len(stack) {
+        var r = stack[head + 1]
+        var l = stack[head]
+        head = head + 2
+        if l < r {
+            // Lomuto 分区：pivot = a[r]
+            var pivot = a[r]
+            var i = l
+            var j = l
+            while j < r {
+                if a[j] < pivot {
+                    // swap a[i], a[j]
+                    var t = a[i]
+                    a[i] = a[j]
+                    a[j] = t
+                    i = i + 1
+                }
+                j = j + 1
+            }
+            // swap a[i], a[r]
+            var t2 = a[i]
+            a[i] = a[r]
+            a[r] = t2
+            // 入栈左右区间
+            if i - 1 > l {
+                table_push(stack, l)
+                table_push(stack, i - 1)
+            }
+            if i + 1 < r {
+                table_push(stack, i + 1)
+                table_push(stack, r)
+            }
+        }
+    }
+    return a
+}
+
+// 最大子段和（Kadane）：返回最大连续子段和（i64）。
+pub func max_subarray(s: string) -> i64 {
+    var a = parse_i64(s)
+    var n: i64 = len(a)
+    if n == 0 {
+        return 0
+    }
+    var best: i64 = a[0]
+    var cur: i64 = a[0]
+    var i: i64 = 1
+    while i < n {
+        if cur > 0 {
+            cur = cur + a[i]
+        } else {
+            cur = a[i]
+        }
+        if cur > best {
+            best = cur
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// 八皇后：返回 n 皇后解的个数（i64）。回溯 + 列/双对角冲突检查。
+pub func n_queens(n: i64) -> i64 {
+    if n <= 0 {
+        return 0
+    }
+    if n == 1 {
+        return 1
+    }
+    // 列占用：col_used[c]；主对角 r-c+n；副对角 r+c
+    var col_used = table_new_i64()
+    var diag1 = table_new_i64()
+    var diag2 = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(col_used, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < 2 * n {
+        table_push(diag1, 0)
+        table_push(diag2, 0)
+        i = i + 1
+    }
+    // 回溯：行 0..n-1 逐行放皇后
+    var count: i64 = 0
+    // 迭代回溯：queen_col[r] 记录第 r 行皇后列位置
+    var queen_col = table_new_i64()
+    var r: i64 = 0
+    while r < n {
+        table_push(queen_col, -1)
+        r = r + 1
+    }
+    var row: i64 = 0
+    while row >= 0 {
+        // 找当前行下一个可用列
+        var placed: bool = false
+        var c: i64 = queen_col[row] + 1
+        while c < n && !placed {
+            var d1 = row - c + n
+            var d2 = row + c
+            if col_used[c] == 0 && diag1[d1] == 0 && diag2[d2] == 0 {
+                // 放置前：若该行已有旧皇后（换列），先撤销旧列占用
+                if queen_col[row] >= 0 {
+                    var oc = queen_col[row]
+                    col_used[oc] = 0
+                    diag1[row - oc + n] = 0
+                    diag2[row + oc] = 0
+                }
+                // 放置
+                queen_col[row] = c
+                col_used[c] = 1
+                diag1[d1] = 1
+                diag2[d2] = 1
+                placed = true
+            }
+            c = c + 1
+        }
+        if placed {
+            if row == n - 1 {
+                // 最后一行放好 → 一个解
+                count = count + 1
+                // 撤销当前列（回溯）
+                var cc = queen_col[row]
+                col_used[cc] = 0
+                diag1[row - cc + n] = 0
+                diag2[row + cc] = 0
+                queen_col[row] = -1
+                row = row - 1
+            } else {
+                row = row + 1
+            }
+        } else {
+            // 当前行无可用列：回溯（若 row 有皇后则撤销）
+            if queen_col[row] >= 0 {
+                var cc2 = queen_col[row]
+                col_used[cc2] = 0
+                diag1[row - cc2 + n] = 0
+                diag2[row + cc2] = 0
+                queen_col[row] = -1
+            }
+            row = row - 1
+        }
+    }
+    return count
+}
+
+// 子集和：判断是否存在子集和为 target。返回 1（存在）/ 0（不存在）。
+// 用 DP（boolean 表）：dp[s] = 前 i 个数能否凑出 s。
+pub func subset_sum(s: string, target: i64) -> i64 {
+    var a = parse_i64(s)
+    var n: i64 = len(a)
+    if target < 0 {
+        return 0
+    }
+    // dp 表（0..target）
+    var dp = table_new_i64()
+    var i: i64 = 0
+    while i <= target {
+        table_push(dp, 0)
+        i = i + 1
+    }
+    dp[0] = 1 // 空集和 = 0
+    var idx: i64 = 0
+    while idx < n {
+        var s2 = target
+        while s2 >= a[idx] {
+            if dp[s2 - a[idx]] == 1 {
+                dp[s2] = 1
+            }
+            s2 = s2 - 1
+        }
+        idx = idx + 1
+    }
+    return dp[target]
+}
+
+// 0-1 背包：容量 cap，物品 (重量, 价值) 序列 "w1,v1,w2,v2,..."。返回最大价值。
+pub func knapsack(items_s: string, cap: i64) -> i64 {
+    var items = parse_i64(items_s)
+    var count: i64 = len(items) / 2
+    // dp[c] = 容量 c 的最大价值（0..cap）
+    var dp = table_new_i64()
+    var c: i64 = 0
+    while c <= cap {
+        table_push(dp, 0)
+        c = c + 1
+    }
+    var i: i64 = 0
+    while i < count {
+        var w = items[i * 2]
+        var v = items[i * 2 + 1]
+        var c2 = cap
+        while c2 >= w {
+            if dp[c2 - w] + v > dp[c2] {
+                dp[c2] = dp[c2 - w] + v
+            }
+            c2 = c2 - 1
+        }
+        i = i + 1
+    }
+    return dp[cap]
+}
+
+// 最长递增子序列长度（LIS，DP）：返回 i64。
+pub func lis(s: string) -> i64 {
+    var a = parse_i64(s)
+    var n: i64 = len(a)
+    if n == 0 {
+        return 0
+    }
+    // dp[i] = 以 a[i] 结尾的 LIS 长度
+    var dp = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(dp, 1)
+        i = i + 1
+    }
+    var best: i64 = 1
+    var j: i64 = 1
+    while j < n {
+        var k: i64 = 0
+        while k < j {
+            if a[k] < a[j] && dp[k] + 1 > dp[j] {
+                dp[j] = dp[k] + 1
+            }
+            k = k + 1
+        }
+        if dp[j] > best {
+            best = dp[j]
+        }
+        j = j + 1
+    }
+    return best
+}
+
+// 截取 s 的 [start, end) 子串。
+func slice(s: string, start: i64, end: i64) -> string {
+    var n: i64 = len(s)
+    var lo: i64 = start
+    if lo < 0 {
+        lo = 0
+    }
+    if lo > n {
+        lo = n
+    }
+    var hi: i64 = end
+    if hi < 0 {
+        hi = 0
+    }
+    if hi > n {
+        hi = n
+    }
+    var result: string = ""
+    var i: i64 = lo
+    while i < hi {
+        result = result + str_char(s, i)
+        i = i + 1
+    }
+    return result
+}
+}
+

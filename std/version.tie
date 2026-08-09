@@ -1,0 +1,157 @@
+// tie:library
+// version.tie：标准库——semver 版本解析/比较/区间匹配（命名空间 version）
+// 内容：版本号 "x.y.z" 的解析、比较、约束匹配（M6 包管理器依赖解析的底座）。
+// 全部基于基础原语（len/str_char/to_string/parse_int/字符串拼接/循环/分支），
+// 无状态纯函数（同输入同输出），符合 std 定位。
+// 注意 tie 约束：表参数的元素类型静态未知（不能下标读取 i64 表），因此
+// 版本比较不传表，直接对字符串逐段解析比较（parse_int 逐段转数字）。
+// 调用：import 后 version.compare("1.0.0", "1.0.1") / version.satisfies("1.5.0", "^1.2")
+
+namespace version {
+// 版本比较：a < b 返回 -1，a == b 返回 0，a > b 返回 1；任一非法版本串返回 0。
+// 按 semver 主.次.修 三段逐段比较（先主再次再修；缺段视为 0）。
+pub func compare(a: string, b: string) -> i64 {
+    var a1 = segment(a, 1)
+    var a2 = segment(a, 2)
+    var a3 = segment(a, 3)
+    var b1 = segment(b, 1)
+    var b2 = segment(b, 2)
+    var b3 = segment(b, 3)
+    // 任一段非法（-1）→ 版本串非法，返回 0（防御约定）
+    if a1 < 0 || a2 < 0 || a3 < 0 || b1 < 0 || b2 < 0 || b3 < 0 {
+        return 0
+    }
+    // 逐段比较：主版本 → 次版本 → 修订号
+    if a1 < b1 {
+        return -1
+    }
+    if a1 > b1 {
+        return 1
+    }
+    if a2 < b2 {
+        return -1
+    }
+    if a2 > b2 {
+        return 1
+    }
+    if a3 < b3 {
+        return -1
+    }
+    if a3 > b3 {
+        return 1
+    }
+    return 0
+}
+
+// 版本号 v 是否满足约束 constraint。约束语法（M6 包管理器支持的子集）：
+// - 精确："1.0.0"            → v == 1.0.0
+// - 区间："^1.2"             → 1.2.0 <= v < 2.0.0（同主版本的最新次版本兼容）
+// - 下界：">=1.0"            → v >= 1.0.0
+// - 任意："*"                → 恒真
+// 非法约束返回 false（防御约定）。
+pub func satisfies(v: string, constraint: string) -> bool {
+    // 任意版本
+    if constraint == "*" {
+        return true
+    }
+    // 下界约束：>=x.y
+    if starts_with(constraint, ">=") {
+        var lo = slice(constraint, 2, len(constraint))
+        // v >= lo（compare >= 0）
+        return compare(v, lo) >= 0
+    }
+    // 区间约束：^x.y（x.y 起，<x+1.0.0）
+    if starts_with(constraint, "^") {
+        var base = slice(constraint, 1, len(constraint))
+        var major = segment(base, 1)
+        var minor = segment(base, 2)
+        if major < 0 || minor < 0 {
+            return false
+        }
+        // 上界 = (major+1).0.0；下界 = major.minor.0
+        var lo = to_string(major) + "." + to_string(minor) + ".0"
+        var hi_major = to_string(major + 1)
+        var hi = hi_major + ".0.0"
+        // 下界 <= v < 上界
+        return compare(v, lo) >= 0 && compare(v, hi) < 0
+    }
+    // 精确版本
+    return compare(v, constraint) == 0
+}
+
+// 取版本串第 idx 段（1 起：主/次/修）的数值；段缺失视为 0；格式非法返回 -1。
+// 解析：按 '.' 切段（str.split 不可 import 到自身——自备切段）。
+func segment(s: string, idx: i64) -> i64 {
+    var n: i64 = len(s)
+    var seg_start: i64 = 0
+    var seg_no: i64 = 1
+    var i: i64 = 0
+    while i <= n {
+        // 遇到 '.' 或到达串尾 → 一段结束
+        var at_end: bool = (i == n)
+        var is_dot: bool = !at_end && str_char(s, i) == "."
+        if at_end || is_dot {
+            if seg_no == idx {
+                // 提取该段文本并解析为整数
+                var seg_text = slice(s, seg_start, i)
+                // 空段（如 "1..2"）非法
+                if len(seg_text) == 0 {
+                    return -1
+                }
+                return parse_int(seg_text)
+            }
+            seg_no = seg_no + 1
+            seg_start = i + 1
+        }
+        i = i + 1
+    }
+    // 段号超出（如取第 3 段但只有 "1.2"）→ 视为 0（semver 缺段补零约定）
+    if seg_no <= idx {
+        return 0
+    }
+    return -1
+}
+
+// 判断 s 是否以 prefix 开头（自备：不 import str 库）。
+func starts_with(s: string, prefix: string) -> bool {
+    var n: i64 = len(s)
+    var m: i64 = len(prefix)
+    if m > n {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(prefix, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 截取 s 的 [start, end) 子串（越界自动收敛；start>=end 返回空串）。
+func slice(s: string, start: i64, end: i64) -> string {
+    var n: i64 = len(s)
+    var lo: i64 = start
+    if lo < 0 {
+        lo = 0
+    }
+    if lo > n {
+        lo = n
+    }
+    var hi: i64 = end
+    if hi < 0 {
+        hi = 0
+    }
+    if hi > n {
+        hi = n
+    }
+    var result: string = ""
+    var i: i64 = lo
+    while i < hi {
+        result = result + str_char(s, i)
+        i = i + 1
+    }
+    return result
+}
+}

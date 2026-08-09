@@ -1,0 +1,34 @@
+// tie:logic
+import "../std/linalg.tie"
+func main() {
+    var c = linalg.mat_mul("1.0,2.0,3.0,4.0", "5.0,6.0,7.0,8.0", 2)
+    var t = linalg.mat_trans("1.0,2.0,3.0,4.0", 2)
+    var d = linalg.det("2.0,1.0,1.0,3.0", 2)
+    var sol = linalg.gauss("1.0,1.0,1.0,0.0,2.0,5.0,2.0,5.0,-1.0", "6.0,-4.0,27.0", 3)
+    var inv = linalg.mat_inv("2.0,1.0,1.0,3.0", 2)
+    var eig = linalg.eigen_power("2.0,1.0,1.0,2.0", 2, 50)
+    println("mat_mul: " + to_string(c[0]) + " " + to_string(c[1]) + " " + to_string(c[2]) + " " + to_string(c[3]))
+    println("mat_trans: " + to_string(t[0]) + " " + to_string(t[1]) + " " + to_string(t[2]) + " " + to_string(t[3]))
+    println("det: " + to_string(d))
+    println("gauss: " + to_string(sol[0]) + " " + to_string(sol[1]) + " " + to_string(sol[2]))
+    println("mat_inv: " + to_string(inv[0]) + " " + to_string(inv[1]) + " " + to_string(inv[2]) + " " + to_string(inv[3]))
+    println("eigen: " + to_string(eig))
+    var pass: bool = true
+    pass = pass && c[0] == 19.0 && c[1] == 22.0 && c[2] == 43.0 && c[3] == 50.0
+    pass = pass && t[0] == 1.0 && t[1] == 3.0 && t[2] == 2.0 && t[3] == 4.0
+    pass = pass && abs_f(d - 5.0) < 0.01
+    pass = pass && abs_f(sol[0] - 5.0) < 0.01 && abs_f(sol[1] - 3.0) < 0.01 && abs_f(sol[2] + 2.0) < 0.01
+    pass = pass && abs_f(inv[0] - 0.6) < 0.01 && abs_f(inv[3] - 0.4) < 0.01
+    pass = pass && abs_f(eig - 3.0) < 0.05
+    if pass {
+        println("PASS")
+    } else {
+        println("FAIL")
+    }
+}
+func abs_f(v: f64) -> f64 {
+    if v < 0.0 {
+        return -v
+    }
+    return v
+}
