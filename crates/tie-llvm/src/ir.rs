@@ -523,10 +523,13 @@ impl<'p> IrGenerator<'p> {
         self.indent();
 
         // 参数入作用域：方法函数首参按引用绑定（by_ptr，直接使用参数指针，
-        // 字段 GEP 用该地址）；其余参数 alloca + store
+        // 字段 GEP 用该地址）；其余参数 alloca + store。
+        // 表参数（table / table<T>，A1）：LLVM 类型恒为 ptr（动态表指针），
+        // 按 by_ptr 绑定（表操作经 tie_table_* 桥访问），不 alloca。
         let mut scope = HashMap::new();
         for (i, p) in f.params.iter().enumerate() {
-            let ty = self.llvm_ty(&p.ty);
+            let is_table_param = p.ty.is_table();
+            let ty = if is_table_param { "ptr" } else { self.llvm_ty(&p.ty) };
             let pname = mangle(&p.name);
             if method_receiver && i == 0 {
                 // 首参按引用绑定：参数寄存器即对象指针（mangle 已含 % 前缀）
@@ -534,6 +537,17 @@ impl<'p> IrGenerator<'p> {
                     p.name.clone(),
                     VarBind { value: pname, ty, by_ptr: true },
                 );
+                continue;
+            }
+            if is_table_param {
+                // 表参数：与动态表变量同布局——alloca ptr 存表指针，
+                // 表访问路径统一 `load ptr, ptr`（tie_table_at/set/len 桥）。
+                // 若直接绑定参数寄存器，表访问会把它当地址再 load 一层（段错误）。
+                // alloca 就地输出（参数区在 entry 顶部，不能用提升缓冲——会晚于 store）。
+                let alloca = self.new_reg();
+                self.line(&format!("{alloca} = alloca ptr"));
+                self.line(&format!("store ptr {pname}, ptr {alloca}"));
+                scope.insert(p.name.clone(), VarBind { value: alloca, ty: "ptr", by_ptr: false });
                 continue;
             }
             let alloca = self.new_reg();
@@ -4054,7 +4068,8 @@ impl<'p> IrGenerator<'p> {
         match t {
             // 动态表：运行时 {ptr,len,cap} 结构，IR 层以不透明指针持有（与字符串一致）。
             // 定长表（字面量）不经过此路径（gen_table_var 直接按数组类型布局）。
-            TypeSpec::Named(TyKw::Table) => "ptr",
+            // table<T>（A1）：与裸 table 同（编译期元素类型不影响 LLVM 表示）。
+            TypeSpec::Named(TyKw::Table) | TypeSpec::Table(_) => "ptr",
             TypeSpec::Named(_) => t.llvm_ty(),
             TypeSpec::Tuple(fields) => {
                 let inner: Vec<&str> = fields.iter().map(|f| self.llvm_ty(&f.ty)).collect();
@@ -4154,6 +4169,7 @@ fn type_name_of(t: &TypeSpec) -> &'static str {
         },
         TypeSpec::Tuple(_) => "元组",
         TypeSpec::Struct(_) => "struct",
+        TypeSpec::Table(_) => "table<T>",
     }
 }
 

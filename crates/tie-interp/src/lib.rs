@@ -3534,6 +3534,8 @@ fn value_matches_ty(v: &Value, ty: &TypeSpec) -> bool {
         TypeSpec::Named(TyKw::Char) => matches!(v, Value::Char(_)),
         TypeSpec::Named(TyKw::Str) => matches!(v, Value::Str(_)),
         TypeSpec::Named(TyKw::Table) => matches!(v, Value::Table(_)),
+        // table<T>（A1）：与裸 table 同（case 类型匹配按动态表）
+        TypeSpec::Table(_) => matches!(v, Value::Table(_)),
         TypeSpec::Named(TyKw::Void) => matches!(v, Value::Void),
         // 宽类型（类别框）：num 接受 Int/Float；text 接受 Str/Char；misc 接受其余
         TypeSpec::Named(TyKw::Num) => matches!(v, Value::Int(_) | Value::Float(_)),
@@ -3700,6 +3702,23 @@ mod tests {
         // 未匹配标签：循环层不消费 → 传播到顶层 → 防御性错误
         let err = ev("while true { break nope; }").unwrap_err();
         assert!(err.contains("只能出现在循环体内"), "错误：{err}");
+    }
+
+    // ---------- A1：table<T> 类型参数（解释路径） ----------
+
+    #[test]
+    fn eval_table元素类型参数() {
+        // table<i64> 参数：函数内下标访问 + len + 遍历（动态表）。
+        // ev() 每次新建会话，注册函数需在同一 Session 内完成——用共享会话。
+        let mut s = Session::new();
+        let _ = s.eval("func sum(t: table<i64>) -> i64 {\n    var s = 0\n    var i = 0\n    while i < len(t) {\n        s = s + t[i]\n        i = i + 1\n    }\n    return s\n}");
+        assert_eq!(s.eval("sum([10, 20, 30])").unwrap(), "60");
+        // 动态表变量传给 table<i64> 参数
+        assert_eq!(s.eval("var d = table_new_i64()\ntable_push(d, 5)\ntable_push(d, 15)\nsum(d)").unwrap(), "20");
+        // table<string> 参数：下标读取字符串元素
+        let reg = s.eval("func join(t: table<string>) -> string {\n    var out = \"\"\n    var i = 0\n    while i < len(t) {\n        if i > 0 { out = out + \",\"; }\n        out = out + t[i]\n        i = i + 1\n    }\n    return out\n}");
+        assert!(reg.is_ok(), "join 注册失败：{}", reg.unwrap_err());
+        assert_eq!(s.eval("join([\"a\", \"b\", \"c\"])").unwrap(), "a,b,c");
     }
 
     #[test]

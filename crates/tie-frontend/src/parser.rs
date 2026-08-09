@@ -742,6 +742,12 @@ impl<'a> Parser<'a> {
             TokenKind::TypeKw(ty) => {
                 let ty = *ty;
                 self.advance();
+                // table<T>（A1）：表类型后跟 <元素类型> → 带元素类型的表
+                if ty == TyKw::Table && self.eat(&TokenKind::Lt) {
+                    let elem = self.parse_type()?;
+                    self.expect(TokenKind::Gt, "表元素类型后需 '>'")?;
+                    return Ok(TypeSpec::Table(Box::new(elem)));
+                }
                 Ok(TypeSpec::Named(ty))
             }
             // 元组类型：`(i64, string)` / `(x: i64, y: i64)`

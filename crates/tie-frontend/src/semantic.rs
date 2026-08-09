@@ -669,17 +669,18 @@ impl Analyzer {
                 });
             }
         }
-        // 表参数：按「动态字符串表」登记布局元数据（M2 无泛型，约定 table<string>）。
-        // 使函数体内可对表参数做 for 遍历 / len / table_at / 下标访问（如 std/json.tie
-        // 的 json_array/json_object 消费调用方传入的序列化片段表）。元素类型固定为 string，
-        // 与动态表（table_new_*）的 table_vars 布局结构一致。
+        // 表参数：按「动态表」登记布局元数据（A1）。`table<T>` 用声明的元素类型 T；
+        // `table` 裸类型约定为字符串表（M2 无泛型时代的兼容默认）。
+        // 使函数体内可对表参数做 for 遍历 / len / table_at / 下标访问，元素类型确定。
         for p in &f.params {
-            if p.ty == TypeSpec::Named(TyKw::Table) {
-                let info = TableInfo {
-                    elem_ty: TypeSpec::Named(TyKw::Str),
-                    len: 0,
-                    dynamic: true,
-                };
+            if p.ty.is_table() {
+                // 元素类型：table<T> 用 T；裸 table 默认 string（兼容历史约定）
+                let elem_ty = p
+                    .ty
+                    .table_elem_ty()
+                    .cloned()
+                    .unwrap_or(TypeSpec::Named(TyKw::Str));
+                let info = TableInfo { elem_ty, len: 0, dynamic: true };
                 // 键用 cur_fn 全名（命名空间函数 = 路径::函数名），与 IR 层查询一致；
                 // 用裸名 f.name 会导致命名空间函数内下标访问查不到布局元数据。
                 self.table_vars
@@ -1146,7 +1147,7 @@ impl Analyzer {
                 // for var in iter：iter 应为范围（默认 i64 元素）或表（元素类型）
                 let iter_ty = self.infer_expr(&f.iter, scope)?;
                 self.result.expr_types.insert(addr_of(&f.iter), iter_ty.clone());
-                let elem_ty = if iter_ty == TypeSpec::Named(TyKw::Table) {
+                let elem_ty = if iter_ty.is_table() {
                     // 表遍历：循环变量类型 = 表的元素类型
                     match &f.iter {
                         Expr::Var(name) => {
@@ -1451,6 +1452,50 @@ impl Analyzer {
         Ok(())
     }
 
+    /// 实参表达式的表元素类型（A1）：表字面量查 tables 元数据；表变量查
+    /// table_vars；返回表的函数调用查 table_ret_elems；非表实参返回 None。
+    fn arg_table_elem_ty(
+        &self,
+        expr: &Expr,
+        scope: &HashMap<String, TypeSpec>,
+    ) -> Result<Option<TypeSpec>, SemanticError> {
+        match expr {
+            // 表字面量：元素类型来自布局元数据（check_stmt 已登记）
+            Expr::TableLit { .. } => Ok(self
+                .result
+                .tables
+                .get(&addr_of(expr))
+                .map(|info| info.elem_ty.clone())),
+            // 表变量：动态表（table_new_* 构造）查 table_vars；定长表查 tables
+            Expr::Var(name) => {
+                let key = (self.cur_fn.clone(), name.clone());
+                if let Some(info) = self.table_vars.get(&key) {
+                    return Ok(Some(info.elem_ty.clone()));
+                }
+                Ok(scope
+                    .get(name)
+                    .filter(|t| t.is_table())
+                    .map(|_| TypeSpec::Named(TyKw::Str)))
+            }
+            // 返回表的函数调用（裸调用/命名空间调用）：查 table_ret_elems
+            Expr::Call { name, .. } | Expr::MethodCall { receiver: _, method: name, .. } => {
+                let full = self
+                    .result
+                    .resolved_calls
+                    .get(&addr_of(expr))
+                    .cloned()
+                    .unwrap_or_else(|| name.clone());
+                match self.result.table_ret_elems.get(&full) {
+                    Some(Some(elem)) => Ok(Some(elem.clone())),
+                    // 未知元素类型：放行（编译路径按动态表处理；校验留给运行时）
+                    Some(None) => Ok(None),
+                    None => Ok(None),
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// break/continue 的循环上下文校验（E1+E5）：
     /// - 无标签：必须在任意循环内（loop_labels 非空）；
     /// - 带标签：标签必须匹配当前某个外层/内层循环的标签（从栈顶向内查找）。
@@ -1592,10 +1637,8 @@ impl Analyzer {
                     if matches!(&args[0], Expr::TableLit { .. }) {
                         return Ok(TypeSpec::Named(TyKw::I64));
                     }
-                    // 表变量（scope 类型为 Table）或字符串
-                    if matches!(&at, TypeSpec::Named(TyKw::Table))
-                        || matches!(&at, TypeSpec::Named(TyKw::Str))
-                    {
+                    // 表变量（scope 类型为 Table / table<T>，A1）或字符串
+                    if at.is_table() || matches!(&at, TypeSpec::Named(TyKw::Str)) {
                         return Ok(TypeSpec::Named(TyKw::I64));
                     }
                     return Err(SemanticError {
@@ -2620,6 +2663,22 @@ impl Analyzer {
                                 type_name(&at)
                             ),
                         });
+                    }
+                    // A1：形参 table<T> 的元素类型校验——实参表字面量/动态表变量/
+                    // 返回表的调用，其元素类型须与 T 一致（裸 table 形参不校验）
+                    if let TypeSpec::Table(want_elem) = want
+                        && let Some(got_elem) = self.arg_table_elem_ty(a, scope)?
+                    {
+                        if !types_compatible(want_elem, &got_elem) {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!(
+                                    "调用 '{call_name}' 表参数元素类型不匹配：期望 table<{}>，实际 table<{}>",
+                                    type_name(want_elem),
+                                    type_name(&got_elem)
+                                ),
+                            });
+                        }
                     }
                     self.result.expr_types.insert(addr_of(a), at);
                 }
@@ -3788,6 +3847,11 @@ fn types_compatible(a: &TypeSpec, b: &TypeSpec) -> bool {
             x.len() == y.len()
                 && x.iter().zip(y).all(|(xf, yf)| types_compatible(&xf.ty, &yf.ty))
         }
+        // 表（A1）：裸 table 与 table<T> 互相兼容；table<T1> 与 table<T2> 元素兼容。
+        // 元素类型精确校验在实参检查处（arg_table_elem_ty）单独进行。
+        (TypeSpec::Named(TyKw::Table), TypeSpec::Table(_))
+        | (TypeSpec::Table(_), TypeSpec::Named(TyKw::Table)) => true,
+        (TypeSpec::Table(x), TypeSpec::Table(y)) => types_compatible(x, y),
         _ => a == b,
     }
 }
@@ -3847,7 +3911,9 @@ fn types_match(want: &TypeSpec, got: &TypeSpec, init: Option<&Expr>) -> bool {
         Some(Expr::BoolLit(_)) => matches!(want, TypeSpec::Named(TyKw::Trit)),
         // 表字面量可传给 table 参数（元素类型与长度由字面量布局元数据记录，
         // IR/解释路径按布局访问；如 tcmsg::error.no_file(["zh-cn","en-us"])）
-        Some(Expr::TableLit { .. }) => matches!(want, TypeSpec::Named(TyKw::Table)),
+        // A1：形参 table<T> 的元素类型校验在调用点（check_call 处）按元数据查表，
+        // 此处仅放行「表 → 表」的形态匹配。
+        Some(Expr::TableLit { .. }) => matches!(want, TypeSpec::Named(TyKw::Table) | TypeSpec::Table(_)),
         _ => false,
     }
 }
@@ -3970,6 +4036,7 @@ fn type_name(t: &TypeSpec) -> &'static str {
         TypeSpec::Named(k) => k.as_str(),
         TypeSpec::Tuple(_) => "tuple",
         TypeSpec::Struct(name) => Box::leak(name.clone().into_boxed_str()),
+        TypeSpec::Table(elem) => Box::leak(format!("table<{}>", type_name(elem)).into_boxed_str()),
     }
 }
 
@@ -3995,6 +4062,46 @@ mod tests {
             err.message,
             keyword
         );
+    }
+
+    // ---------- A1：table<T> 类型参数 ----------
+
+    #[test]
+    fn table元素类型参数登记布局元数据() {
+        // 表参数 table<i64>：函数内可下标读取（元素类型 i64 静态确定）
+        let sem = analyze_src(
+            "func sum(t: table<i64>) -> i64 {\n    var s: i64 = 0\n    var i: i64 = 0\n    while i < len(t) {\n        s = s + t[i]\n        i = i + 1\n    }\n    return s\n}\nfunc main() {}\n",
+        ).expect("table<i64> 参数应通过语义检查");
+        // 参数登记进 table_vars，元素类型 = i64
+        let info = sem.table_vars.get(&("sum".to_string(), "t".to_string())).expect("应有布局元数据");
+        assert!(info.dynamic, "表参数应为动态表");
+        assert_eq!(info.elem_ty, TypeSpec::Named(TyKw::I64));
+    }
+
+    #[test]
+    fn table元素类型不匹配报错() {
+        // 字符串表字面量传给 table<i64> 参数 → 编译期报错
+        expect_err(
+            "func sum(t: table<i64>) -> i64 {\n    return 0\n}\nfunc main() {\n    sum([\"a\", \"b\"])\n}\n",
+            "表参数元素类型不匹配",
+        );
+        // i64 表字面量传给 table<string> 参数 → 报错
+        expect_err(
+            "func join(t: table<string>) -> string {\n    return \"\"\n}\nfunc main() {\n    join([1, 2])\n}\n",
+            "表参数元素类型不匹配",
+        );
+    }
+
+    #[test]
+    fn table裸类型兼容table元素类型() {
+        // 裸 table 形参可接受任意表实参（兼容旧约定，不校验元素类型）
+        analyze_src(
+            "func len_of(t: table) -> i64 {\n    return len(t)\n}\nfunc main() {\n    len_of([1, 2, 3])\n    len_of([\"a\"])\n}\n",
+        ).expect("裸 table 形参应接受任意表实参");
+        // table<T> 形参可接受裸 table 变量实参（元素类型校验由动态表布局提供）
+        analyze_src(
+            "func sum(t: table<i64>) -> i64 {\n    return 0\n}\nfunc main() {\n    var d = table_new_i64()\n    sum(d)\n}\n",
+        ).expect("table<i64> 形参应接受 table_new_i64 动态表");
     }
 
     #[test]

@@ -1,0 +1,47 @@
+// A1 table<T> 类型参数验证：函数内对表参数下标访问/遍历（元素类型静态确定）
+// 此前表参数元素类型静态未知——函数内无法 t[i] 下标读取，只能字符串序列传参。
+
+// 求和：参数声明 table<i64>，函数内可直接下标读取
+func sum_i64(t: table<i64>) -> i64 {
+    var s: i64 = 0
+    var i: i64 = 0
+    while i < len(t) {
+        s = s + t[i]
+        i = i + 1
+    }
+    return s
+}
+
+// 遍历表参数（for x in t，元素类型 i64）
+func dump_i64(t: table<i64>) {
+    for x in t {
+        println(x)
+    }
+}
+
+// 字符串表参数：直接下标读取（此前仅字符串序列传参可绕行）
+func join_strings(t: table<string>) -> string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < len(t) {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + t[i]
+        i = i + 1
+    }
+    return out
+}
+
+func main() {
+    // 表字面量传给 table<i64> 参数
+    println(sum_i64([10, 20, 30]))
+    dump_i64([1, 2, 3])
+    // 动态表变量传给 table<i64> 参数
+    var d = table_new_i64()
+    table_push(d, 5)
+    table_push(d, 15)
+    println(sum_i64(d))
+    // 字符串表参数
+    println(join_strings(["a", "b", "c"]))
+}

@@ -188,6 +188,8 @@ pub fn ty_to_str(ty: &TypeSpec) -> String {
                 .join(", ");
             format!("({inner})")
         }
+        // table<T>（A1）：带元素类型的表类型
+        TypeSpec::Table(elem) => format!("table<{}>", ty_to_str(elem)),
     }
 }
 

@@ -18,6 +18,10 @@ pub enum TypeSpec {
     Tuple(Vec<TupleField>),
     /// struct 类型（用户自定义数据结构，纯数据：只含字段）
     Struct(String),
+    /// 带元素类型的表类型 `table<T>`（A1）：T 为元素类型（i64/f64/string/bool）。
+    /// 编译期概念（与 `table` 裸类型同语义），元素类型供表参数/动态表的布局推断——
+    /// 函数内对表参数 `t[i]` 下标访问/遍历据此确定元素类型。
+    Table(Box<TypeSpec>),
 }
 
 /// 元组的一个字段：可选字段名 + 类型（名字进类型，供 `.x` 命名访问）。
@@ -70,6 +74,10 @@ impl TypeSpec {
             TypeSpec::Struct(_) => {
                 unreachable!("struct 类型映射为字面结构体，需由 IR 生成器的 llvm_ty 包装处理（含泄漏与缓存）")
             }
+            // table<T>（A1）：编译期概念，与 table 裸类型一致
+            TypeSpec::Table(_) => {
+                unreachable!("table<T> 是编译期类型，语义分析阶段应已展开为动态表指针")
+            }
         }
     }
 
@@ -98,9 +106,17 @@ impl TypeSpec {
         matches!(self, TypeSpec::Named(k) if k.is_wide())
     }
 
-    /// 是否为表类型（table，代表数组与高级数组）。
+    /// 是否为表类型（table，代表数组与高级数组；含 table<T>，A1）。
     pub fn is_table(&self) -> bool {
-        matches!(self, TypeSpec::Named(TyKw::Table))
+        matches!(self, TypeSpec::Named(TyKw::Table) | TypeSpec::Table(_))
+    }
+
+    /// 表元素类型：table<T> 返回 T；table 裸类型返回 None（约定为 string 由语义层补充）。
+    pub fn table_elem_ty(&self) -> Option<&TypeSpec> {
+        match self {
+            TypeSpec::Table(elem) => Some(elem),
+            _ => None,
+        }
     }
 
     /// 宽类型是否接受某个具体类型（类别框的归属判断）。
