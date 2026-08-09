@@ -6,10 +6,10 @@
 //! 本解析器只处理清理后的正文源码。
 
 use super::ast::{
-    AssignStmt, BinaryOp, ClassField, Expr, ExprStmt, FieldAssignStmt, FnDefStmt, ForStmt,
-    IfStmt, ImportStmt, IndexAssignStmt, NamespaceStmt, Param, Program, ReturnStmt, Stmt,
-    StructDefStmt, SwitchCase, SwitchStmt, TableCell, TableId, TupleField, TypeSpec, UnaryOp,
-    UsingStmt, VarDeclStmt, WhileStmt,
+    AssignStmt, BinaryOp, BreakStmt, ClassField, ContinueStmt, Expr, ExprStmt, FieldAssignStmt,
+    FnDefStmt, ForStmt, IfStmt, ImportStmt, IndexAssignStmt, NamespaceStmt, Param, Program,
+    ReturnStmt, Stmt, StructDefStmt, SwitchCase, SwitchStmt, TableCell, TableId, TupleField,
+    TypeSpec, UnaryOp, UsingStmt, VarDeclStmt, WhileStmt,
 };
 use super::lexer::{Span, Token, TokenKind, TyKw};
 use std::fmt;
@@ -248,10 +248,26 @@ impl<'a> Parser<'a> {
                 self.parse_var_decl(true).map(|ds| ds.into_iter().map(Stmt::VarDecl).collect())
             }
             TokenKind::If => Ok(vec![Stmt::If(self.parse_if()?)]),
-            TokenKind::While => Ok(vec![Stmt::While(self.parse_while()?)]),
-            TokenKind::For => Ok(vec![Stmt::For(self.parse_for()?)]),
+            TokenKind::While => Ok(vec![Stmt::While(self.parse_while(None)?)]),
+            TokenKind::For => Ok(vec![Stmt::For(self.parse_for(None)?)]),
             TokenKind::Switch => Ok(vec![Stmt::Switch(self.parse_switch()?)]),
             TokenKind::Return => Ok(vec![Stmt::Return(self.parse_return()?)]),
+            TokenKind::Break => Ok(vec![Stmt::Break(self.parse_loop_jump(false)?)]),
+            TokenKind::Continue => {
+                let b = self.parse_loop_jump(true)?;
+                Ok(vec![Stmt::Continue(ContinueStmt { label: b.label, span: b.span })])
+            }
+            // 循环标签（E5）：`L: while cond { }` / `L: for x in ... { }`——
+            // 语句开头的「标识符 + 冒号」只可能是循环标签，转发到带标签解析
+            TokenKind::Ident(_) if self.is_loop_label_ahead() => {
+                let label = self.expect_ident()?; // 已确认是标识符，直接取名
+                let _ = self.advance(); // 冒号
+                match self.peek_kind() {
+                    TokenKind::While => Ok(vec![Stmt::While(self.parse_while(Some(label))?)]),
+                    TokenKind::For => Ok(vec![Stmt::For(self.parse_for(Some(label))?)]),
+                    _ => Err(self.err(format!("标签 '{label}' 后必须是 while 或 for"))),
+                }
+            }
             TokenKind::LBrace => {
                 // 裸块（后续版本），此处按语法错误处理
                 Err(self.err("函数体内不能有裸代码块".into()))
@@ -564,22 +580,59 @@ impl<'a> Parser<'a> {
         Ok(IfStmt { cond, then_branch, else_branch, span })
     }
 
-    /// `while cond { }`。
-    fn parse_while(&mut self) -> Result<WhileStmt, ParseError> {
+    /// `while cond { }`（label 为循环标签，E5）。
+    fn parse_while(&mut self, label: Option<String>) -> Result<WhileStmt, ParseError> {
         let span = self.advance().span; // while
         let cond = self.parse_expr()?;
         let body = self.parse_block()?;
-        Ok(WhileStmt { cond, body, span })
+        Ok(WhileStmt { cond, body, label, span })
     }
 
-    /// `for var in expr { }`。
-    fn parse_for(&mut self) -> Result<ForStmt, ParseError> {
+    /// `for var in expr { }`（label 为循环标签，E5）。
+    fn parse_for(&mut self, label: Option<String>) -> Result<ForStmt, ParseError> {
         let span = self.advance().span; // for
         let var = self.expect_ident()?;
         self.expect(TokenKind::In, "'in'")?;
         let iter = self.parse_expr()?;
         let body = self.parse_block()?;
-        Ok(ForStmt { var, iter, body, span })
+        Ok(ForStmt { var, iter, body, label, span })
+    }
+
+    /// 探测「循环标签前缀」：当前 token 是标识符，且后跟冒号再后跟 while/for（E5）。
+    ///
+    /// 语句开头的 `标识符 : while/for` 只可能是循环标签（变量声明的冒号前是 var
+    /// 关键字，表达式语句的冒号无合法场景），因此可安全判定。
+    fn is_loop_label_ahead(&self) -> bool {
+        let Some(TokenKind::Colon) = self.tokens.get(self.pos + 1).map(|t| &t.kind) else {
+            return false;
+        };
+        matches!(
+            self.tokens.get(self.pos + 2).map(|t| &t.kind),
+            Some(TokenKind::While | TokenKind::For)
+        )
+    }
+
+    /// `break` / `continue` 语句（E1+E5）：可选标签 `break L` / `continue L`。
+    /// `is_continue` 区分两个关键字（仅用于构造对应语句类型，解析逻辑一致）。
+    fn parse_loop_jump(&mut self, is_continue: bool) -> Result<BreakStmt, ParseError> {
+        let kw = if is_continue { "continue" } else { "break" };
+        let span = self.advance().span; // break / continue
+        // 可选标签：后跟标识符且再后跟分号/行尾 → 带标签跳转
+        let label = match self.peek_kind() {
+            TokenKind::Ident(name) if matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::Semi | TokenKind::Eof | TokenKind::RBrace)
+            ) => Some(name.clone()),
+            _ => None,
+        };
+        if let Some(_) = &label {
+            self.advance(); // 消费标签标识符
+        }
+        self.expect(TokenKind::Semi, "语句结束符")?;
+        // break 与 continue 共用同一结构（仅类型语义不同），此处统一返回 BreakStmt，
+        // 调用方按 is_continue 包成 ContinueStmt
+        let _ = kw;
+        Ok(BreakStmt { label, span })
     }
 
     /// `switch subject { case 值[, 值]... [when 条件]: 语句… default: 语句… }`。
@@ -1982,5 +2035,39 @@ mod tests {
             Expr::Unary { op: UnaryOp::PostDec, operand, .. }
                 if matches!(operand.as_ref(), Expr::Var(n) if n == "y")
         ));
+    }
+
+    // ---------- E1+E5：break/continue + 标签跳转解析 ----------
+
+    #[test]
+    fn break_continue解析为循环跳转语句() {
+        let prog = parse("func main() {\n    while true {\n        break\n        continue\n    }\n}\n");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::While(w) = &f.body[0] else { panic!("期望 while 语句") };
+        assert!(matches!(w.body[0], Stmt::Break(_)), "break 应解析为 Stmt::Break");
+        assert!(matches!(w.body[1], Stmt::Continue(_)), "continue 应解析为 Stmt::Continue");
+    }
+
+    #[test]
+    fn break_continue带标签解析() {
+        let prog = parse("func main() {\n    outer: while true {\n        break outer\n        continue outer\n    }\n}\n");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::While(w) = &f.body[0] else { panic!("期望 while 语句") };
+        assert_eq!(w.label.as_deref(), Some("outer"), "循环标签应解析为 outer");
+        let Stmt::Break(b) = &w.body[0] else { panic!("期望 break 语句") };
+        assert_eq!(b.label.as_deref(), Some("outer"), "break 标签应解析为 outer");
+        let Stmt::Continue(c) = &w.body[1] else { panic!("期望 continue 语句") };
+        assert_eq!(c.label.as_deref(), Some("outer"), "continue 标签应解析为 outer");
+    }
+
+    #[test]
+    fn 标签后非循环报错() {
+        // 只有「标识符 : while/for」才被识别为循环标签；其他场景走表达式解析并报错
+        let err = parse_err("func main() {\n    foo: bar = 1\n}\n");
+        assert!(
+            err.message.contains("无法") || err.message.contains("期望"),
+            "错误：{}",
+            err.message
+        );
     }
 }

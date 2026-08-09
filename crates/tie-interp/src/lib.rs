@@ -119,6 +119,19 @@ pub extern "C" fn tie_str_char(s: *const c_char, i: i64) -> *mut c_char {
     string_to_c_char(ch.map(|c| c.to_string()).unwrap_or_default())
 }
 
+/// C ABI 桥：字符串的 Unicode 码点数（按字符计数，非字节）。
+///
+/// 与 [tie_str_char] 的码点索引语义对齐：`len` 返回 UTF-8 字节数（`s.len()`），
+/// 而 `str_char` 按码点取字符——两者对纯 ASCII 一致，对中文等多字节字符
+/// （UTF-8 一个汉字 3 字节）字节数 > 码点数，混用会错位（trim 尾随空白
+/// 无法去除、slice 边界错位）。`tie_str_len` 提供码点数，供 tie 字符串库
+/// （prep/core.tie、std/string.tie）做码点级遍历的边界。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_str_len(s: *const c_char) -> i64 {
+    let s = unsafe { c_char_to_string(s).unwrap_or_default() };
+    s.chars().count() as i64
+}
+
 /// C ABI 桥：i64 → 十进制字符串（与 Rust `{}` 默认格式一致）。
 #[unsafe(no_mangle)]
 pub extern "C" fn tie_to_string_i64(v: i64) -> *mut c_char {
@@ -1445,6 +1458,19 @@ impl Session {
                         _ => unreachable!(),
                     });
                 }
+                // break/continue 传播到顶层：语义层已拦截（循环外报错），此处防御
+                Flow::Break(l) => {
+                    return Err(format!(
+                        "break{}只能出现在循环体内",
+                        l.map(|x| format!(" {x} ")).unwrap_or_else(|| " ".into())
+                    ))
+                }
+                Flow::Continue(l) => {
+                    return Err(format!(
+                        "continue{}只能出现在循环体内",
+                        l.map(|x| format!(" {x} ")).unwrap_or_else(|| " ".into())
+                    ))
+                }
             }
         }
         // 正常结束：返回最后表达式语句的值（void/纯声明 → 空串）
@@ -1504,6 +1530,15 @@ impl Session {
             Flow::Normal(Some(v)) => Ok(v.to_repl_string()),
             Flow::Normal(None) => Ok(String::new()),
             Flow::Return(v) => Ok(v.to_repl_string()),
+            // break/continue 传播到 eval_call 顶层：语义层已拦截，防御性报错
+            Flow::Break(l) => Err(format!(
+                "break{}只能出现在循环体内",
+                l.map(|x| format!(" {x} ")).unwrap_or_else(|| " ".into())
+            )),
+            Flow::Continue(l) => Err(format!(
+                "continue{}只能出现在循环体内",
+                l.map(|x| format!(" {x} ")).unwrap_or_else(|| " ".into())
+            )),
         }
     }
 
@@ -1562,12 +1597,16 @@ impl Session {
     }
 }
 
-/// 语句执行的控制流结果：正常（可能带最后表达式值）或 return。
+/// 语句执行的控制流结果：正常（可能带最后表达式值）、return 或循环跳转（E1+E5）。
 enum Flow {
     /// 正常结束：Option 是最后一条表达式语句的值
     Normal(Option<Value>),
     /// return 语句：携带返回值
     Return(Value),
+    /// break 语句：退出指定循环（None = 最近循环；Some = 标签循环，E5）
+    Break(Option<String>),
+    /// continue 语句：跳指定循环的下一次迭代（None = 最近循环；Some = 标签循环，E5）
+    Continue(Option<String>),
 }
 
 /// 求值环境：作用域栈 + 指向 Session 的借用。
@@ -1679,11 +1718,13 @@ impl<'a> Env<'a> {
             }
             Stmt::Return(r) => {
                 let val = match &r.expr {
-                    Some(e) => self.eval_expr(e)?,
-                    None => Value::Void,
+                    Some(e) => self.eval_expr(e)?,                    None => Value::Void,
                 };
                 Ok(Flow::Return(val))
             }
+            // break/continue 语句（E1+E5）：返回携带标签的控制流，由循环层消费/传播
+            Stmt::Break(b) => Ok(Flow::Break(b.label.clone())),
+            Stmt::Continue(c) => Ok(Flow::Continue(c.label.clone())),
             Stmt::If(i) => {
                 let cond = self.eval_expr(&i.cond)?;
                 if cond.is_truthy()? {
@@ -1694,10 +1735,24 @@ impl<'a> Env<'a> {
             }
             Stmt::While(w) => {
                 let mut last = None;
-                while self.eval_expr(&w.cond)?.is_truthy()? {
+                'while_loop: while self.eval_expr(&w.cond)?.is_truthy()? {
                     match self.exec_block(&w.body)? {
                         Flow::Normal(v) => last = v,
                         flow @ Flow::Return(_) => return Ok(flow),
+                        // break：无标签（作用于本循环）或标签匹配本循环 → 退出；
+                        // 标签不匹配 → 继续向上传播（E5）
+                        Flow::Break(l) => {
+                            if l.is_none() || l.as_deref() == w.label.as_deref() {
+                                break 'while_loop;
+                            }
+                            return Ok(Flow::Break(l));
+                        }
+                        Flow::Continue(l) => {
+                            if l.is_none() || l.as_deref() == w.label.as_deref() {
+                                continue 'while_loop;
+                            }
+                            return Ok(Flow::Continue(l));
+                        }
                     }
                 }
                 Ok(Flow::Normal(last))
@@ -1705,6 +1760,37 @@ impl<'a> Env<'a> {
             Stmt::For(f) => {
                 let iter = self.eval_expr(&f.iter)?;
                 let mut last = None;
+                // 统一循环体执行 → 跳转判定（break/continue 标签匹配本循环才消费）
+                let mut step = |body_flow: Result<Flow, String>, last: &mut Option<Value>,
+                                outer: &mut Flow| -> Result<bool, String> {
+                    match body_flow? {
+                        Flow::Normal(v) => {
+                            *last = v;
+                            Ok(true) // 继续下一次迭代
+                        }
+                        flow @ Flow::Return(_) => {
+                            *outer = flow;
+                            Ok(false) // 结束循环，向上传播 return
+                        }
+                        Flow::Break(l) => {
+                            if l.is_none() || l.as_deref() == f.label.as_deref() {
+                                Ok(false) // 结束循环，正常退出
+                            } else {
+                                *outer = Flow::Break(l);
+                                Ok(false) // 标签不匹配，向上传播
+                            }
+                        }
+                        Flow::Continue(l) => {
+                            if l.is_none() || l.as_deref() == f.label.as_deref() {
+                                Ok(true) // 继续下一次迭代
+                            } else {
+                                *outer = Flow::Continue(l);
+                                Ok(false) // 标签不匹配，向上传播
+                            }
+                        }
+                    }
+                };
+                let mut outer = Flow::Normal(None);
                 match iter {
                     Value::Range(start, end) => {
                         for i in start..end {
@@ -1712,9 +1798,8 @@ impl<'a> Env<'a> {
                             self.scopes.last_mut().unwrap().insert(f.var.clone(), Value::Int(i));
                             let flow = self.exec_block(&f.body);
                             self.scopes.pop();
-                            match flow? {
-                                Flow::Normal(v) => last = v,
-                                flow @ Flow::Return(_) => return Ok(flow),
+                            if !step(flow, &mut last, &mut outer)? {
+                                break;
                             }
                         }
                     }
@@ -1726,15 +1811,19 @@ impl<'a> Env<'a> {
                             self.scopes.last_mut().unwrap().insert(f.var.clone(), item);
                             let flow = self.exec_block(&f.body);
                             self.scopes.pop();
-                            match flow? {
-                                Flow::Normal(v) => last = v,
-                                flow @ Flow::Return(_) => return Ok(flow),
+                            if !step(flow, &mut last, &mut outer)? {
+                                break;
                             }
                         }
                     }
                     _ => return Err("for 的迭代对象必须是范围（0..10）".into()),
                 }
-                Ok(Flow::Normal(last))
+                // 若循环被带标签的跳转传播终止，继续上抛；否则正常结束
+                if matches!(outer, Flow::Break(_) | Flow::Continue(_) | Flow::Return(_)) {
+                    Ok(outer)
+                } else {
+                    Ok(Flow::Normal(last))
+                }
             }
             Stmt::Switch(s) => {
                 // switch 模式匹配（与编译路径语义一致）：
@@ -1801,7 +1890,11 @@ impl<'a> Env<'a> {
                     }
                     match self.exec_block(&c.body)? {
                         Flow::Normal(v) => last = v,
-                        flow @ Flow::Return(_) => return Ok(flow),
+                        // return/break/continue 均向上传播（break 跳出 switch 外层循环时
+                        // 由循环层消费；无循环时语义层已拦截）
+                        flow @ (Flow::Return(_) | Flow::Break(_) | Flow::Continue(_)) => {
+                            return Ok(flow)
+                        }
                     }
                     matched = true;
                     break;
@@ -1810,7 +1903,9 @@ impl<'a> Env<'a> {
                 if !matched {
                     match self.exec_block(&s.default_body)? {
                         Flow::Normal(v) => last = v,
-                        flow @ Flow::Return(_) => return Ok(flow),
+                        flow @ (Flow::Return(_) | Flow::Break(_) | Flow::Continue(_)) => {
+                            return Ok(flow)
+                        }
                     }
                 }
                 Ok(Flow::Normal(last))
@@ -1888,14 +1983,15 @@ impl<'a> Env<'a> {
         Ok((name.clone(), cells, idx))
     }
 
-    /// 执行语句块（压一层作用域），return 向上传播。
+    /// 执行语句块（压一层作用域），return/break/continue 向上传播。
     fn exec_block(&mut self, body: &[Stmt]) -> Result<Flow, String> {
         self.scopes.push(std::collections::HashMap::new());
         let mut last = None;
         for stmt in body {
             match self.exec_stmt(stmt)? {
                 Flow::Normal(v) => last = v,
-                flow @ Flow::Return(_) => {
+                // return/break/continue 都是控制流跳转：出块并向上传播
+                flow @ (Flow::Return(_) | Flow::Break(_) | Flow::Continue(_)) => {
                     self.scopes.pop();
                     return Ok(flow);
                 }
@@ -2348,6 +2444,18 @@ impl<'a> Env<'a> {
                     Value::Str(s) => Ok(Value::Int(s.len() as i64)),
                     Value::Table(cells) => Ok(Value::Int(cells.len() as i64)),
                     _ => Err("len 只支持字符串或表".into()),
+                }
+            }
+            "str_len" => {
+                // 字符串的 Unicode 码点数（与 len 的字节数语义区分）。
+                // tie 字符串库按码点遍历（str_char 码点索引），边界必须用码点数，
+                // 否则中文等多字节字符会错位（trim 尾随空白无法去除等）。
+                if args.len() != 1 {
+                    return Err("str_len 需要一个参数".into());
+                }
+                match &args[0] {
+                    Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
+                    _ => Err("str_len 只支持字符串".into()),
                 }
             }
             // ---------- 动态表构造/读取内置函数 ----------
@@ -3319,6 +3427,15 @@ impl<'a> Env<'a> {
                         Flow::Normal(Some(v)) => Ok(v),
                         Flow::Normal(None) => Ok(Value::Void),
                         Flow::Return(v) => Ok(v),
+                        // break/continue 不应逃出函数体（语义层已保证循环内消费），防御性报错
+                        Flow::Break(l) => Err(format!(
+                            "break{}逃出函数体（内部错误）",
+                            l.map(|x| format!(" {x} ")).unwrap_or_else(|| " ".into())
+                        )),
+                        Flow::Continue(l) => Err(format!(
+                            "continue{}逃出函数体（内部错误）",
+                            l.map(|x| format!(" {x} ")).unwrap_or_else(|| " ".into())
+                        )),
                     }
                 } else {
                     Err(format!("未定义的函数 '{name}'"))
@@ -3532,6 +3649,57 @@ mod tests {
     /// 便捷求值：新会话 + eval。
     fn ev(code: &str) -> Result<String, String> {
         Session::new().eval(code)
+    }
+
+    // ---------- E1+E5：break/continue + 标签跳转（解释路径） ----------
+
+    #[test]
+    fn eval_break_continue() {
+        // ev 对「顶层定义」走注册路径，普通语句自动包装为 func main 执行；
+        // println 直写 stdout 不返回，故用「最后表达式返回值」断言。
+        // 单行须显式分号（ASI 只在换行补）。
+        // break 提前退出 while → 返回 3
+        let code = "var i = 0; while true { i = i + 1; if i == 3 { break; } } i";
+        assert_eq!(ev(code).unwrap(), "3");
+        // continue 跳过当前迭代（收集 1 3 4）
+        let code = "var s = \"\"; var i = 0; while i < 4 { i = i + 1; if i == 2 { continue; } s = s + to_string(i); } s";
+        assert_eq!(ev(code).unwrap(), "134");
+        // for 循环 break（0..5 遇 3 停 → 0 1 2）
+        let code = "var s = \"\"; for i in 0..5 { if i == 3 { break; } s = s + to_string(i); } s";
+        assert_eq!(ev(code).unwrap(), "012");
+        // for 循环 continue（0..5 跳过 2 → 0 1 3 4）
+        let code = "var s = \"\"; for i in 0..5 { if i == 2 { continue; } s = s + to_string(i); } s";
+        assert_eq!(ev(code).unwrap(), "0134");
+        // 表遍历 continue（1 3）
+        let code = "var s = \"\"; var t = [1, 2, 3]; for x in t { if x == 2 { continue; } s = s + to_string(x); } s";
+        assert_eq!(ev(code).unwrap(), "13");
+    }
+
+    #[test]
+    fn eval_break_continue_label() {
+        // 标签 break：跳出双层嵌套 for（E5）→ 0 1 2 10
+        let code = "var s = \"\"; outer: for a in 0..3 { for b in 0..3 { if a == 1 && b == 1 { break outer; } s = s + to_string(a * 10 + b); } } s";
+        assert_eq!(ev(code).unwrap(), "01210");
+        // 标签 continue：continue L 跳外层循环下一次迭代（内层循环被中断，
+        // 每轮 a 只执行 b==0 一次 → 3 轮 × 1 = 3）
+        let code = "var n = 0; outer: for a in 0..3 { for b in 0..3 { if b == 1 { continue outer; } n = n + 1; } } n";
+        assert_eq!(ev(code).unwrap(), "3");
+        // 标签 while（continue L 跳外层 while 条件判断）
+        let code = "var total = 0; var x = 0; outerw: while x < 5 { x = x + 1; var y = 0; while y < 5 { y = y + 1; if y == 3 { continue outerw; } total = total + 1; } } total";
+        assert_eq!(ev(code).unwrap(), "10");
+    }
+
+    #[test]
+    fn eval_break_continue_outside_loop_err() {
+        // REPL 路径（eval 不做语义检查）：break/continue 传播到顶层 → 防御性错误。
+        // 编译路径（tie-frontend semantic）在语义层拦截，见 frontend 侧测试。
+        let err = ev("break;").unwrap_err();
+        assert!(err.contains("只能出现在循环体内"), "错误：{err}");
+        let err = ev("continue;").unwrap_err();
+        assert!(err.contains("只能出现在循环体内"), "错误：{err}");
+        // 未匹配标签：循环层不消费 → 传播到顶层 → 防御性错误
+        let err = ev("while true { break nope; }").unwrap_err();
+        assert!(err.contains("只能出现在循环体内"), "错误：{err}");
     }
 
     #[test]
@@ -4619,6 +4787,23 @@ to_string(n) + ":" + names"#
         assert_eq!(ev("len([\"a\", \"b\"])").unwrap(), "2");
         // len(字符串) 保持原行为（字节数）
         assert_eq!(ev("len(\"hello\")").unwrap(), "5");
+    }
+
+    #[test]
+    fn builtin_str_len() {
+        // str_len(字符串)：Unicode 码点数（chars().count）——中文"你好"2 个码点
+        assert_eq!(ev("str_len(\"你好\")").unwrap(), "2");
+        assert_eq!(ev("str_len(\"hello\")").unwrap(), "5");
+        // "你好，世界" = 5 个码点（你 好 ， 世 界）
+        assert_eq!(ev("str_len(\"你好，世界\")").unwrap(), "5");
+        assert_eq!(ev("str_len(\"\")").unwrap(), "0");
+        // 语义区分：len 是字节数（中文 6 字节），str_len 是码点数（2）
+        assert_eq!(ev("len(\"你好\")").unwrap(), "6");
+        // 与 str_char 码点索引一致：str_char(s, str_len(s)-1) 是最后一个码点
+        assert_eq!(ev("str_char(\"你好\", str_len(\"你好\") - 1)").unwrap(), "好");
+        // 非字符串参数报错
+        let err = ev("str_len(42)").unwrap_err();
+        assert!(err.contains("str_len"), "错误应提及 str_len: {err}");
     }
 
     #[test]

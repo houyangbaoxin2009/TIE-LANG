@@ -111,6 +111,7 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
         ns_stack: Vec::new(),
         import_views: Vec::new(),
         using_prefixes: Vec::new(),
+        loop_labels: Vec::new(),
     };
 
     // 第零遍：收集顶层 import / using 语句，构建导入视图（M2.1.7）。
@@ -331,6 +332,9 @@ struct Analyzer {
     /// using 引入的命名空间前缀（M2.1.7）：`using fmt2;` 之后，该命名空间的
     /// 公有函数可裸名调用（裸调用解析的第三候选）。
     using_prefixes: Vec<Vec<String>>,
+    /// 循环标签栈（E5）：当前嵌套循环的标签（从外到内）。break/continue 的
+    /// 标签跳转校验据此查找目标；无标签 break/continue 作用于栈顶循环。
+    loop_labels: Vec<Option<String>>,
 }
 
 /// 一条 import 引入的视图信息（M2.1.7 单文件命名空间）。
@@ -1130,10 +1134,15 @@ impl Analyzer {
                         message: "while 条件必须是 bool".into(),
                     });
                 }
+                // 循环标签入栈（E5）：body 内 break L/continue L 可跳转到此循环
+                self.loop_labels.push(w.label.clone());
                 self.check_block(&w.body, scope, ret_ty)?;
+                self.loop_labels.pop();
                 Ok(())
             }
-            Stmt::For(f) => {
+            // break/continue（E1+E5）：必须在循环内；带标签的必须能找到匹配循环
+            Stmt::Break(b) => self.check_loop_jump(b.label.as_deref(), b.span, "break"),
+            Stmt::Continue(c) => self.check_loop_jump(c.label.as_deref(), c.span, "continue"),            Stmt::For(f) => {
                 // for var in iter：iter 应为范围（默认 i64 元素）或表（元素类型）
                 let iter_ty = self.infer_expr(&f.iter, scope)?;
                 self.result.expr_types.insert(addr_of(&f.iter), iter_ty.clone());
@@ -1171,7 +1180,10 @@ impl Analyzer {
                     });
                 };
                 scope.insert(f.var.clone(), elem_ty);
+                // 循环标签入栈（E5）：body 内 break L/continue L 可跳转到此循环
+                self.loop_labels.push(f.label.clone());
                 self.check_block(&f.body, scope, ret_ty)?;
+                self.loop_labels.pop();
                 Ok(())
             }
             Stmt::Switch(s) => {
@@ -1439,6 +1451,39 @@ impl Analyzer {
         Ok(())
     }
 
+    /// break/continue 的循环上下文校验（E1+E5）：
+    /// - 无标签：必须在任意循环内（loop_labels 非空）；
+    /// - 带标签：标签必须匹配当前某个外层/内层循环的标签（从栈顶向内查找）。
+    fn check_loop_jump(
+        &self,
+        label: Option<&str>,
+        span: Span,
+        kw: &str,
+    ) -> Result<(), SemanticError> {
+        match label {
+            // 无标签：作用于最近循环，要求处于循环体内
+            None => {
+                if self.loop_labels.is_empty() {
+                    return Err(SemanticError {
+                        span,
+                        message: format!("{kw} 只能出现在循环体内"),
+                    });
+                }
+                Ok(())
+            }
+            // 带标签：从栈顶向内查找匹配标签（最近优先）
+            Some(l) => {
+                if !self.loop_labels.iter().any(|x| x.as_deref() == Some(l)) {
+                    return Err(SemanticError {
+                        span,
+                        message: format!("{kw} 的标签 '{l}' 未匹配任何外层循环"),
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// 表达式类型推断（同时检查）。
     fn infer_expr(
         &mut self,
@@ -1557,6 +1602,26 @@ impl Analyzer {
                         span: expr_span_of(&args[0]),
                         message: format!("len() 参数必须是字符串或表，实际是 {}", type_name(&at)),
                     });
+                }
+                // 内置函数 str_len：单字符串参数，返回 i64（字符串的 Unicode 码点数）。
+                // 与 len（UTF-8 字节数）区分：str_char 按码点索引，码点级遍历必须用
+                // str_len 做边界，否则中文等多字节字符会错位。表用 len（元素数）。
+                if name == "str_len" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("str_len() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("str_len() 参数必须是字符串，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::I64));
                 }
                 // 内置函数 table_new_*：零参数，创建空动态表，返回 table。
                 // 元素类型由函数名决定（i64/f64/string/bool），运行时 {ptr,len,cap} 结构。
@@ -3665,6 +3730,8 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::If(i) => i.span,
         Stmt::While(w) => w.span,
         Stmt::For(f) => f.span,
+        Stmt::Break(b) => b.span,
+        Stmt::Continue(c) => c.span,
         Stmt::Switch(s) => s.span,
         Stmt::Import(i) => i.span,
         Stmt::Namespace(n) => n.span,

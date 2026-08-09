@@ -63,6 +63,10 @@ pub enum TokenKind {
     For,
     In,
     Return,
+    /// 循环提前退出 `break`（E1；可选标签 `break L`，E5）
+    Break,
+    /// 循环跳下一次迭代 `continue`（E1；可选标签 `continue L`，E5）
+    Continue,
     /// 多分支选择 `switch`
     Switch,
     /// switch 分支 `case`
@@ -776,6 +780,9 @@ impl<'a> Lexer<'a> {
             "for" => TokenKind::For,
             "in" => TokenKind::In,
             "return" => TokenKind::Return,
+            // 循环控制（E1+E5）：break/continue，支持可选标签 `break L` / `continue L`
+            "break" => TokenKind::Break,
+            "continue" => TokenKind::Continue,
             "switch" => TokenKind::Switch,
             "case" => TokenKind::Case,
             "default" => TokenKind::Default,

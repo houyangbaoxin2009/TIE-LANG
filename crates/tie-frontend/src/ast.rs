@@ -146,6 +146,10 @@ pub enum Stmt {
     While(WhileStmt),
     /// for 循环（`for x in 0..10` / `for x in arr`）
     For(ForStmt),
+    /// break 语句（E1；`break` / `break L`，E5 标签跳转）
+    Break(BreakStmt),
+    /// continue 语句（E1；`continue` / `continue L`，E5 标签跳转）
+    Continue(ContinueStmt),
     /// switch 多分支选择
     Switch(SwitchStmt),
     /// import 导入其他 tie 文件（`import "./x.tie" [as 别名]`，仅顶层）
@@ -345,6 +349,8 @@ pub struct IfStmt {
 pub struct WhileStmt {
     pub cond: Expr,
     pub body: Vec<Stmt>,
+    /// 循环标签（E5：`L: while cond { }`），break L / continue L 跳转目标
+    pub label: Option<String>,
     pub span: Span,
 }
 
@@ -355,6 +361,24 @@ pub struct ForStmt {
     /// 迭代对象（`0..10` 会解析为 RangeExpr）
     pub iter: Expr,
     pub body: Vec<Stmt>,
+    /// 循环标签（E5：`L: for x in ...`），break L / continue L 跳转目标
+    pub label: Option<String>,
+    pub span: Span,
+}
+
+/// break 语句：`break` 退出最近循环 / `break L` 退出标签 L 的循环（E5）。
+#[derive(Debug, Clone)]
+pub struct BreakStmt {
+    /// 目标循环标签；None = 最近一层循环
+    pub label: Option<String>,
+    pub span: Span,
+}
+
+/// continue 语句：`continue` 跳最近循环下一次迭代 / `continue L` 跳标签 L 的循环（E5）。
+#[derive(Debug, Clone)]
+pub struct ContinueStmt {
+    /// 目标循环标签；None = 最近一层循环
+    pub label: Option<String>,
     pub span: Span,
 }
 

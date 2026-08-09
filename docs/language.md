@@ -299,7 +299,32 @@ while cond { }                              // 循环
 for i in 0..10 { }                          // 范围循环
 for item in arr { }                         // 集合循环
 return expr                                 // 返回值（可省略分号）
+break                                       // 退出最近循环（E1）
+continue                                    // 跳最近循环的下一次迭代（E1）
 ```
+
+### 5.1 break / continue 与循环标签（E1+E5）
+
+**break**：立即退出所在循环（while/for），继续执行循环之后的语句。
+**continue**：跳过本次迭代剩余语句，进入循环的下一次迭代——while 重新判断条件；
+for 先执行步进（自增）再判断条件。
+
+**循环标签（E5）**：给循环命名后，`break L` / `continue L` 可跳出/跳过多层嵌套循环：
+
+```c
+outer: for a in 0..10 {                     // 标签 outer
+    for b in 0..10 {
+        if b == 5 { break outer }           // 直接跳出两层循环
+        if b == 2 { continue outer }        // 跳到外层 for 的下一次迭代（内层重置）
+    }
+}
+```
+
+- 标签语法：`标识符: while/for …`（语句开头的 `标识符 : while|for` 才被识别为循环标签）；
+- 无标签 `break` / `continue` 作用于最近一层循环；
+- 带标签跳转：标签必须匹配某个外层循环（从内向外查找，编译期校验，未匹配报错）；
+- `break` / `continue` 只能出现在循环体内（编译期报错）；
+- switch 分支天然自动退出（无 fallthrough），分支内无需 break。
 
 ### 5.1 switch 多分支（M1 已实现；模式匹配增强 M2 后）
 
@@ -550,6 +575,8 @@ namespace Dog {
 | `for`       | 遍历（范围/集合）                | `for i in 0..10 { }`         |
 | `in`        | `for` 的遍历对象              | `for item in arr { }`        |
 | `return`    | 函数返回                     | `return a + b`               |
+| `break`     | 退出循环（E1；可带标签）          | `break` / `break outer`      |
+| `continue`  | 跳循环下一次迭代（E1；可带标签）     | `continue` / `continue outer` |
 | `switch`    | 多分支（M1 已实现）              | `switch n { case 1: }`       |
 | `case`      | switch 分支（值/区间/类型匹配，可多值） | `case 1, 2:` / `case 3..7:`  |
 | `default`   | switch 默认分支（可省略）         | `default:`                   |

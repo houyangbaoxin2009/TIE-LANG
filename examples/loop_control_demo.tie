@@ -1,0 +1,71 @@
+// break/continue + 标签跳转验证（E1+E5）
+// 覆盖：break 退出循环、continue 跳下次迭代、标签 break L/continue L 跳出嵌套循环
+
+func main() {
+    // 1) continue 跳过偶数，只打印奇数（0..10 → 1 3 5 7 9）
+    var i: i64 = 0
+    while i < 10 {
+        i = i + 1
+        if i % 2 == 0 {
+            continue
+        }
+        println(i)
+    }
+
+    // 2) break 提前退出：找到 5 后停
+    var j: i64 = 0
+    while j < 100 {
+        j = j + 1
+        if j == 5 {
+            break
+        }
+    }
+    println(j)
+
+    // 3) for 循环 continue（0..5 跳过 2）
+    for k in 0..5 {
+        if k == 2 {
+            continue
+        }
+        println(k)
+    }
+
+    // 4) for 循环 break
+    for m in 0..5 {
+        if m == 3 {
+            break
+        }
+        println(m)
+    }
+
+    // 5) 标签跳转：outer 标签跳出双层嵌套 for（E5）
+    var found: i64 = 0
+    outer: for a in 0..10 {
+        for b in 0..10 {
+            if a == 3 && b == 4 {
+                break outer
+            }
+            if b == 2 {
+                continue outer
+            }
+            found = found + 1
+        }
+    }
+    println(found)
+
+    // 6) 标签 while（E5）：continue L 跳外层 while 的条件判断
+    var total: i64 = 0
+    var x: i64 = 0
+    outerw: while x < 5 {
+        x = x + 1
+        var y: i64 = 0
+        while y < 5 {
+            y = y + 1
+            if y == 3 {
+                continue outerw
+            }
+            total = total + 1
+        }
+    }
+    println(total)
+}

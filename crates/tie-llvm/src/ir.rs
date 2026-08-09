@@ -73,6 +73,9 @@ struct IrGenerator<'p> {
     used_externs: Vec<String>,
     /// 当前所在函数
     cur_fn: String,
+    /// 循环跳转上下文栈（E1+E5）：break/continue 的目标 label。元素 = (标签, continue 目标, exit 目标)。
+    /// continue 目标：while 为条件块（跳到下次条件判断）；for 为自增块（跳到步进处）。
+    loop_ctx: Vec<(Option<String>, String, String)>,
 }
 
 /// IR 生成入口：程序 AST + 语义结果 → LLVM IR 文本。
@@ -89,6 +92,7 @@ pub fn gen_ir(program: &Program, sem: &SemanticResult) -> Result<IrOutput, IrErr
         ty_cache: HashMap::new(),
         used_externs: Vec::new(),
         cur_fn: String::new(),
+        loop_ctx: Vec::new(),
     };
     generator.run()?;
     Ok(IrOutput { ir: generator.out, used_externs: generator.used_externs })
@@ -205,6 +209,9 @@ impl<'p> IrGenerator<'p> {
         }
         if self.used_externs.iter().any(|s| s == "tie_str_char") {
             self.out.push_str("declare ptr @tie_str_char(ptr, i64)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_str_len") {
+            self.out.push_str("declare i64 @tie_str_len(ptr)\n");
         }
         if self.used_externs.iter().any(|s| s == "tie_to_string_i64") {
             self.out.push_str("declare ptr @tie_to_string_i64(i64)\n");
@@ -759,6 +766,20 @@ impl<'p> IrGenerator<'p> {
             Stmt::If(i) => self.gen_if(i),
             Stmt::While(w) => self.gen_while(w),
             Stmt::For(f) => self.gen_for(f),
+            // break/continue（E1+E5）：按循环跳转上下文生成分支跳转。
+            // 无标签 → 最近循环；带标签 → 沿栈查找匹配（语义层已校验存在）。
+            Stmt::Break(b) => {
+                let target = self.find_loop_exit(b.label.as_deref());
+                self.line(&format!("br label %{target}"));
+                self.mark_block_terminated();
+                Ok(())
+            }
+            Stmt::Continue(c) => {
+                let target = self.find_loop_continue(c.label.as_deref());
+                self.line(&format!("br label %{target}"));
+                self.mark_block_terminated();
+                Ok(())
+            }
             Stmt::Switch(s) => self.gen_switch(s),
             Stmt::Struct(_) => {
                 // struct 定义只在顶层做字段类型（collect_structs），IR 阶段不应出现
@@ -1117,6 +1138,8 @@ impl<'p> IrGenerator<'p> {
         let cond_label = self.new_label("loop.cond");
         let body_label = self.new_label("loop.body");
         let exit_label = self.new_label("loop.exit");
+        // 循环跳转上下文入栈（E1+E5）：continue → cond（下次条件判断），break → exit
+        self.loop_ctx.push((w.label.clone(), cond_label.clone(), exit_label.clone()));
         self.line(&format!("br label %{cond_label}"));
 
         self.block_start(&cond_label);
@@ -1130,12 +1153,13 @@ impl<'p> IrGenerator<'p> {
             self.gen_stmt(s)?;
         }
         self.scopes.pop();
-        // 循环体若已以 return 终止，则无需跳回条件块（否则 ret 后产生死代码 br）
+        // 循环体若已以 return/break/continue 终止，则无需跳回条件块（否则 ret/br 后产生死代码）
         if !self.block_terminated() {
             self.line(&format!("br label %{cond_label}"));
         }
         self.block_end();
 
+        self.loop_ctx.pop();
         self.block_start(&exit_label);
         Ok(())
     }
@@ -1181,7 +1205,10 @@ impl<'p> IrGenerator<'p> {
 
         let cond_label = self.new_label("for.cond");
         let body_label = self.new_label("for.body");
+        let step_label = self.new_label("for.step");
         let exit_label = self.new_label("for.exit");
+        // 循环跳转上下文入栈（E1+E5）：continue → step（自增后），break → exit
+        self.loop_ctx.push((f.label.clone(), step_label.clone(), exit_label.clone()));
         self.line(&format!("br label %{cond_label}"));
 
         self.block_start(&cond_label);
@@ -1202,16 +1229,21 @@ impl<'p> IrGenerator<'p> {
             self.gen_stmt(s)?;
         }
         self.scopes.pop();
-        // 循环体若已以 return 终止，跳过自增与回跳（否则 ret 后产生死代码指令）
+        // 循环体若已以 return/break/continue 终止，则无需跳自增块（否则产生死代码指令）
         if !self.block_terminated() {
-            // 自增
-            let next = self.new_reg();
-            self.line(&format!("{next} = add i64 {cur}, 1"));
-            self.line(&format!("store i64 {next}, ptr {var_alloca}"));
-            self.line(&format!("br label %{cond_label}"));
+            self.line(&format!("br label %{step_label}"));
         }
         self.block_end();
 
+        // 自增步进块：continue 的目标
+        self.block_start(&step_label);
+        let next = self.new_reg();
+        self.line(&format!("{next} = add i64 {cur}, 1"));
+        self.line(&format!("store i64 {next}, ptr {var_alloca}"));
+        self.line(&format!("br label %{cond_label}"));
+        self.block_end();
+
+        self.loop_ctx.pop();
         self.block_start(&exit_label);
         Ok(())
     }
@@ -1237,7 +1269,10 @@ impl<'p> IrGenerator<'p> {
 
         let cond_label = self.new_label("for.cond");
         let body_label = self.new_label("for.body");
+        let step_label = self.new_label("for.step");
         let exit_label = self.new_label("for.exit");
+        // 循环跳转上下文入栈（E1+E5）：continue → step（自增后），break → exit
+        self.loop_ctx.push((f.label.clone(), step_label.clone(), exit_label.clone()));
         self.line(&format!("br label %{cond_label}"));
 
         self.block_start(&cond_label);
@@ -1267,16 +1302,21 @@ impl<'p> IrGenerator<'p> {
             self.gen_stmt(s)?;
         }
         self.scopes.pop();
-        // 循环体若已以 return 终止，跳过自增与回跳（否则 ret 后产生死代码指令）
+        // 循环体若已以 return/break/continue 终止，则无需跳自增块（否则产生死代码指令）
         if !self.block_terminated() {
-            // 自增
-            let next = self.new_reg();
-            self.line(&format!("{next} = add i64 {cur}, 1"));
-            self.line(&format!("store i64 {next}, ptr {idx_alloca}"));
-            self.line(&format!("br label %{cond_label}"));
+            self.line(&format!("br label %{step_label}"));
         }
         self.block_end();
 
+        // 自增步进块：continue 的目标
+        self.block_start(&step_label);
+        let next = self.new_reg();
+        self.line(&format!("{next} = add i64 {cur}, 1"));
+        self.line(&format!("store i64 {next}, ptr {idx_alloca}"));
+        self.line(&format!("br label %{cond_label}"));
+        self.block_end();
+
+        self.loop_ctx.pop();
         self.block_start(&exit_label);
         Ok(())
     }
@@ -1309,7 +1349,10 @@ impl<'p> IrGenerator<'p> {
 
         let cond_label = self.new_label("for.cond");
         let body_label = self.new_label("for.body");
+        let step_label = self.new_label("for.step");
         let exit_label = self.new_label("for.exit");
+        // 循环跳转上下文入栈（E1+E5）：continue → step（自增后），break → exit
+        self.loop_ctx.push((f.label.clone(), step_label.clone(), exit_label.clone()));
         self.line(&format!("br label %{cond_label}"));
 
         self.block_start(&cond_label);
@@ -1341,15 +1384,21 @@ impl<'p> IrGenerator<'p> {
             self.gen_stmt(s)?;
         }
         self.scopes.pop();
-        // 循环体若已以 return 终止，跳过自增与回跳（否则 ret 后产生死代码指令）
+        // 循环体若已以 return/break/continue 终止，则无需跳自增块（否则产生死代码指令）
         if !self.block_terminated() {
-            let next = self.new_reg();
-            self.line(&format!("{next} = add i64 {cur}, 1"));
-            self.line(&format!("store i64 {next}, ptr {idx_alloca}"));
-            self.line(&format!("br label %{cond_label}"));
+            self.line(&format!("br label %{step_label}"));
         }
         self.block_end();
 
+        // 自增步进块：continue 的目标
+        self.block_start(&step_label);
+        let next = self.new_reg();
+        self.line(&format!("{next} = add i64 {cur}, 1"));
+        self.line(&format!("store i64 {next}, ptr {idx_alloca}"));
+        self.line(&format!("br label %{cond_label}"));
+        self.block_end();
+
+        self.loop_ctx.pop();
         self.block_start(&exit_label);
         Ok(())
     }
@@ -2392,6 +2441,17 @@ impl<'p> IrGenerator<'p> {
             // 字符串：strlen
             let len = self.new_reg();
             self.line(&format!("{len} = call i64 @strlen(ptr {v})"));
+            return Ok((len, "i64"));
+        }
+        // 内置 str_len：字符串的 Unicode 码点数（与 str_char 码点索引对齐）。
+        // len 返回字节数（strlen），对中文等多字节字符字节数 > 码点数，遍历错位；
+        // str_len 返回码点数（chars().count()），供字符串库做码点级遍历边界。
+        // 语义层已保证单参数为字符串（非表，表用 len）。
+        if name == "str_len" {
+            self.mark_used("tie_str_len");
+            let (v, _t) = self.gen_expr(&args[0])?;
+            let len = self.new_reg();
+            self.line(&format!("{len} = call i64 @tie_str_len(ptr {v})"));
             return Ok((len, "i64"));
         }
         // 内置 table_new_*：零参数，创建空动态表，返回不透明指针（运行时 {ptr,len,cap}）。
@@ -3776,10 +3836,10 @@ impl<'p> IrGenerator<'p> {
         self.out.push('\n');
     }
 
-    /// 判断当前基本块是否已终止（最后一条非空指令是 `ret` 或 `unreachable`）。
+    /// 判断当前基本块是否已终止（最后一条非空指令是 `ret` / `unreachable` / `br`）。
     ///
-    /// 用于分支生成：若分支内已 return（块已终结），不能再追加 `br` 跳转，
-    /// 否则会在 `ret` 后生成死代码指令，LLVM 会报「指令编号不连续」错误。
+    /// 用于分支生成：若分支内已 return 或 break/continue（块已终结），不能再追加 `br`
+    /// 跳转，否则会在 `ret`/`br` 后生成死代码指令，LLVM 会报「指令编号不连续」错误。
     fn block_terminated(&self) -> bool {
         self.out
             .lines()
@@ -3787,9 +3847,44 @@ impl<'p> IrGenerator<'p> {
             .find(|l| !l.trim().is_empty())
             .map(|l| {
                 let t = l.trim();
-                t.starts_with("ret ") || t.starts_with("unreachable")
+                t.starts_with("ret ") || t.starts_with("unreachable") || t.starts_with("br ")
             })
             .unwrap_or(false)
+    }
+
+    /// 查找 break 的跳转目标：无标签 → 最近循环的 exit；带标签 → 沿循环栈匹配（从内向外）。
+    fn find_loop_exit(&self, label: Option<&str>) -> String {
+        match label {
+            None => self.loop_ctx.last().map(|c| c.2.clone()).unwrap_or_default(),
+            Some(l) => self
+                .loop_ctx
+                .iter()
+                .rev()
+                .find(|c| c.0.as_deref() == Some(l))
+                .map(|c| c.2.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// 查找 continue 的跳转目标：无标签 → 最近循环的 continue 目标；
+    /// 带标签 → 沿循环栈匹配（从内向外）。
+    fn find_loop_continue(&self, label: Option<&str>) -> String {
+        match label {
+            None => self.loop_ctx.last().map(|c| c.1.clone()).unwrap_or_default(),
+            Some(l) => self
+                .loop_ctx
+                .iter()
+                .rev()
+                .find(|c| c.0.as_deref() == Some(l))
+                .map(|c| c.1.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// 标记当前块已以 br 终止（供 block_terminated 后续判断；无状态，直接依赖输出缓冲）。
+    fn mark_block_terminated(&mut self) {
+        // block_terminated 已能通过输出缓冲检测 br/ret/unreachable，本方法仅为语义占位
+        let _ = ();
     }
 
     /// 基本块起始：输出标签行。
@@ -4097,6 +4192,52 @@ mod tests {
         gen_ir(&program, &sem).map(|o| o.ir).map_err(|e| format!("IR: {e}"))
     }
 
+    // ---------- E1+E5：break/continue + 标签跳转（IR 生成） ----------
+
+    #[test]
+    fn break_continue生成分支跳转() {
+        // break：while 体内 br 到 loop.exit（break/continue 是简单语句需分号）
+        let ir = 编译("func main() {\n    var i = 0\n    while true {\n        i = i + 1\n        if i == 3 { break; }\n    }\n    println(i)\n}");
+        assert!(ir.contains("br label %loop.exit."), "break 应跳 loop.exit");
+        // continue：while 体内 br 到 loop.cond（下次条件判断）
+        let ir2 = 编译("func main() {\n    var i = 0\n    while i < 10 {\n        i = i + 1\n        if i % 2 == 0 { continue; }\n        println(i)\n    }\n}");
+        assert!(ir2.contains("br label %loop.cond."), "continue 应跳 loop.cond");
+        // for：continue 跳 for.step（自增块），break 跳 for.exit
+        let ir3 = 编译("func main() {\n    for i in 0..10 {\n        if i == 2 { continue; }\n        if i == 8 { break; }\n        println(i)\n    }\n}");
+        assert!(ir3.contains("br label %for.step."), "for 的 continue 应跳 for.step");
+        assert!(ir3.contains("br label %for.exit."), "for 的 break 应跳 for.exit");
+        // for 循环本身生成 step 块（范围遍历）
+        let ir4 = 编译("func main() {\n    for i in 0..3 {\n        if i == 1 { continue; }\n        break;\n    }\n}");
+        assert!(ir4.contains("for.step."), "范围 for 应有 step 块");
+    }
+
+    #[test]
+    fn break_continue_标签跳转() {
+        // 标签 break：break outer 跳外层 for 的 exit
+        let ir = 编译("func main() {\n    outer: for a in 0..3 {\n        for b in 0..3 {\n            if a == 1 && b == 1 { break outer; }\n            println(a * 10 + b)\n        }\n    }\n}");
+        // 外层循环 exit 块应存在，且 break outer 的 br 指向它（无法直接断言目标名，
+        // 断言外层 for.exit 块与 break 的 br 同时出现；str::matches 是子串匹配非正则）
+        assert!(ir.contains("for.exit."), "外层循环应有 exit 块");
+        assert!(ir.matches("br label %for.exit.").count() >= 1, "应有 br 到外层 exit");
+        // 标签 continue：continue outer 跳外层 for 的 step
+        let ir2 = 编译("func main() {\n    var n = 0\n    outer: for a in 0..3 {\n        for b in 0..3 {\n            if b == 1 { continue outer; }\n            n = n + 1\n        }\n    }\n    println(n)\n}");
+        assert!(ir2.matches("for.step.").count() >= 2, "内外两层 for 都应有 step 块");
+    }
+
+    #[test]
+    fn break_continue_循环外报错() {
+        // 语义层拦截：循环外 break/continue
+        let err = 管道("func main() {\n    break;\n}").unwrap_err();
+        assert!(err.contains("break 只能出现在循环体内"), "错误：{err}");
+        let err = 管道("func main() {\n    continue;\n}").unwrap_err();
+        assert!(err.contains("continue 只能出现在循环体内"), "错误：{err}");
+        // 未匹配标签
+        let err = 管道("func main() {\n    while true {\n        break nope;\n    }\n}").unwrap_err();
+        assert!(err.contains("标签 'nope' 未匹配"), "错误：{err}");
+        // switch 分支内 break 合法（switch 不消费，语义层应放行——switch 不是循环，
+        // break 在 switch 里仍指向外层循环或报错；当前实现：switch 不 push 循环上下文）
+    }
+
     #[test]
     fn 模块头与运行时函数声明() {
         let ir = 编译("func main() {}");
@@ -4358,6 +4499,15 @@ mod tests {
         assert!(ir.contains("= call i32 @strcmp(ptr @.str."));
         assert!(ir.contains("= icmp eq i32 %"));
         assert!(ir.contains("= call i64 @strlen(ptr @.str."));
+    }
+
+    #[test]
+    fn str_len内置函数生成tie_str_len调用() {
+        // str_len：字符串码点数（与 str_char 码点索引对齐），编译为 tie_str_len 桥调用
+        let out = 编译_输出("func main() {\n    var n: i64 = str_len(\"你好\")\n}");
+        assert!(out.ir.contains("call i64 @tie_str_len(ptr @.str."), "IR 应调用 tie_str_len: {}", out.ir);
+        assert!(out.ir.contains("declare i64 @tie_str_len(ptr)"), "应声明 tie_str_len extern");
+        assert!(out.used_externs.contains(&"tie_str_len".to_string()), "应记录 used_externs");
     }
 
     #[test]
