@@ -3,6 +3,47 @@
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库、M3 = 预处理器自举、M4 = 标准库重构**。
 
+## [M4 补齐] 语言能力扩展：trit 类型 + 多进制字面量 + exmath/radix 库 — 2026-08-09
+
+### 语言特性：平衡三进制 trit 类型（三值逻辑，数论常用）
+- 新增基本类型 `trit`：值域 -1/0/+1（平衡三进制，类似 bool 的三值扩展），LLVM i8 存储；
+- 三值字面量：`true`（+1）/ `zero`（0）/ `false`（-1）；`true`/`false` 在 trit 标注
+  上下文中适配为 trit 值，裸 `true` 仍为 bool；
+- **Kleene 三值逻辑**：`&&` = min、`||` = max、`!` = 取反（-1↔1，0 保持）；
+- **饱和算术**：`trit ± * trit` → trit（clamp 到 [-1,1]）；trit × i64 → i64（sext 提升）；
+  比较（==/!=/</>/<=/>=）与 trit 或 i64 → bool；div/mod 不允许；
+- 转换：`to_string(trit)` → "-1"/"0"/"1"；新增内置 `parse_trit(s)` → trit（非法报错，
+  C ABI 桥 tie_parse_trit，两路径一致）；
+- 五层同步：lexer（TyKw::Trit + TokenKind::Zero + scan_ident）、ast（Expr::TritLit）、
+  parser（zero → TritLit(0)）、semantic（类型推导 + 字面量适配 + Kleene 规则 +
+  to_string 放宽 + parse_trit）、interp（Value::Trit + eval_binary trit 分支 +
+  VarDecl 字面量适配）、IR（i8 生成 + gen_binary_trit icmp/select clamp + sext 混合 +
+  BoolLit/Return 适配 + tie_parse_trit 声明）；
+- 典型用途：三路比较（compare 返回 -1/0/+1）、三态逻辑（未知态）。
+
+### 语言特性：多进制整数字面量
+- `0x`/`0X` 十六进制、`0b`/`0B` 二进制、`0o`/`0O` 八进制、`0t`/`0T` 三进制
+  （t = ternary，数论常用）；
+- 非法输入（进制空/越进制数字/溢出）回退 0（与十进制 parse 防御一致）；
+- 新增 parse_radix 辅助（按进制解析 + 溢出防护）。
+
+### 标准库：exmath 高级数学算法库（std/exmath.tie，命名空间 exmath）
+- 霍夫曼编码/解码（无损压缩）：huffman_build/encode/decode（"字符|编码串" 编码表，
+  纯追加表模拟树 + BFS 生成编码）；
+- 数论/组合：is_prime（试除法）、sieve_to_string（素数筛）、pow_mod（快速幂）、
+  fib（斐波那契）、factorial（阶乘）、binom（组合数）；
+- 修复既有 bug：table_arg_elem_ty 的 Call 分支缺 table_new_* 识别（return table_new_string()
+  等内联调用报"未定义或不是返回表的函数"）+ 回归测试。
+
+### 标准库：radix 通用进制转换库（std/radix.tie，命名空间 radix）
+- `radix.to_str(v, base)`：整数 → 任意进制字符串（2..36，负数带 -）；
+- `radix.parse(s, base)`：任意进制字符串 → 整数（大小写均可，非法返回 0）；
+- `radix.digits(base)`：进制数字字符集。
+
+### 说明
+- 本条目为 Harbor M4 后的语言能力补齐（M4 尚未完全收官，补齐归入 M4 阶段）；
+- 演示：examples/trit_demo.tie、examples/exmath_demo.tie、examples/radix_demo.tie。
+
 ## [Harbor M4] 标准库重构：补全常用函数 + using 简化内部调用 — 2026-08-09
 
 ### 语言特性：顶层持久变量（var/const 全局，M4 新增）

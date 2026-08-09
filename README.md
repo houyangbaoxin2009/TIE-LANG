@@ -4,6 +4,7 @@
 
 tie 是一门**通用编程语言**：用一门语言写逻辑、写界面、写数据库、当数据交换格式。
 同一个 `.tie` 文件扮演什么角色，由文件头（Header）声明——四段式架构（预处理 → 前端 → 中端 → 后端）。
+内置类型含 `trit`（平衡三进制三值逻辑，数论常用）与多进制字面量（`0x`/`0b`/`0o`/`0t`）。
 
 > 语法规范见 [docs/language.md](docs/language.md)；本文件是工程入口（用法、结构、流水线、路线图）。
 
@@ -16,7 +17,7 @@ tie 是一门**通用编程语言**：用一门语言写逻辑、写界面、写
 | [docs/tie-script.md](docs/tie-script.md) | tie:script 模块协议：tie 脚本的注册/调用机制、模块约定、协议文本格式、三层调用入口（Rust/CLI/tie 程序内） |
 | [docs/ai-guide.md](docs/ai-guide.md) | AI 教学指南：语言用法 + 负例 + 编译器架构（教 AI 用/开发 tie） |
 | [docs/prompt-pack.md](docs/prompt-pack.md) | 可粘贴 Prompt 包：自包含简介，直接发给任何 AI |
-| [docs/plans/](docs/plans/) | 后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法 / 动态库编译） |
+| [docs/plans/](docs/plans/) | 后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法 / 动态库编译 / 包管理器 / 算法库分类） |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更记录（按里程碑） |
 
 ## 快速开始
@@ -149,7 +150,7 @@ tie/
 ├── prep/core.tie     预处理器核心模块（tie 语言自写：头部提取/角色判定/正文重建；Harbor M3 自举，编译期内嵌 tie-prep）
 ├── prep/indent.tie   转换器模块示例（制表符→4 空格；证明扩展性——新增转换器只需写 tie 模块，`tie-prep --module` 挂载）
 ├── prep/rename_tcmsg_to_log.tie  转换器模块实战（tcmsg → log 批量改名，tie 语言自写完成真实重构任务）
-├── std/              标准库（tie 语言自写：assert / string / math / csv / format，均为命名空间形式调用，如 assert.assert / str.split / format.sprintf / csv.csv_write，基于语言底座原语；M4 补全大小写转换/join/repeat/trim 拆分/gcd/lcm/pow_i/sprintf 占位符/csv_write/浮点与字符串断言）
+├── std/              标准库（tie 语言自写：assert / string / math / csv / format / exmath / radix，均为命名空间形式调用，如 assert.assert / str.split / format.sprintf / csv.csv_write / exmath.huffman_encode / radix.to_str，基于语言底座原语；M4 补全大小写转换/join/repeat/trim 拆分/gcd/lcm/pow_i/sprintf 占位符/csv_write/浮点与字符串断言；M4 补齐新增 exmath 高级数学算法库——霍夫曼编码/解码、素数判定/筛法、快速幂、斐波那契、阶乘、组合数，与 radix 通用进制转换库——任意进制 2..36 双向转换）
 ├── enl/              扩展库（Enlargement，tie 语言自写，随发行版内置：log 控制台信息库——i18n 消息系统，依赖 std 与语言底座 msg_* 原语；M4 增强带参消息/级别体系/stderr 通道/批量登记/多级回退）
 ├── docs/language.md   语法规范
 ├── docs/tie-script.md tie:script 模块协议（eval/eval_call 机制、模块约定、协议文本、三层调用入口）
