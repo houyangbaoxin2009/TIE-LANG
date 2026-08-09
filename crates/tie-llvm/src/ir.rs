@@ -498,8 +498,11 @@ impl<'p> IrGenerator<'p> {
         self.reg = 0;
         self.scopes.clear();
 
-        // 签名行
-        let ret_llvm = self.llvm_ty(&f.ret_ty);
+        // 签名行。main 特殊处理：即使 tie 声明为 void，也生成 `define i32 @main`
+        // + `ret i32 0`——MSVC CRT 把 main 返回的 EAX 当进程退出码，`ret void`
+        // 会残留 printf 等最后调用的返回值（如打印 3 个字符 → 退出码 3）。
+        let is_main_entry = full_name == "main";
+        let ret_llvm = if is_main_entry && f.ret_ty.is_void() { "i32" } else { self.llvm_ty(&f.ret_ty) };
         // M2.1.8：方法函数（namespace <struct名> 内的函数，首参类型 == 该 struct 名）
         // 首参按**引用**传递（LLVM ptr）——函数内字段修改反映到调用方
         // （与 class 时代的 this 指针机制一致，只是显式首参）。
@@ -588,7 +591,10 @@ impl<'p> IrGenerator<'p> {
             .unwrap_or_default();
         let needs_ret = !last_line.starts_with("ret ");
         if needs_ret {
-            if f.ret_ty.is_void() {
+            if is_main_entry && f.ret_ty.is_void() {
+                // void main：ret i32 0（CRT 退出码正确性）
+                self.line("ret i32 0");
+            } else if f.ret_ty.is_void() {
                 self.line("ret void");
             } else {
                 // 非 void 且缺 return：语义已拦截，这里兜底返回。
@@ -794,7 +800,12 @@ impl<'p> IrGenerator<'p> {
                     Ok(())
                 }
                 None => {
-                    self.line("ret void");
+                    // void main 的裸 return：ret i32 0（CRT 退出码正确性）
+                    if self.cur_fn == "main" && self.current_ret_ty().is_void() {
+                        self.line("ret i32 0");
+                    } else {
+                        self.line("ret void");
+                    }
                     Ok(())
                 }
             },
