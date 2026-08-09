@@ -17,9 +17,11 @@ func is_tab(c: string) -> bool {
 }
 
 // 模块入口（协议约定）：逐字符扫描，制表符 → 4 空格，其余原样保留。
-// 完全基于语言底座原语 str_char / len / 字符串拼接，不依赖任何 import。
+// 完全基于语言底座原语 str_char / str_len / 字符串拼接，不依赖任何 import。
+// 边界用 str_len（码点数）：str_char 按码点索引，用 len 的字节数做上界会
+// 对中文等多字节字符越界（返回空串），虽拼接无害但遍历位置错位。
 func process(src: string) -> string {
-    var n: i64 = len(src)
+    var n: i64 = str_len(src)
     var result: string = ""
     var i: i64 = 0
     while i < n {

@@ -45,9 +45,11 @@ pub func csv_write(path: string, lines: table) -> bool {
 }
 
 // 去掉字符串末尾的一个回车符 "\r"（Windows 换行残留）；无 \r 时原样返回
-// 注意：str_char 是语言底座原语（不在 str 命名空间内），此处裸调用
+// 注意：str_char 是语言底座原语（不在 str 命名空间内），此处裸调用；
+// 边界用 str_len（码点数）——中文等多字节字符下 len 的字节数会让
+// str_char 越界返回空串，导致 \r 判断失效。
 func strip_cr(s: string) -> string {
-    var n: i64 = len(s)
+    var n: i64 = str_len(s)
     if n > 0 && str_char(s, n - 1) == "\r" {
         return slice(s, 0, n - 1)
     }

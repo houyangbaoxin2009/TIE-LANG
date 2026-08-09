@@ -82,7 +82,7 @@ pub func satisfies(v: string, constraint: string) -> bool {
 // 取版本串第 idx 段（1 起：主/次/修）的数值；段缺失视为 0；格式非法返回 -1。
 // 解析：按 '.' 切段（str.split 不可 import 到自身——自备切段）。
 func segment(s: string, idx: i64) -> i64 {
-    var n: i64 = len(s)
+    var n: i64 = str_len(s)
     var seg_start: i64 = 0
     var seg_no: i64 = 1
     var i: i64 = 0
@@ -114,8 +114,8 @@ func segment(s: string, idx: i64) -> i64 {
 
 // 判断 s 是否以 prefix 开头（自备：不 import str 库）。
 func starts_with(s: string, prefix: string) -> bool {
-    var n: i64 = len(s)
-    var m: i64 = len(prefix)
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(prefix)
     if m > n {
         return false
     }
@@ -130,8 +130,10 @@ func starts_with(s: string, prefix: string) -> bool {
 }
 
 // 截取 s 的 [start, end) 子串（越界自动收敛；start>=end 返回空串）。
+// 边界用 str_len（码点数）：str_char 按码点索引，中文等多字节字符下
+// len 的字节数会放大边界导致截取错位。
 func slice(s: string, start: i64, end: i64) -> string {
-    var n: i64 = len(s)
+    var n: i64 = str_len(s)
     var lo: i64 = start
     if lo < 0 {
         lo = 0

@@ -1,0 +1,263 @@
+// tie:library
+// sort.tie：标准库——排序数组 + 二分查找（命名空间 sort，D3）
+// 内容：有序插入（保持升序）、二分查找（contains/index_of）、无序表排序（冒泡）。
+// 定位：替代「字符串 id 表」作符号表过渡的底层方案——符号表用「排序 id 数组 +
+// 二分查找」实现 O(log n) 查找、O(n) 有序插入。
+// 接口约定：表数据用**逗号分隔字符串序列**传参（同 opt/exmath 模式，规避 tie
+// 表参数元素类型静态未知的限制）；函数内 parse 到**局部表**（局部表元素类型已知，
+// 下标读取/赋值合法），操作完再转回逗号分隔序列返回。字符串元素不得含逗号。
+// 表操作约束：只追加（table_push）+ 下标赋值 t[i]=v（M4 支持）；无 pop/删除。
+// 插入算法：新值先追加到尾部，再从尾部向前冒泡交换（插入排序一步），保持升序。
+// 排序算法：冒泡排序（迭代式，双循环 + 相邻交换，禁止递归）。
+// 字符串比较：直接用 < / > / == 运算符（IR 走 strcmp，按码点序）。
+// 调用：import 后 sort.insert_sorted_i64("3,1,2", 0) / sort.contains_i64(...) 等
+// 命名规范：命名空间内函数不加 sort_ 前缀；内部工具私有（非 pub）。
+
+namespace sort {
+// 解析逗号分隔 i64 序列 → 局部 i64 动态表（空串 → 空表；连续逗号跳过空段）。
+func parse_i64(s: string) -> table {
+    var result = table_new_i64()
+    var n: i64 = len(s)
+    if n == 0 {
+        return result
+    }
+    var start: i64 = 0
+    var i: i64 = 0
+    while i <= n {
+        var at_end: bool = (i == n)
+        var is_comma: bool = !at_end && str_char(s, i) == ","
+        if at_end || is_comma {
+            var seg = slice(s, start, i)
+            if len(seg) > 0 {
+                table_push(result, parse_int(seg))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// 解析逗号分隔字符串序列 → 局部 string 动态表（空串 → 空表；连续逗号跳过空段）。
+func parse_string(s: string) -> table {
+    var result = table_new_string()
+    var n: i64 = len(s)
+    if n == 0 {
+        return result
+    }
+    var start: i64 = 0
+    var i: i64 = 0
+    while i <= n {
+        var at_end: bool = (i == n)
+        var is_comma: bool = !at_end && str_char(s, i) == ","
+        if at_end || is_comma {
+            var seg = slice(s, start, i)
+            if len(seg) > 0 {
+                table_push(result, seg)
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// 有序插入 i64：把 value 插入升序序列 tbl，返回新序列（仍升序）。
+// 算法：value 追加到尾部，再从尾部向前与前一元素比较，逆序则交换（插入排序一步）。
+pub func insert_sorted_i64(tbl: string, value: i64) -> string {
+    var a = parse_i64(tbl)
+    // 新值追加到尾部（表只追加）
+    table_push(a, value)
+    var i: i64 = len(a) - 1
+    var moving: bool = true
+    while moving {
+        // 已到表头：无需再前移
+        if i == 0 {
+            moving = false
+        } else if a[i] < a[i - 1] {
+            // 与前一个元素交换，继续向前搬移
+            var tmp: i64 = a[i]
+            a[i] = a[i - 1]
+            a[i - 1] = tmp
+            i = i - 1
+        } else {
+            // 前一元素更小（或相等）：升序已满足
+            moving = false
+        }
+    }
+    // 局部表 → 逗号分隔序列返回
+    var out: string = ""
+    var k: i64 = 0
+    var m: i64 = len(a)
+    while k < m {
+        if k > 0 {
+            out = out + ","
+        }
+        out = out + to_string(a[k])
+        k = k + 1
+    }
+    return out
+}
+
+// 有序插入字符串：把 value 插入升序序列 tbl，返回新序列（仍升序）。
+// 字符串比较用 < 运算符（strcmp 码点序）；算法同 insert_sorted_i64。
+pub func insert_sorted_string(tbl: string, value: string) -> string {
+    var a = parse_string(tbl)
+    table_push(a, value)
+    var i: i64 = len(a) - 1
+    var moving: bool = true
+    while moving {
+        if i == 0 {
+            moving = false
+        } else if a[i] < a[i - 1] {
+            var tmp = a[i]
+            a[i] = a[i - 1]
+            a[i - 1] = tmp
+            i = i - 1
+        } else {
+            moving = false
+        }
+    }
+    var out: string = ""
+    var k: i64 = 0
+    var m: i64 = len(a)
+    while k < m {
+        if k > 0 {
+            out = out + ","
+        }
+        out = out + a[k]
+        k = k + 1
+    }
+    return out
+}
+
+// 二分查找 value 在升序 i64 序列 tbl 中的下标；未找到返回 -1。
+// 迭代式二分（显式 lo/hi 下标），要求 tbl 升序；空表返回 -1。
+pub func index_of_i64(tbl: string, value: i64) -> i64 {
+    var a = parse_i64(tbl)
+    var lo: i64 = 0
+    var hi: i64 = len(a) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if a[mid] == value {
+            return mid
+        }
+        if a[mid] < value {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+// 判断升序 i64 序列 tbl 是否含 value（二分查找）。
+pub func contains_i64(tbl: string, value: i64) -> bool {
+    return index_of_i64(tbl, value) >= 0
+}
+
+// 判断升序字符串序列 tbl 是否含 value（二分查找，strcmp 码点序）。
+pub func contains_string(tbl: string, value: string) -> bool {
+    var a = parse_string(tbl)
+    var lo: i64 = 0
+    var hi: i64 = len(a) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if a[mid] == value {
+            return true
+        }
+        if a[mid] < value {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return false
+}
+
+// 对无序 i64 序列 tbl 冒泡排序（升序），返回排序后序列。
+// 迭代式：外层 n 趟，内层相邻比较交换，每趟把当前最大者沉到尾部。
+pub func sort_i64(tbl: string) -> string {
+    var a = parse_i64(tbl)
+    var n: i64 = len(a)
+    var i: i64 = 0
+    while i < n {
+        var j: i64 = 0
+        while j < n - 1 - i {
+            if a[j] > a[j + 1] {
+                var tmp: i64 = a[j]
+                a[j] = a[j + 1]
+                a[j + 1] = tmp
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    var out: string = ""
+    var k: i64 = 0
+    while k < n {
+        if k > 0 {
+            out = out + ","
+        }
+        out = out + to_string(a[k])
+        k = k + 1
+    }
+    return out
+}
+
+// 对无序字符串序列 tbl 冒泡排序（升序，strcmp 码点序），返回排序后序列。
+pub func sort_string(tbl: string) -> string {
+    var a = parse_string(tbl)
+    var n: i64 = len(a)
+    var i: i64 = 0
+    while i < n {
+        var j: i64 = 0
+        while j < n - 1 - i {
+            if a[j] > a[j + 1] {
+                var tmp = a[j]
+                a[j] = a[j + 1]
+                a[j + 1] = tmp
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    var out: string = ""
+    var k: i64 = 0
+    while k < n {
+        if k > 0 {
+            out = out + ","
+        }
+        out = out + a[k]
+        k = k + 1
+    }
+    return out
+}
+
+// 截取 s 的 [start, end) 子串（越界自动收敛；start>=end 返回空串）。
+// 边界用 len：本库只处理 ASCII 数字/简单字符串，len 字节数 = 码点数。
+func slice(s: string, start: i64, end: i64) -> string {
+    var n: i64 = len(s)
+    var lo: i64 = start
+    if lo < 0 {
+        lo = 0
+    }
+    if lo > n {
+        lo = n
+    }
+    var hi: i64 = end
+    if hi < 0 {
+        hi = 0
+    }
+    if hi > n {
+        hi = n
+    }
+    var result: string = ""
+    var i: i64 = lo
+    while i < hi {
+        result = result + str_char(s, i)
+        i = i + 1
+    }
+    return result
+}
+}

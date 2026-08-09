@@ -145,7 +145,8 @@ pub fn run_module(module_source: &str, entry: &str, source: &str) -> Result<Stri
 /// 解析协议文本（与 prep/core.tie 的 process 输出约定一致）。
 ///
 /// 头部区固定 3 + n 行：ROLE:x / HEADERS:n / H:raw * n / BODY:m，
-/// 随后紧跟恰好 m 字节正文。正文按字节数精确截取（tie 的 len 语义是字节数），
+/// 随后紧跟恰好 m 个字符（码点）的正文。正文按码点数精确截取
+/// （BODY 声明的是 str_len 码点数，与 str.chars().take(m) 对齐），
 /// 可含任意内容（含换行、任意行首文本），不会破坏协议。
 fn parse_protocol(text: &str) -> PreprocessResult {
     let mut headers = Vec::new();
@@ -179,7 +180,7 @@ fn parse_protocol(text: &str) -> PreprocessResult {
         offset += line.len();
     }
 
-    // 正文：从 BODY 行后取恰好 body_len 字节（超出按模块输出截断，缺失补空）
+    // 正文：从 BODY 行后取恰好 body_len 个字符（码点；超出按模块输出截断，缺失补空）
     let cleaned_source = match body_start {
         Some(start) => {
             let rest = &text[start..];
@@ -250,5 +251,78 @@ mod tests {
         // 模块没有顶层 process 函数 → eval_call 报"未定义的函数"
         let err = run_module("func other() {}", "process", "x").unwrap_err();
         assert!(err.contains("process"), "错误应提及入口函数: {err}");
+    }
+
+    // ---------- 中文编码缺陷回归（M 修复：len 字节数 vs str_char 码点索引） ----------
+    //
+    // 缺陷根因：len() 返回 UTF-8 字节数，str_char() 按 Unicode 码点索引。对中文
+    // （一个汉字 3 字节）混用导致 trim 尾随空白无法去除、slice 边界错位。修复后
+    // prep/core.tie 的字符串边界改用 str_len（码点数），以下用例验证中文完整保留。
+
+    #[test]
+    fn 中文正文完整保留() {
+        let src = "// tie:logic\nfunc main() {\n    println(\"你好，世界！\")\n}\n";
+        let r = preprocess(src);
+        assert!(
+            r.cleaned_source.contains("你好，世界！"),
+            "中文正文应完整保留，实际: {:?}",
+            r.cleaned_source
+        );
+        assert_eq!(r.role, FileRole::Logic);
+    }
+
+    #[test]
+    fn 中文头部值尾随空格被去除() {
+        // 头部值含中文且带尾随空格：trim 应去掉空格（len 字节语义下 str_char 越界
+        // 返回空串导致尾随空格残留，str_len 码点语义下正确去除）
+        let src = "// tie:author=张三  \nfunc main() {}\n";
+        let r = preprocess(src);
+        assert_eq!(r.headers.len(), 1);
+        assert_eq!(
+            r.headers[0].raw, "author=张三",
+            "头部值不应有尾随空格，实际: {:?}",
+            r.headers[0].raw
+        );
+    }
+
+    #[test]
+    fn 中文注释行后正文正确重建() {
+        let src = "// tie:logic\n// 中文注释头部行\nfunc main() {}\n";
+        let r = preprocess(src);
+        // "// 中文注释头部行" 不是 tie: 指令 → 属于正文
+        assert!(r.cleaned_source.contains("中文注释头部行"));
+        assert_eq!(r.role, FileRole::Logic);
+    }
+
+    #[test]
+    fn 中文数据文件角色判定() {
+        let src = "// tie:data\n[\"键\":\"值\"]\n";
+        let r = preprocess(src);
+        assert_eq!(r.role, FileRole::Data);
+        assert!(r.cleaned_source.contains("键"), "中文键应保留: {:?}", r.cleaned_source);
+    }
+
+    /// str_len 语义验证：码点数（chars().count）≠ len 字节数（s.len()），
+    /// 中文"你好"码点 2、字节 6；ASCII 两者一致。
+    #[test]
+    fn str_len与len的码点字节语义区分() {
+        let module = include_str!("../../../prep/test_trim.tie");
+        // test_trim.tie 的 T4 行输出 str_len 与 len 对比
+        let out = run_module(module, "process", "").expect("模块执行成功");
+        assert!(out.contains("str_len=2"), "中文 str_len 应为 2（码点），实际: {out:?}");
+        assert!(out.contains("len=6"), "中文 len 应为 6（字节），实际: {out:?}");
+    }
+
+    /// 转换器模块对含中文源码逐字符遍历不丢字（str_len 码点边界）。
+    #[test]
+    fn 中文模块转换完整保留() {
+        let module = include_str!("../../../prep/indent.tie");
+        let src = "func main() {\n\tprintln(\"中文测试\")\n}\n";
+        let out = run_module(module, "process", src).expect("转换器模块执行成功");
+        assert!(
+            out.contains("中文测试"),
+            "中文应完整保留，实际: {out:?}"
+        );
+        assert!(!out.contains('\t'), "制表符应转换，实际: {out:?}");
     }
 }

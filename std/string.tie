@@ -1,6 +1,9 @@
 // tie:library
 // string.tie：标准库——字符串工具函数（命名空间 str，string 是类型关键字不可用）
-// 全部基于 str_char + len + 字符串拼接 + 循环/分支实现，不使用下标索引与字符转换
+// 全部基于 str_char + str_len + 字符串拼接 + 循环/分支实现，不使用下标索引与字符转换
+// 注意：字符串**码点级**遍历必须用 str_len（码点数）而非 len（字节数）——str_char
+// 按码点索引，中文等多字节字符（UTF-8 一个汉字 3 字节）下 len 的字节数会放大
+// 边界导致 trim/slice 等错位（尾随空白无法去除、子串匹配错位）。表元素数仍用 len。
 // 调用：import 后 str.trim(...) / str.split(...)；命名空间内互调为裸调用
 // 命名规范：命名空间内函数不加 str_ 前缀（统一 func 写法，Harbor M2.1.6）
 
@@ -29,7 +32,7 @@ pub func trim(s: string) -> string {
 
 // 去掉字符串首部空白字符；全空白字符串返回空串
 pub func trim_start(s: string) -> string {
-    var n: i64 = len(s)
+    var n: i64 = str_len(s)
     var start: i64 = 0
     while start < n && is_whitespace(str_char(s, start)) {
         start = start + 1
@@ -39,7 +42,7 @@ pub func trim_start(s: string) -> string {
 
 // 去掉字符串尾部空白字符；全空白字符串返回空串
 pub func trim_end(s: string) -> string {
-    var n: i64 = len(s)
+    var n: i64 = str_len(s)
     var end: i64 = n
     while end > 0 && is_whitespace(str_char(s, end - 1)) {
         end = end - 1
@@ -49,7 +52,7 @@ pub func trim_end(s: string) -> string {
 
 // 截取字符串 [start, end) 区间的子串；越界自动收敛到边界；空串或 start>=end 返回空串
 pub func slice(s: string, start: i64, end: i64) -> string {
-    var n: i64 = len(s)
+    var n: i64 = str_len(s)
     // 空串直接返回空串
     if n == 0 {
         return ""
@@ -86,8 +89,8 @@ pub func slice(s: string, start: i64, end: i64) -> string {
 
 // 判断 s 是否包含子串 sub；空子串视为包含
 pub func contains(s: string, sub: string) -> bool {
-    var n: i64 = len(s)
-    var m: i64 = len(sub)
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(sub)
     // 空子串总是包含
     if m == 0 {
         return true
@@ -119,8 +122,8 @@ pub func contains(s: string, sub: string) -> bool {
 // 空子串视为在位置 0 命中；子串比主串长必然未找到。
 // 与 contains 同扫描模式：从每个起点完整匹配，命中即返回该起点。
 pub func find(s: string, sub: string) -> i64 {
-    var n: i64 = len(s)
-    var m: i64 = len(sub)
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(sub)
     // 空子串：位置 0 命中
     if m == 0 {
         return 0
@@ -149,8 +152,8 @@ pub func find(s: string, sub: string) -> i64 {
 
 // 判断 s 是否以 prefix 开头；空前缀视为真
 pub func starts_with(s: string, prefix: string) -> bool {
-    var n: i64 = len(s)
-    var m: i64 = len(prefix)
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(prefix)
     // 前缀比主串长，不可能匹配
     if m > n {
         return false
@@ -167,8 +170,8 @@ pub func starts_with(s: string, prefix: string) -> bool {
 
 // 判断 s 是否以 suffix 结尾；空后缀视为真
 pub func ends_with(s: string, suffix: string) -> bool {
-    var n: i64 = len(s)
-    var m: i64 = len(suffix)
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(suffix)
     // 后缀比主串长，不可能匹配
     if m > n {
         return false
@@ -185,8 +188,8 @@ pub func ends_with(s: string, suffix: string) -> bool {
 
 // 将 s 中所有出现的 from 替换为 to；from 为空串时原样返回（避免死循环）
 pub func replace(s: string, from: string, to: string) -> string {
-    var n: i64 = len(s)
-    var m: i64 = len(from)
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(from)
     // from 为空串：不替换，直接返回原串
     if m == 0 {
         return s
@@ -227,13 +230,13 @@ pub func replace(s: string, from: string, to: string) -> string {
 // 扫描结束后把最后一段 [start, n) 推入（可能为空串）。
 pub func split(s: string, sep: string) -> table {
     var t = table_new_string()
-    var m: i64 = len(sep)
+    var m: i64 = str_len(sep)
     // 空分隔符：不切分，整串作为唯一元素
     if m == 0 {
         table_push(t, s)
         return t
     }
-    var n: i64 = len(s)
+    var n: i64 = str_len(s)
     var start: i64 = 0
     var i: i64 = 0
     while i < n {
@@ -269,7 +272,7 @@ pub func to_upper(s: string) -> string {
     var lower = "abcdefghijklmnopqrstuvwxyz"
     var upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     var out: string = ""
-    var n: i64 = len(s)
+    var n: i64 = str_len(s)
     var i: i64 = 0
     while i < n {
         var c = str_char(s, i)
@@ -289,7 +292,7 @@ pub func to_lower(s: string) -> string {
     var lower = "abcdefghijklmnopqrstuvwxyz"
     var upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     var out: string = ""
-    var n: i64 = len(s)
+    var n: i64 = str_len(s)
     var i: i64 = 0
     while i < n {
         var c = str_char(s, i)

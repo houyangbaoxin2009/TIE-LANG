@@ -7,11 +7,11 @@
 //
 // 挂载方式：tie-prep <输入文件> --module prep/rename_tcmsg_to_log.tie > 输出文件
 // 框架（tie-prep）eval 本文件注册 process，再 eval_call 以字符串值直传文本调用。
-// 自包含：eval 环境不支持 import，完全基于语言底座原语 str_char / len / 字符串拼接。
+// 自包含：eval 环境不支持 import，完全基于语言底座原语 str_char / str_len / 字符串拼接。
 
 // 检查从 i 开始是否命中子串 sub（逐字符匹配，返回是否命中）
 func match_at(src: string, n: i64, i: i64, sub: string) -> bool {
-    var m: i64 = len(sub)
+    var m: i64 = str_len(sub)
     if i + m > n {
         return false
     }
@@ -26,8 +26,10 @@ func match_at(src: string, n: i64, i: i64, sub: string) -> bool {
 }
 
 // 模块入口（协议约定）：扫描 "tcmsg"（5 字符）出现处替换为 "log"，其余原样保留。
+// 边界用 str_len（码点数）：str_char 按码点索引，中文等多字节字符下
+// len 的字节数会错位（子串匹配与推进步长都按码点计）。
 func process(src: string) -> string {
-    var n: i64 = len(src)
+    var n: i64 = str_len(src)
     var result: string = ""
     var i: i64 = 0
     while i < n {

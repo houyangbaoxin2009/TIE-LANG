@@ -1,0 +1,38 @@
+// tie:logic
+// 验证 std/string.tie 对中文的处理（str_len 码点边界修复）
+import "./std/string.tie"
+using str;
+
+func main() {
+    // trim 中文尾随空白
+    var t = str.trim("  你好世界  ")
+    println("trim=[" + t + "]")
+
+    // slice 中文
+    var sl = str.slice("你好世界", 1, 3)
+    println("slice=[" + sl + "]")
+
+    // contains 中文子串
+    var c = str.contains("你好世界", "世界")
+    println("contains=" + to_string(c))
+
+    // find 中文子串位置
+    var f = str.find("你好世界", "好世")
+    println("find=" + to_string(f))
+
+    // starts_with / ends_with 中文
+    println("starts=" + to_string(str.starts_with("你好世界", "你好")))
+    println("ends=" + to_string(str.ends_with("你好世界", "世界")))
+
+    // replace 中文
+    var r = str.replace("你好世界你好", "你好", "Hi")
+    println("replace=[" + r + "]")
+
+    // split 中文分隔
+    var parts = str.split("a你好b你好c", "你好")
+    var i: i64 = 0
+    while i < len(parts) {
+        println("part" + to_string(i) + "=[" + parts[i] + "]")
+        i = i + 1
+    }
+}

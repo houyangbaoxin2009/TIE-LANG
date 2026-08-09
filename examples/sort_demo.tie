@@ -1,0 +1,99 @@
+// tie:logic
+// sort_demo.tie：std/sort 排序数组 + 二分查找演示（D3）
+// 覆盖：有序插入（i64/string）、二分命中/未命中、index_of、冒泡排序、空表边界
+// 编译运行：cargo run -p tie -- examples/sort_demo.tie
+
+import "../std/sort.tie"
+import "../std/assert.tie"
+
+func main() {
+    // ---- 有序插入（i64）----
+    // 输入须为升序序列；新值从尾部向前冒泡归位，其余元素相对顺序不变
+    var s1 = sort.insert_sorted_i64("1,2,3", 0)
+    assert.assert_eq_str(s1, "0,1,2,3")
+    var s2 = sort.insert_sorted_i64("1,2,3", 4)
+    assert.assert_eq_str(s2, "1,2,3,4")
+    var s3 = sort.insert_sorted_i64("1,3,4", 2)
+    assert.assert_eq_str(s3, "1,2,3,4")
+    var s4 = sort.insert_sorted_i64("", 5)
+    assert.assert_eq_str(s4, "5")
+    var s5 = sort.insert_sorted_i64("2,2,2", 2)
+    assert.assert_eq_str(s5, "2,2,2,2")
+    // 无序输入：仅保证新值归位（0 < 所有元素 → 冒泡到表头），其余相对顺序不变
+    var s0 = sort.insert_sorted_i64("3,1,2", 0)
+    assert.assert_eq_str(s0, "0,3,1,2")
+    println("insert_sorted_i64: PASS")
+
+    // ---- 有序插入（string）----
+    var t1 = sort.insert_sorted_string("apple,orange", "banana")
+    assert.assert_eq_str(t1, "apple,banana,orange")
+    var t2 = sort.insert_sorted_string("a,c,d", "b")
+    assert.assert_eq_str(t2, "a,b,c,d")
+    var t3 = sort.insert_sorted_string("", "x")
+    assert.assert_eq_str(t3, "x")
+    var t4 = sort.insert_sorted_string("a,a,c", "a")
+    assert.assert_eq_str(t4, "a,a,a,c")
+    println("insert_sorted_string: PASS")
+
+    // ---- 二分命中 / 未命中（i64）----
+    assert.assert(sort.contains_i64("1,3,5,7,9", 5))
+    assert.assert(sort.contains_i64("1,3,5,7,9", 1))
+    assert.assert(sort.contains_i64("1,3,5,7,9", 9))
+    assert.assert(!sort.contains_i64("1,3,5,7,9", 4))
+    assert.assert(!sort.contains_i64("1,3,5,7,9", 0))
+    assert.assert(!sort.contains_i64("1,3,5,7,9", 10))
+    assert.assert_eq(sort.index_of_i64("1,3,5,7,9", 7), 3)
+    assert.assert_eq(sort.index_of_i64("1,3,5,7,9", 1), 0)
+    assert.assert_eq(sort.index_of_i64("1,3,5,7,9", 9), 4)
+    assert.assert_eq(sort.index_of_i64("1,3,5,7,9", 2), -1)
+    println("binary search i64: PASS")
+
+    // ---- 二分命中 / 未命中（string）----
+    assert.assert(sort.contains_string("apple,banana,cherry", "banana"))
+    assert.assert(sort.contains_string("apple,banana,cherry", "apple"))
+    assert.assert(sort.contains_string("apple,banana,cherry", "cherry"))
+    assert.assert(!sort.contains_string("apple,banana,cherry", "durian"))
+    assert.assert(!sort.contains_string("apple,banana,cherry", "apricot"))
+    assert.assert(!sort.contains_string("apple,banana,cherry", "pear"))
+    println("binary search string: PASS")
+
+    // ---- 空表边界（二分）----
+    assert.assert_eq(sort.index_of_i64("", 5), -1)
+    assert.assert(!sort.contains_i64("", 5))
+    assert.assert(!sort.contains_string("", "x"))
+    println("empty boundary: PASS")
+
+    // ---- 无序表排序（i64）----
+    var sorted1 = sort.sort_i64("5,2,8,1,9,3")
+    assert.assert_eq_str(sorted1, "1,2,3,5,8,9")
+    var sorted2 = sort.sort_i64("1,2,3")
+    assert.assert_eq_str(sorted2, "1,2,3")
+    var sorted3 = sort.sort_i64("3,2,1")
+    assert.assert_eq_str(sorted3, "1,2,3")
+    var sorted4 = sort.sort_i64("")
+    assert.assert_eq_str(sorted4, "")
+    var sorted5 = sort.sort_i64("7,7,7,7")
+    assert.assert_eq_str(sorted5, "7,7,7,7")
+    println("sort_i64: PASS")
+
+    // ---- 无序表排序（string）----
+    var st1 = sort.sort_string("pear,apple,cherry")
+    assert.assert_eq_str(st1, "apple,cherry,pear")
+    var st2 = sort.sort_string("banana,apple,banana")
+    assert.assert_eq_str(st2, "apple,banana,banana")
+    var st3 = sort.sort_string("")
+    assert.assert_eq_str(st3, "")
+    println("sort_string: PASS")
+
+    // ---- 端到端：排序后插入 + 二分（符号表过渡场景）----
+    // 无序 id 列表 → 排序 → 有序插入新 id → 二分查找
+    var ids = sort.sort_i64("9,3,7,1,5")
+    var ids2 = sort.insert_sorted_i64(ids, 4)
+    assert.assert_eq_str(ids2, "1,3,4,5,7,9")
+    assert.assert_eq(sort.index_of_i64(ids2, 7), 4)
+    assert.assert(!sort.contains_i64(ids2, 8))
+    assert.assert(sort.contains_i64(ids2, 1))
+    println("end-to-end: PASS")
+
+    println("ALL PASS")
+}

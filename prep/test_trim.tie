@@ -1,0 +1,84 @@
+// tie:library
+// prep/test_trim.tie：验证含中文文本的 trim / slice / starts_with 处理
+// （探测 str_char 码点索引 vs len 字节数 的语义差异）
+
+// 判断单字符字符串是否为空白字符（与 core.tie 一致）
+func is_ws(c: string) -> bool {
+    if c == " " {
+        return true
+    }
+    if c == "\t" {
+        return true
+    }
+    if c == "\n" {
+        return true
+    }
+    if c == "\r" {
+        return true
+    }
+    return false
+}
+
+// 与 core.tie 相同的 slice：按码点边界 lo/hi 用 str_char（码点索引）截取
+func slc(s: string, start: i64, end: i64) -> string {
+    var n: i64 = str_len(s)
+    if n == 0 {
+        return ""
+    }
+    var lo: i64 = start
+    if lo < 0 {
+        lo = 0
+    }
+    if lo > n {
+        lo = n
+    }
+    var hi: i64 = end
+    if hi < 0 {
+        hi = 0
+    }
+    if hi > n {
+        hi = n
+    }
+    if lo >= hi {
+        return ""
+    }
+    var result: string = ""
+    var i: i64 = lo
+    while i < hi {
+        result = result + str_char(s, i)
+        i = i + 1
+    }
+    return result
+}
+
+// 与 core.tie 相同的 trim（边界用 str_len 码点数）
+func trm(s: string) -> string {
+    var n: i64 = str_len(s)
+    var start: i64 = 0
+    while start < n && is_ws(str_char(s, start)) {
+        start = start + 1
+    }
+    var end: i64 = n
+    while end > start && is_ws(str_char(s, end - 1)) {
+        end = end - 1
+    }
+    return slc(s, start, end)
+}
+
+// 模块入口：输出诊断信息
+func process(src: string) -> string {
+    var out: string = ""
+    // 测试1：中文后跟空格的 trim
+    var a: string = trm("你好  ")
+    out = out + "T1:[" + a + "]\n"
+    // 测试2：中文开头的行 trim
+    var b: string = trm("  中文abc")
+    out = out + "T2:[" + b + "]\n"
+    // 测试3：slice 中文串
+    var c: string = slc("你好世界", 0, 6)
+    out = out + "T3:[" + c + "]\n"
+    // 测试4：str_len（码点数）与 str_char 一致性（中文）
+    var d: string = "你好"
+    out = out + "T4:str_len=" + to_string(str_len(d)) + " len=" + to_string(len(d)) + " ch0=[" + str_char(d, 0) + "] ch1=[" + str_char(d, 1) + "]\n"
+    return out
+}
