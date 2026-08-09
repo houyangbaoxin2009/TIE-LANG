@@ -1,0 +1,9 @@
+// tie:library
+// lib_colors.tie：演示库——颜色常量与命名空间函数
+namespace colors {
+    // 取 24 位 RGB 值（0xRRGGBB）
+    pub func rgb(r: i64, g: i64, b: i64) -> i64 {
+        return r * 65536 + g * 256 + b
+    }
+}
+

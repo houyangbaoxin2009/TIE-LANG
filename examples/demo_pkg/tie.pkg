@@ -1,0 +1,15 @@
+// tie.pkg
+// tie:data
+[
+    "name": "demo_pkg",
+    "version": "0.1.0",
+    "description": "tie 项目",
+    "role": "logic",
+    "main": "main.tie",
+    "author": "",
+    "license": "MIT",
+    "dependencies": [
+        "lib_colors": "path:../lib_colors",
+        "log": "1.0.0",
+    ],
+]

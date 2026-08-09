@@ -3,6 +3,43 @@
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库、M3 = 预处理器自举、M4 = 标准库重构**。
 
+## [Harbor M6] 包管理器骨架（E1/E2）：tie 语言自写 CLI — 2026-08-09
+
+### 目标
+包管理器是「用 tie 语言扩展 tie 工具链」自举路线的最高形态：**完整 CLI 逻辑
+（子命令解析、清单解析、依赖安装）全部用 tie 语言编写**（`pkg/` 目录），Rust
+侧只做两件事——子命令识别 + exec `pkg.exe` 转发（与 REPL 自举同一模式）。
+
+### 新增：pkg/ 包管理器（tie 语言自写，100%）
+- **`pkg/main.tie`** —— CLI 入口：`arg_string(i)` 读取命令行参数，分派
+  `init / add / remove / install / build / run / help` 七个子命令；帮助文本、
+  init 模板生成、add 参数解析（`path:./lib_math` / `name@version`）、remove、
+  install 编排、build/run（调用 tie 编译器并执行产物）；
+- **`pkg/manifest.tie`** —— tie.pkg 清单解析（tie:data 表字面量文本）：字段提取
+  （`field`）、依赖项扫描（`dep_names`/`dep_specs` 逗号分隔序列传参，规避
+  「表参数元素类型静态未知」约束）、依赖增删（`add_dep`/`remove_dep` 文本重写）；
+- **`pkg/deps.tie`** —— path 源安装：`copy_dir` 递归复制源目录到
+  `.tie/deps/<包名>/`（幂等重装：先 `remove_dir_all` 清旧）；registry/git 源
+  提示跳过（后续阶段）；
+- 复用 `std/version.tie` 的 semver 版本比较（add 时校验 `x.y.z` 格式）。
+
+### 新增：Rust 侧子命令识别（crates/tie/src/main.rs）
+- 首个参数命中 `init/add/remove/install/build/run/help` 且非 `.tie` 文件 →
+  查找并 exec `pkg.exe`（查找顺序：`TIE_PKG_EXE` → tie.exe 同目录 → 当前目录
+  → `pkg/` 目录 → tie.exe 向上回溯 workspace，兼容任意项目目录运行）；
+- 参数原样透传、退出码透传；`.tie` 文件/`-` 选项走既有编译路径（回归安全）。
+
+### 演示与文档
+- `examples/pkg_demo.md`：端到端用法说明（init → add → install → build/run）；
+- `examples/demo_pkg/`：`tie init` 生成的示例项目（依赖 `../lib_colors` 目录源）；
+- README：CLI 用法加包管理器子命令表、工程结构加 `pkg/`、路线图 M6 标记。
+
+### 说明
+- 首版范围：仅 path 源平铺复制（不做依赖图解析）；git/registry 源、tie.lock
+  锁文件、`tie update` 为后续阶段（见 docs/plans/package-manager.md）；
+- 构建 `pkg.exe`：`cargo build --release -p tie-interp` +
+  `target/release/tie-llvm.exe pkg/main.tie -o pkg/pkg.exe`。
+
 ## [M4 补齐] 语言能力扩展：trit 类型 + 多进制字面量 + exmath/radix 库 — 2026-08-09
 
 ### 语言特性：平衡三进制 trit 类型（三值逻辑，数论常用）

@@ -1,0 +1,381 @@
+// tie:logic
+// tie:opt=2
+//
+// main.tie —— tie 语言自写的包管理器 CLI 入口（Harbor M6 骨架 E1/E2）
+//
+// 使用（由 Rust 侧 crates/tie/src/main.rs 识别子命令后编译执行本入口）：
+//   tie init <项目名>     初始化项目（生成 tie.pkg + main.tie 模板）
+//   tie add <依赖>        添加依赖（path 源: `tie add path:./lib_math`）
+//   tie remove <包名>     移除依赖
+//   tie install           按 tie.pkg 安装依赖到 .tie/deps/（首版 path 源）
+//   tie build             编译项目（调用 tie 编译器）
+//   tie run               运行项目
+//   tie help              显示帮助
+//
+// 架构：本文件只做「CLI 子命令分派 + 编排」，具体能力按模块分工——
+//   manifest（./mf.tie）  tie.pkg 清单解析（tie:data 文本 → 依赖项）
+//   deps（./dp.tie）          依赖安装（path 源复制到 .tie/deps/）
+//   version（../std/version.tie）semver 版本比较（复用标准库，add 时校验版本）
+// Rust 侧只做两件事：子命令识别 + exec pkg.exe（自举：包管理器 100% tie 写）。
+//
+// tie 约束处理（重要）：
+// - **表参数元素类型静态未知**：跨模块传参一律用逗号分隔字符串序列
+//   （mf.dep_names / dep_specs），本文件不直接操作表；
+// - **tie 的 && 非短路**：`i < n && expr` 这类「边界 + 下标」连写会越界，
+//   全部改用嵌套 if 或拆开判断；
+// - **无 continue/break/递归**：迭代 + return 提前退出；
+// - `table`/`text`/`code`/`char`/`bool`/`i64`/`f64` 是类型关键字，不可作
+//   变量名/参数名（清单文本用 src 命名，不叫 text）；
+// - 命令行参数经 arg_string(i) 读取（0 = 子命令名，1.. = 子命令参数），
+//   越界返回空串。
+
+import "../std/version.tie"
+import "./manifest.tie" as mf
+import "./deps.tie" as dp
+
+// ================= 入口：子命令分派 =================
+
+func main() -> i64 {
+    var n = arg_count()
+    // 无参数：打印帮助
+    if n == 0 {
+        print(help_text())
+        return 0
+    }
+    var cmd = arg_string(0)
+    // 子命令分派（help 优先展示）
+    if cmd == "help" {
+        return cmd_help()
+    }
+    if cmd == "init" {
+        return cmd_init()
+    }
+    if cmd == "add" {
+        return cmd_add()
+    }
+    if cmd == "remove" {
+        return cmd_remove()
+    }
+    if cmd == "install" {
+        return cmd_install()
+    }
+    if cmd == "build" {
+        return cmd_build()
+    }
+    if cmd == "run" {
+        return cmd_run()
+    }
+    // 未知命令：报错并给帮助
+    print_err("[pkg] 未知命令: " + cmd + "\n")
+    print(help_text())
+    return 1
+}
+
+// ================= 帮助 =================
+
+func cmd_help() -> i64 {
+    print(help_text())
+    return 0
+}
+
+// 帮助文本（拼接待转义字符串；命令用法一目了然）。
+func help_text() -> string {
+    return "tie 包管理器（M6 骨架，tie 语言自写）\n" +
+           "\n" +
+           "用法:\n" +
+           "  tie init <项目名>      初始化项目（生成 tie.pkg + main.tie 模板）\n" +
+           "  tie add <依赖>         添加依赖\n" +
+           "  tie remove <包名>      移除依赖\n" +
+           "  tie install            安装全部依赖到 .tie/deps/\n" +
+           "  tie build              编译项目（调用 tie 编译器）\n" +
+           "  tie run                运行项目（tie <main 文件>）\n" +
+           "  tie help               显示本帮助\n" +
+           "\n" +
+           "依赖写法:\n" +
+           "  path:./lib_math        本地路径源（install 时复制目录到 .tie/deps/lib_math/）\n" +
+           "  name@version           版本约束（如 log@1.0.0；registry/git 源后续阶段）\n"
+}
+
+// ================= tie init：初始化项目 =================
+
+func cmd_init() -> i64 {
+    var name = arg_string(1)
+    if name == "" {
+        print_err("[pkg] 用法: tie init <项目名>\n")
+        return 1
+    }
+    // 创建项目目录（mkdir_all 递归创建）
+    if !mkdir_all(name) {
+        print_err("[pkg] 创建目录失败: " + name + "\n")
+        return 1
+    }
+    var pkg_path = name + "/tie.pkg"
+    var main_path = name + "/main.tie"
+    var ok: bool = true
+    // 生成 tie.pkg 清单
+    if file_exists(pkg_path) {
+        println("[pkg] 已存在 " + pkg_path + "，跳过")
+    } else {
+        if file_write(pkg_path, pkg_template(name)) {
+            println("[pkg] 已生成 " + pkg_path)
+        } else {
+            print_err("[pkg] 写入失败: " + pkg_path + "\n")
+            ok = false
+        }
+    }
+    // 生成 main.tie 模板
+    if ok {
+        if file_exists(main_path) {
+            println("[pkg] 已存在 " + main_path + "，跳过")
+        } else {
+            if file_write(main_path, main_template()) {
+                println("[pkg] 已生成 " + main_path)
+            } else {
+                print_err("[pkg] 写入失败: " + main_path + "\n")
+                ok = false
+            }
+        }
+    }
+    if ok {
+        println("[pkg] 项目初始化完成: " + name)
+        println("[pkg] 下一步: cd " + name + " && tie add <依赖> && tie install && tie run")
+        return 0
+    }
+    return 1
+}
+
+// tie.pkg 清单模板（tie:data 格式；name 由 init 参数填充）。
+func pkg_template(name: string) -> string {
+    return "// tie.pkg\n" +
+           "// tie:data\n" +
+           "[\n" +
+           "    \"name\": \"" + name + "\",\n" +
+           "    \"version\": \"0.1.0\",\n" +
+           "    \"description\": \"tie 项目\",\n" +
+           "    \"role\": \"logic\",\n" +
+           "    \"main\": \"main.tie\",\n" +
+           "    \"author\": \"\",\n" +
+           "    \"license\": \"MIT\",\n" +
+           "    \"dependencies\": [\n" +
+           "    ],\n" +
+           "]\n"
+}
+
+// main.tie 项目主文件模板（可编译运行的最小程序）。
+func main_template() -> string {
+    return "// tie:logic\n" +
+           "// tie:opt=2\n" +
+           "\n" +
+           "// 项目主文件（由 tie init 生成）\n" +
+           "\n" +
+           "func main() {\n" +
+           "    println(\"Hello, tie!\")\n" +
+           "}\n"
+}
+
+// ================= tie add：添加依赖 =================
+
+func cmd_add() -> i64 {
+    var spec_arg = arg_string(1)
+    if spec_arg == "" {
+        print_err("[pkg] 用法: tie add <依赖>\n")
+        print_err("[pkg]   示例: tie add path:./lib_math   （本地 path 源）\n")
+        print_err("[pkg]         tie add log@1.0.0        （版本约束，registry 源占位）\n")
+        return 1
+    }
+    if !file_exists("tie.pkg") {
+        print_err("[pkg] 未找到 tie.pkg（请先 tie init <项目名>）\n")
+        return 1
+    }
+    var src = file_read("tie.pkg")
+    var name = add_name(spec_arg)
+    if name == "" {
+        print_err("[pkg] 无法解析包名: " + spec_arg + "\n")
+        return 1
+    }
+    var spec = add_spec(spec_arg)
+    // registry 版本约束格式校验：复用 std/version.tie 的 compare
+    // （compare 对非法版本串返回 0；"0.0.0" 本身合法，排除它做启发式判断）
+    if !mf.starts_with(spec_arg, "path:") {
+        if spec != "0.0.0" {
+            if version.compare(spec, "0.0.0") == 0 {
+                print_err("[pkg] 警告: 版本 \"" + spec + "\" 格式非法（期望 x.y.z）\n")
+            }
+        }
+    }
+    // 查重：同名依赖已存在则拒绝
+    var cnt = mf.dep_count(src)
+    var i: i64 = 0
+    var exists: bool = false
+    while i < cnt {
+        if mf.dep_name(src, i) == name {
+            exists = true
+        }
+        i = i + 1
+    }
+    if exists {
+        print_err("[pkg] 依赖已存在: " + name + "（可先 tie remove " + name + "）\n")
+        return 1
+    }
+    // 写入 tie.pkg
+    var updated = mf.add_dep(src, name, spec)
+    if file_write("tie.pkg", updated) {
+        println("[pkg] 已添加依赖 " + name + " @ " + spec)
+        return 0
+    }
+    print_err("[pkg] 写入 tie.pkg 失败\n")
+    return 1
+}
+
+// 从 add 参数解析包名：path:./lib_math → "lib_math"（路径 basename）；
+// name@version → "name"；裸 name → "name"。
+func add_name(spec_arg: string) -> string {
+    if mf.starts_with(spec_arg, "path:") {
+        var p = mf.slice(spec_arg, 5, len(spec_arg))
+        return path_basename(p)
+    }
+    var at = mf.find(spec_arg, "@")
+    if at < 0 {
+        return spec_arg
+    }
+    return mf.slice(spec_arg, 0, at)
+}
+
+// 从 add 参数解析 spec：path:./lib_math → "path:./lib_math"；
+// name@1.0.0 → "1.0.0"；裸 name → "*"（任意版本）。
+func add_spec(spec_arg: string) -> string {
+    if mf.starts_with(spec_arg, "path:") {
+        return spec_arg
+    }
+    var at = mf.find(spec_arg, "@")
+    if at < 0 {
+        return "*"
+    }
+    return mf.slice(spec_arg, at + 1, len(spec_arg))
+}
+
+// ================= tie remove：移除依赖 =================
+
+func cmd_remove() -> i64 {
+    var name = arg_string(1)
+    if name == "" {
+        print_err("[pkg] 用法: tie remove <包名>\n")
+        return 1
+    }
+    if !file_exists("tie.pkg") {
+        print_err("[pkg] 未找到 tie.pkg\n")
+        return 1
+    }
+    var src = file_read("tie.pkg")
+    var updated = mf.remove_dep(src, name)
+    // 文本未变 → 依赖不存在
+    if updated == src {
+        print_err("[pkg] 依赖不存在: " + name + "\n")
+        return 1
+    }
+    if file_write("tie.pkg", updated) {
+        println("[pkg] 已移除依赖 " + name)
+        return 0
+    }
+    print_err("[pkg] 写入 tie.pkg 失败\n")
+    return 1
+}
+
+// ================= tie install：安装依赖 =================
+
+func cmd_install() -> i64 {
+    if !file_exists("tie.pkg") {
+        print_err("[pkg] 未找到 tie.pkg（请先 tie init <项目名>）\n")
+        return 1
+    }
+    var src = file_read("tie.pkg")
+    // 依赖名与 spec 各为逗号分隔序列（规避表参数限制）
+    var names = mf.dep_names(src)
+    if names == "" {
+        println("[pkg] 无依赖，跳过安装")
+        return 0
+    }
+    var specs = mf.dep_specs(src)
+    // 建安装目录 .tie/deps/
+    if !mkdir_all(".tie/deps") {
+        print_err("[pkg] 创建 .tie/deps 失败\n")
+        return 1
+    }
+    println("[pkg] 安装依赖到 .tie/deps/ ...")
+    var failed = dp.install(names, specs)
+    if failed > 0 {
+        print_err("[pkg] 安装完成，失败 " + to_string(failed) + " 项\n")
+        return 1
+    }
+    println("[pkg] 全部依赖安装完成")
+    return 0
+}
+
+// ================= tie build / tie run =================
+
+// 读 tie.pkg 的 main 字段（缺省 main.tie）；清单缺失返回空串。
+func main_of_pkg() -> string {
+    if !file_exists("tie.pkg") {
+        print_err("[pkg] 未找到 tie.pkg（请先 tie init <项目名>）\n")
+        return ""
+    }
+    var src = file_read("tie.pkg")
+    var main_file = mf.field(src, "main")
+    if main_file == "" {
+        main_file = "main.tie"
+    }
+    return main_file
+}
+
+func cmd_build() -> i64 {
+    var main_file = main_of_pkg()
+    if main_file == "" {
+        return 1
+    }
+    println("[pkg] 编译: tie " + main_file)
+    // 首版：提示后自动调用 tie 编译器（子进程；失败时提示手动执行）
+    var rc = exec_code("tie " + main_file)
+    if rc == 0 {
+        println("[pkg] 编译成功: " + main_file)
+    } else {
+        print_err("[pkg] 编译未完成（可手动执行: tie " + main_file + "）\n")
+    }
+    return rc
+}
+
+func cmd_run() -> i64 {
+    var main_file = main_of_pkg()
+    if main_file == "" {
+        return 1
+    }
+    println("[pkg] 运行: tie " + main_file)
+    // 先编译（tie <文件> 生成同名 .exe；退出码非 0 → 提示手动执行）
+    var rc = exec_code("tie " + main_file)
+    if rc != 0 {
+        print_err("[pkg] 编译未完成（可手动执行: tie " + main_file + "）\n")
+        return rc
+    }
+    // 再执行编译产物（main.tie → main.exe / ./main，平台自适应）
+    var exe_name = exe_of(main_file)
+    println("[pkg] 执行: " + exe_name)
+    return exec_code(exe_name)
+}
+
+// 由入口文件推导可执行文件名：main.tie → main.exe（Windows）或 ./main（Unix）。
+// 用 file_exists 探测产物命名（编译路径按平台生成），两者皆无则回退 .exe。
+func exe_of(main_file: string) -> string {
+    // 取基名（去扩展名）
+    var dot = mf.find(main_file, ".")
+    var base = main_file
+    if dot > 0 {
+        base = mf.slice(main_file, 0, dot)
+    }
+    // Windows 产物 <base>.exe；Unix 产物 ./<base>
+    if file_exists(base + ".exe") {
+        return base + ".exe"
+    }
+    if file_exists("./" + base) {
+        return "./" + base
+    }
+    return base + ".exe"
+}

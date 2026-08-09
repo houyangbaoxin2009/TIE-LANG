@@ -1,0 +1,162 @@
+// tie:library
+// deps.tie —— 依赖安装模块（M6 包管理器骨架 E1/E2）
+//
+// 职责：按依赖 spec 序列安装依赖。首版支持 **path 源**（把本地目录复制到
+// 项目 `.tie/deps/<包名>/`）；registry（HTTP）/ git 源为后续阶段。
+//
+// 安装实现：复用系统原语 copy_dir（递归复制目录内容，自动建目标目录）、
+// mkdir_all、remove_dir_all（幂等重装前清理）、file_exists。整个模块纯 tie
+// 语言编写，只调语言底座原语，不碰 Rust。
+//
+// tie 约束处理（重要）：
+// - **表参数的元素类型静态未知**：本模块对外入口 install() 接收「逗号分隔
+//   字符串序列」（依赖包名序列 name_seq + spec 序列 spec_seq），内部用自备
+//   split() 构建**局部字符串表**后再按下标遍历——函数体内新建/返回的表允许
+//   下标读取（与 examples/table_dynamic.tie 同机制）；
+// - **tie 的 && 非短路**：遍历循环里不写 `i < n && names[i] != ""` 这类
+//   「边界 + 下标」连写的条件（越界风险），一律用嵌套 if 逐层判断；
+// - **无 continue/break**：跳过非 path 源时用「提示后继续」的线性流程；
+// - `table`/`text`/`code`/`char`/`bool`/`i64`/`f64` 是类型关键字，不可作
+//   变量名/参数名（本模块用 tbl 作表变量名）。
+
+namespace deps {
+    // ================= 通用字符串工具（自备，不依赖 std 库） =================
+
+    // 拆 s 为字符串动态表（与 std/str.split 语义一致：连续分隔符产生空元素，
+    // 首尾分隔符产生空元素，空串返回单空元素表）。
+    func split(s: string, sep: string) -> table {
+        var tbl = table_new_string()
+        var m: i64 = len(sep)
+        // 空分隔符：不切分，整串作为唯一元素
+        if m == 0 {
+            table_push(tbl, s)
+            return tbl
+        }
+        var n: i64 = len(s)
+        var start: i64 = 0
+        var i: i64 = 0
+        while i < n {
+            // 从 i 开始检查是否完整匹配 sep
+            var matched: bool = true
+            var j: i64 = 0
+            while j < m && matched {
+                // 嵌套 if 防越界：i+j 越界 → 失配
+                if i + j >= n {
+                    matched = false
+                } else if str_char(s, i + j) != str_char(sep, j) {
+                    matched = false
+                }
+                j = j + 1
+            }
+            if matched {
+                // 切出一段 [start, i)，跳过 sep 继续
+                table_push(tbl, slice(s, start, i))
+                i = i + m
+                start = i
+            } else {
+                i = i + 1
+            }
+        }
+        // 收尾：最后一段 [start, n)
+        table_push(tbl, slice(s, start, n))
+        return tbl
+    }
+
+    // 截取 s 的 [start, end) 子串；越界自动收敛；start>=end 返回空串。
+    func slice(s: string, start: i64, end: i64) -> string {
+        var n: i64 = len(s)
+        var lo: i64 = start
+        if lo < 0 {
+            lo = 0
+        }
+        if lo > n {
+            lo = n
+        }
+        var hi: i64 = end
+        if hi < 0 {
+            hi = 0
+        }
+        if hi > n {
+            hi = n
+        }
+        var result: string = ""
+        var i: i64 = lo
+        while i < hi {
+            result = result + str_char(s, i)
+            i = i + 1
+        }
+        return result
+    }
+
+    // 判断 s 是否以 prefix 开头。
+    func starts_with(s: string, prefix: string) -> bool {
+        var n: i64 = len(s)
+        var m: i64 = len(prefix)
+        if m > n {
+            return false
+        }
+        var i: i64 = 0
+        while i < m {
+            if str_char(s, i) != str_char(prefix, i) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+
+    // ================= 单个依赖安装 =================
+
+    // 安装单个依赖：spec 以 "path:" 开头 → 本地目录复制到 .tie/deps/<包名>/；
+    // 其他源（registry/git）→ 打印提示并视为跳过（返回 true 不记失败）。
+    // 返回是否成功（path 源失败返回 false）。
+    func install_one(name: string, spec: string) -> bool {
+        // ---- path 源：复制目录 ----
+        if starts_with(spec, "path:") {
+            var src = slice(spec, 5, len(spec))
+            var dest = ".tie/deps/" + name
+            // 幂等重装：目标已存在则先整体删除（避免旧文件残留）
+            if file_exists(dest) {
+                remove_dir_all(dest)
+            }
+            // 建目标目录（copy_dir 会自动建，这里显式建更稳妥）
+            if !mkdir_all(dest) {
+                print_err("[pkg]  创建目录失败: " + dest + "\n")
+                return false
+            }
+            // copy_dir(src, dest)：把 src 目录的**内容**递归复制到 dest/
+            var ok = copy_dir(src, dest)
+            if ok {
+                println("[pkg]  已安装 " + name + " ← " + src)
+            } else {
+                print_err("[pkg]  安装失败 " + name + " ← " + src + "（源目录不存在?）\n")
+            }
+            return ok
+        }
+        // ---- 其他源：首版提示跳过（registry/git 后续阶段） ----
+        println("[pkg]  跳过 " + name + ": 源 \"" + spec + "\" 暂不支持（仅 path 源）")
+        return true
+    }
+
+    // ================= 批量安装入口 =================
+
+    // 安装全部依赖（names / specs 为逗号分隔序列，按下标一一对应）。
+    // 返回失败个数（跳过 registry/git 源不计失败）。
+    pub func install(name_seq: string, spec_seq: string) -> i64 {
+        var names = split(name_seq, ",")
+        var specs = split(spec_seq, ",")
+        var n: i64 = len(names)
+        var failed: i64 = 0
+        var i: i64 = 0
+        while i < n {
+            // 嵌套 if：while 已保证 i < n（边界安全），再判非空再安装
+            if names[i] != "" {
+                if !install_one(names[i], specs[i]) {
+                    failed = failed + 1
+                }
+            }
+            i = i + 1
+        }
+        return failed
+    }
+}

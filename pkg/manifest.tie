@@ -1,0 +1,366 @@
+// tie:library
+// manifest.tie —— tie.pkg 清单解析模块（M6 包管理器骨架 E1/E2）
+//
+// 职责：解析 tie:data 格式的 tie.pkg 清单文件文本，提供字段提取与依赖
+// 增删能力。全部基于字符串原语（len / str_char / 拼接 / 循环 / 分支），
+// 纯函数无状态，符合「清单解析 = 文本处理」的定位（分层原则：能进 std 的
+// 进 std、能写 tie 的不进 Rust——此处即 tie 自写清单解析器）。
+//
+// tie 约束处理（重要）：
+// - **表参数的元素类型静态未知**：解析函数一律不接收表参数，跨模块传参
+//   用「逗号分隔字符串序列」（dep_names / dep_specs），模块内按下标索引
+//   访问（dep_name / dep_spec）或切分后再取；
+// - **tie 的 && 非短路**：字符串扫描中「边界判断」与「取字符」不写进同一
+//   个 && 条件（如 `i < n && str_char(s, i) == ","`），用嵌套 if 或拆开的
+//   单独条件表达；
+// - **无 continue/break**：循环用「条件不满足直接 return」提前退出；
+// - `table`/`text`/`code`/`char`/`bool`/`i64`/`f64` 是类型关键字，不可作
+//   变量名/参数名（参数统一用 tbl 等非关键字名）。
+//
+// tie.pkg 格式（tie init 生成的模板，tie:data 表字面量）：
+//   [
+//       "name": "demo",
+//       "version": "0.1.0",
+//       "role": "logic",
+//       "main": "main.tie",
+//       "dependencies": [
+//           "lib_math": "path:../lib_math",
+//       ],
+//   ]
+// 依赖项：键 = 包名，值 = spec（"path:路径" = 本地 path 源；"x.y.z" 版本
+// 约束 = registry 源占位，后续阶段解析）。
+
+namespace manifest {
+    // ================= 通用字符串工具（自备，不依赖 std 库） =================
+    // main.tie / deps.tie 也通过 manifest.* 前缀复用这些工具，避免跨模块
+    // 传表（工具函数全部 pub 导出）。
+
+    // 截取 s 的 [start, end) 子串；越界自动收敛到边界；start>=end 返回空串。
+    pub func slice(s: string, start: i64, end: i64) -> string {
+        var n: i64 = len(s)
+        var lo: i64 = start
+        if lo < 0 {
+            lo = 0
+        }
+        if lo > n {
+            lo = n
+        }
+        var hi: i64 = end
+        if hi < 0 {
+            hi = 0
+        }
+        if hi > n {
+            hi = n
+        }
+        var result: string = ""
+        var i: i64 = lo
+        while i < hi {
+            result = result + str_char(s, i)
+            i = i + 1
+        }
+        return result
+    }
+
+    // 查找 sub 在 s 中首次出现的位置（0 起字符索引）；未找到返回 -1。
+    // 空 sub 视为在位置 0 命中。
+    pub func find(s: string, sub: string) -> i64 {
+        var n: i64 = len(s)
+        var m: i64 = len(sub)
+        if m == 0 {
+            return 0
+        }
+        if m > n {
+            return -1
+        }
+        var i: i64 = 0
+        while i <= n - m {
+            var j: i64 = 0
+            var matched: bool = true
+            while j < m && matched {
+                // 嵌套 if 防越界：i+j 必在 [0, n) 内（外层保证 i <= n-m）
+                if str_char(s, i + j) != str_char(sub, j) {
+                    matched = false
+                }
+                j = j + 1
+            }
+            if matched {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    // 从 pos 位置起查找 sub 首次出现的位置（含 pos）；未找到返回 -1。
+    pub func find_from(s: string, sub: string, pos: i64) -> i64 {
+        // 越界起点直接未找到
+        if pos < 0 {
+            return -1
+        }
+        var n: i64 = len(s)
+        var m: i64 = len(sub)
+        if m == 0 {
+            return pos
+        }
+        // 从 pos 截取后缀，在子串中查找，结果加回偏移
+        var tail = slice(s, pos, n)
+        var off = find(tail, sub)
+        if off < 0 {
+            return -1
+        }
+        return pos + off
+    }
+
+    // 判断 s 是否以 prefix 开头。
+    pub func starts_with(s: string, prefix: string) -> bool {
+        var n: i64 = len(s)
+        var m: i64 = len(prefix)
+        if m > n {
+            return false
+        }
+        var i: i64 = 0
+        while i < m {
+            if str_char(s, i) != str_char(prefix, i) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+
+    // 判断 s 是否包含子串 sub。
+    pub func contains(s: string, sub: string) -> bool {
+        return find(s, sub) >= 0
+    }
+
+    // 找 s 中 pos 之前（不含 pos）最近的 '\n' 的位置；找不到返回 -1。
+    pub func last_newline(s: string, pos: i64) -> i64 {
+        var i: i64 = pos - 1
+        while i >= 0 {
+            if str_char(s, i) == "\n" {
+                return i
+            }
+            i = i - 1
+        }
+        return -1
+    }
+
+    // 按逗号分隔取字符串序列 seq 的第 i 段（0 起；越界返回空串）。
+    // 用于解析 dep_names / dep_specs 的逗号分隔序列。
+    pub func segment(seq: string, i: i64) -> string {
+        var n: i64 = len(seq)
+        var seg_no: i64 = 0
+        var start: i64 = 0
+        var p: i64 = 0
+        while p <= n {
+            var at_end: bool = (p == n)
+            var is_comma: bool = false
+            if !at_end {
+                if str_char(seq, p) == "," {
+                    is_comma = true
+                }
+            }
+            if at_end || is_comma {
+                if seg_no == i {
+                    return slice(seq, start, p)
+                }
+                seg_no = seg_no + 1
+                start = p + 1
+            }
+            p = p + 1
+        }
+        return ""
+    }
+
+    // ================= 清单字段提取 =================
+
+    // 提取 `"key": "value"` 形式字段的 value（引号内内容）；未找到返回空串。
+    // 注意：先匹配到哪个键就返回哪个（tie.pkg 模板 name 键在文件头部，
+    // dependencies 段的键是包名，字段名与包名撞名属极端情况，首版可接受）。
+    pub func field(src: string, key: string) -> string {
+        var marker = "\"" + key + "\": \""
+        var q = find(src, marker)
+        if q < 0 {
+            return ""
+        }
+        // 值起始引号：marker 结束处
+        var vstart = q + len(marker)
+        var vend = find_from(src, "\"", vstart)
+        if vend < 0 {
+            return ""
+        }
+        return slice(src, vstart, vend)
+    }
+
+    // dependencies 数组起始位置（'[' 之后的字符索引）；未找到返回 -1。
+    func deps_start(src: string) -> i64 {
+        var p = find(src, "\"dependencies\":")
+        if p < 0 {
+            return -1
+        }
+        var lb = find_from(src, "[", p)
+        if lb < 0 {
+            return -1
+        }
+        return lb + 1
+    }
+
+    // dependencies 数组结束位置（']' 的字符索引）；未找到返回 -1。
+    func deps_end(src: string) -> i64 {
+        var dstart = deps_start(src)
+        if dstart < 0 {
+            return -1
+        }
+        return find_from(src, "]", dstart)
+    }
+
+    // ================= 依赖项解析 =================
+    // 核心扫描：遍历 dependencies 数组区域的每一行 `"包名": "spec",`，
+    // 把全部包名（want_name=true）或全部 spec（want_name=false）拼成
+    // 逗号分隔序列返回（跨模块传参载体，规避表参数限制）。
+    func scan_deps(src: string, want_name: bool) -> string {
+        var out: string = ""
+        var dstart = deps_start(src)
+        var dend = deps_end(src)
+        if dstart < 0 {
+            return ""
+        }
+        if dend < 0 {
+            return ""
+        }
+        var pos = dstart
+        while pos < dend {
+            // 读键名（包名）：从 pos 找下一对引号
+            var q1 = find_from(src, "\"", pos)
+            if q1 < 0 {
+                return out
+            }
+            if q1 >= dend {
+                return out
+            }
+            var q2 = find_from(src, "\"", q1 + 1)
+            if q2 < 0 {
+                return out
+            }
+            var name = slice(src, q1 + 1, q2)
+            // 读 spec 值：q2 之后找下一对引号
+            var q3 = find_from(src, "\"", q2 + 1)
+            if q3 < 0 {
+                return out
+            }
+            if q3 >= dend {
+                return out
+            }
+            var q4 = find_from(src, "\"", q3 + 1)
+            if q4 < 0 {
+                return out
+            }
+            var spec = slice(src, q3 + 1, q4)
+            // 拼接所选字段（包名为空视为坏行，跳过）
+            if name != "" {
+                if out != "" {
+                    out = out + ","
+                }
+                if want_name {
+                    out = out + name
+                } else {
+                    out = out + spec
+                }
+            }
+            pos = q4 + 1
+        }
+        return out
+    }
+
+    // 全部依赖包名的逗号分隔序列（空依赖返回空串）。
+    pub func dep_names(src: string) -> string {
+        return scan_deps(src, true)
+    }
+
+    // 全部依赖 spec 的逗号分隔序列（与 dep_names 按下标一一对应）。
+    pub func dep_specs(src: string) -> string {
+        return scan_deps(src, false)
+    }
+
+    // 依赖个数。
+    pub func dep_count(src: string) -> i64 {
+        var seq = dep_names(src)
+        if seq == "" {
+            return 0
+        }
+        var c: i64 = 0
+        var i: i64 = 0
+        var n: i64 = len(seq)
+        while i < n {
+            if str_char(seq, i) == "," {
+                c = c + 1
+            }
+            i = i + 1
+        }
+        return c + 1
+    }
+
+    // 第 i 个依赖的包名（0 起；越界返回空串）。
+    pub func dep_name(src: string, i: i64) -> string {
+        return segment(dep_names(src), i)
+    }
+
+    // 第 i 个依赖的 spec（0 起；越界返回空串）。
+    pub func dep_spec(src: string, i: i64) -> string {
+        return segment(dep_specs(src), i)
+    }
+
+    // ================= 依赖增删（返回新文本） =================
+
+    // 追加依赖（name, spec）到 dependencies 数组；返回新清单文本。
+    // 调用方应先查重（存在时本函数仍追加，重复判定放 main）。
+    // 插入点：数组结束 ']' 前最近的换行之后，保持模板 8 空格缩进对齐。
+    pub func add_dep(src: string, name: string, spec: string) -> string {
+        var dend = deps_end(src)
+        if dend < 0 {
+            return src
+        }
+        // 在 ']' 前的行首处插入新行
+        var insert_at: i64 = dend
+        var nl = last_newline(src, dend)
+        if nl >= 0 {
+            insert_at = nl + 1
+        }
+        var line = "        \"" + name + "\": \"" + spec + "\",\n"
+        var prefix = slice(src, 0, insert_at)
+        var suffix = slice(src, insert_at, len(src))
+        return prefix + line + suffix
+    }
+
+    // 移除依赖 name；未找到则原样返回原文本（调用方用引用比较判断）。
+    // 删除整行：行首（q 前最近换行后）到行尾（该行换行后）。
+    pub func remove_dep(src: string, name: string) -> string {
+        var dstart = deps_start(src)
+        if dstart < 0 {
+            return src
+        }
+        var dend = deps_end(src)
+        if dend < 0 {
+            return src
+        }
+        // 在 dependencies 区域内找 "\"name\":" 键
+        var q = find_from(src, "\"" + name + "\":", dstart)
+        if q < 0 {
+            return src
+        }
+        if q >= dend {
+            return src
+        }
+        // 行首：q 前最近换行 + 1
+        var line_start = last_newline(src, q) + 1
+        // 行尾：该行换行符之后（含行尾逗号与换行）
+        var nl = find_from(src, "\n", q)
+        if nl < 0 {
+            return src
+        }
+        var line_end = nl + 1
+        var prefix = slice(src, 0, line_start)
+        var suffix = slice(src, line_end, len(src))
+        return prefix + suffix
+    }
+}

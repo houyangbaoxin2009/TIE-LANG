@@ -25,6 +25,15 @@ mod cache;
 mod config;
 mod pipeline;
 
+/// 包管理器子命令名（M6）：首个参数命中（且非 .tie 文件）→ 转交 pkg.exe。
+///
+/// pkg.exe 是 tie 语言自写的包管理器（pkg/main.tie 经 tie-llvm 编译，
+/// 链接 tie-interp 静态库），完整 CLI（init/add/remove/install/build/run/help）
+/// 的解析与执行逻辑全部在 tie 侧；本入口只做「子命令识别 + exec 转发」。
+const PKG_SUBCOMMANDS: [&str; 7] = [
+    "init", "add", "remove", "install", "build", "run", "help",
+];
+
 /// 命令行参数（编译类选项透传给 tie-llvm）。
 struct Args {
     /// 输入文件/目录列表（多文件或目录 = 编译项目；启用高级编译时按文件切片并行）
@@ -60,6 +69,7 @@ tie 语言总入口（四段式调度器 + REPL）
   tie --lsp          启动语言服务器（LSP over stdio，供编辑器接入）
   tie <input.tie> [选项]   编译并执行脚本文件
   tie <file...|目录> [选项] 编译项目（多文件/目录；需配置文件开启 advanced.enabled）
+  tie init|add|remove|install|build|run|help   包管理器（M6，tie 语言自写）
 
 流程:
   1. tie-prep 预处理（清理代码 + 识别文件类型）
@@ -178,6 +188,87 @@ fn find_repl_exe() -> Option<PathBuf> {
     None
 }
 
+/// 查找包管理器可执行文件（env → exe 同目录 → 当前目录 → workspace pkg/ 目录）。
+///
+/// 与 [find_repl_exe] 同一查找模式：环境变量 TIE_PKG_EXE 显式指定 → 与
+/// tie.exe 同目录（发布部署常见布局）→ 当前工作目录 → pkg/ 目录（开发期：
+/// pkg/pkg.exe 自举产物）。另加「tie.exe 向上回溯找 pkg/」，保证开发期
+/// 在任何项目目录运行 tie.exe 都能定位 workspace 根的 pkg.exe。
+fn find_pkg_exe() -> Option<PathBuf> {
+    // 1. 环境变量显式指定
+    if let Some(p) = env::var_os("TIE_PKG_EXE") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    // Windows 下 pkg.exe；其他平台 pkg
+    let exe_name = if cfg!(target_os = "windows") { "pkg.exe" } else { "pkg" };
+    // 2. 当前可执行文件（tie.exe）所在目录
+    if let Ok(cur) = env::current_exe() {
+        if let Some(dir) = cur.parent() {
+            let p = dir.join(exe_name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    // 3. 当前工作目录
+    let p = PathBuf::from(exe_name);
+    if p.is_file() {
+        return Some(p);
+    }
+    // 4. workspace 标准布局：pkg/pkg.exe（开发期在仓库根直接运行 tie.exe）
+    let p = PathBuf::from("pkg").join(exe_name);
+    if p.is_file() {
+        return Some(p);
+    }
+    // 5. 开发期兜底：tie.exe 所在目录向上回溯找 workspace pkg/（如
+    //    target/debug/tie.exe → workspace 根/pkg/pkg.exe），让任意项目目录
+    //    下运行 tie.exe 也能定位包管理器
+    if let Ok(cur) = env::current_exe() {
+        if let Some(mut dir) = cur.parent().map(|d| d.to_path_buf()) {
+            for _ in 0..6 {
+                let p = dir.join("pkg").join(exe_name);
+                if p.is_file() {
+                    return Some(p);
+                }
+                if !dir.pop() {
+                    break;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 包管理器入口：执行 tie 语言自写的 pkg.exe（完整 CLI 逻辑），
+/// 命令行参数（含子命令名）原样透传，退出码透传。
+fn run_pkg() -> ExitCode {
+    let exe = find_pkg_exe();
+    let Some(exe) = exe else {
+        eprintln!(
+            "未找到包管理器 pkg.exe。请先构建（自举）:\n\
+             1. cargo build --release -p tie-interp\n\
+             2. target\\release\\tie-llvm.exe pkg\\main.tie -o pkg\\pkg.exe\n\
+             （或用环境变量 TIE_PKG_EXE 指定路径）"
+        );
+        // Windows 下直接运行（如双击）时窗口会一闪而过，暂停以让用户看到提示
+        pause_before_exit();
+        return ExitCode::FAILURE;
+    };
+    // 透传全部用户参数（含子命令名 init/add/... 及其参数）给 pkg.exe
+    let args: Vec<String> = env::args().skip(1).collect();
+    match std::process::Command::new(&exe).args(&args).status() {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Err(e) => {
+            eprintln!("启动 pkg.exe 失败: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn parse_args() -> Result<Args, String> {
     let mut args = env::args().skip(1);
     let mut inputs: Vec<PathBuf> = Vec::new();
@@ -247,6 +338,18 @@ fn main() -> ExitCode {
     // 无参数 → REPL 交互模式
     if env::args().len() == 1 {
         return repl();
+    }
+
+    // ---- 包管理器子命令识别（M6）----
+    // 优先级：首个参数是已知子命令名（init/add/remove/install/build/run/help）
+    // 且不是 .tie 文件 → 转交 tie 语言自写的 pkg.exe（不进入编译参数解析）。
+    // 子命令不与既有语义冲突：`tie <file.tie>` 因 .tie 后缀走编译路径；
+    // `tie -h/--lsp/...` 因 `-` 前缀走既有参数解析。
+    if let Some(first) = env::args().nth(1) {
+        let is_pkg_cmd = !first.ends_with(".tie") && PKG_SUBCOMMANDS.contains(&first.as_str());
+        if is_pkg_cmd {
+            return run_pkg();
+        }
     }
 
     let args = match parse_args() {

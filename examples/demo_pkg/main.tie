@@ -1,0 +1,8 @@
+// tie:logic
+// tie:opt=2
+
+// 项目主文件（由 tie init 生成）
+
+func main() {
+    println("Hello, tie!")
+}
