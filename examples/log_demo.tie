@@ -1,0 +1,41 @@
+// tie:logic
+// log_new_demo.tie：新版 std/log.tie（命名空间 + 默认值参数综合方案）验证
+// 双路径：tie-llvm 编译运行 / tie-interp 解释，输出与断言应一致。
+
+import "../enl/log.tie"
+import "../std/assert.tie"
+
+func main() {
+    // ---- 消息系统基础 API（命名空间形式）----
+    log.register("hello", "zh", "你好")
+    log.register("hello", "en", "Hello")
+    assert.assert(log.t("hello") == "你好")          // 默认 zh
+    log.set_lang("en")
+    assert.assert(log.t("hello") == "Hello")         // 切 en
+    assert.assert(log.t("unknown.key") == "unknown.key")  // 回退键本身
+
+    // ---- 综合方案 方案 B：省略 texts → 查字典 ----
+    log.register("error.no_file", "zh", "文件不存在")
+    log.register("error.no_file", "en", "File not found")
+    log.set_lang("zh")
+    assert.assert(log.error.no_file(["zh-cn", "en-us"]) == "文件不存在")
+    log.set_lang("en")
+    assert.assert(log.error.no_file(["zh-cn", "en-us"]) == "File not found")
+    // 当前语言与 langs 无关：字典查的是 msg 当前语言（回退 zh）
+
+    // ---- 综合方案 方案 A：传 texts → 按当前语言匹配 langs ----
+    log.set_lang("zh")
+    assert.assert(log.error.no_file(["zh-cn", "en-us"], ["调用方中文", "caller en"]) == "调用方中文")
+    log.set_lang("en")
+    assert.assert(log.error.no_file(["zh-cn", "en-us"], ["调用方中文", "caller en"]) == "caller en")
+    // langs 未命中当前语言 → 回退第一个文本
+    assert.assert(log.error.no_file(["ja"], ["仅日文"]) == "仅日文")
+
+    // ---- 分级打印（命名空间封装）----
+    log.set_lang("zh")
+    log.error("error.no_file")   // 错误: 文件不存在
+    log.warn("error.no_file")    // 警告: 文件不存在
+    log.info("hello")            // 信息: 你好
+
+    println("log 新 API 演示全部通过")
+}

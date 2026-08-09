@@ -110,4 +110,52 @@ pub func deg_to_rad(deg: f64) -> f64 {
 pub func rad_to_deg(rad: f64) -> f64 {
     return rad * 180.0 / 3.141592653589793
 }
+
+// 两个整数的最大公约数（欧几里得辗转相除；负数取绝对值，0 与 x 的 gcd 为 |x|）
+pub func gcd(a: i64, b: i64) -> i64 {
+    var x: i64 = a
+    var y: i64 = b
+    // 负数取绝对值（i64::MIN 取反回绕为自身，数学上 gcd 符号无意义）
+    if x < 0 {
+        x = -x
+    }
+    if y < 0 {
+        y = -y
+    }
+    while y != 0 {
+        var r: i64 = x % y
+        x = y
+        y = r
+    }
+    return x
+}
+
+// 两个整数的最小公倍数：|a*b| / gcd(a, b)；任一为 0 → 0
+pub func lcm(a: i64, b: i64) -> i64 {
+    if a == 0 || b == 0 {
+        return 0
+    }
+    var g = gcd(a, b)
+    // |a / g * b|：先除后乘避免中间溢出（a/g 与 b 的乘积仍可能溢出，本期接受）
+    var q: i64 = a / g
+    var r: i64 = q * b
+    if r < 0 {
+        r = -r
+    }
+    return r
+}
+
+// 整数幂 x^n（n >= 0 循环乘）；n < 0 返回 0（整数负指数无意义，与多数语言一致）
+pub func pow_i(x: i64, n: i64) -> i64 {
+    if n < 0 {
+        return 0
+    }
+    var result: i64 = 1
+    var i: i64 = 0
+    while i < n {
+        result = result * x
+        i = i + 1
+    }
+    return result
+}
 }

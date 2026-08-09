@@ -26,4 +26,20 @@ pub func assert_neq(a: i64, b: i64) {
         exit(1)
     }
 }
+
+// 断言两个浮点相等；不相等时打印两个值并退出（退出码 1）
+pub func assert_eq_f64(a: f64, b: f64) {
+    if a != b {
+        println("assert_eq_f64 失败：" + to_string(a) + " != " + to_string(b))
+        exit(1)
+    }
+}
+
+// 断言两个字符串相等；不相等时打印两个值并退出（退出码 1）
+pub func assert_eq_str(a: string, b: string) {
+    if a != b {
+        println("assert_eq_str 失败：" + a + " != " + b)
+        exit(1)
+    }
+}
 }

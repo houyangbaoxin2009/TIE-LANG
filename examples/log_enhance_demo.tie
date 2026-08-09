@@ -1,0 +1,41 @@
+// tie:logic
+// tie:opt=2
+
+// log_enhance_demo.tie——Harbor M4 log 增强演示
+// 覆盖：register_all 批量登记 / error_f 带参消息 / debug 级别与 set_level /
+// set_fallbacks 多级回退 / lang / level / 输出通道（error/warn 走 stderr）
+// 注意：log.tie 已随同展开 string.tie + format.tie，本文件不再重复导入
+// 运行：tie examples/log_enhance_demo.tie
+
+import "../enl/log.tie"
+import "../std/assert.tie"
+
+func main() {
+    // 1. 批量登记（register_all：每行 "key|lang|text"；表字面量须单行，避免 ASI 截断）
+    log.register_all(["greet|zh|你好，{}！", "greet|en|Hello, {}!", "file.not_found|zh|文件不存在", "file.not_found|en|File not found"])
+    assert.assert_eq_str(log.t("file.not_found"), "文件不存在")
+
+    // 2. 带参消息（error_f/warn_f/info_f：模板 {} 由 args 填充）
+    log.info_f("greet", ["tie"])        // stdout：信息: 你好，tie！
+    log.set_lang("en")
+    log.info_f("greet", ["tie"])        // stdout：信息: Hello, tie!
+    log.error_f("greet", ["M4"])        // stderr：错误: Hello, M4!
+
+    // 3. 级别控制：debug 默认不输出（阈值 1=info）；set_level(0) 后输出
+    log.debug("file.not_found")          // 不输出（默认阈值 1）
+    log.set_level(0)
+    assert.assert_eq(log.level(), 0)
+    log.debug("file.not_found")          // stderr：调试: File not found
+
+    // 4. 多级回退：当前语言 fr（未登记）→ 回退链 en → 键本身
+    log.set_fallbacks(["en"])
+    log.set_lang("fr")
+    log.info("file.not_found")           // stdout：信息: File not found（回退 en）
+    log.info("no_such_key")              // stdout：信息: no_such_key（回退键本身）
+
+    // 5. 恢复默认并确认查询
+    log.set_lang("zh")
+    log.set_level(1)
+    assert.assert_eq_str(log.lang(), "zh")
+    println("log 增强演示全部通过")
+}

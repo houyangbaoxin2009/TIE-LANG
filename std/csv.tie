@@ -1,12 +1,14 @@
 // tie:library
-// csv.tie：标准库——CSV 读取（命名空间 csv；纯 tie 实现，基于 file_read + str 命名空间切分）
-// 本文件 import string.tie（str.split / str.slice / str_char）：
+// csv.tie：标准库——CSV 读写（命名空间 csv；纯 tie 实现，基于 file_read/file_write
+// + str 命名空间函数）。本文件 import string.tie 并用 `using str;` 裸调
+// split/slice/join（M2.1.7 using 引入）；str_char 是语言底座原语（非 str 命名空间）。
 // 注意——当前 import 展开不做去重，调用方只需导入 csv.tie（string.tie 会随
 // 之展开）；若再重复导入 string.tie，会导致 str 命名空间内函数重复定义。
 // csv_cells 直接委托 str.split，保证与 string.tie 的语义逐字符一致。
-// 调用：import 后 csv.csv_read(...) / csv.csv_cells(...)
+// 调用：import 后 csv.csv_read(...) / csv.csv_cells(...) / csv.csv_write(...)
 
 import "./string.tie"
+using str;
 
 namespace csv {
 // 读取 CSV 文件全部内容为字符串表（一行一个元素）：
@@ -17,7 +19,7 @@ namespace csv {
 // 每行内的单元格由调用方用 csv_cells(row, ",") 切分（支持任意分隔符）。
 pub func csv_read(path: string) -> table {
     var content: string = file_read(path)
-    var raw = str.split(content, "\n")
+    var raw = split(content, "\n")
     var lines = table_new_string()
     var n: i64 = len(raw)
     var i: i64 = 0
@@ -31,7 +33,15 @@ pub func csv_read(path: string) -> table {
 // 把一行 CSV 文本按分隔符切分为单元格表（str.split 的别名，直接委托）；
 // sep 为空串时返回单元素 [line]。
 pub func csv_cells(line: string, sep: string) -> table {
-    return str.split(line, sep)
+    return split(line, sep)
+}
+
+// 把行表 lines 写入 CSV 文件（每行已含分隔符，用 \n 连接，**无尾换行**——
+// 与 csv_read 的 split("\n") 对称，写读往返不产生空行元素）；
+// 返回 file_write 是否成功（true 成功 / false 失败）。
+pub func csv_write(path: string, lines: table) -> bool {
+    var content = join(lines, "\n")
+    return file_write(path, content)
 }
 
 // 去掉字符串末尾的一个回车符 "\r"（Windows 换行残留）；无 \r 时原样返回
@@ -39,7 +49,7 @@ pub func csv_cells(line: string, sep: string) -> table {
 func strip_cr(s: string) -> string {
     var n: i64 = len(s)
     if n > 0 && str_char(s, n - 1) == "\r" {
-        return str.slice(s, 0, n - 1)
+        return slice(s, 0, n - 1)
     }
     return s
 }

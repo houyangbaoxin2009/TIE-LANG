@@ -1,7 +1,76 @@
 # CHANGELOG
 
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
-里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库**。
+里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库、M3 = 预处理器自举、M4 = 标准库重构**。
+
+## [Harbor M4] 标准库重构：补全常用函数 + using 简化内部调用 — 2026-08-09
+
+### 语言特性：顶层持久变量（var/const 全局，M4 新增）
+- 顶层允许 `var name: Ty = 字面量` / `const name: Ty = 字面量`（标量类型 i8..u64/f32/f64/
+  bool/char/string；字面量初始化）——**跨函数共享的可变状态**，tie 语言自身表达
+  （此前无全局状态，消息系统的语言/字典只能下沉 Rust thread_local 原语）
+- 函数体内：读直接引用（作用域未命中查全局表）、写 `name = v`（const 全局拦截赋值）
+- 四层同步：parser（顶层 Var/Const）、semantic（globals 收集 + 校验 + Var/Assign 解析 +
+  ns_path_segments/ns_call_full_name 全局判定）、IR（`@name = global Ty 字面量` +
+  load/store）、interp（register_top_level → 会话 globals）
+- 命名空间裸调用补全升级：**逐级外层**（log::error 内裸调 log 的 lookup）；
+  check_visibility 子命名空间可访问父命名空间私有函数（与逐级补全配套）
+
+### log 增强（M4，移入 enl/ 扩展库）
+- **enl/ 扩展库（Enlargement）**：log 从 std/ 移入 enl/——有状态/应用级能力分层
+  （std = 无状态纯函数工具；enl = 依赖 std 与语言底座的扩展，随发行版内置）
+- 状态纯 tie 化：消息级别（msg_level 全局变量）与回退语言链（msg_fallbacks 全局变量）
+- 带参消息：error_f/warn_f/info_f/debug_f（msg_t 模板 + format.sprintf 填充 {}）
+- 级别体系：debug(0) < info(1) < warn(2) < error(3)，set_level/level 控制只输出 >= 阈值
+- 输出通道：error/warn/debug 走 **stderr**（新原语 print_err），info 走 stdout
+- 字典管理：register_all 批量登记（"key|lang|text"）、lang() 查询、set_fallbacks 多级回退
+  （新原语 msg_t_lang 指定语言查询，回退链遍历由 log 纯 tie 实现）
+- 新增原语共 2 个：`print_err(s)`（stderr 输出）、`msg_t_lang(key, lang)`（指定语言
+  查询，未命中空串）——四层同步（interp C ABI + eval、semantic 校验、IR declare/生成）
+
+### 标准库补全
+- **string.tie**（str 命名空间）：新增 `to_upper`/`to_lower`（ASCII 查表大小写转换）、
+  `join`（字符串表连接，与 split 互逆）、`repeat`（重复拼接）、`trim_start`/`trim_end`
+  （单侧去空白；trim 复用二者）
+- **math.tie**（math 命名空间）：新增 `gcd`（欧几里得辗转相除，负数取绝对值）、
+  `lcm`（先除后乘避免中间溢出，任一为 0 → 0）、`pow_i`（整数幂，负指数返回 0）
+- **format.tie**（format 命名空间）：新增 `sprintf(fmt, args: table)` 占位符格式化
+  ——`{}` 依次替换为字符串表元素（tie 无变参，多值用表参数传入），未配对占位符补空串
+- **csv.tie**（csv 命名空间）：新增 `csv_write(path, lines)` 写行表（`join(lines, "\n")`
+  无尾换行，与 csv_read 的 split 对称——写读往返不产生空行元素）
+- **assert.tie**（assert 命名空间）：新增 `assert_eq_f64`/`assert_eq_str`（浮点/字符串断言）
+
+### using 简化内部调用（M2.1.7 特性落地）
+- csv.tie / log.tie 改用 `using str;` 后**裸调用** str 命名空间函数
+  （csv_cells 裸调 split、strip_cr 裸调 slice、no_file 裸调 starts_with）
+
+### 修复的编译器 bug（标准库重构暴露）
+1. **ns_call_full_name 未支持 using（M2.1.7 遗留）**：表元素类型查询（dynamic_table_elem_ty /
+   table_arg_elem_ty）解析裸调用只认裸名/ns_stack 前缀补全，漏了 using 引入的命名空间 →
+   `using str` 后裸调 split（返回表）误报「函数 'split' 未定义或不是返回表的函数」；
+   补第三候选（唯一候选，多候选歧义返回 None）
+2. **IR gen_dyn_table_var 裸调用绕过 resolved_calls**：动态表变量初始化（`var raw = split(...)`）
+   直接按函数名生成调用 → using 裸调命中全名（str::split）时查签名失败；改先查
+   resolved_calls（与 gen_expr 的 Call 分支一致）
+3. **下标访问不支持返回表的函数调用**：语义层 Index 分支只认表变量/表字面量，
+   IR gen_index 只认变量 → `csv.csv_cells(...)[0]` 报错；语义层加 Call/MethodCall 分支
+   （查 table_ret_elems 元素类型），IR 层加调用结果 base（求值拿动态表指针走 tie_table_at）
+
+### 验证
+- workspace 全量 **321 全绿**（137 frontend + 59 interp + 34 llvm + 75 lsp + 6 prep + 10 tie）
+- 新增 examples/std_refactor_demo.tie 综合演示（str 大小写/trim 拆分/join/repeat、
+  math gcd/lcm/pow_i、sprintf、csv_write 往返、assert 泛化——21 项输出全对）
+- 新增 examples/log_enhance_demo.tie（register_all/error_f 带参/debug 级别与
+  set_level/set_fallbacks 回退 en/lang/level/stderr 通道——stdout 与 stderr 分离验证）
+- 全部 std demo 回归通过（std/csv/log/format/std_math/ns_import/oop）
+- `cargo build --workspace` 零错误
+
+### 文档
+- README：M3 里程碑更正为 **✅ 完成**（预处理器自举阶段一/二已全部落地）；
+  新增 Harbor M4 行；工程结构补 **enl/** 扩展库目录；std/ 结构描述同步
+- scripts/package.ps1：发行版打包补录 std/ 与 enl/（用户程序 import 依赖本地库目录）
+- 新增 examples/std_refactor_demo.tie、examples/log_enhance_demo.tie；
+  CHANGELOG 历史条目保留原样
 
 ## [Harbor M2.1.8] 数据结构与逻辑分离：struct 取代 class，方法移出为命名空间函数 — 2026-08-09
 

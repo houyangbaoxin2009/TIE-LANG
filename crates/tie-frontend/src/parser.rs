@@ -119,7 +119,8 @@ impl<'a> Parser<'a> {
 
     fn parse_program(&mut self) -> Result<Program, ParseError> {
         let mut stmts = Vec::new();
-        // 顶层只允许函数定义、import、using、类定义与命名空间声明（import 由 driver 递归展开为函数）
+        // 顶层只允许函数定义、import、using、struct、命名空间声明与全局持久变量
+        //（var/const，M4：跨函数共享的可变状态；import 由 driver 递归展开为函数）。
         while !matches!(self.peek_kind(), TokenKind::Eof) {
             match self.peek_kind() {
                 TokenKind::Func | TokenKind::Pub => stmts.push(Stmt::FnDef(self.parse_fn_def()?)),
@@ -127,9 +128,16 @@ impl<'a> Parser<'a> {
                 TokenKind::Using => stmts.push(Stmt::Using(self.parse_using()?)),
                 TokenKind::Struct => stmts.push(Stmt::Struct(self.parse_struct()?)),
                 TokenKind::Namespace => stmts.push(Stmt::Namespace(self.parse_namespace()?)),
+                // 顶层全局持久变量（跨函数共享；限标量类型 + 字面量初始化，语义层校验）
+                TokenKind::Var | TokenKind::Const => {
+                    let is_const = matches!(self.peek_kind(), TokenKind::Const);
+                    for v in self.parse_var_decl(is_const)? {
+                        stmts.push(Stmt::VarDecl(v));
+                    }
+                }
                 other => {
                     return Err(self.err(format!(
-                        "顶层只允许函数定义、import、using、类定义或命名空间声明，实际是 {}",
+                        "顶层只允许函数定义、import、using、struct、命名空间声明或全局变量，实际是 {}",
                         self.describe(other)
                     )))
                 }

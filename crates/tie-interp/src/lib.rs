@@ -315,6 +315,8 @@ pub extern "C" fn tie_msg_register(key: *const c_char, lang: *const c_char, text
 /// C ABI 桥：查询键的翻译文本，返回新分配的堆串（调用方用完必须 tie_free_result）。
 ///
 /// 查询顺序：当前语言 → 回退 "zh" → 回退「键本身」（未登记时原样返回键）。
+/// M4 起消息系统状态（级别/回退链）由 tie 语言自身用顶层持久变量表达，
+/// 本桥保持最小查询能力；指定语言查询见 tie_msg_t_lang。
 #[unsafe(no_mangle)]
 pub extern "C" fn tie_msg_t(key: *const c_char) -> *mut c_char {
     let key = unsafe { c_char_to_string(key).unwrap_or_default() };
@@ -332,6 +334,33 @@ pub extern "C" fn tie_msg_t(key: *const c_char) -> *mut c_char {
         }
         // 3) 回退键本身
         key.clone()
+    });
+    string_to_c_char(out)
+}
+
+/// C ABI 桥：向 stderr 输出一行（消息系统的 error/warn/debug 通道；info 走 stdout 的
+/// println——M4 控制台消息库按级别区分输出通道）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_print_err(text: *const c_char) {
+    let text = unsafe { c_char_to_string(text).unwrap_or_default() };
+    eprintln!("{text}");
+}
+
+/// C ABI 桥：按**指定语言**查询键的翻译文本（不做回退，命中返回文本、未命中返回空串），
+/// 返回新分配的堆串（调用方用完必须 tie_free_result）。
+///
+/// M4 起消息系统的回退语言链由 tie 语言自身用顶层持久变量表达，tcmsg 遍历回退链时
+/// 逐个调用本桥做指定语言查询（替代固定 zh 回退的 msg_t）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_msg_t_lang(key: *const c_char, lang: *const c_char) -> *mut c_char {
+    let key = unsafe { c_char_to_string(key).unwrap_or_default() };
+    let lang = unsafe { c_char_to_string(lang).unwrap_or_default() };
+    let out = MSG_STATE.with(|s| {
+        s.borrow()
+            .dict
+            .get(&(key, lang))
+            .cloned()
+            .unwrap_or_default()
     });
     string_to_c_char(out)
 }
@@ -864,10 +893,11 @@ impl Session {
         }
     }
 
-    /// 注册顶层定义（func → funcs；class/import → v1 暂不支持）。
+    /// 注册顶层定义（func → funcs；顶层持久变量 → globals；class/import → v1 暂不支持）。
     ///
     /// 命名空间（Namespace）递归注册：体内函数以全名（路径段::函数名）进 funcs，
     /// 使 `tcmsg::error.no_file(...)` 路径调用与命名空间内裸调用都能命中。
+    /// M4 顶层 var/const：求值初始化后存入 globals（跨函数共享的可变状态）。
     fn register_top_level(&mut self, program: tie_frontend::ast::Program) -> Result<String, String> {
         let mut count = 0;
         for stmt in &program.stmts {
@@ -879,10 +909,16 @@ impl Session {
                 Stmt::Namespace(ns) => {
                     count += self.register_ns_funcs(&ns.body, &ns.path)?;
                 }
+                Stmt::VarDecl(v) => {
+                    // 顶层持久变量：求值初始化后存入会话 globals（跨函数共享）
+                    let mut env = Env::new(self);
+                    let val = env.eval_expr(&v.init)?;
+                    env.session.globals.insert(v.name.clone(), val);
+                }
                 Stmt::Struct(_) => return Err("REPL v1 暂不支持 struct 定义".into()),
                 Stmt::Import(_) => return Err("REPL v1 暂不支持 import".into()),
                 Stmt::Using(_) => return Err("REPL v1 暂不支持 using".into()),
-                _ => return Err("顶层只允许函数/类/import/using/命名空间定义".into()),
+                _ => return Err("顶层只允许函数/类/import/using/命名空间/全局变量定义".into()),
             }
         }
         Ok(format!("已定义 {count} 个函数"))
@@ -1782,6 +1818,36 @@ impl<'a> Env<'a> {
                 let k = CString::new(key.as_str()).unwrap_or_default();
                 // 返回堆串，用完必须释放（与 file_read 同机制）
                 let p = tie_msg_t(k.as_ptr());
+                let s = unsafe { c_char_to_string(p).unwrap_or_default() };
+                tie_free_result(p);
+                Ok(Value::Str(s))
+            }
+            // ---------- 消息系统增强（M4）内置函数 ----------
+            // 与编译路径一致：走 C ABI 桥。M4 起消息系统的级别/回退链状态由 tie 语言
+            // 自身用顶层持久变量表达（纯 tie），本桥只保留 I/O 通道（print_err）与
+            // 指定语言查询（msg_t_lang）。
+            "print_err" => {
+                if args.len() != 1 {
+                    return Err("print_err 需要一个字符串参数".into());
+                }
+                let Value::Str(s) = &args[0] else {
+                    return Err("print_err 需要一个字符串参数".into());
+                };
+                let c = CString::new(s.as_str()).unwrap_or_default();
+                tie_print_err(c.as_ptr());
+                Ok(Value::Void)
+            }
+            "msg_t_lang" => {
+                if args.len() != 2 {
+                    return Err("msg_t_lang 需要两个字符串参数（键, 语言）".into());
+                }
+                let (Value::Str(key), Value::Str(lang)) = (&args[0], &args[1]) else {
+                    return Err("msg_t_lang 需要两个字符串参数（键, 语言）".into());
+                };
+                let k = CString::new(key.as_str()).unwrap_or_default();
+                let l = CString::new(lang.as_str()).unwrap_or_default();
+                // 返回堆串，用完必须释放（与 msg_t 同机制）
+                let p = tie_msg_t_lang(k.as_ptr(), l.as_ptr());
                 let s = unsafe { c_char_to_string(p).unwrap_or_default() };
                 tie_free_result(p);
                 Ok(Value::Str(s))

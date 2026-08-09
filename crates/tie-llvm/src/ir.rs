@@ -139,6 +139,10 @@ impl<'p> IrGenerator<'p> {
         self.out.push_str("declare double @ceil(double)\n");
         self.out.push_str("declare double @round(double)\n\n");
 
+        // 顶层全局持久变量（M4）：`@name = global Ty 字面量`（静态初始化，
+        // 函数内 load/store 访问）。字符串全局存指向常量串的指针。
+        self.gen_globals()?;
+
         // 收集函数签名（与语义一致）
         let sigs: HashMap<String, FuncSig> = self
             .program
@@ -268,6 +272,14 @@ impl<'p> IrGenerator<'p> {
         if self.used_externs.iter().any(|s| s == "tie_msg_t") {
             self.out.push_str("declare ptr @tie_msg_t(ptr)\n");
         }
+        // M4 消息系统增强桥：print_err（stderr 通道）与 msg_t_lang（指定语言查询，
+        // 返回堆串；tcmsg 用顶层持久变量表达回退链后逐语言遍历）。
+        if self.used_externs.iter().any(|s| s == "tie_print_err") {
+            self.out.push_str("declare void @tie_print_err(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_msg_t_lang") {
+            self.out.push_str("declare ptr @tie_msg_t_lang(ptr, ptr)\n");
+        }
         // 动态表（table_new_*/table_push/table_at）的 C ABI 桥（与解释路径共用实现）：
         // tie_table_new 创建空表（elem_size 决定元素宽度）；tie_table_push_* 追加元素；
         // tie_table_at_* 按下标读取（越界置 ok=0）；tie_table_len 返回元素个数；
@@ -304,6 +316,40 @@ impl<'p> IrGenerator<'p> {
         }
         if self.used_externs.iter().any(|s| s == "tie_table_at_bool") {
             self.out.push_str("declare i1 @tie_table_at_bool(ptr, i64, ptr)\n");
+        }
+        Ok(())
+    }
+
+    /// 顶层全局持久变量声明（M4）：`@name = global Ty 字面量`（静态初始化）。
+    ///
+    /// - 数值/布尔/字符：按类型直接写字面量值；字符串：指向常量串的指针
+    ///   （`@name = global ptr @.str.N`，常量串由 string_global 延迟收集）；
+    /// - 函数内访问：读 `load Ty, ptr @name`、写 `store Ty %v, ptr @name`（见
+    ///   gen_expr 的 Var 分支与 gen_stmt 的 Assign 分支的全局回退）。
+    fn gen_globals(&mut self) -> Result<(), IrError> {
+        for stmt in &self.program.stmts {
+            let Stmt::VarDecl(v) = stmt else { continue };
+            let Some(ty) = self.sem.globals.get(&v.name) else {
+                continue; // 非全局（函数内声明不会到顶层）；语义层已收集全局
+            };
+            let llvm_ty = self.llvm_ty(ty);
+            let init = match &v.init {
+                Expr::IntLit(n) => n.to_string(),
+                Expr::FloatLit(f) => format_float(*f),
+                Expr::BoolLit(b) => if *b { "1".to_string() } else { "0".to_string() },
+                Expr::CharLit(c) => (*c as i32).to_string(),
+                Expr::StrLit(s) => format!("@{}", self.string_global(s)),
+                _ => {
+                    return Err(IrError {
+                        message: format!(
+                            "内部错误：全局变量 '{}' 初始化不是字面量（语义层应已拦截）",
+                            v.name
+                        ),
+                    })
+                }
+            };
+            self.out
+                .push_str(&format!("@{} = global {llvm_ty} {init}\n", v.name));
         }
         Ok(())
     }
@@ -503,30 +549,39 @@ impl<'p> IrGenerator<'p> {
                 Ok(())
             }
             Stmt::Assign(a) => {
-                // 赋值：查找目标变量绑定（语义已保证存在且非 const）
-                let bind = self.lookup_var(&a.target).cloned().ok_or_else(|| IrError {
-                    message: format!("内部错误：赋值目标 '{}' 未入作用域（函数 {}）", a.target, self.cur_fn),
-                })?;
+                // 赋值：查找目标变量绑定（函数作用域）或顶层全局持久变量（M4）
+                let bind = self.lookup_var(&a.target).cloned();
+                let global_ty = if bind.is_none() {
+                    self.sem.globals.get(&a.target).cloned()
+                } else {
+                    None
+                };
+                let (target_ptr, target_ty) = if let Some(b) = &bind {
+                    (b.value.clone(), b.ty.clone())
+                } else if let Some(gt) = &global_ty {
+                    (format!("@{}", a.target), self.llvm_ty(gt))
+                } else {
+                    return Err(IrError {
+                        message: format!(
+                            "内部错误：赋值目标 '{}' 未入作用域（函数 {}）",
+                            a.target, self.cur_fn
+                        ),
+                    });
+                };
                 match a.op {
-                    // 普通赋值：直接求右值并 store（按变量的声明类型，语义已保证类型匹配）
+                    // 普通赋值：直接求右值并 store（按目标类型，语义已保证类型匹配）
                     None => {
                         let (val, _ty) = self.gen_expr(&a.value)?;
-                        self.line(&format!("store {} {}, ptr {}", bind.ty, val, bind.value));
+                        self.line(&format!("store {target_ty} {val}, ptr {target_ptr}"));
                     }
                     // 复合赋值（+= -= *= /= %= &= |= ^= <<= >>=，M4）：
                     // load 目标当前值 → 与右值做二元运算 → store 结果回目标。
-                    // 运算指令生成复用 gen_binary_on_regs（与 gen_binary 同一套逻辑）。
                     Some(op) => {
                         let (rv, _rty) = self.gen_expr(&a.value)?;
                         let cur = self.new_reg();
-                        self.line(&format!("{cur} = load {}, ptr {}", bind.ty, bind.value));
+                        self.line(&format!("{cur} = load {target_ty}, ptr {target_ptr}"));
                         // 目标是否字符串：LLVM 类型名 "ptr" 无法区分字符串与裸指针。
-                        // 复合赋值目标为 ptr 的场景只有字符串拼接（+=），
-                        // 类/元组/数组不进标量复合赋值（语义层已拦），故用 ptr 近似。
-                        let lhs_is_str = bind.ty == "ptr";
-                        // 无符号性：右值表达式的语义类型近似（右值非字面量时与目标同型，
-                        // 字面量默认 i64 有符号——无符号复合除法/取模/右移是边缘场景，
-                        // 早期开发按有符号处理可接受）。
+                        let lhs_is_str = target_ty == "ptr";
                         let rhs_is_unsigned = matches!(
                             self.sem_ty_of(&a.value),
                             Some(TypeSpec::Named(TyKw::U8 | TyKw::U16 | TyKw::U32 | TyKw::U64))
@@ -535,11 +590,11 @@ impl<'p> IrGenerator<'p> {
                             op,
                             lhs_is_str,
                             cur,
-                            bind.ty,
+                            &target_ty,
                             rv,
                             rhs_is_unsigned,
                         )?;
-                        self.line(&format!("store {} {}, ptr {}", bind.ty, res, bind.value));
+                        self.line(&format!("store {target_ty} {res}, ptr {target_ptr}"));
                     }
                 }
                 Ok(())
@@ -710,9 +765,17 @@ impl<'p> IrGenerator<'p> {
         //   str.split(...)）→ 调用该函数取表指针；
         // - 其余（table_new_* 等）→ 直接 tie_table_new 新建空表。
         let tptr = match &v.init {
-            // 裸调用：直接按函数名生成调用
+            // 裸调用：先查语义层解析记录（using/命名空间裸调 → 全名，如 split → str::split），
+            // 无记录则按函数名生成调用
             Expr::Call { name: fname, args, .. } => {
-                let (r, _t) = self.gen_call(fname, args)?;
+                let key = &v.init as *const Expr as usize;
+                let full = self
+                    .sem
+                    .resolved_calls
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| fname.clone());
+                let (r, _t) = self.gen_call(&full, args)?;
                 r
             }
             // 命名空间调用（MethodCall）：复用 gen_expr 的调用分发
@@ -1231,14 +1294,23 @@ impl<'p> IrGenerator<'p> {
             }),
             Expr::Var(name) => {
                 // 克隆绑定以结束对 scopes 的借用，随后可安全调用 &mut 方法
-                let bind = self.lookup_var(name).cloned().ok_or_else(|| IrError {
+                if let Some(bind) = self.lookup_var(name).cloned() {
+                    let ty = bind.ty;
+                    // i1 类型需要扩展（load i1 无法直接使用），这里统一 load
+                    let tmp = self.new_reg();
+                    self.line(&format!("{tmp} = load {ty}, ptr {}", bind.value));
+                    return Ok((tmp, ty));
+                }
+                // 未命中函数作用域：顶层全局持久变量（M4）→ load @name
+                if let Some(ty) = self.sem.globals.get(name).cloned() {
+                    let llvm = self.llvm_ty(&ty);
+                    let tmp = self.new_reg();
+                    self.line(&format!("{tmp} = load {llvm}, ptr @{name}"));
+                    return Ok((tmp, llvm));
+                }
+                Err(IrError {
                     message: format!("内部错误：变量 '{name}' 未入作用域（函数 {}）", self.cur_fn),
-                })?;
-                let ty = bind.ty;
-                // i1 类型需要扩展（load i1 无法直接使用），这里统一 load
-                let tmp = self.new_reg();
-                self.line(&format!("{tmp} = load {ty}, ptr {}", bind.value));
-                Ok((tmp, ty))
+                })
             }
             Expr::Call { name, args, .. } => {
                 // 构造调用：类名(...) → insertvalue 链构建结构体值（P8）
@@ -1441,10 +1513,43 @@ impl<'p> IrGenerator<'p> {
     /// VarBind 中保存的 alloca 指针做 GEP（与标量变量的 load 路径不同）。
     /// 字符串是 ptr 的 alloca（先 load 拿到串首指针），按字节 GEP + load + zext 成 char(i32)。
     fn gen_index(&mut self, base: &Expr, index: &Expr) -> Result<(String, &'static str), IrError> {
+        // 下标值：整数（i64 直接使用，窄整数先扩展）
+        let (idx_val, idx_ty) = self.gen_expr(index)?;
+        let idx_val = self.extend_int_to_i64(&idx_val, idx_ty, index)?;
+        // base 是返回表的函数调用（csv.csv_cells(...)[0]）：求值得到动态表指针，
+        // 走 tie_table_at（与动态表变量同一路径；函数调用结果直接是 ptr，无需 load）。
+        if matches!(base, Expr::Call { .. } | Expr::MethodCall { .. }) {
+            let (tptr, _t_ty) = self.gen_expr(base)?;
+            let elem_ty = self.dyn_table_elem_ty(base)?;
+            let elem_llvm = self.llvm_ty(&elem_ty);
+            let suffix = table_elem_suffix(elem_llvm);
+            self.mark_used(&format!("tie_table_at_{suffix}"));
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = alloca i1"));
+            self.line(&format!("store i1 1, ptr {ok}"));
+            let val = self.new_reg();
+            self.line(&format!(
+                "{val} = call {elem_llvm} @tie_table_at_{suffix}(ptr {tptr}, i64 {idx_val}, ptr {ok})"
+            ));
+            let okv = self.new_reg();
+            self.line(&format!("{okv} = load i1, ptr {ok}"));
+            let ok_label = self.new_label("table_at.ok");
+            let err_label = self.new_label("table_at.err");
+            self.line(&format!("br i1 {okv}, label %{ok_label}, label %{err_label}"));
+            self.block_start(&err_label);
+            let tlen = self.table_len_reg(&tptr)?;
+            self.gen_runtime_error(
+                "运行时错误: table_at 下标越界：索引 %lld 超出长度 %lld",
+                &[("i64", idx_val.clone()), ("i64", tlen)],
+            );
+            self.block_end();
+            self.block_start(&ok_label);
+            return Ok((val, elem_llvm));
+        }
         // base 必须是表/字符串变量：查作用域拿到 alloca 指针 + 类型名（不做 load）
         let Expr::Var(name) = base else {
             return Err(IrError {
-                message: "下标访问仅支持表/字符串变量（base[index] 的 base 必须是变量）".into(),
+                message: "下标访问仅支持表/字符串变量、表字面量或返回表的函数调用".into(),
             });
         };
         let bind = self.lookup_var(name).cloned().ok_or_else(|| IrError {
@@ -1452,9 +1557,6 @@ impl<'p> IrGenerator<'p> {
         })?;
         let base_ptr = bind.value;
         let base_ty = bind.ty;
-        // 下标值：整数（i64 直接使用，窄整数先扩展）
-        let (idx_val, idx_ty) = self.gen_expr(index)?;
-        let idx_val = self.extend_int_to_i64(&idx_val, idx_ty, index)?;
         // 字符串下标：s[i] → 取第 i 个字节，zext 成 char（i32）。
         // 通过语义类型区分字符串（LLVM "ptr" 无法区分字符串与裸指针）。
         if matches!(self.sem_ty_of(base), Some(TypeSpec::Named(TyKw::Str))) {
@@ -2345,6 +2447,24 @@ impl<'p> IrGenerator<'p> {
             let (k, _t) = self.gen_expr(&args[0])?;
             let tmp = self.new_reg();
             self.line(&format!("{tmp} = call ptr @tie_msg_t(ptr {k})"));
+            return Ok((tmp, "ptr"));
+        }
+        // 内置 print_err（M4）：单字符串参数，void——向 stderr 输出一行。
+        if name == "print_err" {
+            self.mark_used("tie_print_err");
+            let (s, _t) = self.gen_expr(&args[0])?;
+            self.line(&format!("call void @tie_print_err(ptr {s})"));
+            return Ok((String::new(), "void"));
+        }
+        // 内置 msg_t_lang（M4）：两个字符串参数（键, 语言），返回 string（指定语言查询，
+        // 未命中返回空串；返回值是堆串，用完必须 tie_free_result 释放）。
+        if name == "msg_t_lang" {
+            self.mark_used("tie_msg_t_lang");
+            self.mark_used("tie_free_result");
+            let (k, _t) = self.gen_expr(&args[0])?;
+            let (l, _t) = self.gen_expr(&args[1])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_msg_t_lang(ptr {k}, ptr {l})"));
             return Ok((tmp, "ptr"));
         }
         // ---------- P1 正则表达式内置函数 ----------

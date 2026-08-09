@@ -990,14 +990,14 @@ func main() {
         assert_eq!(d.range.start, d.range.end, "v1 诊断应为零宽度点");
     }
 
-    /// 语法错误（顶层 var 语句）：1 条诊断，消息沿用原始 message。
+    /// 语义错误（顶层全局变量缺类型标注，M4）：1 条诊断，消息含「必须显式标注类型」。
     #[test]
     fn 语法错误生成一条诊断() {
-        let src = "var x = 1"; // 顶层只允许函数/import/类
+        let src = "var x = 1\n"; // 顶层全局持久变量必须显式类型标注（M4 新特性）
         let diags = diagnostics_for_source(src, None);
-        assert_eq!(diags.len(), 1, "语法错误应恰好 1 条诊断");
+        assert_eq!(diags.len(), 1, "应恰好 1 条诊断");
         let d = &diags[0];
-        assert!(d.message.contains("顶层只允许"), "消息应沿用原始 message：{}", d.message);
+        assert!(d.message.contains("必须显式标注类型"), "消息应沿用原始 message：{}", d.message);
         assert_eq!(d.range.start.line, 0, "第 1 行 → LSP line 0");
     }
 

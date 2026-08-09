@@ -56,4 +56,30 @@ pub func format(b: bool) -> string {
     }
     return "false"
 }
+
+// 占位符格式化：把 fmt 中的每个 `{}` 依次替换为 args 的元素（字符串表），
+// 未配对的 `{}`（args 耗尽）替换为空串；单个 `{`/`}` 原样保留。
+// 示例：sprintf("{} + {} = {}", ["1", "2", "3"]) → "1 + 2 = 3"
+// 注意：参数个数不可变（tie 无变参），多值用字符串表传入（元素经 to_string 转）。
+pub func sprintf(fmt: string, args: table) -> string {
+    var out: string = ""
+    var n: i64 = len(fmt)
+    var k: i64 = 0
+    var klen: i64 = len(args)
+    var i: i64 = 0
+    while i < n {
+        // 命中 `{}`：占位符替换（args 耗尽则空串）
+        if i + 1 < n && str_char(fmt, i) == "{" && str_char(fmt, i + 1) == "}" {
+            if k < klen {
+                out = out + args[k]
+            }
+            k = k + 1
+            i = i + 2
+        } else {
+            out = out + str_char(fmt, i)
+            i = i + 1
+        }
+    }
+    return out
+}
 }

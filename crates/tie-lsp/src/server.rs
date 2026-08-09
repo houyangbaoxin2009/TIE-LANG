@@ -417,7 +417,7 @@ mod tests {
     #[test]
     fn 打开文档语法错误推送诊断() {
         let mut state = ServerState::default();
-        let out = handle_message(&mut state, 打开文档("file:///bad.tie", "var x = 1"));
+        let out = handle_message(&mut state, 打开文档("file:///bad.tie", "var x = 1\n"));
         assert_eq!(out.len(), 1, "应推送 1 条通知");
         let notif = &out[0];
         assert_eq!(notif["method"], "textDocument/publishDiagnostics");
@@ -427,7 +427,7 @@ mod tests {
         assert_eq!(diags[0]["severity"], json!(1));
         assert_eq!(diags[0]["source"], "tie");
         let msg = diags[0]["message"].as_str().expect("消息应为字符串");
-        assert!(msg.contains("顶层只允许"), "消息应沿用原始 message：{msg}");
+        assert!(msg.contains("必须显式标注类型"), "消息应沿用原始 message：{msg}");
     }
 
     /// didOpen 合法源码 → publishDiagnostics 通知（空诊断数组）。

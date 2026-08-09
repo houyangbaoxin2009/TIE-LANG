@@ -54,6 +54,11 @@ pub struct SemanticResult {
     /// 是 Path 时拼接 "tcmsg::error::no_file"）。IR 层与解释层据此生成调用目标。
     /// 键与 expr_types 一致（AST 节点地址），调用方用 addr_of(expr) 查询。
     pub resolved_calls: HashMap<usize, String>,
+    /// 顶层全局持久变量（M4）：变量名 → 类型（跨函数共享；限标量类型 + 字面量初始化）。
+    /// 函数体内 Var 解析/Assign 目标优先查函数作用域，未命中再查全局表。
+    pub globals: HashMap<String, TypeSpec>,
+    /// 顶层全局不可变变量名（const 声明；赋值时校验，与函数内 const_vars 并列）。
+    pub const_globals: std::collections::HashSet<String>,
 }
 
 /// 表（table）的布局信息：元素类型、元素个数与是否动态。
@@ -136,6 +141,76 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
             Stmt::Namespace(ns) => {
                 // 命名空间体内函数：递归注册全名（当前命名空间路径 + 函数名）
                 ctx.collect_ns_funcs(&ns.body, &ns.path)?;
+            }
+            // 顶层全局持久变量（M4）：收集类型并校验（显式标量类型 + 字面量初始化 +
+            // 命名不冲突）。函数体内 Var 解析/Assign 未命中作用域时查全局表。
+            // 无显式类型标注（var x = 1）→ 报错（IR 全局需要静态类型布局）。
+            Stmt::VarDecl(v) => {
+                let Some(ty) = v.ty.clone() else {
+                    return Err(SemanticError {
+                        span: v.span,
+                        message: format!("全局变量 '{}' 必须显式标注类型（如 var x: i64）", v.name),
+                    });
+                };
+                // 全局变量限标量类型（i64/f64/bool/char/string）——IR 需要静态初始化布局
+                let is_scalar = matches!(
+                    &ty,
+                    TypeSpec::Named(
+                        TyKw::I8 | TyKw::I16 | TyKw::I32 | TyKw::I64
+                            | TyKw::U8 | TyKw::U16 | TyKw::U32 | TyKw::U64
+                            | TyKw::F32 | TyKw::F64 | TyKw::Bool | TyKw::Char | TyKw::Str
+                    )
+                );
+                if !is_scalar {
+                    return Err(SemanticError {
+                        span: v.span,
+                        message: format!(
+                            "全局变量 '{}' 必须是标量类型（i8..u64/f32/f64/bool/char/string），实际是 {}",
+                            v.name,
+                            type_name(&ty)
+                        ),
+                    });
+                }
+                // 初始化必须是编译期字面量（与字段默认值同规则，IR 静态初始化）
+                if !is_const_literal(&v.init) {
+                    return Err(SemanticError {
+                        span: v.span,
+                        message: format!(
+                            "全局变量 '{}' 的初始化必须是字面量（数/布尔/字符/字符串）",
+                            v.name
+                        ),
+                    });
+                }
+                // 命名冲突：函数名 / 全局变量重名
+                if ctx.result.funcs.contains_key(&v.name) {
+                    return Err(SemanticError {
+                        span: v.span,
+                        message: format!("全局变量 '{}' 与函数名冲突", v.name),
+                    });
+                }
+                if ctx.result.globals.contains_key(&v.name) {
+                    return Err(SemanticError {
+                        span: v.span,
+                        message: format!("全局变量 '{}' 重复定义", v.name),
+                    });
+                }
+                // 初始化类型与标注类型匹配（字面量适配）
+                let init_ty = ctx.infer_expr(&v.init, &HashMap::new())?;
+                if !types_match(&ty, &init_ty, Some(&v.init)) {
+                    return Err(SemanticError {
+                        span: v.span,
+                        message: format!(
+                            "全局变量 '{}' 初始化类型不匹配：期望 {}，实际 {}",
+                            v.name,
+                            type_name(&ty),
+                            type_name(&init_ty)
+                        ),
+                    });
+                }
+                ctx.result.globals.insert(v.name.clone(), ty);
+                if v.is_const {
+                    ctx.result.const_globals.insert(v.name.clone());
+                }
             }
             _ => {}
         }
@@ -291,13 +366,16 @@ impl Analyzer {
         if self.result.funcs.contains_key(name) {
             return Ok(name.to_string());
         }
-        // 候选 2：当前命名空间前缀补全（命名空间内函数互调）
+        // 候选 2：当前命名空间前缀补全（逐级外层：tcmsg::error::x → tcmsg::x → x，
+        // 子命名空间可裸调父命名空间函数，如 tcmsg::error 内裸调 tcmsg 的 lookup）
         if !self.ns_stack.is_empty() {
-            let mut segs = self.ns_stack.clone();
-            segs.push(name.to_string());
-            let full = segs.join("::");
-            if self.result.funcs.contains_key(&full) {
-                return Ok(full);
+            for depth in (0..=self.ns_stack.len()).rev() {
+                let mut segs = self.ns_stack[..depth].to_vec();
+                segs.push(name.to_string());
+                let full = segs.join("::");
+                if self.result.funcs.contains_key(&full) {
+                    return Ok(full);
+                }
             }
         }
         // 候选 3：using 引入的命名空间（裸调用补全；多候选报歧义）
@@ -388,8 +466,13 @@ impl Analyzer {
             return Ok(());
         };
         let own: Vec<&str> = prefix.split("::").collect();
-        let same_ns = self.ns_stack.len() == own.len()
-            && self.ns_stack.iter().zip(own.iter()).all(|(a, b)| a == b);
+        // 同命名空间或**子命名空间**放行：tcmsg::error 内可访问 tcmsg 的私有函数
+        //（子模块可见父模块私有项，与裸调用逐级外层补全配套）
+        let same_ns = self.ns_stack.len() >= own.len()
+            && self.ns_stack[..own.len()]
+                .iter()
+                .zip(own.iter())
+                .all(|(a, b)| a == b);
         if same_ns {
             return Ok(());
         }
@@ -875,20 +958,26 @@ impl Analyzer {
                 Ok(())
             }
             Stmt::Assign(a) => {
-                // 赋值：目标必须已声明；const 不可变；普通赋值类型匹配 / 复合赋值按运算符校验
+                // 赋值：目标必须已声明（函数作用域或全局持久变量）；const 不可变；
+                // 普通赋值类型匹配 / 复合赋值按运算符校验
                 let target_ty = match scope.get(&a.target) {
                     Some(t) => t.clone(),
-                    None => {
-                        return Err(SemanticError {
-                            span: a.span,
-                            message: format!("赋值目标 '{}' 未声明", a.target),
-                        })
-                    }
+                    None => match self.result.globals.get(&a.target) {
+                        Some(t) => t.clone(),
+                        None => {
+                            return Err(SemanticError {
+                                span: a.span,
+                                message: format!("赋值目标 '{}' 未声明", a.target),
+                            })
+                        }
+                    },
                 };
                 let value_ty = self.infer_expr(&a.value, scope)?;
                 self.result.expr_types.insert(addr_of(&a.value), value_ty.clone());
-                // const 变量不允许重新赋值（普通赋值与复合赋值一律禁止）
-                if self.result.const_vars.contains(&a.target) {
+                // const 变量不允许重新赋值（函数内 const 与全局 const 并列校验）
+                if self.result.const_vars.contains(&a.target)
+                    || self.result.const_globals.contains(&a.target)
+                {
                     return Err(SemanticError {
                         span: a.span,
                         message: format!("不能给 const 变量 '{}' 赋值", a.target),
@@ -1241,12 +1330,16 @@ impl Analyzer {
             }
             Expr::Var(name) => match scope.get(name) {
                 Some(t) => t.clone(),
-                None => {
-                    return Err(SemanticError {
-                        span: expr_span_of(expr),
-                        message: format!("未声明的变量 '{name}'"),
-                    })
-                }
+                // 未命中函数作用域：查顶层全局持久变量（M4）
+                None => match self.result.globals.get(name) {
+                    Some(t) => t.clone(),
+                    None => {
+                        return Err(SemanticError {
+                            span: expr_span_of(expr),
+                            message: format!("未声明的变量 '{name}'"),
+                        })
+                    }
+                },
             },
             // 命名空间路径（a::b::c）本身不是值表达式：只能作为 MethodCall 的
             // receiver（tcmsg::error.no_file()），独立出现即语义错误。
@@ -1898,6 +1991,50 @@ impl Analyzer {
                     }
                     return Ok(TypeSpec::Named(TyKw::Str));
                 }
+                // 内置函数 print_err（M4）：单字符串参数，void——向 stderr 输出一行
+                //（消息系统的 error/warn/debug 通道；info 走 stdout 的 println）。
+                if name == "print_err" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("print_err() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("print_err() 参数必须是字符串，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Void));
+                }
+                // 内置函数 msg_t_lang（M4）：两个字符串参数（键, 语言），返回 string——
+                // 按指定语言查询字典（不做回退，未命中返回空串）；供 tcmsg 用顶层
+                // 持久变量表达回退链后逐语言遍历（替代固定 zh 回退的 msg_t）。
+                if name == "msg_t_lang" {
+                    if args.len() != 2 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("msg_t_lang() 期望 2 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    for a in args {
+                        let at = self.infer_expr(a, scope)?;
+                        self.result.expr_types.insert(addr_of(a), at.clone());
+                        if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!(
+                                    "msg_t_lang() 参数必须是字符串，实际是 {}",
+                                    type_name(&at)
+                                ),
+                            });
+                        }
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Str));
+                }
                 // 内置函数 sqrt/sin/cos/tan/exp/log/floor/ceil/round：单数字参数，返回 f64。
                 // 数字重载：语义层允许任意数字类型（num 类别框），IR 层按实参类型提升为 double。
                 if matches!(
@@ -2223,7 +2360,8 @@ impl Analyzer {
                         ),
                     });
                 }
-                // 元素类型：base 是表变量 → 查其布局元数据；是内联表字面量 → 元素同构类型
+                // 元素类型：base 是表变量 → 查其布局元数据；是内联表字面量 → 元素同构类型；
+                // 是返回表的函数调用（如 csv.csv_cells(...)[0]）→ 查 table_ret_elems
                 match base.as_ref() {
                     Expr::TableLit { .. } => base_ty,
                     Expr::Var(name) => {
@@ -2238,10 +2376,36 @@ impl Analyzer {
                             }
                         }
                     }
+                    Expr::Call { .. } | Expr::MethodCall { .. } => {
+                        let full = ns_call_full_name(
+                            &self.result.funcs,
+                            base,
+                            scope,
+                            &self.ns_stack,
+                            &self.using_prefixes,
+                            &self.result.globals,
+                        )
+                        .ok_or_else(|| SemanticError {
+                            span: *span,
+                            message: format!(
+                                "下标访问的调用 '{}' 未解析（内部错误）",
+                                type_name(&base_ty)
+                            ),
+                        })?;
+                        match self.result.table_ret_elems.get(&full) {
+                            Some(Some(elem)) => elem.clone(),
+                            _ => {
+                                return Err(SemanticError {
+                                    span: *span,
+                                    message: format!("下标访问的调用 '{full}' 不是返回表的函数"),
+                                })
+                            }
+                        }
+                    }
                     _ => {
                         return Err(SemanticError {
                             span: *span,
-                            message: "下标访问仅支持表变量或表字面量".into(),
+                            message: "下标访问仅支持表变量、表字面量或返回表的函数调用".into(),
                         })
                     }
                 }
@@ -2344,7 +2508,7 @@ impl Analyzer {
                 let ns_segs: Option<Vec<String>> = match receiver.as_ref() {
                     Expr::Path { segments, .. } => Some(segments.clone()),
                     // Var/FieldAccess 链未绑定（非类实例/非变量）→ 命名空间形态
-                    _ => ns_path_segments(receiver, scope),
+                    _ => ns_path_segments(receiver, scope, &self.result.globals),
                 };
                 let import_mapped: Result<Option<Vec<String>>, SemanticError> =
                     match &ns_segs {
@@ -2627,7 +2791,14 @@ impl Analyzer {
         scope: &HashMap<String, TypeSpec>,
     ) -> Result<TypeSpec, SemanticError> {
         // 裸调用：函数名在表达式上；命名空间调用（MethodCall）：用统一解析拿全名
-        let Some(name) = ns_call_full_name(&self.result.funcs, expr, scope, &self.ns_stack) else {
+        let Some(name) = ns_call_full_name(
+            &self.result.funcs,
+            expr,
+            scope,
+            &self.ns_stack,
+            &self.using_prefixes,
+            &self.result.globals,
+        ) else {
             return Err(SemanticError {
                 span: expr_span_of(expr),
                 message: format!(
@@ -2692,7 +2863,15 @@ impl Analyzer {
             }
             Expr::Call { .. } | Expr::MethodCall { .. } => {
                 // 裸调用/命名空间调用（如 str.split）：统一解析全名后查 table_ret_elems
-                let full = ns_call_full_name(&self.result.funcs, expr, scope, &self.ns_stack).unwrap_or_default();
+                let full = ns_call_full_name(
+                    &self.result.funcs,
+                    expr,
+                    scope,
+                    &self.ns_stack,
+                    &self.using_prefixes,
+                    &self.result.globals,
+                )
+                .unwrap_or_default();
                 match self.result.table_ret_elems.get(&full) {
                     Some(Some(elem)) => Ok(elem.clone()),
                     Some(None) => Err(SemanticError {
@@ -2846,18 +3025,22 @@ fn param_count_desc(required: usize, total: usize) -> String {
     }
 }
 
-fn ns_path_segments(expr: &Expr, scope: &HashMap<String, TypeSpec>) -> Option<Vec<String>> {
+fn ns_path_segments(
+    expr: &Expr,
+    scope: &HashMap<String, TypeSpec>,
+    globals: &HashMap<String, TypeSpec>,
+) -> Option<Vec<String>> {
     match expr {
         Expr::Var(name) => {
-            // 未绑定才是命名空间首段；绑定变量（含 struct 实例）不是
-            if scope.contains_key(name) {
+            // 未绑定才是命名空间首段；绑定变量/全局持久变量不是
+            if scope.contains_key(name) || globals.contains_key(name) {
                 None
             } else {
                 Some(vec![name.clone()])
             }
         }
         Expr::FieldAccess { base, field, .. } => {
-            let mut segs = ns_path_segments(base, scope)?;
+            let mut segs = ns_path_segments(base, scope, globals)?;
             // 字段名也必须未绑定（类实例字段链的中间段通常绑定在对象上，
             // 但语义上 FieldAccess 的 field 无独立绑定——保守起见：基座必须是
             // 命名空间形态（Var/FieldAccess 链），field 直接追加）
@@ -2885,35 +3068,57 @@ fn ns_prefix_exists(funcs: &HashMap<String, FuncSig>, segs: &[String]) -> bool {
 /// 且 funcs 中存在该前缀 → 全名 = 路径段::方法名。
 /// 裸调用按当前命名空间前缀补全（命名空间内函数互调返回表时，如 prep::split_lines——
 /// table_ret_elems 注册键是全名，见 dynamic_table_elem_ty 的调用约定）。
+/// M2.1.7 using：裸调用第三候选查 using 引入的命名空间（唯一候选；多候选歧义返回 None，
+/// 由调用方按未定义报错），与 resolve_bare_call 的解析顺序一致。
 fn ns_call_full_name(
     funcs: &HashMap<String, FuncSig>,
     expr: &Expr,
     scope: &HashMap<String, TypeSpec>,
     ns_stack: &[String],
+    using_prefixes: &[Vec<String>],
+    globals: &HashMap<String, TypeSpec>,
 ) -> Option<String> {
     let (segments, method) = match expr {
-        // 裸调用：先查裸名（顶层函数），未命中再按当前命名空间前缀补全。
+        // 裸调用：先查裸名（顶层函数），未命中再按当前命名空间前缀补全，
+        // 再查 using 引入的命名空间（M2.1.7 第三候选）。
         // 不做 funcs 校验——内建函数（table_new_i64 等）不注册进 funcs，校验会误杀；
         // 后续查表 table_ret_elems 查不到会由调用方给出正确错误。
         Expr::Call { name, .. } => {
             if funcs.contains_key(name) {
                 return Some(name.clone());
             }
+            // 当前命名空间前缀补全（逐级外层：tcmsg::error::x → tcmsg::x → x，
+            // 与 resolve_bare_call 一致——子命名空间裸调父命名空间函数）
             if !ns_stack.is_empty() {
-                let mut segs = ns_stack.to_vec();
+                for depth in (0..=ns_stack.len()).rev() {
+                    let mut segs = ns_stack[..depth].to_vec();
+                    segs.push(name.clone());
+                    let full = segs.join("::");
+                    if funcs.contains_key(&full) {
+                        return Some(full);
+                    }
+                }
+            }
+            // using 引入的命名空间（唯一候选；多候选歧义 → None）
+            let mut hit: Option<String> = None;
+            for prefix in using_prefixes {
+                let mut segs = prefix.clone();
                 segs.push(name.clone());
                 let full = segs.join("::");
                 if funcs.contains_key(&full) {
-                    return Some(full);
+                    if hit.is_some() {
+                        return None;
+                    }
+                    hit = Some(full);
                 }
             }
-            return Some(name.clone());
+            return hit.or_else(|| Some(name.clone()));
         }
         Expr::MethodCall { receiver, method, .. } => {
             // Path（a::b）→ 段；Var/FieldAccess 链 → 未绑定则视为命名空间形态
             let segs = match receiver.as_ref() {
                 Expr::Path { segments, .. } => segments.clone(),
-                _ => ns_path_segments(receiver, scope)?,
+                _ => ns_path_segments(receiver, scope, globals)?,
             };
             (segs, method)
         }

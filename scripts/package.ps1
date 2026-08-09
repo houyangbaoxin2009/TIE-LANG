@@ -153,6 +153,20 @@ if (Test-Path $ExamplesSrc) {
     Write-Host "  examples/ ✔" -ForegroundColor DarkGray
 }
 
+# std/ 与 enl/：标准库与扩展库（tie 语言自写，随发行版内置；
+# 用户程序 import "../std/..." 或 "../enl/..." 依赖本地库目录）
+foreach ($lib in @("std", "enl")) {
+    $LibSrc = Join-Path $Root $lib
+    if (Test-Path $LibSrc) {
+        $LibTarget = Join-Path $DistDir $lib
+        New-Item -ItemType Directory -Path $LibTarget -Force | Out-Null
+        Get-ChildItem $LibSrc -Filter "*.tie" | ForEach-Object {
+            Copy-Item $_.FullName $LibTarget
+        }
+        Write-Host "  $lib/ ✔" -ForegroundColor DarkGray
+    }
+}
+
 # editor/vscode-tie/：VSCode 扩展（净化复制——排除 node_modules/ 与 out/ 构建产物，
 # 源码分发：用户 npm install + npm run compile 或 vsce package 后安装）
 $EditorSrc = Join-Path $Root "editor\vscode-tie"

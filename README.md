@@ -16,7 +16,7 @@ tie 是一门**通用编程语言**：用一门语言写逻辑、写界面、写
 | [docs/tie-script.md](docs/tie-script.md) | tie:script 模块协议：tie 脚本的注册/调用机制、模块约定、协议文本格式、三层调用入口（Rust/CLI/tie 程序内） |
 | [docs/ai-guide.md](docs/ai-guide.md) | AI 教学指南：语言用法 + 负例 + 编译器架构（教 AI 用/开发 tie） |
 | [docs/prompt-pack.md](docs/prompt-pack.md) | 可粘贴 Prompt 包：自包含简介，直接发给任何 AI |
-| [docs/plans/](docs/plans/) | 后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法） |
+| [docs/plans/](docs/plans/) | 后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法 / 动态库编译） |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更记录（按里程碑） |
 
 ## 快速开始
@@ -107,7 +107,12 @@ tie             # 无参数 → 进入 REPL 交互模式（启动 tie 语言自�
 
 ```bash
 tie examples/lib_math.tie          # → examples/lib_math.a（经 clang -c 生成 .o，llvm-ar rcs 打包）
+tie examples/lib_math.tie -o lib_math.lib   # → MSVC 兼容静态库 .lib（COFF 归档，同一产物不同扩展名）
 ```
+
+- 静态库 `.a` / `.lib`（Windows 上均为 COFF 归档）：导出符号为 `命名空间$函数`
+  （如 `mathlib$add`），C/其他语言可链接消费；
+- 动态库（`.dll` / `.so`）编译为 Harbor M5 内容（见 docs/plans/dynamic-library.md）。
 
 子工具可单独使用：
 
@@ -143,10 +148,12 @@ tie/
 ├── repl/repl.tie     REPL 外壳（tie 语言自写，自举；编译链接 tie-interp 静态库）
 ├── prep/core.tie     预处理器核心模块（tie 语言自写：头部提取/角色判定/正文重建；Harbor M3 自举，编译期内嵌 tie-prep）
 ├── prep/indent.tie   转换器模块示例（制表符→4 空格；证明扩展性——新增转换器只需写 tie 模块，`tie-prep --module` 挂载）
-├── std/              标准库（tie 语言自写：assert / string / math / csv / format / tcmsg，均为命名空间形式调用，如 assert.assert / str.split，基于语言底座原语）
+├── prep/rename_tcmsg_to_log.tie  转换器模块实战（tcmsg → log 批量改名，tie 语言自写完成真实重构任务）
+├── std/              标准库（tie 语言自写：assert / string / math / csv / format，均为命名空间形式调用，如 assert.assert / str.split / format.sprintf / csv.csv_write，基于语言底座原语；M4 补全大小写转换/join/repeat/trim 拆分/gcd/lcm/pow_i/sprintf 占位符/csv_write/浮点与字符串断言）
+├── enl/              扩展库（Enlargement，tie 语言自写，随发行版内置：log 控制台信息库——i18n 消息系统，依赖 std 与语言底座 msg_* 原语；M4 增强带参消息/级别体系/stderr 通道/批量登记/多级回退）
 ├── docs/language.md   语法规范
 ├── docs/tie-script.md tie:script 模块协议（eval/eval_call 机制、模块约定、协议文本、三层调用入口）
-├── docs/plans/        后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法）
+├── docs/plans/        后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法 / 动态库编译）
 ├── examples/          示例程序（hello / wide / table / tuple / oop / 负例 oop_neg_* 等）
 └── Cargo.toml         workspace（统一 edition/lints/release 配置）
 ```
@@ -204,5 +211,7 @@ tie/
 | --- | --- | --- |
 | M0 | 正式发行版基础：版本规则（年份.修订号）、内部代号（2026.1 "Harbor"）、工具链合集打包（`scripts/package.ps1` → zip） | ✅ 完成 |
 | M1 | VSCode 插件：语法高亮 / 智能缩进 / 代码片段 + LSP 客户端（诊断 / hover / 跳转定义 / 补全），TypeScript 重构 | ✅ 完成 |
-| M2 | 标准库：`std/`（文件 / 字符串 / 断言 / CSV / 格式化）+ `math`（数学函数）+ 20+ 语言底座原语 + **`tcmsg` 控制台信息库（i18n）** + **默认值参数**（可选参数省略时用字面量默认值）；M2.1.2 起 std 库全部采用命名空间形式（`assert.assert` / `str.split` / `math.abs`）；M2.1.6 起命名空间内函数去 `str_` 前缀（`str.split` / `str.trim`）且方法定义统一 `func` 关键字（`static func`）；M2.1.7 起单文件命名空间成为真模块边界——命名空间内函数默认私有（`pub func` 显式导出）、`using` 引入后裸调用、`import as` 别名唯一入口；M2.1.8 起 **struct 数据与逻辑分离**（`class` 改名 `struct` 为纯数据，方法移出为绑定 struct 名的命名空间函数，`obj.method()` 转发且接收者按引用传递；`this`/`static` 废弃），为自举与生态奠定基础 | ✅ 完成 |
-| M3 | 预处理器自举：完全用 tie 语言重写 `tie-prep`，使其可扩展（编译器自举阶段一） | 🔄 阶段一完成（核心逻辑已 tie 语言化，`prep/core.tie`；Rust 壳仅解释执行）；阶段二完成（协调统筹增强：`tie.config` 配置文件 + 缓存池 + 多线程并行分片编译） |
+| M2 | 标准库：`std/`（文件 / 字符串 / 断言 / CSV / 格式化）+ `math`（数学函数）+ 20+ 语言底座原语 + **`log` 控制台信息库（i18n，M4 起迁入 enl/ 扩展库）** + **默认值参数**（可选参数省略时用字面量默认值）；M2.1.2 起 std 库全部采用命名空间形式（`assert.assert` / `str.split` / `math.abs`）；M2.1.6 起命名空间内函数去 `str_` 前缀（`str.split` / `str.trim`）且方法定义统一 `func` 关键字（`static func`）；M2.1.7 起单文件命名空间成为真模块边界——命名空间内函数默认私有（`pub func` 显式导出）、`using` 引入后裸调用、`import as` 别名唯一入口；M2.1.8 起 **struct 数据与逻辑分离**（`class` 改名 `struct` 为纯数据，方法移出为绑定 struct 名的命名空间函数，`obj.method()` 转发且接收者按引用传递；`this`/`static` 废弃），为自举与生态奠定基础 | ✅ 完成 |
+| M3 | 预处理器自举 + 协调统筹：完全用 tie 语言重写 `tie-prep`（编译器自举），并增强为多文件并行编译（配置文件 + 缓存池 + 三阶段并行分片） | ✅ 完成（阶段一：预处理器自举——核心逻辑 tie 语言化 `prep/core.tie`，Rust 壳仅解释执行；阶段二：协调统筹增强——`tie.config` 配置文件 + 缓存池 + 多线程并行分片编译） |
+| M4 | 标准库重构 + 扩展库分层：补全常用函数（str 大小写/join/repeat/trim_start/trim_end、math gcd/lcm/pow_i、format sprintf 占位符、csv_write、assert 浮点与字符串断言）+ 内部 using 简化 + **顶层持久变量**（var/const 全局，纯 tie 表达消息状态）+ log 增强（带参消息/级别/stderr/批量登记/多级回退，移入 **enl/** 扩展库）+ 修复 using 表元素解析/调用结果下标等编译器边界 | ✅ 完成 |
+| M5 | 动态库编译：`// tie:library` 输出 `.dll`（win）/ `.so`（linux）——库公有函数 `dllexport` 导出、跨语言调用约定（标量直传/字符串 C ABI 桥）、C 程序 LoadLibrary/dlopen 消费示例（见 docs/plans/dynamic-library.md） | 📋 规划 |

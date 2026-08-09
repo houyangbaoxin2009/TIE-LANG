@@ -1,0 +1,181 @@
+// tie:library
+// log.tie：标准库——控制台信息库（消息系统，i18n，命名空间形式）
+//
+// 基于语言底座原语 msg_set_lang / msg_register / msg_t / msg_t_lang / msg_get_lang：
+// - msg_set_lang(lang)：切换当前语言（如 "zh" / "en"）
+// - msg_register(key, lang, text)：登记 (键, 语言) → 文本（同键同语言覆盖）
+// - msg_t(key)：查询键的翻译（当前语言 → 回退 zh → 键本身，Rust 层实现）
+// - msg_t_lang(key, lang)：按指定语言查询（未命中空串；M4 新增，供自定义回退链）
+// - msg_get_lang()：查询当前语言
+// 当前语言 + 消息字典存 Rust thread_local（见 tie-interp C ABI 桥）。
+//
+// M4 重构（Harbor M4）：
+// - **消息状态用顶层持久变量**（tie 语言自身表达跨函数共享的可变状态，纯 tie）：
+//   msg_level（级别阈值）与 msg_fallbacks（回退语言链）；
+// - 级别体系：debug(0) < info(1) < warn(2) < error(3)，set_level 只输出 >= 阈值；
+// - 输出通道：error/warn/debug 走 stderr（print_err），info 走 stdout（println）；
+// - 带参消息：error_f/warn_f/info_f/debug_f（msg_t 模板 + format.sprintf 填充 {}）；
+// - 字典管理：register_all 批量登记、lang() 查询、set_fallbacks 多级回退。
+//
+// 注意——当前 import 展开不做去重，调用方只需导入 log.tie（string.tie / format.tie
+// 会随同展开）；重复导入会导致 str/format 命名空间函数与全局变量重复定义。
+
+import "../std/string.tie"
+import "../std/format.tie"
+using str;
+using format;
+
+// ---- 消息系统状态（M4：顶层持久变量，跨函数共享） ----
+// 级别阈值：只输出严重度 >= 阈值的消息（0=debug 最详细，1=info 默认，2=warn，3=error）
+var msg_level: i64 = 1
+// 回退语言链（"|" 分隔；查询顺序：当前语言 → 回退链依次 → 键本身；默认 zh）
+var msg_fallbacks: string = "zh"
+
+namespace log {
+    // 内部：按当前语言 + 回退链查询键的翻译；全部未命中回退键本身。
+    // 指定语言查询用 msg_t_lang（未命中返回空串），回退链遍历全局 msg_fallbacks。
+    func lookup(key: string) -> string {
+        var txt = msg_t_lang(key, msg_get_lang())
+        if txt != "" {
+            return txt
+        }
+        var fbs = split(msg_fallbacks, "|")
+        var n: i64 = len(fbs)
+        var i: i64 = 0
+        while i < n {
+            if fbs[i] != msg_get_lang() {
+                var t = msg_t_lang(key, fbs[i])
+                if t != "" {
+                    return t
+                }
+            }
+            i = i + 1
+        }
+        return key
+    }
+
+    // 内部：级别阈值判断——消息严重度 sev 是否达到阈值（0=debug 1=info 2=warn 3=error）
+    func allowed(sev: i64) -> bool {
+        return msg_level <= sev
+    }
+
+    // 打印错误级消息（stderr）：前缀「错误: 」+ 当前语言翻译（未登记回退键本身）
+    pub func error(key: string) {
+        print_err("错误: " + lookup(key))
+    }
+
+    // 带参错误消息：模板（查字典）的 {} 由 args 依次填充（format.sprintf）
+    pub func error_f(key: string, args: table) {
+        print_err("错误: " + sprintf(lookup(key), args))
+    }
+
+    // 打印警告级消息（stderr）：前缀「警告: 」+ 翻译
+    pub func warn(key: string) {
+        print_err("警告: " + lookup(key))
+    }
+
+    // 带参警告消息
+    pub func warn_f(key: string, args: table) {
+        print_err("警告: " + sprintf(lookup(key), args))
+    }
+
+    // 打印信息级消息（stdout）：前缀「信息: 」+ 翻译
+    pub func info(key: string) {
+        println("信息: " + lookup(key))
+    }
+
+    // 带参信息消息
+    pub func info_f(key: string, args: table) {
+        println("信息: " + sprintf(lookup(key), args))
+    }
+
+    // 调试级消息（stderr，前缀「调试: 」）：仅级别阈值 <= 0（debug 开启）时输出
+    pub func debug(key: string) {
+        if allowed(0) {
+            print_err("调试: " + lookup(key))
+        }
+    }
+
+    // 带参调试消息
+    pub func debug_f(key: string, args: table) {
+        if allowed(0) {
+            print_err("调试: " + sprintf(lookup(key), args))
+        }
+    }
+
+    // 设置级别阈值：0=debug 1=info 2=warn 3=error（默认 1，只输出 >= 阈值）
+    pub func set_level(n: i64) {
+        msg_level = n
+    }
+
+    // 查询当前级别阈值
+    pub func level() -> i64 {
+        return msg_level
+    }
+
+    // 查询消息系统当前语言（透传 msg_get_lang）
+    pub func lang() -> string {
+        return msg_get_lang()
+    }
+
+    // 设置回退语言链（表元素按序；查询顺序：当前语言 → 回退链 → 键本身）
+    pub func set_fallbacks(langs: table) {
+        msg_fallbacks = join(langs, "|")
+    }
+
+    // 批量登记消息文本：entries 每个元素形如 "key|lang|text"（| 分隔三段）；
+    // 格式不符的行静默跳过。
+    pub func register_all(entries: table) {
+        var n: i64 = len(entries)
+        var i: i64 = 0
+        while i < n {
+            var parts = split(entries[i], "|")
+            if len(parts) == 3 {
+                register(parts[0], parts[1], parts[2])
+            }
+            i = i + 1
+        }
+    }
+
+    // 切换消息系统当前语言（透传内置 msg_set_lang）
+    pub func set_lang(lang: string) {
+        msg_set_lang(lang)
+    }
+
+    // 登记一条消息文本（透传内置 msg_register）
+    pub func register(key: string, lang: string, content: string) {
+        msg_register(key, lang, content)
+    }
+
+    // 查询键的翻译（按当前语言 + 回退链；未命中回退键本身）
+    pub func t(key: string) -> string {
+        return lookup(key)
+    }
+
+    // 错误子命名空间：按错误键分组，提供多语言 API
+    namespace error {
+        // 综合方案示例：no_file 错误。
+        // 调用形态 1（方案 B）：log::error.no_file(["zh-cn","en-us"])
+        //   → 省略 texts，从字典查当前语言的 no_file 文本（需先 register 登记）
+        // 调用形态 2（方案 A）：log::error.no_file(["zh-cn","en-us"], ["文件不存在","File not found"])
+        //   → texts 按 langs 顺序给文本，直接返回当前语言对应文本，调用点自包含
+        pub func no_file(langs: table, texts: table = []) -> string {
+            // 方案 A：调用方提供了文本表（非空）→ 按当前语言匹配 langs 取文本
+            if len(texts) > 0 {
+                // langs 与 texts 按位置对应；langs[i] 是地区码（如 "zh-cn"），
+                // 当前语言是基础码（如 "zh"）→ 用前缀匹配（"zh-cn" 以 "zh" 开头）
+                var i: i64 = 0
+                while i < len(langs) {
+                    if starts_with(langs[i], msg_get_lang()) {
+                        return texts[i]
+                    }
+                    i = i + 1
+                }
+                // 未命中任何语言 → 回退第一个文本
+                return texts[0]
+            }
+            // 方案 B：字典集中登记（键 "error.no_file"），回退链兜底
+            return lookup("error.no_file")
+        }
+    }
+}

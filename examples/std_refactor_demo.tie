@@ -1,0 +1,56 @@
+// tie:logic
+// tie:opt=2
+
+// std_refactor_demo.tie——Harbor M4 标准库重构演示
+// 覆盖新增函数：str 大小写/join/repeat/trim_start/trim_end、
+// math gcd/lcm/pow_i、format sprintf 占位符、csv csv_write 往返、assert 泛化断言
+// 运行：tie examples/std_refactor_demo.tie
+
+// 注意：csv.tie 已随同展开 string.tie（import 不做去重），此处不重复导入 string.tie
+import "../std/math.tie"
+import "../std/format.tie"
+import "../std/assert.tie"
+import "../std/csv.tie"
+
+func main() {
+    // 1. str 大小写 / trim 拆分 / join / repeat
+    println(str.to_upper("Hello, tie!"))        // HELLO, TIE!
+    println(str.to_lower("HeLLo"))              // hello
+    println(str.trim_start("  hi  "))           // "hi  "
+    println(str.trim_end("  hi  "))             // "  hi"
+    println(str.trim("  hi  "))                 // "hi"
+    var words = str.split("a,b,c", ",")
+    println(str.join(words, "-"))               // a-b-c
+    println(str.join(["x", "y"], ""))           // xy
+    println(str.repeat("ab", 3))                // ababab
+    println(str.repeat("ab", 0))                // （空）
+
+    // 2. math gcd / lcm / pow_i
+    println(math.gcd(48, 36))                   // 12
+    println(math.gcd(-48, 36))                  // 12
+    println(math.lcm(4, 6))                     // 12
+    println(math.lcm(0, 5))                     // 0
+    println(math.pow_i(2, 10))                  // 1024
+    println(math.pow_i(2, -1))                  // 0
+
+    // 3. format sprintf 占位符
+    println(format.sprintf("{} + {} = {}", ["1", "2", "3"]))  // 1 + 2 = 3
+    println(format.sprintf("name: {} age: {}", ["Rex", "3"])) // name: Rex age: 3
+    println(format.sprintf("a{}b{}c", ["1"]))                 // a1bc（缺省占位符空串）
+
+    // 4. csv 写入 + 读回往返（无尾换行，读回不产生空行元素）
+    var rows = table_new_string()
+    table_push(rows, "name,age,city")
+    table_push(rows, "张三,30,北京")
+    var ok = csv.csv_write("./std_refactor_tmp.csv", rows)
+    println(ok)                                 // true
+    var lines = csv.csv_read("./std_refactor_tmp.csv")
+    println(len(lines))                         // 2
+    println(csv.csv_cells(lines[1], ",")[0])    // 张三
+    file_delete("./std_refactor_tmp.csv")
+
+    // 5. assert 泛化断言
+    assert.assert_eq_f64(1.5, 1.5)
+    assert.assert_eq_str("hi", "hi")
+    println("全部通过")
+}

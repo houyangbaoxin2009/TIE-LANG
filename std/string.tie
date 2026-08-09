@@ -24,19 +24,27 @@ func is_whitespace(c: string) -> bool {
 
 // 去除字符串首尾空白字符；全空白字符串返回空串
 pub func trim(s: string) -> string {
+    return trim_end(trim_start(s))
+}
+
+// 去掉字符串首部空白字符；全空白字符串返回空串
+pub func trim_start(s: string) -> string {
     var n: i64 = len(s)
-    // 从头部跳过空白，定位第一个非空白字符
     var start: i64 = 0
     while start < n && is_whitespace(str_char(s, start)) {
         start = start + 1
     }
-    // 从尾部跳过空白，定位最后一个非空白字符之后的位置
+    return slice(s, start, n)
+}
+
+// 去掉字符串尾部空白字符；全空白字符串返回空串
+pub func trim_end(s: string) -> string {
+    var n: i64 = len(s)
     var end: i64 = n
-    while end > start && is_whitespace(str_char(s, end - 1)) {
+    while end > 0 && is_whitespace(str_char(s, end - 1)) {
         end = end - 1
     }
-    // 截取 [start, end) 区间
-    return slice(s, start, end)
+    return slice(s, 0, end)
 }
 
 // 截取字符串 [start, end) 区间的子串；越界自动收敛到边界；空串或 start>=end 返回空串
@@ -253,5 +261,76 @@ pub func split(s: string, sep: string) -> table {
     // 收尾：最后一段 [start, n)（sep 结尾时 start==n → 空元素）
     table_push(t, slice(s, start, n))
     return t
+}
+
+// 将 s 中 ASCII 小写字母（a-z）转为大写；其余字符原样保留。
+// 算法：用小写表定位字符下标，从大写表取对应字符（无字符算术原语，查表实现）。
+pub func to_upper(s: string) -> string {
+    var lower = "abcdefghijklmnopqrstuvwxyz"
+    var upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    var out: string = ""
+    var n: i64 = len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        var idx = find(lower, c)
+        if idx >= 0 {
+            out = out + str_char(upper, idx)
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 将 s 中 ASCII 大写字母（A-Z）转为小写；其余字符原样保留（查表实现）。
+pub func to_lower(s: string) -> string {
+    var lower = "abcdefghijklmnopqrstuvwxyz"
+    var upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    var out: string = ""
+    var n: i64 = len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        var idx = find(upper, c)
+        if idx >= 0 {
+            out = out + str_char(lower, idx)
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 把字符串表 items 的元素用 sep 连接成一个字符串；空表返回空串。
+// 约定：items 是字符串动态表（table<string>），与 split 的输出互逆。
+pub func join(items: table, sep: string) -> string {
+    var out: string = ""
+    var n: i64 = len(items)
+    if n == 0 {
+        return ""
+    }
+    var i: i64 = 0
+    while i < n {
+        if i > 0 {
+            out = out + sep
+        }
+        out = out + items[i]
+        i = i + 1
+    }
+    return out
+}
+
+// 把 s 重复 n 次拼接；n <= 0 返回空串（n 为负视为不重复）。
+pub func repeat(s: string, n: i64) -> string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < n {
+        out = out + s
+        i = i + 1
+    }
+    return out
 }
 }
