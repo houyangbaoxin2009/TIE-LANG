@@ -1,11 +1,11 @@
 // oop_neg_d.tie：负例——继承环（A extends B，B extends A）
-// 期望：语义错误「类继承形成环（含 'A' 或 'B'）」
+// 期望：语义错误「struct 继承形成环（含 'A' 或 'B'）」
 
-class A extends B {
+struct A extends B {
     var a: i64
 }
 
-class B extends A {
+struct B extends A {
     var b: i64
 }
 

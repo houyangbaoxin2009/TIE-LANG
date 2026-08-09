@@ -82,13 +82,16 @@ var out = eval_call("process", "hi")       // eval_call(函数全名, 字符串�
 // 多行文本原样直传（换行/引号不转义）；void 入口返回空串。
 // 完整协议见 docs/tie-script.md；端到端示例见 examples/script_demo.tie。
 
-【class / OOP】
-class Point {
+【struct 数据与逻辑分离】（M2.1.8）
+struct Point {
     var x: i64 = 0                // 字段 var name[: Ty] [= 默认值]
-    func dist() -> i64 {        // 实例方法：func 定义（类内即方法），体内 this 绑定当前对象
-        return this.x * this.x + this.y * this.y
+    var y: i64 = 0
+}
+namespace Point {
+    pub func dist(p: Point) -> i64 {   // 实例方法：首参 = 接收者（按引用）
+        return p.x * p.x + p.y * p.y
     }
-    static func origin() -> Point {   // 静态方法：无 this
+    pub func origin() -> Point {       // 静态风格：无接收者，struct 名调用
         return Point(0, 0)
     }
 }
@@ -96,38 +99,43 @@ var p = Point(3, 4)               // 构造表达式，按字段声明顺序传�
 var q = Point()                   // 全用默认值
 var r = Point(1)                  // 部分实参：缺省用默认值
 p.x = 5                           // 字段直写
-println(p.dist())                 // 实例方法调用
-var o = Point.origin()            // 静态方法调用：先存变量
+println(p.dist())                 // 方法转发 → Point::dist(&p)
+var o = Point.origin()            // 静态风格调用：先存变量
 println(o.x)
 
-【继承】class Dog extends Animal：字段拍平（父在前）+ 方法遮蔽；无虚表/无向上转型。
-字段名跨继承链唯一；继承环、子类字段与父类重名 → 报错。
+【继承】struct Dog extends Animal：字段拍平（父在前）+ 方法沿继承链转发（子遮蔽父）。
+字段名跨继承链唯一；继承环、子 struct 字段与父重名 → 报错。
 
 【硬性规则——违反即编译报错】
-1. class/import/func 只出现在文件顶层；函数体内只有语句。
+1. struct/import/func/namespace 只出现在文件顶层；函数体内只有语句。
 2. 每条语句独占一行（分号在换行处自动补全）；同一行多条语句必须显式 ;
    `return "x" }` 同行会报错。
-3. 类实例访问字段/调方法前必须先存入变量：可以 `var p = Point(0); p.x`，
-   不能 `Point(0).x` 或 `make().get()`（寄存器中的类值不可寻址）。
-4. 静态方法必须类名调用（Point.origin()）；实例方法必须实例调用（p.dist()）。
-5. 类字段必须有类型标注或有默认值字面量，否则报错。
+3. struct 实例访问字段/调方法前必须先存入变量：可以 `var p = Point(0); p.x`，
+   不能 `Point(0).x` 或 `make().get()`（寄存器中的 struct 值不可寻址）。
+4. 方法函数必须 pub func；无接收者函数经实例调用（c.make()）→ 参数个数报错。
+5. struct 字段必须有类型标注或有默认值字面量，否则报错。
 6. string 用双引号，char 用单引号。string 不能与 i64 拼接。
 7. const 变量不能重赋值；类型不匹配（i64 赋给标注 i32）报错。
 
 【未实现，不要使用】ui/db 角色；二维表/字符串 id 表运行时；data 导入为表；
-库编译；--target 交叉；--backend=gnu；对象比较/println 对象/方法重载/析构。
+库编译；--target 交叉；--backend=gnu；对象比较/println 对象/方法重载/析构；
+class/this/static（已废弃）。
 
 【示例：验证通过的可运行程序】
 // tie:logic
-class Animal {
+struct Animal {
     var name: string
-    func sound() -> string {
+}
+struct Dog extends Animal {
+    var breed: string
+}
+namespace Animal {
+    pub func sound(a: Animal) -> string {
         return "..."
     }
 }
-class Dog extends Animal {
-    var breed: string
-    func sound() -> string {
+namespace Dog {
+    pub func sound(d: Dog) -> string {
         return "Woof"
     }
 }

@@ -6,8 +6,8 @@
 //! 本解析器只处理清理后的正文源码。
 
 use super::ast::{
-    AssignStmt, BinaryOp, ClassDefStmt, ClassField, Expr, ExprStmt, FieldAssignStmt, FnDefStmt,
-    ForStmt, IfStmt, ImportStmt, MethodDefStmt, NamespaceStmt, Param, Program, ReturnStmt, Stmt,
+    AssignStmt, BinaryOp, ClassField, Expr, ExprStmt, FieldAssignStmt, FnDefStmt, ForStmt,
+    IfStmt, ImportStmt, NamespaceStmt, Param, Program, ReturnStmt, Stmt, StructDefStmt,
     SwitchCase, SwitchStmt, TableCell, TableId, TupleField, TypeSpec, UnaryOp, UsingStmt,
     VarDeclStmt, WhileStmt,
 };
@@ -125,7 +125,7 @@ impl<'a> Parser<'a> {
                 TokenKind::Func | TokenKind::Pub => stmts.push(Stmt::FnDef(self.parse_fn_def()?)),
                 TokenKind::Import => stmts.push(Stmt::Import(self.parse_import()?)),
                 TokenKind::Using => stmts.push(Stmt::Using(self.parse_using()?)),
-                TokenKind::Class => stmts.push(Stmt::Class(self.parse_class()?)),
+                TokenKind::Struct => stmts.push(Stmt::Struct(self.parse_struct()?)),
                 TokenKind::Namespace => stmts.push(Stmt::Namespace(self.parse_namespace()?)),
                 other => {
                     return Err(self.err(format!(
@@ -155,7 +155,7 @@ impl<'a> Parser<'a> {
         while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
             match self.peek_kind() {
                 TokenKind::Func | TokenKind::Pub => body.push(Stmt::FnDef(self.parse_fn_def()?)),
-                TokenKind::Class => body.push(Stmt::Class(self.parse_class()?)),
+                TokenKind::Struct => body.push(Stmt::Struct(self.parse_struct()?)),
                 TokenKind::Namespace => body.push(Stmt::Namespace(self.parse_namespace()?)),
                 other => {
                     return Err(self.err(format!(
@@ -460,14 +460,15 @@ impl<'a> Parser<'a> {
         Ok(FnDefStmt { name, params, ret_ty, is_pub, body, span })
     }
 
-    /// `class Name [extends Parent] { 字段… 方法… }`（仅顶层，P8）。
+    /// `struct Name [extends Parent] { 字段 }`（纯数据，仅顶层/命名空间体）。
     ///
-    /// 类体由字段声明（`var name[: Ty] [= 默认值]`）与方法定义
-    /// （`[static] func name(params) -> Ty { body }`）交错组成。
-    fn parse_class(&mut self) -> Result<ClassDefStmt, ParseError> {
-        let span = self.advance().span; // class
+    /// struct 体**只允许字段声明**（`var name[: Ty] [= 默认值]`）——方法已移出，
+    /// 由绑定 struct 名的命名空间函数定义（`namespace Point { pub func dist(p: Point) }`），
+    /// `p.dist()` 调用由语义层转发。方法语法出现在 struct 体内 → 报错提示。
+    fn parse_struct(&mut self) -> Result<StructDefStmt, ParseError> {
+        let span = self.advance().span; // struct
         let name = self.expect_ident()?;
-        // 继承：`extends Parent`
+        // 继承：`extends Parent`（字段拍平）
         let parent = if self.eat(&TokenKind::Extends) {
             Some(self.expect_ident()?)
         } else {
@@ -475,7 +476,6 @@ impl<'a> Parser<'a> {
         };
         self.expect(TokenKind::LBrace, "'{'")?;
         let mut fields = Vec::new();
-        let mut methods = Vec::new();
         while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
             match self.peek_kind() {
                 // 字段：`var name[: Ty] [= 默认值]`
@@ -495,60 +495,23 @@ impl<'a> Parser<'a> {
                     self.expect(TokenKind::Semi, "字段声明结束符")?;
                     fields.push(ClassField { name: fname, ty, init, span: fspan });
                 }
-                // 方法：`[static] func ...`（类内函数定义即方法）
-                TokenKind::Func | TokenKind::Static => {
-                    methods.push(self.parse_method()?);
+                // 方法语法（M2.1.8 已移出 struct）：报错并提示新写法
+                TokenKind::Func | TokenKind::Pub => {
+                    return Err(self.err(format!(
+                        "struct 体不允许方法定义：逻辑请用绑定 struct 名的命名空间函数定义 \
+                         （namespace 数据名 {{ pub func 方法名(首参: 数据名) ... }}），调用仍写 obj.method()"
+                    )))
                 }
                 other => {
                     return Err(self.err(format!(
-                        "类体内只允许字段(var)或方法(func/static func)，实际是 {}",
+                        "struct 体内只允许字段(var)，实际是 {}",
                         self.describe(other)
                     )))
                 }
             }
         }
         self.expect(TokenKind::RBrace, "'}'")?;
-        Ok(ClassDefStmt { name, parent, fields, methods, span })
-    }
-
-    /// `[static] func name(params) -> Ty { body }`（P8，类内函数定义即方法）。
-    ///
-    /// 与 parse_fn_def 结构相同，多一个可选 `static` 前缀；`func` 在类体内即方法。
-    fn parse_method(&mut self) -> Result<MethodDefStmt, ParseError> {
-        let span = self.peek().span;
-        let is_static = self.eat(&TokenKind::Static);
-        self.expect(TokenKind::Func, "'func'")?;
-        let name = self.expect_ident()?;
-        self.expect(TokenKind::LParen, "'('")?;
-        let mut params = Vec::new();
-        if !self.eat(&TokenKind::RParen) {
-            loop {
-                let pspan = self.peek().span;
-                let pname = self.expect_ident()?;
-                self.expect(TokenKind::Colon, "':'")?;
-                let pty = self.parse_type()?;
-                // 默认值（可选参数）：`name: Ty = 字面量`（与函数定义同一语法）。
-                let default = if self.eat(&TokenKind::Eq) {
-                    Some(self.parse_expr()?)
-                } else {
-                    None
-                };
-                params.push(Param { name: pname, ty: pty, default, span: pspan });
-                if self.eat(&TokenKind::Comma) {
-                    continue;
-                }
-                self.expect(TokenKind::RParen, "')'")?;
-                break;
-            }
-        }
-        // 返回类型：`-> Ty` 可省略（默认 void）
-        let ret_ty = if self.eat(&TokenKind::Arrow) {
-            self.parse_type()?
-        } else {
-            TypeSpec::Named(TyKw::Void)
-        };
-        let body = self.parse_block()?;
-        Ok(MethodDefStmt { name, is_static, params, ret_ty, body, span })
+        Ok(StructDefStmt { name, parent, fields, span })
     }
 
     /// `{ stmts }` 代码块。
@@ -709,11 +672,11 @@ impl<'a> Parser<'a> {
             }
             // 元组类型：`(i64, string)` / `(x: i64, y: i64)`
             TokenKind::LParen => self.parse_tuple_type(),
-            // 类类型：`MyClass`（用户自定义类型，P8）
+            // struct 类型：`MyStruct`（用户自定义数据结构，M2.1.8）
             TokenKind::Ident(name) => {
                 let name = name.clone();
                 self.advance();
-                Ok(TypeSpec::Class(name))
+                Ok(TypeSpec::Struct(name))
             }
             other => Err(self.err(format!("期望类型，实际是 {}", self.describe(other)))),
         }
@@ -1084,12 +1047,6 @@ impl<'a> Parser<'a> {
                 } else {
                     Ok(Expr::Var(name))
                 }
-            }
-            // 当前实例 `this`：以特殊变量名形式进入表达式
-            // （lexer 已把 this 作为关键字，用户无法声明同名变量，语义层识别该名）
-            TokenKind::This => {
-                self.advance();
-                Ok(Expr::Var("this".to_string()))
             }
             TokenKind::LParen => self.parse_paren_or_tuple(span),
             TokenKind::LBracket => self.parse_table_lit(span),
@@ -1607,11 +1564,11 @@ mod tests {
     }
 
     #[test]
-    fn 类定义解析出字段方法与继承() {
+    fn struct定义解析出字段与继承() {
         let prog = parse(
-            "class Point extends Base {\n    var x: i64 = 0\n    var y: i64\n    static func origin() -> Point {\n        return 0\n    }\n    func move(dx: i64) -> void {\n        this.x = dx\n    }\n}",
+            "struct Point extends Base {\n    var x: i64 = 0\n    var y: i64\n}",
         );
-        let Stmt::Class(c) = &prog.stmts[0] else { panic!("期望类定义") };
+        let Stmt::Struct(c) = &prog.stmts[0] else { panic!("期望 struct 定义") };
         assert_eq!(c.name, "Point");
         assert_eq!(c.parent.as_deref(), Some("Base"));
         // 字段：`x`（带默认值）与 `y`（无默认值）
@@ -1621,22 +1578,15 @@ mod tests {
         assert!(matches!(&c.fields[0].init, Some(Expr::IntLit(0))));
         assert_eq!(c.fields[1].name, "y");
         assert!(c.fields[1].init.is_none());
-        // 方法：静态 `origin` 与实例 `move`
-        assert_eq!(c.methods.len(), 2);
-        let m0 = &c.methods[0];
-        assert!(m0.is_static);
-        assert_eq!(m0.name, "origin");
-        assert!(matches!(&m0.ret_ty, TypeSpec::Class(n) if n == "Point"));
-        let m1 = &c.methods[1];
-        assert!(!m1.is_static);
-        assert_eq!(m1.name, "move");
-        assert_eq!(m1.params.len(), 1);
-        assert_eq!(m1.params[0].name, "dx");
-        assert!(matches!(m1.params[0].ty, TypeSpec::Named(TyKw::I64)));
-        // 实例方法体内 `this.x = dx` 解析为 FieldAssign，base 为 this
-        let Stmt::FieldAssign(fa) = &m1.body[0] else { panic!("期望字段赋值语句") };
-        assert!(matches!(fa.base.as_ref(), Expr::Var(n) if n == "this"));
-        assert_eq!(fa.field, "x");
+    }
+
+    #[test]
+    fn struct体内方法语法报错() {
+        // M2.1.8：struct 纯数据，方法请用命名空间函数定义 → parser 报错提示
+        let err = parse_err(
+            "struct Point {\n    var x: i64\n    func move(dx: i64) {\n        x = dx\n    }\n}",
+        );
+        assert!(err.message.contains("命名空间函数"), "错误应提示新写法：{err}");
     }
 
     #[test]

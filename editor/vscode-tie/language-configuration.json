@@ -24,7 +24,7 @@
   ],
   "onEnterRules": [
     {
-      "beforeText": "^\\s*(?:func|class|static|if|else|while|for|switch|return)\\b.*\\{\\s*$",
+      "beforeText": "^\\s*(?:func|pub func|struct|if|else|while|for|switch|return|namespace)\\b.*\\{\\s*$",
       "action": { "indent": "indent" }
     },
     {

@@ -418,32 +418,39 @@ func main() {
   多个 using 都含同名函数 → 裸调用歧义报错（改用前缀调用）。
 - 裸调用解析顺序：顶层裸名 → 当前命名空间前缀补全 → using 引入的命名空间（唯一候选）。
 
-## 8. 面向对象（class / 方法 / 继承）
+## 8. 数据结构与逻辑分离（struct / 命名空间函数 / 继承）
 
-`class` 提供**值类型对象**（C# 风格）：类实例是字面结构体（LLVM 内联布局），字段直读直写，无虚表、无动态分派。
+**M2.1.8**：`class` 改名为 `struct` 并成为**纯数据**（只含字段）；逻辑（方法）移出为
+**绑定 struct 名的命名空间函数**（`namespace Point { pub func dist(p: Point) }`）。
+`obj.method()` 调用由编译器**转发**为命名空间函数（首参 = 接收者，按引用传递）。
+`this`/`static` 关键字随之废弃（`this` 变普通标识符，接收者改为显式首参）。
 
-### 8.1 类定义与字段
+### 8.1 struct 定义与字段
 
 ```c
-class Point {
+struct Point {
     var x: i64 = 0        // 字段：var name[: Ty] [= 默认值]；默认值可省略（缺省为类型零值）
     var y: i64 = 0
-    func dist() -> i64 {          // 实例方法：func 定义（类内即方法），首参自动绑定 this
-        return this.x * this.x + this.y * this.y
+}
+
+// 逻辑 = 绑定 struct 名的命名空间函数（方法）：
+namespace Point {
+    pub func dist(p: Point) -> i64 {          // 实例方法：首参 = 接收者（按引用）
+        return p.x * p.x + p.y * p.y
     }
-    static func origin() -> Point {   // 静态方法：无 this
+    pub func origin() -> Point {              // 静态风格：无接收者，struct 名调用
         return Point(0, 0)
     }
 }
 ```
 
+- struct 体**只允许字段**；方法语法出现在 struct 体内 → 报错并提示用命名空间函数定义。
 - 字段类型：显式标注（`var x: i64`）优先；否则从默认值字面量推导；两者皆无 → 编译报错。
 - 字段访问：`obj.x` 读（`GEP + load`）、`obj.x = 值` 写（`GEP + store`）。
-- 方法重名遮蔽：子类方法同名覆盖父类（无重载）。
 
 ### 8.2 构造
 
-`类名(实参…)` 是**构造表达式**（值类型，非 `new` 引用）：
+`Struct名(实参…)` 是**构造表达式**（值类型，非 `new` 引用）：
 
 ```c
 var p = Point(3, 4)        // 按字段声明顺序传参
@@ -451,44 +458,49 @@ var q = Point()            // 全部用默认值
 var r = Point(1)           // 部分实参：缺省字段用默认值
 ```
 
-### 8.3 方法调用
+### 8.3 方法调用（转发）
 
-- 实例方法：`obj.method(...)`，方法体内 `this` 绑定调用对象。
-- 静态方法：`类名.method(...)`，无 `this`。
-- 方法内 `this` 字段可读可写：`this.x = this.x + 1`。
-- 方法定义统一使用 `func` 关键字（类内 `func` 即方法；`static func` 为静态方法）——
-  语言只有一种函数定义写法，不再有 `method` 关键字。
+- 实例方法：`obj.method(...)` → 编译器转发为 `命名空间函数(obj, ...)`——
+  接收者作为**首参按引用传递**（LLVM ptr），函数内字段修改反映到调用方；
+- 静态风格：`Point.origin(...)`（receiver 是 struct 名）→ 直接调用，无接收者实参；
+- 方法函数必须 `pub`（与普通命名空间函数一致，私有则转发被拦截）；
+- 方法函数首参类型 == struct 名即视为「实例方法」（引用传递）；否则为普通参数。
 
-### 8.4 继承（复用式）
+### 8.4 继承（字段复用）
 
 ```c
-class Animal {
+struct Animal {
     var name: string
-    func sound() -> string { return "..." }
 }
-class Dog extends Animal {          // 字段拍平：父类字段在前
+struct Dog extends Animal {          // 字段拍平：父 struct 字段在前
     var breed: string
-    func sound() -> string { return "Woof" }   // 遮蔽父类同名方法
+}
+namespace Animal {
+    pub func sound(a: Animal) -> string { return "..." }
+}
+namespace Dog {
+    pub func sound(d: Dog) -> string { return "Woof" }   // 遮蔽父 struct 同名方法
 }
 ```
 
-- 布局：子类实例 = 父类字段 + 自身字段（拍平，无嵌套指针）。
-- 方法解析：查找自身 → 逐级父类；子类同名遮蔽父类。
+- 布局：子 struct 实例 = 父 struct 字段 + 自身字段（拍平，无嵌套指针）。
+- 方法解析：`obj.method()` 沿继承链查找（子 → 父）；子类同名遮蔽父类；
+  子实例调用父类方法时接收者地址直接可用（字段布局前缀一致）。
 - **限制**：无向上转型（子类不能当父类用）、无虚方法/动态分派、字段名必须跨继承链唯一（否则报错）、继承不得成环（否则报错）。
 
 ### 8.5 语义限制（编译期报错）
 
-- 类定义仅允许出现在**文件顶层**（函数体内定义 → 语法错误）。
-- 类实例字段访问/方法调用要求对象**可寻址**：`Point(0).x`、`make().dist()` 报错
-  （寄存器中的类值无内存地址；请先存入变量再访问）。
-- 静态方法必须通过类名调用；实例方法必须通过实例调用。
-- 类名与函数名冲突、类重复定义 → 报错。
+- struct 定义仅允许出现在**文件顶层**（函数体内定义 → 语法错误）。
+- struct 实例字段访问/方法调用要求对象**可寻址**：`Point(0).x`、`make().dist()` 报错
+  （寄存器中的 struct 值无内存地址；请先存入变量再访问）。
+- 方法函数必须 `pub` 才可被 `obj.method()` 转发；无接收者方法经实例调用 → 参数个数报错。
+- struct 名与函数名冲突、struct 重复定义 → 报错。
 - 本期不支持：对象比较（`==`）、`println` 直接打印对象、方法重载、析构。
 
 ### 8.6 与元组的关系
 
-- 二者都是**字面结构体值类型**（LLVM `{...}`）；元组字段可匿名/数字/命名访问，类字段仅命名访问。
-- 元组字段访问对寄存器值开放（`divmod(9,2).q` 合法）；类字段访问要求可寻址对象。
+- 二者都是**字面结构体值类型**（LLVM `{...}`）；元组字段可匿名/数字/命名访问，struct 字段仅命名访问。
+- 元组字段访问对寄存器值开放（`divmod(9,2).q` 合法）；struct 字段访问要求可寻址对象。
 
 ## 9. 语法速查表
 
@@ -514,14 +526,13 @@ class Dog extends Animal {          // 字段拍平：父类字段在前
 | `namespace` | 命名空间声明（M2 已实现）           | `namespace tcmsg { }`        |
 | `pub`       | 公有可见性标记（M2.1.7 已实现）      | `pub func public_api()`      |
 | `using`     | 引入命名空间公有函数（M2.1.7 已实现）   | `using fmt;`                 |
+| `struct`    | 数据结构定义（纯数据，M2.1.8）       | `struct Point { }`           |
+| `extends`   | 继承父 struct（P8/M2.1.8）     | `struct Dog extends Animal`  |
 | `true`      | 布尔真字面量                   | `var b = true`               |
 | `false`     | 布尔假字面量                   | `var b = false`              |
-| `class`     | 类定义（值类型对象，P8）            | `class Point { }`            |
-| `extends`   | 继承父类（P8）                 | `class Dog extends Animal`   |
-| `static`    | 静态方法标记（P8）               | `static func origin()`       |
-| `this`      | 实例方法内当前对象（P8）            | `this.x = 1`                 |
 
-> `let`与`fn` 为早期名称，已分别由 `var`/`const` 与 `func` 取代，不再支持。
+> `let`/`fn` 为早期名称，已分别由 `var`/`const` 与 `func` 取代；`class`/`static`/`this`
+> 已随 M2.1.8 废弃（`struct` 取代 `class`，接收者改为显式首参），均不再作为关键字。
 
 ### 9.2 所有类型
 

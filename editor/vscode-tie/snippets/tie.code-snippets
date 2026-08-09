@@ -17,18 +17,26 @@
     ],
     "description": "定义函数（无返回类型）"
   },
-  "class": {
-    "prefix": "class",
+  "struct": {
+    "prefix": "struct",
     "body": [
-      "class ${1:Name} {",
+      "struct ${1:Name} {",
       "\tvar ${2:field}: ${3:i64}",
-      "",
-      "\tfunc ${4:methodName}(${5:params}) -> ${6:ret} {",
-      "\t\t${0:// 方法体}",
+      "\t${0:// 字段（纯数据，方法见 ns-method 片段）}",
+      "}"
+    ],
+    "description": "定义 struct（纯数据，M2.1.8）"
+  },
+  "ns-method": {
+    "prefix": "ns",
+    "body": [
+      "namespace ${1:StructName} {",
+      "\tpub func ${2:method}(${3:receiver}: ${1:StructName}, ${4:params}) -> ${5:ret} {",
+      "\t\t${0:// 方法体（首参 = 接收者，按引用）}",
       "\t}",
       "}"
     ],
-    "description": "定义类（含字段与方法）"
+    "description": "定义绑定 struct 的命名空间方法函数（pub func）"
   },
   "if": {
     "prefix": "if",
@@ -83,20 +91,20 @@
   "func-method": {
     "prefix": "func",
     "body": [
-      "func ${1:name}(${2:params}) -> ${3:ret} {",
-      "\t${0:// 方法体}",
+      "pub func ${1:name}(${2:receiver}: ${3:Struct}, ${4:params}) -> ${5:ret} {",
+      "\t${0:// 方法函数（namespace Struct 内，首参 = 接收者按引用）}",
       "}"
     ],
-    "description": "定义实例方法（类内 func，可访问 this）"
+    "description": "定义命名空间方法函数（pub func，首参接收者）"
   },
   "static-func": {
     "prefix": "static",
     "body": [
-      "static func ${1:name}(${2:params}) -> ${3:ret} {",
-      "\t${0:// 静态方法体（无 this，通过类名调用）}",
+      "pub func ${1:name}(${2:params}) -> ${3:ret} {",
+      "\t${0:// 静态风格方法函数（无接收者，struct 名调用）}",
       "}"
     ],
-    "description": "定义静态方法"
+    "description": "定义静态风格方法函数（无接收者）"
   },
   "import": {
     "prefix": "import",

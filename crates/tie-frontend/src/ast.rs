@@ -16,8 +16,8 @@ pub enum TypeSpec {
     Named(TyKw),
     /// 元组类型 `(T1, T2)` / `(x: T1, y: T2)`（元素 ≥1，字段名可空）
     Tuple(Vec<TupleField>),
-    /// 类类型（用户自定义 OOP 类型，P8）
-    Class(String),
+    /// struct 类型（用户自定义数据结构，纯数据：只含字段）
+    Struct(String),
 }
 
 /// 元组的一个字段：可选字段名 + 类型（名字进类型，供 `.x` 命名访问）。
@@ -65,8 +65,8 @@ impl TypeSpec {
             TypeSpec::Tuple(_) => {
                 unreachable!("元组类型映射为字面结构体，需由 IR 生成器的 llvm_ty 包装处理（含泄漏与缓存）")
             }
-            TypeSpec::Class(_) => {
-                unreachable!("类类型映射为字面结构体，需由 IR 生成器的 llvm_ty 包装处理（含泄漏与缓存）")
+            TypeSpec::Struct(_) => {
+                unreachable!("struct 类型映射为字面结构体，需由 IR 生成器的 llvm_ty 包装处理（含泄漏与缓存）")
             }
         }
     }
@@ -153,8 +153,8 @@ pub enum Stmt {
     /// using 引入语句（`using fmt2;`，仅顶层）：把已导入命名空间的公有函数
     /// 引入当前文件作用域，之后可裸调用（如 `public_api()`）
     Using(UsingStmt),
-    /// 类定义 `class Name [extends Parent] { 字段/方法 }`（P8，仅顶层）
-    Class(ClassDefStmt),
+    /// struct 定义 `struct Name [extends Parent] { 字段 }`（纯数据，仅顶层）
+    Struct(StructDefStmt),
     /// 字段赋值 `obj.field = expr`（P8，对已存在实例字段的写入）
     FieldAssign(FieldAssignStmt),
 }
@@ -249,23 +249,25 @@ pub struct Param {
     pub span: Span,
 }
 
-/// 类定义语句（P8）：`class Name [extends Parent] { 字段… 方法… }`。
+/// struct 定义语句：`struct Name [extends Parent] { 字段 }`。
 ///
-/// 仅允许出现在文件顶层（与 import 相同）；字段与方法并列在类体内。
+/// **纯数据**：只含字段声明（`var name[: Ty] [= 默认值]`），不含方法。
+/// 逻辑（操作该数据的行为）通过**绑定 struct 名的命名空间函数**定义：
+/// `namespace Point { pub func dist(p: Point) -> i64 { ... } }`，调用时
+/// `p.dist()` 由语义层转发为 `Point::dist(p)`（方法函数必须 `pub` 才可转发）。
+/// 仅允许出现在文件顶层（与 import 相同）；`extends` 支持字段继承（拍平）。
 #[derive(Debug, Clone)]
-pub struct ClassDefStmt {
-    /// 类名（全局唯一，不能与函数名/其他类名冲突）
+pub struct StructDefStmt {
+    /// struct 名（全局唯一，不能与函数名/其他 struct 名冲突）
     pub name: String,
-    /// 父类名（`extends Parent`）；`None` 表示无继承
+    /// 父 struct 名（`extends Parent`）；`None` 表示无继承
     pub parent: Option<String>,
     /// 自身字段（不含继承的；拍平由语义层完成）
     pub fields: Vec<ClassField>,
-    /// 自身方法（不含继承的；遮蔽解析由语义层完成）
-    pub methods: Vec<MethodDefStmt>,
     pub span: Span,
 }
 
-/// 类的一个字段声明：`var name[: Ty] [= 默认值]`（P8）。
+/// struct 的一个字段声明：`var name[: Ty] [= 默认值]`。
 ///
 /// 默认值限编译期字面量（构造缺省时兜底）；字段恒可变（const 字段留后续版本）。
 #[derive(Debug, Clone)]
@@ -275,22 +277,6 @@ pub struct ClassField {
     pub ty: Option<TypeSpec>,
     /// 默认值（`var count = 0`）；`None` 表示构造时必须传参
     pub init: Option<Expr>,
-    pub span: Span,
-}
-
-/// 类的一个方法定义（P8）：`[static] func name(params) -> Ty { body }`（类内 func 即方法）。
-///
-/// 与 [FnDefStmt] 同构 + `is_static`；不复用 FnDefStmt 以免污染顶层函数构造点。
-/// 实例方法体内 `this` 绑定当前实例（语义层处理）。
-#[derive(Debug, Clone)]
-pub struct MethodDefStmt {
-    pub name: String,
-    /// 静态方法：不绑定 this，通过 `类名.方法名()` 调用
-    pub is_static: bool,
-    pub params: Vec<Param>,
-    /// 返回类型（省略时为 void）
-    pub ret_ty: TypeSpec,
-    pub body: Vec<Stmt>,
     pub span: Span,
 }
 
@@ -416,7 +402,7 @@ pub enum Expr {
     /// 字段访问（读）`base.field`（P8 统一变体）：
     ///
     /// - base 是元组 → 元组字段（`.x` 命名 / `.Item1` / `.0`，语义层按 tuple_field_index 解析）；
-    /// - base 是类实例 → 类字段（`.x` 命名，field_index 解析）。
+    /// - base 是 struct 实例 → struct 字段（`.x` 命名，field_index 解析）。
     ///
     /// 同一变体管两种，语义层按 base 的推导类型分发。
     FieldAccess { base: Box<Expr>, field: String, span: Span },
@@ -431,11 +417,13 @@ pub enum Expr {
     /// 仅在 switch 的 case pattern 位置出现；普通表达式上下文不存在。
     /// 语义层校验：subject 为动态类型容器（宽类型/表/元组）才允许，静态类型上报错。
     TypeLit { ty: TypeSpec, span: Span },
-    /// 方法调用 `obj.m(args)`（实例）/ `MyClass.m(args)`（静态）（P8）
+    /// 方法调用 `obj.m(args)`（实例）/ `MyStruct.m(args)`（静态）/ 命名空间调用（M2.1.8）。
     ///
-    /// receiver 是变量/this → 实例方法（receiver 地址作隐藏 this 参数）；
-    /// receiver 是类名 → 静态方法（无 this）；receiver 是命名空间路径（Expr::Path）
-    /// → 命名空间函数调用（全名 = 路径段 + 方法名）。同一变体管三种，语义层区分。
+    /// receiver 是变量（类型 T 为 struct）→ **方法转发**：语义层查 `T::m`（命名空间函数，
+    /// 沿继承链），实参 = [receiver] + args，等价 `T::m(obj, args)`；
+    /// receiver 是 struct 名 → 静态调用 `T::m(args)`（无首参插入）；
+    /// receiver 是命名空间路径（Expr::Path / 未绑定链）→ 命名空间函数调用（全名 = 路径段 + 方法名）。
+    /// 同一变体管三种，语义层区分。
     MethodCall { receiver: Box<Expr>, method: String, args: Vec<Expr>, span: Span },
 }
 

@@ -1,61 +1,65 @@
-// oop.tie：P8 class/OOP 功能演示
-// 覆盖：类定义、构造（字段位置初始化 + 缺省默认值）、字段读写、
-//       实例方法（this）、静态方法（类名调用）、继承（字段拍平 + 方法遮蔽）
-// 方法定义统一使用 func 关键字（类内 func 即方法）：func / static func
+// oop.tie：M2.1.8 struct 数据与逻辑分离演示
+// struct = 纯数据（只含字段）；逻辑 = 绑定 struct 名的命名空间函数（pub func），
+// obj.method() 调用由编译器转发为 命名空间函数(首参: struct名)（实例方法）/
+// struct名.fn()（静态风格，无接收者）。this/static/class 已废弃。
 
-// 静态方法：通过类名调用，无 this
-class MathHelper {
-    static func twice(x: i64) -> i64 {
+// 静态风格：通过 struct 名调用，无接收者
+namespace MathHelper {
+    pub func twice(x: i64) -> i64 {
         return x * 2
     }
-    static func greet(name: string) -> string {
+    pub func greet(name: string) -> string {
         return "Hello, " + name + "!"
     }
 }
 
-// 计数器：实例方法 this 字段读写
-class Counter {
+// 计数器：接收者显式为首参（c.count 字段读写）
+struct Counter {
     var count: i64
-    func inc() {
-        this.count = this.count + 1
+}
+namespace Counter {
+    pub func inc(c: Counter) {
+        c.count = c.count + 1
     }
-    func get() -> i64 {
-        return this.count
+    pub func get(c: Counter) -> i64 {
+        return c.count
     }
 }
 
-// 继承：父类字段/方法 + 子类新增字段
-class Animal {
+// 继承：父 struct 字段 + 子 struct 字段；方法沿继承链转发（子类遮蔽父类）
+struct Animal {
     var name: string
     var age: i64
-    func speak() -> string {
-        return this.name + " makes a sound"
+}
+struct Dog extends Animal {
+    var breed: string
+}
+namespace Animal {
+    pub func speak(a: Animal) -> string {
+        return a.name + " makes a sound"
     }
 }
-
-class Dog extends Animal {
-    var breed: string
-    // 遮蔽父类方法
-    func speak() -> string {
-        return this.name + " barks"
+namespace Dog {
+    pub func speak(d: Dog) -> string {
+        return d.name + " barks"
     }
-    func info() -> string {
-        return "I am a " + this.breed
+    pub func info(d: Dog) -> string {
+        return "I am a " + d.breed
     }
 }
 
 // 构造缺省字段：未传参用默认值
-class Point {
+struct Point {
     var x: i64
     var y: i64 = 10
 }
 
 func main() {
-    // 1. 静态方法调用
+    // 1. struct 名调用（静态风格）
     println(MathHelper.twice(21))
     println(MathHelper.greet("tie"))
 
-    // 2. 构造 + 字段读取 + 实例方法
+    // 2. 构造 + 字段读取 + 方法转发（obj.method() → Counter::get(obj)）
     var c = Counter(0)
     c.inc()
     c.inc()
@@ -70,7 +74,7 @@ func main() {
     println(p.x)
     println(p.y)
 
-    // 4. 继承：父类字段 + 子类字段 + 方法遮蔽
+    // 4. 继承：父 struct 字段 + 子 struct 字段 + 方法遮蔽
     var d = Dog("Rex", 3, "Golden")
     println(d.name)
     println(d.age)
@@ -78,7 +82,7 @@ func main() {
     println(d.speak())
     println(d.info())
 
-    // 5. 父类实例：自己的方法
+    // 5. 父 struct 实例：自己的方法
     var a = Animal("Cat", 2)
     println(a.speak())
 }

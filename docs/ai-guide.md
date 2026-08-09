@@ -153,16 +153,23 @@ using math;                       // 引入命名空间：其公有函数可裸�
     多 using 同名函数 → 裸调用歧义报错。
 - **未实现**：`data` 文件导入为只读数据表、按角色分派可见符号集。
 
-### 2.8 class / OOP（P8 新增）
+### 2.8 struct 数据与逻辑分离（M2.1.8）
+
+`struct` = **纯数据**（只含字段，值类型，LLVM 内联布局）；逻辑（方法）移出为
+**绑定 struct 名的命名空间函数**。`obj.method()` 由编译器转发为命名空间函数
+（接收者作首参，按**引用**传递——函数内字段修改反映到调用方）。
+`this`/`static`/`class` 已废弃。
 
 ```c
-class Point {
+struct Point {
     var x: i64 = 0                // 字段：var name[: Ty] [= 默认值]
     var y: i64 = 0
-    func dist() -> i64 {        // 实例方法：func 定义（类内即方法），体内 this 绑定当前对象
-        return this.x * this.x + this.y * this.y
+}
+namespace Point {
+    pub func dist(p: Point) -> i64 {   // 实例方法：首参 = 接收者（按引用）
+        return p.x * p.x + p.y * p.y
     }
-    static func origin() -> Point {   // 静态方法：无 this
+    pub func origin() -> Point {       // 静态风格：无接收者，struct 名调用
         return Point(0, 0)
     }
 }
@@ -172,28 +179,33 @@ func main() {
     var q = Point()               // 全部用默认值
     var r = Point(1)              // 部分实参：缺省字段用默认值
     p.x = 5                       // 字段直写
-    println(p.dist())             // 实例方法调用（25）
-    var o = Point.origin()        // 静态方法调用：先存变量（寄存器类值不可直接 .x）
+    println(p.dist())             // 实例方法转发 → Point::dist(&p)（25）
+    var o = Point.origin()        // 静态风格调用：先存变量（寄存器 struct 值不可直接 .x）
     println(o.x)                  // 0
 }
 ```
 
-> **P8 关键限制**：`Point.origin().x` 直接连用会报「字段访问需要可寻址对象」——
-> 静态方法返回的类值在寄存器中，必须先 `var o = Point.origin()` 存入变量再访问。
+> **关键限制**：`Point.origin().x` / `make().dist()` 直接连用会报「需要可寻址」——
+> 寄存器中的 struct 值无内存地址，必须先 `var o = ...` 存入变量再访问。
+> 方法函数必须 `pub`（否则 `obj.method()` 转发被私有拦截）。
 
-**继承**（复用式，无虚表/无动态分派/无向上转型）：
+**继承**（字段复用，无虚表/无动态分派/无向上转型）：
 
 ```c
-class Animal {
+struct Animal {
     var name: string
-    func sound() -> string { return "..." }
 }
-class Dog extends Animal {
+struct Dog extends Animal {
     var breed: string
-    func sound() -> string { return "Woof" }   // 遮蔽父类方法
+}
+namespace Animal {
+    pub func sound(a: Animal) -> string { return "..." }
+}
+namespace Dog {
+    pub func sound(d: Dog) -> string { return "Woof" }   // 遮蔽父 struct 方法
 }
 // Dog 实例布局 = Animal 字段（在前） + 自身字段（拍平）
-// 方法解析：自身 → 父类逐级；子类同名遮蔽父类
+// obj.method() 沿继承链查找（子 → 父）；子实例调父方法时接收者地址直接可用
 ```
 
 > 注意：文档早期用过 `str`，**当前类型名是 `string`**（`var name: string`）。
@@ -204,15 +216,16 @@ class Dog extends Animal {
 
 | 场景 | 错误信息（关键词） |
 |---|---|
-| `Counter(0).count` / `make().get()`（寄存器中的类值直接访问） | 「字段访问需要可寻址对象」/「方法调用的对象需要可寻址的类实例」 |
-| 静态方法通过实例调用 `c.make()` | 「静态方法必须通过类名调用」 |
-| 实例方法通过类名调用 | 「方法调用的对象必须是类实例」 |
-| 继承环 `class A extends B` 且 B extends A | 「类继承形成环」 |
-| 子类字段与父类字段重名 | 「字段名必须跨继承链唯一」 |
+| `Counter(0).count` / `make().get()`（寄存器中的 struct 值直接访问） | 「字段访问需要可寻址对象」/「方法调用的对象需要可寻址的 struct 实例」 |
+| 方法函数未加 `pub` 被 `obj.method()` 调用 | 「私有函数…不可在命名空间之外调用」 |
+| 无接收者方法经实例调用 `c.make()` | 「含接收者对象」 |
+| 继承环 `struct A extends B` 且 B extends A | 「struct 继承形成环」 |
+| 子 struct 字段与父 struct 字段重名 | 「字段名必须跨继承链唯一」 |
+| struct 体内定义方法（M2.1.8 后） | 「struct 体不允许方法定义：逻辑请用命名空间函数」 |
 | 字段无类型标注且无默认值 | 「字段必须标注类型或有默认值」 |
 | 字段默认值是非字面量表达式 | 「默认值必须是字面量」 |
-| 类名与函数名冲突 / 类重复定义 | 「类名与函数名冲突」/「类重复定义」 |
-| 函数体内定义类 / import / 嵌套函数 | 「顶层只允许…」/「函数体内不支持…」/「函数体内不支持嵌套函数定义」 |
+| struct 名与函数名冲突 / struct 重复定义 | 「struct 名与函数名冲突」/「struct 重复定义」 |
+| 函数体内定义 struct / import / 嵌套函数 | 「顶层只允许…」/「函数体内不支持…」/「函数体内不支持嵌套函数定义」 |
 | const 变量重新赋值 | 「不可变变量不能赋值」 |
 | 类型不匹配（如 i64 赋给标注 i32 的变量） | 「类型不匹配」 |
 | 元组空解构 `var () = ...` | 「空解构 () 不支持」 |
@@ -331,26 +344,24 @@ tie-llvm 内部：AST → `.ll` 文本 → `opt` 优化 → `clang` 汇编 → `
 ### 8.3 AST（ast.rs）
 
 ```rust
-pub enum TypeSpec { Named(TyKw), Tuple(Vec<TupleField>), Class(String) }
-pub enum Stmt { VarDecl, FnDef, Expr, Assign, Return, If, While, For, Switch, Import, Class, FieldAssign }
+pub enum TypeSpec { Named(TyKw), Tuple(Vec<TupleField>), Struct(String) }
+pub enum Stmt { VarDecl, FnDef, Expr, Assign, Return, If, While, For, Switch, Import, Namespace, Using, Struct, FieldAssign }
 pub enum Expr { IntLit, FloatLit, StrLit, CharLit, BoolLit, Var, Call, Unary, Binary, Range,
                 TableLit, Index, TupleLit, FieldAccess, MethodCall }
-pub struct ClassDefStmt { name: String, parent: Option<String>, fields: Vec<ClassField>,
-                          methods: Vec<MethodDefStmt>, span: Span }
-pub struct MethodDefStmt { name: String, is_static: bool, params: Vec<Param>,
-                           ret_ty: TypeSpec, body: Vec<Stmt>, span: Span }
+pub struct StructDefStmt { name: String, parent: Option<String>, fields: Vec<ClassField>, span: Span }
 pub struct FieldAssignStmt { base: Box<Expr>, field: String, value: Expr, span: Span }
 ```
 
 ### 8.4 语义（semantic.rs）
 
-入口 `analyze(&Program) -> Result<SemanticResult, SemanticError>`，共 **4 遍**：
+入口 `analyze(&Program) -> Result<SemanticResult, SemanticError>`，共 **3 遍**：
 
-1. **收集函数签名**：`funcs: HashMap<名称, FuncSig>`，重复定义报错（允许前向引用）。
-2. **collect_classes**：类名登记（vs 函数名/类名冲突）→ 逐个 `flatten_class` 拍平继承链
-   （父类字段在前 + 方法遮蔽，`chain: HashSet` 检测继承环）。
-3. **check_fn**：逐函数体 `check_stmt`（作用域为 `HashMap<名称, TypeSpec>`）。
-4. **check_method**：逐方法体；实例方法先在作用域插入 `this` → 当前类类型。
+1. **收集函数签名**：`funcs: HashMap<全名, FuncSig>`（顶层裸名 / 命名空间全名
+   `Point::dist`），重复定义报错（允许前向引用）。
+2. **collect_structs**：struct 名登记（vs 函数名/struct 名冲突）→ 逐个 `flatten_struct`
+   拍平继承链（父 struct 字段在前，`chain: HashSet` 检测继承环）。方法不在 struct 内。
+3. **check_fn**：逐函数体 `check_stmt`（作用域为 `HashMap<名称, TypeSpec>`）；
+   命名空间函数由 check_ns_stmts 递归覆盖。
 
 关键数据结构：
 
@@ -359,15 +370,16 @@ pub struct ClassInfo {
     pub parent: Option<String>,
     pub fields: Vec<ClassField>,                 // 拍平字段（含继承），顺序即 LLVM 结构体字段序
     pub field_index: HashMap<String, usize>,     // 字段名 → GEP 偏移（语义与 IR 共用唯一权威）
-    pub methods: HashMap<String, MethodSig>,     // 拍平方法（子类遮蔽父类）
-    pub method_owner: HashMap<String, String>,   // 方法名 → 实际定义类（mangle 用 @<定义类>$<方法>）
 }
 ```
 
 - `resolve_class_field_ty`：字段类型解析——显式标注优先；无标注从默认值字面量推导；
   两者皆无 → 报错。
-- `is_addressable_expr`（语义层）：类字段访问/实例方法调用要求对象可寻址
-  （Var 或 FieldAccess 链）；寄存器中的类值（构造表达式/方法调用结果）→ 报错。
+- **方法转发**（`infer_expr` 的 MethodCall 分支）：receiver 类型是 struct →
+  沿继承链查 `funcs` 键 `T::method`（子 → 父），方法函数必须 `pub`；首参类型须
+  struct 兼容（`struct_assignable`：子类可赋父类）；receiver 必须可寻址（引用传递）。
+- `is_addressable_expr`（语义层）：struct 字段访问/方法转发要求对象可寻址
+  （Var 或 FieldAccess 链）；寄存器中的 struct 值（构造表达式/方法调用结果）→ 报错。
 - `expr_types: HashMap<usize, TypeSpec>`：用表达式地址（`addr_of`）记录推导类型，IR 层查询。
 - `tables: HashMap<usize, TableInfo>`：表字面量布局元数据（元素类型/长度）。
 
@@ -377,22 +389,26 @@ pub struct ClassInfo {
 
 ### 9.1 核心设计
 
-- **值类型用字面结构体**：元组/类 → LLVM `{T0, T1, ...}`，通过 `ty_cache` 缓存
+- **值类型用字面结构体**：元组/struct → LLVM `{T0, T1, ...}`，通过 `ty_cache` 缓存
   （`HashMap<TypeSpec, String>` 生成 `%tup.N` / `%cls.N` 类型名），避免重复声明。
-- **方法 mangle**：`@<定义类>$<方法名>`（用 `method_owner` 查定义类），签名
-  `define ret @C$m(ptr %_this, params...)`——实例方法首参 `ptr %this`，
-  用 `by_ptr` 的 `VarBind` 绑定（**不 alloca**，直接复用入参指针）。
+- **方法 mangle**：方法 = 命名空间函数（`namespace Point`），全名转 `$`
+  （`Point::dist` → `@Point$dist`），由 `gen_ns_fns` 统一生成。**方法函数首参**
+  （类型 == struct 名）按**引用**传递：签名首参为 `ptr`，用 `by_ptr` 的 `VarBind`
+  绑定（不 alloca，直接复用入参指针）——函数内字段修改反映到调用方。
+- **方法转发调用**（`gen_call_inner` 的 `first` 参数）：实例 `p.dist()` 时 receiver
+  作首实参，`is_method_fn` 判定后传**地址**（`gen_class_addr`）；静态 `Point.dist()`
+  走命名空间分支（无接收者实参）。
 - **字段读**：`GEP + load`；**字段写**：`GEP + store`（`gen_field_assign`）。
 - **构造**（`gen_construct`）：`insertvalue` 链逐字段装配，缺省参数用默认值/零值。
 - **元组字段访问**：`extractvalue`（寄存器值直接取，无地址要求）；
-  **类字段访问**：`gen_class_addr` 先取地址（Var → 绑定地址；FieldAccess 链 → 逐级 GEP），再 load。
-- **`current_ret_ty`**：方法内 return 的返回类型查询——按 `类$方法` 拆分，查 `classes`，
-  兜底查 `funcs`（→ `I64` 兜底）。
+  **struct 字段访问**：`gen_class_addr` 先取地址（Var → 绑定地址；FieldAccess 链 → 逐级 GEP），再 load。
+- **`current_ret_ty`**：函数/方法内 return 的返回类型查询——查 `funcs`（兜底 `I64`）。
 
 ### 9.2 运行流程
 
-1. 先遍历 `Stmt::Class` 生成全部方法 `@C$m`（方法间可互相调用）。
-2. 再遍历 `Stmt::FnDef` 生成顶层函数（`gen_fn`），含 `main`。
+1. 先遍历 `Stmt::FnDef` / `Stmt::Namespace` 生成全部函数（`gen_fn` / `gen_ns_fns`，
+   含方法函数 `@Point$dist`），`gen_fn` 判定方法函数首参按引用生成。
+2. `Stmt::Struct` 不生成代码（纯类型布局，字段由语义层拍平）。
 3. import 已在 driver 层递归加载为内联函数（语义分析前）。
 4. 生成 `.ll` → 调用 `opt`（优化）→ `clang`（汇编）→ `lld`（链接）。
 
@@ -422,7 +438,8 @@ tie:script 是「宿主进程 ↔ tie 脚本」的执行协议：约定 `.tie` �
    添加分支并保证 `match` 穷尽。
 2. **字段索引唯一权威**：`ClassInfo.field_index`（语义层计算），IR 层不得自行遍历拍平，
    否则偏移错位。
-3. **类方法与顶层函数分离**：类方法不进 `result.funcs`；用 `result.classes` + `method_owner`。
+3. **方法函数在 funcs 表**：方法 = 绑定 struct 名的命名空间函数（全名 `Point::dist`），
+   与顶层函数统一进 `result.funcs`；struct 名与函数名冲突由 collect_structs 拦截。
 4. **语义先于 IR**：所有编译期错误在 semantic 层拦截（如可寻址性、继承环、字段重名），
    IR 层出现 `unwrap/expect` 即视为内部错误。
 5. **宽类型/`code`/`table` 是编译期概念**：语义阶段展开为具体类型，IR 阶段不出现。

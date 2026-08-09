@@ -1,20 +1,19 @@
-// oop_neg_b.tie：负例——寄存器中的类值不可寻址（方法调用结果直接调用方法）
-// 期望：语义错误「方法调用的对象需要可寻址的类实例」
+// oop_neg_b.tie：负例——方法函数未显式 pub（M2.1.8：方法必须 pub 才可被 obj.method() 转发）
+// 期望：语义错误「函数 'Counter::get' 是命名空间 'Counter' 的私有函数」
+// 注：寄存器中的 struct 值调用方法（如 make().get()）在 M2.1.8 已合法（值传递转发），
+// 原「不可寻址」负例语义消失，替换为本负例。
 
-class Counter {
+struct Counter {
     var count: i64
-    func inc() {
-        this.count = this.count + 1
-    }
-    func get() -> i64 {
-        return this.count
-    }
 }
-
-func make() -> Counter {
-    return Counter(0)
+namespace Counter {
+    // 未加 pub → 默认私有，跨命名空间调用被拦截
+    func get(c: Counter) -> i64 {
+        return c.count
+    }
 }
 
 func main() {
-    println(make().get())
+    var c = Counter(0)
+    println(c.get())
 }

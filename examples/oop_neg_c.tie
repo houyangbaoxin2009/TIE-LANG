@@ -1,9 +1,12 @@
-// oop_neg_c.tie：负例——静态方法通过实例调用（应报错：静态方法必须通过类名调用）
-// 期望：语义错误「静态方法 'make' 必须通过类名调用」
+// oop_neg_c.tie：负例——无接收者方法函数经实例调用（M2.1.8）
+// 期望：语义错误「方法 'Counter::make' 期望 0-0 个参数（含接收者对象）」
+// 注：make 无首参（静态风格），c.make() 转发时多出 receiver 实参 → 报错。
 
-class Counter {
+struct Counter {
     var count: i64
-    static func make() -> i64 {
+}
+namespace Counter {
+    pub func make() -> i64 {
         return 1
     }
 }

@@ -879,7 +879,7 @@ impl Session {
                 Stmt::Namespace(ns) => {
                     count += self.register_ns_funcs(&ns.body, &ns.path)?;
                 }
-                Stmt::Class(_) => return Err("REPL v1 暂不支持类定义".into()),
+                Stmt::Struct(_) => return Err("REPL v1 暂不支持 struct 定义".into()),
                 Stmt::Import(_) => return Err("REPL v1 暂不支持 import".into()),
                 Stmt::Using(_) => return Err("REPL v1 暂不支持 using".into()),
                 _ => return Err("顶层只允许函数/类/import/using/命名空间定义".into()),
@@ -1164,7 +1164,7 @@ impl<'a> Env<'a> {
                 // 顶层注册路径已报错，函数体内（不应出现）防御性空操作。
                 Ok(Flow::Normal(None))
             }
-            Stmt::Class(_) => Err("REPL v1 暂不支持类定义".into()),
+            Stmt::Struct(_) => Err("REPL v1 暂不支持 struct 定义".into()),
             Stmt::FnDef(f) => {
                 // 函数体内的嵌套函数定义 → 注册进 funcs（从简）
                 self.session.funcs.insert(f.name.clone(), f.clone());
@@ -1359,8 +1359,8 @@ impl<'a> Env<'a> {
                     let arg_vals = self.eval_args(args)?;
                     return self.call_fn(&full, arg_vals);
                 }
-                // 其余方法调用（类）：REPL v1 暂不支持
-                Err("REPL v1 暂不支持方法调用（类）".into())
+                // 其余方法调用（struct 实例转发）：REPL v1 暂不支持 struct 值
+                Err("REPL v1 暂不支持 struct 方法调用".into())
             }
             // 命名空间路径独立出现：只能作调用 receiver，解释器防御报错
             Expr::Path { segments, .. } => Err(format!(
@@ -1376,10 +1376,10 @@ impl<'a> Env<'a> {
     }
 
     /// 命名空间路径段提取（解释层版）：把 `tcmsg.error` 的 FieldAccess 链/Var
-    /// 递归拍平为 ["tcmsg","error"]。条件：每个标识符都未声明（非变量/非 this）。
+    /// 递归拍平为 ["tcmsg","error"]。条件：每个标识符都未声明（非变量）。
     fn ns_segments(&self, expr: &Expr) -> Option<Vec<String>> {
         match expr {
-            Expr::Var(name) if name != "this" && !self.is_declared(name) => {
+            Expr::Var(name) if !self.is_declared(name) => {
                 Some(vec![name.clone()])
             }
             Expr::FieldAccess { base, field, .. } => {
@@ -2234,7 +2234,7 @@ fn value_matches_ty(v: &Value, ty: &TypeSpec) -> bool {
             Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Char(_) | Value::Str(_)
         ),
         // code 是编译期概念，interp 无对应值；元组/类暂不支持
-        TypeSpec::Named(TyKw::Code) | TypeSpec::Tuple(_) | TypeSpec::Class(_) => false,
+        TypeSpec::Named(TyKw::Code) | TypeSpec::Tuple(_) | TypeSpec::Struct(_) => false,
     }
 }
 

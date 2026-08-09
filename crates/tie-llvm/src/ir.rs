@@ -9,11 +9,10 @@
 //! - 函数入口块命名为 `entry`，控制流块命名为 `if.then`/`if.else`/`loop.cond` 等
 
 use tie_frontend::ast::{
-    BinaryOp, Expr, FieldAssignStmt, FnDefStmt, MethodDefStmt, Program, Stmt, TableCell, TypeSpec,
-    UnaryOp,
+    BinaryOp, Expr, FieldAssignStmt, FnDefStmt, Program, Stmt, TableCell, TypeSpec, UnaryOp,
 };
 use tie_frontend::lexer::TyKw;
-use tie_frontend::semantic::{ClassInfo, FuncSig, MethodSig, SemanticResult};
+use tie_frontend::semantic::{ClassInfo, FuncSig, SemanticResult};
 use std::collections::HashMap;
 
 /// IR 生成结果。
@@ -171,15 +170,8 @@ impl<'p> IrGenerator<'p> {
             }
         }
 
-        // 生成各类的方法（P8）：按类定义顺序，逐个方法生成。
-        // 方法名 mangling：`@<定义类>$<方法名>`（继承中同名方法各自独立生成）。
-        for stmt in &self.program.stmts {
-            if let Stmt::Class(c) = stmt {
-                for m in &c.methods {
-                    self.gen_method(m, &c.name)?;
-                }
-            }
-        }
+        // M2.1.8：方法已移出 struct——逻辑是绑定 struct 名的命名空间函数，
+        // 由上方 gen_ns_fns 统一生成（@Point$dist 等），无需单独方法生成循环。
 
         // 函数体生成过程中延迟收集的全局常量，统一输出到模块级
         self.out.push('\n');
@@ -349,9 +341,17 @@ impl<'p> IrGenerator<'p> {
 
         // 签名行
         let ret_llvm = self.llvm_ty(&f.ret_ty);
+        // M2.1.8：方法函数（namespace <struct名> 内的函数，首参类型 == 该 struct 名）
+        // 首参按**引用**传递（LLVM ptr）——函数内字段修改反映到调用方
+        // （与 class 时代的 this 指针机制一致，只是显式首参）。
+        let method_receiver = self.is_method_fn(full_name, f.params.first().map(|p| &p.ty));
         let mut params = Vec::new();
-        for p in &f.params {
-            params.push(format!("{} {}", self.llvm_ty(&p.ty), mangle(&p.name)));
+        for (i, p) in f.params.iter().enumerate() {
+            if method_receiver && i == 0 {
+                params.push(format!("ptr {}", mangle(&p.name)));
+            } else {
+                params.push(format!("{} {}", self.llvm_ty(&p.ty), mangle(&p.name)));
+            }
         }
         self.out.push_str(&format!(
             "define {} @{}({}) {{\n",
@@ -363,11 +363,20 @@ impl<'p> IrGenerator<'p> {
         self.out.push_str("entry:\n");
         self.indent();
 
-        // 参数入作用域：alloca + store
+        // 参数入作用域：方法函数首参按引用绑定（by_ptr，直接使用参数指针，
+        // 字段 GEP 用该地址）；其余参数 alloca + store
         let mut scope = HashMap::new();
-        for p in &f.params {
+        for (i, p) in f.params.iter().enumerate() {
             let ty = self.llvm_ty(&p.ty);
             let pname = mangle(&p.name);
+            if method_receiver && i == 0 {
+                // 首参按引用绑定：参数寄存器即对象指针（mangle 已含 % 前缀）
+                scope.insert(
+                    p.name.clone(),
+                    VarBind { value: pname, ty, by_ptr: true },
+                );
+                continue;
+            }
             let alloca = self.new_reg();
             self.line(&format!("{alloca} = alloca {ty}"));
             self.line(&format!("store {ty} {pname}, ptr {alloca}"));
@@ -409,82 +418,10 @@ impl<'p> IrGenerator<'p> {
         Ok(())
     }
 
-    // ---------- 方法生成（P8） ----------
-
-    /// 方法生成：`define ret @<类>$<方法>(ptr %this, 参数...)`。
-    ///
-    /// - 实例方法：第一个参数是隐藏的 this（`ptr`），绑定为 by_ptr VarBind（不 alloca，
-    ///   直接引用参数寄存器作为对象地址，字段访问 GEP 时用该地址）。
-    /// - 静态方法：无 this 参数，签名与普通函数一致。
-    fn gen_method(&mut self, m: &MethodDefStmt, class_name: &str) -> Result<(), IrError> {
-        self.cur_fn = format!("{class_name}${}", m.name);
-        self.reg = 0;
-        self.scopes.clear();
-
-        // 签名行：实例方法首参为 this（ptr），静态方法无
-        let ret_llvm = self.llvm_ty(&m.ret_ty);
-        let mut params = Vec::new();
-        if !m.is_static {
-            params.push("ptr %this".to_string());
-        }
-        for p in &m.params {
-            params.push(format!("{} {}", self.llvm_ty(&p.ty), mangle(&p.name)));
-        }
-        self.out
-            .push_str(&format!("define {} @{}({}) {{\n", ret_llvm, self.cur_fn, params.join(", ")));
-        // 入口块
-        self.out.push_str("entry:\n");
-        self.indent();
-
-        // 参数入作用域：this 直接绑定参数寄存器（by_ptr，不 alloca）；
-        // 普通参数 alloca + store（与函数一致）
-        let mut scope = HashMap::new();
-        if !m.is_static {
-            let this_ty = self.llvm_ty(&TypeSpec::Class(class_name.to_string()));
-            scope.insert(
-                "this".to_string(),
-                VarBind { value: "%this".to_string(), ty: this_ty, by_ptr: true },
-            );
-        }
-        for p in &m.params {
-            let ty = self.llvm_ty(&p.ty);
-            let pname = mangle(&p.name);
-            let alloca = self.new_reg();
-            self.line(&format!("{alloca} = alloca {ty}"));
-            self.line(&format!("store {ty} {pname}, ptr {alloca}"));
-            scope.insert(p.name.clone(), VarBind { value: alloca, ty, by_ptr: false });
-        }
-        self.scopes.push(scope);
-
-        // 方法体
-        for stmt in &m.body {
-            self.gen_stmt(stmt)?;
-        }
-
-        // 结尾：无 return 时补默认返回（与 gen_fn 同一逻辑）
-        let last_line = self
-            .out
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .map(|l| l.trim().to_string())
-            .unwrap_or_default();
-        let needs_ret = !last_line.starts_with("ret ");
-        if needs_ret {
-            if m.ret_ty.is_void() {
-                self.line("ret void");
-            } else {
-                let ty = self.llvm_ty(&m.ret_ty);
-                let zero = if ty == "ptr" { "null" } else { "0" };
-                self.line(&format!("ret {ty} {zero}"));
-            }
-        }
-
-        self.dedent();
-        self.out.push_str("}\n\n");
-        self.scopes.pop();
-        Ok(())
-    }
+    // ---------- 方法生成（M2.1.8：已并入命名空间函数） ----------
+    // 方法 = 绑定 struct 名的命名空间函数（namespace Point { pub func dist(p: Point) }），
+    // 由 gen_ns_fns 生成（符号 ns_symbol("Point::dist") = @Point$dist）；p.dist() 调用
+    // 由语义层解析为全名，IR 层 MethodCall 生成时把 receiver 作为首实参传入。
 
     // ---------- 语句生成 ----------
 
@@ -628,8 +565,8 @@ impl<'p> IrGenerator<'p> {
             Stmt::While(w) => self.gen_while(w),
             Stmt::For(f) => self.gen_for(f),
             Stmt::Switch(s) => self.gen_switch(s),
-            Stmt::Class(_) => {
-                // 类定义只在顶层生成方法（run 中遍历），函数体内不应出现
+            Stmt::Struct(_) => {
+                // struct 定义只在顶层做字段类型（collect_structs），IR 阶段不应出现
                 Ok(())
             }
             Stmt::FieldAssign(fa) => self.gen_field_assign(fa),
@@ -651,10 +588,10 @@ impl<'p> IrGenerator<'p> {
         let base_ty = self.sem_ty_of(&fa.base).ok_or_else(|| IrError {
             message: format!("内部错误：字段赋值缺少基类型（函数 {}）", self.cur_fn),
         })?;
-        let TypeSpec::Class(class_name) = &base_ty else {
+        let TypeSpec::Struct(class_name) = &base_ty else {
             return Err(IrError {
                 message: format!(
-                    "内部错误：字段赋值的对象不是类（{}，函数 {}）",
+                    "内部错误：字段赋值的对象不是 struct（{}，函数 {}）",
                     type_name_of(&base_ty),
                     self.cur_fn
                 ),
@@ -666,11 +603,11 @@ impl<'p> IrGenerator<'p> {
             .get(class_name)
             .cloned()
             .ok_or_else(|| IrError {
-                message: format!("内部错误：类 '{class_name}' 无信息（函数 {}）", self.cur_fn),
+                message: format!("内部错误：struct '{class_name}' 无信息（函数 {}）", self.cur_fn),
             })?;
         let idx = info.field_index.get(&fa.field).copied().ok_or_else(|| IrError {
             message: format!(
-                "内部错误：类 '{class_name}' 无字段 '{}'（函数 {}）",
+                "内部错误：struct '{class_name}' 无字段 '{}'（函数 {}）",
                 fa.field, self.cur_fn
             ),
         })?;
@@ -1435,7 +1372,7 @@ impl<'p> IrGenerator<'p> {
                         self.line(&format!("{tmp} = extractvalue {agg_ty} {bv}, {idx}"));
                         Ok((tmp, ft))
                     }
-                    TypeSpec::Class(class_name) => {
+                    TypeSpec::Struct(class_name) => {
                         // 取对象地址：变量/字段链 → 地址；否则不可寻址
                         let (base_ptr, base_llvm) = self.gen_class_addr(base)?;
                         let info = self
@@ -1444,10 +1381,10 @@ impl<'p> IrGenerator<'p> {
                             .get(class_name)
                             .cloned()
                             .ok_or_else(|| IrError {
-                                message: format!("内部错误：类 '{class_name}' 无信息（函数 {}）", self.cur_fn),
+                                message: format!("内部错误：struct '{class_name}' 无信息（函数 {}）", self.cur_fn),
                             })?;
                         let idx = info.field_index.get(field).copied().ok_or_else(|| IrError {
-                            message: format!("内部错误：类 '{class_name}' 无字段 '{field}'（函数 {}）", self.cur_fn),
+                            message: format!("内部错误：struct '{class_name}' 无字段 '{field}'（函数 {}）", self.cur_fn),
                         })?;
                         let fty = info.fields[idx].ty.clone().expect("字段类型已在类收集时解析");
                         let f_llvm = self.llvm_ty(&fty);
@@ -1469,40 +1406,25 @@ impl<'p> IrGenerator<'p> {
                 }
             }
             Expr::MethodCall { receiver, method, args, .. } => {
-                // 命名空间函数调用：receiver 是 Path（a::b）、未绑定 Var（a，单段）或
-                // FieldAccess 链（a.b，点分命名空间）。语义层已把调用点解析为全名
-                // （a::b::method）记录在 resolved_calls——以解析记录为准统一分发。
+                // M2.1.8 统一分发：语义层已把一切 MethodCall（命名空间调用 / 静态
+                // 调用 / struct 实例方法转发）解析为全名记录在 resolved_calls。
+                // - receiver 是「可求值实例」（绑定变量/字段链/构造/方法链）→ 实例转发，
+                //   实参 = [receiver] + args（方法函数首参 = 隐含接收者）；
+                // - 否则（未绑定 Var / Path / 未绑定链）→ 命名空间/静态调用，实参 = args。
                 let key = expr as *const Expr as usize;
-                if let Expr::Path { .. } = receiver.as_ref() {
-                    let full = self.sem.resolved_calls.get(&key).cloned().ok_or_else(|| {
-                        IrError {
-                            message: format!(
-                                "内部错误：命名空间调用缺少解析记录（{}，函数 {}）",
-                                method,
-                                self.cur_fn
-                            ),
-                        }
-                    })?;
-                    return self.gen_call(&full, args);
+                let full = self.sem.resolved_calls.get(&key).cloned().ok_or_else(|| {
+                    IrError {
+                        message: format!(
+                            "内部错误：方法调用缺少解析记录（{method}，函数 {}）",
+                            self.cur_fn
+                        ),
+                    }
+                })?;
+                if self.receiver_is_value(receiver) {
+                    self.gen_call_inner(&full, args, Some(receiver))
+                } else {
+                    self.gen_call(&full, args)
                 }
-                // 单段命名空间（tcmsg.hello()）与点分命名空间（tcmsg.error.hello()）：
-                // receiver 是未绑定 Var 或 FieldAccess 链，且语义层有全名解析记录。
-                if (matches!(receiver.as_ref(), Expr::Var(n) if !self.scope_has(n))
-                    || matches!(receiver.as_ref(), Expr::FieldAccess { .. }))
-                    && self.sem.resolved_calls.contains_key(&key)
-                {
-                    let full = self.sem.resolved_calls[&key].clone();
-                    return self.gen_call(&full, args);
-                }
-                // 方法调用：实例方法（receiver 地址作 this 首参）或静态方法（无 this）
-                // ——与语义层同一判定：receiver 是未绑定变量且名字是类名 → 静态
-                if let Expr::Var(rname) = receiver.as_ref()
-                    && !self.scope_has(rname)
-                    && self.sem.classes.contains_key(rname)
-                {
-                    return self.gen_static_call(rname, method, args);
-                }
-                self.gen_instance_call(receiver, method, args)
             }
             // 命名空间路径独立出现：语义层已拦截（只能作调用 receiver），IR 层防御
             Expr::Path { .. } => Err(IrError {
@@ -1880,7 +1802,18 @@ impl<'p> IrGenerator<'p> {
 
     /// 函数调用生成：内置 println/print/len/read_line/eval → printf/strlen/interp 库；
     /// 用户函数 → call。
+    /// 普通函数/命名空间函数调用（无隐含接收者）。
     fn gen_call(&mut self, name: &str, args: &[Expr]) -> Result<(String, &'static str), IrError> {
+        self.gen_call_inner(name, args, None)
+    }
+
+    /// 函数调用实际实现（M2.1.8 起支持 `first` = 实例方法转发的隐含接收者）。
+    fn gen_call_inner(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        first: Option<&Expr>,
+    ) -> Result<(String, &'static str), IrError> {
         if name == "println" {
             return self.gen_printf(args, true);
         }
@@ -2542,21 +2475,35 @@ impl<'p> IrGenerator<'p> {
         // 默认值参数（可选参数）：实参不足时按签名默认值补齐——LLVM 函数签名不变
         // （含全部形参），缺省实参在调用点直接生成（默认值限字面量/空表，无作用域依赖）。
         for (i, want_ty) in sig.param_tys.iter().enumerate() {
-            // 实参来源：调用方提供的实参；不足时取该形参的默认值表达式
-            let a = if let Some(a) = args.get(i) {
-                a
+            // 首参（i==0）且是实例转发（first=Some）→ receiver（隐含接收者，无默认值）
+            let is_first = first.is_some() && i == 0;
+            let a: &Expr = if is_first {
+                first.expect("is_first 为真时 first 必为 Some")
             } else {
-                sig.param_defaults
-                    .get(i)
-                    .and_then(|d| d.as_ref())
-                    .ok_or_else(|| IrError {
-                        message: format!(
-                            "内部错误：函数 '{name}' 缺少第 {} 个实参且无默认值（函数 {}）",
-                            i + 1,
-                            self.cur_fn
-                        ),
-                    })?
+                // 实参来源：调用方实参；不足时取该形参的默认值表达式
+                let j = if first.is_some() { i - 1 } else { i };
+                if let Some(a) = args.get(j) {
+                    a
+                } else {
+                    sig.param_defaults
+                        .get(i)
+                        .and_then(|d| d.as_ref())
+                        .ok_or_else(|| IrError {
+                            message: format!(
+                                "内部错误：函数 '{name}' 缺少第 {} 个实参且无默认值（函数 {}）",
+                                i + 1,
+                                self.cur_fn
+                            ),
+                        })?
+                }
             };
+            // 方法函数（namespace <struct名>，首参类型 == 该 struct 名）首参按**引用**
+            // 传递：传 receiver 地址（ptr）。语义层已保证 receiver 可寻址。
+            if is_first && self.is_method_fn(name, sig.param_tys.first()) {
+                let (ptr, _ptr_llvm) = self.gen_class_addr(a)?;
+                arg_list.push(format!("ptr {ptr}"));
+                continue;
+            }
             // 表字面量实参：table 形参在 LLVM 中是不透明 ptr（动态表），
             // 与定长表变量声明的数组布局不同，这里按动态表构造
             // （tie_table_new + 逐元素 tie_table_push_*），返回表指针。
@@ -2566,8 +2513,7 @@ impl<'p> IrGenerator<'p> {
             } else {
                 self.gen_expr(a)?
             };
-            let aty = self.llvm_ty(want_ty);
-            arg_list.push(format!("{aty} {v}"));
+            arg_list.push(format!("{} {v}", self.llvm_ty(want_ty)));
         }
         let ret_llvm = self.llvm_ty(&sig.ret_ty);
         let tmp = self.new_reg();
@@ -2577,6 +2523,32 @@ impl<'p> IrGenerator<'p> {
         } else {
             self.line(&format!("{tmp} = call {ret_llvm} @{}({})", symbol, arg_list.join(", ")));
             Ok((tmp, ret_llvm))
+        }
+    }
+
+    /// 是否为方法函数（M2.1.8）：`namespace <struct名>` 内的函数且首参类型 == 该
+    /// struct 名——首参按**引用**（ptr）传递，函数内字段修改反映到调用方。
+    ///
+    /// 判定：全名 `ns::m` 的命名空间路径末段 == 首参 struct 名
+    /// （`Point::dist(p: Point)` → ns 末段 "Point" == "Point"）。
+    fn is_method_fn(&self, full: &str, first_ty: Option<&TypeSpec>) -> bool {
+        let Some(TypeSpec::Struct(sn)) = first_ty else {
+            return false;
+        };
+        let Some((ns, _)) = full.rsplit_once("::") else {
+            return false;
+        };
+        ns.rsplit("::").next() == Some(sn.as_str())
+    }
+
+    /// receiver 是否为「可求值实例」（绑定变量/字段链/构造/方法链）→ 实例转发
+    /// （实参插 receiver）。未绑定 Var / Path / 未绑定链 → 命名空间/静态调用。
+    fn receiver_is_value(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Var(name) => self.scope_has(name),
+            Expr::FieldAccess { base, .. } => self.receiver_is_value(base),
+            Expr::MethodCall { .. } | Expr::Call { .. } | Expr::TupleLit { .. } => true,
+            _ => false,
         }
     }
 
@@ -2627,7 +2599,7 @@ impl<'p> IrGenerator<'p> {
         info: &ClassInfo,
         args: &[Expr],
     ) -> Result<(String, &'static str), IrError> {
-        let agg_ty = self.llvm_ty(&TypeSpec::Class(class_name.to_string()));
+        let agg_ty = self.llvm_ty(&TypeSpec::Struct(class_name.to_string()));
         let mut cur = "undef".to_string();
         for (i, f) in info.fields.iter().enumerate() {
             let fty = f.ty.clone().expect("字段类型已在类收集时解析");
@@ -2653,132 +2625,22 @@ impl<'p> IrGenerator<'p> {
         Ok((cur, agg_ty))
     }
 
-    /// 静态方法调用：`类名.方法(实参...)`（无 this 隐藏参数）。
-    ///
-    /// 方法名 mangling：`@<定义类>$<方法名>`（method_owner 给出实际定义类）。
-    fn gen_static_call(&mut self, class_name: &str, method: &str, args: &[Expr]) -> Result<(String, &'static str), IrError> {
-        let info = self
-            .sem
-            .classes
-            .get(class_name)
-            .cloned()
-            .ok_or_else(|| IrError {
-                message: format!("内部错误：类 '{class_name}' 无信息（函数 {}）", self.cur_fn),
-            })?;
-        let sig = info.methods.get(method).cloned().ok_or_else(|| IrError {
-            message: format!("内部错误：类 '{class_name}' 无方法 '{method}'（函数 {}）", self.cur_fn),
-        })?;
-        if !sig.is_static {
-            return Err(IrError {
-                message: format!(
-                    "内部错误：实例方法 '{method}' 被当作静态方法调用（函数 {}）",
-                    self.cur_fn
-                ),
-            });
-        }
-        // 定义类：继承中同名方法可能由父类定义
-        let owner = info.method_owner.get(method).cloned().unwrap_or_else(|| class_name.to_string());
-        let mname = format!("{owner}${method}");
-        self.emit_method_call(&mname, &sig, args, None)
-    }
-
-    /// 实例方法调用：`obj.方法(实参...)`（obj 地址作隐藏 this 首参）。
-    ///
-    /// receiver 必须是可寻址的类实例（变量/this/字段链）——语义已保证，
-    /// gen_class_addr 内部做地址解析；方法名 mangling 同上。
-    fn gen_instance_call(
-        &mut self,
-        receiver: &Expr,
-        method: &str,
-        args: &[Expr],
-    ) -> Result<(String, &'static str), IrError> {
-        // receiver 语义类型 → 类名
-        let recv_ty = self.sem_ty_of(receiver).ok_or_else(|| IrError {
-            message: format!("内部错误：方法调用缺少 receiver 类型（函数 {}）", self.cur_fn),
-        })?;
-        let TypeSpec::Class(class_name) = &recv_ty else {
-            return Err(IrError {
-                message: format!(
-                    "内部错误：方法调用的对象不是类（{}，函数 {}）",
-                    type_name_of(&recv_ty),
-                    self.cur_fn
-                ),
-            });
-        };
-        let info = self
-            .sem
-            .classes
-            .get(class_name)
-            .cloned()
-            .ok_or_else(|| IrError {
-                message: format!("内部错误：类 '{class_name}' 无信息（函数 {}）", self.cur_fn),
-            })?;
-        let sig = info.methods.get(method).cloned().ok_or_else(|| IrError {
-            message: format!("内部错误：类 '{class_name}' 无方法 '{method}'（函数 {}）", self.cur_fn),
-        })?;
-        if sig.is_static {
-            return Err(IrError {
-                message: format!(
-                    "内部错误：静态方法 '{method}' 被当作实例方法调用（函数 {}）",
-                    self.cur_fn
-                ),
-            });
-        }
-        // receiver 地址（this 隐藏参数）
-        let (this_ptr, _this_llvm) = self.gen_class_addr(receiver)?;
-        // 定义类（继承遮蔽时取实际定义类）
-        let owner = info.method_owner.get(method).cloned().unwrap_or_else(|| class_name.to_string());
-        let mname = format!("{owner}${method}");
-        self.emit_method_call(&mname, &sig, args, Some(&this_ptr))
-    }
-
-    /// 方法调用公共发射：参数列表组装 + call 指令（可选 this 首参）。
-    fn emit_method_call(
-        &mut self,
-        mname: &str,
-        sig: &MethodSig,
-        args: &[Expr],
-        this_ptr: Option<&str>,
-    ) -> Result<(String, &'static str), IrError> {
-        let mut arg_list = Vec::new();
-        // this 首参：receiver 地址（ptr）
-        if let Some(tp) = this_ptr {
-            arg_list.push(format!("ptr {tp}"));
-        }
-        // 普通参数（类型以方法签名为准，字面量按签名类型写）
-        for (a, want_ty) in args.iter().zip(sig.param_tys.iter()) {
-            let (v, _t) = self.gen_expr(a)?;
-            let aty = self.llvm_ty(want_ty);
-            arg_list.push(format!("{aty} {v}"));
-        }
-        let ret_llvm = self.llvm_ty(&sig.ret_ty);
-        let tmp = self.new_reg();
-        if sig.ret_ty.is_void() {
-            self.line(&format!("call void @{mname}({})", arg_list.join(", ")));
-            Ok((tmp, "void"))
-        } else {
-            self.line(&format!("{tmp} = call {ret_llvm} @{mname}({})", arg_list.join(", ")));
-            Ok((tmp, ret_llvm))
-        }
-    }
-
-    /// 求类实例表达式的内存地址（供字段 GEP 与方法调用 this 使用）。
+    /// 求 struct 实例表达式的内存地址（供字段 GEP 使用）。
     ///
     /// 支持：
-    /// - 变量（VarBind：alloca 指针 / by_ptr 的 this 参数指针）→ 直接返回绑定地址；
+    /// - 变量（VarBind：alloca 指针）→ 直接返回绑定地址；
     /// - 字段链（obj.a.b）→ 递归：先取 obj 地址，再逐级 GEP 到字段。
     ///
     /// 返回 (地址寄存器, 该地址指向的结构体 LLVM 类型)。
-    /// 语义层已保证表达式类型为类，此处仅内部防御。
+    /// 语义层已保证表达式类型为 struct，此处仅内部防御。
     fn gen_class_addr(&mut self, expr: &Expr) -> Result<(String, &'static str), IrError> {
         match expr {
-            // 变量/this：绑定地址即对象地址（alloca 或 by_ptr 参数）
+            // 变量：绑定地址即对象地址（alloca 指针）
             Expr::Var(name) => {
                 let bind = self.lookup_var(name).cloned().ok_or_else(|| IrError {
                     message: format!("内部错误：变量 '{name}' 未入作用域（函数 {}）", self.cur_fn),
                 })?;
-                // by_ptr（this 参数）：value 即对象指针，直接使用；普通变量：alloca 指针。
-                // 两者对 GEP 等价，这里统一按绑定地址返回。
+                // 普通变量：alloca 指针，GEP 直接用绑定地址
                 let _ = bind.by_ptr;
                 Ok((bind.value, bind.ty))
             }
@@ -2789,10 +2651,10 @@ impl<'p> IrGenerator<'p> {
                 let base_ty = self.sem_ty_of(base).ok_or_else(|| IrError {
                     message: format!("内部错误：字段链缺少基类型（函数 {}）", self.cur_fn),
                 })?;
-                let TypeSpec::Class(class_name) = &base_ty else {
+                let TypeSpec::Struct(class_name) = &base_ty else {
                     return Err(IrError {
                         message: format!(
-                            "内部错误：字段链的基类型不是类（{}，函数 {}）",
+                            "内部错误：字段链的基类型不是 struct（{}，函数 {}）",
                             type_name_of(&base_ty),
                             self.cur_fn
                         ),
@@ -2804,11 +2666,11 @@ impl<'p> IrGenerator<'p> {
                     .get(class_name)
                     .cloned()
                     .ok_or_else(|| IrError {
-                        message: format!("内部错误：类 '{class_name}' 无信息（函数 {}）", self.cur_fn),
+                        message: format!("内部错误：struct '{class_name}' 无信息（函数 {}）", self.cur_fn),
                     })?;
                 let idx = info.field_index.get(field).copied().ok_or_else(|| IrError {
                     message: format!(
-                        "内部错误：类 '{class_name}' 无字段 '{field}'（函数 {}）",
+                        "内部错误：struct '{class_name}' 无字段 '{field}'（函数 {}）",
                         self.cur_fn
                     ),
                 })?;
@@ -3069,17 +2931,10 @@ impl<'p> IrGenerator<'p> {
 
     /// 当前函数/方法的返回类型（Return 生成按签名类型适配字面量）。
     ///
-    /// 普通函数名查 funcs 表；方法名形如 `类$方法`，从 classes 表的方法签名查
-    /// （方法不在 funcs 表中，返回类型不能回落为 i64——如方法返回 string/类）。
+    /// 当前函数的返回类型（Return 生成按签名类型适配字面量）。
+    ///
+    /// 普通函数/命名空间函数（含方法函数，如 Point::dist）都查 funcs 表。
     fn current_ret_ty(&self) -> TypeSpec {
-        // 方法名：`类$方法`
-        if let Some((class_name, method_name)) = self.cur_fn.split_once('$')
-            && let Some(info) = self.sem.classes.get(class_name)
-            && let Some(sig) = info.methods.get(method_name)
-        {
-            return sig.ret_ty.clone();
-        }
-        // 普通函数（或兜底）
         self.sem
             .funcs
             .get(&self.cur_fn)
@@ -3168,14 +3023,14 @@ impl<'p> IrGenerator<'p> {
                 self.ty_cache.insert(leaked.to_string(), leaked);
                 leaked
             }
-            TypeSpec::Class(class_name) => {
-                // 类 → 拍平字段结构体：字段类型已在语义层解析为 Some。
-                // 类必然已收集（语义层保证），此处 expect 兜底（与元组字段解析一致）。
+            TypeSpec::Struct(class_name) => {
+                // struct → 拍平字段结构体：字段类型已在语义层解析为 Some。
+                // struct 必然已收集（语义层保证），此处 expect 兜底（与元组字段解析一致）。
                 let info = self
                     .sem
                     .classes
                     .get(class_name)
-                    .unwrap_or_else(|| panic!("内部错误：类 '{class_name}' 无信息（函数 {}）", self.cur_fn));
+                    .unwrap_or_else(|| panic!("内部错误：struct '{class_name}' 无信息（函数 {}）", self.cur_fn));
                 let inner: Vec<&str> = info
                     .fields
                     .iter()
@@ -3254,7 +3109,7 @@ fn type_name_of(t: &TypeSpec) -> &'static str {
             _ => "类型",
         },
         TypeSpec::Tuple(_) => "元组",
-        TypeSpec::Class(_) => "类",
+        TypeSpec::Struct(_) => "struct",
     }
 }
 
@@ -3690,31 +3545,34 @@ mod tests {
     }
 
     #[test]
-    fn 类实例方法生成this参数与字段gep() {
-        let ir = 编译("class Point {\n    var x: i64\n    var y: i64\n    func area() -> i64 {\n        return this.x * this.y\n    }\n}\nfunc main() {\n    var p = Point(3, 4)\n    println(p.area())\n}");
-        // 实例方法签名：隐藏 this 首参（ptr %this）
-        assert!(ir.contains("define i64 @Point$area(ptr %this) {"));
-        // 字段访问：按拍平偏移 GEP（x→0，y→1）
-        assert!(ir.contains("getelementptr {i64, i64}, ptr %this, i32 0, i32 0"));
-        assert!(ir.contains("getelementptr {i64, i64}, ptr %this, i32 0, i32 1"));
-        // 构造：insertvalue 链构建结构体值；实例调用：receiver 地址作 this 实参
+    fn struct实例方法转发生成调用() {
+        // M2.1.8：方法 = 绑定 struct 名的命名空间函数，p.area() 转发为 Point::area(&p)，
+        // 首参按引用（ptr）传递——函数内字段修改反映到调用方。
+        let ir = 编译("struct Point {\n    var x: i64\n    var y: i64\n}\nnamespace Point {\n    pub func area(p: Point) -> i64 {\n        return p.x * p.y\n    }\n}\nfunc main() {\n    var p = Point(3, 4)\n    println(p.area())\n}");
+        // 方法函数签名：首参是引用（ptr，非结构体值）
+        assert!(ir.contains("define i64 @Point$area(ptr %p) {"));
+        // 字段访问：方法函数体内按拍平偏移 GEP（x→0，y→1）
+        assert!(ir.contains("getelementptr {i64, i64}, ptr %p, i32 0, i32 0"));
+        assert!(ir.contains("getelementptr {i64, i64}, ptr %p, i32 0, i32 1"));
+        // 构造：insertvalue 链构建结构体值；转发调用：receiver 地址作首实参
         assert!(ir.contains("insertvalue {i64, i64}"));
         assert!(ir.contains("= call i64 @Point$area(ptr %"));
     }
 
     #[test]
-    fn 类静态方法不接收this() {
-        let ir = 编译("class Point {\n    var x: i64\n    var y: i64\n    static func create(x: i64, y: i64) -> i64 {\n        return x + y\n    }\n}\nfunc main() {\n    println(Point.create(1, 2))\n}");
-        // 静态方法签名与普通函数一致：无 this 首参
+    fn struct名静态调用无接收者() {
+        // M2.1.8：Point.create(...)（receiver 是 struct 名）→ 命名空间函数，无接收者实参。
+        let ir = 编译("struct Point {\n    var x: i64\n    var y: i64\n}\nnamespace Point {\n    pub func create(x: i64, y: i64) -> i64 {\n        return x + y\n    }\n}\nfunc main() {\n    println(Point.create(1, 2))\n}");
+        // 签名与普通函数一致：无接收者首参
         assert!(ir.contains("define i64 @Point$create(i64 %x, i64 %y) {"));
-        assert!(!ir.contains("Point$create(ptr"));
-        // 类名调用 → 静态调用（无 this 实参）
+        assert!(!ir.contains("Point$create({"));
+        // struct 名调用 → 无接收者实参
         assert!(ir.contains("call i64 @Point$create(i64 1, i64 2)"));
     }
 
     #[test]
-    fn 类构造与字段赋值() {
-        let ir = 编译("class Point {\n    var x: i64\n    var y: i64\n}\nfunc main() {\n    var p = Point(3, 4)\n    p.x = 100\n    println(p.x)\n}");
+    fn struct构造与字段赋值() {
+        let ir = 编译("struct Point {\n    var x: i64\n    var y: i64\n}\nfunc main() {\n    var p = Point(3, 4)\n    p.x = 100\n    println(p.x)\n}");
         // 构造：逐字段 insertvalue（字段顺序与拍平顺序一致）
         assert!(ir.contains("insertvalue {i64, i64} undef, i64 3, 0"));
         assert!(ir.contains("insertvalue {i64, i64} %"));

@@ -176,7 +176,7 @@ pub fn span_to_range(span: Span) -> Range {
 pub fn ty_to_str(ty: &TypeSpec) -> String {
     match ty {
         TypeSpec::Named(kw) => kw.as_str().to_string(),
-        TypeSpec::Class(name) => name.clone(),
+        TypeSpec::Struct(name) => name.clone(),
         TypeSpec::Tuple(fields) => {
             let inner = fields
                 .iter()
@@ -255,7 +255,7 @@ pub fn hover_markdown(
     }
 
     if let Some(cls) = sem.classes.get(&name) {
-        let mut text = format!("**类**：class {name}");
+        let mut text = format!("**类**：struct {name}");
         if let Some(parent) = &cls.parent {
             text.push_str(&format!(" extends {parent}"));
         }
@@ -373,6 +373,12 @@ fn collect_defs_inner(tokens: &[Token], stmts: &[Stmt], ns_prefix: &[String], ma
                     let mut segs = ns_prefix.to_vec();
                     segs.push(f.name.clone());
                     map.funcs.insert(segs.join("::"), span);
+                    // M2.1.8：命名空间方法函数（namespace Point 内）额外注册裸名——
+                    // 实例方法转发 `p.dist()` 的 dist 跳转按裸名命中（funcs 全名
+                    // 需 receiver 类型，此处无类型信息；多 struct 同名方法取后定义）。
+                    if !ns_prefix.is_empty() {
+                        map.methods.insert(f.name.clone(), span);
+                    }
                 }
                 // 参数：跳转场景四（变量引用）可命中参数名
                 for p in &f.params {
@@ -380,8 +386,8 @@ fn collect_defs_inner(tokens: &[Token], stmts: &[Stmt], ns_prefix: &[String], ma
                 }
                 collect_stmt_defs(tokens, &f.body, map);
             }
-            Stmt::Class(c) => {
-                // 类名：`class` 关键字之后的第一个 Ident
+            Stmt::Struct(c) => {
+                // struct 名：`struct` 关键字之后的第一个 Ident
                 if let Some(span) = name_span_after(tokens, c.span) {
                     map.classes.insert(c.name.clone(), span);
                 }
@@ -391,17 +397,8 @@ fn collect_defs_inner(tokens: &[Token], stmts: &[Stmt], ns_prefix: &[String], ma
                         map.fields.insert(f.name.clone(), span);
                     }
                 }
-                // 方法：`method`/`static` 关键字之后的第一个 Ident；方法体内继续收集局部变量
-                for m in &c.methods {
-                    if let Some(span) = name_span_after(tokens, m.span) {
-                        map.methods.insert(m.name.clone(), span);
-                    }
-                    // 方法参数：跳转场景四（变量引用）可命中参数名
-                    for p in &m.params {
-                        map.vars.push((p.name.clone(), p.span));
-                    }
-                    collect_stmt_defs(tokens, &m.body, map);
-                }
+                // M2.1.8：方法已移出 struct（逻辑 = 绑定 struct 名的命名空间函数，
+                // 其 FnDef 由上方 Stmt::FnDef 分支以全名注册进 funcs）
             }
             Stmt::Namespace(ns) => {
                 // 命名空间：路径拼接后递归（函数以全名注册）
@@ -516,10 +513,10 @@ const KIND_CLASS: u32 = 7;
 const KIND_NAMESPACE: u32 = 9;
 const KIND_KEYWORD: u32 = 14;
 
-/// 关键词补全列表（tie 语言关键字）。
+/// 关键词补全列表（tie 语言关键字；class/static/this 已废弃为普通标识符，M2.1.8）。
 const KEYWORDS: &[&str] = &[
-    "func", "var", "const", "if", "else", "while", "for", "return", "import", "class",
-    "static", "extends", "switch", "case", "default", "in", "this",
+    "func", "var", "const", "if", "else", "while", "for", "return", "import", "struct",
+    "extends", "switch", "case", "default", "in", "namespace", "pub", "using",
 ];
 
 /// 类型名补全列表（tie 类型关键字）。
@@ -560,15 +557,10 @@ pub fn completion(
         let program = program.and_then(|p| expand_with_base(p, base_dir).ok());
         let sem = program.as_ref().and_then(|p| analyze(p).ok());
         if let (Some(program), Some(sem)) = (&program, &sem) {
-            // 场景一：类名. → 类成员补全
-            if program
-                .stmts
-                .iter()
-                .any(|s| matches!(s, Stmt::Class(c) if c.name == receiver))
-            {
-                return member_completions(program, &receiver);
-            }
-            // 场景二：命名空间. → 命名空间函数补全（裸名）
+            // M2.1.8：struct 名/命名空间名点场景 → 命名空间函数补全。
+            // `Point.` 补 Point:: 命名空间函数（方法）；`tcmsg.error.` 补其成员。
+            // 实例变量 `.` 的字段/方法补全（需类型信息）暂缺，回退全集。
+            let _ = program;
             let ns_items = ns_member_completions(program, sem, &receiver);
             if !ns_items.is_empty() {
                 return ns_items;
@@ -677,47 +669,7 @@ fn member_receiver(source: &str, line: u32, character: u32) -> Option<String> {
     }
 }
 
-/// 类成员补全：给定类名，返回其字段（kind=Field，detail 填类型）与方法
-/// （kind=Method，detail 填签名）。
-fn member_completions(program: &Program, class_name: &str) -> Vec<CompletionItem> {
-    let Some(class_def) = program
-        .stmts
-        .iter()
-        .find_map(|s| match s {
-            Stmt::Class(c) if c.name == class_name => Some(c),
-            _ => None,
-        })
-    else {
-        return Vec::new();
-    };
-    let mut items = Vec::new();
-    // 字段：detail 填类型文本
-    for f in &class_def.fields {
-        let detail = f.ty.as_ref().map(ty_to_str).unwrap_or_default();
-        items.push(CompletionItem {
-            label: f.name.clone(),
-            kind: Some(KIND_FIELD),
-            detail: Some(detail),
-        });
-    }
-    // 方法：detail 填签名 `func name(params) -> Ret`
-    for m in &class_def.methods {
-        let params = m
-            .params
-            .iter()
-            .map(|p| format!("{}: {}", p.name, ty_to_str(&p.ty)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        items.push(CompletionItem {
-            label: m.name.clone(),
-            kind: Some(KIND_METHOD),
-            detail: Some(format!("func {}({params}) -> {}", m.name, ty_to_str(&m.ret_ty))),
-        });
-    }
-    items
-}
-
-/// 全集补全：关键词 + 类型名 + 内置函数 + 顶层函数 + 类名。
+/// 全集补全：关键词 + 类型名 + 内置函数 + 顶层函数 + struct 名。
 ///
 /// 顶层函数 / 类名来自语义结果（需源码合法，含 import 展开后的跨文件定义）；
 /// 关键词、类型名与内置函数恒返回（编辑中的半成品源码也能补全）。
@@ -778,12 +730,12 @@ fn all_completions(source: &str, base_dir: Option<&Path>) -> Vec<CompletionItem>
                 detail: Some(format!("func {name}({params}) -> {}", ty_to_str(&sig.ret_ty))),
             });
         }
-        // 类名：detail 填 `class`
+        // struct 名：detail 填 `struct`
         for name in sem.classes.keys() {
             items.push(CompletionItem {
                 label: name.clone(),
                 kind: Some(KIND_CLASS),
-                detail: Some("class".into()),
+                detail: Some("struct".into()),
             });
         }
     }
@@ -804,23 +756,25 @@ mod st {
     pub const NAMESPACE: u32 = 0;
     /// 类名（定义与引用）
     pub const CLASS: u32 = 1;
+    /// struct 名（定义与引用，M2.1.8）
+    pub const STRUCT: u32 = 2;
     /// 函数（定义与调用）
-    pub const FUNCTION: u32 = 2;
+    pub const FUNCTION: u32 = 3;
     /// 方法（定义与调用）
-    pub const METHOD: u32 = 3;
+    pub const METHOD: u32 = 4;
     /// 属性/字段（`p.x` 的 x）
-    pub const PROPERTY: u32 = 4;
+    pub const PROPERTY: u32 = 5;
     /// 变量（声明与引用）
-    pub const VARIABLE: u32 = 5;
+    pub const VARIABLE: u32 = 6;
     /// 参数（形参声明与引用）
-    pub const PARAMETER: u32 = 6;
+    pub const PARAMETER: u32 = 7;
 }
 
 /// 语义 token 类型名称列表（LSP `SemanticTokensLegend.tokenTypes`）。
 ///
 /// 下标与 [st] 模块常量一一对应；供 [crate::server] 构造 initialize 能力声明。
 pub fn semantic_token_types() -> Vec<String> {
-    ["namespace", "class", "function", "method", "property", "variable", "parameter"]
+    ["namespace", "class", "struct", "function", "method", "property", "variable", "parameter"]
         .iter()
         .map(|s| s.to_string())
         .collect()
@@ -902,13 +856,8 @@ fn collect_param_spans_inner(stmts: &[Stmt], spans: &mut Vec<Span>) {
                 }
                 collect_param_spans_inner(&f.body, spans);
             }
-            Stmt::Class(c) => {
-                for m in &c.methods {
-                    for p in &m.params {
-                        spans.push(p.span);
-                    }
-                    collect_param_spans_inner(&m.body, spans);
-                }
+            Stmt::Struct(_) => {
+                // struct 无方法（M2.1.8）；字段无参数，无需收集
             }
             Stmt::Namespace(ns) => collect_param_spans_inner(&ns.body, spans),
             Stmt::If(i) => {
@@ -951,9 +900,19 @@ fn classify_ident(
     if idx > 0 {
         match &tokens[idx - 1].kind {
             TokenKind::Func => return st::FUNCTION,
-            TokenKind::Class => return st::CLASS,
+            TokenKind::Struct => return st::STRUCT,
             TokenKind::Namespace => return st::NAMESPACE,
             _ => {}
+        }
+    }
+
+    // 1.5. struct 名构造：`Point(...)`（后跟 `(` 且名字是 struct）→ CLASS
+    // （在命名空间链判定之前——`Point` 同时是方法函数命名空间前缀）
+    if let Some(s) = sem {
+        if s.classes.contains_key(name)
+            && matches!(tokens.get(idx + 1), Some(n) if matches!(n.kind, TokenKind::LParen))
+        {
+            return st::CLASS;
         }
     }
 
@@ -1076,7 +1035,7 @@ func main() {
         use tie_frontend::lexer::TyKw;
         assert_eq!(ty_to_str(&TypeSpec::Named(TyKw::I64)), "i64");
         assert_eq!(ty_to_str(&TypeSpec::Named(TyKw::Str)), "string");
-        assert_eq!(ty_to_str(&TypeSpec::Class("Point".into())), "Point");
+        assert_eq!(ty_to_str(&TypeSpec::Struct("Point".into())), "Point");
         let tuple = TypeSpec::Tuple(vec![
             TupleField { name: None, ty: TypeSpec::Named(TyKw::I64) },
             TupleField { name: None, ty: TypeSpec::Named(TyKw::Str) },
@@ -1106,32 +1065,29 @@ func main() {
         assert!(md.contains("func add(a: i64, b: i64) -> i64"), "签名格式不符：{md}");
     }
 
-    /// hover 命中类名：返回类信息（含 extends 父类）。
+    /// hover 命中 struct 名：返回 struct 信息（含 extends 父 struct）。
     #[test]
     fn hover命中类名返回类信息() {
         let src = r#"
-class Animal {
+struct Animal {
     var name: string
     var age: i64
-    func speak() -> string {
-        return this.name + " makes a sound"
-    }
 }
-class Dog extends Animal {
+struct Dog extends Animal {
     var breed: string
 }
 func main() {
     println(1)
 }
 "#;
-        // "class Animal" 中 Animal 在 LSP line 1、character 6（无继承）
-        let md = hover_markdown(src, 1, 6, None).expect("命中 Animal 应返回类信息");
-        assert!(md.contains("**类**：class Animal"), "应为类信息：{md}");
-        assert!(!md.contains("extends"), "Animal 无父类：{md}");
-        // "class Dog extends Animal" 中 Dog 在 LSP line 8、character 6（有继承）
-        let md = hover_markdown(src, 8, 6, None).expect("命中 Dog 应返回类信息");
-        assert!(md.contains("**类**：class Dog"), "应为类信息：{md}");
-        assert!(md.contains("extends Animal"), "应含父类：{md}");
+        // "struct Animal" 中 Animal 在 LSP line 1、character 7（无继承）
+        let md = hover_markdown(src, 1, 7, None).expect("命中 Animal 应返回 struct 信息");
+        assert!(md.contains("**类**：struct Animal"), "应为 struct 信息：{md}");
+        assert!(!md.contains("extends"), "Animal 无父 struct：{md}");
+        // "struct Dog extends Animal" 中 Dog 在 LSP line 5、character 7（有继承）
+        let md = hover_markdown(src, 5, 7, None).expect("命中 Dog 应返回 struct 信息");
+        assert!(md.contains("**类**：struct Dog"), "应为 struct 信息：{md}");
+        assert!(md.contains("extends Animal"), "应含父 struct：{md}");
     }
 
     /// hover 未命中（关键字 func 上）：返回 None（result 为 null）。
@@ -1159,16 +1115,32 @@ func main() {
         assert!(md.contains("func add"), "应命中 add：{md}");
     }
 
-    /// 定义测试源码：类（字段/静态方法/实例方法）+ 顶层函数 + main 中的变量与调用。
+    /// 定义测试源码（M2.1.8）：struct（纯数据）+ 绑定 struct 名的命名空间方法函数
+    /// + 顶层函数 + main 中的变量与调用。
+    ///
+    /// 行号（LSP line，0 起；struct 比 class 多 1 个字符）：
+    /// - L0  `struct Point {`                    → Point char 7
+    /// - L1  `    var x: i64`                    → x char 8
+    /// - L5  `    pub func create() -> Point {`  → create char 13
+    /// - L6  `        return Point(0, 0)`        → Point char 15
+    /// - L8  `    pub func dist(p: Point) -> i64 {` → dist char 13
+    /// - L9  `        return p.x`                → x char 17
+    /// - L12 `func add(a: i64, b: i64) -> i64 {` → add char 5
+    /// - L16 `    var count = 1`                 → count char 8
+    /// - L17 `    var p = Point.create()`        → create char 18
+    /// - L18 `    println(add(count, 2))`        → add char 12 / count char 16
+    /// - L19 `    println(p.dist())`             → p char 12 / dist char 14
     fn 定义源码() -> &'static str {
-        r#"class Point {
+        r#"struct Point {
     var x: i64
     var y: i64
-    static func create() -> Point {
+}
+namespace Point {
+    pub func create() -> Point {
         return Point(0, 0)
     }
-    func dist() -> i64 {
-        return this.x
+    pub func dist(p: Point) -> i64 {
+        return p.x
     }
 }
 func add(a: i64, b: i64) -> i64 {
@@ -1183,69 +1155,70 @@ func main() {
 "#
     }
 
-    /// 跳转定义：函数调用 `add(...)` → `func add` 定义处名字位置（line 10、character 5）。
+    /// 跳转定义：函数调用 `add(...)` → `func add` 定义处名字位置（line 12、character 5）。
     #[test]
     fn 跳转定义函数调用返回函数定义() {
-        let r = definition(定义源码(), 16, 12, None).expect("add 调用应命中函数定义");
-        assert_eq!(r.start, Position { line: 10, character: 5 }, "函数名位置");
+        let r = definition(定义源码(), 18, 12, None).expect("add 调用应命中函数定义");
+        assert_eq!(r.start, Position { line: 12, character: 5 }, "函数名位置");
         assert!(r.end.character > r.start.character, "range 应覆盖整个名字");
     }
 
-    /// 跳转定义：类构造 `Point(0, 0)` → `class Point` 定义处名字位置（line 0、character 6）。
+    /// 跳转定义：struct 构造 `Point(0, 0)` → `struct Point` 定义处名字位置（line 0、character 7）。
     #[test]
     fn 跳转定义类构造返回类定义() {
-        let r = definition(定义源码(), 4, 15, None).expect("Point 构造应命中类定义");
-        assert_eq!(r.start, Position { line: 0, character: 6 }, "类名位置");
+        let r = definition(定义源码(), 6, 15, None).expect("Point 构造应命中 struct 定义");
+        assert_eq!(r.start, Position { line: 0, character: 7 }, "struct 名位置");
     }
 
-    /// 跳转定义：实例方法调用 `p.dist()` → `func dist` 定义处名字位置（line 6、character 9）。
+    /// 跳转定义：实例方法转发调用 `p.dist()` → `namespace Point` 中 `func dist` 定义处
+    /// 名字位置（line 8、character 13）。
     #[test]
     fn 跳转定义方法调用返回方法定义() {
-        let r = definition(定义源码(), 17, 14, None).expect("dist 调用应命中方法定义");
-        assert_eq!(r.start, Position { line: 6, character: 9 }, "方法名位置");
+        let r = definition(定义源码(), 19, 14, None).expect("dist 调用应命中方法定义");
+        assert_eq!(r.start, Position { line: 8, character: 13 }, "方法名位置");
     }
 
-    /// 跳转定义：静态方法调用 `Point.create()` → 同名方法定义（line 3、character 16）。
+    /// 跳转定义：struct 名调用 `Point.create()` → 同名函数定义（line 5、character 13）。
     #[test]
     fn 跳转定义静态方法调用返回方法定义() {
-        let r = definition(定义源码(), 15, 18, None).expect("create 调用应命中方法定义");
-        assert_eq!(r.start, Position { line: 3, character: 16 }, "静态方法名位置");
+        let r = definition(定义源码(), 17, 18, None).expect("create 调用应命中方法定义");
+        assert_eq!(r.start, Position { line: 5, character: 13 }, "方法函数名位置");
     }
 
-    /// 跳转定义：变量引用 `count` → `var count` 声明处名字位置（line 14、character 8）。
+    /// 跳转定义：变量引用 `count` → `var count` 声明处名字位置（line 16、character 8）。
     #[test]
     fn 跳转定义变量引用返回声明位置() {
-        let r = definition(定义源码(), 16, 16, None).expect("count 应命中变量声明");
-        assert_eq!(r.start, Position { line: 14, character: 8 }, "变量名位置");
+        let r = definition(定义源码(), 18, 16, None).expect("count 应命中变量声明");
+        assert_eq!(r.start, Position { line: 16, character: 8 }, "变量名位置");
     }
 
-    /// 跳转定义：字段访问 `this.x` → `var x` 字段声明处（line 1、character 8）。
+    /// 跳转定义：字段访问 `p.x` → `var x` 字段声明处（line 1、character 8）。
     #[test]
     fn 跳转定义字段访问返回字段声明() {
-        let r = definition(定义源码(), 7, 20, None).expect("x 字段应命中声明");
+        let r = definition(定义源码(), 9, 17, None).expect("x 字段应命中声明");
         assert_eq!(r.start, Position { line: 1, character: 8 }, "字段名位置");
     }
 
     /// 跳转定义：光标在关键字/空白处（无 Ident token）→ None。
     #[test]
     fn 跳转定义未命中返回空() {
-        // line 10 的 character 0 是 `func` 关键字（非 Ident）
-        assert!(definition(定义源码(), 10, 0, None).is_none(), "关键字不应命中");
+        // line 12 的 character 0 是 `func` 关键字（非 Ident）
+        assert!(definition(定义源码(), 12, 0, None).is_none(), "关键字不应命中");
         // 行首空白
-        assert!(definition(定义源码(), 14, 0, None).is_none(), "行首空白不应命中");
+        assert!(definition(定义源码(), 16, 0, None).is_none(), "行首空白不应命中");
     }
 
-    /// 补全全集：包含关键词 func/var、内置函数 println、类型 i64、顶层函数 add、类名 Point。
+    /// 补全全集：包含关键词 func/var、内置函数 println、类型 i64、顶层函数 add、struct 名 Point。
     #[test]
     fn 补全全集包含关键词类型与函数() {
-        let items = completion(定义源码(), 14, 0, None);
+        let items = completion(定义源码(), 16, 0, None);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"func"), "应含关键词 func：{labels:?}");
         assert!(labels.contains(&"var"), "应含关键词 var：{labels:?}");
         assert!(labels.contains(&"println"), "应含内置函数 println：{labels:?}");
         assert!(labels.contains(&"i64"), "应含类型 i64：{labels:?}");
         assert!(labels.contains(&"add"), "应含顶层函数 add：{labels:?}");
-        assert!(labels.contains(&"Point"), "应含类名 Point：{labels:?}");
+        assert!(labels.contains(&"Point"), "应含 struct 名 Point：{labels:?}");
         // 顶层函数 detail 填签名
         let add = items.iter().find(|i| i.label == "add").expect("应有 add");
         assert_eq!(
@@ -1253,9 +1226,9 @@ func main() {
             Some("func add(a: i64, b: i64) -> i64"),
             "函数 detail 应为签名"
         );
-        // 类名 detail 填 class
+        // struct 名 detail 填 struct
         let cls = items.iter().find(|i| i.label == "Point").expect("应有 Point");
-        assert_eq!(cls.detail.as_deref(), Some("class"));
+        assert_eq!(cls.detail.as_deref(), Some("struct"));
         // 排序去重：label 唯一且有序
         assert!(items.windows(2).all(|w| w[0].label <= w[1].label), "应按 label 排序");
         let mut unique: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
@@ -1264,29 +1237,26 @@ func main() {
         assert_eq!(unique.len(), items.len(), "不应有重复 label");
     }
 
-    /// 补全点场景：`Point.` → 只补该类成员（字段 x/y + 方法 create/dist），不含关键词。
+    /// 补全点场景：`Point.` → 补绑定 struct 名的命名空间函数（方法 create/dist），
+    /// 不含关键词（字段不补——实例字段需通过实例访问）。
     #[test]
     fn 补全类名点后返回类成员() {
-        // line 15 `    var p = Point.create()`：光标在 `Point.` 之后（character 18）
-        let items = completion(定义源码(), 15, 18, None);
+        // line 17 `    var p = Point.create()`：光标在 `Point.` 之后（character 18）
+        let items = completion(定义源码(), 17, 18, None);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-        assert!(labels.contains(&"x"), "应含字段 x：{labels:?}");
-        assert!(labels.contains(&"y"), "应含字段 y：{labels:?}");
-        assert!(labels.contains(&"create"), "应含静态方法 create：{labels:?}");
-        assert!(labels.contains(&"dist"), "应含实例方法 dist：{labels:?}");
+        assert!(labels.contains(&"create"), "应含方法函数 create：{labels:?}");
+        assert!(labels.contains(&"dist"), "应含方法函数 dist：{labels:?}");
         assert!(!labels.contains(&"func"), "点场景不应含关键词：{labels:?}");
-        // 方法 detail 填签名
-        let dist = items.iter().find(|i| i.label == "dist").expect("应有 dist");
-        assert_eq!(dist.detail.as_deref(), Some("func dist() -> i64"));
+        assert!(!labels.contains(&"x"), "点场景不应含实例字段：{labels:?}");
     }
 
-    /// 补全点场景：receiver 是变量（非类名）→ 回退全集。
+    /// 补全点场景：receiver 是变量（非 struct 名/命名空间）→ 回退全集。
     #[test]
     fn 补全变量点后回退全集() {
-        // line 17 `    println(p.dist())`：光标在 `p.` 之后（character 14）
-        let items = completion(定义源码(), 17, 14, None);
+        // line 19 `    println(p.dist())`：光标在 `p.` 之后（character 14）
+        let items = completion(定义源码(), 19, 14, None);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-        assert!(labels.contains(&"func"), "变量 p 不是类名，应回退全集：{labels:?}");
+        assert!(labels.contains(&"func"), "变量 p 不是 struct 名，应回退全集：{labels:?}");
     }
 
     // ==================== import 展开（base_dir） ====================
@@ -1535,10 +1505,12 @@ func main() {
     #[test]
     fn 方法参数引用跳转命中参数声明() {
         let src = r#"
-class Point {
+struct Point {
     var x: i64
     var y: i64
-    func dist(o: Point) -> i64 {
+}
+namespace Point {
+    pub func dist(o: Point) -> i64 {
         return o.x
     }
 }
@@ -1547,11 +1519,11 @@ func main() {
     println(p.dist(p))
 }
 "#;
-        // 第 6 行 `        return o.x`（LSP line 5）：参数 o 起始 character 15；
-        // 形参 o 声明在 LSP line 4 `    func dist(o: Point)`，character 14
-        let range = definition(src, 5, 15, None).expect("参数 o 应可跳转");
-        assert_eq!(range.start.line, 4, "参数 o 定义应在 LSP line 4");
-        assert_eq!(range.start.character, 14, "参数 o 定义应从 character 14 开始");
+        // 第 8 行 `        return o.x`（LSP line 7）：参数 o 起始 character 15；
+        // 形参 o 声明在 LSP line 6 `    pub func dist(o: Point)`，character 18
+        let range = definition(src, 7, 15, None).expect("参数 o 应可跳转");
+        assert_eq!(range.start.line, 6, "参数 o 定义应在 LSP line 6");
+        assert_eq!(range.start.character, 18, "参数 o 定义应从 character 18 开始");
     }
 
     // ==================== 语义高亮（semanticTokens） ====================
@@ -1624,17 +1596,19 @@ func add(a: i64, b: i64) -> i64 {
         assert_eq!(sum.map(|t| t.3.as_str()), Some("variable"), "变量 sum 应为 variable");
     }
 
-    /// 语义高亮：实例方法调用（`p.dist(`）→ method；字段访问（`p.x`）→ property。
+    /// 语义高亮：实例方法转发调用（`p.dist(`）→ method；字段访问（`p.x`）→ property。
     #[test]
     fn 语义高亮方法与字段分类() {
         let src = r#"
-class Point {
+struct Point {
     var x: i64
     var y: i64
-    func dist() -> i64 {
-        return this.x
+}
+namespace Point {
+    pub func dist(p: Point) -> i64 {
+        return p.x
     }
-    static func create() -> Point {
+    pub func create() -> Point {
         return Point(1, 2)
     }
 }
@@ -1646,17 +1620,17 @@ func main() {
 "#;
         let data = semantic_tokens(src, None);
         let toks = 解码语义token(src, &data);
-        // 方法定义名 dist（LSP line 4，col 9）→ function（func 关键字后定义名）
-        let dist_def = toks.iter().find(|(l, c, _, _)| *l == 4 && *c == 9);
+        // 方法函数定义名 dist（LSP line 6，col 13）→ function（func 关键字后定义名）
+        let dist_def = toks.iter().find(|(l, c, _, _)| *l == 6 && *c == 13);
         assert_eq!(dist_def.map(|t| t.3.as_str()), Some("function"), "方法定义 dist 应为 function");
-        // 类名 Point 引用（LSP line 12，col 12）→ class
-        let point_ref = toks.iter().find(|(l, c, _, _)| *l == 12 && *c == 12);
-        assert_eq!(point_ref.map(|t| t.3.as_str()), Some("class"), "类引用 Point 应为 class");
-        // 方法调用 p.dist（LSP line 13，col 14）→ method
-        let dist_call = toks.iter().find(|(l, c, _, _)| *l == 13 && *c == 14);
+        // struct 名 Point 引用（LSP line 14，col 12）→ class
+        let point_ref = toks.iter().find(|(l, c, _, _)| *l == 14 && *c == 12);
+        assert_eq!(point_ref.map(|t| t.3.as_str()), Some("class"), "struct 引用 Point 应为 class");
+        // 方法转发调用 p.dist（LSP line 15，col 14）→ method
+        let dist_call = toks.iter().find(|(l, c, _, _)| *l == 15 && *c == 14);
         assert_eq!(dist_call.map(|t| t.3.as_str()), Some("method"), "方法调用 dist 应为 method");
-        // 字段访问 p.x（LSP line 14，col 14）→ property
-        let x_field = toks.iter().find(|(l, c, _, _)| *l == 14 && *c == 14);
+        // 字段访问 p.x（LSP line 16，col 14）→ property
+        let x_field = toks.iter().find(|(l, c, _, _)| *l == 16 && *c == 14);
         assert_eq!(x_field.map(|t| t.3.as_str()), Some("property"), "字段访问 x 应为 property");
     }
 }

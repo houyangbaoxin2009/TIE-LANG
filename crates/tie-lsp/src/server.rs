@@ -553,16 +553,19 @@ mod tests {
         assert_eq!(out[0]["error"]["code"], json!(-32600));
     }
 
-    /// 定义测试源码：类（字段/静态方法/实例方法）+ 顶层函数 + main 中的变量与调用。
+    /// 定义测试源码（M2.1.8）：struct（纯数据）+ 绑定 struct 名的命名空间方法函数
+    /// + 顶层函数 + main 中的变量与调用（与 diagnostics.rs 的 定义源码 同构）。
     fn 定义源码() -> &'static str {
-        r#"class Point {
+        r#"struct Point {
     var x: i64
     var y: i64
-    static func create() -> Point {
+}
+namespace Point {
+    pub func create() -> Point {
         return Point(0, 0)
     }
-    func dist() -> i64 {
-        return this.x
+    pub func dist(p: Point) -> i64 {
+        return p.x
     }
 }
 func add(a: i64, b: i64) -> i64 {
@@ -577,8 +580,8 @@ func main() {
 "#
     }
 
-    /// definition 命中函数调用 add（line 16、character 12）→ 返回 add 定义处位置
-    /// （line 10、character 5），且 uri 与请求文档一致。
+    /// definition 命中函数调用 add（line 18、character 12）→ 返回 add 定义处位置
+    /// （line 12、character 5），且 uri 与请求文档一致。
     #[test]
     fn 跳转定义命中函数调用返回位置() {
         let mut state = ServerState::default();
@@ -587,18 +590,18 @@ func main() {
             &mut state,
             请求(20, "textDocument/definition", json!({
                 "textDocument": {"uri": "file:///a.tie"},
-                "position": {"line": 16, "character": 12}
+                "position": {"line": 18, "character": 12}
             })),
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["id"], json!(20));
         assert_eq!(out[0]["result"]["uri"], "file:///a.tie");
-        assert_eq!(out[0]["result"]["range"]["start"]["line"], json!(10));
+        assert_eq!(out[0]["result"]["range"]["start"]["line"], json!(12));
         assert_eq!(out[0]["result"]["range"]["start"]["character"], json!(5));
     }
 
-    /// definition 命中类构造 Point（line 4、character 15）→ 返回 class Point 定义处
-    /// （line 0、character 6）。
+    /// definition 命中 struct 构造 Point（line 6、character 15）→ 返回 struct Point
+    /// 定义处（line 0、character 7）。
     #[test]
     fn 跳转定义命中类构造返回位置() {
         let mut state = ServerState::default();
@@ -607,15 +610,15 @@ func main() {
             &mut state,
             请求(21, "textDocument/definition", json!({
                 "textDocument": {"uri": "file:///a.tie"},
-                "position": {"line": 4, "character": 15}
+                "position": {"line": 6, "character": 15}
             })),
         );
         assert_eq!(out[0]["result"]["range"]["start"]["line"], json!(0));
-        assert_eq!(out[0]["result"]["range"]["start"]["character"], json!(6));
+        assert_eq!(out[0]["result"]["range"]["start"]["character"], json!(7));
     }
 
-    /// definition 命中变量 count（line 16、character 16）→ 返回 var count 声明处
-    /// （line 14、character 8）。
+    /// definition 命中变量 count（line 18、character 16）→ 返回 var count 声明处
+    /// （line 16、character 8）。
     #[test]
     fn 跳转定义命中变量返回声明位置() {
         let mut state = ServerState::default();
@@ -624,14 +627,14 @@ func main() {
             &mut state,
             请求(22, "textDocument/definition", json!({
                 "textDocument": {"uri": "file:///a.tie"},
-                "position": {"line": 16, "character": 16}
+                "position": {"line": 18, "character": 16}
             })),
         );
-        assert_eq!(out[0]["result"]["range"]["start"]["line"], json!(14));
+        assert_eq!(out[0]["result"]["range"]["start"]["line"], json!(16));
         assert_eq!(out[0]["result"]["range"]["start"]["character"], json!(8));
     }
 
-    /// definition 未命中（光标在关键字 func 上，line 10、character 0）→ result 为 null。
+    /// definition 未命中（光标在关键字 func 上，line 12、character 0）→ result 为 null。
     #[test]
     fn 跳转定义未命中返回null() {
         let mut state = ServerState::default();
@@ -640,7 +643,7 @@ func main() {
             &mut state,
             请求(23, "textDocument/definition", json!({
                 "textDocument": {"uri": "file:///a.tie"},
-                "position": {"line": 10, "character": 0}
+                "position": {"line": 12, "character": 0}
             })),
         );
         assert!(out[0]["result"].is_null(), "关键字处应返回 null");
@@ -669,7 +672,7 @@ func main() {
             &mut state,
             请求(25, "textDocument/completion", json!({
                 "textDocument": {"uri": "file:///a.tie"},
-                "position": {"line": 14, "character": 0}
+                "position": {"line": 16, "character": 0}
             })),
         );
         assert_eq!(out.len(), 1);
@@ -686,7 +689,8 @@ func main() {
         assert!(labels.contains(&"i64"), "应含类型 i64：{labels:?}");
     }
 
-    /// completion 点场景：`Point.`（line 15、character 18）→ 只补该类成员（x/y/create/dist）。
+    /// completion 点场景：`Point.`（line 17、character 18）→ 只补命名空间方法函数
+    /// （create/dist；字段不补——实例字段需通过实例访问）。
     #[test]
     fn 补全类名点后返回类成员() {
         let mut state = ServerState::default();
@@ -695,14 +699,13 @@ func main() {
             &mut state,
             请求(26, "textDocument/completion", json!({
                 "textDocument": {"uri": "file:///a.tie"},
-                "position": {"line": 15, "character": 18}
+                "position": {"line": 17, "character": 18}
             })),
         );
         let items = out[0]["result"]["items"].as_array().expect("items 应为数组");
         let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
-        assert!(labels.contains(&"x"), "应含字段 x：{labels:?}");
-        assert!(labels.contains(&"create"), "应含方法 create：{labels:?}");
-        assert!(labels.contains(&"dist"), "应含方法 dist：{labels:?}");
+        assert!(labels.contains(&"create"), "应含方法函数 create：{labels:?}");
+        assert!(labels.contains(&"dist"), "应含方法函数 dist：{labels:?}");
         assert!(!labels.contains(&"func"), "点场景不应含关键词：{labels:?}");
     }
 

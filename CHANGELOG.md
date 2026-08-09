@@ -3,6 +3,56 @@
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库**。
 
+## [Harbor M2.1.8] 数据结构与逻辑分离：struct 取代 class，方法移出为命名空间函数 — 2026-08-09
+
+### 语言体系重构（class → struct 纯数据 + 命名空间函数方法）
+- `class` 改名 **`struct`** 并成为**纯数据**（类体只允许字段 `var name[: Ty] [= 默认值]`；
+  方法语法出现在 struct 体内 → 报错并提示用命名空间函数定义）
+- **方法 = 绑定 struct 名的命名空间函数**：`namespace Point { pub func dist(p: Point) }`，
+  `obj.method()` 由编译器**转发**为 `Point::dist(&obj)`；`Point.origin()`（struct 名调用）
+  为静态风格（无接收者）
+- **接收者按引用传递**（首参 LLVM ptr，by_ptr 绑定）：函数内字段修改反映到调用方
+  （与 class 时代 this 指针机制一致，只是显式首参）；继承沿链解析（子 → 父），
+  子实例调父方法时接收者地址直接可用（字段布局前缀一致）
+- **this / static 关键字废弃**（变普通标识符，方法函数用显式首参）；`method` 早已废弃
+- 方法函数必须 `pub`（否则 `obj.method()` 转发被私有拦截）；无接收者函数经实例调用
+  → 参数个数报错（含接收者对象）
+
+### 四层同步
+- lexer：Struct token（删 Class/This/Static；关键字 22 → 20）
+- parser：parse_struct（只字段）、删 parse_method；顶层/命名空间体认 struct
+- semantic：collect_structs/flatten_struct（只拍平字段）、MethodCall 转发（沿继承链 +
+  struct_assignable 首参兼容 + 可寻址校验）、删 MethodSig/check_method/ClassInfo 方法表、
+  this 特殊处理全删
+- IR：方法生成并入 gen_ns_fns（`@Point$dist`）；gen_fn 方法函数首参 by_ptr 引用；
+  gen_call_inner 实例转发传 receiver 地址；删除原 gen_method/gen_static_call/
+  gen_instance_call/emit_method_call/值降级 extractvalue
+- interp：Stmt::Struct/TypeSpec::Struct 适配（REPL 仍不支持 struct 值）
+- LSP：classify_ident（struct 定义名 → STRUCT；struct 名构造 → CLASS，命名空间链段
+  不误判）、关键词表/补全 detail/hover「**类**：struct」、定义收集方法函数裸名跳转、
+  `Point.` 补全走命名空间函数
+
+### 示例与负例
+- examples/oop.tie 重写为 struct + 命名空间函数（42/Hello, tie!/3/100/5/10/Rex/3/
+  Golden/Rex barks/I am a Golden/Cat makes a sound 全对）
+- oop_neg_a~e 重写：字段访问不可寻址 / 方法函数未 pub 私有拦截 / 无接收者经实例调用 /
+  struct 继承环 / 字段跨链重名——5 个负例全部按新消息报错
+
+### 测试与验证
+- frontend +1（struct 体内方法报错），重写 OOP 语义/IR/LSP 测试为 struct 风格 →
+  workspace 全量 **321 全绿**（137 frontend + 59 interp + 34 llvm + 75 lsp + 6 prep + 10 tie）
+- 端到端：oop / std_demo / csv_demo / tcmsg_demo / ns_import_demo / import_nested 全过；
+  继承方法转发（子实例调父方法 "hi Rex"）验证通过
+- `cargo build --workspace` 零错误
+
+### 文档与扩展同步
+- docs/language.md：§8 重写为「数据结构与逻辑分离」（struct/命名空间函数/继承/转发/
+  限制）；§9.1 关键词表（struct 替换 class，删 static/this）
+- docs/ai-guide.md §2.8 + 架构描述（collect_structs/方法转发/gen_ns_fns/by_ptr）、
+  prompt-pack struct 段与硬性规则
+- README：M3 行 class→struct；M2 行补 M2.1.8
+- VSCode 扩展：tmLanguage 关键词（struct 替换 class，删 this/static）、片段、智能缩进同步
+
 ## [Harbor M2.1.7] 单文件命名空间：pub 可见性 + using 引入 + import 别名唯一入口 — 2026-08-09
 
 落地规划 docs/plans/namespace-single-file.md，让命名空间成为真正的**模块边界**。

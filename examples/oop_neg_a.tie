@@ -1,11 +1,8 @@
-// oop_neg_a.tie：负例——寄存器中的类值不可寻址（构造表达式直接字段访问）
-// 期望：语义错误「类实例 'Counter' 的字段访问需要可寻址对象」
+// oop_neg_a.tie：负例——寄存器中的 struct 值不可寻址（构造表达式直接字段访问）
+// 期望：语义错误「struct 实例 'Counter' 的字段访问需要可寻址对象」
 
-class Counter {
+struct Counter {
     var count: i64
-    func inc() {
-        this.count = this.count + 1
-    }
 }
 
 func main() {

@@ -73,12 +73,8 @@ pub enum TokenKind {
     When,
     Import,
     As,
-    /// 类定义 `class`
-    Class,
-    /// 当前实例 `this`
-    This,
-    /// 静态 `static`
-    Static,
+    /// struct 定义 `struct`（纯数据，M2.1.8；取代 class）
+    Struct,
     /// 继承 `extends`
     Extends,
     /// 命名空间声明 `namespace tcmsg { }`
@@ -684,10 +680,8 @@ impl<'a> Lexer<'a> {
             "when" => TokenKind::When,
             "import" => TokenKind::Import,
             "as" => TokenKind::As,
-            // 面向对象（P8）：class/this/static/extends（方法定义统一用 func）
-            "class" => TokenKind::Class,
-            "this" => TokenKind::This,
-            "static" => TokenKind::Static,
+            // 面向对象（M2.1.8）：struct 纯数据（class/this/static 废弃，逻辑走命名空间函数）
+            "struct" => TokenKind::Struct,
             "extends" => TokenKind::Extends,
             // 命名空间（命名空间语法，C# 风格块式声明）
             "namespace" => TokenKind::Namespace,
@@ -1061,10 +1055,11 @@ mod tests {
 
     // ---------- 关键字与标识符 ----------
 
-    /// 控制流/OOP/字面量关键字逐一识别（func..false 共 22 个）。
+    /// 控制流/OOP/字面量关键字逐一识别（func..false 共 20 个；class/this/static
+    /// 已废弃为普通标识符，M2.1.8 struct 取代 class）。
     #[test]
     fn 关键字全部识别() {
-        let src = "func var const if else while for in return switch case default when import as class this static extends namespace pub using true false";
+        let src = "func var const if else while for in return switch case default when import as struct extends namespace pub using true false";
         let toks = tokenize(src).expect("不应报错");
         let expected = [
             TokenKind::Func,
@@ -1082,9 +1077,7 @@ mod tests {
             TokenKind::When,
             TokenKind::Import,
             TokenKind::As,
-            TokenKind::Class,
-            TokenKind::This,
-            TokenKind::Static,
+            TokenKind::Struct,
             TokenKind::Extends,
             TokenKind::Namespace,
             TokenKind::Pub,

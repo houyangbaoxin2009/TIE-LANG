@@ -1,12 +1,12 @@
-// oop_neg_e.tie：负例——字段跨继承链重名（子类字段与父类字段同名）
+// oop_neg_e.tie：负例——字段跨继承链重名（子 struct 字段与父 struct 字段同名）
 // 期望：语义错误「字段 'Dog.name' 与继承链中的字段重名」
 
-class Animal {
-    var name: str
+struct Animal {
+    var name: string
 }
 
-class Dog extends Animal {
-    var name: str
+struct Dog extends Animal {
+    var name: string
 }
 
 func main() {

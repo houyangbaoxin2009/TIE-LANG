@@ -9,7 +9,7 @@
 //! （IR 生成时无需重复推导类型）。
 
 use super::ast::{
-    BinaryOp, ClassDefStmt, ClassField, Expr, FnDefStmt, MethodDefStmt, Program, Stmt, TableId,
+    BinaryOp, ClassField, Expr, FnDefStmt, Program, Stmt, StructDefStmt, TableId,
     TupleField, TypeSpec, UnaryOp,
 };
 use super::lexer::{Span, TyKw};
@@ -80,32 +80,21 @@ pub struct FuncSig {
     pub is_pub: bool,
 }
 
-/// 类的方法签名（P8）。
-#[derive(Debug, Clone)]
-pub struct MethodSig {
-    /// 静态方法：不绑定 this，通过 `类名.方法名()` 调用
-    pub is_static: bool,
-    pub param_tys: Vec<TypeSpec>,
-    pub ret_ty: TypeSpec,
-}
-
-/// 类的完整信息（P8）：字段与方法均为**继承拍平**后的结果。
+/// struct 的完整信息（M2.1.8）：字段为**继承拍平**后的结果。
 ///
-/// 字段顺序即 LLVM 结构体字段序（父类字段在前，子类字段在后）；
+/// 字段顺序即 LLVM 结构体字段序（父 struct 字段在前，子 struct 字段在后）；
 /// `field_index` 是字段名 → GEP 偏移的唯一权威来源（语义校验与 IR 生成共用，
-/// 避免两处各自遍历拍平造成错位）。
+/// 避免两处各自遍历拍平造成错位）。逻辑（方法）不在 struct 内——由绑定
+/// struct 名的命名空间函数定义（`namespace Point { pub func dist(p: Point) }`），
+/// `p.dist()` 调用由语义层转发到 `Point::dist(p)`。
 #[derive(Debug, Clone)]
 pub struct ClassInfo {
-    /// 直接父类名（`extends Parent`）
+    /// 直接父 struct 名（`extends Parent`）
     pub parent: Option<String>,
     /// 拍平字段（含继承），顺序即 LLVM 结构体字段序
     pub fields: Vec<ClassField>,
     /// 字段名 → 字段下标（拍平顺序，IR 的 GEP 偏移）
     pub field_index: HashMap<String, usize>,
-    /// 拍平方法（子类同名方法遮蔽父类）
-    pub methods: HashMap<String, MethodSig>,
-    /// 方法名 → 实际定义它的类（mangle 用 `@<定义类>$<方法名>`）
-    pub method_owner: HashMap<String, String>,
 }
 
 /// 语义分析入口。
@@ -153,7 +142,7 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
     }
 
     // 类收集：继承链解析（环检测）+ 字段/方法拍平 + 冲突检查（类名 vs 函数名）
-    ctx.collect_classes(program)?;
+    ctx.collect_structs(program)?;
 
     // 内置 list_dir：返回「字符串动态表」（文件名集合）。预登记元素类型，使
     // `var t = list_dir(p)` / `for x in list_dir(p)` / `table_at(t, i)` 的
@@ -200,14 +189,8 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
         }
     }
 
-    // 第三遍：检查方法体（this 绑定、成员访问、类型检查）
-    for stmt in &program.stmts {
-        if let Stmt::Class(c) = stmt {
-            for m in &c.methods {
-                ctx.check_method(m, &c.name)?;
-            }
-        }
-    }
+    // 第三遍：方法体检查已随方法体系移出 struct（M2.1.8）——
+    // 方法即绑定 struct 名的命名空间函数，其函数体已由第一遍 check_fn/check_ns_stmts 覆盖。
 
     // 入口检查：logic 类文件必须有 main（main 检查在 driver 按头类型分派）
     Ok(ctx.result)
@@ -582,93 +565,88 @@ impl Analyzer {
         Ok(())
     }
 
-    /// 类收集（第一遍的延续）：继承链解析 + 字段/方法拍平 + 冲突检查。
+    /// struct 收集（M2.1.8）：继承链解析 + 字段拍平 + 冲突检查。
     ///
-    /// 顺序保证：父类先于子类拍平（递归），拍平结果存 `result.classes`。
-    fn collect_classes(&mut self, program: &Program) -> Result<(), SemanticError> {
-        // 第一步：类名登记与冲突检查（类名 vs 函数名、类名 vs 类名）
+    /// 顺序保证：父 struct 先于子 struct 拍平（递归），拍平结果存 `result.classes`。
+    /// 方法已移出 struct（逻辑 = 绑定 struct 名的命名空间函数），此处只处理字段。
+    fn collect_structs(&mut self, program: &Program) -> Result<(), SemanticError> {
+        // 第一步：struct 名登记与冲突检查（struct 名 vs 函数名、struct 名 vs struct 名）
         for stmt in &program.stmts {
-            if let Stmt::Class(c) = stmt {
+            if let Stmt::Struct(c) = stmt {
                 if self.result.funcs.contains_key(&c.name) {
                     return Err(SemanticError {
                         span: c.span,
-                        message: format!("类名 '{}' 与函数名冲突", c.name),
+                        message: format!("struct 名 '{}' 与函数名冲突", c.name),
                     });
                 }
                 if self.result.classes.contains_key(&c.name) {
                     return Err(SemanticError {
                         span: c.span,
-                        message: format!("类 '{}' 重复定义", c.name),
+                        message: format!("struct '{}' 重复定义", c.name),
                     });
                 }
                 self.result.classes.insert(c.name.clone(), ClassInfo {
                     parent: c.parent.clone(),
                     fields: Vec::new(),
                     field_index: HashMap::new(),
-                    methods: HashMap::new(),
-                    method_owner: HashMap::new(),
                 });
             }
         }
-        // 第二步：逐个类做继承链拍平（递归解析父类字段/方法）
-        // 先构造「类名 → 定义」映射以便查找父类
-        let defs: HashMap<String, &ClassDefStmt> = program
+        // 第二步：逐个 struct 做继承链拍平（递归解析父 struct 字段）
+        // 先构造「struct 名 → 定义」映射以便查找父 struct
+        let defs: HashMap<String, &StructDefStmt> = program
             .stmts
             .iter()
             .filter_map(|s| match s {
-                Stmt::Class(c) => Some((c.name.clone(), c)),
+                Stmt::Struct(c) => Some((c.name.clone(), c)),
                 _ => None,
             })
             .collect();
         let names: Vec<String> = self.result.classes.keys().cloned().collect();
         for name in names {
-            let info = self.flatten_class(&name, &defs, &mut HashSet::new())?;
+            let info = self.flatten_struct(&name, &defs, &mut HashSet::new())?;
             // 拍平后的结果替换占位
             self.result.classes.insert(name, info);
         }
         Ok(())
     }
 
-    /// 拍平单个类：递归合并父类字段/方法，自身字段/方法叠加，环检测。
+    /// 拍平单个 struct：递归合并父 struct 字段，自身字段叠加，环检测。
     ///
-    /// `chain` 是当前继承链上的类名集合（路径环检测用，非全局访问集合）。
-    fn flatten_class(
+    /// `chain` 是当前继承链上的 struct 名集合（路径环检测用，非全局访问集合）。
+    fn flatten_struct(
         &self,
         name: &str,
-        defs: &HashMap<String, &ClassDefStmt>,
+        defs: &HashMap<String, &StructDefStmt>,
         chain: &mut HashSet<String>,
     ) -> Result<ClassInfo, SemanticError> {
-        // 环检测：`class A extends B` 且 B 又依赖 A → 死循环
+        // 环检测：`struct A extends B` 且 B 又依赖 A → 死循环
         if !chain.insert(name.to_string()) {
             return Err(SemanticError {
                 span: defs.get(name).map(|c| c.span).unwrap_or(Span { line: 0, col: 0 }),
-                message: format!("类继承形成环（含 '{name}'）"),
+                message: format!("struct 继承形成环（含 '{name}'）"),
             });
         }
         let def = defs.get(name).ok_or_else(|| SemanticError {
             span: Span { line: 0, col: 0 },
-            message: format!("内部错误：类 '{name}' 无定义"),
+            message: format!("内部错误：struct '{name}' 无定义"),
         })?;
         let mut info = ClassInfo {
             parent: def.parent.clone(),
             fields: Vec::new(),
             field_index: HashMap::new(),
-            methods: HashMap::new(),
-            method_owner: HashMap::new(),
         };
-        // 父类字段/方法拍平（递归；父类未定义 → 报错）
+        // 父 struct 字段拍平（递归；父 struct 未定义 → 报错）
         if let Some(p) = &def.parent {
             if !defs.contains_key(p) {
                 return Err(SemanticError {
                     span: def.span,
-                    message: format!("父类 '{p}' 未定义"),
+                    message: format!("父 struct '{p}' 未定义"),
                 });
             }
-            let pinfo = self.flatten_class(p, defs, chain)?;
+            let pinfo = self.flatten_struct(p, defs, chain)?;
             info.fields = pinfo.fields;
             info.field_index = pinfo.field_index;
-            info.methods = pinfo.methods;
-            info.method_owner = pinfo.method_owner;
         }
         // 自身字段：字段名跨继承链唯一（布局平铺后重名即歧义）
         for f in &def.fields {
@@ -689,61 +667,11 @@ impl Analyzer {
             info.fields.push(cf);
             info.field_index.insert(f.name.clone(), idx);
         }
-        // 自身方法：同名遮蔽父类（method_owner 记录实际定义类），同类内重名报错
-        for m in &def.methods {
-            if let Some(owner) = info.method_owner.get(&m.name)
-                && owner == name
-            {
-                return Err(SemanticError {
-                    span: m.span,
-                    message: format!("方法 '{name}.{}' 重复定义", m.name),
-                });
-            }
-            let sig = MethodSig {
-                is_static: m.is_static,
-                param_tys: m.params.iter().map(|p| p.ty.clone()).collect(),
-                ret_ty: m.ret_ty.clone(),
-            };
-            info.methods.insert(m.name.clone(), sig);
-            info.method_owner.insert(m.name.clone(), name.to_string());
-        }
         chain.remove(name);
         Ok(info)
     }
 
-    /// 检查方法体：实例方法先绑定 `this`（当前类类型），静态方法不绑定。
-    fn check_method(&mut self, m: &MethodDefStmt, class_name: &str) -> Result<(), SemanticError> {
-        self.cur_fn = format!("{class_name}.{}", m.name);
-        // 方法体内作用域：this（实例方法）+ 参数
-        let mut scope: HashMap<String, TypeSpec> = HashMap::new();
-        if !m.is_static {
-            scope.insert("this".to_string(), TypeSpec::Class(class_name.to_string()));
-        }
-        for p in &m.params {
-            if scope.insert(p.name.clone(), p.ty.clone()).is_some() {
-                return Err(SemanticError {
-                    span: p.span,
-                    message: format!("参数 '{}' 重复", p.name),
-                });
-            }
-            // 方法默认值参数暂不支持（M3）：MethodSig 无默认值字段，调用点无法补齐。
-            if p.default.is_some() {
-                return Err(SemanticError {
-                    span: p.span,
-                    message: format!(
-                        "方法参数 '{}' 不支持默认值（方法默认值参数留待 M3，函数已支持）",
-                        p.name
-                    ),
-                });
-            }
-        }
-        for stmt in &m.body {
-            self.check_stmt(stmt, &mut scope, &m.ret_ty)?;
-        }
-        Ok(())
-    }
-
-    /// 解析类字段的具体类型（P8）。
+    /// 解析 struct 字段的具体类型。
     ///
     /// 规则：显式标注优先；无标注但有默认值 → 从默认值字面量推导；
     /// 两者皆无 → 报错（IR 无法确定字段类型）。
@@ -1221,22 +1149,22 @@ impl Analyzer {
                 self.check_block(&s.default_body, scope, ret_ty)?;
                 Ok(())
             }
-            Stmt::Class(_) => {
-                // 类定义只允许出现在文件顶层（analyze 第三遍统一检查方法体）
+            Stmt::Struct(_) => {
+                // struct 定义只允许出现在文件顶层（字段类型解析在 collect_structs）
                 Err(SemanticError {
                     span: stmt_span(stmt),
-                    message: "类定义只能出现在文件顶层".into(),
+                    message: "struct 定义只能出现在文件顶层".into(),
                 })
             }
             Stmt::FieldAssign(fa) => {
-                // 字段赋值：base 必须是类实例（变量/this/字段链，可寻址），字段存在，类型匹配
+                // 字段赋值：base 必须是 struct 实例（变量/字段链，可寻址），字段存在，类型匹配
                 let base_ty = self.infer_expr(&fa.base, scope)?;
                 self.result.expr_types.insert(addr_of(&fa.base), base_ty.clone());
-                let TypeSpec::Class(class_name) = &base_ty else {
+                let TypeSpec::Struct(class_name) = &base_ty else {
                     return Err(SemanticError {
                         span: fa.span,
                         message: format!(
-                            "字段赋值的对象必须是类实例，实际是 {}",
+                            "字段赋值的对象必须是 struct 实例，实际是 {}",
                             type_name(&base_ty)
                         ),
                     });
@@ -1362,7 +1290,7 @@ impl Analyzer {
                         }
                         self.result.expr_types.insert(addr_of(a), at);
                     }
-                    return Ok(TypeSpec::Class(name.clone()));
+                    return Ok(TypeSpec::Struct(name.clone()));
                 }
                 // 内置函数 println：任意参数，void（元组除外——IR 层 printf 变参无法传结构体）
                 if name == "println" {
@@ -2362,14 +2290,14 @@ impl Analyzer {
                         })?;
                         fields[idx].ty.clone()
                     }
-                    TypeSpec::Class(class_name) => {
-                        // 寄存器中的类值不可寻址：构造表达式/方法调用结果直接连用字段
+                    TypeSpec::Struct(class_name) => {
+                        // 寄存器中的 struct 值不可寻址：构造表达式/方法调用结果直接连用字段
                         // 会在 IR 阶段无法取地址，语义层提前报错（Oracle 方案）。
                         if !is_addressable_expr(base) {
                             return Err(SemanticError {
                                 span: *span,
                                 message: format!(
-                                    "类实例 '{class_name}' 的字段访问需要可寻址对象（变量/this/字段链），"
+                                    "struct 实例 '{class_name}' 的字段访问需要可寻址对象（变量/字段链），"
                                 ),
                             });
                         }
@@ -2380,7 +2308,7 @@ impl Analyzer {
                             .cloned()
                             .ok_or_else(|| SemanticError {
                                 span: *span,
-                                message: format!("内部错误：类 '{class_name}' 无信息"),
+                                message: format!("内部错误：struct '{class_name}' 无信息"),
                             })?;
                         let idx = info
                             .field_index
@@ -2404,10 +2332,10 @@ impl Analyzer {
                 }
             }
             Expr::MethodCall { receiver, method, args, span } => {
-                // 方法调用：receiver 是变量/this → 实例方法（receiver 类型必须是类）；
-                // receiver 是类名 → 静态方法（无 this）；
-                // receiver 是命名空间路径（a::b / a.b / 导入别名）→ 命名空间函数调用。
-                // 同一变体多种语义，此处分发。
+                // 方法调用（M2.1.8）：receiver 是 struct 实例 → 方法转发到
+                // `struct名::方法名`（namespace 绑定函数，首参 = 接收者）；
+                // receiver 是命名空间路径（a::b / a.b / 导入别名）→ 命名空间函数调用；
+                // receiver 是 struct 名（静态调用，如 Point.origin()）→ 命名空间分支覆盖。
                 //
                 // 命名空间调用判定（M2.1.7 升级）：除了 funcs 前缀存在（原逻辑），
                 // 命中「导入视图」（别名可用前缀 / 原前缀）也算命名空间形态——
@@ -2491,71 +2419,98 @@ impl Analyzer {
                     self.result.resolved_calls.insert(addr_of(expr), full);
                     return Ok(sig.ret_ty);
                 }
-                // 静态方法：receiver 是 Var 且名字在 classes 表中（未绑定变量）
-                if let Expr::Var(rname) = receiver.as_ref()
-                    && !scope.contains_key(rname)
-                    && self.result.classes.contains_key(rname)
-                {
-                    let class_name = rname.clone();
-                    let info = self.result.classes[&class_name].clone();
-                    let sig = info.methods.get(method).cloned().ok_or_else(|| SemanticError {
-                        span: *span,
-                        message: format!("类 '{class_name}' 没有方法 '{method}'"),
-                    })?;
-                    if !sig.is_static {
-                        return Err(SemanticError {
-                            span: *span,
-                            message: format!(
-                                "实例方法 '{method}' 必须通过实例调用（如 obj.{method}(...)）"
-                            ),
-                        });
-                    }
-                    self.check_call_args(method, &sig.param_tys, args, scope, span)?;
-                    return Ok(sig.ret_ty);
-                }
-                // 实例方法：receiver 推断类型必须是类
+                // ===== M2.1.8：struct 方法转发 =====
+                // receiver 必须是 struct 实例（变量/字段链/构造表达式）。方法函数定义
+                // 在绑定 struct 名的命名空间里（namespace Point { pub func dist(p: Point) }），
+                // `p.dist(args)` 转发为 `Point::dist(p, args)`——沿继承链查找方法函数
+                // （子 → 父），方法函数必须 pub（否则私有拦截，与普通命名空间函数一致）。
+                // `Point.origin()` 静态调用已由上方命名空间分支覆盖（funcs 前缀
+                // "Point::" 命中 → 全名 Point::origin，无首参插入）。
                 let recv_ty = self.infer_expr(receiver, scope)?;
                 self.result.expr_types.insert(addr_of(receiver), recv_ty.clone());
-                let TypeSpec::Class(class_name) = &recv_ty else {
+                let TypeSpec::Struct(struct_name) = &recv_ty else {
                     return Err(SemanticError {
                         span: *span,
                         message: format!(
-                            "方法调用的对象必须是类实例，实际是 {}",
+                            "方法调用的对象必须是 struct 实例或 struct 名，实际是 {}",
                             type_name(&recv_ty)
                         ),
                     });
                 };
-                // 寄存器中的类值不可寻址：构造表达式/方法调用结果直接调用方法
-                // 会在 IR 阶段无法取 this 地址，语义层提前报错（Oracle 方案）。
+                // 实例方法首参按**引用**传递（by_ptr：函数内字段修改反映到调用方，
+                // 与 class 时代的 this 指针一致）→ receiver 必须可寻址（变量/字段链）。
+                // 寄存器中的 struct 值（构造表达式/方法链返回值）不可取地址，语义层报错。
                 if !is_addressable_expr(receiver) {
                     return Err(SemanticError {
                         span: *span,
-                        // 寄存器中的类值不可寻址：无法取 this 地址
-                        message: "方法调用的对象需要可寻址的类实例（变量/this/字段链）".to_string(),
-                    });
-                }
-                let info = self
-                    .result
-                    .classes
-                    .get(class_name)
-                    .cloned()
-                    .ok_or_else(|| SemanticError {
-                        span: *span,
-                        message: format!("内部错误：类 '{class_name}' 无信息"),
-                    })?;
-                let sig = info.methods.get(method).cloned().ok_or_else(|| SemanticError {
-                    span: *span,
-                    message: format!("类 '{class_name}' 没有方法 '{method}'"),
-                })?;
-                if sig.is_static {
-                    return Err(SemanticError {
-                        span: *span,
                         message: format!(
-                            "静态方法 '{method}' 必须通过类名调用（如 {class_name}.{method}(...)）"
+                            "方法调用的对象需要可寻址的 struct 实例（变量/字段链），{} 不可取地址",
+                            type_name(&recv_ty)
                         ),
                     });
                 }
-                self.check_call_args(method, &sig.param_tys, args, scope, span)?;
+                // 沿继承链查找方法函数（子 → 父）：funcs 键 `T::method`
+                let mut cur: Option<&str> = Some(struct_name.as_str());
+                let full: String = loop {
+                    let Some(cn) = cur else { break String::new() };
+                    let candidate = format!("{cn}::{method}");
+                    if self.result.funcs.contains_key(&candidate) {
+                        break candidate;
+                    }
+                    cur = self.result.classes.get(cn).and_then(|i| i.parent.as_deref());
+                };
+                if full.is_empty() {
+                    return Err(SemanticError {
+                        span: *span,
+                        message: format!(
+                            "struct '{struct_name}'（含继承链）没有方法 '{method}'：请在 \
+                             namespace {struct_name} 中定义 pub func {method}(首参: {struct_name}, ...)"
+                        ),
+                    });
+                }
+                let sig = self.result.funcs.get(&full).cloned().expect("上方已确认存在");
+                // 方法函数必须 pub（私有 → 拦截）
+                self.check_visibility(&full, &sig, span)?;
+                // 参数个数：总实参 = [receiver] + args（首参是隐含的接收者）
+                let required = sig.param_defaults.iter().take_while(|d| d.is_none()).count();
+                let total = sig.param_tys.len();
+                let n_args = args.len() + 1;
+                if n_args < required || n_args > total {
+                    return Err(SemanticError {
+                        span: *span,
+                        message: format!(
+                            "方法 '{full}' 期望 {required}-{total} 个参数（含接收者对象），实际 {n_args} 个"
+                        ),
+                    });
+                }
+                // 首参类型：receiver 必须是首参类型或其子类（子类实例可调父类方法）
+                let first = &sig.param_tys[0];
+                if !struct_assignable(&self.result.classes, first, &recv_ty) {
+                    return Err(SemanticError {
+                        span: *span,
+                        message: format!(
+                            "方法 '{full}' 首参类型不匹配：期望 {}，实际 {}",
+                            type_name(first),
+                            type_name(&recv_ty)
+                        ),
+                    });
+                }
+                // 其余实参逐个校验
+                for (a, want) in args.iter().zip(sig.param_tys.iter().skip(1)) {
+                    let at = self.infer_expr(a, scope)?;
+                    if !types_match(want, &at, Some(a)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(a),
+                            message: format!(
+                                "调用 '{full}' 参数类型不匹配：期望 {}，实际 {}",
+                                type_name(want),
+                                type_name(&at)
+                            ),
+                        });
+                    }
+                    self.result.expr_types.insert(addr_of(a), at);
+                }
+                self.result.resolved_calls.insert(addr_of(expr), full);
                 sig.ret_ty
             }
         };
@@ -2757,42 +2712,6 @@ impl Analyzer {
         }
     }
 
-    /// 校验方法调用的实参（个数 + 逐个类型匹配）。
-    fn check_call_args(
-        &mut self,
-        method: &str,
-        param_tys: &[TypeSpec],
-        args: &[Expr],
-        scope: &HashMap<String, TypeSpec>,
-        span: &Span,
-    ) -> Result<(), SemanticError> {
-        if param_tys.len() != args.len() {
-            return Err(SemanticError {
-                span: *span,
-                message: format!(
-                    "方法 '{method}' 期望 {} 个参数，实际 {} 个",
-                    param_tys.len(),
-                    args.len()
-                ),
-            });
-        }
-        for (a, want) in args.iter().zip(param_tys.iter()) {
-            let at = self.infer_expr(a, scope)?;
-            if !types_match(want, &at, Some(a)) {
-                return Err(SemanticError {
-                    span: expr_span_of(a),
-                    message: format!(
-                        "调用 '{method}' 参数类型不匹配：期望 {}，实际 {}",
-                        type_name(want),
-                        type_name(&at)
-                    ),
-                });
-            }
-            self.result.expr_types.insert(addr_of(a), at);
-        }
-        Ok(())
-    }
-
     /// 复合赋值类型校验（M4）：`x op= v` 中 op 对应的二元运算对 target/value 的类型要求。
     ///
     /// 规则（与 infer_expr 的 Binary 分支类型规则对齐）：
@@ -2914,9 +2833,9 @@ fn addr_of(expr: &Expr) -> usize {
 /// 命名空间路径段提取：把 `tcmsg.error.hello` 的 receiver（FieldAccess 链/Var）
 /// 递归拍平为路径段 ["tcmsg","error"]。
 ///
-/// 条件：链上每个标识符都必须是**未绑定**的（非变量、非 this、非类实例字段），
-/// 否则它可能是实例字段链（obj.field.method 之类），不属于命名空间。
-/// 返回 None 表示不是命名空间形态（调用方按实例/静态方法处理）。
+/// 条件：链上每个标识符都必须是**未绑定**的（非变量），否则它可能是实例字段链
+/// （obj.field.method 之类），不属于命名空间。返回 None 表示不是命名空间形态
+/// （调用方按 struct 方法转发处理）。
 /// 参数个数区间的中文措辞（不含「个」）：必选数 == 总数 → "N"；否则 "N-M"。
 /// 与调用点模板「期望 {desc} 个参数」拼接。
 fn param_count_desc(required: usize, total: usize) -> String {
@@ -2930,8 +2849,8 @@ fn param_count_desc(required: usize, total: usize) -> String {
 fn ns_path_segments(expr: &Expr, scope: &HashMap<String, TypeSpec>) -> Option<Vec<String>> {
     match expr {
         Expr::Var(name) => {
-            // 未绑定（非变量/非 this）才是命名空间首段；this 是实例对象
-            if name == "this" || scope.contains_key(name) {
+            // 未绑定才是命名空间首段；绑定变量（含 struct 实例）不是
+            if scope.contains_key(name) {
                 None
             } else {
                 Some(vec![name.clone()])
@@ -3023,7 +2942,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::Import(i) => i.span,
         Stmt::Namespace(n) => n.span,
         Stmt::Using(u) => u.span,
-        Stmt::Class(c) => c.span,
+        Stmt::Struct(c) => c.span,
         Stmt::FieldAssign(f) => f.span,
     }
 }
@@ -3076,6 +2995,29 @@ fn types_compatible(a: &TypeSpec, b: &TypeSpec) -> bool {
         }
         _ => a == b,
     }
+}
+
+/// struct 继承兼容（M2.1.8）：`got` 能否赋给 `want`——
+/// got == want，或 got 是 want 的后代（沿 extends 链上升可找到 want）。
+///
+/// 用于方法转发首参校验：子类实例可调用父 struct 的方法函数
+/// （`namespace Parent { pub func dist(p: Parent) }`，`child.dist()` 时首参是 Child）。
+fn struct_assignable(
+    classes: &HashMap<String, ClassInfo>,
+    want: &TypeSpec,
+    got: &TypeSpec,
+) -> bool {
+    let (TypeSpec::Struct(w), TypeSpec::Struct(g)) = (want, got) else {
+        return want == got;
+    };
+    let mut cur = Some(g.as_str());
+    while let Some(c) = cur {
+        if c == w {
+            return true;
+        }
+        cur = classes.get(c).and_then(|i| i.parent.as_deref());
+    }
+    false
 }
 
 /// 类型是否匹配（含字面量适配）。
@@ -3226,7 +3168,7 @@ fn type_name(t: &TypeSpec) -> &'static str {
     match t {
         TypeSpec::Named(k) => k.as_str(),
         TypeSpec::Tuple(_) => "tuple",
-        TypeSpec::Class(name) => Box::leak(name.clone().into_boxed_str()),
+        TypeSpec::Struct(name) => Box::leak(name.clone().into_boxed_str()),
     }
 }
 
@@ -3618,13 +3560,13 @@ mod tests {
     }
 
     #[test]
-    fn 类名与函数名冲突报错() {
+    fn struct名与函数名冲突报错() {
         expect_err(
             r#"
             func Point() -> i64 {
                 return 1
             }
-            class Point {
+            struct Point {
                 var x: i64
             }
             func main() {
@@ -3640,69 +3582,86 @@ mod tests {
         // A extends B，B extends A → 死循环，必须报错
         expect_err(
             r#"
-            class A extends B {
+            struct A extends B {
                 var a: i64
             }
-            class B extends A {
+            struct B extends A {
                 var b: i64
             }
             func main() {
                 println(1)
             }
             "#,
-            "类继承形成环",
+            "struct 继承形成环",
         );
     }
 
     #[test]
-    fn 子类遮蔽父类方法与字段拍平() {
+    fn 子类字段拍平与方法函数转发() {
+        // M2.1.8：struct 纯数据（只字段），逻辑 = 绑定 struct 名的命名空间函数；
+        // d.speak() 转发到 Dog::speak(d)（沿继承链）。
         let sem = analyze_src(
             r#"
-            class Animal {
+            struct Animal {
                 var name: string
                 var age: i64
-                func speak() -> string {
-                    return this.name + " makes a sound"
+            }
+            struct Dog extends Animal {
+                var breed: string
+            }
+            namespace Animal {
+                pub func speak(a: Animal) -> string {
+                    return a.name + " makes a sound"
                 }
             }
-            class Dog extends Animal {
-                var breed: string
-                func speak() -> string {
-                    return this.name + " barks"
+            namespace Dog {
+                pub func speak(d: Dog) -> string {
+                    return d.name + " barks"
                 }
-                func info() -> string {
-                    return "I am a " + this.breed
+                pub func info(d: Dog) -> string {
+                    return "I am a " + d.breed
                 }
             }
             func main() {
                 var d = Dog("Rex", 3, "Golden")
                 println(d.speak())
+                println(d.info())
             }
             "#,
         )
         .expect("应当通过语义检查");
-        // 字段拍平：父类字段在前，子类字段在后（顺序即 LLVM 结构体字段序）
+        // 字段拍平：父 struct 字段在前，子 struct 字段在后（顺序即 LLVM 结构体字段序）
         let dog = &sem.classes["Dog"];
         assert_eq!(dog.fields.len(), 3);
         assert_eq!(dog.field_index["name"], 0);
         assert_eq!(dog.field_index["age"], 1);
         assert_eq!(dog.field_index["breed"], 2);
-        // 方法拍平：子类遮蔽父类同名方法，method_owner 记录实际定义类
-        assert!(dog.methods.contains_key("speak"));
-        assert!(dog.methods.contains_key("info"));
-        assert_eq!(dog.method_owner["speak"], "Dog");
-        assert_eq!(dog.method_owner["info"], "Dog");
-        // 父类自身的方法归属
-        assert_eq!(sem.classes["Animal"].method_owner["speak"], "Animal");
+        // 方法 = 绑定 struct 名的命名空间函数（全名注册，供 d.speak() 转发）
+        assert!(sem.funcs.contains_key("Animal::speak"));
+        assert!(sem.funcs.contains_key("Dog::speak"));
+        assert!(sem.funcs.contains_key("Dog::info"));
+        // 调用点解析：d.speak() → Dog::speak、d.info() → Dog::info（resolved_calls 全名）
+        assert!(
+            sem.resolved_calls.values().any(|v| v == "Dog::speak"),
+            "子类实例方法应转发到 Dog::speak"
+        );
+        assert!(
+            sem.resolved_calls.values().any(|v| v == "Dog::info"),
+            "子类实例方法应转发到 Dog::info"
+        );
     }
 
     #[test]
-    fn 方法重复定义报错() {
+    fn 方法函数重复定义报错() {
+        // 方法 = 命名空间函数：namespace A 内同名 pub func 重复 → 报错
         expect_err(
             r#"
-            class A {
-                func f() {}
-                func f() {}
+            struct A {
+                var x: i64
+            }
+            namespace A {
+                pub func f(a: A) {}
+                pub func f(a: A) {}
             }
             func main() {
                 println(1)
@@ -3713,16 +3672,20 @@ mod tests {
     }
 
     #[test]
-    fn 方法内this使用正确() {
+    fn 方法函数this废弃() {
+        // M2.1.8：this 不再是关键字/隐式对象——方法函数用显式首参（接收者），
+        // this 是普通标识符，未声明即报「未声明的变量」。
         let sem = analyze_src(
             r#"
-            class Counter {
+            struct Counter {
                 var count: i64
-                func inc() {
-                    this.count = this.count + 1
+            }
+            namespace Counter {
+                pub func inc(c: Counter) {
+                    c.count = c.count + 1
                 }
-                func get() -> i64 {
-                    return this.count
+                pub func get(c: Counter) -> i64 {
+                    return c.count
                 }
             }
             func main() {
@@ -3733,23 +3696,28 @@ mod tests {
             "#,
         )
         .expect("应当通过语义检查");
-        // 方法签名收集进 classes 表
-        let counter = &sem.classes["Counter"];
-        assert!(counter.methods.contains_key("inc"));
-        assert!(counter.methods.contains_key("get"));
-        assert_eq!(counter.methods["get"].ret_ty, TypeSpec::Named(TyKw::I64));
-        // 实例方法不标记静态
-        assert!(!counter.methods["inc"].is_static);
+        // 方法函数以全名注册进 funcs 表
+        assert!(sem.funcs.contains_key("Counter::inc"));
+        assert!(sem.funcs.contains_key("Counter::get"));
+        assert_eq!(
+            sem.funcs["Counter::get"].ret_ty,
+            TypeSpec::Named(TyKw::I64)
+        );
+        // 调用转发记录全名
+        assert!(sem.resolved_calls.values().any(|v| v == "Counter::inc"));
+        assert!(sem.resolved_calls.values().any(|v| v == "Counter::get"));
     }
 
     #[test]
-    fn 静态方法内使用this报错() {
-        // 静态方法不绑定 this：体内引用 this 视为未声明变量
+    fn this作为普通标识符报未声明() {
+        // this 已废弃（M2.1.8）：方法函数体内引用 this 视为未声明变量
         expect_err(
             r#"
-            class Counter {
+            struct Counter {
                 var count: i64
-                static func bad() {
+            }
+            namespace Counter {
+                pub func bad(c: Counter) {
                     println(this.count)
                 }
             }
@@ -3933,12 +3901,16 @@ mod tests {
     }
 
     #[test]
-    fn 静态方法通过实例调用报错() {
+    fn 无接收者方法函数经实例调用报错() {
+        // M2.1.8：方法 = 命名空间函数，实例转发要求首参接收 receiver。
+        // `make` 无首参（静态风格）→ `c.make()` 转发时实参多出 receiver → 报错。
         expect_err(
             r#"
-            class Counter {
+            struct Counter {
                 var count: i64
-                static func make() -> i64 {
+            }
+            namespace Counter {
+                pub func make() -> i64 {
                     return 1
                 }
             }
@@ -3947,7 +3919,7 @@ mod tests {
                 println(c.make())
             }
             "#,
-            "必须通过类名调用",
+            "含接收者对象",
         );
     }
 

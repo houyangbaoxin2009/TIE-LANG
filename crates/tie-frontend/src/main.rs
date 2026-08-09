@@ -198,10 +198,10 @@ fn main() -> ExitCode {
 
     // ---- 默认模式：输出统计 ----
     // 顶层语句统计
-    let (fn_count, class_count, import_count) =
+    let (fn_count, struct_count, import_count) =
         program.stmts.iter().fold((0, 0, 0), |(f, c, i), s| match s {
             tie_frontend::ast::Stmt::FnDef(_) => (f + 1, c, i),
-            tie_frontend::ast::Stmt::Class(_) => (f, c + 1, i),
+            tie_frontend::ast::Stmt::Struct(_) => (f, c + 1, i),
             tie_frontend::ast::Stmt::Import(_) => (f, c, i + 1),
             _ => (f, c, i),
         });
@@ -209,7 +209,7 @@ fn main() -> ExitCode {
     println!("前端分析通过: {}", args.input);
     println!("  token 数: {}", tokens.len() - 1); // 减去 Eof
     println!("  顶层函数: {fn_count}");
-    println!("  顶层类: {class_count}");
+    println!("  顶层 struct: {struct_count}");
     println!("  import 语句: {import_count}");
     println!("  函数签名: {}", sem.funcs.len());
     println!("  类信息: {}", sem.classes.len());
