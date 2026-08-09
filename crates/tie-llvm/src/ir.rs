@@ -76,6 +76,11 @@ struct IrGenerator<'p> {
     /// 循环跳转上下文栈（E1+E5）：break/continue 的目标 label。元素 = (标签, continue 目标, exit 目标)。
     /// continue 目标：while 为条件块（跳到下次条件判断）；for 为自增块（跳到步进处）。
     loop_ctx: Vec<(Option<String>, String, String)>,
+    /// alloca 提升缓冲（F1）：函数体执行过程中生成的 alloca 指令文本。
+    /// LLVM 规范要求 alloca 位于 entry block——非 entry 块的 alloca 每次执行都会
+    /// 重新分配栈空间，循环体内密集 alloca（如表读 ok 标志）会逐次累积导致栈溢出
+    /// （0xC00000FD）。统一收集后 flush 到函数 entry 块末尾，根治该缺陷。
+    entry_allocas: Vec<String>,
 }
 
 /// IR 生成入口：程序 AST + 语义结果 → LLVM IR 文本。
@@ -93,9 +98,13 @@ pub fn gen_ir(program: &Program, sem: &SemanticResult) -> Result<IrOutput, IrErr
         used_externs: Vec::new(),
         cur_fn: String::new(),
         loop_ctx: Vec::new(),
+        entry_allocas: Vec::new(),
     };
     generator.run()?;
-    Ok(IrOutput { ir: generator.out, used_externs: generator.used_externs })
+    // F1：alloca 提升后 entry 块编号可能倒挂（%54 在 %1 之前），LLVM 要求递增，
+    // 全局重编号（按文本出现顺序重映射 %N → 1..N）
+    let ir = IrGenerator::renumber_ir(&generator.out);
+    Ok(IrOutput { ir, used_externs: generator.used_externs })
 }
 
 impl<'p> IrGenerator<'p> {
@@ -534,10 +543,25 @@ impl<'p> IrGenerator<'p> {
         }
         self.scopes.push(scope);
 
-        // 函数体
+        // F1（alloca 提升）：函数体生成进临时缓冲，结束后把函数体内收集的全部
+        // alloca 拼接到入口块（参数区之后、函数体之前）。LLVM 规范要求 alloca 位于
+        // entry block——循环体内密集 alloca（表读 ok 标志）若留在循环体每次迭代分配
+        // 栈空间会逐次累积导致栈溢出（0xC00000FD）。
+        let saved_out = std::mem::take(&mut self.out);
         for stmt in &f.body {
             self.gen_stmt(stmt)?;
         }
+        // 把提升的 alloca 指令拼到入口块尾部：参数区（saved_out）之后、函数体之前
+        let body_out = std::mem::take(&mut self.out);
+        let mut allocas = String::new();
+        for a in &self.entry_allocas {
+            allocas.push_str(a);
+            allocas.push('\n');
+        }
+        self.entry_allocas.clear();
+        self.out = saved_out;
+        self.out.push_str(&allocas);
+        self.out.push_str(&body_out);
 
         // 结尾：无 return 时补默认返回。
         // 判断依据：函数体最后一条非空指令是否以 `ret ` 开头（含 `ret void`/`ret i64 ...`）。
@@ -604,8 +628,7 @@ impl<'p> IrGenerator<'p> {
                 if matches!(v.ty, Some(TypeSpec::Named(TyKw::Trit))) {
                     if let Expr::BoolLit(b) = &v.init {
                         let val: i8 = if *b { 1 } else { -1 };
-                        let alloca = self.new_reg();
-                        self.line(&format!("{alloca} = alloca i8"));
+                        let alloca = self.emit_alloca("i8");
                         self.line(&format!("store i8 {val}, ptr {alloca}"));
                         self.cur_scope_mut().insert(
                             v.name.clone(),
@@ -614,8 +637,7 @@ impl<'p> IrGenerator<'p> {
                         return Ok(());
                     }
                     if let Expr::TritLit(t) = &v.init {
-                        let alloca = self.new_reg();
-                        self.line(&format!("{alloca} = alloca i8"));
+                        let alloca = self.emit_alloca("i8");
                         self.line(&format!("store i8 {t}, ptr {alloca}"));
                         self.cur_scope_mut().insert(
                             v.name.clone(),
@@ -643,8 +665,7 @@ impl<'p> IrGenerator<'p> {
                     Some(t) => self.llvm_ty(t),
                     None => ty,
                 };
-                let alloca = self.new_reg();
-                self.line(&format!("{alloca} = alloca {ty_name}"));
+                let alloca = self.emit_alloca(ty_name);
                 self.line(&format!("store {ty_name} {val}, ptr {alloca}"));
                 // 变量类型：int/float/bool 等；string 特殊（ptr）
                 self.cur_scope_mut()
@@ -920,8 +941,7 @@ impl<'p> IrGenerator<'p> {
                 Some(op) => {
                     // 读旧值（tie_table_at_* 带 ok 标志）
                     self.mark_used(&format!("tie_table_at_{suffix}"));
-                    let ok = self.new_reg();
-                    self.line(&format!("{ok} = alloca i1"));
+                    let ok = self.emit_alloca("i1");
                     self.line(&format!("store i1 1, ptr {ok}"));
                     let old = self.new_reg();
                     self.line(&format!(
@@ -945,8 +965,7 @@ impl<'p> IrGenerator<'p> {
                 }
             };
             // 写入（set 桥带 ok 标志，越界 → 运行时错误）
-            let ok = self.new_reg();
-            self.line(&format!("{ok} = alloca i1"));
+            let ok = self.emit_alloca("i1");
             self.line(&format!("store i1 0, ptr {ok}"));
             self.line(&format!(
                 "call void @tie_table_set_{suffix}(ptr {tptr}, i64 {idx_val}, {elem_llvm} {new_val}, ptr {ok})"
@@ -1019,8 +1038,7 @@ impl<'p> IrGenerator<'p> {
             })?;
         let elem_llvm = self.llvm_ty(&info.elem_ty);
         let arr_ty = format!("[{} x {}]", info.len, elem_llvm);
-        let alloca = self.new_reg();
-        self.line(&format!("{alloca} = alloca {arr_ty}"));
+        let alloca = self.emit_alloca(&arr_ty);
         // 逐元素 store 到数组内偏移（GEP 第 0 行，第 i 列）
         if let Expr::TableLit { cells, .. } = &v.init {
             for (i, cell) in cells.iter().enumerate() {
@@ -1089,8 +1107,7 @@ impl<'p> IrGenerator<'p> {
                 t
             }
         };
-        let alloca = self.new_reg();
-        self.line(&format!("{alloca} = alloca ptr"));
+        let alloca = self.emit_alloca("ptr");
         self.line(&format!("store ptr {tptr}, ptr {alloca}"));
         // 绑定：变量类型 = ptr（动态表不透明指针，与字符串一致）
         self.cur_scope_mut()
@@ -1199,8 +1216,7 @@ impl<'p> IrGenerator<'p> {
         let end_val = self.extend_int_to_i64(&end_val, end_ty, end)?;
 
         // 循环变量 alloca
-        let var_alloca = self.new_reg();
-        self.line(&format!("{var_alloca} = alloca i64"));
+        let var_alloca = self.emit_alloca("i64");
         self.line(&format!("store i64 {start_val}, ptr {var_alloca}"));
 
         let cond_label = self.new_label("for.cond");
@@ -1260,12 +1276,10 @@ impl<'p> IrGenerator<'p> {
         elem_ty: &'static str,
     ) -> Result<(), IrError> {
         // 计数器 alloca（i64）
-        let idx_alloca = self.new_reg();
-        self.line(&format!("{idx_alloca} = alloca i64"));
+        let idx_alloca = self.emit_alloca("i64");
         self.line(&format!("store i64 0, ptr {idx_alloca}"));
         // 循环变量 alloca（元素类型 T，每次迭代覆盖）
-        let item_alloca = self.new_reg();
-        self.line(&format!("{item_alloca} = alloca {elem_ty}"));
+        let item_alloca = self.emit_alloca(elem_ty);
 
         let cond_label = self.new_label("for.cond");
         let body_label = self.new_label("for.body");
@@ -1340,12 +1354,10 @@ impl<'p> IrGenerator<'p> {
         let tptr = self.new_reg();
         self.line(&format!("{tptr} = load ptr, ptr {}", tbl_bind.value));
         // 计数器 alloca（i64）
-        let idx_alloca = self.new_reg();
-        self.line(&format!("{idx_alloca} = alloca i64"));
+        let idx_alloca = self.emit_alloca("i64");
         self.line(&format!("store i64 0, ptr {idx_alloca}"));
         // 循环变量 alloca（元素类型 T，每次迭代覆盖）
-        let item_alloca = self.new_reg();
-        self.line(&format!("{item_alloca} = alloca {elem_llvm}"));
+        let item_alloca = self.emit_alloca(elem_llvm);
 
         let cond_label = self.new_label("for.cond");
         let body_label = self.new_label("for.body");
@@ -1367,8 +1379,7 @@ impl<'p> IrGenerator<'p> {
 
         self.block_start(&body_label);
         // item = table_at(t, cur)（越界理论上不会发生：cur < len(t) 且表只增不减）
-        let ok = self.new_reg();
-        self.line(&format!("{ok} = alloca i1"));
+        let ok = self.emit_alloca("i1");
         self.line(&format!("store i1 1, ptr {ok}"));
         let val = self.new_reg();
         self.line(&format!(
@@ -1870,8 +1881,7 @@ impl<'p> IrGenerator<'p> {
             let elem_llvm = self.llvm_ty(&elem_ty);
             let suffix = table_elem_suffix(elem_llvm);
             self.mark_used(&format!("tie_table_at_{suffix}"));
-            let ok = self.new_reg();
-            self.line(&format!("{ok} = alloca i1"));
+            let ok = self.emit_alloca("i1");
             self.line(&format!("store i1 1, ptr {ok}"));
             let val = self.new_reg();
             self.line(&format!(
@@ -1934,8 +1944,7 @@ impl<'p> IrGenerator<'p> {
             // 表变量是 alloca ptr，先 load 出表指针
             let tptr = self.new_reg();
             self.line(&format!("{tptr} = load ptr, ptr {base_ptr}"));
-            let ok = self.new_reg();
-            self.line(&format!("{ok} = alloca i1"));
+            let ok = self.emit_alloca("i1");
             self.line(&format!("store i1 1, ptr {ok}"));
             let val = self.new_reg();
             self.line(&format!(
@@ -2493,8 +2502,7 @@ impl<'p> IrGenerator<'p> {
             let suffix = table_elem_suffix(elem_llvm);
             self.mark_used(&format!("tie_table_at_{suffix}"));
             // ok 标志：alloca i1，桥函数越界时置 0
-            let ok = self.new_reg();
-            self.line(&format!("{ok} = alloca i1"));
+            let ok = self.emit_alloca("i1");
             self.line(&format!("store i1 1, ptr {ok}"));
             let val = self.new_reg();
             self.line(&format!(
@@ -2720,8 +2728,7 @@ impl<'p> IrGenerator<'p> {
             self.mark_used("tie_parse_int");
             let (s, _t) = self.gen_expr(&args[0])?;
             // 栈上分配 ok 标志（桥写入 0/1），调用后检查
-            let ok = self.new_reg();
-            self.line(&format!("{ok} = alloca i8"));
+            let ok = self.emit_alloca("i8");
             self.line(&format!("store i8 0, ptr {ok}"));
             let tmp = self.new_reg();
             self.line(&format!("{tmp} = call i64 @tie_parse_int(ptr {s}, ptr {ok})"));
@@ -2747,8 +2754,7 @@ impl<'p> IrGenerator<'p> {
         if name == "parse_float" {
             self.mark_used("tie_parse_float");
             let (s, _t) = self.gen_expr(&args[0])?;
-            let ok = self.new_reg();
-            self.line(&format!("{ok} = alloca i8"));
+            let ok = self.emit_alloca("i8");
             self.line(&format!("store i8 0, ptr {ok}"));
             let tmp = self.new_reg();
             self.line(&format!("{tmp} = call double @tie_parse_float(ptr {s}, ptr {ok})"));
@@ -2775,8 +2781,7 @@ impl<'p> IrGenerator<'p> {
         if name == "parse_trit" {
             self.mark_used("tie_parse_trit");
             let (s, _t) = self.gen_expr(&args[0])?;
-            let ok = self.new_reg();
-            self.line(&format!("{ok} = alloca i8"));
+            let ok = self.emit_alloca("i8");
             self.line(&format!("store i8 0, ptr {ok}"));
             let tmp = self.new_reg();
             self.line(&format!("{tmp} = call i8 @tie_parse_trit(ptr {s}, ptr {ok})"));
@@ -2875,8 +2880,7 @@ impl<'p> IrGenerator<'p> {
             let (max, max_ty) = self.gen_expr(&args[1])?;
             let min64 = self.extend_int_to_i64(&min, min_ty, &args[0])?;
             let max64 = self.extend_int_to_i64(&max, max_ty, &args[1])?;
-            let ok = self.new_reg();
-            self.line(&format!("{ok} = alloca i8"));
+            let ok = self.emit_alloca("i8");
             self.line(&format!("store i8 0, ptr {ok}"));
             let tmp = self.new_reg();
             self.line(&format!(
@@ -3234,8 +3238,7 @@ impl<'p> IrGenerator<'p> {
             let (s, _t) = self.gen_expr(&args[0])?;
             let (p, _t) = self.gen_expr(&args[1])?;
             // 栈上分配 ok 标志（桥写入 0/1），调用后检查：0 → 模式非法错误
-            let ok = self.new_reg();
-            self.line(&format!("{ok} = alloca i8"));
+            let ok = self.emit_alloca("i8");
             self.line(&format!("store i8 0, ptr {ok}"));
             let tmp = self.new_reg();
             self.line(&format!("{tmp} = call i8 @tie_regex_match(ptr {s}, ptr {p}, ptr {ok})"));
@@ -3828,6 +3831,136 @@ impl<'p> IrGenerator<'p> {
     fn new_label(&mut self, prefix: &str) -> String {
         self.reg += 1;
         format!("{}.{}", prefix, self.reg)
+    }
+
+    /// 申请一个 alloca（F1：alloca 提升）。
+    ///
+    /// 指令不立即输出，而是进入 entry_allocas 缓冲；gen_fn 在函数体前统一 flush
+    /// 到 entry block 末尾。保证所有 alloca 位于 entry block（LLVM 规范），
+    /// 避免循环体内 alloca 逐次迭代累积栈空间导致栈溢出（0xC00000FD）。
+    fn emit_alloca(&mut self, ty: &str) -> String {
+        let reg = self.new_reg();
+        self.entry_allocas.push(format!("{reg} = alloca {ty}"));
+        reg
+    }
+
+    /// flush 全部提升的 alloca 到当前输出位置（gen_fn 的 entry 块末尾调用）。
+    fn flush_allocas(&mut self) {
+        let allocas = std::mem::take(&mut self.entry_allocas);
+        for a in &allocas {
+            self.line(a);
+        }
+    }
+
+    /// 全局重编号 IR 文本（F1 配套）：
+    ///
+    /// alloca 提升后，entry 块的 alloca 指令（如 %54 = alloca i1）在文本上位于
+    /// 函数体低编号指令（%1 = call ...）之前，编号倒挂。LLVM 解析器要求指令编号
+    /// 严格递增，故按文本出现顺序把 %N 统一重映射为 1..N。
+    ///
+    /// 行级处理要点：
+    /// - `%N = ...` 定义：重映射编号（首次出现分配新号）；
+    /// - 无编号指令（call/store/br/ret 等）：分配递增编号（LLVM 允许指令带编号）；
+    ///   其中变参 call（`call T (ptr, ...) @f`）经实测消耗 **2 个**编号槽
+    ///   （该 LLVM 版本解析变参调用时推进两个期望值），故编号再 +1 保证连续；
+    /// - 标签/注释/空行/declare/define：原样保留，不占编号。
+    fn renumber_ir(ir: &str) -> String {
+        use std::collections::HashMap;
+        let mut map: HashMap<u32, u32> = HashMap::new();
+        let mut next: u32 = 1;
+        let mut result = String::with_capacity(ir.len());
+        for line in ir.lines() {
+            let trimmed = line.trim_start();
+            // 新函数开始：重置编号（各函数编号独立，LLVM 允许跨函数复用）
+            if trimmed.starts_with("define ") {
+                map.clear();
+                next = 1;
+                result.push_str(line);
+                result.push('\n');
+                continue;
+            }
+            // 标签 / 注释 / 空行 / 声明行：原样保留（不占编号）
+            if trimmed.is_empty()
+                || trimmed.starts_with(';')
+                || trimmed.ends_with(':')
+                || trimmed.starts_with("declare ")
+                || trimmed.starts_with("attributes ")
+                || trimmed.starts_with("source_filename")
+                || trimmed.starts_with("target ")
+                || trimmed.starts_with("ModuleID")
+            {
+                result.push_str(line);
+                result.push('\n');
+                continue;
+            }
+            // 有编号指令：`%N = ...` → 重映射编号（引用同一 %N 也复用映射）
+            let mut rest = trimmed;
+            if rest.starts_with('%') {
+                let bytes = rest.as_bytes();
+                let mut j = 1;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > 1 {
+                    let n: u32 = rest[1..j].parse().unwrap_or(0);
+                    let new = *map.entry(n).or_insert_with(|| {
+                        let v = next;
+                        next += 1;
+                        v
+                    });
+                    result.push_str(&format!("%{new}"));
+                    rest = &rest[j..];
+                }
+            }
+            // 重映射行内其余 %N 引用（操作数/调用参数）
+            let mut rebuilt = String::new();
+            let bytes = rest.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'%' {
+                    let mut j = i + 1;
+                    let start = j;
+                    while j < bytes.len() && bytes[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    if j > start {
+                        let n: u32 = rest[start..j].parse().unwrap_or(0);
+                        let new = *map.entry(n).or_insert_with(|| {
+                            let v = next;
+                            next += 1;
+                            v
+                        });
+                        rebuilt.push('%');
+                        rebuilt.push_str(&new.to_string());
+                        i = j;
+                        continue;
+                    }
+                }
+                let ch = rest[i..].chars().next().unwrap_or('\0');
+                rebuilt.push(ch);
+                i += ch.len_utf8();
+            }
+            // 无编号指令：非 void 的 call 可编号（变参 call 消耗 2 槽）；
+            // void 指令（call void/store/br/ret/unreachable）LLVM 禁止命名，保持无编号
+            if !trimmed.starts_with('%') {
+                if trimmed.starts_with("call ") && !trimmed.starts_with("call void ") {
+                    let vararg = trimmed.contains("(ptr, ...)");
+                    let new = next;
+                    next += 1;
+                    if vararg {
+                        next += 1;
+                    }
+                    result.push_str(&format!("%{new} = {rebuilt}"));
+                } else {
+                    // void 指令：原样保留（引用已重映射）
+                    result.push_str(&rebuilt);
+                }
+            } else {
+                result.push_str(&rebuilt);
+            }
+            result.push('\n');
+        }
+        result
     }
 
     /// 输出一行（带当前缩进）。
@@ -4631,5 +4764,58 @@ mod tests {
         assert!(ir.contains("= add i64 %"));
         assert!(ir.contains("= sub i64 %"));
         assert!(ir.contains("store i64 %"));
+    }
+
+    // ---------- F1：alloca 提升 + 全局重编号 ----------
+
+    #[test]
+    fn renumber_ir_全局重编号() {
+        // alloca 提升场景：entry 块 %54 = alloca 在函数体 %1 = call 之前（编号倒挂）
+        let src = "define void @main() {\nentry:\n  %54 = alloca i1\n  %1 = call ptr @tie_table_new(i64 8)\n  store ptr %1, ptr %54\n  br label %loop.cond.2\nloop.cond.2:\n  %19 = load i64, ptr %54\n  %2 = icmp slt i64 %19, 100\n  br i1 %2, label %loop.body.3, label %loop.exit.4\nloop.body.3:\n  %55 = load i64, ptr %54\n  br label %loop.cond.2\nloop.exit.4:\n  ret void\n}";
+        let re = super::IrGenerator::renumber_ir(src);
+        // 定义行（`%N = `）编号必须严格递增；引用可重复出现（同一寄存器多次使用合法）
+        let mut prev = 0u32;
+        for line in re.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix('%') {
+                let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if !num.is_empty() && rest[num.len()..].starts_with(" = ") {
+                    let n: u32 = num.parse().unwrap();
+                    assert!(n > prev, "定义编号未递增: {n} <= {prev}\n{re}");
+                    prev = n;
+                }
+            }
+        }
+        // 所有寄存器引用（含提升的 alloca）都保留
+        assert!(re.contains("= alloca i1"), "应保留 alloca 定义");
+        assert!(re.contains("@tie_table_new"), "函数调用保留");
+    }
+
+    #[test]
+    fn renumber_ir_无编号指令分配编号() {
+        // 无编号指令（call/store/br）与变参 call 混合：行级处理应分配递增编号
+        let src = "define void @main() {\nentry:\n  %1 = alloca i64\n  store i64 0, ptr %1\n  br label %l.2\nl.2:\n  %2 = load i64, ptr %1\n  call i32 (ptr, ...) @printf(ptr null, i64 %2)\n  call void @exit(i32 1)\n  %3 = add i64 %2, 1\n  store i64 %3, ptr %1\n  br label %l.2\n}";
+        let re = super::IrGenerator::renumber_ir(src);
+        // 非 void 指令（alloca/load/call/add）获得递增编号；void 指令（store/br）无编号
+        let mut prev = 0u32;
+        let mut cmd_count = 0;
+        for line in re.lines() {
+            let t = line.trim();
+            if t.starts_with('%') {
+                let num: String = t[1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+                if !num.is_empty() && t[1 + num.len()..].starts_with(" = ") {
+                    let n: u32 = num.parse().unwrap();
+                    assert!(n > prev, "编号未递增: {n} <= {prev}\n{re}");
+                    prev = n;
+                    cmd_count += 1;
+                }
+            }
+        }
+        // 非 void 指令：alloca/load/printf/add = 4 条（变参 call 占 2 槽编号到 5+）
+        assert!(cmd_count >= 4, "应有 ≥4 条编号指令，实际 {cmd_count}\n{re}");
+        assert!(re.contains("call i32 (ptr, ...) @printf"), "变参 call 保留");
+        // void 指令保持无编号（LLVM 禁止命名）
+        assert!(re.contains("store i64 0, ptr %1"), "store 应保持无编号");
+        assert!(re.contains("br label %l.2"), "br 应保持无编号");
     }
 }
