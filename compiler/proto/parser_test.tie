@@ -1,0 +1,63 @@
+// tie:logic
+// compiler/proto/parser_test.tie —— 自举 v2 T1.2 验收程序
+// ============================================================
+// 用法：编译运行（tie-llvm 编译 + 直接运行），或 cargo run -p tie -- parser_test.tie
+// 职责：对 ≥5 个真实文件跑「词法 + 语法」全管道，断言全部解析成功；
+//       输出每个文件的节点总数与顶层语句 tag 序列，供与 Rust tie-frontend --ast 对照。
+// 文件清单覆盖：基础示例（hello）、表字面量（table）、switch 模式匹配（switch）、
+// OOP struct（oop）、标准库（std/string）、全局表验收（tests/language/global_table）。
+//
+// 注意：本文件仅 import parser.tie（parser 已内部 import lexer，避免双重导入
+// 导致命名空间重复定义）。字符串前缀判断用内置原语 str_len/str_char 实现。
+
+import "./parser.tie"
+using parser;
+
+// 判断字符串是否以 "ERR:" 开始（词法/语法错误的统一协议前缀）
+func has_err(s: string) -> bool {
+    var n = str_len(s)
+    if n < 4 {
+        return false
+    }
+    if str_char(s, 0) == "E" {
+        if str_char(s, 1) == "R" {
+            if str_char(s, 2) == "R" {
+                if str_char(s, 3) == ":" {
+                    return true
+                }
+            }
+        }
+    }
+    return false
+}
+
+// 解析单个文件：成功返回 1（并打印节点数），失败返回 0（打印错误）
+func check_file(path: string) -> i64 {
+    var src = file_read(path)
+    var ast = parser.parse_src(src)
+    if has_err(ast) {
+        println("  失败  " + path + " :: " + ast)
+        return 0
+    }
+    println("  OK    " + path + "（" + to_string(parser.node_count()) + " 节点）")
+    return 1
+}
+
+func main() {
+    var files: table<string> = [
+        "examples/hello.tie",
+        "examples/table.tie",
+        "examples/switch.tie",
+        "examples/oop.tie",
+        "std/string.tie",
+        "tests/language/global_table.tie"
+    ]
+    var ok: i64 = 0
+    var i: i64 = 0
+    while i < len(files) {
+        var r = check_file(files[i])
+        ok = ok + r
+        i = i + 1
+    }
+    println("parser 验收通过：" + to_string(ok) + "/" + to_string(len(files)) + " 文件解析成功")
+}

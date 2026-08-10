@@ -1,0 +1,2877 @@
+// tie:library
+// compiler/proto/parser.tie —— 自举 v2 T1.2：用 tie 语言重写的语法分析原型
+// ============================================================
+// 里程碑：自举 v2 计划 T1.2（见 .omo/plans/self-hosting-v2.md），消费 T1.1
+// lexer.tie 的**列式 token 表**（T0.4 全局表），产出**列式 tag 表 AST**
+// （B1 arena，docs/plans/self-hosting.md §3.5 修订编码）。行为基准是 Rust 版
+// crates/tie-frontend/src/parser.rs（parse_program 入口 + 全部语句/表达式规则
+// + ParseError 消息文本）。
+//
+// # 职责：token 流 → 列式 AST arena（节点 id = 全局表下标）
+//   全局列式表（全部 table<i64>，下标对齐 = 节点 id）：
+//     node_tags       : table<i64>   第 0 列：节点 tag（见下方 tag 编号表）
+//     node_names      : table<i64>   第 1 列：字符串池 id（-1 = 无名字）
+//     node_vals       : table<i64>   第 2 列：主整数值（字面量值/运算符编号/标志）
+//     node_aux        : table<i64>   第 3 列：次整数值（nparams/nsegs/ncases/别名等）
+//     node_child_off  : table<i64>   第 4 列：子节点段起点（node_children 中的偏移）
+//     node_nchild     : table<i64>   第 5 列：子节点个数
+//     node_children   : table<i64>   第 6 列：**扁平化**子节点 id 拼接区（段偏移方案）
+//     node_lines      : table<i64>   第 7 列：起始行（1 起；旁路 span 表）
+//     node_cols       : table<i64>   第 8 列：起始列（1 起）
+//
+//   - 节点 i 的子节点 = node_children[node_child_off[i] .. +node_nchild[i])
+//   - 可空字段用 -1 哨兵（子节点槽位存 -1 表示无节点；T1.3 消费时先判 >= 0）
+//   - 字符串字段统一存字符串池 id（intern.intern 登记；与 lexer 共用同一池，
+//     lexeme 直接 intern 回来即可复用原 id）
+//   - 节点创建即确定 tag 与标量字段；子节点先收集进局部表，再经 set_children
+//     一次性**连续批量**追加进 node_children（保证每节点子节点段连续，段偏移
+//     O(1) 读取；无 O(n²) 拼接）
+//
+// # 设计修订（实测语言边界，2026-08-10）：
+//   原 §3.5 方案的 node_children 拟用 `table<table<i64>>` 全局嵌套表，实测发现：
+//   (1) 全局嵌套表无法用空字面量重置（IR 缺陷：空嵌套字面量是 [0 x i64] 与 ptr 不符）；
+//   (2) 局部别名子表（var sub = g[i]）table_push 报「找不到表变量元素类型」；
+//   (3) 双重 import 同一文件 → 命名空间重复定义（故本文件仅 import lexer.tie）。
+//   故 node_children 改为**全局 table<i64> 扁平化 + 段偏移表**（任务书预先认可的
+//   替代方案），其余设计不变。
+//
+// # 节点 tag 编号表（按 Rust ast.rs Stmt/Expr 变体顺序对齐，便于 --ast 对比）
+//   段 0-22 表达式（Rust Expr 顺序）：0=IntLit 1=FloatLit 2=StrLit 3=CharLit
+//     4=BoolLit 5=TritLit 6=Var 7=Call 8=Unary 9=Binary 10=Ternary 11=Range
+//     12=TableLit 13=Index 14=TupleLit 15=FieldAccess 16=Path 17=TypeLit
+//     18=MethodCall
+//   段 19-22 表达式辅助：19=TableCell 20=TableId 21=TupleField 22=Segment
+//   段 100-117 语句（Rust Stmt 顺序）：100=VarDecl 101=FnDef 102=ExprStmt
+//     103=Assign 104=Return 105=If 106=While 107=For 108=Break 109=Continue
+//     110=Switch 111=Import 112=Namespace 113=Using 114=Struct
+//     115=FieldAssign 116=IndexAssign 117=Extern
+//   段 118-125 语句辅助：118=Param 120=SwitchCase 121=PatternList
+//     122=StmtList 123=ClassField 124=TupleTypeField（125 预留 Label 未用——
+//     循环/跳转标签直接存 name/aux 字段，无独立 Label 节点）
+//   段 200-204 类型：200=NamedType（val=TyKw 索引，name=类型关键字文本池 id）
+//     201=TupleType 202=StructType（name=struct 名） 203=TableType（children=[元素类型]）
+//     204=MapType（children=[值类型]；裸 map 合成 map<i64>）
+//
+// # 节点字段布局（children 列表按序，-1 = 无）
+//   表达式：IntLit[val=值] / FloatLit[name=lexeme] / StrLit[name=lexeme]
+//     CharLit[name=lexeme] / BoolLit[val=0/1] / TritLit[val=-1/0/1]
+//     Var[name] / Call[name=函数名, children=实参...]
+//     Unary[val=一元 op 码, children=[操作数]]
+//     Binary[val=二元 op 码, children=[左, 右]]
+//     Ternary[children=[条件, 真支, 假支]] / Range[children=[起点, 终点]]
+//     TableLit[children=TableCell...] / Index[children=[基址, 下标]]
+//     TupleLit[children=TupleField...]
+//     FieldAccess[name=字段名, children=[基址]] / Path[children=Segment...]
+//     TypeLit[children=[类型节点]] / MethodCall[name=方法名, children=[接收者, 实参...]]
+//     TableCell[val=行号, children=[TableId 或 -1, 值]]
+//     TableId[name=字符串键池 id(-1=数字键), val=数字键值]
+//     TupleField[name=字段名(-1=匿名), children=[值]] / Segment[name=段名池 id]
+//   语句：VarDecl[name, val=is_const, children=[类型或 -1, 初值]]
+//     FnDef[name=函数名, val=is_pub, aux=nparams, children=[返回类型]+参数...+[函数体 StmtList]]
+//     ExprStmt[children=[表达式]] / Assign[name=目标名, val=op 码(-1=普通), children=[值]]
+//     Return[children=[表达式或 -1]] / If[children=[条件, then StmtList, else StmtList]]
+//     While[name=循环标签(-1=无), children=[条件, 体 StmtList]]
+//     For[name=迭代变量, aux=循环标签, children=[迭代对象, 体 StmtList]]
+//     Break/Continue[name=标签(-1=无)]
+//     Switch[aux=ncases, children=[主体]+cases...+[default StmtList]]
+//     Import[name=路径池 id, aux=别名(-1=无)] / Using[aux=nsegs, children=Segment...]
+//     Namespace[aux=nsegs, children=Segment...+[体 StmtList]]
+//     Struct[name, aux=父名(-1=无), children=ClassField...]
+//     FieldAssign[name=字段名, val=op 码, children=[基址, 值]]
+//     IndexAssign[val=op 码, children=[目标, 值]]
+//     Extern[name, aux=nparams, children=[返回类型]+参数...]
+//     Param[name=参数名, val=by_ref(0/1), children=[类型, 默认值或 -1]]
+//     SwitchCase[children=[PatternList, when 或 -1, 体 StmtList]]
+//     PatternList[children=模式表达式...] / StmtList[children=语句...]
+//     ClassField[name, children=[类型或 -1, 默认值或 -1]]
+//     TupleTypeField[name=字段名(-1=匿名), children=[类型]]
+//
+// # 二元/一元 op 码（对齐 Rust BinaryOp/UnaryOp 变体顺序）
+//   二元：0=Add 1=Sub 2=Mul 3=Div 4=Mod 5=Eq 6=NotEq 7=Lt 8=Gt 9=Le 10=Ge
+//     11=And 12=Or 13=BitAnd 14=BitOr 15=BitXor 16=Shl 17=Shr
+//   一元：0=Neg 1=Not 2=PreInc 3=PreDec 4=PostInc 5=PostDec
+//
+// # 类型关键字 TyKw 索引（对齐 Rust TyKw 变体顺序）：0=i8 1=i16 2=i32 3=i64
+//   4=u8 5=u16 6=u32 7=u64 8=f32 9=f64 10=bool 11=trit 12=char 13=string
+//   14=void 15=code 16=num 17=text 18=misc 19=table 20=map
+//
+// # 协议（parse 返回值，T1.3 语义单遍将消费）
+//   首行 <N>:（N = 节点总数）
+//   之后每行一个节点：<id> <tag> <name_id> <val> <aux> <line> <col> <nchild> <c1> <c2> ...
+//   语法错误：ERR:<line> <col> <message>（对齐 Rust「语法错误 @行:列: 消息」）
+//   parse_debug 返回可读树形输出（缩进展示 tag 名 + lexeme + span + 顶层语句序列）。
+//
+// # 词法游标与 >> 分裂（A1/E1 类型参数闭括号）
+//   游标 g_pos 指向真实 token 流；g_pending 是 FIFO 虚拟 token 队列（容纳
+//   `table<table<i64>>` 的 `>>` 闭括号分裂 remainder）。peek/advance 先消费
+//   pending 再消费真实流。split_current_gt(remainder)：pending 内原位覆盖 + 前移
+//   游标 / 否则 push remainder 到队尾并 g_pos++（Shr→余 Gt、Ge→余 Eq、ShrEq→余 Ge）。
+//
+// # 错误处理
+//   无异常：每个解析函数返回节点 id 或 -1（错误已写入 p_err_* 全局槽），
+//   调用链逐层检查 -1 立即返回（错误路径不继续构建 AST）。
+
+// ---------- 导入（仅 lexer，避免双重 import 重复定义）----------
+// intern/str 命名空间经 lexer 的 import 链传递可见（实测）；字符串操作尽量用内置原语。
+import "./lexer.tie"
+using lexer;
+
+// ---------- AST 节点 tag 常量（对齐 Rust ast.rs 变体顺序）----------
+const N_INT_LIT: i64 = 0;
+const N_FLOAT_LIT: i64 = 1;
+const N_STR_LIT: i64 = 2;
+const N_CHAR_LIT: i64 = 3;
+const N_BOOL_LIT: i64 = 4;
+const N_TRIT_LIT: i64 = 5;
+const N_VAR: i64 = 6;
+const N_CALL: i64 = 7;
+const N_UNARY: i64 = 8;
+const N_BINARY: i64 = 9;
+const N_TERNARY: i64 = 10;
+const N_RANGE: i64 = 11;
+const N_TABLE_LIT: i64 = 12;
+const N_INDEX: i64 = 13;
+const N_TUPLE_LIT: i64 = 14;
+const N_FIELD_ACCESS: i64 = 15;
+const N_PATH: i64 = 16;
+const N_TYPE_LIT: i64 = 17;
+const N_METHOD_CALL: i64 = 18;
+const N_TABLE_CELL: i64 = 19;
+const N_TABLE_ID: i64 = 20;
+const N_TUPLE_FIELD: i64 = 21;
+const N_SEGMENT: i64 = 22;
+const N_VAR_DECL: i64 = 100;
+const N_FN_DEF: i64 = 101;
+const N_EXPR_STMT: i64 = 102;
+const N_ASSIGN: i64 = 103;
+const N_RETURN: i64 = 104;
+const N_IF: i64 = 105;
+const N_WHILE: i64 = 106;
+const N_FOR: i64 = 107;
+const N_BREAK: i64 = 108;
+const N_CONTINUE: i64 = 109;
+const N_SWITCH: i64 = 110;
+const N_IMPORT: i64 = 111;
+const N_NAMESPACE: i64 = 112;
+const N_USING: i64 = 113;
+const N_STRUCT: i64 = 114;
+const N_FIELD_ASSIGN: i64 = 115;
+const N_INDEX_ASSIGN: i64 = 116;
+const N_EXTERN: i64 = 117;
+const N_PARAM: i64 = 118;
+const N_SWITCH_CASE: i64 = 120;
+const N_PATTERN_LIST: i64 = 121;
+const N_STMTLIST: i64 = 122;
+const N_CLASS_FIELD: i64 = 123;
+const N_TUPLE_TYPE_FIELD: i64 = 124;
+const N_NAMED_TYPE: i64 = 200;
+const N_TUPLE_TYPE: i64 = 201;
+const N_STRUCT_TYPE: i64 = 202;
+const N_TABLE_TYPE: i64 = 203;
+const N_MAP_TYPE: i64 = 204;
+
+// ---------- 二元/一元 op 码（对齐 Rust BinaryOp/UnaryOp 顺序）----------
+const B_ADD: i64 = 0;
+const B_SUB: i64 = 1;
+const B_MUL: i64 = 2;
+const B_DIV: i64 = 3;
+const B_MOD: i64 = 4;
+const B_EQ: i64 = 5;
+const B_NOTEQ: i64 = 6;
+const B_LT: i64 = 7;
+const B_GT: i64 = 8;
+const B_LE: i64 = 9;
+const B_GE: i64 = 10;
+const B_AND: i64 = 11;
+const B_OR: i64 = 12;
+const B_BITAND: i64 = 13;
+const B_BITOR: i64 = 14;
+const B_BITXOR: i64 = 15;
+const B_SHL: i64 = 16;
+const B_SHR: i64 = 17;
+
+const U_NEG: i64 = 0;
+const U_NOT: i64 = 1;
+const U_PRE_INC: i64 = 2;
+const U_PRE_DEC: i64 = 3;
+const U_POST_INC: i64 = 4;
+const U_POST_DEC: i64 = 5;
+
+// ---------- 类型关键字 TyKw 索引（对齐 Rust TyKw 顺序）----------
+const TK_I8: i64 = 0;
+const TK_I16: i64 = 1;
+const TK_I32: i64 = 2;
+const TK_I64: i64 = 3;
+const TK_U8: i64 = 4;
+const TK_U16: i64 = 5;
+const TK_U32: i64 = 6;
+const TK_U64: i64 = 7;
+const TK_F32: i64 = 8;
+const TK_F64: i64 = 9;
+const TK_BOOL: i64 = 10;
+const TK_TRIT: i64 = 11;
+const TK_CHAR: i64 = 12;
+const TK_STR: i64 = 13;
+const TK_VOID: i64 = 14;
+const TK_CODE: i64 = 15;
+const TK_NUM: i64 = 16;
+const TK_TEXT: i64 = 17;
+const TK_MISC: i64 = 18;
+const TK_TABLE: i64 = 19;
+const TK_MAP: i64 = 20;
+
+// ---------- 全局列式 AST 表（T0.4 全局表：下标对齐 = 节点 id）----------
+var node_tags: table<i64>;
+var node_names: table<i64>;
+var node_vals: table<i64>;
+var node_aux: table<i64>;
+var node_child_off: table<i64>;
+var node_nchild: table<i64>;
+var node_children: table<i64>;
+var node_lines: table<i64>;
+var node_cols: table<i64>;
+
+// ---------- 词法游标与 pending（>> 分裂）状态 ----------
+var g_pos: i64 = 0;           // 真实 token 流游标
+var g_pending: table<i64>;    // 待消费虚拟 token 队列（FIFO）
+var g_pending_idx: i64 = 0;   // 指向 g_pending 中下一个待消费位置
+var g_pending_lines: table<i64>;  // 虚拟 token 的旁路行号
+var g_pending_cols: table<i64>;   // 虚拟 token 的旁路列号
+
+// ---------- 语法错误槽位（parse 返回 ERR: 协议）----------
+var p_err_line: i64 = 0;
+var p_err_col: i64 = 0;
+var p_err_msg: string = "";
+
+// ---------- 元组解构临时变量计数器（生成 _tmpN 唯一名）----------
+var g_tmp: i64 = 0;
+
+// ---------- tag 名称表（懒构建，仅供 describe/parse_debug 使用）----------
+var g_tag_names: table<string>;   // 节点 tag → 名称
+var g_tok_names: table<string>;   // token tag → Rust Debug 变体名
+
+namespace parser {// ---------- 节点池：重置 / 创建 / 链接 / 读取 ----------
+// ---------- 节点池：重置 / 创建 / 子节点批量设置 ----------
+
+// 重置全部节点表与游标/错误状态（每次 parse 前调用）
+pub func reset_nodes() {
+    node_tags = table_new_i64()
+    node_names = table_new_i64()
+    node_vals = table_new_i64()
+    node_aux = table_new_i64()
+    node_child_off = table_new_i64()
+    node_nchild = table_new_i64()
+    node_children = table_new_i64()
+    node_lines = table_new_i64()
+    node_cols = table_new_i64()
+    g_pos = 0
+    g_pending = table_new_i64()
+    g_pending_idx = 0
+    g_pending_lines = table_new_i64()
+    g_pending_cols = table_new_i64()
+    p_err_line = 0
+    p_err_col = 0
+    p_err_msg = ""
+}
+
+// 当前节点总数
+pub func node_count() -> i64 {
+    return len(node_tags)
+}
+
+// 第 i 个节点的 tag（供验收程序统计对照）
+pub func node_tag(i: i64) -> i64 {
+    return node_tags[i]
+}
+
+// 创建节点：tag/name/val/aux + span（子节点稍后经 set_children 一次性设置）
+func new_node(tag: i64, name: i64, val: i64, aux: i64, line: i64, col: i64) -> i64 {
+    table_push(node_tags, tag)
+    table_push(node_names, name)
+    table_push(node_vals, val)
+    table_push(node_aux, aux)
+    table_push(node_child_off, 0)
+    table_push(node_nchild, 0)
+    table_push(node_lines, line)
+    table_push(node_cols, col)
+    return len(node_tags) - 1
+}
+
+// 一次性批量设置子节点：children 已收集完毕，连续 push 进 node_children 段，
+// 记录段起点与个数。子节点列表允许含 -1 哨兵（空槽位）。
+func set_children(node: i64, children: table<i64>) {
+    node_child_off[node] = len(node_children)
+    var k: i64 = 0
+    while k < len(children) {
+        table_push(node_children, children[k])
+        k = k + 1
+    }
+    node_nchild[node] = len(children)
+}
+
+// 子节点个数
+func child_count(id: i64) -> i64 {
+    return node_nchild[id]
+}
+
+// 第 i 个子节点 id
+func child_at(id: i64, i: i64) -> i64 {
+    return node_children[node_child_off[id] + i]
+}
+
+// 是否 StmtList 节点（parse_var_decl 解构时返回的多语句包装）
+func is_stmt_list(id: i64) -> bool {
+    if id < 0 {
+        return false
+    }
+    return node_tags[id] == N_STMTLIST
+}
+
+// 收集语句到列表：解构 StmtList 时展开其子语句，否则直接收集
+func collect_stmt(list: ref table<i64>, s: i64) {
+    if is_stmt_list(s) {
+        var k: i64 = 0
+        while k < child_count(s) {
+            table_push(list, child_at(s, k))
+            k = k + 1
+        }
+    } else {
+        table_push(list, s)
+    }
+}
+
+// ---------- 错误槽位 ----------
+
+func set_err(line: i64, col: i64, msg: string) {
+    p_err_line = line
+    p_err_col = col
+    p_err_msg = msg
+}
+
+// 组装错误协议文本：ERR:<line> <col> <message>
+func err_protocol() -> string {
+    return "ERR:" + to_string(p_err_line) + " " + to_string(p_err_col) + " " + p_err_msg
+}
+
+// ---------- tag 名称表（懒构建）----------
+
+// 构建节点 tag 名称表（len = 205，非连续 tag 处填空串；仅 parse_debug 使用）
+func ensure_tag_names() {
+    if len(g_tag_names) > 0 {
+        return
+    }
+    g_tag_names = table_new_string()
+    var tags: table<i64> = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        17, 18, 19, 20, 21, 22, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
+        110, 111, 112, 113, 114, 115, 116, 117, 118, 120, 121, 122, 123, 124, 200,
+        201, 202, 203, 204]
+    var names: table<string> = ["IntLit", "FloatLit", "StrLit", "CharLit", "BoolLit",
+        "TritLit", "Var", "Call", "Unary", "Binary", "Ternary", "Range", "TableLit",
+        "Index", "TupleLit", "FieldAccess", "Path", "TypeLit", "MethodCall",
+        "TableCell", "TableId", "TupleField", "Segment", "VarDecl", "FnDef",
+        "ExprStmt", "Assign", "Return", "If", "While", "For", "Break", "Continue",
+        "Switch", "Import", "Namespace", "Using", "Struct", "FieldAssign",
+        "IndexAssign", "Extern", "Param", "SwitchCase", "PatternList", "StmtList",
+        "ClassField", "TupleTypeField", "NamedType", "TupleType", "StructType",
+        "TableType", "MapType"]
+    var i: i64 = 0
+    while i < len(tags) {
+        while len(g_tag_names) < tags[i] {
+            table_push(g_tag_names, "")
+        }
+        table_push(g_tag_names, names[i])
+        i = i + 1
+    }
+}
+
+// 构建 token tag 名称表（对齐 Rust TokenKind 的 Debug 变体名，供 describe 使用）
+func ensure_tok_names() {
+    if len(g_tok_names) > 0 {
+        return
+    }
+    g_tok_names = table_new_string()
+    var names: table<string> = ["Int", "Float", "Str", "CharLit", "Ident", "Func",
+        "Var", "Const", "If", "Else", "While", "For", "In", "Return", "Break",
+        "Continue", "Switch", "Case", "Default", "When", "Import", "As", "Struct",
+        "Extends", "Namespace", "Pub", "Using", "Extern", "True", "False", "Zero",
+        "Ref", "TypeKw", "LParen", "RParen", "LBrace", "RBrace", "LBracket",
+        "RBracket", "Comma", "Colon", "DoubleColon", "Semi", "Dot", "DotDot",
+        "Arrow", "Plus", "Minus", "Star", "Slash", "Percent", "Eq", "EqEq",
+        "NotEq", "Lt", "Gt", "Le", "Ge", "AndAnd", "OrOr", "Bang", "PlusEq",
+        "MinusEq", "StarEq", "SlashEq", "PercentEq", "AmpEq", "PipeEq", "CaretEq",
+        "ShlEq", "ShrEq", "Amp", "Pipe", "Caret", "Shl", "Shr", "Inc", "Dec",
+        "Question", "Eof"]
+    var i: i64 = 0
+    while i < len(names) {
+        table_push(g_tok_names, names[i])
+        i = i + 1
+    }
+}
+
+// 节点 tag 的可读名称（parse_debug 用）
+func node_tag_name(tag: i64) -> string {
+    ensure_tag_names()
+    return g_tag_names[tag]
+}
+
+// token tag 的可读描述（对齐 Rust describe 的 {other:?} Debug 变体名）
+func tok_debug_name(tag: i64) -> string {
+    ensure_tok_names()
+    return g_tok_names[tag]
+}
+
+// ---------- 词法游标（含 >> 分裂 pending 队列）----------
+
+// 待消费虚拟 token 个数
+func pending_n() -> i64 {
+    return len(g_pending) - g_pending_idx
+}
+
+// 当前有效 token tag（先消费 pending 队列，再消费真实 token 流）
+func peek_tag() -> i64 {
+    if g_pending_idx < len(g_pending) {
+        return g_pending[g_pending_idx]
+    }
+    return lexer.token_tag(g_pos)
+}
+
+// 当前有效 token 行号
+func peek_line() -> i64 {
+    if g_pending_idx < len(g_pending) {
+        return g_pending_lines[g_pending_idx]
+    }
+    return lexer.token_line(g_pos)
+}
+
+// 当前有效 token 列号
+func peek_col() -> i64 {
+    if g_pending_idx < len(g_pending) {
+        return g_pending_cols[g_pending_idx]
+    }
+    return lexer.token_col(g_pos)
+}
+
+// 当前有效 token 的 lexeme 文本（虚拟 token 无 lexeme 返回空串）
+func peek_lexeme() -> string {
+    if g_pending_idx < len(g_pending) {
+        return ""
+    }
+    return lexer.token_lexeme(g_pos)
+}
+
+// 推进游标：优先消费 pending 队列，队列空时消费真实 token 流
+func advance() {
+    if g_pending_idx < len(g_pending) {
+        g_pending_idx = g_pending_idx + 1
+    } else {
+        g_pos = g_pos + 1
+    }
+}
+
+// 消费当前 token 若匹配 tag；返回是否消费
+func eat(tag: i64) -> bool {
+    if peek_tag() == tag {
+        advance()
+        return true
+    }
+    return false
+}
+
+// 第 n 个后续 token 的 tag（n=0 当前，1 下一…；合并 pending 与真实流的合成视图）
+func peek_n(n: i64) -> i64 {
+    var pn = pending_n()
+    if n < pn {
+        return g_pending[g_pending_idx + n]
+    }
+    var k = g_pos + (n - pn)
+    var total = lexer.token_count()
+    if k >= total {
+        k = total - 1
+    }
+    return lexer.token_tag(k)
+}
+
+// 当前 token 的可读描述（对齐 Rust describe；错误消息用）
+func describe(tag: i64) -> string {
+    if tag == T_IDENT {
+        return "标识符 '" + peek_lexeme() + "'"
+    }
+    if tag == T_INT {
+        return "整数 " + peek_lexeme()
+    }
+    if tag == T_FLOAT {
+        return "浮点数 " + peek_lexeme()
+    }
+    if tag == T_STR {
+        return "字符串"
+    }
+    if tag == T_TYPEKW {
+        return "类型 '" + peek_lexeme() + "'"
+    }
+    if tag == T_SEMI {
+        return "分号"
+    }
+    if tag == T_EOF {
+        return "文件结束"
+    }
+    return tok_debug_name(tag)
+}
+
+// 期望当前 token 为指定 tag；失败报「期望 {what}，实际是 {describe}」
+func expect(tag: i64, what: string) -> bool {
+    if peek_tag() == tag {
+        advance()
+        return true
+    }
+    set_err(peek_line(), peek_col(), "期望 " + what + "，实际是 " + describe(peek_tag()))
+    return false
+}
+
+// 期望当前为标识符；成功返回其字符串池 id，失败返回 -1
+func expect_ident() -> i64 {
+    if peek_tag() == T_IDENT {
+        var id = intern.intern(peek_lexeme())
+        advance()
+        return id
+    }
+    set_err(peek_line(), peek_col(), "期望标识符，实际是 " + describe(peek_tag()))
+    return -1
+}
+
+// ---------- >> 闭括号分裂（A1/E1 类型参数）----------
+
+// 分裂当前 token（Shr/Ge/ShrEq）为两个：当前位置按 Gt 消费，remainder 成为下一 token。
+// 分裂映射：Shr→余 Gt、Ge→余 Eq、ShrEq→余 Ge（Ge 再经一轮分裂为 Gt + Eq）。
+func split_current_gt(remainder: i64) {
+    if g_pending_idx < len(g_pending) {
+        // 当前在 pending 队列中：原位覆盖为 remainder（当前位置按 Gt 消费）
+        g_pending[g_pending_idx] = remainder
+        g_pending_idx = g_pending_idx + 1
+    } else {
+        // 当前在真实 token 流：记录 span，push remainder 到队尾，消费原位
+        table_push(g_pending, remainder)
+        table_push(g_pending_lines, lexer.token_line(g_pos))
+        table_push(g_pending_cols, lexer.token_col(g_pos))
+        g_pos = g_pos + 1
+    }
+}
+
+// 类型参数闭括号 '>'（支持 Shr/Ge/ShrEq 复合 token 分裂）
+func expect_type_gt(what: string) -> bool {
+    var tag = peek_tag()
+    if tag == T_GT {
+        advance()
+        return true
+    }
+    if tag == T_SHR {
+        split_current_gt(T_GT)
+        return true
+    }
+    if tag == T_GE {
+        split_current_gt(T_EQ)
+        return true
+    }
+    if tag == T_SHREQ {
+        split_current_gt(T_GE)
+        return true
+    }
+    set_err(peek_line(), peek_col(), what + "，实际是 " + describe(tag))
+    return false
+}
+
+// ---------- 类型关键字与整数字面量 ----------
+
+// 类型关键字文本 → TyKw 索引（对齐 Rust TyKw 枚举顺序）
+func typekw_index(s: string) -> i64 {
+    switch s {
+        case "i8": return 0
+        case "i16": return 1
+        case "i32": return 2
+        case "i64": return 3
+        case "u8": return 4
+        case "u16": return 5
+        case "u32": return 6
+        case "u64": return 7
+        case "f32": return 8
+        case "f64": return 9
+        case "bool": return 10
+        case "trit": return 11
+        case "char": return 12
+        case "string": return 13
+        case "void": return 14
+        case "code": return 15
+        case "num": return 16
+        case "text": return 17
+        case "misc": return 18
+        case "table": return 19
+        case "map": return 20
+        default: return -1
+    }
+}
+
+// 单个字符的数值（0-9 a-f A-F → 0-15；其余 -1）
+func digit_val(c: string) -> i64 {
+    var cc = char_code(c)
+    if cc >= 48 {
+        if cc <= 57 {
+            return cc - 48
+        }
+    }
+    if cc >= 97 {
+        if cc <= 102 {
+            return cc - 87
+        }
+    }
+    if cc >= 65 {
+        if cc <= 70 {
+            return cc - 55
+        }
+    }
+    return -1
+}
+
+// 整数字面量 lexeme → i64 值（支持十进制/0x/0b/0o/0t 前缀）
+func parse_int_lit(lex: string) -> i64 {
+    var n = str_len(lex)
+    var base: i64 = 10
+    var start: i64 = 0
+    if n >= 2 {
+        var c0 = str_char(lex, 0)
+        var c1 = str_char(lex, 1)
+        if c0 == "0" {
+            if c1 == "x" || c1 == "X" {
+                base = 16
+                start = 2
+            } else if c1 == "b" || c1 == "B" {
+                base = 2
+                start = 2
+            } else if c1 == "o" || c1 == "O" {
+                base = 8
+                start = 2
+            } else if c1 == "t" || c1 == "T" {
+                base = 3
+                start = 2
+            }
+        }
+    }
+    var val: i64 = 0
+    var i = start
+    while i < n {
+        var c = str_char(lex, i)
+        var d = digit_val(c)
+        if d < 0 {
+            break
+        }
+        if d >= base {
+            break
+        }
+        val = val * base + d
+        i = i + 1
+    }
+    return val
+}
+
+// 类型节点是否为表类型（table<T> 或裸 table；VarDecl 省略初始化器判定用）
+func is_table_type(ty: i64) -> bool {
+    if ty < 0 {
+        return false
+    }
+    var tag = node_tags[ty]
+    if tag == N_TABLE_TYPE {
+        return true
+    }
+    if tag == N_NAMED_TYPE {
+        if node_vals[ty] == TK_TABLE {
+            return true
+        }
+    }
+    return false
+}
+
+// 是否赋值运算符 token（快速路径预探测，不消费）
+func is_assign_op_tag(tag: i64) -> bool {
+    if tag == T_EQ {
+        return true
+    }
+    if tag >= T_PLUSEQ {
+        if tag <= T_SHREQ {
+            return true
+        }
+    }
+    return false
+}
+
+// 消费赋值运算符；普通 = 返回 -1，复合返回对应二元 op 码，未匹配返回 -2
+func eat_assign_op() -> i64 {
+    var tag = peek_tag()
+    var op = -2
+    if tag == T_EQ {
+        op = -1
+    } else if tag == T_PLUSEQ {
+        op = B_ADD
+    } else if tag == T_MINUSEQ {
+        op = B_SUB
+    } else if tag == T_STAREQ {
+        op = B_MUL
+    } else if tag == T_SLASHEQ {
+        op = B_DIV
+    } else if tag == T_PERCENTEQ {
+        op = B_MOD
+    } else if tag == T_AMPEQ {
+        op = B_BITAND
+    } else if tag == T_PIPEEQ {
+        op = B_BITOR
+    } else if tag == T_CARETEQ {
+        op = B_BITXOR
+    } else if tag == T_SHLEQ {
+        op = B_SHL
+    } else if tag == T_SHREQ {
+        op = B_SHR
+    }
+    if op != -2 {
+        advance()
+    }
+    return op
+}
+
+// 表达式是否可寻址（字段赋值 base 校验）：Var 或 FieldAccess 链
+func is_addressable_base(id: i64) -> bool {
+    if id < 0 {
+        return false
+    }
+    var tag = node_tags[id]
+    if tag == N_VAR {
+        return true
+    }
+    if tag == N_FIELD_ACCESS {
+        return is_addressable_base(child_at(id, 0))
+    }
+    return false
+}// ---------- 程序与顶层语句 ----------
+
+// 解析整个程序：返回根 StmtList 节点（id=0），失败返回 -1
+func parse_program() -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    var stmts: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        var tag = peek_tag()
+        if tag == T_EOF {
+            done = true
+        } else if tag == T_FUNC {
+            var s = parse_fn_def()
+            if s < 0 {
+                return -1
+            }
+            collect_stmt(stmts, s)
+        } else if tag == T_PUB {
+            var s = parse_fn_def()
+            if s < 0 {
+                return -1
+            }
+            collect_stmt(stmts, s)
+        } else if tag == T_IMPORT {
+            var s = parse_import()
+            if s < 0 {
+                return -1
+            }
+            collect_stmt(stmts, s)
+        } else if tag == T_USING {
+            var s = parse_using()
+            if s < 0 {
+                return -1
+            }
+            collect_stmt(stmts, s)
+        } else if tag == T_STRUCT {
+            var s = parse_struct()
+            if s < 0 {
+                return -1
+            }
+            collect_stmt(stmts, s)
+        } else if tag == T_NAMESPACE {
+            var s = parse_namespace()
+            if s < 0 {
+                return -1
+            }
+            collect_stmt(stmts, s)
+        } else if tag == T_EXTERN {
+            var s = parse_extern()
+            if s < 0 {
+                return -1
+            }
+            collect_stmt(stmts, s)
+        } else if tag == T_VAR {
+            var s = parse_var_decl(0)
+            if s < 0 {
+                return -1
+            }
+            collect_stmt(stmts, s)
+        } else if tag == T_CONST {
+            var s = parse_var_decl(1)
+            if s < 0 {
+                return -1
+            }
+            collect_stmt(stmts, s)
+        } else {
+            set_err(peek_line(), peek_col(), "顶层只允许函数定义、import、using、struct、命名空间声明、extern 声明或全局变量，实际是 " + describe(tag))
+            return -1
+        }
+    }
+    var root = new_node(N_STMTLIST, -1, -1, -1, line, col)
+    set_children(root, stmts)
+    return root
+}
+
+// ---------- 语句分派 ----------
+
+// 解析一条或多条语句（var 解构可能产生多条，返回 StmtList；单条返回语句节点）
+func parse_stmt() -> i64 {
+    var tag = peek_tag()
+    if tag == T_VAR {
+        return parse_var_decl(0)
+    }
+    if tag == T_CONST {
+        return parse_var_decl(1)
+    }
+    if tag == T_IF {
+        return parse_if()
+    }
+    if tag == T_WHILE {
+        return parse_while(-1)
+    }
+    if tag == T_FOR {
+        return parse_for(-1)
+    }
+    if tag == T_SWITCH {
+        return parse_switch()
+    }
+    if tag == T_RETURN {
+        return parse_return()
+    }
+    if tag == T_BREAK {
+        return parse_loop_jump(false)
+    }
+    if tag == T_CONTINUE {
+        return parse_loop_jump(true)
+    }
+    if tag == T_IDENT {
+        if is_loop_label_ahead() {
+            return parse_labeled_loop()
+        }
+        return parse_expr_or_assign()
+    }
+    if tag == T_LBRACE {
+        set_err(peek_line(), peek_col(), "函数体内不能有裸代码块")
+        return -1
+    }
+    if tag == T_EXTERN {
+        set_err(peek_line(), peek_col(), "extern 声明只能出现在文件顶层")
+        return -1
+    }
+    return parse_expr_or_assign()
+}
+
+// ---------- 顶层 import / using / namespace / extern ----------
+
+// import 语句：`import "./x.tie"` 或 `import "./x.tie" as 别名`
+func parse_import() -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    advance()   // import
+    var path = -1
+    if peek_tag() == T_STR {
+        path = intern.intern(peek_lexeme())
+        advance()
+    } else {
+        set_err(peek_line(), peek_col(), "import 后必须是字符串路径，实际是 " + describe(peek_tag()))
+        return -1
+    }
+    var alias = -1
+    if eat(T_AS) {
+        if peek_tag() == T_IDENT {
+            alias = intern.intern(peek_lexeme())
+            advance()
+        } else {
+            set_err(peek_line(), peek_col(), "as 后必须是别名标识符，实际是 " + describe(peek_tag()))
+            return -1
+        }
+    }
+    if !expect(T_SEMI, "import 语句结束的分号") {
+        return -1
+    }
+    return new_node(N_IMPORT, path, -1, alias, line, col)
+}
+
+// using 引入语句：`using fmt2;` / `using fmt.error;`（仅顶层）
+func parse_using() -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    advance()   // using
+    var segs: table<i64> = table_new_i64()
+    var s = expect_ident()
+    if s < 0 {
+        return -1
+    }
+    table_push(segs, s)
+    while eat(T_DOT) {
+        s = expect_ident()
+        if s < 0 {
+            return -1
+        }
+        table_push(segs, s)
+    }
+    if !expect(T_SEMI, "using 语句结束的分号") {
+        return -1
+    }
+    var n = new_node(N_USING, -1, -1, len(segs), line, col)
+    var kids: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < len(segs) {
+        table_push(kids, new_node(N_SEGMENT, segs[i], -1, -1, line, col))
+        i = i + 1
+    }
+    set_children(n, kids)
+    return n
+}
+
+// 命名空间声明：`namespace tcmsg { ... }` / `namespace tcmsg.error { ... }`
+func parse_namespace() -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    advance()   // namespace
+    var segs: table<i64> = table_new_i64()
+    var s = expect_ident()
+    if s < 0 {
+        return -1
+    }
+    table_push(segs, s)
+    while eat(T_DOT) {
+        s = expect_ident()
+        if s < 0 {
+            return -1
+        }
+        table_push(segs, s)
+    }
+    if !expect(T_LBRACE, "命名空间声明必须跟 '{'") {
+        return -1
+    }
+    var body_stmts: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        var tag = peek_tag()
+        if tag == T_RBRACE {
+            advance()
+            done = true
+        } else if tag == T_EOF {
+            if !expect(T_RBRACE, "命名空间声明必须跟 '}'") {
+                return -1
+            }
+            done = true
+        } else if tag == T_FUNC {
+            var st = parse_fn_def()
+            if st < 0 {
+                return -1
+            }
+            table_push(body_stmts, st)
+        } else if tag == T_PUB {
+            var st = parse_fn_def()
+            if st < 0 {
+                return -1
+            }
+            table_push(body_stmts, st)
+        } else if tag == T_STRUCT {
+            var st = parse_struct()
+            if st < 0 {
+                return -1
+            }
+            table_push(body_stmts, st)
+        } else if tag == T_NAMESPACE {
+            var st = parse_namespace()
+            if st < 0 {
+                return -1
+            }
+            table_push(body_stmts, st)
+        } else {
+            set_err(peek_line(), peek_col(), "命名空间体内只允许函数定义、类定义或嵌套命名空间，实际是 " + describe(tag))
+            return -1
+        }
+    }
+    var n = new_node(N_NAMESPACE, -1, -1, len(segs), line, col)
+    var kids: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < len(segs) {
+        table_push(kids, new_node(N_SEGMENT, segs[i], -1, -1, line, col))
+        i = i + 1
+    }
+    table_push(kids, new_node(N_STMTLIST, -1, -1, -1, line, col))
+    set_children(n, kids)
+    // 最后一个子节点（body StmtList）填充体语句
+    set_children(child_at(n, len(segs)), body_stmts)
+    return n
+}
+
+// extern 函数声明（T0.7）：`extern fn name(a: i64, b: string) -> bool;`
+func parse_extern() -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    advance()   // extern
+    if peek_tag() == T_IDENT {
+        if peek_lexeme() == "fn" {
+            advance()
+        } else {
+            set_err(peek_line(), peek_col(), "extern 声明必须跟 'fn'，实际是 " + describe(T_IDENT))
+            return -1
+        }
+    } else {
+        set_err(peek_line(), peek_col(), "extern 声明必须跟 'fn'，实际是 " + describe(peek_tag()))
+        return -1
+    }
+    var name = expect_ident()
+    if name < 0 {
+        return -1
+    }
+    if !expect(T_LPAREN, "'('") {
+        return -1
+    }
+    var params: table<i64> = table_new_i64()
+    if !eat(T_RPAREN) {
+        var d = false
+        while !d {
+            var pname = expect_ident()
+            if pname < 0 {
+                return -1
+            }
+            if !expect(T_COLON, "':'") {
+                return -1
+            }
+            var pty = parse_type()
+            if pty < 0 {
+                return -1
+            }
+            var p = new_node(N_PARAM, pname, 0, -1, peek_line(), peek_col())
+            var pkids: table<i64> = table_new_i64()
+            table_push(pkids, pty)
+            table_push(pkids, -1)
+            set_children(p, pkids)
+            table_push(params, p)
+            if eat(T_COMMA) {
+                // 继续
+            } else {
+                if !expect(T_RPAREN, "')'") {
+                    return -1
+                }
+                d = true
+            }
+        }
+    }
+    var ret_ty = -1
+    if eat(T_ARROW) {
+        ret_ty = parse_type()
+        if ret_ty < 0 {
+            return -1
+        }
+    } else {
+        ret_ty = new_node(N_NAMED_TYPE, intern.intern("void"), TK_VOID, -1, line, col)
+    }
+    if !expect(T_SEMI, "extern 声明结束的分号") {
+        return -1
+    }
+    var e = new_node(N_EXTERN, name, -1, len(params), line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, ret_ty)
+    var i: i64 = 0
+    while i < len(params) {
+        table_push(kids, params[i])
+        i = i + 1
+    }
+    set_children(e, kids)
+    return e
+}
+
+// ---------- 函数 / struct 定义 ----------
+
+// `[pub] func name(params) -> Ty { stmts }`
+func parse_fn_def() -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    var is_pub: i64 = 0
+    if eat(T_PUB) {
+        is_pub = 1
+    }
+    if !expect(T_FUNC, "'func'") {
+        return -1
+    }
+    var name = expect_ident()
+    if name < 0 {
+        return -1
+    }
+    if !expect(T_LPAREN, "'('") {
+        return -1
+    }
+    var params: table<i64> = table_new_i64()
+    if !eat(T_RPAREN) {
+        var d = false
+        while !d {
+            var pname = expect_ident()
+            if pname < 0 {
+                return -1
+            }
+            if !expect(T_COLON, "':'") {
+                return -1
+            }
+            var by_ref: i64 = 0
+            if eat(T_REF) {
+                by_ref = 1
+            }
+            var pty = parse_type()
+            if pty < 0 {
+                return -1
+            }
+            var pdef = -1
+            if eat(T_EQ) {
+                pdef = parse_expr()
+                if pdef < 0 {
+                    return -1
+                }
+            }
+            var p = new_node(N_PARAM, pname, by_ref, -1, peek_line(), peek_col())
+            var pkids: table<i64> = table_new_i64()
+            table_push(pkids, pty)
+            table_push(pkids, pdef)
+            set_children(p, pkids)
+            table_push(params, p)
+            if eat(T_COMMA) {
+                // 继续
+            } else {
+                if !expect(T_RPAREN, "')'") {
+                    return -1
+                }
+                d = true
+            }
+        }
+    }
+    var ret_ty = -1
+    if eat(T_ARROW) {
+        ret_ty = parse_type()
+        if ret_ty < 0 {
+            return -1
+        }
+    } else {
+        ret_ty = new_node(N_NAMED_TYPE, intern.intern("void"), TK_VOID, -1, line, col)
+    }
+    var body = parse_block()
+    if body < 0 {
+        return -1
+    }
+    var f = new_node(N_FN_DEF, name, is_pub, len(params), line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, ret_ty)
+    var i: i64 = 0
+    while i < len(params) {
+        table_push(kids, params[i])
+        i = i + 1
+    }
+    table_push(kids, body)
+    set_children(f, kids)
+    return f
+}
+
+// `struct Name [extends Parent] { 字段 }`（纯数据）
+func parse_struct() -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    advance()   // struct
+    var name = expect_ident()
+    if name < 0 {
+        return -1
+    }
+    var parent = -1
+    if eat(T_EXTENDS) {
+        parent = expect_ident()
+        if parent < 0 {
+            return -1
+        }
+    }
+    if !expect(T_LBRACE, "'{'") {
+        return -1
+    }
+    var fields: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        var tag = peek_tag()
+        if tag == T_RBRACE {
+            advance()
+            done = true
+        } else if tag == T_EOF {
+            if !expect(T_RBRACE, "'}'") {
+                return -1
+            }
+            done = true
+        } else if tag == T_VAR {
+            var fl = peek_line()
+            var fc = peek_col()
+            advance()   // var
+            var fname = expect_ident()
+            if fname < 0 {
+                return -1
+            }
+            var fty = -1
+            if eat(T_COLON) {
+                fty = parse_type()
+                if fty < 0 {
+                    return -1
+                }
+            }
+            var finit = -1
+            if eat(T_EQ) {
+                finit = parse_expr()
+                if finit < 0 {
+                    return -1
+                }
+            }
+            if !expect(T_SEMI, "字段声明结束符") {
+                return -1
+            }
+            var f = new_node(N_CLASS_FIELD, fname, -1, -1, fl, fc)
+            var fkids: table<i64> = table_new_i64()
+            table_push(fkids, fty)
+            table_push(fkids, finit)
+            set_children(f, fkids)
+            table_push(fields, f)
+        } else if tag == T_FUNC {
+            set_err(peek_line(), peek_col(), "struct 体不允许方法定义：逻辑请用绑定 struct 名的命名空间函数定义（namespace 数据名 { pub func 方法名(首参: 数据名) ... }），调用仍写 obj.method()")
+            return -1
+        } else if tag == T_PUB {
+            set_err(peek_line(), peek_col(), "struct 体不允许方法定义：逻辑请用绑定 struct 名的命名空间函数定义（namespace 数据名 { pub func 方法名(首参: 数据名) ... }），调用仍写 obj.method()")
+            return -1
+        } else {
+            set_err(peek_line(), peek_col(), "struct 体内只允许字段(var)，实际是 " + describe(tag))
+            return -1
+        }
+    }
+    var s = new_node(N_STRUCT, name, -1, parent, line, col)
+    set_children(s, fields)
+    return s
+}
+
+// ---------- 块 / 控制流语句 ----------
+
+// `{ stmts }` 代码块：返回 StmtList 节点
+func parse_block() -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    if !expect(T_LBRACE, "'{'") {
+        return -1
+    }
+    var stmts: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        if peek_tag() == T_RBRACE {
+            advance()
+            done = true
+        } else if peek_tag() == T_EOF {
+            if !expect(T_RBRACE, "'}'") {
+                return -1
+            }
+            done = true
+        } else {
+            var s = parse_stmt()
+            if s < 0 {
+                return -1
+            }
+            collect_stmt(stmts, s)
+        }
+    }
+    var list = new_node(N_STMTLIST, -1, -1, -1, line, col)
+    set_children(list, stmts)
+    return list
+}
+
+// `if cond { } else { }` / else if 链
+func parse_if() -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    advance()   // if
+    var cond = parse_expr()
+    if cond < 0 {
+        return -1
+    }
+    var then_list = parse_block()
+    if then_list < 0 {
+        return -1
+    }
+    var else_list = -1
+    if eat(T_ELSE) {
+        if peek_tag() == T_IF {
+            var inner = parse_if()
+            if inner < 0 {
+                return -1
+            }
+            var tmp: table<i64> = table_new_i64()
+            table_push(tmp, inner)
+            else_list = new_node(N_STMTLIST, -1, -1, -1, line, col)
+            set_children(else_list, tmp)
+        } else {
+            else_list = parse_block()
+            if else_list < 0 {
+                return -1
+            }
+        }
+    } else {
+        else_list = new_node(N_STMTLIST, -1, -1, -1, line, col)
+    }
+    var n = new_node(N_IF, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, cond)
+    table_push(kids, then_list)
+    table_push(kids, else_list)
+    set_children(n, kids)
+    return n
+}
+
+// `while cond { }`（label 为循环标签，E5）
+func parse_while(label: i64) -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    advance()   // while
+    var cond = parse_expr()
+    if cond < 0 {
+        return -1
+    }
+    var body = parse_block()
+    if body < 0 {
+        return -1
+    }
+    var n = new_node(N_WHILE, label, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, cond)
+    table_push(kids, body)
+    set_children(n, kids)
+    return n
+}
+
+// `for var in expr { }`（label 为循环标签，E5）
+func parse_for(label: i64) -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    advance()   // for
+    var var_id = expect_ident()
+    if var_id < 0 {
+        return -1
+    }
+    if !expect(T_IN, "'in'") {
+        return -1
+    }
+    var iter = parse_expr()
+    if iter < 0 {
+        return -1
+    }
+    var body = parse_block()
+    if body < 0 {
+        return -1
+    }
+    var n = new_node(N_FOR, var_id, -1, label, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, iter)
+    table_push(kids, body)
+    set_children(n, kids)
+    return n
+}
+
+// 探测「循环标签前缀」：当前标识符 + 冒号 + while/for（E5）
+func is_loop_label_ahead() -> bool {
+    if peek_tag() != T_IDENT {
+        return false
+    }
+    if peek_n(1) != T_COLON {
+        return false
+    }
+    var n2 = peek_n(2)
+    if n2 == T_WHILE {
+        return true
+    }
+    if n2 == T_FOR {
+        return true
+    }
+    return false
+}
+
+// `L: while/for` 带标签循环（E5）
+func parse_labeled_loop() -> i64 {
+    var label = expect_ident()
+    if label < 0 {
+        return -1
+    }
+    advance()   // 冒号
+    var tag = peek_tag()
+    if tag == T_WHILE {
+        return parse_while(label)
+    }
+    if tag == T_FOR {
+        return parse_for(label)
+    }
+    set_err(peek_line(), peek_col(), "标签 '" + intern.lookup(label) + "' 后必须是 while 或 for")
+    return -1
+}
+
+// `break` / `continue`（可选标签 break L / continue L，E1+E5）
+func parse_loop_jump(is_continue: bool) -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    advance()   // break / continue
+    var label = -1
+    if peek_tag() == T_IDENT {
+        var n1 = peek_n(1)
+        if n1 == T_SEMI {
+            label = intern.intern(peek_lexeme())
+            advance()
+        } else if n1 == T_EOF {
+            label = intern.intern(peek_lexeme())
+            advance()
+        } else if n1 == T_RBRACE {
+            label = intern.intern(peek_lexeme())
+            advance()
+        }
+    }
+    if !expect(T_SEMI, "语句结束符") {
+        return -1
+    }
+    if is_continue {
+        return new_node(N_CONTINUE, label, -1, -1, line, col)
+    }
+    return new_node(N_BREAK, label, -1, -1, line, col)
+}
+
+// `switch subject { case ...: ... default: ... }`
+func parse_switch() -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    advance()   // switch
+    var subject = parse_expr()
+    if subject < 0 {
+        return -1
+    }
+    if !expect(T_LBRACE, "'{'") {
+        return -1
+    }
+    var cases: table<i64> = table_new_i64()
+    var default_list = -1
+    var done = false
+    while !done {
+        var tag = peek_tag()
+        if tag == T_CASE {
+            var cl = peek_line()
+            var cc = peek_col()
+            advance()   // case
+            var pats: table<i64> = table_new_i64()
+            var p = parse_case_pattern()
+            if p < 0 {
+                return -1
+            }
+            table_push(pats, p)
+            while eat(T_COMMA) {
+                p = parse_case_pattern()
+                if p < 0 {
+                    return -1
+                }
+                table_push(pats, p)
+            }
+            var when_expr = -1
+            if eat(T_WHEN) {
+                when_expr = parse_expr()
+                if when_expr < 0 {
+                    return -1
+                }
+            }
+            if !expect(T_COLON, "':'") {
+                return -1
+            }
+            var body = parse_switch_body()
+            if body < 0 {
+                return -1
+            }
+            var c = new_node(N_SWITCH_CASE, -1, -1, -1, cl, cc)
+            var pl = new_node(N_PATTERN_LIST, -1, -1, -1, cl, cc)
+            set_children(pl, pats)
+            var ckids: table<i64> = table_new_i64()
+            table_push(ckids, pl)
+            table_push(ckids, when_expr)
+            table_push(ckids, body)
+            set_children(c, ckids)
+            table_push(cases, c)
+        } else if tag == T_DEFAULT {
+            advance()   // default
+            if !expect(T_COLON, "':'") {
+                return -1
+            }
+            default_list = parse_switch_body()
+            if default_list < 0 {
+                return -1
+            }
+        } else if tag == T_RBRACE {
+            advance()
+            done = true
+        } else if tag == T_EOF {
+            if !expect(T_RBRACE, "'}'") {
+                return -1
+            }
+            done = true
+        } else {
+            set_err(peek_line(), peek_col(), "switch 体内只允许 case/default/右花括号，实际是 " + describe(tag))
+            return -1
+        }
+    }
+    if default_list < 0 {
+        default_list = new_node(N_STMTLIST, -1, -1, -1, line, col)
+    }
+    var n = new_node(N_SWITCH, -1, -1, len(cases), line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, subject)
+    var i: i64 = 0
+    while i < len(cases) {
+        table_push(kids, cases[i])
+        i = i + 1
+    }
+    table_push(kids, default_list)
+    set_children(n, kids)
+    return n
+}
+
+// case/default 分支体：连续语句直到下一个 case/default/右花括号/文件结束
+func parse_switch_body() -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    var stmts: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        var tag = peek_tag()
+        if tag == T_CASE {
+            done = true
+        } else if tag == T_DEFAULT {
+            done = true
+        } else if tag == T_RBRACE {
+            done = true
+        } else if tag == T_EOF {
+            done = true
+        } else {
+            var s = parse_stmt()
+            if s < 0 {
+                return -1
+            }
+            collect_stmt(stmts, s)
+        }
+    }
+    var list = new_node(N_STMTLIST, -1, -1, -1, line, col)
+    set_children(list, stmts)
+    return list
+}
+
+// case 匹配模式：类型匹配（case string:）或值/区间表达式
+func parse_case_pattern() -> i64 {
+    if peek_tag() == T_TYPEKW {
+        var line = peek_line()
+        var col = peek_col()
+        var lid = intern.intern(peek_lexeme())
+        var tk = typekw_index(peek_lexeme())
+        advance()
+        var t = new_node(N_NAMED_TYPE, lid, tk, -1, line, col)
+        var tl = new_node(N_TYPE_LIT, -1, -1, -1, line, col)
+        var kids: table<i64> = table_new_i64()
+        table_push(kids, t)
+        set_children(tl, kids)
+        return tl
+    }
+    return parse_expr()
+}
+
+// `return [expr]`
+func parse_return() -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    advance()   // return
+    var expr = -1
+    if peek_tag() != T_SEMI {
+        expr = parse_expr()
+        if expr < 0 {
+            return -1
+        }
+    }
+    if !expect(T_SEMI, "语句结束符") {
+        return -1
+    }
+    var n = new_node(N_RETURN, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, expr)
+    set_children(n, kids)
+    return n
+}
+
+// `var name[: Ty] [= expr]` / `const ...`（解构返回 StmtList）
+func parse_var_decl(is_const: i64) -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    advance()   // var / const
+    if peek_tag() == T_LPAREN {
+        return parse_tuple_destructure(line, col, is_const)
+    }
+    var name = expect_ident()
+    if name < 0 {
+        return -1
+    }
+    var ty = -1
+    if eat(T_COLON) {
+        ty = parse_type()
+        if ty < 0 {
+            return -1
+        }
+    }
+    var init = -1
+    if eat(T_EQ) {
+        init = parse_expr()
+        if init < 0 {
+            return -1
+        }
+        if !expect(T_SEMI, "语句结束符") {
+            return -1
+        }
+    } else if is_table_type(ty) {
+        // T0.4 顶层表全局变量：表类型可省略初始化，合成空表 []（元素类型由标注决定）
+        if !expect(T_SEMI, "语句结束符") {
+            return -1
+        }
+        init = new_node(N_TABLE_LIT, -1, -1, -1, line, col)
+    } else {
+        if !expect(T_EQ, "'='") {
+            return -1
+        }
+        return -1
+    }
+    var v = new_node(N_VAR_DECL, name, is_const, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, ty)
+    table_push(kids, init)
+    set_children(v, kids)
+    return v
+}
+
+// 元组解构声明：`var (q, r) = expr;` → _tmpN + 逐字段声明（StmtList）
+func parse_tuple_destructure(line: i64, col: i64, is_const: i64) -> i64 {
+    if !expect(T_LPAREN, "'('") {
+        return -1
+    }
+    var names: table<i64> = table_new_i64()
+    if eat(T_RPAREN) {
+        set_err(line, col, "空解构 () 不支持")
+        return -1
+    }
+    var d = false
+    while !d {
+        var nm = expect_ident()
+        if nm < 0 {
+            return -1
+        }
+        table_push(names, nm)
+        if eat(T_COMMA) {
+            // 继续
+        } else {
+            if !expect(T_RPAREN, "')'") {
+                return -1
+            }
+            d = true
+        }
+    }
+    if !expect(T_EQ, "'='") {
+        return -1
+    }
+    var init = parse_expr()
+    if init < 0 {
+        return -1
+    }
+    if !expect(T_SEMI, "语句结束符") {
+        return -1
+    }
+    var tmp_name = intern.intern("_tmp" + to_string(g_tmp))
+    g_tmp = g_tmp + 1
+    var list = new_node(N_STMTLIST, -1, -1, -1, line, col)
+    var decls: table<i64> = table_new_i64()
+    // 第一条：临时变量持有元组值（可写）
+    var tv = new_node(N_VAR_DECL, tmp_name, 0, -1, line, col)
+    var tkids: table<i64> = table_new_i64()
+    table_push(tkids, -1)
+    table_push(tkids, init)
+    set_children(tv, tkids)
+    table_push(decls, tv)
+    // 逐字段：var q = _tmpN.Item1; var r = _tmpN.Item2;
+    var i: i64 = 0
+    while i < len(names) {
+        var var_node = new_node(N_VAR, tmp_name, -1, -1, line, col)
+        var fa = new_node(N_FIELD_ACCESS, intern.intern("Item" + to_string(i + 1)), -1, -1, line, col)
+        var fkids: table<i64> = table_new_i64()
+        table_push(fkids, var_node)
+        set_children(fa, fkids)
+        var fv = new_node(N_VAR_DECL, names[i], is_const, -1, line, col)
+        var vkids: table<i64> = table_new_i64()
+        table_push(vkids, -1)
+        table_push(vkids, fa)
+        set_children(fv, vkids)
+        table_push(decls, fv)
+        i = i + 1
+    }
+    set_children(list, decls)
+    return list
+}// ---------- 表达式与赋值语句 ----------
+
+// 表达式语句与赋值语句统一入口：Ident op= → Assign；否则解析表达式后按目标分派
+func parse_expr_or_assign() -> i64 {
+    // 快速路径：变量名后紧跟赋值运算符 → Assign
+    if peek_tag() == T_IDENT {
+        var n1 = peek_n(1)
+        if is_assign_op_tag(n1) {
+            var line = peek_line()
+            var col = peek_col()
+            var name = intern.intern(peek_lexeme())
+            advance()   // 目标变量名
+            var op = eat_assign_op()
+            if op == -2 {
+                set_err(peek_line(), peek_col(), "期望赋值运算符")
+                return -1
+            }
+            var value = parse_expr()
+            if value < 0 {
+                return -1
+            }
+            if !expect(T_SEMI, "语句结束符") {
+                return -1
+            }
+            var a = new_node(N_ASSIGN, name, op, -1, line, col)
+            var kids: table<i64> = table_new_i64()
+            table_push(kids, value)
+            set_children(a, kids)
+            return a
+        }
+    }
+    var line = peek_line()
+    var col = peek_col()
+    var expr = parse_expr()
+    if expr < 0 {
+        return -1
+    }
+    var op = eat_assign_op()
+    if op != -2 {
+        var tag = node_tags[expr]
+        if tag == N_INDEX {
+            // 表下标赋值：t[i] op= v / t[i][j] op= v
+            var value = parse_expr()
+            if value < 0 {
+                return -1
+            }
+            if !expect(T_SEMI, "语句结束符") {
+                return -1
+            }
+            var ia = new_node(N_INDEX_ASSIGN, -1, op, -1, line, col)
+            var kids: table<i64> = table_new_i64()
+            table_push(kids, expr)
+            table_push(kids, value)
+            set_children(ia, kids)
+            return ia
+        }
+        if tag == N_FIELD_ACCESS {
+            // 字段赋值：obj.field op= v（base 需可寻址）
+            var base = child_at(expr, 0)
+            if is_addressable_base(base) {
+                var value = parse_expr()
+                if value < 0 {
+                    return -1
+                }
+                if !expect(T_SEMI, "语句结束符") {
+                    return -1
+                }
+                var fa = new_node(N_FIELD_ASSIGN, node_names[expr], op, -1, line, col)
+                var kids: table<i64> = table_new_i64()
+                table_push(kids, base)
+                table_push(kids, value)
+                set_children(fa, kids)
+                return fa
+            }
+        }
+        if tag == N_VAR {
+            // 变量赋值（防御：快速路径已拦截，此处兜底）
+            var value = parse_expr()
+            if value < 0 {
+                return -1
+            }
+            if !expect(T_SEMI, "语句结束符") {
+                return -1
+            }
+            var a = new_node(N_ASSIGN, node_names[expr], op, -1, line, col)
+            var kids: table<i64> = table_new_i64()
+            table_push(kids, value)
+            set_children(a, kids)
+            return a
+        }
+        set_err(peek_line(), peek_col(), "赋值目标必须是变量或对象字段")
+        return -1
+    }
+    // 普通表达式语句
+    if !expect(T_SEMI, "语句结束符") {
+        return -1
+    }
+    var e = new_node(N_EXPR_STMT, -1, -1, -1, line, col)
+    var ekids: table<i64> = table_new_i64()
+    table_push(ekids, expr)
+    set_children(e, ekids)
+    return e
+}
+
+// ---------- 表达式优先级链（从低到高）----------
+
+// 表达式：三目 → 可选范围 `..`
+func parse_expr() -> i64 {
+    var lhs = parse_ternary()
+    if lhs < 0 {
+        return -1
+    }
+    if eat(T_DOT_DOT) {
+        var line = node_lines[lhs]
+        var col = node_cols[lhs]
+        var end = parse_expr()
+        if end < 0 {
+            return -1
+        }
+        var n = new_node(N_RANGE, -1, -1, -1, line, col)
+        var kids: table<i64> = table_new_i64()
+        table_push(kids, lhs)
+        table_push(kids, end)
+        set_children(n, kids)
+        return n
+    }
+    return lhs
+}
+
+// 三目运算符（右结合）：cond ? then : else
+func parse_ternary() -> i64 {
+    var lhs = parse_or()
+    if lhs < 0 {
+        return -1
+    }
+    if eat(T_QUESTION) {
+        var line = node_lines[lhs]
+        var col = node_cols[lhs]
+        var then_expr = parse_expr()
+        if then_expr < 0 {
+            return -1
+        }
+        if !expect(T_COLON, "':'") {
+            return -1
+        }
+        var else_expr = parse_expr()
+        if else_expr < 0 {
+            return -1
+        }
+        var n = new_node(N_TERNARY, -1, -1, -1, line, col)
+        var kids: table<i64> = table_new_i64()
+        table_push(kids, lhs)
+        table_push(kids, then_expr)
+        table_push(kids, else_expr)
+        set_children(n, kids)
+        return n
+    }
+    return lhs
+}
+
+// 逻辑或 ||
+func parse_or() -> i64 {
+    var lhs = parse_and()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        if peek_tag() != T_OROR {
+            d = true
+        } else {
+            advance()
+            var rhs = parse_and()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(B_OR, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 逻辑与 &&
+func parse_and() -> i64 {
+    var lhs = parse_bit_or()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        if peek_tag() != T_ANDAND {
+            d = true
+        } else {
+            advance()
+            var rhs = parse_bit_or()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(B_AND, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 按位或 |
+func parse_bit_or() -> i64 {
+    var lhs = parse_bit_xor()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        if peek_tag() != T_PIPE {
+            d = true
+        } else {
+            advance()
+            var rhs = parse_bit_xor()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(B_BITOR, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 按位异或 ^
+func parse_bit_xor() -> i64 {
+    var lhs = parse_bit_and()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        if peek_tag() != T_CARET {
+            d = true
+        } else {
+            advance()
+            var rhs = parse_bit_and()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(B_BITXOR, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 按位与 &
+func parse_bit_and() -> i64 {
+    var lhs = parse_equality()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        if peek_tag() != T_AMP {
+            d = true
+        } else {
+            advance()
+            var rhs = parse_equality()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(B_BITAND, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 相等 == !=
+func parse_equality() -> i64 {
+    var lhs = parse_comparison()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        var op = -1
+        if peek_tag() == T_EQEQ {
+            op = B_EQ
+        } else if peek_tag() == T_NOTEQ {
+            op = B_NOTEQ
+        } else {
+            d = true
+        }
+        if !d {
+            advance()
+            var rhs = parse_comparison()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(op, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 比较 < > <= >=
+func parse_comparison() -> i64 {
+    var lhs = parse_shift()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        var op = -1
+        if peek_tag() == T_LT {
+            op = B_LT
+        } else if peek_tag() == T_GT {
+            op = B_GT
+        } else if peek_tag() == T_LE {
+            op = B_LE
+        } else if peek_tag() == T_GE {
+            op = B_GE
+        } else {
+            d = true
+        }
+        if !d {
+            advance()
+            var rhs = parse_shift()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(op, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 移位 << >>
+func parse_shift() -> i64 {
+    var lhs = parse_term()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        var op = -1
+        if peek_tag() == T_SHL {
+            op = B_SHL
+        } else if peek_tag() == T_SHR {
+            op = B_SHR
+        } else {
+            d = true
+        }
+        if !d {
+            advance()
+            var rhs = parse_term()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(op, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 加减 + -
+func parse_term() -> i64 {
+    var lhs = parse_factor()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        var op = -1
+        if peek_tag() == T_PLUS {
+            op = B_ADD
+        } else if peek_tag() == T_MINUS {
+            op = B_SUB
+        } else {
+            d = true
+        }
+        if !d {
+            advance()
+            var rhs = parse_factor()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(op, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 乘除模 * / %
+func parse_factor() -> i64 {
+    var lhs = parse_unary()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        var op = -1
+        if peek_tag() == T_STAR {
+            op = B_MUL
+        } else if peek_tag() == T_SLASH {
+            op = B_DIV
+        } else if peek_tag() == T_PERCENT {
+            op = B_MOD
+        } else {
+            d = true
+        }
+        if !d {
+            advance()
+            var rhs = parse_unary()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(op, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 构造二元节点（span 取左操作数起点，对齐 Rust expr_span 行为）
+func mk_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
+    var n = new_node(N_BINARY, -1, op, -1, node_lines[lhs], node_cols[lhs])
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, lhs)
+    table_push(kids, rhs)
+    set_children(n, kids)
+    return n
+}
+
+// 构造一元节点
+func mk_unary(op: i64, operand: i64, line: i64, col: i64) -> i64 {
+    var n = new_node(N_UNARY, -1, op, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, operand)
+    set_children(n, kids)
+    return n
+}
+
+// 构造下标节点（span 取基址起点）
+func mk_index(base: i64, index: i64) -> i64 {
+    var n = new_node(N_INDEX, -1, -1, -1, node_lines[base], node_cols[base])
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, base)
+    table_push(kids, index)
+    set_children(n, kids)
+    return n
+}
+
+// ---------- 一元与主表达式 ----------
+
+// 一元（前缀 - ! ++ --）+ 后缀访问链（[index] .field/.method ++ --）
+func parse_unary() -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    var expr = -1
+    var tag = peek_tag()
+    if tag == T_MINUS {
+        advance()
+        var operand = parse_unary()
+        if operand < 0 {
+            return -1
+        }
+        expr = mk_unary(U_NEG, operand, line, col)
+    } else if tag == T_BANG {
+        advance()
+        var operand = parse_unary()
+        if operand < 0 {
+            return -1
+        }
+        expr = mk_unary(U_NOT, operand, line, col)
+    } else if tag == T_INC {
+        advance()
+        var operand = parse_unary()
+        if operand < 0 {
+            return -1
+        }
+        expr = mk_unary(U_PRE_INC, operand, line, col)
+    } else if tag == T_DEC {
+        advance()
+        var operand = parse_unary()
+        if operand < 0 {
+            return -1
+        }
+        expr = mk_unary(U_PRE_DEC, operand, line, col)
+    } else {
+        expr = parse_primary()
+        if expr < 0 {
+            return -1
+        }
+    }
+    // 后缀访问链
+    var d = false
+    while !d {
+        var t = peek_tag()
+        if t == T_LBRACKET {
+            advance()
+            var index = parse_expr()
+            if index < 0 {
+                return -1
+            }
+            if !expect(T_RBRACKET, "']'") {
+                return -1
+            }
+            expr = mk_index(expr, index)
+        } else if t == T_DOT {
+            advance()
+            var field = -1
+            if peek_tag() == T_IDENT {
+                field = intern.intern(peek_lexeme())
+                advance()
+            } else if peek_tag() == T_INT {
+                field = intern.intern(peek_lexeme())
+                advance()
+            } else {
+                set_err(peek_line(), peek_col(), "字段访问 '.' 后必须是字段名/方法名/数字下标，实际是 " + describe(peek_tag()))
+                return -1
+            }
+            if eat(T_LPAREN) {
+                // 方法调用：obj.m(args)
+                var args: table<i64> = table_new_i64()
+                if !parse_args_after_lparen(args) {
+                    return -1
+                }
+                var mc = new_node(N_METHOD_CALL, field, -1, -1, node_lines[expr], node_cols[expr])
+                var mkids: table<i64> = table_new_i64()
+                table_push(mkids, expr)
+                var k: i64 = 0
+                while k < len(args) {
+                    table_push(mkids, args[k])
+                    k = k + 1
+                }
+                set_children(mc, mkids)
+                expr = mc
+            } else {
+                var fa = new_node(N_FIELD_ACCESS, field, -1, -1, node_lines[expr], node_cols[expr])
+                var fkids: table<i64> = table_new_i64()
+                table_push(fkids, expr)
+                set_children(fa, fkids)
+                expr = fa
+            }
+        } else if t == T_INC {
+            advance()
+            expr = mk_unary(U_POST_INC, expr, node_lines[expr], node_cols[expr])
+        } else if t == T_DEC {
+            advance()
+            expr = mk_unary(U_POST_DEC, expr, node_lines[expr], node_cols[expr])
+        } else {
+            d = true
+        }
+    }
+    return expr
+}
+
+// 解析实参列表到 args（前提：'(' 已消费；以 ')' 结束）
+func parse_args_after_lparen(args: ref table<i64>) -> bool {
+    if eat(T_RPAREN) {
+        return true
+    }
+    var d = false
+    while !d {
+        var a = parse_expr()
+        if a < 0 {
+            return false
+        }
+        table_push(args, a)
+        if eat(T_COMMA) {
+            // 继续
+        } else {
+            if !expect(T_RPAREN, "')'") {
+                return false
+            }
+            d = true
+        }
+    }
+    return true
+}
+
+// 原子表达式：字面量 / 标识符（路径/调用/变量）/ 括号元组 / 表字面量
+func parse_primary() -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    var tag = peek_tag()
+    if tag == T_INT {
+        var v = parse_int_lit(peek_lexeme())
+        advance()
+        return new_node(N_INT_LIT, -1, v, -1, line, col)
+    }
+    if tag == T_FLOAT {
+        var lid = intern.intern(peek_lexeme())
+        advance()
+        return new_node(N_FLOAT_LIT, lid, -1, -1, line, col)
+    }
+    if tag == T_STR {
+        var lid = intern.intern(peek_lexeme())
+        advance()
+        return new_node(N_STR_LIT, lid, -1, -1, line, col)
+    }
+    if tag == T_CHARLIT {
+        var lid = intern.intern(peek_lexeme())
+        advance()
+        return new_node(N_CHAR_LIT, lid, -1, -1, line, col)
+    }
+    if tag == T_TRUE {
+        advance()
+        return new_node(N_BOOL_LIT, -1, 1, -1, line, col)
+    }
+    if tag == T_FALSE {
+        advance()
+        return new_node(N_BOOL_LIT, -1, 0, -1, line, col)
+    }
+    if tag == T_ZERO {
+        advance()
+        return new_node(N_TRIT_LIT, -1, 0, -1, line, col)
+    }
+    if tag == T_IDENT {
+        var name = intern.intern(peek_lexeme())
+        advance()
+        // 命名空间路径：a::b::c
+        if peek_tag() == T_DOUBLE_COLON {
+            var segs: table<i64> = table_new_i64()
+            table_push(segs, name)
+            while eat(T_DOUBLE_COLON) {
+                var s = expect_ident()
+                if s < 0 {
+                    return -1
+                }
+                table_push(segs, s)
+            }
+            var path = new_node(N_PATH, -1, -1, -1, line, col)
+            var pkids: table<i64> = table_new_i64()
+            var i: i64 = 0
+            while i < len(segs) {
+                table_push(pkids, new_node(N_SEGMENT, segs[i], -1, -1, line, col))
+                i = i + 1
+            }
+            set_children(path, pkids)
+            return path
+        }
+        // 函数调用
+        if eat(T_LPAREN) {
+            var args: table<i64> = table_new_i64()
+            if !parse_args_after_lparen(args) {
+                return -1
+            }
+            var call = new_node(N_CALL, name, -1, -1, line, col)
+            set_children(call, args)
+            return call
+        }
+        return new_node(N_VAR, name, -1, -1, line, col)
+    }
+    if tag == T_LPAREN {
+        return parse_paren_or_tuple(line, col)
+    }
+    if tag == T_LBRACKET {
+        return parse_table_lit(line, col)
+    }
+    set_err(line, col, "无法以 " + describe(tag) + " 开始表达式")
+    return -1
+}
+
+// `(` 起始：元组字面量 `(1, "a")` / `(x: 1, y: 2)`，或分组表达式 `(expr)`
+func parse_paren_or_tuple(line: i64, col: i64) -> i64 {
+    if !expect(T_LPAREN, "'('") {
+        return -1
+    }
+    if eat(T_RPAREN) {
+        set_err(line, col, "空元组 () 不支持")
+        return -1
+    }
+    var first = parse_tuple_field()
+    if first < 0 {
+        return -1
+    }
+    if eat(T_COMMA) {
+        var fields: table<i64> = table_new_i64()
+        table_push(fields, first)
+        var d = false
+        while !d {
+            var f = parse_tuple_field()
+            if f < 0 {
+                return -1
+            }
+            table_push(fields, f)
+            if eat(T_COMMA) {
+                // 继续
+            } else {
+                if !expect(T_RPAREN, "')'") {
+                    return -1
+                }
+                d = true
+            }
+        }
+        var tup = new_node(N_TUPLE_LIT, -1, -1, -1, line, col)
+        set_children(tup, fields)
+        return tup
+    }
+    // 无逗号 → 分组表达式
+    if !expect(T_RPAREN, "')'") {
+        return -1
+    }
+    if node_names[first] != -1 {
+        set_err(line, col, "命名字段必须作为元组元素（如 (x: 1, y: 2)），单个 (x: 1) 不是合法表达式")
+        return -1
+    }
+    return child_at(first, 0)
+}
+
+// 元组字段：`name: expr`（命名字段）或 `expr`（匿名）——返回 TupleField 节点
+func parse_tuple_field() -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    if peek_tag() == T_IDENT {
+        if peek_n(1) == T_COLON {
+            var name = intern.intern(peek_lexeme())
+            advance()
+            if !expect(T_COLON, "':'") {
+                return -1
+            }
+            var value = parse_expr()
+            if value < 0 {
+                return -1
+            }
+            var f = new_node(N_TUPLE_FIELD, name, -1, -1, line, col)
+            var kids: table<i64> = table_new_i64()
+            table_push(kids, value)
+            set_children(f, kids)
+            return f
+        }
+    }
+    var value = parse_expr()
+    if value < 0 {
+        return -1
+    }
+    var f = new_node(N_TUPLE_FIELD, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, value)
+    set_children(f, kids)
+    return f
+}
+
+// 表字面量 `[col, col; row, row]`（逗号分列、分号分行；空表 [] 合法）
+func parse_table_lit(line: i64, col: i64) -> i64 {
+    if !expect(T_LBRACKET, "'['") {
+        return -1
+    }
+    var cells: table<i64> = table_new_i64()
+    if eat(T_RBRACKET) {
+        return new_node(N_TABLE_LIT, -1, -1, -1, line, col)
+    }
+    var row: i64 = 0
+    var d = false
+    while !d {
+        var cell = parse_table_cell(row)
+        if cell < 0 {
+            return -1
+        }
+        table_push(cells, cell)
+        var tag = peek_tag()
+        if tag == T_COMMA {
+            advance()
+        } else if tag == T_SEMI {
+            advance()
+            row = row + 1
+        } else if tag == T_RBRACKET {
+            advance()
+            d = true
+        } else {
+            set_err(peek_line(), peek_col(), "期望 , 或 ; 或 ]，实际是 " + describe(tag))
+            return -1
+        }
+    }
+    var t = new_node(N_TABLE_LIT, -1, -1, -1, line, col)
+    set_children(t, cells)
+    return t
+}
+
+// 表单元格：`id:value`（id 为数字或字符串键）或普通 `value`
+func parse_table_cell(row: i64) -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    var id_node = -1
+    if peek_tag() == T_INT {
+        if peek_n(1) == T_COLON {
+            var v = parse_int_lit(peek_lexeme())
+            advance()   // 数字
+            advance()   // 冒号
+            id_node = new_node(N_TABLE_ID, -1, v, -1, line, col)
+        }
+    } else if peek_tag() == T_STR {
+        if peek_n(1) == T_COLON {
+            var lid = intern.intern(peek_lexeme())
+            advance()   // 字符串
+            advance()   // 冒号
+            id_node = new_node(N_TABLE_ID, lid, -1, -1, line, col)
+        }
+    }
+    var value = parse_expr()
+    if value < 0 {
+        return -1
+    }
+    var c = new_node(N_TABLE_CELL, -1, row, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, id_node)
+    table_push(kids, value)
+    set_children(c, kids)
+    return c
+}
+
+// ---------- 类型解析（含 >> 闭括号分裂）----------
+
+// 类型：基本类型 / table<T> / map<T> / 元组 / struct 名
+func parse_type() -> i64 {
+    var line = peek_line()
+    var col = peek_col()
+    var tag = peek_tag()
+    if tag == T_TYPEKW {
+        var lex = peek_lexeme()
+        var tk = typekw_index(lex)
+        advance()
+        if tk == TK_TABLE {
+            if eat(T_LT) {
+                var elem = parse_type()
+                if elem < 0 {
+                    return -1
+                }
+                if !expect_type_gt("表元素类型后需 '>'") {
+                    return -1
+                }
+                var t = new_node(N_TABLE_TYPE, -1, -1, -1, line, col)
+                var kids: table<i64> = table_new_i64()
+                table_push(kids, elem)
+                set_children(t, kids)
+                return t
+            }
+            return new_node(N_NAMED_TYPE, intern.intern(lex), TK_TABLE, -1, line, col)
+        }
+        if tk == TK_MAP {
+            if eat(T_LT) {
+                var val = parse_type()
+                if val < 0 {
+                    return -1
+                }
+                if !expect_type_gt("键值表值类型后需 '>'") {
+                    return -1
+                }
+                var t = new_node(N_MAP_TYPE, -1, -1, -1, line, col)
+                var kids: table<i64> = table_new_i64()
+                table_push(kids, val)
+                set_children(t, kids)
+                return t
+            }
+            // 裸 map = map<i64>
+            var i64node = new_node(N_NAMED_TYPE, intern.intern("i64"), TK_I64, -1, line, col)
+            var t = new_node(N_MAP_TYPE, -1, -1, -1, line, col)
+            var kids: table<i64> = table_new_i64()
+            table_push(kids, i64node)
+            set_children(t, kids)
+            return t
+        }
+        return new_node(N_NAMED_TYPE, intern.intern(lex), tk, -1, line, col)
+    }
+    if tag == T_LPAREN {
+        return parse_tuple_type(line, col)
+    }
+    if tag == T_IDENT {
+        var name = intern.intern(peek_lexeme())
+        advance()
+        return new_node(N_STRUCT_TYPE, name, -1, -1, line, col)
+    }
+    set_err(line, col, "期望类型，实际是 " + describe(tag))
+    return -1
+}
+
+// 元组类型：`(T1, T2, ...)` / `(name: T1, name: T2, ...)`
+func parse_tuple_type(line: i64, col: i64) -> i64 {
+    if !expect(T_LPAREN, "'('") {
+        return -1
+    }
+    if eat(T_RPAREN) {
+        set_err(line, col, "空元组类型 () 不支持")
+        return -1
+    }
+    var fields: table<i64> = table_new_i64()
+    var d = false
+    while !d {
+        var name = -1
+        if peek_tag() == T_IDENT {
+            if peek_n(1) == T_COLON {
+                name = intern.intern(peek_lexeme())
+                advance()
+                if !expect(T_COLON, "':'") {
+                    return -1
+                }
+            }
+        }
+        var fty = parse_type()
+        if fty < 0 {
+            return -1
+        }
+        var f = new_node(N_TUPLE_TYPE_FIELD, name, -1, -1, line, col)
+        var fkids: table<i64> = table_new_i64()
+        table_push(fkids, fty)
+        set_children(f, fkids)
+        table_push(fields, f)
+        if eat(T_COMMA) {
+            // 继续
+        } else {
+            if !expect(T_RPAREN, "')'") {
+                return -1
+            }
+            d = true
+        }
+    }
+    var t = new_node(N_TUPLE_TYPE, -1, -1, -1, line, col)
+    set_children(t, fields)
+    return t
+}// ---------- 公开接口：parse / parse_src / parse_debug ----------
+
+// 判断字符串是否以给定前缀开始（内置原语实现，避免依赖 str 命名空间）
+func has_prefix(s: string, pre: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(pre)
+    if n < m {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(pre, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 主入口：token 流 → AST 协议文本。
+// 前提：lexer 列式 token 表已被 lexer.tokenize/run_lex 填充（parse_src 内部完成）。
+// proto_text 仅用于调试透传（词法错误 ERR 原样返回）。
+pub func parse(proto_text: string) -> string {
+    if has_prefix(proto_text, "ERR:") {
+        return proto_text
+    }
+    reset_nodes()
+    var root = parse_program()
+    if root < 0 {
+        return err_protocol()
+    }
+    return build_protocol()
+}
+
+// 便捷入口：源码字符串 → 词法 + 语法 → AST 协议文本（T1.3/验收程序用）
+pub func parse_src(src: string) -> string {
+    var ok = lexer.run_lex(src)
+    if !ok {
+        // 词法错误：直接读 lexer 的全局错误槽（词法失败时 token 表不可靠）
+        return "ERR:" + to_string(g_err_line) + " " + to_string(g_err_col) + " " + g_err_msg
+    }
+    return parse("")
+}
+
+// 可读 AST 树形输出（缩进展示 tag 名 + lexeme + span + 顶层语句序列），供人工对比
+pub func parse_debug(src: string) -> string {
+    var ok = lexer.run_lex(src)
+    if !ok {
+        return "ERR:" + to_string(g_err_line) + " " + to_string(g_err_col) + " " + g_err_msg
+    }
+    reset_nodes()
+    var root = parse_program()
+    if root < 0 {
+        return err_protocol()
+    }
+    var out: string = "共 " + to_string(len(node_tags)) + " 个节点，顶层 " +
+        to_string(child_count(root)) + " 条语句\n"
+    out = out + "顶层语句 tag 序列: " + top_seq(root) + "\n"
+    out = out + dump_node(root, 0) + "\n"
+    return out
+}
+
+// 顶层语句 tag 序列（Rust --ast 顶层语句变体对照用）
+func top_seq(root: i64) -> string {
+    var s: string = ""
+    var k: i64 = 0
+    while k < child_count(root) {
+        var c = child_at(root, k)
+        s = s + node_tag_name(node_tags[c])
+        if k + 1 < child_count(root) {
+            s = s + " "
+        }
+        k = k + 1
+    }
+    return s
+}
+
+// 递归树形输出：节点文本 + 子节点缩进
+func dump_node(id: i64, depth: i64) -> string {
+    var indent: string = ""
+    var d: i64 = 0
+    while d < depth {
+        indent = indent + "  "
+        d = d + 1
+    }
+    var txt: string = indent + node_text(id)
+    var k: i64 = 0
+    while k < child_count(id) {
+        var c = child_at(id, k)
+        if c >= 0 {
+            txt = txt + "\n" + dump_node(c, depth + 1)
+        } else {
+            txt = txt + "\n" + indent + "  -1(空)"
+        }
+        k = k + 1
+    }
+    return txt
+}
+
+// 节点单行文本：tag 名 + 名字 lexeme + 关键标量字段 + span
+func node_text(id: i64) -> string {
+    var tag = node_tags[id]
+    var s: string = node_tag_name(tag)
+    var nm = node_names[id]
+    if nm >= 0 {
+        s = s + " '" + intern.lookup(nm) + "'"
+    }
+    var v = node_vals[id]
+    if tag == N_BINARY {
+        s = s + " " + op_symbol(v, false)
+    } else if tag == N_UNARY {
+        s = s + " " + op_symbol(v, true)
+    } else if tag == N_INT_LIT {
+        s = s + " " + to_string(v)
+    } else if tag == N_BOOL_LIT {
+        s = s + " " + to_string(v)
+    } else if tag == N_TRIT_LIT {
+        s = s + " " + to_string(v)
+    } else if tag == N_ASSIGN {
+        if v >= 0 {
+            s = s + " " + op_symbol(v, false) + "="
+        }
+    } else if tag == N_FIELD_ASSIGN {
+        if v >= 0 {
+            s = s + " " + op_symbol(v, false) + "="
+        }
+    } else if tag == N_INDEX_ASSIGN {
+        if v >= 0 {
+            s = s + " " + op_symbol(v, false) + "="
+        }
+    } else if v >= 0 {
+        s = s + " v=" + to_string(v)
+    }
+    s = s + " @" + to_string(node_lines[id]) + ":" + to_string(node_cols[id])
+    return s
+}
+
+// 运算符编号 → 符号文本（parse_debug 展示用）
+func op_symbol(op: i64, is_unary: bool) -> string {
+    if is_unary {
+        if op == 0 {
+            return "-"
+        }
+        if op == 1 {
+            return "!"
+        }
+        if op == 2 {
+            return "++"
+        }
+        if op == 3 {
+            return "--"
+        }
+        if op == 4 {
+            return "++"
+        }
+        if op == 5 {
+            return "--"
+        }
+        return "?" + to_string(op)
+    }
+    if op == 0 {
+        return "+"
+    }
+    if op == 1 {
+        return "-"
+    }
+    if op == 2 {
+        return "*"
+    }
+    if op == 3 {
+        return "/"
+    }
+    if op == 4 {
+        return "%"
+    }
+    if op == 5 {
+        return "=="
+    }
+    if op == 6 {
+        return "!="
+    }
+    if op == 7 {
+        return "<"
+    }
+    if op == 8 {
+        return ">"
+    }
+    if op == 9 {
+        return "<="
+    }
+    if op == 10 {
+        return ">="
+    }
+    if op == 11 {
+        return "&&"
+    }
+    if op == 12 {
+        return "||"
+    }
+    if op == 13 {
+        return "&"
+    }
+    if op == 14 {
+        return "|"
+    }
+    if op == 15 {
+        return "^"
+    }
+    if op == 16 {
+        return "<<"
+    }
+    if op == 17 {
+        return ">>"
+    }
+    return "?" + to_string(op)
+}
+
+// ---------- AST 协议输出 ----------
+
+// 组装 AST 协议文本：首行 <N>:（节点总数），随后每行一个节点
+// <id> <tag> <name_id> <val> <aux> <line> <col> <nchild> <c1> <c2> ...
+func build_protocol() -> string {
+    var out: string = to_string(len(node_tags)) + ":\n"
+    var i: i64 = 0
+    while i < len(node_tags) {
+        var line: string = to_string(i) + " " + to_string(node_tags[i]) + " " +
+            to_string(node_names[i]) + " " + to_string(node_vals[i]) + " " +
+            to_string(node_aux[i]) + " " + to_string(node_lines[i]) + " " +
+            to_string(node_cols[i]) + " " + to_string(node_nchild[i])
+        var off = node_child_off[i]
+        var k: i64 = 0
+        while k < node_nchild[i] {
+            line = line + " " + to_string(node_children[off + k])
+            k = k + 1
+        }
+        out = out + line + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+}
