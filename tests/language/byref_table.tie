@@ -1,0 +1,33 @@
+// tie:logic
+// tie:opt=2
+
+// T0.3 验收：ref 表参数按引用传递（by_ref）——内容修改与重绑定都写回调用方。
+//
+// fill：函数内对 ref 表参数做内容修改（table_push 追加 + 下标写改元素），
+//      调用方变量 t 直接可见（真引用，非值拷贝）。
+// replace：函数内重绑定 x = table_new_i64()（换新表），调用方 t 跟随指向新表。
+func fill(x: ref table<i64>) {
+    table_push(x, 99)
+    table_push(x, 100)
+    x[0] = 42
+}
+
+func replace(x: ref table<i64>) {
+    x = table_new_i64()
+    table_push(x, 7)
+}
+
+func main() {
+    var t = table_new_i64()
+    table_push(t, 1)
+    fill(t)
+    // 内容修改写回：len 3（原 1 + push 99/100），t[0] 被改写为 42
+    println(len(t))
+    println(t[0])
+    println(t[1])
+    println(t[2])
+    replace(t)
+    // 重绑定写回：t 现指向新表（含 7）
+    println(len(t))
+    println(t[0])
+}

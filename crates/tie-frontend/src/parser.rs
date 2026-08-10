@@ -472,15 +472,19 @@ impl Parser {
                 let pspan = self.peek().span;
                 let pname = self.expect_ident()?;
                 self.expect(TokenKind::Colon, "':'")?;
+                // 按引用传递修饰（T0.3 by_ref）：`name: ref table<T>`——ref 表形参
+                // 是真引用（内容修改/重绑定写回调用方）。仅限表参数（语义层校验）。
+                let by_ref = self.eat(&TokenKind::Ref);
                 let pty = self.parse_type()?;
                 // 默认值（可选参数）：`name: Ty = 字面量`。限字面量（含空表 []），
                 // 与类字段默认值规则一致（语义层校验类型，语法层只负责解析）。
+                // ref 参数不允许默认值（语义层校验：引用目标无法由默认值表达）。
                 let default = if self.eat(&TokenKind::Eq) {
                     Some(self.parse_expr()?)
                 } else {
                     None
                 };
-                params.push(Param { name: pname, ty: pty, default, span: pspan });
+                params.push(Param { name: pname, ty: pty, default, by_ref, span: pspan });
                 if self.eat(&TokenKind::Comma) {
                     continue;
                 }

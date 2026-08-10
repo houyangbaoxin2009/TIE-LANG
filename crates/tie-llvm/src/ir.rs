@@ -13,7 +13,7 @@ use tie_frontend::ast::{
     TypeSpec, UnaryOp,
 };
 use tie_frontend::lexer::TyKw;
-use tie_frontend::semantic::{ClassInfo, FuncSig, SemanticResult};
+use tie_frontend::semantic::{ClassInfo, SemanticResult};
 use std::collections::HashMap;
 
 /// IR 生成结果。
@@ -157,34 +157,16 @@ impl<'p> IrGenerator<'p> {
         // 函数内 load/store 访问）。字符串全局存指向常量串的指针。
         self.gen_globals()?;
 
-        // 收集函数签名（与语义一致）
-        let sigs: HashMap<String, FuncSig> = self
-            .program
-            .stmts
-            .iter()
-            .filter_map(|s| match s {
-                Stmt::FnDef(f) => Some((
-                    f.name.clone(),
-                    FuncSig {
-                        param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
-                        param_defaults: f.params.iter().map(|p| p.default.clone()).collect(),
-                        ret_ty: f.ret_ty.clone(),
-                        // 顶层函数恒公有（与语义层一致）
-                        is_pub: true,
-                    },
-                )),
-                _ => None,
-            })
-            .collect();
-
         // 生成各函数（顶层 + 命名空间内）：全名 = 顶层裸名 / 命名空间路径::函数名。
         // 递归遍历命名空间体，fn_full_names 提供 FnDefStmt 地址 → 全名映射
         // （与语义层一致；gen_fn 用全名生成 LLVM 符号）。
+        // 签名（含 T0.3 by_ref 标志）统一查语义层结果 self.sem.funcs（键 = 全名，
+        // 与 gen_fn 的 full_name 一致）——IR 不另造签名，避免双判定源。
         for stmt in &self.program.stmts {
             if let Stmt::FnDef(f) = stmt {
-                self.gen_fn(f, &f.name, &sigs)?;
+                self.gen_fn(f, &f.name)?;
             } else if let Stmt::Namespace(ns) = stmt {
-                self.gen_ns_fns(&ns.body, &ns.path, &sigs)?;
+                self.gen_ns_fns(&ns.body, &ns.path)?;
             }
         }
 
@@ -500,19 +482,19 @@ impl<'p> IrGenerator<'p> {
 
     /// 命名空间体内函数生成（顶层发射循环递归入口）：全名 = 当前路径::函数名，
     /// 嵌套命名空间递归拼接路径。与语义层 collect_ns_funcs 的路径规则一致。
-    fn gen_ns_fns(&mut self, stmts: &[Stmt], prefix: &[String], sigs: &HashMap<String, FuncSig>) -> Result<(), IrError> {
+    fn gen_ns_fns(&mut self, stmts: &[Stmt], prefix: &[String]) -> Result<(), IrError> {
         for stmt in stmts {
             match stmt {
                 Stmt::FnDef(f) => {
                     let mut segs = prefix.to_vec();
                     segs.push(f.name.clone());
                     let full = segs.join("::");
-                    self.gen_fn(f, &full, sigs)?;
+                    self.gen_fn(f, &full)?;
                 }
                 Stmt::Namespace(inner) => {
                     let mut segs = prefix.to_vec();
                     segs.extend(inner.path.iter().cloned());
-                    self.gen_ns_fns(&inner.body, &segs, sigs)?;
+                    self.gen_ns_fns(&inner.body, &segs)?;
                 }
                 _ => {}
             }
@@ -520,7 +502,7 @@ impl<'p> IrGenerator<'p> {
         Ok(())
     }
 
-    fn gen_fn(&mut self, f: &FnDefStmt, full_name: &str, sigs: &HashMap<String, FuncSig>) -> Result<(), IrError> {
+    fn gen_fn(&mut self, f: &FnDefStmt, full_name: &str) -> Result<(), IrError> {
         // LLVM 符号名：顶层函数 = 裸名；命名空间函数 = 全名转 $（tcmsg::error::no_file
         // → tcmsg$error$no_file，与类方法 mangle 同约定）。
         self.cur_fn = full_name.to_string();
@@ -532,10 +514,16 @@ impl<'p> IrGenerator<'p> {
         // 会残留 printf 等最后调用的返回值（如打印 3 个字符 → 退出码 3）。
         let is_main_entry = full_name == "main";
         let ret_llvm = if is_main_entry && f.ret_ty.is_void() { "i32" } else { self.llvm_ty(&f.ret_ty) };
-        // M2.1.8：方法函数（namespace <struct名> 内的函数，首参类型 == 该 struct 名）
-        // 首参按**引用**传递（LLVM ptr）——函数内字段修改反映到调用方
-        // （与 class 时代的 this 指针机制一致，只是显式首参）。
-        let method_receiver = self.is_method_fn(full_name, f.params.first().map(|p| &p.ty));
+        // M2.1.8 + T0.3 by_ref：方法函数（namespace <struct名> 内的函数，首参类型
+        // == 该 struct 名）首参按**引用**（ptr）传递——函数内字段修改反映到调用方
+        // （与 class 时代的 this 指针机制一致，只是显式首参）。语义层已把方法首参
+        // 显式登记到 FuncSig.param_by_ref[0]（替代 IR 层旧的名字约定判定）。
+        let method_receiver = self
+            .sem
+            .funcs
+            .get(full_name)
+            .map(|s| s.param_by_ref.first().copied().unwrap_or(false))
+            .unwrap_or(false);
         let mut params = Vec::new();
         for (i, p) in f.params.iter().enumerate() {
             if method_receiver && i == 0 {
@@ -572,7 +560,27 @@ impl<'p> IrGenerator<'p> {
                 continue;
             }
             if is_table_param {
-                // 表参数：与动态表变量同布局——alloca ptr 存表指针，
+                // T0.3 by_ref：ref 表形参是**真引用**——参数寄存器即调用方实参槽
+                // 地址，直接按 by_ptr 绑定（不 alloca）。效果与普通表形参的
+                // 「alloca 存表指针」同构：表访问路径统一 `load ptr, ptr` 从绑定
+                // 地址 load 出表指针（by_ref 是从调用方槽 load）；重绑定
+                // `store ptr, ptr` 写回参数地址 = 写回调用方槽（内容共享 +
+                // 重绑定都写回调用方）。别名（同一变量传两个 ref 参数）暂不防护。
+                if self
+                    .sem
+                    .funcs
+                    .get(full_name)
+                    .and_then(|s| s.param_by_ref.get(i))
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    scope.insert(
+                        p.name.clone(),
+                        VarBind { value: pname, ty: "ptr", by_ptr: true },
+                    );
+                    continue;
+                }
+                // 普通表参数：与动态表变量同布局——alloca ptr 存表指针，
                 // 表访问路径统一 `load ptr, ptr`（tie_table_at/set/len 桥）。
                 // 若直接绑定参数寄存器，表访问会把它当地址再 load 一层（段错误）。
                 // alloca 就地输出（参数区在 entry 顶部，不能用提升缓冲——会晚于 store）。
@@ -637,7 +645,6 @@ impl<'p> IrGenerator<'p> {
         self.dedent();
         self.out.push_str("}\n\n");
         self.scopes.pop();
-        let _ = sigs;
         Ok(())
     }
 
@@ -1044,11 +1051,7 @@ impl<'p> IrGenerator<'p> {
             || (tv.is_none() && matches!(self.sem_ty_of(base), Some(t) if t.is_table() || t.is_map()));
         if is_dynamic {
             // 元素类型（E1 未登记表变量：取语义推导类型的元素类型）
-            let elem_ty = if let Some(t) = self.sem_ty_of(base) {
-                t.table_elem_ty().cloned().unwrap_or(t)
-            } else {
-                self.dyn_table_elem_ty(base)?
-            };
+            let elem_ty = self.dyn_elem_ty_of(base)?;
             let elem_llvm = self.llvm_ty(&elem_ty);
             let suffix = self.table_bridge_suffix(&elem_ty);
             self.mark_used(&format!("tie_table_set_{suffix}"));
@@ -1542,11 +1545,7 @@ impl<'p> IrGenerator<'p> {
     ) -> Result<(), IrError> {
         // 元素类型：来自语义层 table_vars（动态表的 LLVM 类型恒为 "ptr"）；
         // E1 未登记表变量（循环变量）由语义推导类型取元素类型
-        let elem_ty = if let Some(t) = self.sem_ty_of(&f.iter) {
-            t.table_elem_ty().cloned().unwrap_or(t)
-        } else {
-            self.dyn_table_elem_ty(&f.iter)?
-        };
+        let elem_ty = self.dyn_elem_ty_of(&f.iter)?;
         let elem_llvm = self.llvm_ty(&elem_ty);
         let suffix = self.table_bridge_suffix(&elem_ty);
         self.mark_used(&format!("tie_table_at_{suffix}"));
@@ -2246,11 +2245,7 @@ impl<'p> IrGenerator<'p> {
         let is_dynamic = tv.map(|info| info.dynamic).unwrap_or(false)
             || (tv.is_none() && matches!(self.sem_ty_of(base), Some(t) if t.is_table()));
         if is_dynamic {
-            let elem_ty = if let Some(t) = self.sem_ty_of(base) {
-                t.table_elem_ty().cloned().unwrap_or(t)
-            } else {
-                self.dyn_table_elem_ty(base)?
-            };
+            let elem_ty = self.dyn_elem_ty_of(base)?;
             let elem_llvm = self.llvm_ty(&elem_ty);
             let suffix = self.table_bridge_suffix(&elem_ty);
             self.mark_used(&format!("tie_table_at_{suffix}"));
@@ -3721,9 +3716,13 @@ impl<'p> IrGenerator<'p> {
                         })?
                 }
             };
-            // 方法函数（namespace <struct名>，首参类型 == 该 struct 名）首参按**引用**
-            // 传递：传 receiver 地址（ptr）。语义层已保证 receiver 可寻址。
-            if is_first && self.is_method_fn(name, sig.param_tys.first()) {
+            // T0.3 by_ref：形参按引用传递（方法首参 / 显式 ref 表形参，语义层
+            // 已登记 param_by_ref）——传实参**槽地址**（ptr）。语义层已保证实参
+            // 可寻址（动态表变量 / 方法 receiver 字段链），gen_class_addr 直接取地址：
+            // - 表变量 → 绑定 alloca 槽地址（被调函数 by_ptr 绑定参数寄存器后，
+            //   load/store 都穿透到调用方槽：内容修改共享 + 重绑定写回）；
+            // - 方法 receiver → 对象地址（与旧 is_method_fn 判定路径一致）。
+            if sig.param_by_ref.get(i).copied().unwrap_or(false) {
                 let (ptr, _ptr_llvm) = self.gen_class_addr(a)?;
                 arg_list.push(format!("ptr {ptr}"));
                 continue;
@@ -3753,21 +3752,6 @@ impl<'p> IrGenerator<'p> {
             self.line(&format!("{tmp} = call {ret_llvm} @{}({})", symbol, arg_list.join(", ")));
             Ok((tmp, ret_llvm))
         }
-    }
-
-    /// 是否为方法函数（M2.1.8）：`namespace <struct名>` 内的函数且首参类型 == 该
-    /// struct 名——首参按**引用**（ptr）传递，函数内字段修改反映到调用方。
-    ///
-    /// 判定：全名 `ns::m` 的命名空间路径末段 == 首参 struct 名
-    /// （`Point::dist(p: Point)` → ns 末段 "Point" == "Point"）。
-    fn is_method_fn(&self, full: &str, first_ty: Option<&TypeSpec>) -> bool {
-        let Some(TypeSpec::Struct(sn)) = first_ty else {
-            return false;
-        };
-        let Some((ns, _)) = full.rsplit_once("::") else {
-            return false;
-        };
-        ns.rsplit("::").next() == Some(sn.as_str())
     }
 
     /// receiver 是否为「可求值实例」（绑定变量/字段链/构造/方法链）→ 实例转发
@@ -4204,12 +4188,30 @@ impl<'p> IrGenerator<'p> {
         self.lookup_var(name).is_some()
     }
 
+    /// 动态表表达式元素类型（统一入口，T0.3 修复）。
+    ///
+    /// 旧路径对已登记 table_vars 的表变量先取 sem_ty_of(base)（`var t =
+    /// table_new_i64()` 的 scope 类型是 Named(Table)，无元素信息），unwrap_or
+    /// 把元素类型误判成表本身 → 选 ptr 桥（tie_table_at_ptr）→ 运行时段错误。
+    /// 修复：已登记变量/表形参一律以 table_vars 登记元素类型为准；未登记表
+    /// 变量（循环变量/下标链推导）取语义推导类型；调用/下标链兜底查表。
+    fn dyn_elem_ty_of(&self, expr: &Expr) -> Result<TypeSpec, IrError> {
+        if let Expr::Var(name) = expr
+            && let Some(tv) = self.sem.table_vars.get(&(self.cur_fn.clone(), name.clone()))
+        {
+            return Ok(tv.elem_ty.clone());
+        }
+        if let Some(t) = self.sem_ty_of(expr) {
+            return Ok(t.table_elem_ty().cloned().unwrap_or(t));
+        }
+        self.dyn_table_elem_ty(expr)
+    }
+
     /// 解析动态表表达式的元素类型（table_at 返回类型 / 下标访问用）。
     ///
     /// 表变量查 table_vars（键 = 当前函数 + 变量名）；返回表的函数调用查 table_ret_elems。
     /// 动态表的 LLVM 类型恒为 "ptr"，元素类型必须从语义元数据取。
-    fn dyn_table_elem_ty(&self, expr: &Expr) -> Result<TypeSpec, IrError> {
-        match expr {
+    fn dyn_table_elem_ty(&self, expr: &Expr) -> Result<TypeSpec, IrError> {        match expr {
             Expr::Var(name) => {
                 let key = (self.cur_fn.clone(), name.clone());
                 self.sem
@@ -5292,5 +5294,42 @@ mod tests {
         // void 指令保持无编号（LLVM 禁止命名）
         assert!(re.contains("store i64 0, ptr %1"), "store 应保持无编号");
         assert!(re.contains("br label %l.2"), "br 应保持无编号");
+    }
+
+    // ---------- T0.3：ref 表参数按引用传递（IR 生成） ----------
+
+    #[test]
+    fn ref表参数by_ref绑定与槽地址传参与重绑定写回() {
+        // ref 表形参的 IR 形态（与普通表形参的「alloca 存表指针」区分）：
+        // 1. 入口直接绑定参数寄存器 %x（by_ptr，不 alloca）——表访问路径
+        //    `load ptr, ptr %x` 从参数寄存器 load（= 调用方槽内容）；
+        // 2. 调用点 f(t) 传实参变量槽地址（%t 的 alloca，不再 load 表指针）；
+        // 3. 重绑定 x = table_new_i64() → `store ptr, ptr %x` 写回参数地址
+        //    （即调用方槽）——内容修改与重绑定都写回调用方。
+        let ir = 编译(
+            "func f(x: ref table<i64>) {\n    table_push(x, 99)\n    x[0] = 1\n    x = table_new_i64()\n}\nfunc main() {\n    var t = table_new_i64()\n    f(t)\n}",
+        );
+        // 1. 形参签名是 ptr（表恒为 ptr），且表访问直接 load 参数寄存器 %x
+        assert!(ir.contains("define void @f(ptr %x)"), "f 首参应按 ptr 绑定参数寄存器：\n{ir}");
+        assert!(ir.contains("load ptr, ptr %x"), "表访问应直接 load 参数寄存器 %x（by_ref 不 alloca）：\n{ir}");
+        // 3. 重绑定写回参数地址（调用方槽）——store 目标是 %x 而非本地 alloca
+        assert!(
+            ir.lines()
+                .any(|l| l.trim().starts_with("store ptr %") && l.trim().ends_with(", ptr %x")),
+            "重绑定应 store 写回参数地址 %x：\n{ir}"
+        );
+        // 2. 调用点传槽地址（call void @f(ptr %...)，无中间 load）
+        assert!(ir.contains("call void @f(ptr %"), "调用点应传实参槽地址：\n{ir}");
+    }
+
+    #[test]
+    fn ref表参数与普通表参数绑定区分() {
+        // 对照组：普通表形参仍 alloca 存表指针（by_ptr:false 现状不变）——
+        // 表访问 load 自本地 alloca（%N），重绑定 store 写本地 alloca，不写调用方。
+        let ir = 编译(
+            "func f(x: table<i64>) {\n    table_push(x, 99)\n}\nfunc main() {\n    var t = table_new_i64()\n    f(t)\n}",
+        );
+        assert!(ir.contains("define void @f(ptr %x)"), "普通表形参也是 ptr 参数");
+        assert!(!ir.contains("load ptr, ptr %x"), "普通表形参不得直接 load 参数寄存器：\n{ir}");
     }
 }

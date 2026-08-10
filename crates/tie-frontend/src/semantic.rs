@@ -79,6 +79,12 @@ pub struct FuncSig {
     /// 参数默认值（可选参数）：与 param_tys 等长对齐，None = 必选参数。
     /// 调用点省略实参时按此补齐（LLVM 函数签名不变，缺省实参在调用点生成）。
     pub param_defaults: Vec<Option<Expr>>,
+    /// 参数是否按引用传递（T0.3 by_ref）：与 param_tys 等长对齐。true =
+    /// 该形参是真引用——内容修改与变量重绑定都写回调用方实参槽（IR 层 by_ptr
+    /// 绑定 + 槽地址传参；interp 层引用槽穿透）。来源：显式 `ref` 修饰的表形参
+    /// + 方法函数首参（`namespace <struct名>` 内首参类型 == 该 struct 名，
+    /// 与 IR 层旧名字约定等价，改由语义层显式登记、IR 直接查询）。
+    pub param_by_ref: Vec<bool>,
     pub ret_ty: TypeSpec,
     /// 是否公有（M2.1.7 单文件命名空间）：命名空间内函数默认私有（仅同命名
     /// 空间可见，`pub func` 显式导出）；顶层函数恒为 true。
@@ -128,6 +134,9 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
                 let sig = FuncSig {
                     param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
                     param_defaults: f.params.iter().map(|p| p.default.clone()).collect(),
+                    // 顶层函数无命名空间（裸名），不可能命中方法名字约定——
+                    // 仅登记显式 `ref` 修饰的形参（T0.3 by_ref）
+                    param_by_ref: f.params.iter().map(|p| p.by_ref).collect(),
                     ret_ty: f.ret_ty.clone(),
                     // 顶层函数恒公有（与现状兼容）
                     is_pub: true,
@@ -543,9 +552,25 @@ impl Analyzer {
                     let mut segs = prefix.to_vec();
                     segs.push(f.name.clone());
                     let full = segs.join("::");
+                    // 方法函数判定（T0.3 by_ref）：命名空间末段 == 首参 struct 名
+                    // （`Point::dist(p: Point)`）——首参按引用传递（与 IR 层旧
+                    // 名字约定等价，改由语义层显式登记 param_by_ref，IR 直接查询）。
+                    let is_method = prefix
+                        .last()
+                        .zip(f.params.first().map(|p| &p.ty))
+                        .is_some_and(|(ns, ty)| {
+                            matches!(ty, TypeSpec::Struct(sn) if ns == sn)
+                        });
                     let sig = FuncSig {
                         param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
                         param_defaults: f.params.iter().map(|p| p.default.clone()).collect(),
+                        // 显式 ref 形参 + 方法函数首参（i==0）都按引用传递
+                        param_by_ref: f
+                            .params
+                            .iter()
+                            .enumerate()
+                            .map(|(i, p)| p.by_ref || (is_method && i == 0))
+                            .collect(),
                         ret_ty: f.ret_ty.clone(),
                         // 命名空间内函数默认私有；`pub func` 显式导出（M2.1.7）
                         is_pub: f.is_pub,
@@ -620,6 +645,27 @@ impl Analyzer {
         //   字面量暂不支持——表默认值的布局元数据按调用点展开，非空表会因语义
         //   元数据键（表达式地址）与调用点克隆体不一致而失效，故语义层直接拦截）；
         // - 默认值类型必须与参数类型匹配。
+        // ref 形参校验（T0.3 by_ref）：
+        // - ref 仅支持表参数（标量/字符串/struct 形参引用无实义，IR 也无 by_ptr 槽）；
+        // - ref 参数不允许默认值（引用目标必须由调用点实参提供，无法用默认值表达）。
+        for p in &f.params {
+            if p.by_ref && !p.ty.is_table() {
+                return Err(SemanticError {
+                    span: p.span,
+                    message: format!(
+                        "参数 '{}' 的 ref 修饰仅支持表参数（table/table<T>），实际是 {}",
+                        p.name,
+                        type_name(&p.ty)
+                    ),
+                });
+            }
+            if p.by_ref && p.default.is_some() {
+                return Err(SemanticError {
+                    span: p.span,
+                    message: format!("参数 '{}' 的 ref 参数不能有默认值（必须在调用点传实参）", p.name),
+                });
+            }
+        }
         let mut seen_default = false;
         for p in &f.params {
             if p.default.is_some() {
@@ -1794,7 +1840,9 @@ impl Analyzer {
                     let t_ty = self.infer_expr(&args[0], scope)?;
                     let x_ty = self.infer_expr(&args[1], scope)?;
                     self.result.expr_types.insert(addr_of(&args[1]), x_ty.clone());
-                    if !matches!(&t_ty, TypeSpec::Named(TyKw::Table)) {
+                    // 表类型含 table<T>（A1）：形参/变量可能推导为 TypeSpec::Table(elem)，
+                    // 不只是裸 Named(Table)——is_table 同时接受两者
+                    if !t_ty.is_table() {
                         return Err(SemanticError {
                             span: expr_span_of(&args[0]),
                             message: format!("table_push() 第 1 个参数必须是表，实际是 {}", type_name(&t_ty)),
@@ -1846,7 +1894,8 @@ impl Analyzer {
                     let t_ty = self.infer_expr(&args[0], scope)?;
                     let i_ty = self.infer_expr(&args[1], scope)?;
                     self.result.expr_types.insert(addr_of(&args[1]), i_ty.clone());
-                    if !matches!(&t_ty, TypeSpec::Named(TyKw::Table)) {
+                    // 表类型含 table<T>（A1）：形参/变量可能推导为 TypeSpec::Table(elem)
+                    if !t_ty.is_table() {
                         return Err(SemanticError {
                             span: expr_span_of(&args[0]),
                             message: format!("table_at() 第 1 个参数必须是表，实际是 {}", type_name(&t_ty)),
@@ -2774,7 +2823,38 @@ impl Analyzer {
                         ),
                     });
                 }
-                for (a, want) in args.iter().zip(sig.param_tys.iter()) {
+                for (i, (a, want)) in args.iter().zip(sig.param_tys.iter()).enumerate() {
+                    // T0.3 by_ref：ref 形参的实参必须可寻址（表变量）——IR 层按实参
+                    // 槽地址传参（by_ptr 绑定省一次 load），重绑定写回调用方槽。
+                    // 字面量/下标/调用结果无变量槽；定长表变量是 [N x T] 数组布局
+                    // （无动态表指针槽，传地址会被被调函数误当动态表指针）→ 报错。
+                    if sig.param_by_ref.get(i).copied().unwrap_or(false) {
+                        let Expr::Var(vname) = a else {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!(
+                                    "调用 '{call_name}' 的 ref 参数需要可寻址的表变量实参（字面量/下标/调用结果不可取地址）"
+                                ),
+                            });
+                        };
+                        let info = self
+                            .table_vars
+                            .get(&(self.cur_fn.clone(), vname.clone()))
+                            .ok_or_else(|| SemanticError {
+                                span: expr_span_of(a),
+                                message: format!(
+                                    "调用 '{call_name}' 的 ref 参数实参 '{vname}' 必须是动态表变量（table_new_* 创建）"
+                                ),
+                            })?;
+                        if !info.dynamic {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!(
+                                    "调用 '{call_name}' 的 ref 参数实参 '{vname}' 必须是动态表变量（table_new_* 创建），'{vname}' 是定长表"
+                                ),
+                            });
+                        }
+                    }
                     let mut at = self.infer_expr(a, scope)?;
                     // E0/E3：表/键值表变量实参的表身份还原——未标注表字面量变量
                     // （var arr = [1,2,3]）scope 存的是元素类型（既有行为），传参时按
@@ -6114,6 +6194,92 @@ mod tests {
         assert!(
             sem.resolved_calls.values().any(|v| v == "fmt::inner::deep"),
             "裸调用应记录全名 fmt::inner::deep"
+        );
+    }
+
+    // ---------- T0.3：ref 表参数按引用传递 ----------
+
+    #[test]
+    fn ref表参数函数内修改与重绑定语义通过() {
+        // 被调函数内对 ref 表参数做内容修改（table_push / 下标写）与变量重绑定，
+        // 语义层应通过——真实写回调用方由 IR/interp 层保证（此处只验证语义不误报）。
+        analyze_src(
+            r#"
+            func f(x: ref table<i64>) {
+                table_push(x, 99)
+                x[0] = 1
+                x = table_new_i64()
+            }
+            func main() {
+                var t = table_new_i64()
+                f(t)
+            }
+            "#,
+        )
+        .expect("ref 表参数函数调用应通过语义检查");
+        // ref 标志应登记到签名（IR 层按此决定 by_ptr 绑定与槽地址传参）
+        let sem = analyze_src(
+            "func f(x: ref table<i64>) {}\nfunc main() {\n    var t = table_new_i64()\n    f(t)\n}",
+        )
+        .expect("ref 签名收集应通过");
+        assert!(
+            sem.funcs.get("f").map(|s| s.param_by_ref.first() == Some(&true)).unwrap_or(false),
+            "FuncSig 应登记 f 的首参为 by_ref"
+        );
+    }
+
+    #[test]
+    fn ref表参数非表类型报错() {
+        // ref 修饰仅限表参数（设计决策 2）：标量/字符串/struct 形参加 ref → 报错
+        expect_err(
+            r#"
+            func g(t: ref i64) {}
+            func main() {
+                var x = 1
+                g(x)
+            }
+            "#,
+            "ref 修饰仅支持表参数",
+        );
+    }
+
+    #[test]
+    fn ref表参数不能带默认值() {
+        // ref 参数必须在调用点传实参（引用目标无法由默认值表达）→ 语义错误
+        expect_err(
+            r#"
+            func g(t: ref table<i64> = []) {}
+            func main() {
+                var t = table_new_i64()
+                g(t)
+            }
+            "#,
+            "ref 参数不能有默认值",
+        );
+    }
+
+    #[test]
+    fn ref表参数不可寻址实参报错() {
+        // ref 形参要求实参可寻址（表变量）：字面量/下标/调用结果不可寻址 → 语义错误
+        expect_err(
+            r#"
+            func g(t: ref table<i64>) {}
+            func main() {
+                g([1, 2])
+            }
+            "#,
+            "可寻址",
+        );
+        // 定长表变量（表字面量初始化）没有动态表布局，也不可作为 ref 实参
+        expect_err(
+            r#"
+            func g(t: ref table<i64>) {}
+            func main() {
+                var a = [1, 2]
+                g(a)
+            }
+            "#,
+            "动态表",
         );
     }
 }

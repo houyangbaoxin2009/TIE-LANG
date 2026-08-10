@@ -1780,6 +1780,14 @@ enum Flow {
 struct Env<'a> {
     session: &'a mut Session,
     scopes: Vec<std::collections::HashMap<String, Value>>,
+    /// by_ref 引用槽栈（T0.3）：每层对应一次函数调用，记录该函数各 ref 形参
+    /// 指向的调用方变量槽（`p.name → 调用方槽位置`）。lookup/assign 对 ref
+    /// 形参名的读写穿透到调用方槽——内容修改（table_push/下标写）与变量
+    /// 重绑定都写回调用方（真引用，非值拷贝）。非 ref 形参不在其中。
+    ///
+    /// 正确性：调用方作用域在被调期间只 push 不 pop（栈式 Vec 天然存活），
+    /// 递归调用下各层引用槽各自指向自己的调用方——与值拷贝语义一致。
+    refs: Vec<std::collections::HashMap<String, RefTarget>>,
     /// 当前执行函数的命名空间前缀（空 = 顶层函数）。
     /// 命名空间内裸调用（如 tcmsg::error 内 helper()）据此补全为全名
     /// （helper → tcmsg::error::helper）；由 call_fn 执行函数体时设置/恢复。
@@ -1793,13 +1801,31 @@ struct Env<'a> {
     scope_base: usize,
 }
 
+/// by_ref 引用槽目标（T0.3）：ref 表形参指向的调用方变量槽。
+#[derive(Debug, Clone)]
+enum RefTarget {
+    /// 调用方函数作用域层（scopes 绝对索引，被调期间保持存活）
+    Scope { layer: usize, name: String },
+    /// 顶层全局变量（REPL globals）
+    Global { name: String },
+}
+
 impl<'a> Env<'a> {
     fn new(session: &'a mut Session) -> Self {
-        Self { session, scopes: Vec::new(), cur_ns: Vec::new(), scope_base: 0 }
+        Self { session, scopes: Vec::new(), refs: Vec::new(), cur_ns: Vec::new(), scope_base: 0 }
     }
 
-    /// 变量查找：当前函数作用域栈（scope_base 起）→ 顶层 globals。
+    /// 变量查找：当前函数引用槽（ref 形参穿透调用方）→ 函数作用域栈
+    /// （scope_base 起）→ 顶层 globals。
     fn lookup(&self, name: &str) -> Option<Value> {
+        // T0.3 by_ref：当前函数的引用槽优先——ref 形参从调用方槽取当前值
+        //（table_push/下标写后能立即读到共享的新内容）
+        if let Some(t) = self.refs.last().and_then(|r| r.get(name)) {
+            return Some(match t {
+                RefTarget::Scope { layer, name } => self.scopes[*layer].get(name)?.clone(),
+                RefTarget::Global { name } => self.session.globals.get(name)?.clone(),
+            });
+        }
         for scope in self.scopes[self.scope_base..].iter().rev() {
             if let Some(v) = scope.get(name) {
                 return Some(v.clone());
@@ -1808,8 +1834,22 @@ impl<'a> Env<'a> {
         self.session.globals.get(name).cloned()
     }
 
-    /// 变量赋值：当前函数作用域（scope_base 起）内找到则改，否则写顶层 globals。
+    /// 变量赋值：当前函数引用槽（ref 形参写回调用方槽）→ 函数作用域
+    /// （scope_base 起）→ 顶层 globals。
     fn assign(&mut self, name: &str, value: Value) -> Result<(), String> {
+        // T0.3 by_ref：引用槽优先——写回调用方变量槽。内容修改与变量重绑定
+        //（x = table_new_*）都经此路径写回，调用方可见。
+        if let Some(t) = self.refs.last().and_then(|r| r.get(name)).cloned() {
+            match t {
+                RefTarget::Scope { layer, name: slot } => {
+                    self.scopes[layer].insert(slot, value);
+                }
+                RefTarget::Global { name: slot } => {
+                    self.session.globals.insert(slot, value);
+                }
+            }
+            return Ok(());
+        }
         for scope in self.scopes[self.scope_base..].iter_mut().rev() {
             if scope.contains_key(name) {
                 scope.insert(name.to_string(), value);
@@ -1823,11 +1863,13 @@ impl<'a> Env<'a> {
         Err(format!("变量 '{name}' 未声明"))
     }
 
-    /// 变量是否已声明（当前函数作用域 scope_base 起，或顶层）。
+    /// 变量是否已声明（当前函数引用槽 / 函数作用域 scope_base 起 / 顶层）。
     fn is_declared(&self, name: &str) -> bool {
-        self.scopes[self.scope_base..]
-            .iter()
-            .any(|s| s.contains_key(name))
+        // T0.3 by_ref：ref 形参名视为已声明（防止函数体内 `var x` 重声明）
+        self.refs.last().is_some_and(|r| r.contains_key(name))
+            || self.scopes[self.scope_base..]
+                .iter()
+                .any(|s| s.contains_key(name))
             || self.session.globals.contains_key(name)
     }
 
@@ -2293,7 +2335,9 @@ impl<'a> Env<'a> {
                 } else {
                     name.clone()
                 };
-                self.call_fn(&resolved, arg_vals)
+                // 实参表达式一并传入（T0.3 by_ref：ref 形参需取实参变量名，
+                // 建立指向调用方变量槽的引用）
+                self.call_fn(&resolved, arg_vals, Some(args))
             }
             Expr::Index { base, index, .. } => {
                 // 表下标：t[i] 读取第 i 个元素（越界 → 运行时错误，文本与编译路径一致）；
@@ -2383,7 +2427,7 @@ impl<'a> Env<'a> {
                     segs.push(method.clone());
                     let full = segs.join("::");
                     let arg_vals = self.eval_args(args)?;
-                    return self.call_fn(&full, arg_vals);
+                    return self.call_fn(&full, arg_vals, Some(args));
                 }
                 // 其余方法调用（struct 实例转发）：REPL v1 暂不支持 struct 值
                 Err("REPL v1 暂不支持 struct 方法调用".into())
@@ -2639,7 +2683,18 @@ impl<'a> Env<'a> {
     }
 
     /// 函数调用：内置函数 → 用户函数 → 报错。
-    fn call_fn(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String> {
+    /// 调用用户函数（顶层裸名或命名空间全名）：绑定参数后执行函数体。
+    ///
+    /// `arg_exprs`（T0.3 by_ref）：实参表达式切片（与 args 等长）。ref 形参
+    /// 需从实参表达式取变量名、建立指向调用方变量槽的引用；按值路径只取
+    /// args 中的值。eval_expr 调用路径传 Some(args)，其余入口（无 ref 需求）
+    /// 传 None。
+    fn call_fn(
+        &mut self,
+        name: &str,
+        args: Vec<Value>,
+        arg_exprs: Option<&[Expr]>,
+    ) -> Result<Value, String> {
         match name {
             "println" => {
                 let line = args.iter().map(|v| v.to_print_string()).collect::<Vec<_>>().join("");
@@ -3635,8 +3690,39 @@ impl<'a> Env<'a> {
                     let saved_base = self.scope_base;
                     // 压新作用域绑定参数：实参在前，缺省参数按默认值表达式求值补齐
                     //（默认值限字面量/空表，eval_expr 直接求值，无作用域依赖）。
+                    // T0.3 by_ref：ref 形参不插入参数作用域（避免整表值拷贝），
+                    // 改在引用槽层记录「调用方槽位置」——函数体对形参的读写经
+                    // lookup/assign 穿透到调用方槽（真引用）。引用目标在调用方
+                    // 作用域（scopes[..saved_base] 逆序找最近声明）或顶层 globals。
                     self.scopes.push(std::collections::HashMap::new());
+                    let mut ref_layer = std::collections::HashMap::new();
                     for (i, p) in f.params.iter().enumerate() {
+                        if p.by_ref {
+                            // 实参必须是可寻址表变量（编译路径由语义层校验；
+                            // REPL 动态求值此处防御）。arg_exprs 缺失（非表达式
+                            // 调用入口）时按不可寻址处理——ref 形参必须表达式实参。
+                            let Some(Expr::Var(aname)) = arg_exprs.and_then(|es| es.get(i)) else {
+                                return Err(format!(
+                                    "函数 '{name}' 的 ref 参数需要可寻址的表变量实参（字面量/下标/调用结果不可取地址）"
+                                ));
+                            };
+                            // 实参变量槽：saved_base 前的调用方作用域层（逆序找
+                            // 最近声明），未命中则视为顶层 globals
+                            let target = self
+                                .scopes
+                                .iter()
+                                .enumerate()
+                                .take(saved_base)
+                                .rev()
+                                .find(|(_, s)| s.contains_key(aname))
+                                .map(|(layer, _)| RefTarget::Scope {
+                                    layer,
+                                    name: aname.clone(),
+                                })
+                                .unwrap_or(RefTarget::Global { name: aname.clone() });
+                            ref_layer.insert(p.name.clone(), target);
+                            continue;
+                        }
                         let v = if let Some(v) = args.get(i) {
                             v.clone()
                         } else if let Some(d) = &p.default {
@@ -3649,9 +3735,11 @@ impl<'a> Env<'a> {
                         };
                         self.scopes.last_mut().unwrap().insert(p.name.clone(), v);
                     }
+                    self.refs.push(ref_layer);
                     self.scope_base = self.scopes.len() - 1;
                     let result = self.exec_block(&f.body);
                     self.scopes.pop();
+                    self.refs.pop();
                     self.scope_base = saved_base;
                     self.cur_ns = saved_ns;
                     // 处理 return 传播
@@ -5236,5 +5324,42 @@ to_string(n) + ":" + names"#
         assert_eq!(s.eval("f([\"x\": 9])").unwrap(), "9");
         // map 字面量直接作实参
         assert_eq!(s2.eval("g([\"q\": 7])").unwrap(), "7");
+    }
+
+    // ---------- T0.3：ref 表参数按引用传递（解释路径） ----------
+
+    #[test]
+    fn ref表参数内容修改与重绑定写回调用方() {
+        // 调用方建动态表 → 传 ref 函数 → 函数内 push + 下标写 + 重绑定 →
+        // 返回后调用方变量读到函数内写入的内容（真引用，非值拷贝）。
+        // 注意：顶层 func 走注册路径（ev 两次：先注册函数，再执行调用段）。
+        let mut s = Session::new();
+        s.eval(
+            "func f(x: ref table<i64>) {\n    table_push(x, 99)\n    x[0] = 42\n    x = table_new_i64()\n    table_push(x, 7)\n}",
+        )
+        .unwrap();
+        // 内容修改（push 99 / 下标写 42）写回调用方原表；
+        // 重绑定 x = table_new_i64() 后，调用方 t 也指向新表（含 7）。
+        assert_eq!(
+            s.eval("var t = table_new_i64(); table_push(t, 1); f(t); table_at(t, 0)").unwrap(),
+            "7"
+        );
+        // 控制组：非 ref 表参数重绑定不写回调用方（现状行为不变）——t 仍是原表
+        let mut s2 = Session::new();
+        s2.eval("func g(x: table<i64>) {\n    table_push(x, 99)\n    x = table_new_i64()\n    table_push(x, 7)\n}")
+            .unwrap();
+        assert_eq!(
+            s2.eval("var t = table_new_i64(); table_push(t, 1); g(t); table_at(t, 0)").unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn ref表参数不可寻址实参报错() {
+        // ref 形参要求实参是可寻址表变量（字面量无变量槽可写回）→ 运行时防御报错
+        let mut s = Session::new();
+        s.eval("func g(t: ref table<i64>) {}").unwrap();
+        let err = s.eval("g([1, 2])").unwrap_err();
+        assert!(err.contains("可寻址"), "错误消息：{err}");
     }
 }

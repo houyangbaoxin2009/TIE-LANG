@@ -93,6 +93,9 @@ pub enum TokenKind {
     False,
     /// 平衡三进制 trit 的零值字面量（M4 补齐）：`zero`——trit 三值 true(+1)/zero(0)/false(-1)
     Zero,
+    /// 表参数按引用传递修饰符（T0.3 by_ref）：形参类型前 `ref`（`t: ref table<i64>`）——
+    /// ref 表形参 = 真引用，内容修改与变量重绑定都写回调用方实参槽
+    Ref,
     /// 类型关键字：i8..u64/f32/f64/bool/trit/char/string/void/code/num/text/misc/table
     TypeKw(TyKw),
 
@@ -805,6 +808,8 @@ impl<'a> Lexer<'a> {
             "false" => TokenKind::False,
             // 平衡三进制 trit 零值（M4 补齐）：zero 是保留字
             "zero" => TokenKind::Zero,
+            // 表参数按引用传递（T0.3 by_ref）：ref 是保留字
+            "ref" => TokenKind::Ref,
             "i8" => TokenKind::TypeKw(TyKw::I8),
             "i16" => TokenKind::TypeKw(TyKw::I16),
             "i32" => TokenKind::TypeKw(TyKw::I32),

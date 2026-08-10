@@ -291,6 +291,9 @@ pub struct Param {
     /// 默认值表达式（可选参数）：调用时省略该实参则用默认值补齐。
     /// 限字面量（含空表 `[]`），与类字段默认值规则一致（避免作用域依赖）。
     pub default: Option<Expr>,
+    /// 是否按引用传递（T0.3 by_ref）：`t: ref table<i64>`——ref 表形参 = 真引用，
+    /// 内容修改与变量重绑定都写回调用方实参槽。仅限表参数（语义层校验）。
+    pub by_ref: bool,
     pub span: Span,
 }
 
