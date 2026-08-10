@@ -121,7 +121,7 @@ pub extern "C" fn tie_str_char(s: *const c_char, i: i64) -> *mut c_char {
 
 /// C ABI 桥：取字符串首字符的 Unicode 标量值（UTF-32 码点，i64）；
 /// 空串返回 -1（哨兵）。与 [tie_str_char] 同源（`chars().next()` 解码），
-/// 供 tie 语言 `char_code` 原语使用——编译器（compiler/lexer.tie）解析
+/// 供 tie 语言 `char_code` 原语使用——编译器（archive/compiler-v1/lexer.tie）解析
 /// 字符字面量需要「字符 → 码点」的精确值（自举阶段 2 清扫的语言障碍）。
 #[unsafe(no_mangle)]
 pub extern "C" fn tie_char_code(s: *const c_char) -> i64 {
@@ -3427,7 +3427,7 @@ impl<'a> Env<'a> {
                 Ok(Value::Str(out))
             }
             // char_code：取字符串首字符的 Unicode 标量值（i64，UTF-32 码点）；
-            // 空串返回 -1。自举阶段 2 新增（compiler/lexer.tie 解析字符字面量
+            // 空串返回 -1。自举阶段 2 新增（archive/compiler-v1/lexer.tie 解析字符字面量
             // 需要「字符 → 码点」的精确值，tie 内无字节访问原语无法自行计算）。
             "char_code" => {
                 if args.len() != 1 {

@@ -1835,7 +1835,9 @@ func parse_comparison() -> i64 {
         } else if peek() == 75 {
             op = 9
         } else if peek() == 76 {
-            op = 16
+            // Ge（>=）：Rust BinaryOp::Ge 在协议中编号 23（§5.5；0-16 已占用，
+            // 历史实现曾误映射为 16 与 Shr 冲突，已修正）
+            op = 23
         } else {
             break
         }

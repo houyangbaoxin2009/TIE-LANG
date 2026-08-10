@@ -1,0 +1,93 @@
+// tie:library
+// prep/cleanup_archived_refs.tie：转换器模块——清理指向已归档 compiler-v1 的注释引用
+//
+// 协议：顶层 `func process(src: string) -> string`——输入文本，输出转换后文本。
+// 背景：自举 v2 把旧的 compiler-v1（lexer/parser/semantic.tie + PROTOCOL.md）归档到
+//       archive/compiler-v1/（见 .omo/plans/self-hosting-v2.md T0.0）。历史源码注释中
+//       仍以 "compiler/lexer.tie" 等旧路径引用它们（悬空引用）。本模块把注释中的
+//       旧路径统一改写为归档路径，保持注释可追溯。
+// 挂载方式：tie-prep <输入文件> --module prep/cleanup_archived_refs.tie > 输出文件
+// 注意：tie-prep 会做 CRLF→LF 规范化——对 LF 文本（.tie 源码/文档）可直接写回；
+//       对 CRLF 文件（部分 Rust 源码）需另行保留换行符合并（见模块用途说明）。
+// 自包含：eval 环境不支持 import，完全基于语言底座原语 str_char / str_len / 字符串拼接。
+// 策略：仅改写**注释行**（行内含 "//" 标记）中的目标路径，避免误伤代码字符串。
+
+// 检查从 i 开始是否命中子串 sub（逐字符匹配，返回是否命中）
+func match_at(src: string, n: i64, i: i64, sub: string) -> bool {
+    var m: i64 = str_len(sub)
+    if i + m > n {
+        return false
+    }
+    var j: i64 = 0
+    while j < m {
+        if str_char(src, i + j) != str_char(sub, j) {
+            return false
+        }
+        j = j + 1
+    }
+    return true
+}
+
+// 行内把 target 全部替换为 repl（返回新串）
+func replace_all(line: string, target: string, repl: string) -> string {
+    var n: i64 = str_len(line)
+    var m: i64 = str_len(target)
+    var result: string = ""
+    var i: i64 = 0
+    while i < n {
+        if match_at(line, n, i, target) {
+            result = result + repl
+            i = i + m
+        } else {
+            result = result + str_char(line, i)
+            i = i + 1
+        }
+    }
+    return result
+}
+
+// 单行处理：行内无 "//"（非注释）→ 原样返回；有 → 依次替换 4 个旧路径
+func fix_line(line: string) -> string {
+    if !contains_comment(line) {
+        return line
+    }
+    var s: string = replace_all(line, "compiler/lexer.tie", "archive/compiler-v1/lexer.tie")
+    s = replace_all(s, "compiler/parser.tie", "archive/compiler-v1/parser.tie")
+    s = replace_all(s, "compiler/semantic.tie", "archive/compiler-v1/semantic.tie")
+    s = replace_all(s, "compiler/PROTOCOL.md", "archive/compiler-v1/PROTOCOL.md")
+    return s
+}
+
+// 行内是否含注释标记 "//"
+func contains_comment(line: string) -> bool {
+    var n: i64 = str_len(line)
+    var i: i64 = 0
+    while i + 1 < n {
+        if str_char(line, i) == "/" && str_char(line, i + 1) == "/" {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 模块入口（协议约定）：逐行处理，保留换行符；最后一行无结尾换行
+func process(src: string) -> string {
+    var n: i64 = str_len(src)
+    var result: string = ""
+    var line: string = ""
+    var i: i64 = 0
+    while i <= n {
+        if i == n || str_char(src, i) == "\n" {
+            result = result + fix_line(line)
+            if i < n {
+                result = result + "\n"
+            }
+            line = ""
+        } else {
+            line = line + str_char(src, i)
+        }
+        i = i + 1
+    }
+    return result
+}

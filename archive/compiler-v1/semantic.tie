@@ -1,0 +1,5150 @@
+// tie:library
+// compiler/semantic.tie：语义分析器（tie 语言自写，自举阶段 2 模块 3）
+//
+// 入口：semantic.check(ast_text) -> string
+//   成功：OK:<expr_type_count>\nTYPES:<n>\n<node_id> <ty> ...   （类型字符串，供 ir 查表）
+//   失败：ERR:<line> <col> <message>（§4 错误协议，消息与 Rust 版逐字对齐）
+// 行为与 Rust 版 crates/tie-frontend/src/semantic.rs 对齐：
+//   - 第零遍 collect_imports_using（import/using 顶层收集）
+//   - 第一遍函数签名收集（顶层裸名 + 命名空间全名）+ 全局持久变量校验
+//   - collect_structs（继承拍平 + 环检测 + 字段唯一性）
+//   - 表返回预扫描 fixpoint（scan_return_table_elem + collect_local_dyn_tables）
+//   - 第二遍 check_fn / check_ns_stmts（含命名空间内函数）
+//
+// 设计约束（interp eval 注册，不能 import，自包含）：
+//   - 全局变量必须标量 → 所有符号表/元数据用「全局字符串行表」：
+//     每行一条记录，行首键 + 空格分隔字段；contains_key = 逐行查前缀。
+//     作用域 = 全局累积行 + 反向查找（Rust HashMap insert 覆盖语义一致）。
+//   - 类型用「规范类型字符串」：i64 / table<i64> / map<string> /
+//     tuple{f1:i64,f2:string}（字段名仅用于元组访问解析）/ struct:Point。
+//     type_name 显示转换：tuple{...}→"tuple"，struct:X→"X"。
+//   - 表达式节点 id（AST 行序）= Rust 版 addr_of(expr) 的键。
+//   - else-if 长链迭代检查（不递归，与 Rust 版一致）。
+//   - 错误用全局 sm_err 标志 + 返回 -1 短路传播，主入口返回 ERR: 文本。
+
+// ==================== 全局状态（interp 注册时初始化，check 重置） ====================
+
+var sm_ast: string = ""          // AST 协议文本（输入）
+var sm_ast_n: i64 = 0            // 节点数
+var sm_pool_n: i64 = 0           // 池条目数
+var sm_ast_pos: i64 = 0          // 节点行扫描游标（ast_node_line 用）
+
+// 错误状态（首个错误保留）
+var sm_err: string = ""
+var sm_err_line: i64 = 0
+var sm_err_col: i64 = 0
+
+// 结果：表达式类型表（节点 id → 类型字符串，IR 阶段用）
+var sm_expr_types: string = ""   // 每行：node_id ty
+var sm_expr_count: i64 = 0
+
+// ---- 符号表（全部全局字符串行表，键 = 行首字段） ----
+// sm_funcs：full_name is_pub nparam t1..tn d1..dn ret   （d = 默认值节点 id 或 -1）
+var sm_funcs: string = ""
+// sm_globals：name ty；sm_const_globals：name（每行一个）
+var sm_globals: string = ""
+var sm_const_globals: string = ""
+// sm_const_vars：name（函数内 const，每行一个）
+var sm_const_vars: string = ""
+// sm_table_vars：fn_name<SEP>var_name elem_ty len dynamic
+var sm_table_vars: string = ""
+// sm_tables：node_id elem_ty len dynamic（表字面量布局元数据）
+var sm_tables: string = ""
+// sm_table_ret_elems：full_name elem_ty（元素类型，均为已知）
+var sm_table_ret_elems: string = ""
+// sm_classes：name parent fields（fields = f1:t1;f2:t2;...，parent 空 = 无）
+var sm_classes: string = ""
+// sm_resolved_calls：node_id full_name
+var sm_resolved_calls: string = ""
+// sm_fn_full_names：node_id full_name（FnDef 节点 → 全名）
+var sm_fn_full_names: string = ""
+// sm_using_prefixes：每行一个命名空间路径（段用 :: 连接）
+var sm_using_prefixes: string = ""
+// sm_import_views：alias ns1;ns2;...（alias 空 = 无别名；ns = :: 连接路径）
+var sm_import_views: string = ""
+// sm_loop_labels：每行一个标签（空行 = 无标签循环）
+var sm_loop_labels: string = ""
+
+// ---- 分析器状态 ----
+var sm_cur_fn: string = ""       // 当前检查函数全名
+var sm_ns_stack: string = ""     // 命名空间前缀栈（每行一段）
+var sm_scope: string = ""        // 函数内作用域（每行：name ty）
+
+var sm_ok: bool = false          // 最终成功标志（无错误）
+
+// 分隔符约定：行内字段用空格；fn/var 复合键用 \x01 分隔（标识符不含）
+//（此处直接用空格：sm_table_vars 行格式 "fn|var elem len dyn"，fn/var 用 | 分隔）
+
+// 基本类型名表（AST 类型 tag 200-224 索引用；tag-200 取第 N 个空格分隔词）
+var ty_names: string = "i64 f64 f32 i32 i16 i8 u64 u32 u16 u8 bool char string void trit num text misc code table map"
+
+// 整数类型名集合（is_int 判断用）
+var int_tys: string = "i8 i16 i32 i64 u8 u16 u32 u64"
+var float_tys: string = "f32 f64"
+
+namespace semantic {
+
+// ==================== 字符/字符串工具 ====================
+
+// 在 s 中从 pos 起找单字符 c；未找到返回 -1
+func find_char_at(s: string, c: string, pos: i64) -> i64 {
+    var n: i64 = str_len(s)
+    var i: i64 = pos
+    while i < n {
+        if str_char(s, i) == c {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 在 s 中找单字符 c；未找到返回 -1
+func find_char(s: string, c: string) -> i64 {
+    return find_char_at(s, c, 0)
+}
+
+// 截取 [start, end) 码点区间子串
+func slice(s: string, start: i64, end: i64) -> string {
+    var n: i64 = str_len(s)
+    var lo = start
+    if lo < 0 {
+        lo = 0
+    }
+    var hi = end
+    if hi > n {
+        hi = n
+    }
+    if lo >= hi {
+        return ""
+    }
+    var r: string = ""
+    var i: i64 = lo
+    while i < hi {
+        r = r + str_char(s, i)
+        i = i + 1
+    }
+    return r
+}
+
+// 字符串转义（与 lexer/parser 同规则，池条目解析用）
+func escape_str(s: string) -> string {
+    var out: string = ""
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "\n" {
+            out = out + "\\n"
+        } else if c == "\t" {
+            out = out + "\\t"
+        } else if c == "\r" {
+            out = out + "\\r"
+        } else if c == "\\" {
+            out = out + "\\\\"
+        } else if c == "\"" {
+            out = out + "\\\""
+        } else if c == "'" {
+            out = out + "\\'"
+        } else if c == "\0" {
+            out = out + "\\0"
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 字符串反转义（escape_str 的逆）
+func unescape_str(s: string) -> string {
+    var out: string = ""
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "\\" && i + 1 < n {
+            var e = str_char(s, i + 1)
+            if e == "n" {
+                out = out + "\n"
+                i = i + 2
+            } else if e == "t" {
+                out = out + "\t"
+                i = i + 2
+            } else if e == "r" {
+                out = out + "\r"
+                i = i + 2
+            } else if e == "\\" {
+                out = out + "\\"
+                i = i + 2
+            } else if e == "\"" {
+                out = out + "\""
+                i = i + 2
+            } else if e == "'" {
+                out = out + "'"
+                i = i + 2
+            } else if e == "0" {
+                out = out + "\0"
+                i = i + 2
+            } else {
+                out = out + c
+                i = i + 1
+            }
+        } else {
+            out = out + c
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// 十进制解析（防御，非法回退 0）
+func parse_dec(s: string) -> i64 {
+    var result: i64 = 0
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    var neg = false
+    if n > 0 && str_char(s, 0) == "-" {
+        neg = true
+        i = 1
+    }
+    while i < n {
+        var c = str_char(s, i)
+        if c >= "0" && c <= "9" {
+            result = result * 10 + (char_code(c) - 48)
+        } else {
+            return 0
+        }
+        i = i + 1
+    }
+    if neg {
+        result = 0 - result
+    }
+    return result
+}
+
+// ==================== 错误 ====================
+
+// 记录错误（首个保留）
+func set_err(msg: string, line: i64, col: i64) {
+    if sm_err == "" {
+        sm_err = msg
+        sm_err_line = line
+        sm_err_col = col
+    }
+}
+
+// ==================== AST 协议解析 ====================
+
+// 取第 i 行文本（0 起；含换行符的协议文本按 \n 分行的第 i 行）
+func line_of(txt: string, i: i64) -> string {
+    var pos: i64 = 0
+    var idx: i64 = 0
+    var n: i64 = str_len(txt)
+    while idx < i {
+        var p = find_char_at(txt, "\n", pos)
+        if p < 0 {
+            return ""
+        }
+        pos = p + 1
+        idx = idx + 1
+    }
+    var end = find_char_at(txt, "\n", pos)
+    if end < 0 {
+        end = n
+    }
+    return slice(txt, pos, end)
+}
+
+// 取第 i 个节点的行文本（第 0 行是 AST: 头）
+func node_row(i: i64) -> string {
+    return line_of(sm_ast, i + 1)
+}
+
+// 取池条目 i 的原始文本（第 0 行是 POOL: 头，位置 = AST 头 + n 节点行 + POOL 头）
+func pool_row(i: i64) -> string {
+    // 池区起始行号 = 1（AST 头）+ sm_ast_n（节点行）+ 1（POOL 头）
+    return line_of(sm_ast, sm_ast_n + 2 + i)
+}
+
+// 取池条目 i 的解码字符串
+func pool_str(i: i64) -> string {
+    if i < 0 {
+        return ""
+    }
+    return unescape_str(pool_row(i))
+}
+
+// 按空格切分字段，取第 k 个（0 起）；越界返回空串
+func field(s: string, k: i64) -> string {
+    var idx: i64 = 0
+    var start: i64 = 0
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n && idx <= k {
+        if str_char(s, i) == " " {
+            if idx == k {
+                return slice(s, start, i)
+            }
+            idx = idx + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if idx == k {
+        return slice(s, start, n)
+    }
+    return ""
+}
+
+// ---- 节点字段访问（节点 id = 行序） ----
+
+func node_tag(id: i64) -> i64 {
+    return parse_dec(field(node_row(id), 0))
+}
+
+func node_line(id: i64) -> i64 {
+    return parse_dec(field(node_row(id), 1))
+}
+
+func node_col(id: i64) -> i64 {
+    return parse_dec(field(node_row(id), 2))
+}
+
+func node_name(id: i64) -> i64 {
+    return parse_dec(field(node_row(id), 3))
+}
+
+func node_val(id: i64) -> i64 {
+    return parse_dec(field(node_row(id), 4))
+}
+
+func node_aux(id: i64) -> i64 {
+    return parse_dec(field(node_row(id), 5))
+}
+
+// 子节点个数（第 6 字段）
+func node_nkids(id: i64) -> i64 {
+    return parse_dec(field(node_row(id), 6))
+}
+
+// 第 j 个子节点 id（第 7+j 字段；越界返回 -1）
+func node_kid(id: i64, j: i64) -> i64 {
+    return parse_dec(field(node_row(id), 7 + j))
+}
+
+// 全部子节点 id → 局部表
+func node_kids(id: i64) -> table<i64> {
+    var t = table_new_i64()
+    var n = node_nkids(id)
+    var j: i64 = 0
+    while j < n {
+        table_push(t, node_kid(id, j))
+        j = j + 1
+    }
+    return t
+}
+
+// 表达式/语句的 span（节点自身的 line/col）
+func node_span_line(id: i64) -> i64 {
+    return node_line(id)
+}
+
+func node_span_col(id: i64) -> i64 {
+    return node_col(id)
+}
+
+// 池 id → 名称文本（name_id 解析）
+func node_name_str(id: i64) -> string {
+    var nid = node_name(id)
+    if nid < 0 {
+        return ""
+    }
+    return pool_str(nid)
+}
+
+// ==================== 类型系统（规范类型字符串） ====================
+
+// 基本类型 tag → 名字（200-224）
+func ty_tag_name(tag: i64) -> string {
+    if tag >= 200 && tag <= 224 {
+        var idx: i64 = 0
+        var start: i64 = 0
+        var n: i64 = str_len(ty_names)
+        var target = tag - 200
+        var i: i64 = 0
+        while i < n && idx <= target {
+            if str_char(ty_names, i) == " " {
+                if idx == target {
+                    return slice(ty_names, start, i)
+                }
+                idx = idx + 1
+                start = i + 1
+            }
+            i = i + 1
+        }
+        return slice(ty_names, start, n)
+    }
+    return "?"
+}
+
+// 类型节点 id → 类型字符串（递归展开 table<T>/map<T>/tuple/struct）
+func type_of(id: i64) -> string {
+    var tag = node_tag(id)
+    if tag == 220 {
+        // table<T>：children = [元素类型节点]
+        var elem = type_of(node_kid(id, 0))
+        return "table<" + elem + ">"
+    }
+    if tag == 224 {
+        // map<T>：children = [值类型节点]
+        var val = type_of(node_kid(id, 0))
+        return "map<" + val + ">"
+    }
+    if tag == 221 {
+        // 元组类型：children = [TypeField(305)...]，TypeField children = [类型节点]
+        var out: string = "tuple{"
+        var n = node_nkids(id)
+        var j: i64 = 0
+        while j < n {
+            var tf = node_kid(id, j)
+            if j > 0 {
+                out = out + ","
+            }
+            var fname = node_name_str(tf)
+            var fty = type_of(node_kid(tf, 0))
+            if fname != "" {
+                out = out + fname + ":" + fty
+            } else {
+                out = out + fty
+            }
+            j = j + 1
+        }
+        out = out + "}"
+        return out
+    }
+    if tag == 222 {
+        // struct 名：name_id = 结构名池 id
+        return "struct:" + node_name_str(id)
+    }
+    if tag == 219 {
+        return "table"
+    }
+    if tag == 223 {
+        return "map"
+    }
+    return ty_tag_name(tag)
+}
+
+// 类型字符串 → 显示名（错误消息用，对齐 Rust type_name）
+// tuple{...} → "tuple"；struct:X → "X"；其余原样
+func type_name(t: string) -> string {
+    if str_len(t) >= 6 && slice(t, 0, 6) == "tuple{" {
+        return "tuple"
+    }
+    if str_len(t) >= 7 && slice(t, 0, 7) == "struct:" {
+        return slice(t, 7, str_len(t))
+    }
+    return t
+}
+
+// ---- 类型判断 ----
+
+var int_tys = "i8 i16 i32 i64 u8 u16 u32 u64"
+
+// t 是否整数类型
+func is_int(t: string) -> bool {
+    return find_char(int_tys + " ", t + " ") >= 0
+}
+
+var float_tys = "f32 f64"
+
+// t 是否浮点类型
+func is_float(t: string) -> bool {
+    return find_char(float_tys + " ", t + " ") >= 0
+}
+
+// t 是否数字类型
+func is_number(t: string) -> bool {
+    return is_int(t) || is_float(t)
+}
+
+// t 是否 bool（if/while 条件）
+func is_bool_like(t: string) -> bool {
+    return t == "bool"
+}
+
+// t 是否 trit
+func is_trit(t: string) -> bool {
+    return t == "trit"
+}
+
+// t 是否表类型（裸 table 或 table<T>）
+func is_table(t: string) -> bool {
+    return t == "table" || (str_len(t) >= 6 && slice(t, 0, 6) == "table<")
+}
+
+// t 是否键值表类型（裸 map 或 map<T>）
+func is_map(t: string) -> bool {
+    return t == "map" || (str_len(t) >= 4 && slice(t, 0, 4) == "map<")
+}
+
+// table<T>/map<T> 的元素/值类型；裸 table/map 返回空串
+func container_elem(t: string) -> string {
+    var n = str_len(t)
+    if n >= 6 && slice(t, 0, 6) == "table<" && str_char(t, n - 1) == ">" {
+        return slice(t, 6, n - 1)
+    }
+    if n >= 4 && slice(t, 0, 4) == "map<" && str_char(t, n - 1) == ">" {
+        return slice(t, 4, n - 1)
+    }
+    return ""
+}
+
+// t 是否元组类型
+func is_tuple(t: string) -> bool {
+    return str_len(t) >= 6 && slice(t, 0, 6) == "tuple{"
+}
+
+// t 是否 struct 类型
+func is_struct(t: string) -> bool {
+    return str_len(t) >= 7 && slice(t, 0, 7) == "struct:"
+}
+
+// struct 类型 → 类名
+func struct_name_of(t: string) -> string {
+    return slice(t, 7, str_len(t))
+}
+
+// ---- 类型兼容（对齐 Rust types_compatible 4058 行） ----
+
+// 元组字段数量
+func tuple_nfields(t: string) -> i64 {
+    // tuple{f1:t1,f2:t2} 顶层逗号计数
+    var n = str_len(t)
+    var depth: i64 = 0
+    var count: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(t, i)
+        if c == "{" {
+            depth = depth + 1
+        } else if c == "}" {
+            depth = depth - 1
+        } else if c == "," && depth == 1 {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count == 0 && n > 6 {
+        return 1
+    }
+    return count + 1
+}
+
+// 元组第 k 个字段的类型（k 0 起）
+func tuple_field_ty(t: string, k: i64) -> string {
+    // 逐顶层逗号切分，字段形式 "name:ty" 或 "ty"；取冒号后部分
+    var n = str_len(t)
+    var depth: i64 = 0
+    var start: i64 = 6
+    var idx: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(t, i)
+        if c == "{" {
+            depth = depth + 1
+        } else if c == "}" {
+            depth = depth - 1
+        }
+        if (c == "," && depth == 1) || (c == "}" && depth == 0) {
+            var seg = slice(t, start, i)
+            if idx == k {
+                var colon = find_char(seg, ":")
+                if colon >= 0 {
+                    return slice(seg, colon + 1, str_len(seg))
+                }
+                return seg
+            }
+            idx = idx + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 类型兼容（递归）
+func types_compatible(a: string, b: string) -> bool {
+    if is_tuple(a) && is_tuple(b) {
+        // 长度相同 + 逐字段类型兼容（字段名不参与比较）
+        var na = tuple_nfields(a)
+        var nb = tuple_nfields(b)
+        if na != nb {
+            return false
+        }
+        var k: i64 = 0
+        while k < na {
+            if !types_compatible(tuple_field_ty(a, k), tuple_field_ty(b, k)) {
+                return false
+            }
+            k = k + 1
+        }
+        return true
+    }
+    // 表：裸 table 与 table<T> 互相兼容；table<T1> 与 table<T2> 元素兼容
+    if (a == "table" && is_table(b)) || (is_table(a) && b == "table") {
+        return true
+    }
+    if is_table(a) && is_table(b) {
+        return types_compatible(container_elem(a), container_elem(b))
+    }
+    // 键值表：裸 map 与 map<T> 互相兼容；map<T1> 与 map<T2> 值类型兼容
+    if (a == "map" && is_map(b)) || (is_map(a) && b == "map") {
+        return true
+    }
+    if is_map(a) && is_map(b) {
+        return types_compatible(container_elem(a), container_elem(b))
+    }
+    return a == b
+}
+
+// struct 继承兼容：got 能否赋给 want（子类实例可调父类方法）
+func struct_assignable(want: string, got: string) -> bool {
+    if !is_struct(want) || !is_struct(got) {
+        return want == got
+    }
+    var w = struct_name_of(want)
+    var g = struct_name_of(got)
+    // 沿 got 的继承链上升找 w
+    var cur = g
+    var guard: i64 = 0
+    while guard < 64 {
+        if cur == w {
+            return true
+        }
+        var parent = class_parent(cur)
+        if parent == "" {
+            return false
+        }
+        cur = parent
+        guard = guard + 1
+    }
+    return false
+}
+
+// 表达式节点 → 字面量类别（types_match 用）：
+// 0=非字面量/其他, 1=整数, 2=浮点, 3=布尔, 4=trit, 5=字符串, 6=表字面量, 7=元组, 8=负数字面量
+func lit_kind(id: i64) -> i64 {
+    var tag = node_tag(id)
+    if tag == 0 {
+        return 1
+    }
+    if tag == 1 {
+        return 2
+    }
+    if tag == 3 {
+        return 3
+    }
+    if tag == 16 {
+        return 4
+    }
+    if tag == 2 {
+        return 5
+    }
+    if tag == 12 {
+        return 6
+    }
+    if tag == 11 {
+        return 7
+    }
+    if tag == 7 {
+        // Unary：取负字面量（-1 / -1.5）
+        var op = node_val(id)
+        if op == 17 {
+            var kid = node_kid(id, 0)
+            var kt = node_tag(kid)
+            if kt == 0 {
+                return 8
+            }
+            if kt == 1 {
+                return 9
+            }
+        }
+    }
+    return 0
+}
+
+// 类型匹配（含字面量适配，对齐 Rust types_match 4107 行）
+func types_match(want: string, got: string, init_id: i64) -> bool {
+    if types_compatible(want, got) {
+        return true
+    }
+    // 元组：逐字段适配（字段级字面量适配，如 (i32, i64) = (1, 2)）
+    if is_tuple(want) && is_tuple(got) {
+        var kt = lit_kind(init_id)
+        if kt == 7 {
+            var nw = tuple_nfields(want)
+            var ng = tuple_nfields(got)
+            if nw == ng {
+                // init 元组字段节点 = TupleLit 的 children（TupleField → value）
+                var tlit = init_id
+                var nf = node_nkids(tlit)
+                if nf == nw {
+                    var k: i64 = 0
+                    var ok = true
+                    while k < nw {
+                        var tf = node_kid(tlit, k)
+                        var fe = node_kid(tf, 0)
+                        if !types_match(tuple_field_ty(want, k), tuple_field_ty(got, k), fe) {
+                            ok = false
+                        }
+                        k = k + 1
+                    }
+                    return ok
+                }
+            }
+        }
+        return false
+    }
+    var k = lit_kind(init_id)
+    if k == 1 {
+        // 整数字面量可适配任意整数标注
+        return is_int(want) && is_int(got)
+    }
+    if k == 2 {
+        return is_float(want) && is_float(got)
+    }
+    if k == 4 {
+        return want == "trit"
+    }
+    if k == 3 {
+        return want == "trit"
+    }
+    if k == 6 {
+        return want == "table" || is_table(want)
+    }
+    return false
+}
+
+// ==================== 符号表操作（全局字符串行表） ====================
+
+// 行表查找：逐行查行首 key + " "；返回行号或 -1
+func row_find(tbl: string, key: string) -> i64 {
+    var pos: i64 = 0
+    var idx: i64 = 0
+    var n: i64 = str_len(tbl)
+    var kl = str_len(key)
+    while pos < n {
+        var end = find_char_at(tbl, "\n", pos)
+        if end < 0 {
+            end = n
+        }
+        var line = slice(tbl, pos, end)
+        if kl == str_len(line) && line == key {
+            return idx
+        }
+        if kl < str_len(line) && slice(line, 0, kl) == key && str_char(line, kl) == " " {
+            return idx
+        }
+        pos = end + 1
+        idx = idx + 1
+    }
+    return -1
+}
+
+// 行表反向查找（最近追加优先，作用域覆盖语义）
+func row_find_back(tbl: string, key: string) -> i64 {
+    var n: i64 = str_len(tbl)
+    var idx: i64 = 0
+    var pos: i64 = 0
+    // 先数行数
+    while pos < n {
+        var end = find_char_at(tbl, "\n", pos)
+        if end < 0 {
+            end = n
+        }
+        pos = end + 1
+        idx = idx + 1
+    }
+    var total = idx
+    // 从后往前查
+    pos = 0
+    var line_start: i64 = 0
+    var cur: i64 = 0
+    while cur < total {
+        var end = find_char_at(tbl, "\n", line_start)
+        if end < 0 {
+            end = n
+        }
+        pos = line_start
+        line_start = end + 1
+        cur = cur + 1
+    }
+    // line_start 现在是文本末尾（或最后一行后），反向扫描
+    var idx2: i64 = total
+    pos = n
+    while pos > 0 {
+        var ls: i64 = 0
+        // 找行首
+        var p = find_char_at(tbl, "\n", 0)
+        // 用 find_char_at 从 0 逐行走到 pos 前——简化：直接按行切分正向找行边界数组
+        break
+    }
+    // 简化实现：正向逐行收集行首位置到局部表，再反向
+    var starts = table_new_i64()
+    var s2: i64 = 0
+    var cnt: i64 = 0
+    while s2 <= n {
+        var e2 = find_char_at(tbl, "\n", s2)
+        if e2 < 0 {
+            e2 = n
+        }
+        table_push(starts, s2)
+        cnt = cnt + 1
+        if e2 >= n {
+            break
+        }
+        s2 = e2 + 1
+    }
+    var j: i64 = cnt - 1
+    while j >= 0 {
+        var ls = table_at(starts, j)
+        var e2 = find_char_at(tbl, "\n", ls)
+        if e2 < 0 {
+            e2 = n
+        }
+        var line = slice(tbl, ls, e2)
+        var kl = str_len(key)
+        if kl == str_len(line) && line == key {
+            return j
+        }
+        if kl < str_len(line) && slice(line, 0, kl) == key && str_char(line, kl) == " " {
+            return j
+        }
+        j = j - 1
+    }
+    return -1
+}
+
+// 取行表的第 i 行（0 起）
+func row_line(tbl: string, i: i64) -> string {
+    return line_of(tbl, i)
+}
+
+// 取行表第 i 行、第 k 字段
+func row_field(tbl: string, i: i64, k: i64) -> string {
+    return field(row_line(tbl, i), k)
+}
+
+// 行数
+func row_count(tbl: string) -> i64 {
+    var n: i64 = str_len(tbl)
+    if n == 0 {
+        return 0
+    }
+    var count: i64 = 1
+    var pos: i64 = 0
+    while pos < n {
+        var end = find_char_at(tbl, "\n", pos)
+        if end < 0 {
+            break
+        }
+        count = count + 1
+        pos = end + 1
+    }
+    return count
+}
+
+// 追加一行（key + 空格 + fields；fields 空则只存 key）
+func row_append(tbl: string, key: string, fields: string) -> string {
+    if fields == "" {
+        return tbl + key + "\n"
+    }
+    return tbl + key + " " + fields + "\n"
+}
+
+// ---- 各符号表封装 ----
+
+// funcs：full_name is_pub nparam t1..tn d1..dn ret
+func func_find(full: string) -> i64 {
+    return row_find(sm_funcs, full)
+}
+
+func func_exists(full: string) -> bool {
+    return func_find(full) >= 0
+}
+
+func func_is_pub(full: string) -> bool {
+    var i = func_find(full)
+    if i < 0 {
+        return false
+    }
+    return row_field(sm_funcs, i, 1) == "1"
+}
+
+func func_nparam(full: string) -> i64 {
+    var i = func_find(full)
+    if i < 0 {
+        return 0
+    }
+    return parse_dec(row_field(sm_funcs, i, 2))
+}
+
+// 第 k 个参数类型
+func func_param_ty(full: string, k: i64) -> string {
+    var i = func_find(full)
+    if i < 0 {
+        return ""
+    }
+    return row_field(sm_funcs, i, 3 + k)
+}
+
+// 第 k 个参数默认值节点 id（-1 = 无）
+func func_param_def(full: string, k: i64) -> i64 {
+    var i = func_find(full)
+    if i < 0 {
+        return -1
+    }
+    var n = func_nparam(full)
+    return parse_dec(row_field(sm_funcs, i, 3 + n + k))
+}
+
+// 返回类型
+func func_ret_ty(full: string) -> string {
+    var i = func_find(full)
+    if i < 0 {
+        return ""
+    }
+    var n = func_nparam(full)
+    return row_field(sm_funcs, i, 3 + n + n)
+}
+
+// 必选参数个数（无默认值的形参数）
+func func_required(full: string) -> i64 {
+    var n = func_nparam(full)
+    var k: i64 = 0
+    while k < n {
+        if func_param_def(full, k) >= 0 {
+            return k
+        }
+        k = k + 1
+    }
+    return n
+}
+
+// 注册函数签名（fields = "is_pub nparam t1..tn d1..dn ret"）——由 register_fn 直接拼接
+
+// 全局变量
+func global_exists(name: string) -> bool {
+    return row_find(sm_globals, name) >= 0
+}
+
+func global_ty(name: string) -> string {
+    var i = row_find(sm_globals, name)
+    if i < 0 {
+        return ""
+    }
+    return row_field(sm_globals, i, 1)
+}
+
+// 表变量：键 = cur_fn|name（行首）
+func table_var_find(fn: string, name: string) -> i64 {
+    var key = fn + "|" + name
+    return row_find(sm_table_vars, key)
+}
+
+func table_var_elem(fn: string, name: string) -> string {
+    var i = table_var_find(fn, name)
+    if i < 0 {
+        return ""
+    }
+    return row_field(sm_table_vars, i, 1)
+}
+
+func table_var_len(fn: string, name: string) -> i64 {
+    var i = table_var_find(fn, name)
+    if i < 0 {
+        return 0
+    }
+    return parse_dec(row_field(sm_table_vars, i, 2))
+}
+
+func table_var_dynamic(fn: string, name: string) -> bool {
+    var i = table_var_find(fn, name)
+    if i < 0 {
+        return false
+    }
+    return row_field(sm_table_vars, i, 3) == "1"
+}
+
+// 表字面量布局：node_id 行首
+func table_lit_find(id: i64) -> i64 {
+    return row_find(sm_tables, to_string(id))
+}
+
+func table_lit_elem(id: i64) -> string {
+    var i = table_lit_find(id)
+    if i < 0 {
+        return ""
+    }
+    return row_field(sm_tables, i, 1)
+}
+
+func table_lit_len(id: i64) -> i64 {
+    var i = table_lit_find(id)
+    if i < 0 {
+        return 0
+    }
+    return parse_dec(row_field(sm_tables, i, 2))
+}
+
+func table_lit_dynamic(id: i64) -> bool {
+    var i = table_lit_find(id)
+    if i < 0 {
+        return false
+    }
+    return row_field(sm_tables, i, 3) == "1"
+}
+
+// 返回表的函数：full_name 行首
+func table_ret_find(full: string) -> i64 {
+    return row_find(sm_table_ret_elems, full)
+}
+
+func table_ret_elem(full: string) -> string {
+    var i = table_ret_find(full)
+    if i < 0 {
+        return ""
+    }
+    return row_field(sm_table_ret_elems, i, 1)
+}
+
+// classes：name parent fields（fields = f1:t1;f2:t2;...）
+func class_find(name: string) -> i64 {
+    return row_find(sm_classes, name)
+}
+
+func class_exists(name: string) -> bool {
+    return class_find(name) >= 0
+}
+
+func class_parent(name: string) -> string {
+    var i = class_find(name)
+    if i < 0 {
+        return ""
+    }
+    return row_field(sm_classes, i, 1)
+}
+
+func class_fields_raw(name: string) -> string {
+    var i = class_find(name)
+    if i < 0 {
+        return ""
+    }
+    return row_field(sm_classes, i, 2)
+}
+
+// 类字段数
+func class_nfields(name: string) -> i64 {
+    var raw = class_fields_raw(name)
+    if raw == "" {
+        return 0
+    }
+    var count: i64 = 1
+    var pos: i64 = 0
+    var n: i64 = str_len(raw)
+    while pos < n {
+        var p = find_char_at(raw, ";", pos)
+        if p < 0 {
+            break
+        }
+        count = count + 1
+        pos = p + 1
+    }
+    return count
+}
+
+// 类第 k 个字段名（0 起）
+func class_field_name(name: string, k: i64) -> string {
+    var raw = class_fields_raw(name)
+    var idx: i64 = 0
+    var start: i64 = 0
+    var n: i64 = str_len(raw)
+    var i: i64 = 0
+    while i <= n {
+        var c: string = ""
+        if i < n {
+            c = str_char(raw, i)
+        }
+        if c == ";" || i == n {
+            if idx == k {
+                var seg = slice(raw, start, i)
+                var colon = find_char(seg, ":")
+                if colon >= 0 {
+                    return slice(seg, 0, colon)
+                }
+                return seg
+            }
+            idx = idx + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 类第 k 个字段类型
+func class_field_ty(name: string, k: i64) -> string {
+    var raw = class_fields_raw(name)
+    var idx: i64 = 0
+    var start: i64 = 0
+    var n: i64 = str_len(raw)
+    var i: i64 = 0
+    while i <= n {
+        var c: string = ""
+        if i < n {
+            c = str_char(raw, i)
+        }
+        if c == ";" || i == n {
+            if idx == k {
+                var seg = slice(raw, start, i)
+                var colon = find_char(seg, ":")
+                if colon >= 0 {
+                    return slice(seg, colon + 1, str_len(seg))
+                }
+                return seg
+            }
+            idx = idx + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 类字段名 → 下标（无返回 -1）
+func class_field_index(name: string, fname: string) -> i64 {
+    var n = class_nfields(name)
+    var k: i64 = 0
+    while k < n {
+        if class_field_name(name, k) == fname {
+            return k
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// 作用域：查最近声明（反向查找）；全局变量兜底在调用方
+func scope_find(name: string) -> i64 {
+    return row_find_back(sm_scope, name)
+}
+
+func scope_ty(name: string) -> string {
+    var i = scope_find(name)
+    if i < 0 {
+        return ""
+    }
+    return row_field(sm_scope, i, 1)
+}
+
+func scope_contains(name: string) -> bool {
+    return scope_find(name) >= 0
+}
+
+// 声明变量（覆盖语义）
+func scope_set(name: string, ty: string) {
+    sm_scope = row_append(sm_scope, name, ty)
+}
+
+// 循环标签栈
+func loop_push(label: string) {
+    sm_loop_labels = sm_loop_labels + label + "\n"
+}
+
+func loop_pop() {
+    var n = row_count(sm_loop_labels)
+    if n > 0 {
+        var rest: string = ""
+        var i: i64 = 0
+        while i < n - 1 {
+            rest = rest + row_line(sm_loop_labels, i) + "\n"
+            i = i + 1
+        }
+        sm_loop_labels = rest
+    }
+}
+
+// 循环栈中是否有匹配标签（label 空 = 栈非空）
+func loop_has(label: string) -> bool {
+    var n = row_count(sm_loop_labels)
+    if label == "" {
+        return n > 0
+    }
+    var i: i64 = 0
+    while i < n {
+        if row_line(sm_loop_labels, i) == label {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 命名空间栈（每行一段，push/pop）
+func ns_push(seg: string) {
+    sm_ns_stack = sm_ns_stack + seg + "\n"
+}
+
+func ns_pop() {
+    var n = row_count(sm_ns_stack)
+    if n > 0 {
+        var rest: string = ""
+        var i: i64 = 0
+        while i < n - 1 {
+            rest = rest + row_line(sm_ns_stack, i) + "\n"
+            i = i + 1
+        }
+        sm_ns_stack = rest
+    }
+}
+
+func ns_len() -> i64 {
+    return row_count(sm_ns_stack)
+}
+
+func ns_seg(i: i64) -> string {
+    return row_line(sm_ns_stack, i)
+}
+
+// 当前命名空间前缀（:: 连接；空 = 顶层）
+func ns_prefix() -> string {
+    var n = ns_len()
+    var out: string = ""
+    var i: i64 = 0
+    while i < n {
+        if i > 0 {
+            out = out + "::"
+        }
+        out = out + ns_seg(i)
+        i = i + 1
+    }
+    return out
+}
+
+// 命名空间前缀存在判定：funcs 中是否存在以 "前缀::" 开头的函数键
+func ns_prefix_exists(segs: string) -> bool {
+    var prefix = segs + "::"
+    var n = row_count(sm_funcs)
+    var i: i64 = 0
+    while i < n {
+        var line = row_line(sm_funcs, i)
+        var kl = str_len(prefix)
+        if str_len(line) > kl && slice(line, 0, kl) == prefix {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 表达式类型记录（node_id → ty）
+func expr_ty_record(id: i64, ty: string) {
+    sm_expr_types = row_append(sm_expr_types, to_string(id), ty)
+    sm_expr_count = sm_expr_count + 1
+}
+
+// 重置全部状态（check 每次调用）
+func reset_state(ast_text: string) {
+    sm_ast = ast_text
+    sm_ast_n = 0
+    sm_pool_n = 0
+    sm_ast_pos = 0
+    sm_err = ""
+    sm_err_line = 0
+    sm_err_col = 0
+    sm_expr_types = ""
+    sm_expr_count = 0
+    sm_funcs = ""
+    sm_globals = ""
+    sm_const_globals = ""
+    sm_const_vars = ""
+    sm_table_vars = ""
+    sm_tables = ""
+    sm_table_ret_elems = ""
+    sm_classes = ""
+    sm_resolved_calls = ""
+    sm_fn_full_names = ""
+    sm_using_prefixes = ""
+    sm_import_views = ""
+    sm_loop_labels = ""
+    sm_cur_fn = ""
+    sm_ns_stack = ""
+    sm_scope = ""
+    sm_ok = true
+}
+
+// ==================== 顶层语句识别 ====================
+
+// 被引用节点集合（children 中出现过的节点 id；顶层语句不被任何节点引用）
+var sm_refs: string = ""
+
+func refs_contains(id: i64) -> bool {
+    return row_find(sm_refs, to_string(id)) >= 0
+}
+
+// 构建被引用集合：遍历全部节点行，children 逐个标记
+func build_refs() {
+    sm_refs = ""
+    var id: i64 = 0
+    while id < sm_ast_n {
+        var nk = node_nkids(id)
+        var j: i64 = 0
+        while j < nk {
+            sm_refs = row_append(sm_refs, to_string(node_kid(id, j)), "")
+            j = j + 1
+        }
+        id = id + 1
+    }
+}
+
+// 顶层语句 id 列表（不被引用的语句节点）
+var sm_tops: string = ""
+
+func tops_count() -> i64 {
+    return row_count(sm_tops)
+}
+
+func top_id(i: i64) -> i64 {
+    return parse_dec(row_line(sm_tops, i))
+}
+
+// 收集顶层语句
+func collect_tops() {
+    sm_tops = ""
+    var id: i64 = 0
+    while id < sm_ast_n {
+        var tag = node_tag(id)
+        var is_stmt = tag >= 100 && tag <= 116
+        if is_stmt && !refs_contains(id) {
+            sm_tops = row_append(sm_tops, to_string(id), "")
+        }
+        id = id + 1
+    }
+}
+
+// ==================== 第零遍：import / using 收集（M2.1.7） ====================
+
+// import 视图：alias ns1;ns2;...（alias 空 = 无别名；ns = :: 连接路径）
+func collect_imports_using() -> i64 {
+    var n = tops_count()
+    var i: i64 = 0
+    while i < n {
+        var sid = top_id(i)
+        var tag = node_tag(sid)
+        if tag == 113 {
+            // Import：path = name_id 池文本；alias = aux 池 id
+            var path = pool_str(node_name(sid))
+            var alias_id = node_aux(sid)
+            var alias = ""
+            if alias_id >= 0 {
+                alias = pool_str(alias_id)
+            }
+            // ns_paths = children（NsPath 节点，展开器填充；parser 输出为空）
+            var nsp: string = ""
+            var nk = node_nkids(sid)
+            var j: i64 = 0
+            while j < nk {
+                var nspath_id = node_kid(sid, j)
+                if j > 0 {
+                    nsp = nsp + ";"
+                }
+                nsp = nsp + ns_path_str(nspath_id)
+                j = j + 1
+            }
+            var view: string = alias
+            if nsp != "" {
+                if view != "" {
+                    view = view + " "
+                }
+                view = view + nsp
+            }
+            sm_import_views = row_append(sm_import_views, path, view)
+        } else if tag == 115 {
+            // Using：目标 = NsPath children[0] 的段（点分连接）
+            var nspath_id = node_kid(sid, 0)
+            var path_segs = ns_path_segs_of(nspath_id)
+            var target = join_segs(path_segs, ".")
+            // 在导入视图中解析目标 → 原命名空间全路径（:: 连接）
+            var resolved = using_resolve(path_segs)
+            if resolved == "" {
+                set_err("using 目标 '" + target + "' 未导入：using 只能引用 import 引入的命名空间前缀或别名", node_line(sid), node_col(sid))
+                return -1
+            }
+            if using_prefix_has(resolved) {
+                set_err("命名空间 '" + resolved + "' 重复 using", node_line(sid), node_col(sid))
+                return -1
+            }
+            sm_using_prefixes = row_append(sm_using_prefixes, resolved, "")
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// NsPath 节点 → 段表（每行一段）
+func ns_path_segs_of(nspath_id: i64) -> string {
+    var out: string = ""
+    var nk = node_nkids(nspath_id)
+    var j: i64 = 0
+    while j < nk {
+        var seg_id = node_kid(nspath_id, j)
+        out = row_append(out, pool_str(node_name(seg_id)), "")
+        j = j + 1
+    }
+    return out
+}
+
+// 段行表 → 分隔符连接
+func join_segs(segs: string, sep: string) -> string {
+    var n = row_count(segs)
+    var out: string = ""
+    var i: i64 = 0
+    while i < n {
+        if i > 0 {
+            out = out + sep
+        }
+        out = out + row_line(segs, i)
+        i = i + 1
+    }
+    return out
+}
+
+// using 目标解析：导入视图匹配 → 原命名空间全路径；无命中返回 ""
+func using_resolve(segs: string) -> string {
+    var n = row_count(sm_import_views)
+    var i: i64 = 0
+    while i < n {
+        var view = row_line(sm_import_views, i)
+        var alias = row_field(sm_import_views, i, 1)
+        // ns 列表 = 第 2 字段起（分号分隔的 :: 路径）
+        var nss = field(view, 2)
+        // 逐 ns 匹配
+        var pos: i64 = 0
+        var nl = str_len(nss)
+        while pos <= nl {
+            var end = find_char_at(nss, ";", pos)
+            if end < 0 {
+                end = nl
+            }
+            var ns = slice(nss, pos, end)
+            var ns_segs = split_path(ns, "::")
+            var hit = false
+            if alias == "" {
+                hit = segs_equal(segs, ns_segs)
+            } else {
+                // 有别名：segs[0] == alias 且其余段 == ns 的后续段
+                var na = row_count(ns_segs)
+                if row_count(segs) == na && row_count(segs) > 0 && row_line(segs, 0) == alias {
+                    hit = true
+                    var k: i64 = 1
+                    while k < na {
+                        if row_line(segs, k) != row_line(ns_segs, k) {
+                            hit = false
+                        }
+                        k = k + 1
+                    }
+                }
+            }
+            if hit && ns != "" {
+                return ns
+            }
+            if end >= nl {
+                break
+            }
+            pos = end + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 路径字符串按分隔符切分 → 段行表
+func split_path(s: string, sep: string) -> string {
+    var out: string = ""
+    var sl = str_len(sep)
+    var pos: i64 = 0
+    var n = str_len(s)
+    while pos < n {
+        var p = find_char_at(s, sep, pos)
+        if p < 0 {
+            out = row_append(out, slice(s, pos, n), "")
+            break
+        }
+        out = row_append(out, slice(s, pos, p), "")
+        pos = p + sl
+    }
+    return out
+}
+
+// 段行表相等
+func segs_equal(a: string, b: string) -> bool {
+    var na = row_count(a)
+    if na != row_count(b) {
+        return false
+    }
+    var i: i64 = 0
+    while i < na {
+        if row_line(a, i) != row_line(b, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// using 前缀集合中是否已有该路径
+func using_prefix_has(ns: string) -> bool {
+    return row_find(sm_using_prefixes, ns) >= 0
+}
+
+// ==================== 第一遍：函数签名 + 全局变量收集 ====================
+
+// 解析 FnDef 节点的参数/返回/块，注册签名
+// 返回 0 成功 / -1 错误
+func register_fn(fn_id: i64, full: string, is_pub: i64) -> i64 {
+    var nk = node_nkids(fn_id)
+    // children = [Param..., ret_ty, Block]
+    var nparam = nk - 2
+    var line: string = ""
+    line = line + to_string(is_pub) + " " + to_string(nparam)
+    var k: i64 = 0
+    while k < nparam {
+        var p = node_kid(fn_id, k)
+        var pty = type_of(node_kid(p, 0))
+        line = line + " " + pty
+        k = k + 1
+    }
+    k = 0
+    while k < nparam {
+        var p = node_kid(fn_id, k)
+        // Param：无默认→[ty]；有默认→[ty, default]
+        var def = -1
+        if node_nkids(p) >= 2 {
+            def = node_kid(p, 1)
+        }
+        line = line + " " + to_string(def)
+        k = k + 1
+    }
+    var ret_id = node_kid(fn_id, nparam)
+    var ret = type_of(ret_id)
+    line = line + " " + ret
+    if func_exists(full) {
+        return -1
+    }
+    sm_funcs = row_append(sm_funcs, full, line)
+    // FnDef 节点 → 全名（IR 层生成 LLVM 符号用）
+    sm_fn_full_names = row_append(sm_fn_full_names, to_string(fn_id), full)
+    return 0
+}
+
+// 命名空间内函数收集（递归注册全名）
+func collect_ns_funcs(body_id: i64, prefix: string) -> i64 {
+    var blk = node_kid(body_id, 0)
+    var nk = node_nkids(blk)
+    var i: i64 = 0
+    while i < nk {
+        var sid = node_kid(blk, i)
+        var tag = node_tag(sid)
+        if tag == 110 {
+            var name = node_name_str(sid)
+            var full = name
+            if prefix != "" {
+                full = prefix + "::" + name
+            }
+            if register_fn(sid, full, node_aux(sid)) < 0 {
+                set_err("函数 '" + name + "' 在命名空间 '" + prefix + "' 中重复定义", node_line(sid), node_col(sid))
+                return -1
+            }
+        } else if tag == 114 {
+            // 嵌套命名空间：路径拼接后递归
+            var nspath_id = node_kid(sid, 0)
+            var segs = ns_path_segs_of(nspath_id)
+            var sub = join_segs(segs, "::")
+            var full = sub
+            if prefix != "" {
+                full = prefix + "::" + sub
+            }
+            if collect_ns_funcs(node_kid(sid, 1), full) < 0 {
+                return -1
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 字面量表达式的推断类型（全局变量初始化用；仅字面量）
+func literal_ty(id: i64) -> string {
+    var tag = node_tag(id)
+    if tag == 0 {
+        return "i64"
+    }
+    if tag == 1 {
+        return "f64"
+    }
+    if tag == 3 {
+        return "bool"
+    }
+    if tag == 16 {
+        return "trit"
+    }
+    if tag == 2 {
+        return "string"
+    }
+    if tag == 15 {
+        return "char"
+    }
+    if tag == 7 {
+        // Unary Neg：操作数类型
+        var op = node_val(id)
+        if op == 17 {
+            return literal_ty(node_kid(id, 0))
+        }
+    }
+    return ""
+}
+
+// 编译期字面量（switch case / 全局初始化）
+func is_const_literal(id: i64) -> bool {
+    var tag = node_tag(id)
+    if tag == 0 || tag == 1 || tag == 15 || tag == 3 || tag == 2 {
+        return true
+    }
+    if tag == 7 {
+        var op = node_val(id)
+        if op == 17 {
+            var kt = node_tag(node_kid(id, 0))
+            if kt == 0 || kt == 1 {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// 第一遍：顶层 FnDef 注册 + 全局变量校验
+func collect_funcs_and_globals() -> i64 {
+    var n = tops_count()
+    var i: i64 = 0
+    while i < n {
+        var sid = top_id(i)
+        var tag = node_tag(sid)
+        if tag == 110 {
+            var name = node_name_str(sid)
+            if register_fn(sid, name, 1) < 0 {
+                set_err("函数 '" + name + "' 重复定义", node_line(sid), node_col(sid))
+                return -1
+            }
+        } else if tag == 114 {
+            var nspath_id = node_kid(sid, 0)
+            var segs = ns_path_segs_of(nspath_id)
+            var prefix = join_segs(segs, "::")
+            if collect_ns_funcs(node_kid(sid, 1), prefix) < 0 {
+                return -1
+            }
+        } else if tag == 100 {
+            // 全局持久变量（M4）：显式标量类型 + 字面量初始化 + 命名冲突
+            var name = node_name_str(sid)
+            var is_const = node_aux(sid) == 1
+            var nk = node_nkids(sid)
+            if nk < 2 {
+                // 无显式类型标注
+                set_err("全局变量 '" + name + "' 必须显式标注类型（如 var x: i64）", node_line(sid), node_col(sid))
+                return -1
+            }
+            var ty = type_of(node_kid(sid, 0))
+            var init_id = node_kid(sid, 1)
+            // 限标量类型
+            var scalar = ty == "i8" || ty == "i16" || ty == "i32" || ty == "i64" ||
+                         ty == "u8" || ty == "u16" || ty == "u32" || ty == "u64" ||
+                         ty == "f32" || ty == "f64" || ty == "bool" || ty == "char" || ty == "string"
+            if !scalar {
+                set_err("全局变量 '" + name + "' 必须是标量类型（i8..u64/f32/f64/bool/char/string），实际是 " + type_name(ty), node_line(sid), node_col(sid))
+                return -1
+            }
+            if !is_const_literal(init_id) {
+                set_err("全局变量 '" + name + "' 的初始化必须是字面量（数/布尔/字符/字符串）", node_line(sid), node_col(sid))
+                return -1
+            }
+            if func_exists(name) {
+                set_err("全局变量 '" + name + "' 与函数名冲突", node_line(sid), node_col(sid))
+                return -1
+            }
+            if global_exists(name) {
+                set_err("全局变量 '" + name + "' 重复定义", node_line(sid), node_col(sid))
+                return -1
+            }
+            var init_ty = literal_ty(init_id)
+            if !types_match(ty, init_ty, init_id) {
+                set_err("全局变量 '" + name + "' 初始化类型不匹配：期望 " + type_name(ty) + "，实际 " + type_name(init_ty), node_line(sid), node_col(sid))
+                return -1
+            }
+            sm_globals = row_append(sm_globals, name, ty)
+            if is_const {
+                sm_const_globals = row_append(sm_const_globals, name, "")
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ==================== struct 收集（继承拍平） ====================
+
+// 顶层 Struct 定义查找（按名）
+func struct_def(name: string) -> i64 {
+    var n = tops_count()
+    var i: i64 = 0
+    while i < n {
+        var sid = top_id(i)
+        if node_tag(sid) == 116 && node_name_str(sid) == name {
+            return sid
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 拍平单个 struct：chain = 继承链上的名字集合（分号分隔）；返回 0/-1
+func flatten_struct(name: string, chain: string) -> i64 {
+    // 环检测
+    if find_char(chain + ";", name + ";") >= 0 {
+        var cdef = struct_def(name)
+        var cl = 0
+        var cc = 0
+        if cdef >= 0 {
+            cl = node_line(cdef)
+            cc = node_col(cdef)
+        }
+        set_err("struct 继承形成环（含 '" + name + "'）", cl, cc)
+        return -1
+    }
+    var def = struct_def(name)
+    if def < 0 {
+        set_err("内部错误：struct '" + name + "' 无定义", 0, 0)
+        return -1
+    }
+    // 继承父字段
+    var fields: string = ""
+    var parent_id = node_aux(def)
+    var parent = ""
+    if parent_id >= 0 {
+        parent = pool_str(parent_id)
+        if struct_def(parent) < 0 {
+            set_err("父 struct '" + parent + "' 未定义", node_line(def), node_col(def))
+            return -1
+        }
+        if flatten_struct(parent, chain + name + ";") < 0 {
+            return -1
+        }
+        // 父类已拍平登记，读回其字段
+        fields = class_fields_raw(parent)
+    }
+    // 自身字段：重名检查 + 类型解析
+    var nk = node_nkids(def)
+    var i: i64 = 0
+    while i < nk {
+        var sf = node_kid(def, i)
+        var fname = node_name_str(sf)
+        // 跨继承链唯一
+        if class_field_index_str(fields, fname) >= 0 {
+            set_err("字段 '" + name + "." + fname + "' 与继承链中的字段重名（字段名必须跨继承链唯一）", node_line(sf), node_col(sf))
+            return -1
+        }
+        // 字段类型：显式标注优先；否则默认值字面量推导；都无 → 报错
+        var fty: string = ""
+        var snk = node_nkids(sf)
+        if snk >= 1 {
+            // 有类型标注（children[0] = ty）
+            var ty0 = node_kid(sf, 0)
+            if node_tag(ty0) >= 200 {
+                fty = type_of(ty0)
+            }
+        }
+        if fty == "" {
+            // 无标注：默认值字面量推导（children 末尾）
+            var has_def = false
+            var d: i64 = -1
+            if snk >= 1 {
+                var last = node_kid(sf, snk - 1)
+                var lt = node_tag(last)
+                if lt != 200 && lt != 201 && lt != 202 && lt != 203 && lt != 204 && lt != 205 &&
+                   lt != 206 && lt != 207 && lt != 208 && lt != 209 && lt != 210 && lt != 211 &&
+                   lt != 212 && lt != 213 && lt != 214 && lt != 215 && lt != 216 && lt != 217 &&
+                   lt != 218 && lt != 219 && lt != 220 && lt != 221 && lt != 222 && lt != 223 && lt != 224 {
+                    has_def = true
+                    d = last
+                }
+            }
+            if !has_def {
+                set_err("字段 '" + fname + "' 必须标注类型或有默认值", node_line(sf), node_col(sf))
+                return -1
+            }
+            var dt = node_tag(d)
+            if dt == 0 {
+                fty = "i64"
+            } else if dt == 1 {
+                fty = "f64"
+            } else if dt == 3 {
+                fty = "bool"
+            } else if dt == 2 {
+                fty = "string"
+            } else if dt == 15 {
+                fty = "char"
+            } else {
+                set_err("字段 '" + fname + "' 无类型标注，默认值必须是字面量（当前是表达式）", node_line(sf), node_col(sf))
+                return -1
+            }
+        }
+        if fields != "" {
+            fields = fields + ";"
+        }
+        fields = fields + fname + ":" + fty
+        i = i + 1
+    }
+    // 登记拍平结果（name parent fields）
+    sm_classes = row_append(sm_classes, name, parent + " " + fields)
+    return 0
+}
+
+// 字段串（f1:t1;f2:t2）中查字段名
+func class_field_index_str(fields: string, fname: string) -> i64 {
+    if fields == "" {
+        return -1
+    }
+    var idx: i64 = 0
+    var start: i64 = 0
+    var n = str_len(fields)
+    var i: i64 = 0
+    while i <= n {
+        var c: string = ""
+        if i < n {
+            c = str_char(fields, i)
+        }
+        if c == ";" || i == n {
+            var seg = slice(fields, start, i)
+            var colon = find_char(seg, ":")
+            var nm = seg
+            if colon >= 0 {
+                nm = slice(seg, 0, colon)
+            }
+            if nm == fname {
+                return idx
+            }
+            idx = idx + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// struct 收集：登记 + 冲突检查 + 逐个拍平
+func collect_structs() -> i64 {
+    // 第一步：登记与冲突检查
+    var n = tops_count()
+    var i: i64 = 0
+    while i < n {
+        var sid = top_id(i)
+        if node_tag(sid) == 116 {
+            var name = node_name_str(sid)
+            if func_exists(name) {
+                set_err("struct 名 '" + name + "' 与函数名冲突", node_line(sid), node_col(sid))
+                return -1
+            }
+            if class_exists(name) {
+                set_err("struct '" + name + "' 重复定义", node_line(sid), node_col(sid))
+                return -1
+            }
+            // 占位登记（fields 空，第二步拍平后覆盖）
+            sm_classes = row_append(sm_classes, name, " ")
+        }
+        i = i + 1
+    }
+    // 第二步：逐个拍平（按登记顺序；父先于子由递归保证）
+    n = row_count(sm_classes)
+    i = 0
+    while i < n {
+        var name = row_line(sm_classes, i)
+        if flatten_struct(name, "") < 0 {
+            return -1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ==================== 表返回预扫描（fixpoint） ====================
+
+// table_new_* 内置：名字 → 元素类型（"" = 不是）
+func table_new_elem_ty(name: string) -> string {
+    if name == "table_new_i64" {
+        return "i64"
+    }
+    if name == "table_new_f64" {
+        return "f64"
+    }
+    if name == "table_new_string" {
+        return "string"
+    }
+    if name == "table_new_bool" {
+        return "bool"
+    }
+    return ""
+}
+
+// 收集语句块内声明的动态表变量（sm_local：name elem）
+func collect_local_dyn_tables(block_id: i64) {
+    var blk = block_id
+    var nk = node_nkids(blk)
+    var i: i64 = 0
+    while i < nk {
+        var sid = node_kid(blk, i)
+        var tag = node_tag(sid)
+        if tag == 100 {
+            var init = node_kid(sid, node_nkids(sid) - 1)
+            if node_tag(init) == 5 {
+                var fname = node_name_str(init)
+                var elem = table_new_elem_ty(fname)
+                if elem == "" {
+                    var full = fname
+                    if table_ret_find(full) >= 0 {
+                        elem = table_ret_elem(full)
+                    }
+                }
+                if elem != "" {
+                    sm_local = row_append(sm_local, node_name_str(sid), elem)
+                }
+            }
+        } else if tag == 103 {
+            // If：then/else 递归（children[1]/[2]）
+            var tn = node_nkids(sid)
+            var b: i64 = 1
+            while b < tn {
+                collect_local_dyn_tables(node_kid(sid, b))
+                b = b + 1
+            }
+        } else if tag == 104 {
+            collect_local_dyn_tables(node_kid(sid, 1))
+        } else if tag == 105 {
+            collect_local_dyn_tables(node_kid(sid, 1))
+        } else if tag == 106 {
+            // Switch：case + default 递归
+            var cn = node_nkids(sid)
+            var c: i64 = 1
+            while c < cn {
+                var case_id = node_kid(sid, c)
+                if node_tag(case_id) == 304 {
+                    collect_local_dyn_tables(node_kid(case_id, node_nkids(case_id) - 1))
+                } else {
+                    collect_local_dyn_tables(case_id)
+                }
+                c = c + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+var sm_local: string = ""
+
+// 扫描 return 表达式元素类型（"" = 无）
+func scan_return_table_elem(block_id: i64) -> string {
+    var nk = node_nkids(block_id)
+    var i: i64 = 0
+    while i < nk {
+        var sid = node_kid(block_id, i)
+        var tag = node_tag(sid)
+        if tag == 102 {
+            // Return：无值 → 整体 None
+            if node_nkids(sid) == 0 {
+                return ""
+            }
+            var e = node_kid(sid, 0)
+            var et = node_tag(e)
+            if et == 5 {
+                // Call：table_new_* 或已知返回表函数
+                var fname = node_name_str(e)
+                var elem = table_new_elem_ty(fname)
+                if elem != "" {
+                    return elem
+                }
+                if table_ret_find(fname) >= 0 {
+                    return table_ret_elem(fname)
+                }
+                // 未登记：继续下一语句
+            } else if et == 4 {
+                // Var：local 表
+                var nm = node_name_str(e)
+                if row_find(sm_local, nm) >= 0 {
+                    return row_field(sm_local, row_find(sm_local, nm), 1)
+                }
+            }
+        } else if tag == 103 {
+            var tn = node_nkids(sid)
+            var b: i64 = 1
+            while b < tn {
+                var r = scan_return_table_elem(node_kid(sid, b))
+                if r != "" {
+                    return r
+                }
+                b = b + 1
+            }
+        } else if tag == 104 {
+            var r = scan_return_table_elem(node_kid(sid, 1))
+            if r != "" {
+                return r
+            }
+        } else if tag == 105 {
+            var r = scan_return_table_elem(node_kid(sid, 1))
+            if r != "" {
+                return r
+            }
+        } else if tag == 106 {
+            var cn = node_nkids(sid)
+            var c: i64 = 1
+            while c < cn {
+                var case_id = node_kid(sid, c)
+                var r: string = ""
+                if node_tag(case_id) == 304 {
+                    r = scan_return_table_elem(node_kid(case_id, node_nkids(case_id) - 1))
+                } else {
+                    r = scan_return_table_elem(case_id)
+                }
+                if r != "" {
+                    return r
+                }
+                c = c + 1
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 递归扫描命名空间/顶层函数（返回表 fixpoint 一轮）；1 = 有新增
+func scan_tables_pass(block_id: i64, prefix: string) -> i64 {
+    var changed: i64 = 0
+    var nk = node_nkids(block_id)
+    var i: i64 = 0
+    while i < nk {
+        var sid = node_kid(block_id, i)
+        var tag = node_tag(sid)
+        if tag == 110 {
+            var name = node_name_str(sid)
+            var full = name
+            if prefix != "" {
+                full = prefix + "::" + name
+            }
+            if table_ret_find(full) >= 0 {
+                i = i + 1
+                continue
+            }
+            // local 表收集 + return 元素扫描
+            sm_local = ""
+            collect_local_dyn_tables(node_kid(sid, node_nkids(sid) - 1))
+            var te = scan_return_table_elem(node_kid(sid, node_nkids(sid) - 1))
+            if te != "" {
+                sm_table_ret_elems = row_append(sm_table_ret_elems, full, te)
+                changed = 1
+            }
+        } else if tag == 114 {
+            var nspath_id = node_kid(sid, 0)
+            var segs = ns_path_segs_of(nspath_id)
+            var sub = join_segs(segs, "::")
+            var full = sub
+            if prefix != "" {
+                full = prefix + "::" + sub
+            }
+            if scan_tables_pass(node_kid(sid, 1), full) == 1 {
+                changed = 1
+            }
+        }
+        i = i + 1
+    }
+    return changed
+}
+
+// fixpoint 主循环
+func scan_tables_fixpoint() {
+    // 内置预登记
+    sm_table_ret_elems = row_append(sm_table_ret_elems, "list_dir", "string")
+    sm_table_ret_elems = row_append(sm_table_ret_elems, "walk_dir", "string")
+    sm_table_ret_elems = row_append(sm_table_ret_elems, "byte_read", "i64")
+    sm_table_ret_elems = row_append(sm_table_ret_elems, "byte_concat", "i64")
+    sm_table_ret_elems = row_append(sm_table_ret_elems, "regex_find_all", "string")
+    var changed: i64 = 1
+    var guard: i64 = 0
+    while changed == 1 && guard < 64 {
+        changed = 0
+        var n = tops_count()
+        var i: i64 = 0
+        while i < n {
+            var sid = top_id(i)
+            var tag = node_tag(sid)
+            if tag == 110 {
+                // 顶层函数：包成块检查
+                var fake = table_new_i64()
+                table_push(fake, sid)
+                // 直接复用 scan_tables_pass：构造临时块（不可行——节点不可构造）
+                // 改为内联处理：直接调用单函数扫描
+                var name = node_name_str(sid)
+                if table_ret_find(name) < 0 {
+                    sm_local = ""
+                    collect_local_dyn_tables(node_kid(sid, node_nkids(sid) - 1))
+                    var te = scan_return_table_elem(node_kid(sid, node_nkids(sid) - 1))
+                    if te != "" {
+                        sm_table_ret_elems = row_append(sm_table_ret_elems, name, te)
+                        changed = 1
+                    }
+                }
+            } else if tag == 114 {
+                var nspath_id = node_kid(sid, 0)
+                var segs = ns_path_segs_of(nspath_id)
+                var prefix = join_segs(segs, "::")
+                if scan_tables_pass(node_kid(sid, 1), prefix) == 1 {
+                    changed = 1
+                }
+            }
+            i = i + 1
+        }
+        guard = guard + 1
+    }
+}
+
+// ==================== 第二遍：函数体检查 ====================
+
+// check_ns_stmts：维护 ns_stack，递归检查
+func check_ns_stmts(body_id: i64, prefix_segs: string) -> i64 {
+    var n = row_count(prefix_segs)
+    var i: i64 = 0
+    while i < n {
+        ns_push(row_line(prefix_segs, i))
+        i = i + 1
+    }
+    var blk = node_kid(body_id, 0)
+    var nk = node_nkids(blk)
+    i = 0
+    while i < nk {
+        var sid = node_kid(blk, i)
+        var tag = node_tag(sid)
+        if tag == 110 {
+            if check_fn(sid) < 0 {
+                ns_pop_n(n)
+                return -1
+            }
+        } else if tag == 114 {
+            var nspath_id = node_kid(sid, 0)
+            var segs = ns_path_segs_of(nspath_id)
+            if check_ns_stmts(node_kid(sid, 1), segs) < 0 {
+                ns_pop_n(n)
+                return -1
+            }
+        }
+        i = i + 1
+    }
+    ns_pop_n(n)
+    return 0
+}
+
+// 弹出 n 段命名空间栈
+func ns_pop_n(n: i64) {
+    var i: i64 = 0
+    while i < n {
+        ns_pop()
+        i = i + 1
+    }
+}
+
+// 检查全部函数体
+func check_all_fns() -> i64 {
+    var n = tops_count()
+    var i: i64 = 0
+    while i < n {
+        var sid = top_id(i)
+        var tag = node_tag(sid)
+        if tag == 110 {
+            if check_fn(sid) < 0 {
+                return -1
+            }
+        } else if tag == 114 {
+            var nspath_id = node_kid(sid, 0)
+            var segs = ns_path_segs_of(nspath_id)
+            if check_ns_stmts(node_kid(sid, 1), segs) < 0 {
+                return -1
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ==================== check_fn（597-697 行） ====================
+
+func check_fn(fn_id: i64) -> i64 {
+    var name = node_name_str(fn_id)
+    var prefix = ns_prefix()
+    var full = name
+    if prefix != "" {
+        full = prefix + "::" + name
+    }
+    sm_cur_fn = full
+    var nk = node_nkids(fn_id)
+    var nparam = nk - 2
+    var k: i64 = 0
+    // 参数入作用域（重复检测）
+    while k < nparam {
+        var p = node_kid(fn_id, k)
+        var pname = node_name_str(p)
+        if scope_contains(pname) {
+            set_err("参数 '" + pname + "' 重复", node_line(p), node_col(p))
+            return -1
+        }
+        scope_set(pname, type_of(node_kid(p, 0)))
+        k = k + 1
+    }
+    // 可选参数连续性 + 默认值字面量 + 类型匹配
+    var seen_default = false
+    k = 0
+    while k < nparam {
+        var p = node_kid(fn_id, k)
+        var has_def = node_nkids(p) >= 2
+        if has_def {
+            seen_default = true
+        } else if seen_default {
+            set_err("参数 '" + node_name_str(p) + "' 缺少默认值：可选参数（带默认值）必须连续排在必选参数之后", node_line(p), node_col(p))
+            return -1
+        }
+        k = k + 1
+    }
+    k = 0
+    while k < nparam {
+        var p = node_kid(fn_id, k)
+        if node_nkids(p) < 2 {
+            k = k + 1
+            continue
+        }
+        var d = node_kid(p, 1)
+        var pname = node_name_str(p)
+        // 限字面量：标量字面量或空表
+        var ok_lit = false
+        var dt = node_tag(d)
+        if dt == 0 || dt == 1 || dt == 3 || dt == 15 || dt == 2 {
+            ok_lit = true
+        } else if dt == 12 {
+            ok_lit = node_nkids(d) == 0
+        }
+        if !ok_lit {
+            set_err("参数 '" + pname + "' 的默认值必须是字面量（数/布尔/字符/字符串或空表 []）", node_line(d), node_col(d))
+            return -1
+        }
+        var dt2 = infer_expr(d)
+        var pty = type_of(node_kid(p, 0))
+        if !types_match(pty, dt2, d) {
+            set_err("参数 '" + pname + "' 默认值类型不匹配：期望 " + type_name(pty) + "，实际 " + type_name(dt2), node_line(d), node_col(d))
+            return -1
+        }
+        k = k + 1
+    }
+    // 表参数：登记 table_vars（table<T> 元素 = T；裸 table 默认 string；dynamic）
+    k = 0
+    while k < nparam {
+        var p = node_kid(fn_id, k)
+        var pty = type_of(node_kid(p, 0))
+        if is_table(pty) {
+            var elem = container_elem(pty)
+            if elem == "" {
+                elem = "string"
+            }
+            sm_table_vars = row_append(sm_table_vars, full + "|" + node_name_str(p), elem + " 0 1")
+        }
+        k = k + 1
+    }
+    // 函数体
+    var body = node_kid(fn_id, nparam + 1)
+    var ret = type_of(node_kid(fn_id, nparam))
+    var bn = node_nkids(body)
+    k = 0
+    while k < bn {
+        if check_stmt(node_kid(body, k), ret) < 0 {
+            return -1
+        }
+        k = k + 1
+    }
+    return 0
+}
+
+// ==================== check_stmt（840-1543 行） ====================
+
+func check_block(block_id: i64, ret: string) -> i64 {
+    var nk = node_nkids(block_id)
+    var i: i64 = 0
+    while i < nk {
+        if check_stmt(node_kid(block_id, i), ret) < 0 {
+            return -1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 表达式 span（对齐 expr_span_of：字面量用 0,0 占位）
+func expr_line(id: i64) -> i64 {
+    var tag = node_tag(id)
+    if tag == 0 || tag == 1 || tag == 2 || tag == 15 || tag == 3 || tag == 16 || tag == 4 {
+        return 0
+    }
+    return node_line(id)
+}
+
+func expr_col(id: i64) -> i64 {
+    var tag = node_tag(id)
+    if tag == 0 || tag == 1 || tag == 2 || tag == 15 || tag == 3 || tag == 16 || tag == 4 {
+        return 0
+    }
+    return node_col(id)
+}
+
+// 类实例表达式是否可寻址（变量或字段链）
+func is_addressable_expr(id: i64) -> bool {
+    var tag = node_tag(id)
+    if tag == 4 {
+        return true
+    }
+    if tag == 9 {
+        return is_addressable_expr(node_kid(id, 0))
+    }
+    return false
+}
+
+// 元组字段访问解析（.x / .Item1 / .0）→ 下标（-1 无）
+func tuple_field_index(t: string, access: string) -> i64 {
+    if !is_tuple(t) {
+        return -1
+    }
+    // 数字下标：.0 起
+    var is_num = true
+    var n = str_len(access)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(access, i)
+        if c < "0" || c > "9" {
+            is_num = false
+        }
+        i = i + 1
+    }
+    if is_num && n > 0 {
+        var idx = parse_dec(access)
+        if idx < tuple_nfields(t) {
+            return idx
+        }
+        return -1
+    }
+    // ItemN：1 起编号
+    if n > 4 && slice(access, 0, 4) == "Item" {
+        var nn = slice(access, 4, n)
+        var is_num2 = true
+        var j: i64 = 0
+        while j < str_len(nn) {
+            var c = str_char(nn, j)
+            if c < "0" || c > "9" {
+                is_num2 = false
+            }
+            j = j + 1
+        }
+        if is_num2 && str_len(nn) > 0 {
+            var idx2 = parse_dec(nn) - 1
+            if idx2 >= 0 && idx2 < tuple_nfields(t) {
+                return idx2
+            }
+            return -1
+        }
+    }
+    // 字段名
+    var nf = tuple_nfields(t)
+    var k: i64 = 0
+    while k < nf {
+        // 提取第 k 字段名（"name:ty" 或 "ty"）
+        var raw = t
+        var depth: i64 = 0
+        var start: i64 = 6
+        var idx: i64 = 0
+        var m: i64 = 0
+        var mlen = str_len(raw)
+        while m < mlen {
+            var c = str_char(raw, m)
+            if c == "{" {
+                depth = depth + 1
+            } else if c == "}" {
+                depth = depth - 1
+            }
+            if (c == "," && depth == 1) || (c == "}" && depth == 0) {
+                if idx == k {
+                    var seg = slice(raw, start, m)
+                    var colon = find_char(seg, ":")
+                    if colon >= 0 {
+                        if slice(seg, 0, colon) == access {
+                            return k
+                        }
+                    } else if seg == access {
+                        return k
+                    }
+                    break
+                }
+                idx = idx + 1
+                start = m + 1
+            }
+            m = m + 1
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// 复合赋值校验（对齐 check_compound_assign 3764 行）
+func check_compound_assign(target_ty: string, op: i64, value_ty: string, value_id: i64, line: i64, col: i64) -> i64 {
+    // 值必须与目标类型匹配（含字面量适配）
+    var ty_ok = types_match(target_ty, value_ty, value_id)
+    if op == 0 {
+        // +=：字符串拼接复合（target 是 string 且 value 也是 string）
+        if target_ty == "string" {
+            if !ty_ok {
+                set_err("复合赋值类型不匹配：目标类型 " + type_name(target_ty) + " 与表达式 " + type_name(value_ty), line, col)
+                return -1
+            }
+            return 0
+        }
+    }
+    if op == 0 || op == 1 || op == 2 || op == 3 {
+        // 算术复合（数字）
+        if !is_number(target_ty) {
+            set_err("复合赋值运算符不能用于 " + type_name(target_ty), line, col)
+            return -1
+        }
+        if !ty_ok {
+            set_err("复合赋值类型不匹配：目标类型 " + type_name(target_ty) + " 与表达式 " + type_name(value_ty), line, col)
+            return -1
+        }
+        return 0
+    }
+    if op == 4 {
+        // %= 仅整数
+        if !is_int(target_ty) {
+            set_err("复合赋值取模只支持整数，目标类型是 " + type_name(target_ty), line, col)
+            return -1
+        }
+        if !ty_ok {
+            set_err("复合赋值类型不匹配：目标类型 " + type_name(target_ty) + " 与表达式 " + type_name(value_ty), line, col)
+            return -1
+        }
+        return 0
+    }
+    if op == 12 || op == 13 || op == 14 || op == 15 || op == 16 {
+        // 位运算复合（整数）
+        if !is_int(target_ty) {
+            set_err("复合赋值位运算只支持整数，目标类型是 " + type_name(target_ty), line, col)
+            return -1
+        }
+        if !ty_ok {
+            set_err("复合赋值类型不匹配：目标类型 " + type_name(target_ty) + " 与表达式 " + type_name(value_ty), line, col)
+            return -1
+        }
+        return 0
+    }
+    set_err("无效的复合赋值运算符", line, col)
+    return -1
+}
+
+// break/continue 循环上下文校验（E1+E5）
+func check_loop_jump(label: string, line: i64, col: i64, kw: string) -> i64 {
+    if label == "" {
+        if row_count(sm_loop_labels) == 0 {
+            set_err(kw + " 只能出现在循环体内", line, col)
+            return -1
+        }
+        return 0
+    }
+    if !loop_has(label) {
+        set_err(kw + " 的标签 '" + label + "' 未匹配任何外层循环", line, col)
+        return -1
+    }
+    return 0
+}
+
+// ==================== check_stmt 语句分派（840-1543 行） ====================
+
+func check_stmt(stmt_id: i64, ret: string) -> i64 {
+    var tag = node_tag(stmt_id)
+    if tag == 100 {
+        return check_var_decl(stmt_id)
+    }
+    if tag == 110 {
+        set_err("函数体内不支持嵌套函数定义", node_line(stmt_id), node_col(stmt_id))
+        return -1
+    }
+    if tag == 113 {
+        set_err("import 语句只能出现在文件顶层", node_line(stmt_id), node_col(stmt_id))
+        return -1
+    }
+    if tag == 115 {
+        set_err("using 语句只能出现在文件顶层", node_line(stmt_id), node_col(stmt_id))
+        return -1
+    }
+    if tag == 114 {
+        // Namespace（函数体内）：防御性递归，跳过 FnDef/Namespace（已由 analyze 处理）
+        var blk = node_kid(stmt_id, 1)
+        var nk = node_nkids(blk)
+        var i: i64 = 0
+        while i < nk {
+            var s2 = node_kid(blk, i)
+            var t2 = node_tag(s2)
+            if t2 != 110 && t2 != 114 {
+                if check_stmt(s2, ret) < 0 {
+                    return -1
+                }
+            }
+            i = i + 1
+        }
+        return 0
+    }
+    if tag == 107 {
+        // Expr：推断类型记录
+        var e = node_kid(stmt_id, 0)
+        var ty = infer_expr(e)
+        if ty == "ERR" {
+            return -1
+        }
+        expr_ty_record(e, ty)
+        return 0
+    }
+    if tag == 101 {
+        return check_assign(stmt_id)
+    }
+    if tag == 102 {
+        return check_return(stmt_id, ret)
+    }
+    if tag == 103 {
+        return check_if(stmt_id, ret)
+    }
+    if tag == 104 {
+        return check_while(stmt_id, ret)
+    }
+    if tag == 105 {
+        return check_for(stmt_id, ret)
+    }
+    if tag == 111 {
+        var label = ""
+        var la = node_aux(stmt_id)
+        if la >= 0 {
+            label = pool_str(la)
+        }
+        return check_loop_jump(label, node_line(stmt_id), node_col(stmt_id), "break")
+    }
+    if tag == 112 {
+        var label = ""
+        var la = node_aux(stmt_id)
+        if la >= 0 {
+            label = pool_str(la)
+        }
+        return check_loop_jump(label, node_line(stmt_id), node_col(stmt_id), "continue")
+    }
+    if tag == 106 {
+        return check_switch(stmt_id, ret)
+    }
+    if tag == 116 {
+        set_err("struct 定义只能出现在文件顶层", node_line(stmt_id), node_col(stmt_id))
+        return -1
+    }
+    if tag == 109 {
+        return check_field_assign(stmt_id)
+    }
+    if tag == 108 {
+        return check_index_assign(stmt_id)
+    }
+    return 0
+}
+
+// VarDecl（847-1040 行）
+func check_var_decl(v: i64) -> i64 {
+    var name = node_name_str(v)
+    var is_const = node_aux(v) == 1
+    var nk = node_nkids(v)
+    var init_id = node_kid(v, nk - 1)
+    var init_ty = infer_expr(init_id)
+    if init_ty == "ERR" {
+        return -1
+    }
+    if nk >= 2 {
+        // 有显式类型标注
+        var ty = type_of(node_kid(v, 0))
+        if ty == "num" || ty == "text" || ty == "misc" {
+            // 宽类型：只校验类别框；scope 存具体推导类型
+            var ok = false
+            if ty == "num" {
+                ok = is_number(init_ty)
+            } else if ty == "text" {
+                ok = init_ty == "string" || init_ty == "char"
+            } else {
+                ok = true
+            }
+            if !ok {
+                set_err("变量 '" + name + "' 标注 " + type_name(ty) + " 不匹配初始化表达式的类型 " + type_name(init_ty), node_line(v), node_col(v))
+                return -1
+            }
+            scope_set(name, init_ty)
+        } else if is_table(ty) {
+            var inittag = node_tag(init_id)
+            if inittag == 12 {
+                // 表字面量：M2 范围检查（单行纯位置表）+ 布局登记
+                var ncell = node_nkids(init_id)
+                // 二维表（分号分行）：行号去重
+                var rows = table_new_i64()
+                var r: i64 = 0
+                var multi_row = false
+                while r < ncell {
+                    var cell = node_kid(init_id, r)
+                    var rowv = node_val(cell)
+                    var already = false
+                    var q: i64 = 0
+                    while q < len(rows) {
+                        if rows[q] == rowv {
+                            already = true
+                        }
+                        q = q + 1
+                    }
+                    if already {
+                        multi_row = true
+                    } else {
+                        table_push(rows, rowv)
+                    }
+                    r = r + 1
+                }
+                if multi_row {
+                    set_err("二维表（分号分行）的运行时留待 M3，当前仅支持单行表", node_line(v), node_col(v))
+                    return -1
+                }
+                // 字符串 id 表
+                r = 0
+                while r < ncell {
+                    var cell = node_kid(init_id, r)
+                    if node_aux(cell) == 2 {
+                        set_err("字符串 id 表（[\"a\":1]）的运行时留待 M3，当前仅支持数字下标", node_line(v), node_col(v))
+                        return -1
+                    }
+                    r = r + 1
+                }
+                // 元素类型 = 表字面量登记的元素类型（E1 嵌套表查 tables 元数据）
+                var elem_ty = table_lit_elem(init_id)
+                if elem_ty == "" {
+                    elem_ty = init_ty
+                }
+                var dynamic = false
+                if ncell > 0 {
+                    var c0 = node_kid(init_id, 0)
+                    if node_tag(c0) == 12 {
+                        dynamic = true
+                    }
+                }
+                sm_table_vars = row_append(sm_table_vars, sm_cur_fn + "|" + name, elem_ty + " " + to_string(ncell) + " " + to_string(dynamic))
+            } else {
+                // 动态表：table_new_* 或返回表的函数调用
+                var elem = dynamic_table_elem_ty(init_id, name)
+                if elem == "ERR" {
+                    return -1
+                }
+                sm_table_vars = row_append(sm_table_vars, sm_cur_fn + "|" + name, elem + " 0 1")
+            }
+            scope_set(name, "table")
+        } else if is_map(ty) {
+            // E3 键值表：值类型 = 字面量元数据或标注值类型
+            var val_ty = table_lit_elem(init_id)
+            if val_ty == "" {
+                val_ty = container_elem(ty)
+                if val_ty == "" {
+                    val_ty = "i64"
+                }
+            }
+            sm_table_vars = row_append(sm_table_vars, sm_cur_fn + "|" + name, val_ty + " 0 1")
+            scope_set(name, ty)
+        } else if !types_match(ty, init_ty, init_id) {
+            set_err("变量 '" + name + "' 类型不匹配：标注 " + type_name(ty) + "，表达式推导为 " + type_name(init_ty), node_line(v), node_col(v))
+            return -1
+        } else {
+            scope_set(name, ty)
+            // 平衡三进制字面量适配：标注 trit 且初始化是 Bool/Trit 字面量 → 改写为 trit
+            var it = node_tag(init_id)
+            if ty == "trit" && (it == 3 || it == 16) {
+                expr_ty_record(init_id, "trit")
+            }
+        }
+    } else {
+        // 无类型标注
+        if init_ty == "void" {
+            set_err("变量 '" + name + "' 不能用 void 表达式初始化", node_line(v), node_col(v))
+            return -1
+        }
+        if init_ty == "table" {
+            var elem = dynamic_table_elem_ty(init_id, name)
+            if elem == "ERR" {
+                return -1
+            }
+            sm_table_vars = row_append(sm_table_vars, sm_cur_fn + "|" + name, elem + " 0 1")
+        } else if node_tag(init_id) == 12 {
+            // 未标注表字面量
+            var ncell = node_nkids(init_id)
+            var elem_ty = "i64"
+            if ncell > 0 {
+                elem_ty = table_lit_elem(init_id)
+                if elem_ty == "" {
+                    elem_ty = init_ty
+                }
+            }
+            var dynamic = false
+            if ncell > 0 {
+                var c0 = node_kid(init_id, 0)
+                if node_tag(c0) == 12 {
+                    dynamic = true
+                }
+            }
+            // 键值表（带字符串键）也动态表化
+            var r: i64 = 0
+            while r < ncell {
+                var cell = node_kid(init_id, r)
+                if node_aux(cell) == 2 {
+                    dynamic = true
+                }
+                r = r + 1
+            }
+            sm_table_vars = row_append(sm_table_vars, sm_cur_fn + "|" + name, elem_ty + " " + to_string(ncell) + " " + to_string(dynamic))
+        }
+        scope_set(name, init_ty)
+    }
+    // 推导类型写入结果表（特例：元组标注 + 元组字面量 → 覆盖写为标注类型）
+    var recorded = init_ty
+    if nk >= 2 {
+        var ty = type_of(node_kid(v, 0))
+        if is_tuple(ty) && node_tag(init_id) == 11 {
+            recorded = ty
+        }
+    }
+    expr_ty_record(init_id, recorded)
+    if is_const {
+        sm_const_vars = row_append(sm_const_vars, name, "")
+    }
+    return 0
+}
+
+// Assign（1080-1122 行）
+func check_assign(a: i64) -> i64 {
+    var target = node_name_str(a)
+    var target_ty = scope_ty(target)
+    if target_ty == "" {
+        target_ty = global_ty(target)
+        if target_ty == "" {
+            set_err("赋值目标 '" + target + "' 未声明", node_line(a), node_col(a))
+            return -1
+        }
+    }
+    var value = node_kid(a, node_nkids(a) - 1)
+    var value_ty = infer_expr(value)
+    if value_ty == "ERR" {
+        return -1
+    }
+    expr_ty_record(value, value_ty)
+    if row_find(sm_const_vars, target) >= 0 || row_find(sm_const_globals, target) >= 0 {
+        set_err("不能给 const 变量 '" + target + "' 赋值", node_line(a), node_col(a))
+        return -1
+    }
+    var op = node_val(a)
+    if op >= 0 {
+        return check_compound_assign(target_ty, op, value_ty, value, node_line(a), node_col(a))
+    }
+    if !types_match(target_ty, value_ty, value) {
+        set_err("赋值类型不匹配：变量 '" + target + "' 类型为 " + type_name(target_ty) + "，表达式为 " + type_name(value_ty), node_line(a), node_col(a))
+        return -1
+    }
+    return 0
+}
+
+// Return（1123-1160 行）
+func check_return(r: i64, ret: string) -> i64 {
+    var expr_ty: string = "void"
+    var e: i64 = -1
+    if node_nkids(r) >= 1 {
+        e = node_kid(r, 0)
+        expr_ty = infer_expr(e)
+        if expr_ty == "ERR" {
+            return -1
+        }
+        expr_ty_record(e, expr_ty)
+    }
+    if !types_match(ret, expr_ty, e) {
+        set_err("return 类型不匹配：函数返回 " + type_name(ret) + "，实际返回 " + type_name(expr_ty), node_line(r), node_col(r))
+        return -1
+    }
+    if e >= 0 {
+        // 元组返回字面量：返回类型覆盖写回
+        if is_tuple(ret) && node_tag(e) == 11 {
+            expr_ty_record(e, ret)
+        }
+        // 动态表返回：记录元素类型
+        if ret == "table" {
+            var elem = table_arg_elem_ty(e)
+            if elem == "ERR" {
+                return -1
+            }
+            sm_table_ret_elems = row_append(sm_table_ret_elems, sm_cur_fn, elem)
+        }
+    }
+    return 0
+}
+
+// If（1161-1187 行）：else-if 链迭代检查（不递归）
+func check_if(first: i64, ret: string) -> i64 {
+    var cur = first
+    var guard: i64 = 0
+    while guard < 1024 {
+        var cond = node_kid(cur, 0)
+        var ct = infer_expr(cond)
+        if ct == "ERR" {
+            return -1
+        }
+        expr_ty_record(cond, ct)
+        if !is_bool_like(ct) {
+            set_err("if 条件必须是 bool", expr_line(cond), expr_col(cond))
+            return -1
+        }
+        if check_block(node_kid(cur, 1), ret) < 0 {
+            return -1
+        }
+        // else 分支（children[2]，可为空 Block）
+        var nk = node_nkids(cur)
+        if nk < 3 {
+            return 0
+        }
+        var else_blk = node_kid(cur, 2)
+        if node_nkids(else_blk) == 0 {
+            return 0
+        }
+        // else-if 链：else Block 只有单条 If 语句 → 延续
+        if node_nkids(else_blk) == 1 && node_tag(node_kid(else_blk, 0)) == 103 {
+            cur = node_kid(else_blk, 0)
+            guard = guard + 1
+            continue
+        }
+        if check_block(else_blk, ret) < 0 {
+            return -1
+        }
+        return 0
+    }
+    return 0
+}
+
+// While（1188-1202 行）
+func check_while(w: i64, ret: string) -> i64 {
+    var cond = node_kid(w, 0)
+    var ct = infer_expr(cond)
+    if ct == "ERR" {
+        return -1
+    }
+    expr_ty_record(cond, ct)
+    if !is_bool_like(ct) {
+        set_err("while 条件必须是 bool", expr_line(cond), expr_col(cond))
+        return -1
+    }
+    var label = ""
+    var la = node_aux(w)
+    if la >= 0 {
+        label = pool_str(la)
+    }
+    loop_push(label)
+    if check_block(node_kid(w, 1), ret) < 0 {
+        loop_pop()
+        return -1
+    }
+    loop_pop()
+    return 0
+}
+
+// For（1205-1252 行）
+func check_for(f: i64, ret: string) -> i64 {
+    var iter = node_kid(f, 0)
+    var iter_ty = infer_expr(iter)
+    if iter_ty == "ERR" {
+        return -1
+    }
+    expr_ty_record(iter, iter_ty)
+    var elem_ty: string = ""
+    if is_table(iter_ty) {
+        if node_tag(iter) == 4 {
+            // 表变量：查 table_vars 元数据
+            var vn = node_name_str(iter)
+            var te = table_var_elem(sm_cur_fn, vn)
+            if te != "" {
+                elem_ty = te
+            } else {
+                elem_ty = container_elem(iter_ty)
+                if elem_ty == "" {
+                    elem_ty = "i64"
+                }
+            }
+        } else {
+            elem_ty = container_elem(iter_ty)
+            if elem_ty == "" {
+                elem_ty = "i64"
+            }
+        }
+    } else if node_tag(iter) == 13 {
+        elem_ty = "i64"
+    } else {
+        set_err("for 迭代对象仅支持范围（0..10）或表变量，实际是 " + type_name(iter_ty), node_line(f), node_col(f))
+        return -1
+    }
+    scope_set(node_name_str(f), elem_ty)
+    var label = ""
+    var la = node_aux(f)
+    if la >= 0 {
+        label = pool_str(la)
+    }
+    loop_push(label)
+    if check_block(node_kid(f, 1), ret) < 0 {
+        loop_pop()
+        return -1
+    }
+    loop_pop()
+    return 0
+}
+
+// Switch（1253-1386 行）
+func check_switch(s: i64, ret: string) -> i64 {
+    var subject = node_kid(s, 0)
+    var subject_ty = infer_expr(subject)
+    if subject_ty == "ERR" {
+        return -1
+    }
+    expr_ty_record(subject, subject_ty)
+    if !is_number(subject_ty) && !is_bool_like(subject_ty) &&
+       subject_ty != "char" && subject_ty != "string" {
+        set_err("switch 对象仅支持数字、布尔、字符或字符串类型，实际是 " + type_name(subject_ty), node_line(s), node_col(s))
+        return -1
+    }
+    var seen = table_new_string()
+    var nk = node_nkids(s)
+    var ci: i64 = 1
+    while ci < nk {
+        var case_id = node_kid(s, ci)
+        if node_tag(case_id) != 304 {
+            // default Block
+            if check_block(case_id, ret) < 0 {
+                return -1
+            }
+            ci = ci + 1
+            continue
+        }
+        // SwitchCase：[PatternList, when 或空, Block(body)]
+        var plist = node_kid(case_id, 0)
+        var cnk = node_nkids(case_id)
+        var body = node_kid(case_id, cnk - 1)
+        var has_when = false
+        var when_id: i64 = -1
+        if cnk >= 3 {
+            var mid = node_kid(case_id, 1)
+            if node_tag(mid) != 306 {
+                has_when = true
+                when_id = mid
+            }
+        }
+        // 逐 pattern
+        var pn = node_nkids(plist)
+        var p: i64 = 0
+        while p < pn {
+            var pat = node_kid(plist, p)
+            var pt = node_tag(pat)
+            if pt == 13 {
+                // 区间 pattern
+                var st = node_kid(pat, 0)
+                var en = node_kid(pat, 1)
+                if !is_int_or_char_literal(st) || !is_int_or_char_literal(en) {
+                    set_err("case 区间两端必须是整数或字符字面量（浮点区间不支持）", node_line(pat), node_col(pat))
+                    return -1
+                }
+                if literal_cmp(st, en) >= 0 {
+                    set_err("case 区间必须 start < end（左闭右开）", node_line(pat), node_col(pat))
+                    return -1
+                }
+                var range_is_char = node_tag(st) == 15
+                var ok = false
+                if range_is_char {
+                    ok = subject_ty == "char"
+                } else {
+                    ok = is_int(subject_ty)
+                }
+                if !ok {
+                    set_err("case 区间类型与 switch 对象类型 " + type_name(subject_ty) + " 不匹配", node_line(pat), node_col(pat))
+                    return -1
+                }
+                var key = literal_key(st) + ".." + literal_key(en)
+                if list_has(seen, key) {
+                    set_err("重复的 case 区间 " + key, node_line(pat), node_col(pat))
+                    return -1
+                }
+                table_push(seen, key)
+            } else if pt == 18 {
+                // 类型匹配 pattern
+                set_err("case 类型匹配（" + type_name(type_of(node_kid(pat, 0))) + "）仅支持宽类型或动态容器对象，当前 switch 对象是静态类型 " + type_name(subject_ty), node_line(pat), node_col(pat))
+                return -1
+            } else {
+                // 字面量 pattern
+                var value_ty = infer_expr(pat)
+                if value_ty == "ERR" {
+                    return -1
+                }
+                expr_ty_record(pat, value_ty)
+                if !is_const_literal(pat) {
+                    set_err("case 值必须是字面量（整数/浮点/字符/布尔/字符串）", node_line(case_id), node_col(case_id))
+                    return -1
+                }
+                if !types_match(subject_ty, value_ty, pat) {
+                    set_err("case 值类型 " + type_name(value_ty) + " 与 switch 对象类型 " + type_name(subject_ty) + " 不匹配", node_line(case_id), node_col(case_id))
+                    return -1
+                }
+                var key = literal_key(pat)
+                if list_has(seen, key) {
+                    set_err("重复的 case 值 " + key, node_line(case_id), node_col(case_id))
+                    return -1
+                }
+                table_push(seen, key)
+            }
+            p = p + 1
+        }
+        // when 守卫
+        if has_when {
+            var wty = infer_expr(when_id)
+            if wty == "ERR" {
+                return -1
+            }
+            expr_ty_record(when_id, wty)
+            if !is_bool_like(wty) {
+                set_err("when 守卫必须是布尔表达式，实际是 " + type_name(wty), expr_line(when_id), expr_col(when_id))
+                return -1
+            }
+        }
+        if check_block(body, ret) < 0 {
+            return -1
+        }
+        ci = ci + 1
+    }
+    return 0
+}
+
+// 字符串表包含检查
+func list_has(t: table<string>, v: string) -> bool {
+    var i: i64 = 0
+    while i < len(t) {
+        if t[i] == v {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 字面量去重键（对齐 literal_key 4170 行；char/string 的 Debug 格式近似）
+func literal_key(id: i64) -> string {
+    var tag = node_tag(id)
+    if tag == 0 {
+        return "i:" + to_string(node_val(id))
+    }
+    if tag == 1 {
+        return "f:" + pool_str(node_name(id))
+    }
+    if tag == 15 {
+        return "c:" + to_string(node_val(id))
+    }
+    if tag == 3 {
+        if node_val(id) == 1 {
+            return "b:true"
+        }
+        return "b:false"
+    }
+    if tag == 2 {
+        return "s:" + pool_str(node_name(id))
+    }
+    if tag == 7 {
+        var op = node_val(id)
+        if op == 17 {
+            var kid = node_kid(id, 0)
+            var kt = node_tag(kid)
+            if kt == 0 {
+                return "i:-" + to_string(node_val(kid))
+            }
+            if kt == 1 {
+                return "f:-" + pool_str(node_name(kid))
+            }
+        }
+    }
+    return "?"
+}
+
+// 整数/字符字面量（区间两端）
+func is_int_or_char_literal(id: i64) -> bool {
+    var tag = node_tag(id)
+    if tag == 0 || tag == 15 {
+        return true
+    }
+    if tag == 7 {
+        var op = node_val(id)
+        if op == 17 {
+            return node_tag(node_kid(id, 0)) == 0
+        }
+    }
+    return false
+}
+
+// 字面量数值（字符按码点；负数取负）
+func literal_value(id: i64) -> i64 {
+    var tag = node_tag(id)
+    if tag == 0 {
+        return node_val(id)
+    }
+    if tag == 15 {
+        return node_val(id)
+    }
+    if tag == 7 {
+        var op = node_val(id)
+        if op == 17 {
+            var kid = node_kid(id, 0)
+            if node_tag(kid) == 0 {
+                return 0 - node_val(kid)
+            }
+        }
+    }
+    return 0
+}
+
+func literal_cmp(a: i64, b: i64) -> i64 {
+    return literal_value(a) - literal_value(b)
+}
+
+// FieldAssign（1394-1441 行）
+func check_field_assign(fa: i64) -> i64 {
+    var base = node_kid(fa, 0)
+    var base_ty = infer_expr(base)
+    if base_ty == "ERR" {
+        return -1
+    }
+    expr_ty_record(base, base_ty)
+    if !is_struct(base_ty) {
+        set_err("字段赋值的对象必须是 struct 实例，实际是 " + type_name(base_ty), node_line(fa), node_col(fa))
+        return -1
+    }
+    var class_name = struct_name_of(base_ty)
+    if !class_exists(class_name) {
+        set_err("内部错误：类 '" + class_name + "' 无信息", node_line(fa), node_col(fa))
+        return -1
+    }
+    var field = node_name_str(fa)
+    var fidx = class_field_index(class_name, field)
+    if fidx < 0 {
+        set_err("类 '" + class_name + "' 没有字段 '" + field + "'", node_line(fa), node_col(fa))
+        return -1
+    }
+    var field_ty = class_field_ty(class_name, fidx)
+    var value = node_kid(fa, node_nkids(fa) - 1)
+    var value_ty = infer_expr(value)
+    if value_ty == "ERR" {
+        return -1
+    }
+    expr_ty_record(value, value_ty)
+    var op = node_val(fa)
+    if op >= 0 {
+        return check_compound_assign(field_ty, op, value_ty, value, node_line(fa), node_col(fa))
+    }
+    if !types_match(field_ty, value_ty, value) {
+        set_err("字段赋值类型不匹配：'" + class_name + "." + field + "' 类型为 " + type_name(field_ty) + "，表达式为 " + type_name(value_ty), node_line(fa), node_col(fa))
+        return -1
+    }
+    return 0
+}
+
+// IndexAssign（1442-1541 行）
+func check_index_assign(ia: i64) -> i64 {
+    var target = node_kid(ia, 0)
+    if node_tag(target) != 8 {
+        set_err("下标赋值的目标必须是表元素访问（t[i]）", node_line(ia), node_col(ia))
+        return -1
+    }
+    var base = node_kid(target, 0)
+    var index = node_kid(target, 1)
+    var base_ty0 = infer_expr(base)
+    if base_ty0 == "ERR" {
+        return -1
+    }
+    expr_ty_record(base, base_ty0)
+    // 键值表下标赋值
+    if is_map(base_ty0) {
+        var idx_ty = infer_expr(index)
+        if idx_ty == "ERR" {
+            return -1
+        }
+        expr_ty_record(index, idx_ty)
+        if idx_ty != "string" {
+            set_err("键值表下标必须是字符串键，实际是 " + type_name(idx_ty), expr_line(index), expr_col(index))
+            return -1
+        }
+        var val_ty = container_elem(base_ty0)
+        if val_ty == "" {
+            val_ty = "i64"
+        }
+        var value = node_kid(ia, node_nkids(ia) - 1)
+        var value_ty = infer_expr(value)
+        if value_ty == "ERR" {
+            return -1
+        }
+        expr_ty_record(value, value_ty)
+        var op = node_val(ia)
+        if op < 0 {
+            if !types_match(val_ty, value_ty, value) {
+                set_err("键值表值类型不匹配：map 值为 " + type_name(val_ty) + "，表达式为 " + type_name(value_ty), expr_line(value), expr_col(value))
+                return -1
+            }
+        } else {
+            if check_compound_assign(val_ty, op, value_ty, value, node_line(ia), node_col(ia)) < 0 {
+                return -1
+            }
+        }
+        return 0
+    }
+    // 表下标赋值
+    var is_table = false
+    if node_tag(base) == 4 {
+        var vn = node_name_str(base)
+        is_table = table_var_find(sm_cur_fn, vn) >= 0 || is_table(base_ty0)
+    } else {
+        is_table = is_table(base_ty0)
+    }
+    if !is_table {
+        set_err("下标赋值的对象必须是表，实际是 " + type_name(base_ty0), node_line(ia), node_col(ia))
+        return -1
+    }
+    var elem_ty = table_arg_elem_ty(base)
+    if elem_ty == "ERR" {
+        return -1
+    }
+    var idx_ty = infer_expr(index)
+    if idx_ty == "ERR" {
+        return -1
+    }
+    expr_ty_record(index, idx_ty)
+    if !is_int(idx_ty) {
+        set_err("下标必须是整数，实际是 " + type_name(idx_ty), expr_line(index), expr_col(index))
+        return -1
+    }
+    var value = node_kid(ia, node_nkids(ia) - 1)
+    var value_ty = infer_expr(value)
+    if value_ty == "ERR" {
+        return -1
+    }
+    expr_ty_record(value, value_ty)
+    var op = node_val(ia)
+    if op >= 0 {
+        return check_compound_assign(elem_ty, op, value_ty, value, node_line(ia), node_col(ia))
+    }
+    if !types_match(elem_ty, value_ty, value) {
+        set_err("下标赋值类型不匹配：表元素类型为 " + type_name(elem_ty) + "，表达式为 " + type_name(value_ty), node_line(ia), node_col(ia))
+        return -1
+    }
+    return 0
+}
+
+// ==================== 命名空间解析辅助（M2.1.7） ====================
+
+// 裸调用名解析（411-451 行）：返回实际调用注册键或 "ERR"（歧义错误已设）
+func resolve_bare_call(name: string, line: i64, col: i64) -> string {
+    // 候选 1：顶层裸名
+    if func_exists(name) {
+        return name
+    }
+    // 候选 2：当前命名空间前缀补全（逐级外层）
+    var depth: i64 = ns_len()
+    while depth >= 0 {
+        var full: string = ""
+        var d: i64 = 0
+        while d < depth {
+            if d > 0 {
+                full = full + "::"
+            }
+            full = full + ns_seg(d)
+            d = d + 1
+        }
+        if full != "" {
+            full = full + "::"
+        }
+        full = full + name
+        if func_exists(full) {
+            return full
+        }
+        depth = depth - 1
+    }
+    // 候选 3：using 引入的命名空间
+    var hit: string = ""
+    var un = row_count(sm_using_prefixes)
+    var i: i64 = 0
+    while i < un {
+        var prefix = row_line(sm_using_prefixes, i)
+        var full = prefix + "::" + name
+        if func_exists(full) {
+            if hit != "" {
+                set_err("裸调用 '" + name + "' 有歧义：多个 using 引入的命名空间都包含该函数，请改用命名空间前缀调用", line, col)
+                return "ERR"
+            }
+            hit = full
+        }
+        i = i + 1
+    }
+    if hit != "" {
+        return hit
+    }
+    // 都不命中：保持裸名（调用方按未定义报错）
+    return name
+}
+
+// 可见性校验（501-532 行）：私有函数仅同命名空间可调
+func check_visibility(call_name: string, line: i64, col: i64) -> i64 {
+    if func_is_pub(call_name) {
+        return 0
+    }
+    // 顶层函数恒公有；只有命名空间函数（含 ::）才需私有校验
+    var idx = find_char(call_name, ":")
+    if idx < 0 {
+        return 0
+    }
+    var prefix = slice(call_name, 0, idx)
+    var own = split_path(prefix, "::")
+    var own_n = row_count(own)
+    // 同命名空间或子命名空间放行
+    var same = ns_len() >= own_n
+    var k: i64 = 0
+    while k < own_n {
+        if ns_seg(k) != row_line(own, k) {
+            same = false
+        }
+        k = k + 1
+    }
+    if same {
+        return 0
+    }
+    set_err("函数 '" + call_name + "' 是命名空间 '" + prefix + "' 的私有函数（默认私有，`pub func` 显式导出），不可在命名空间之外调用", line, col)
+    return -1
+}
+
+// 命名空间路径段提取（3888 行）：未绑定的 Var/FieldAccess 链 → 段行表；否则 ""
+func ns_path_segments(id: i64) -> string {
+    var tag = node_tag(id)
+    if tag == 4 {
+        var nm = node_name_str(id)
+        if scope_contains(nm) || global_exists(nm) {
+            return ""
+        }
+        return row_append("", nm, "")
+    }
+    if tag == 9 {
+        var base = node_kid(id, 0)
+        var segs = ns_path_segments(base)
+        if segs == "" {
+            return ""
+        }
+        return row_append(segs, node_name_str(id), "")
+    }
+    return ""
+}
+
+// 导入前缀映射（458-494 行）："" = 无映射；"ERR" = 违规（sm_err 已设）；其余 = 映射路径
+func map_import_prefix(segs: string, line: i64, col: i64) -> string {
+    var n = row_count(sm_import_views)
+    var i: i64 = 0
+    while i < n {
+        var alias = row_field(sm_import_views, i, 1)
+        var nss = field(row_line(sm_import_views, i), 2)
+        var pos: i64 = 0
+        var nl = str_len(nss)
+        while pos <= nl {
+            var end = find_char_at(nss, ";", pos)
+            if end < 0 {
+                end = nl
+            }
+            var ns = slice(nss, pos, end)
+            var ns_segs = split_path(ns, "::")
+            if alias != "" {
+                // 有别名：原前缀被屏蔽（唯一入口）
+                var nn = row_count(ns_segs)
+                if row_count(segs) >= nn {
+                    var is_orig = true
+                    var k: i64 = 0
+                    while k < nn {
+                        if row_line(segs, k) != row_line(ns_segs, k) {
+                            is_orig = false
+                        }
+                        k = k + 1
+                    }
+                    if is_orig {
+                        set_err("命名空间前缀 '" + ns + "' 已被别名 '" + alias + "' 取代（import as 唯一入口），请改用别名访问", line, col)
+                        return "ERR"
+                    }
+                }
+                // 别名命中：segs[0] == alias 且其余段 == ns 后续段
+                if row_count(segs) == nn && nn > 0 && row_line(segs, 0) == alias {
+                    var hit = true
+                    var k: i64 = 1
+                    while k < nn {
+                        if row_line(segs, k) != row_line(ns_segs, k) {
+                            hit = false
+                        }
+                        k = k + 1
+                    }
+                    if hit {
+                        return ns
+                    }
+                }
+            } else {
+                // 无别名：原前缀可用
+                if segs_equal(segs, ns_segs) {
+                    return ns
+                }
+            }
+            if end >= nl {
+                break
+            }
+            pos = end + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 命名空间调用 → 函数全名（3933 行）；"" = 无法解析
+func ns_call_full_name(id: i64) -> string {
+    var tag = node_tag(id)
+    if tag == 5 {
+        // 裸调用：裸名 → 前缀补全 → using（与 resolve_bare_call 一致，不做 funcs 校验）
+        var name = node_name_str(id)
+        if func_exists(name) {
+            return name
+        }
+        var depth: i64 = ns_len()
+        while depth >= 0 {
+            var full: string = ""
+            var d: i64 = 0
+            while d < depth {
+                if d > 0 {
+                    full = full + "::"
+                }
+                full = full + ns_seg(d)
+                d = d + 1
+            }
+            if full != "" {
+                full = full + "::"
+            }
+            full = full + name
+            if func_exists(full) {
+                return full
+            }
+            depth = depth - 1
+        }
+        var hit: string = ""
+        var un = row_count(sm_using_prefixes)
+        var i: i64 = 0
+        while i < un {
+            var prefix = row_line(sm_using_prefixes, i)
+            var full = prefix + "::" + name
+            if func_exists(full) {
+                if hit != "" {
+                    return ""
+                }
+                hit = full
+            }
+            i = i + 1
+        }
+        if hit != "" {
+            return hit
+        }
+        return name
+    }
+    if tag == 10 {
+        // MethodCall：receiver Path → 段；Var/FieldAccess 链 → 未绑定则命名空间形态
+        var recv = node_kid(id, 0)
+        var segs: string = ""
+        if node_tag(recv) == 17 {
+            segs = ns_path_segs_of(recv)
+        } else {
+            segs = ns_path_segments(recv)
+            if segs == "" {
+                return ""
+            }
+        }
+        var prefix = join_segs(segs, "::")
+        if !ns_prefix_exists(prefix) {
+            return ""
+        }
+        var method = node_name_str(id)
+        return prefix + "::" + method
+    }
+    return ""
+}
+
+// 实参表达式的表元素类型（A1，1559 行）："" = 非表；"ERR" = 错误
+func arg_table_elem_ty(id: i64) -> string {
+    var tag = node_tag(id)
+    if tag == 12 {
+        return table_lit_elem(id)
+    }
+    if tag == 4 {
+        var vn = node_name_str(id)
+        var i = table_var_find(sm_cur_fn, vn)
+        if i >= 0 {
+            return row_field(sm_table_vars, i, 1)
+        }
+        return ""
+    }
+    if tag == 5 || tag == 10 {
+        var full = ns_call_full_name(id)
+        if full == "" {
+            full = node_name_str(id)
+        }
+        if table_ret_find(full) >= 0 {
+            return table_ret_elem(full)
+        }
+        return ""
+    }
+    return ""
+}
+
+// 动态表构造/返回调用元素类型（3618 行）；"ERR" = 错误
+func dynamic_table_elem_ty(id: i64, var_name: string) -> string {
+    var name = ns_call_full_name(id)
+    if name == "" {
+        name = node_name_str(id)
+        if name == "" {
+            set_err("变量 '" + var_name + "' 标注 table，初始化必须是表字面量 [...] 或 table_new_* / 返回表的函数调用", expr_line(id), expr_col(id))
+            return "ERR"
+        }
+    }
+    var elem = table_new_elem_ty(name)
+    if elem != "" {
+        return elem
+    }
+    if table_ret_find(name) >= 0 {
+        return table_ret_elem(name)
+    }
+    set_err("函数 '" + name + "' 未定义或不是返回表的函数", expr_line(id), expr_col(id))
+    return "ERR"
+}
+
+// table_at / 下标访问的表参数元素类型（3665 行）；"ERR" = 错误
+func table_arg_elem_ty(id: i64) -> string {
+    var tag = node_tag(id)
+    if tag == 12 {
+        var elem = table_lit_elem(id)
+        if elem == "" {
+            set_err("找不到表字面量的元素类型元数据", expr_line(id), expr_col(id))
+            return "ERR"
+        }
+        return elem
+    }
+    if tag == 4 {
+        var vn = node_name_str(id)
+        var i = table_var_find(sm_cur_fn, vn)
+        if i >= 0 {
+            return row_field(sm_table_vars, i, 1)
+        }
+        if scope_ty(vn) == "table" {
+            set_err("表参数 '" + vn + "' 的元素类型未知，无法确定 table_at 返回类型", expr_line(id), expr_col(id))
+            return "ERR"
+        }
+        set_err("'" + vn + "' 不是表变量", expr_line(id), expr_col(id))
+        return "ERR"
+    }
+    if tag == 5 || tag == 10 {
+        var name = node_name_str(id)
+        var elem = table_new_elem_ty(name)
+        if elem != "" {
+            return elem
+        }
+        var full = ns_call_full_name(id)
+        if table_ret_find(full) >= 0 {
+            return table_ret_elem(full)
+        }
+        set_err("函数 '" + full + "' 未定义或不是返回表的函数", expr_line(id), expr_col(id))
+        return "ERR"
+    }
+    set_err("table_at 第 1 个参数必须是表字面量、表变量或返回表的函数", expr_line(id), expr_col(id))
+    return "ERR"
+}
+
+// ==================== infer_expr（1631-3513 行，最核心） ====================
+
+func infer_expr(id: i64) -> string {
+    var tag = node_tag(id)
+    if tag == 0 {
+        return "i64"
+    }
+    if tag == 1 {
+        return "f64"
+    }
+    if tag == 3 {
+        return "bool"
+    }
+    if tag == 16 {
+        return "trit"
+    }
+    if tag == 2 {
+        return "string"
+    }
+    if tag == 15 {
+        return "char"
+    }
+    if tag == 18 {
+        // 类型字面量：只能用作 switch 的 case 类型匹配
+        set_err("类型字面量 " + type_name(type_of(node_kid(id, 0))) + " 只能用作 switch 的 case 类型匹配", node_line(id), node_col(id))
+        return "ERR"
+    }
+    if tag == 4 {
+        var nm = node_name_str(id)
+        var t = scope_ty(nm)
+        if t != "" {
+            return t
+        }
+        t = global_ty(nm)
+        if t != "" {
+            return t
+        }
+        set_err("未声明的变量 '" + nm + "'", expr_line(id), expr_col(id))
+        return "ERR"
+    }
+    if tag == 17 {
+        // 命名空间路径不能作为值
+        var segs = ns_path_segs_of(id)
+        var joined = join_segs(segs, "::")
+        set_err("命名空间路径 '" + joined + "' 不能作为值使用（只能用于调用，如 '" + joined + "::xxx()'）", node_line(id), node_col(id))
+        return "ERR"
+    }
+    if tag == 5 {
+        return infer_call(id)
+    }
+    if tag == 7 {
+        return infer_unary(id)
+    }
+    if tag == 6 {
+        return infer_binary(id)
+    }
+    if tag == 14 {
+        return infer_ternary(id)
+    }
+    if tag == 13 {
+        return infer_range(id)
+    }
+    if tag == 12 {
+        return infer_table_lit(id)
+    }
+    if tag == 8 {
+        return infer_index(id)
+    }
+    if tag == 11 {
+        return infer_tuple_lit(id)
+    }
+    if tag == 9 {
+        return infer_field_access(id)
+    }
+    if tag == 10 {
+        return infer_method_call(id)
+    }
+    return "ERR"
+}
+
+// 参数个数检查（消息：{name}() 期望 N 个参数，实际 {} 个）
+func check_n_args(name: string, n: i64, want: i64, line: i64, col: i64) -> i64 {
+    if n != want {
+        set_err(name + "() 期望 " + to_string(want) + " 个参数，实际 " + to_string(n) + " 个", line, col)
+        return -1
+    }
+    return 0
+}
+
+// 实参表（Call children）
+func call_args(id: i64) -> table<i64> {
+    return node_kids(id)
+}
+
+// 单个实参类型检查（字符串）
+func check_arg_str(name: string, arg: i64, idx: i64) -> i64 {
+    var at = infer_expr(arg)
+    if at == "ERR" {
+        return -1
+    }
+    expr_ty_record(arg, at)
+    if at != "string" {
+        set_err(name + "() 参数必须是字符串，实际是 " + type_name(at), expr_line(arg), expr_col(arg))
+        return -1
+    }
+    return 0
+}
+
+// 单个实参类型检查（整数）
+func check_arg_int(name: string, arg: i64, idx: i64) -> i64 {
+    var at = infer_expr(arg)
+    if at == "ERR" {
+        return -1
+    }
+    expr_ty_record(arg, at)
+    if !is_int(at) {
+        set_err(name + "() 参数必须是整数，实际是 " + type_name(at), expr_line(arg), expr_col(arg))
+        return -1
+    }
+    return 0
+}
+
+// 单个实参类型检查（数字）
+func check_arg_num(name: string, arg: i64, idx: i64) -> i64 {
+    var at = infer_expr(arg)
+    if at == "ERR" {
+        return -1
+    }
+    expr_ty_record(arg, at)
+    if !is_number(at) {
+        set_err(name + "() 参数必须是数字（i64/f64），实际是 " + type_name(at), expr_line(arg), expr_col(arg))
+        return -1
+    }
+    return 0
+}
+
+// 调用表达式（1677-2820 行：构造/内置/用户函数）
+func infer_call(id: i64) -> string {
+    var name = node_name_str(id)
+    var args = call_args(id)
+    var n = len(args)
+    var line = node_line(id)
+    var col = node_col(id)
+    // 构造调用：类名命中
+    if class_exists(name) {
+        var nf = class_nfields(name)
+        if n > nf {
+            set_err("构造 '" + name + "' 最多 " + to_string(nf) + " 个参数（字段数），实际 " + to_string(n) + " 个", line, col)
+            return "ERR"
+        }
+        var i: i64 = 0
+        while i < n {
+            var a = args[i]
+            var at = infer_expr(a)
+            if at == "ERR" {
+                return "ERR"
+            }
+            var fty = class_field_ty(name, i)
+            if !types_match(fty, at, a) {
+                set_err("构造 '" + name + "' 参数类型不匹配：字段 '" + class_field_name(name, i) + "' 期望 " + type_name(fty) + "，实际 " + type_name(at), expr_line(a), expr_col(a))
+                return "ERR"
+            }
+            expr_ty_record(a, at)
+            i = i + 1
+        }
+        return "struct:" + name
+    }
+    // println：任意参数，void（元组拒绝）
+    if name == "println" {
+        var i: i64 = 0
+        while i < n {
+            var a = args[i]
+            var at = infer_expr(a)
+            if at == "ERR" {
+                return "ERR"
+            }
+            if is_tuple(at) {
+                set_err("println 不支持元组参数（类型 " + type_name(at) + "）", expr_line(a), expr_col(a))
+                return "ERR"
+            }
+            expr_ty_record(a, at)
+            i = i + 1
+        }
+        return "void"
+    }
+    // len：1 参（字符串/表/键值表）→ i64
+    if name == "len" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        var a = args[0]
+        var at = infer_expr(a)
+        if at == "ERR" {
+            return "ERR"
+        }
+        expr_ty_record(a, at)
+        if node_tag(a) == 12 {
+            return "i64"
+        }
+        if is_table(at) || is_map(at) || at == "string" {
+            return "i64"
+        }
+        set_err("len() 参数必须是字符串、表或键值表，实际是 " + type_name(at), expr_line(a), expr_col(a))
+        return "ERR"
+    }
+    // str_len：1 字符串 → i64
+    if name == "str_len" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_str(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "i64"
+    }
+    // table_new_*：0 参 → table
+    var tne = table_new_elem_ty(name)
+    if tne != "" {
+        if check_n_args(name, n, 0, line, col) < 0 {
+            return "ERR"
+        }
+        expr_ty_record(id, "table")
+        return "table"
+    }
+    // table_push：2 参（表变量, 元素）→ void
+    if name == "table_push" {
+        if check_n_args(name, n, 2, line, col) < 0 {
+            return "ERR"
+        }
+        var t_ty = infer_expr(args[0])
+        if t_ty == "ERR" {
+            return "ERR"
+        }
+        var x_ty = infer_expr(args[1])
+        if x_ty == "ERR" {
+            return "ERR"
+        }
+        expr_ty_record(args[1], x_ty)
+        if !is_table(t_ty) {
+            set_err("table_push() 第 1 个参数必须是表，实际是 " + type_name(t_ty), expr_line(args[0]), expr_col(args[0]))
+            return "ERR"
+        }
+        if node_tag(args[0]) != 4 {
+            set_err("table_push() 第 1 个参数必须是表变量（不能是字面量/下标）", expr_line(args[0]), expr_col(args[0]))
+            return "ERR"
+        }
+        var name0 = node_name_str(args[0])
+        var tv = table_var_find(sm_cur_fn, name0)
+        if tv < 0 {
+            set_err("table_push() 找不到表变量 '" + name0 + "' 的元素类型", expr_line(args[0]), expr_col(args[0]))
+            return "ERR"
+        }
+        if !table_var_dynamic(sm_cur_fn, name0) {
+            set_err("table_push() 只能用于动态表（table_new_* 创建），'" + name0 + "' 是定长表", expr_line(args[0]), expr_col(args[0]))
+            return "ERR"
+        }
+        var elem = row_field(sm_table_vars, tv, 1)
+        if !types_match(elem, x_ty, args[1]) {
+            set_err("table_push() 元素类型不匹配：表 '" + name0 + "' 的元素是 " + type_name(elem) + "，推入的是 " + type_name(x_ty), expr_line(args[1]), expr_col(args[1]))
+            return "ERR"
+        }
+        return "void"
+    }
+    // table_at：2 参（表, 下标）→ 元素类型
+    if name == "table_at" {
+        if check_n_args(name, n, 2, line, col) < 0 {
+            return "ERR"
+        }
+        var t_ty = infer_expr(args[0])
+        if t_ty == "ERR" {
+            return "ERR"
+        }
+        var i_ty = infer_expr(args[1])
+        if i_ty == "ERR" {
+            return "ERR"
+        }
+        expr_ty_record(args[1], i_ty)
+        if !is_table(t_ty) {
+            set_err("table_at() 第 1 个参数必须是表，实际是 " + type_name(t_ty), expr_line(args[0]), expr_col(args[0]))
+            return "ERR"
+        }
+        if !is_int(i_ty) {
+            set_err("table_at() 下标必须是整数，实际是 " + type_name(i_ty), expr_line(args[1]), expr_col(args[1]))
+            return "ERR"
+        }
+        var elem = table_arg_elem_ty(args[0])
+        if elem == "ERR" {
+            return "ERR"
+        }
+        return elem
+    }
+    // print：同 println
+    if name == "print" {
+        var i: i64 = 0
+        while i < n {
+            var a = args[i]
+            var at = infer_expr(a)
+            if at == "ERR" {
+                return "ERR"
+            }
+            if is_tuple(at) {
+                set_err("print 不支持元组参数（类型 " + type_name(at) + "）", expr_line(a), expr_col(a))
+                return "ERR"
+            }
+            expr_ty_record(a, at)
+            i = i + 1
+        }
+        return "void"
+    }
+    // read_line：0 参 → string
+    if name == "read_line" {
+        if check_n_args(name, n, 0, line, col) < 0 {
+            return "ERR"
+        }
+        return "string"
+    }
+    // eval：1 字符串 → string
+    if name == "eval" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_str(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "string"
+    }
+    // eval_call：2 字符串 → string
+    if name == "eval_call" {
+        if check_n_args(name, n, 2, line, col) < 0 {
+            return "ERR"
+        }
+        var i: i64 = 0
+        while i < n {
+            if check_arg_str(name, args[i], i) < 0 {
+                return "ERR"
+            }
+            i = i + 1
+        }
+        return "string"
+    }
+    // file_read：1 字符串 → string
+    if name == "file_read" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_str(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "string"
+    }
+    // file_write / file_append：2 字符串 → bool
+    if name == "file_write" || name == "file_append" {
+        if check_n_args(name, n, 2, line, col) < 0 {
+            return "ERR"
+        }
+        var i: i64 = 0
+        while i < n {
+            if check_arg_str(name, args[i], i) < 0 {
+                return "ERR"
+            }
+            i = i + 1
+        }
+        return "bool"
+    }
+    // file_exists：1 字符串 → bool
+    if name == "file_exists" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_str(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "bool"
+    }
+    // file_delete：1 字符串 → bool
+    if name == "file_delete" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_str(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "bool"
+    }
+    // M4 系统能力：单字符串 → string
+    if name == "http_get" || name == "exec_output" || name == "path_basename" ||
+       name == "path_dirname" || name == "path_abs" || name == "path_normalize" ||
+       name == "get_env" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_str(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "string"
+    }
+    // 单字符串 → bool
+    if name == "mkdir_all" || name == "remove_dir_all" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_str(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "bool"
+    }
+    // 单字符串 → i64
+    if name == "exec_code" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_str(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "i64"
+    }
+    // 单字符串 → table（walk_dir）
+    if name == "walk_dir" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_str(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "table"
+    }
+    // D7 字节原语
+    if name == "byte_read" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_str(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "table"
+    }
+    if name == "byte_write" {
+        if check_n_args(name, n, 2, line, col) < 0 {
+            return "ERR"
+        }
+        var p = infer_expr(args[0])
+        if p == "ERR" {
+            return "ERR"
+        }
+        expr_ty_record(args[0], p)
+        if p != "string" {
+            set_err("byte_write() 第 1 个参数必须是字符串，实际是 " + type_name(p), expr_line(args[0]), expr_col(args[0]))
+            return "ERR"
+        }
+        var b = infer_expr(args[1])
+        if b == "ERR" {
+            return "ERR"
+        }
+        expr_ty_record(args[1], b)
+        if !is_table(b) {
+            set_err("byte_write() 第 2 个参数必须是字节表，实际是 " + type_name(b), expr_line(args[1]), expr_col(args[1]))
+            return "ERR"
+        }
+        return "bool"
+    }
+    if name == "bit_read" {
+        if check_n_args(name, n, 2, line, col) < 0 {
+            return "ERR"
+        }
+        var b = infer_expr(args[0])
+        if b == "ERR" {
+            return "ERR"
+        }
+        expr_ty_record(args[0], b)
+        if !is_table(b) {
+            set_err("bit_read() 第 1 个参数必须是字节表，实际是 " + type_name(b), expr_line(args[0]), expr_col(args[0]))
+            return "ERR"
+        }
+        var q = infer_expr(args[1])
+        if q == "ERR" {
+            return "ERR"
+        }
+        expr_ty_record(args[1], q)
+        if !is_int(q) {
+            set_err("bit_read() 第 2 个参数必须是整数，实际是 " + type_name(q), expr_line(args[1]), expr_col(args[1]))
+            return "ERR"
+        }
+        return "i64"
+    }
+    if name == "bit_write" {
+        if check_n_args(name, n, 3, line, col) < 0 {
+            return "ERR"
+        }
+        var b = infer_expr(args[0])
+        if b == "ERR" {
+            return "ERR"
+        }
+        expr_ty_record(args[0], b)
+        if !is_table(b) {
+            set_err("bit_write() 第 1 个参数必须是字节表，实际是 " + type_name(b), expr_line(args[0]), expr_col(args[0]))
+            return "ERR"
+        }
+        var i: i64 = 1
+        while i < n {
+            var t = infer_expr(args[i])
+            if t == "ERR" {
+                return "ERR"
+            }
+            expr_ty_record(args[i], t)
+            if !is_int(t) {
+                set_err("bit_write() 位置/位值必须是整数，实际是 " + type_name(t), expr_line(args[i]), expr_col(args[i]))
+                return "ERR"
+            }
+            i = i + 1
+        }
+        return "bool"
+    }
+    if name == "byte_concat" {
+        if check_n_args(name, n, 2, line, col) < 0 {
+            return "ERR"
+        }
+        var i: i64 = 0
+        while i < n {
+            var t = infer_expr(args[i])
+            if t == "ERR" {
+                return "ERR"
+            }
+            expr_ty_record(args[i], t)
+            if !is_table(t) {
+                set_err("byte_concat() 参数必须是字节表，实际是 " + type_name(t), expr_line(args[i]), expr_col(args[i]))
+                return "ERR"
+            }
+            i = i + 1
+        }
+        return "table"
+    }
+    // 双字符串 → bool
+    if name == "http_get_file" || name == "untar_gz" || name == "unzip" ||
+       name == "copy_dir" || name == "file_copy" || name == "file_move" {
+        if check_n_args(name, n, 2, line, col) < 0 {
+            return "ERR"
+        }
+        var i: i64 = 0
+        while i < n {
+            if check_arg_str(name, args[i], i) < 0 {
+                return "ERR"
+            }
+            i = i + 1
+        }
+        return "bool"
+    }
+    // 双字符串 → string（path_join）
+    if name == "path_join" {
+        if check_n_args(name, n, 2, line, col) < 0 {
+            return "ERR"
+        }
+        var i: i64 = 0
+        while i < n {
+            if check_arg_str(name, args[i], i) < 0 {
+                return "ERR"
+            }
+            i = i + 1
+        }
+        return "string"
+    }
+    // 双字符串 → void（set_env）
+    if name == "set_env" {
+        if check_n_args(name, n, 2, line, col) < 0 {
+            return "ERR"
+        }
+        var i: i64 = 0
+        while i < n {
+            if check_arg_str(name, args[i], i) < 0 {
+                return "ERR"
+            }
+            i = i + 1
+        }
+        return "void"
+    }
+    // 零参 → string（cwd）
+    if name == "cwd" {
+        if check_n_args(name, n, 0, line, col) < 0 {
+            return "ERR"
+        }
+        return "string"
+    }
+    // str_char：字符串 + 整数 → string
+    if name == "str_char" {
+        if check_n_args(name, n, 2, line, col) < 0 {
+            return "ERR"
+        }
+        var st = infer_expr(args[0])
+        if st == "ERR" {
+            return "ERR"
+        }
+        expr_ty_record(args[0], st)
+        if st != "string" {
+            set_err("str_char() 第 1 个参数必须是字符串，实际是 " + type_name(st), expr_line(args[0]), expr_col(args[0]))
+            return "ERR"
+        }
+        var it = infer_expr(args[1])
+        if it == "ERR" {
+            return "ERR"
+        }
+        expr_ty_record(args[1], it)
+        if !is_int(it) {
+            set_err("str_char() 第 2 个参数必须是整数，实际是 " + type_name(it), expr_line(args[1]), expr_col(args[1]))
+            return "ERR"
+        }
+        return "string"
+    }
+    // char_code：1 字符串 → i64
+    if name == "char_code" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        var st = infer_expr(args[0])
+        if st == "ERR" {
+            return "ERR"
+        }
+        expr_ty_record(args[0], st)
+        if st != "string" {
+            set_err("char_code() 第 1 个参数必须是字符串，实际是 " + type_name(st), expr_line(args[0]), expr_col(args[0]))
+            return "ERR"
+        }
+        return "i64"
+    }
+    // P1 正则
+    if name == "regex_match" || name == "regex_find" || name == "regex_find_all" {
+        if check_n_args(name, n, 2, line, col) < 0 {
+            return "ERR"
+        }
+        var i: i64 = 0
+        while i < n {
+            if check_arg_str(name, args[i], i) < 0 {
+                return "ERR"
+            }
+            i = i + 1
+        }
+        if name == "regex_match" {
+            return "bool"
+        }
+        if name == "regex_find" {
+            return "string"
+        }
+        return "table"
+    }
+    if name == "regex_replace" {
+        if check_n_args(name, n, 3, line, col) < 0 {
+            return "ERR"
+        }
+        var i: i64 = 0
+        while i < n {
+            if check_arg_str(name, args[i], i) < 0 {
+                return "ERR"
+            }
+            i = i + 1
+        }
+        return "string"
+    }
+    if name == "regex_group" {
+        if check_n_args(name, n, 3, line, col) < 0 {
+            return "ERR"
+        }
+        var st = infer_expr(args[0])
+        if st == "ERR" {
+            return "ERR"
+        }
+        expr_ty_record(args[0], st)
+        if st != "string" {
+            set_err("regex_group() 第 1 个参数必须是字符串，实际是 " + type_name(st), expr_line(args[0]), expr_col(args[0]))
+            return "ERR"
+        }
+        var pt = infer_expr(args[1])
+        if pt == "ERR" {
+            return "ERR"
+        }
+        expr_ty_record(args[1], pt)
+        if pt != "string" {
+            set_err("regex_group() 第 2 个参数必须是字符串，实际是 " + type_name(pt), expr_line(args[1]), expr_col(args[1]))
+            return "ERR"
+        }
+        var it = infer_expr(args[2])
+        if it == "ERR" {
+            return "ERR"
+        }
+        expr_ty_record(args[2], it)
+        if !is_int(it) {
+            set_err("regex_group() 第 3 个参数必须是整数，实际是 " + type_name(it), expr_line(args[2]), expr_col(args[2]))
+            return "ERR"
+        }
+        return "string"
+    }
+    // to_string：数字/trit → string
+    if name == "to_string" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        var at = infer_expr(args[0])
+        if at == "ERR" {
+            return "ERR"
+        }
+        expr_ty_record(args[0], at)
+        if at == "trit" {
+            return "string"
+        }
+        if !is_number(at) {
+            set_err("to_string() 参数必须是数字（i64/f64），实际是 " + type_name(at), expr_line(args[0]), expr_col(args[0]))
+            return "ERR"
+        }
+        return "string"
+    }
+    // parse_int / parse_float / parse_trit：1 字符串
+    if name == "parse_int" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_str(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "i64"
+    }
+    if name == "parse_float" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_str(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "f64"
+    }
+    if name == "parse_trit" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_str(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "trit"
+    }
+    // exit：1 整数 → void
+    if name == "exit" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_int(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "void"
+    }
+    // time_now：0 参 → i64
+    if name == "time_now" {
+        if check_n_args(name, n, 0, line, col) < 0 {
+            return "ERR"
+        }
+        return "i64"
+    }
+    // rand_range：2 整数 → i64
+    if name == "rand_range" {
+        if check_n_args(name, n, 2, line, col) < 0 {
+            return "ERR"
+        }
+        var i: i64 = 0
+        while i < n {
+            if check_arg_int(name, args[i], i) < 0 {
+                return "ERR"
+            }
+            i = i + 1
+        }
+        return "i64"
+    }
+    // arg_count：0 参 → i64
+    if name == "arg_count" {
+        if check_n_args(name, n, 0, line, col) < 0 {
+            return "ERR"
+        }
+        return "i64"
+    }
+    // arg_string：1 整数 → string
+    if name == "arg_string" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_int(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "string"
+    }
+    // list_dir：1 字符串 → table
+    if name == "list_dir" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_str(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "table"
+    }
+    // msg_set_lang：1 字符串 → void
+    if name == "msg_set_lang" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_str(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "void"
+    }
+    // msg_get_lang：0 参 → string
+    if name == "msg_get_lang" {
+        if check_n_args(name, n, 0, line, col) < 0 {
+            return "ERR"
+        }
+        return "string"
+    }
+    // msg_register：3 字符串 → void
+    if name == "msg_register" {
+        if check_n_args(name, n, 3, line, col) < 0 {
+            return "ERR"
+        }
+        var i: i64 = 0
+        while i < n {
+            if check_arg_str(name, args[i], i) < 0 {
+                return "ERR"
+            }
+            i = i + 1
+        }
+        return "void"
+    }
+    // msg_t：1 字符串 → string
+    if name == "msg_t" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_str(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "string"
+    }
+    // print_err：1 字符串 → void
+    if name == "print_err" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_str(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "void"
+    }
+    // msg_t_lang：2 字符串 → string
+    if name == "msg_t_lang" {
+        if check_n_args(name, n, 2, line, col) < 0 {
+            return "ERR"
+        }
+        var i: i64 = 0
+        while i < n {
+            if check_arg_str(name, args[i], i) < 0 {
+                return "ERR"
+            }
+            i = i + 1
+        }
+        return "string"
+    }
+    // 数学：1 数字 → f64
+    if name == "sqrt" || name == "sin" || name == "cos" || name == "tan" ||
+       name == "exp" || name == "log" || name == "floor" || name == "ceil" || name == "round" {
+        if check_n_args(name, n, 1, line, col) < 0 {
+            return "ERR"
+        }
+        if check_arg_num(name, args[0], 0) < 0 {
+            return "ERR"
+        }
+        return "f64"
+    }
+    // pow：2 数字 → f64
+    if name == "pow" {
+        if check_n_args(name, n, 2, line, col) < 0 {
+            return "ERR"
+        }
+        var i: i64 = 0
+        while i < n {
+            if check_arg_num(name, args[i], i) < 0 {
+                return "ERR"
+            }
+            i = i + 1
+        }
+        return "f64"
+    }
+    // 用户函数：裸名解析 + 可见性 + 参数区间 + 类型匹配
+    var call_name = resolve_bare_call(name, line, col)
+    if call_name == "ERR" {
+        return "ERR"
+    }
+    if !func_exists(call_name) {
+        set_err("未定义的函数 '" + name + "'", line, col)
+        return "ERR"
+    }
+    if check_visibility(call_name, line, col) < 0 {
+        return "ERR"
+    }
+    if call_name != name {
+        sm_resolved_calls = row_append(sm_resolved_calls, to_string(id), call_name)
+    }
+    var required = func_required(call_name)
+    var total = func_nparam(call_name)
+    if n < required || n > total {
+        var desc = to_string(total)
+        if required != total {
+            desc = to_string(required) + "-" + to_string(total)
+        }
+        set_err("函数 '" + call_name + "' 期望 " + desc + " 个参数，实际 " + to_string(n) + " 个", line, col)
+        return "ERR"
+    }
+    var i: i64 = 0
+    while i < n {
+        var a = args[i]
+        var at = infer_expr(a)
+        if at == "ERR" {
+            return "ERR"
+        }
+        var want = func_param_ty(call_name, i)
+        // E0/E3：表/键值表变量实参的表身份还原
+        if (is_table(want) || is_map(want)) && node_tag(a) == 4 {
+            var elem = arg_table_elem_ty(a)
+            if elem != "" {
+                if is_map(want) {
+                    at = "map<" + elem + ">"
+                } else {
+                    at = "table<" + elem + ">"
+                }
+            }
+        }
+        if !types_match(want, at, a) {
+            set_err("调用 '" + call_name + "' 参数类型不匹配：期望 " + type_name(want) + "，实际 " + type_name(at), expr_line(a), expr_col(a))
+            return "ERR"
+        }
+        // A1：形参 table<T> 的元素类型校验
+        if is_table(want) && want != "table" {
+            var got_elem = arg_table_elem_ty(a)
+            if got_elem != "" && !types_compatible(container_elem(want), got_elem) {
+                set_err("调用 '" + call_name + "' 表参数元素类型不匹配：期望 table<" + type_name(container_elem(want)) + ">，实际 table<" + type_name(got_elem) + ">", expr_line(a), expr_col(a))
+                return "ERR"
+            }
+        }
+        expr_ty_record(a, at)
+        i = i + 1
+    }
+    return func_ret_ty(call_name)
+}
+
+// Unary（2821-2873 行）
+func infer_unary(id: i64) -> string {
+    var op = node_val(id)
+    var operand = node_kid(id, 0)
+    var ot = infer_expr(operand)
+    if ot == "ERR" {
+        return "ERR"
+    }
+    expr_ty_record(operand, ot)
+    if op == 17 {
+        // Neg
+        if !is_number(ot) {
+            set_err("取负运算的操作数必须是数字", node_line(id), node_col(id))
+            return "ERR"
+        }
+        return ot
+    }
+    if op == 18 {
+        // Not
+        if ot == "trit" {
+            return "trit"
+        }
+        if !is_bool_like(ot) {
+            set_err("逻辑非的操作数必须是 bool", node_line(id), node_col(id))
+            return "ERR"
+        }
+        return "bool"
+    }
+    // 自增自减（19-22）
+    if node_tag(operand) == 4 {
+        var vn = node_name_str(operand)
+        if row_find(sm_const_vars, vn) >= 0 {
+            set_err("不能对 const 变量 '" + vn + "' 自增/自减", node_line(id), node_col(id))
+            return "ERR"
+        }
+    } else if node_tag(operand) != 9 {
+        set_err("自增/自减的操作数必须是可写数字变量", node_line(id), node_col(id))
+        return "ERR"
+    }
+    if !is_number(ot) {
+        set_err("自增/自减的操作数必须是可写数字变量", node_line(id), node_col(id))
+        return "ERR"
+    }
+    return ot
+}
+
+// Binary（2875-3010 行）
+func infer_binary(id: i64) -> string {
+    var op = node_val(id)
+    var lhs = node_kid(id, 0)
+    var rhs = node_kid(id, 1)
+    var lt = infer_expr(lhs)
+    if lt == "ERR" {
+        return "ERR"
+    }
+    var rt = infer_expr(rhs)
+    if rt == "ERR" {
+        return "ERR"
+    }
+    expr_ty_record(lhs, lt)
+    expr_ty_record(rhs, rt)
+    // 两侧类型一致（trit×i64 例外）
+    var ok_pair = types_compatible(lt, rt)
+    if !ok_pair {
+        ok_pair = (lt == "trit" && rt == "i64") || (rt == "trit" && lt == "i64")
+    }
+    if !ok_pair {
+        set_err("二元运算两侧类型不一致：" + type_name(lt) + " 与 " + type_name(rt), node_line(id), node_col(id))
+        return "ERR"
+    }
+    if op >= 0 && op <= 4 {
+        // 算术：字符串拼接 / trit / 数字
+        if op == 0 && lt == "string" {
+            return "string"
+        }
+        if lt == "trit" || rt == "trit" {
+            if op == 3 || op == 4 {
+                set_err("trit 不支持除/取模运算（三值无除法）", node_line(id), node_col(id))
+                return "ERR"
+            }
+            if lt == "trit" && rt == "trit" {
+                return "trit"
+            }
+            if (lt == "trit" && rt == "i64") || (rt == "trit" && lt == "i64") {
+                return "i64"
+            }
+            var other = lt
+            if lt == "trit" {
+                other = rt
+            }
+            set_err("trit 只能与 trit 或 i64 做算术，不能与 " + type_name(other), node_line(id), node_col(id))
+            return "ERR"
+        }
+        if !is_number(lt) {
+            set_err("算术运算符不能用于 " + type_name(lt), node_line(id), node_col(id))
+            return "ERR"
+        }
+        if op == 4 && !is_int(lt) {
+            set_err("取模运算只支持整数", node_line(id), node_col(id))
+            return "ERR"
+        }
+        return lt
+    }
+    if op == 5 || op == 6 || op == 7 || op == 8 || op == 9 || op == 23 {
+        // 比较
+        if lt == "string" {
+            return "bool"
+        }
+        if is_tuple(lt) {
+            set_err("元组暂不支持比较运算（逐字段比较留待后续版本）", node_line(id), node_col(id))
+            return "ERR"
+        }
+        if lt == "trit" && (rt == "trit" || rt == "i64") {
+            return "bool"
+        }
+        if !is_number(lt) && lt != "bool" {
+            set_err("比较运算符不能用于 " + type_name(lt), node_line(id), node_col(id))
+            return "ERR"
+        }
+        return "bool"
+    }
+    if op == 10 || op == 11 {
+        // 逻辑
+        if lt == "trit" && rt == "trit" {
+            return "trit"
+        }
+        if !is_bool_like(lt) {
+            set_err("逻辑运算符两侧必须是 bool（或两侧同为 trit）", node_line(id), node_col(id))
+            return "ERR"
+        }
+        return "bool"
+    }
+    // 位运算（12-16）
+    if !is_int(lt) {
+        set_err("位运算只支持整数，不能用于 " + type_name(lt), node_line(id), node_col(id))
+        return "ERR"
+    }
+    return lt
+}
+
+// Ternary（3011-3036 行）
+func infer_ternary(id: i64) -> string {
+    var cond = node_kid(id, 0)
+    var then_e = node_kid(id, 1)
+    var else_e = node_kid(id, 2)
+    var ct = infer_expr(cond)
+    if ct == "ERR" {
+        return "ERR"
+    }
+    expr_ty_record(cond, ct)
+    if !is_bool_like(ct) {
+        set_err("三目条件必须是 bool", node_line(id), node_col(id))
+        return "ERR"
+    }
+    var then_ty = infer_expr(then_e)
+    if then_ty == "ERR" {
+        return "ERR"
+    }
+    expr_ty_record(then_e, then_ty)
+    var else_ty = infer_expr(else_e)
+    if else_ty == "ERR" {
+        return "ERR"
+    }
+    expr_ty_record(else_e, else_ty)
+    if !types_compatible(then_ty, else_ty) {
+        set_err("三目两分支类型不一致：" + type_name(then_ty) + " 与 " + type_name(else_ty), node_line(id), node_col(id))
+        return "ERR"
+    }
+    return then_ty
+}
+
+// Range（3037-3050 行）
+func infer_range(id: i64) -> string {
+    var st = infer_expr(node_kid(id, 0))
+    if st == "ERR" {
+        return "ERR"
+    }
+    var et = infer_expr(node_kid(id, 1))
+    if et == "ERR" {
+        return "ERR"
+    }
+    expr_ty_record(node_kid(id, 0), st)
+    expr_ty_record(node_kid(id, 1), et)
+    if !is_int(st) || !is_int(et) {
+        set_err("范围两端必须是整数", node_line(id), node_col(id))
+        return "ERR"
+    }
+    return "i64"
+}
+
+// TableLit（3051-3118 行）
+func infer_table_lit(id: i64) -> string {
+    var ncell = node_nkids(id)
+    if ncell == 0 {
+        return "i64"
+    }
+    // E3 键值表检测：字符串 id
+    var is_map = false
+    var has_pos = false
+    var c: i64 = 0
+    while c < ncell {
+        var cell = node_kid(id, c)
+        if node_aux(cell) == 2 {
+            is_map = true
+        } else {
+            has_pos = true
+        }
+        c = c + 1
+    }
+    if is_map && has_pos {
+        set_err("键值表元素必须全部带字符串键（[\"a\":1]），不能混用位置元素", node_line(id), node_col(id))
+        return "ERR"
+    }
+    var first_ty = infer_expr(node_kid(node_kid(id, 0), 0))
+    if first_ty == "ERR" {
+        return "ERR"
+    }
+    expr_ty_record(node_kid(node_kid(id, 0), 0), first_ty)
+    c = 1
+    while c < ncell {
+        var cell = node_kid(id, c)
+        var ct = infer_expr(node_kid(cell, 0))
+        if ct == "ERR" {
+            return "ERR"
+        }
+        expr_ty_record(node_kid(cell, 0), ct)
+        if !types_compatible(first_ty, ct) {
+            set_err("表元素类型不一致：" + type_name(first_ty) + " 与 " + type_name(ct), node_line(id), node_col(id))
+            return "ERR"
+        }
+        c = c + 1
+    }
+    if is_map {
+        sm_tables = row_append(sm_tables, to_string(id), first_ty + " " + to_string(ncell) + " 1")
+        return "map<" + first_ty + ">"
+    }
+    var nested = node_tag(node_kid(node_kid(id, 0), 0)) == 12
+    var elem_ty = first_ty
+    if nested {
+        elem_ty = "table<" + first_ty + ">"
+    }
+    sm_tables = row_append(sm_tables, to_string(id), elem_ty + " " + to_string(ncell) + " " + to_string(nested))
+    if nested {
+        return "table<" + elem_ty + ">"
+    }
+    return first_ty
+}
+
+// Index（3119-3243 行）
+func infer_index(id: i64) -> string {
+    var base = node_kid(id, 0)
+    var index = node_kid(id, 1)
+    var base_ty = infer_expr(base)
+    if base_ty == "ERR" {
+        return "ERR"
+    }
+    var index_ty = infer_expr(index)
+    if index_ty == "ERR" {
+        return "ERR"
+    }
+    expr_ty_record(base, base_ty)
+    expr_ty_record(index, index_ty)
+    // 键值表下标
+    if is_map(base_ty) {
+        if index_ty != "string" {
+            set_err("键值表下标必须是字符串键，实际是 " + type_name(index_ty), node_line(id), node_col(id))
+            return "ERR"
+        }
+        var val = container_elem(base_ty)
+        if val == "" {
+            val = "i64"
+        }
+        return val
+    }
+    if !is_int(index_ty) {
+        set_err("下标必须是整数，实际是 " + type_name(index_ty), node_line(id), node_col(id))
+        return "ERR"
+    }
+    // 字符串下标：s[i] → char（排除登记过 table_vars 的变量）
+    if base_ty == "string" {
+        var is_tv = false
+        if node_tag(base) == 4 {
+            is_tv = table_var_find(sm_cur_fn, node_name_str(base)) >= 0
+        }
+        if !is_tv {
+            return "char"
+        }
+    }
+    // 表身份判定
+    var is_table = false
+    if node_tag(base) == 4 {
+        var vn = node_name_str(base)
+        is_table = table_var_find(sm_cur_fn, vn) >= 0 || is_table(base_ty)
+    } else {
+        is_table = is_table(base_ty)
+    }
+    if !is_table {
+        set_err("下标访问的对象必须是表或字符串，实际是 " + type_name(base_ty), node_line(id), node_col(id))
+        return "ERR"
+    }
+    // 元素类型
+    var btag = node_tag(base)
+    if btag == 12 {
+        var elem = table_lit_elem(base)
+        if elem == "" {
+            return base_ty
+        }
+        return elem
+    }
+    if btag == 4 {
+        var vn = node_name_str(base)
+        var te = table_var_elem(sm_cur_fn, vn)
+        if te != "" {
+            return te
+        }
+        var ce = container_elem(base_ty)
+        if ce != "" {
+            return ce
+        }
+        return base_ty
+    }
+    if btag == 5 || btag == 10 {
+        var full = ns_call_full_name(base)
+        if full == "" {
+            full = node_name_str(base)
+        }
+        if table_ret_find(full) >= 0 {
+            return table_ret_elem(full)
+        }
+        if full == "" {
+            set_err("下标访问的调用 '" + type_name(base_ty) + "' 未解析（内部错误）", node_line(id), node_col(id))
+            return "ERR"
+        }
+        set_err("下标访问的调用 '" + full + "' 不是返回表的函数", node_line(id), node_col(id))
+        return "ERR"
+    }
+    if btag == 8 {
+        var ce = container_elem(base_ty)
+        if ce != "" {
+            return ce
+        }
+        return base_ty
+    }
+    set_err("下标访问仅支持表变量、表字面量或返回表的函数调用", node_line(id), node_col(id))
+    return "ERR"
+}
+
+// TupleLit（3244-3271 行）
+func infer_tuple_lit(id: i64) -> string {
+    var nf = node_nkids(id)
+    if nf == 0 {
+        set_err("空元组 () 不支持", node_line(id), node_col(id))
+        return "ERR"
+    }
+    var out: string = "tuple{"
+    var seen_names = table_new_string()
+    var i: i64 = 0
+    while i < nf {
+        var tf = node_kid(id, i)
+        if i > 0 {
+            out = out + ","
+        }
+        var fname = node_name_str(tf)
+        var ft = infer_expr(node_kid(tf, 0))
+        if ft == "ERR" {
+            return "ERR"
+        }
+        expr_ty_record(node_kid(tf, 0), ft)
+        if fname != "" {
+            if list_has(seen_names, fname) {
+                set_err("元组字段名 '" + fname + "' 重复", node_line(id), node_col(id))
+                return "ERR"
+            }
+            table_push(seen_names, fname)
+            out = out + fname + ":"
+        }
+        out = out + ft
+        i = i + 1
+    }
+    out = out + "}"
+    return out
+}
+
+// FieldAccess（3272-3328 行）
+func infer_field_access(id: i64) -> string {
+    var base = node_kid(id, 0)
+    var field = node_name_str(id)
+    var base_ty = infer_expr(base)
+    if base_ty == "ERR" {
+        return "ERR"
+    }
+    expr_ty_record(base, base_ty)
+    if is_tuple(base_ty) {
+        var idx = tuple_field_index(base_ty, field)
+        if idx < 0 {
+            set_err("元组没有字段 '" + field + "'（元组字段为 " + type_name(base_ty) + "）", node_line(id), node_col(id))
+            return "ERR"
+        }
+        return tuple_field_ty(base_ty, idx)
+    }
+    if is_struct(base_ty) {
+        var class_name = struct_name_of(base_ty)
+        if !is_addressable_expr(base) {
+            set_err("struct 实例 '" + class_name + "' 的字段访问需要可寻址对象（变量/字段链），", node_line(id), node_col(id))
+            return "ERR"
+        }
+        if !class_exists(class_name) {
+            set_err("内部错误：struct '" + class_name + "' 无信息", node_line(id), node_col(id))
+            return "ERR"
+        }
+        var fidx = class_field_index(class_name, field)
+        if fidx < 0 {
+            set_err("类 '" + class_name + "' 没有字段 '" + field + "'", node_line(id), node_col(id))
+            return "ERR"
+        }
+        return class_field_ty(class_name, fidx)
+    }
+    set_err("字段访问 '.' 的对象必须是元组或类实例，实际是 " + type_name(base_ty), node_line(id), node_col(id))
+    return "ERR"
+}
+
+// MethodCall（3329-3510 行）
+func infer_method_call(id: i64) -> string {
+    var receiver = node_kid(id, 0)
+    var method = node_name_str(id)
+    var args = call_args(id)
+    // args 含 receiver？——MethodCall children = [receiver, ...args]。
+    // 修正：MethodCall 的 children 首个是 receiver，其余是实参。
+    var n = 0
+    var arg_start = 1
+    n = len(args) - 1
+    var line = node_line(id)
+    var col = node_col(id)
+    // 命名空间形态判定
+    var ns_segs: string = ""
+    if node_tag(receiver) == 17 {
+        ns_segs = ns_path_segs_of(receiver)
+    } else {
+        ns_segs = ns_path_segments(receiver)
+    }
+    var mapped = ""
+    if ns_segs != "" {
+        mapped = map_import_prefix(ns_segs, line, col)
+    }
+    if mapped == "ERR" {
+        return "ERR"
+    }
+    var is_path_form = node_tag(receiver) == 17
+    var is_ns_call = false
+    if mapped != "" {
+        is_ns_call = true
+    } else if ns_segs != "" {
+        var prefix = join_segs(ns_segs, "::")
+        is_ns_call = is_path_form || ns_prefix_exists(prefix)
+    }
+    if is_ns_call {
+        var full = mapped
+        if full == "" {
+            full = join_segs(ns_segs, "::")
+        }
+        full = full + "::" + method
+        if !func_exists(full) {
+            set_err("命名空间函数 '" + full + "' 未定义", line, col)
+            return "ERR"
+        }
+        if check_visibility(full, line, col) < 0 {
+            return "ERR"
+        }
+        var required = func_required(full)
+        var total = func_nparam(full)
+        if n < required || n > total {
+            var desc = to_string(total)
+            if required != total {
+                desc = to_string(required) + "-" + to_string(total)
+            }
+            set_err("命名空间函数 '" + full + "' 期望 " + desc + " 个参数，实际 " + to_string(n) + " 个", line, col)
+            return "ERR"
+        }
+        var i: i64 = 0
+        while i < n {
+            var a = args[i + arg_start]
+            var at = infer_expr(a)
+            if at == "ERR" {
+                return "ERR"
+            }
+            var want = func_param_ty(full, i)
+            if !types_match(want, at, a) {
+                set_err("调用 '" + full + "' 参数类型不匹配：期望 " + type_name(want) + "，实际 " + type_name(at), expr_line(a), expr_col(a))
+                return "ERR"
+            }
+            expr_ty_record(a, at)
+            i = i + 1
+        }
+        sm_resolved_calls = row_append(sm_resolved_calls, to_string(id), full)
+        return func_ret_ty(full)
+    }
+    // ===== struct 方法转发（M2.1.8） =====
+    var recv_ty = infer_expr(receiver)
+    if recv_ty == "ERR" {
+        return "ERR"
+    }
+    expr_ty_record(receiver, recv_ty)
+    if !is_struct(recv_ty) {
+        set_err("方法调用的对象必须是 struct 实例或 struct 名，实际是 " + type_name(recv_ty), line, col)
+        return "ERR"
+    }
+    if !is_addressable_expr(receiver) {
+        set_err("方法调用的对象需要可寻址的 struct 实例（变量/字段链），" + type_name(recv_ty) + " 不可取地址", line, col)
+        return "ERR"
+    }
+    // 沿继承链查找方法函数（子 → 父）
+    var struct_name = struct_name_of(recv_ty)
+    var full: string = ""
+    var cur = struct_name
+    var guard: i64 = 0
+    while guard < 64 && cur != "" {
+        var candidate = cur + "::" + method
+        if func_exists(candidate) {
+            full = candidate
+            break
+        }
+        cur = class_parent(cur)
+        guard = guard + 1
+    }
+    if full == "" {
+        set_err("struct '" + struct_name + "'（含继承链）没有方法 '" + method + "'：请在 \n                             namespace " + struct_name + " 中定义 pub func " + method + "(首参: " + struct_name + ", ...)", line, col)
+        return "ERR"
+    }
+    if check_visibility(full, line, col) < 0 {
+        return "ERR"
+    }
+    var required = func_required(full)
+    var total = func_nparam(full)
+    var n_args = n + 1
+    if n_args < required || n_args > total {
+        set_err("方法 '" + full + "' 期望 " + to_string(required) + "-" + to_string(total) + " 个参数（含接收者对象），实际 " + to_string(n_args) + " 个", line, col)
+        return "ERR"
+    }
+    var first = func_param_ty(full, 0)
+    if !struct_assignable(first, recv_ty) {
+        set_err("方法 '" + full + "' 首参类型不匹配：期望 " + type_name(first) + "，实际 " + type_name(recv_ty), line, col)
+        return "ERR"
+    }
+    var i: i64 = 0
+    while i < n {
+        var a = args[i + arg_start]
+        var at = infer_expr(a)
+        if at == "ERR" {
+            return "ERR"
+        }
+        var want = func_param_ty(full, i + 1)
+        if !types_match(want, at, a) {
+            set_err("调用 '" + full + "' 参数类型不匹配：期望 " + type_name(want) + "，实际 " + type_name(at), expr_line(a), expr_col(a))
+            return "ERR"
+        }
+        expr_ty_record(a, at)
+        i = i + 1
+    }
+    sm_resolved_calls = row_append(sm_resolved_calls, to_string(id), full)
+    return func_ret_ty(full)
+}
+
+// ==================== check 主入口 ====================
+
+func check(ast_text: string) -> string {
+    reset_state(ast_text)
+    // 解析头：AST:<n> <pool>
+    var head = line_of(sm_ast, 0)
+    if str_len(head) < 4 || slice(head, 0, 4) != "AST:" {
+        return "ERR:1 1 无效的 AST 协议文本"
+    }
+    var sp = find_char(head, " ")
+    if sp < 0 {
+        return "ERR:1 1 无效的 AST 协议文本"
+    }
+    sm_ast_n = parse_dec(slice(head, 4, sp))
+    sm_pool_n = parse_dec(slice(head, sp + 1, str_len(head)))
+    if sm_ast_n < 0 || sm_pool_n < 0 {
+        return "ERR:1 1 无效的 AST 协议文本"
+    }
+    // 第零遍：顶层识别 + import/using 收集
+    build_refs()
+    collect_tops()
+    if collect_imports_using() < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err
+    }
+    // 第一遍：函数签名 + 全局变量
+    if collect_funcs_and_globals() < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err
+    }
+    // struct 收集
+    if collect_structs() < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err
+    }
+    // 表返回预扫描（fixpoint）
+    scan_tables_fixpoint()
+    // 第二遍：函数体检查
+    if check_all_fns() < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err
+    }
+    // 成功：OK:<expr_count> + TYPES 段
+    var out = "OK:" + to_string(sm_expr_count)
+    var tn = row_count(sm_expr_types)
+    if tn > 0 {
+        out = out + "\nTYPES:" + to_string(tn) + "\n" + sm_expr_types
+    }
+    return out
+}
+
+}

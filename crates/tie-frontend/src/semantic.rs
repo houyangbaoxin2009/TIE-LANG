@@ -1161,7 +1161,7 @@ impl Analyzer {
             Stmt::If(first) => {
                 // else-if 链展开为迭代：`else if` 在 AST 中表现为 else_branch
                 // 是单条 `Stmt::If` 的嵌套（递归下降产物）。长链（自举编译器
-                // 判别链可达 40+ 层，如 compiler/lexer.tie 的 scan_ident 关键字表）
+                // 判别链可达 40+ 层，如 archive/compiler-v1/lexer.tie 的 scan_ident 关键字表）
                 // 若递归 check_block 会导致调用栈溢出——改为循环逐个检查。
                 let mut cur = first;
                 loop {
@@ -2309,7 +2309,7 @@ impl Analyzer {
                 }
                 // 内置函数 char_code（自举阶段 2 新增）：单字符串参数，
                 // 返回首字符的 Unicode 标量值（i64，UTF-32 码点；空串返回 -1）。
-                // tie 语言编译器（compiler/lexer.tie）解析字符字面量需要
+                // tie 语言编译器（archive/compiler-v1/lexer.tie）解析字符字面量需要
                 // 「字符 → 码点」的精确值，tie 内无字节访问原语无法自行计算。
                 if name == "char_code" {
                     if args.len() != 1 {

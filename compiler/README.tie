@@ -1,0 +1,20 @@
+// tie:library
+// compiler/README.tie —— 自举 v2 编译器源码目录（tie 语言 100% 重写）
+//
+// 本目录是自举 v2 计划的编译器源码根（规划见 .omo/plans/self-hosting-v2.md）。
+// 旧的 v1 尝试（文本协议 AST + 惰性字符串解析）已归档至 archive/compiler-v1/，
+// 全部废弃，不再引用。
+//
+// 目标架构（LLVM 三层模块化，Pass 基础设施直接借鉴 LLVM）：
+//   compiler/
+//   ├── driver.tie         CLI 薄壳（阶段 3）
+//   ├── lib/               基础库：interner（字符串池）/ columnar（列式表）/ dispatch（分派表）
+//   ├── frontend/          lexer → parser → semantic（ast 为列式 tag 表 arena）
+//   ├── middle/            tie IR（列式函数/块/指令表）+ pass 管线（AnalysisManager 惰性+失效追踪）
+//   ├── backend/           LLVM IR 文本生成（单调 %N 直生）+ opt/clang/lld 工具链驱动
+//   ├── interp/            tie 写的树遍历解释器（阶段 4，0 Rust 目标）
+//   ├── repl.tie           REPL 主循环（阶段 4）
+//   └── tests/             错误 golden 语料 / pass 测试 / interp 测试 / 运行器
+//
+// 当前状态：阶段 0（语言能力补强，Rust 种子侧）+ 阶段 1（性能原型）进行中，
+// 本目录各模块自阶段 2 起逐个创建（先 proto/ 原型，后模块化正式版）。
