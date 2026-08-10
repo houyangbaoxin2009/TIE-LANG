@@ -119,6 +119,19 @@ pub extern "C" fn tie_str_char(s: *const c_char, i: i64) -> *mut c_char {
     string_to_c_char(ch.map(|c| c.to_string()).unwrap_or_default())
 }
 
+/// C ABI 桥：取字符串首字符的 Unicode 标量值（UTF-32 码点，i64）；
+/// 空串返回 -1（哨兵）。与 [tie_str_char] 同源（`chars().next()` 解码），
+/// 供 tie 语言 `char_code` 原语使用——编译器（compiler/lexer.tie）解析
+/// 字符字面量需要「字符 → 码点」的精确值（自举阶段 2 清扫的语言障碍）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_char_code(s: *const c_char) -> i64 {
+    let s = unsafe { c_char_to_string(s).unwrap_or_default() };
+    match s.chars().next() {
+        Some(c) => c as i64,
+        None => -1,
+    }
+}
+
 /// C ABI 桥：字符串的 Unicode 码点数（按字符计数，非字节）。
 ///
 /// 与 [tie_str_char] 的码点索引语义对齐：`len` 返回 UTF-8 字节数（`s.len()`），
@@ -3398,7 +3411,7 @@ impl<'a> Env<'a> {
                 tie_free_result(r);
                 Ok(Value::Str(out))
             }
-            // 字符串类：str_char / to_string 走 C ABI 桥（与编译路径共用实现，
+            // 字符串类：str_char / char_code / to_string 走 C ABI 桥（与编译路径共用实现，
             // 保证 UTF-8 码点索引与数字格式化两路径逐字节一致）。
             "str_char" => {
                 if args.len() != 2 {
@@ -3412,6 +3425,19 @@ impl<'a> Env<'a> {
                 let out = unsafe { c_char_to_string(r).unwrap_or_default() };
                 tie_free_result(r);
                 Ok(Value::Str(out))
+            }
+            // char_code：取字符串首字符的 Unicode 标量值（i64，UTF-32 码点）；
+            // 空串返回 -1。自举阶段 2 新增（compiler/lexer.tie 解析字符字面量
+            // 需要「字符 → 码点」的精确值，tie 内无字节访问原语无法自行计算）。
+            "char_code" => {
+                if args.len() != 1 {
+                    return Err("char_code 需要一个字符串参数".into());
+                }
+                let Value::Str(s) = &args[0] else {
+                    return Err("char_code 需要一个字符串参数".into());
+                };
+                let p = CString::new(s.as_str()).unwrap_or_default();
+                Ok(Value::Int(tie_char_code(p.as_ptr())))
             }
             "to_string" => {
                 if args.len() != 1 {

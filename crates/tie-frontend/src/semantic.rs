@@ -1158,17 +1158,31 @@ impl Analyzer {
                 }
                 Ok(())
             }
-            Stmt::If(i) => {
-                let c = self.infer_expr(&i.cond, scope)?;
-                self.result.expr_types.insert(addr_of(&i.cond), c.clone());
-                if !is_bool_like(&c) {
-                    return Err(SemanticError {
-                        span: expr_span_of(&i.cond),
-                        message: "if 条件必须是 bool".into(),
-                    });
+            Stmt::If(first) => {
+                // else-if 链展开为迭代：`else if` 在 AST 中表现为 else_branch
+                // 是单条 `Stmt::If` 的嵌套（递归下降产物）。长链（自举编译器
+                // 判别链可达 40+ 层，如 compiler/lexer.tie 的 scan_ident 关键字表）
+                // 若递归 check_block 会导致调用栈溢出——改为循环逐个检查。
+                let mut cur = first;
+                loop {
+                    let c = self.infer_expr(&cur.cond, scope)?;
+                    self.result.expr_types.insert(addr_of(&cur.cond), c.clone());
+                    if !is_bool_like(&c) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&cur.cond),
+                            message: "if 条件必须是 bool".into(),
+                        });
+                    }
+                    self.check_block(&cur.then_branch, scope, ret_ty)?;
+                    // 单条 If 的 else 分支 = else-if 链的延续；否则是普通 else 块
+                    match cur.else_branch.as_slice() {
+                        [Stmt::If(next)] => cur = next,
+                        _ => {
+                            self.check_block(&cur.else_branch, scope, ret_ty)?;
+                            break;
+                        }
+                    }
                 }
-                self.check_block(&i.then_branch, scope, ret_ty)?;
-                self.check_block(&i.else_branch, scope, ret_ty)?;
                 Ok(())
             }
             Stmt::While(w) => {
@@ -2292,6 +2306,27 @@ impl Analyzer {
                         });
                     }
                     return Ok(TypeSpec::Named(TyKw::Str));
+                }
+                // 内置函数 char_code（自举阶段 2 新增）：单字符串参数，
+                // 返回首字符的 Unicode 标量值（i64，UTF-32 码点；空串返回 -1）。
+                // tie 语言编译器（compiler/lexer.tie）解析字符字面量需要
+                // 「字符 → 码点」的精确值，tie 内无字节访问原语无法自行计算。
+                if name == "char_code" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("char_code() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let st = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), st.clone());
+                    if !matches!(&st, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("char_code() 第 1 个参数必须是字符串，实际是 {}", type_name(&st)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::I64));
                 }
                 // ---------- P1 正则表达式内置函数 ----------
                 //

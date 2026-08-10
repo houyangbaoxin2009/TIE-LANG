@@ -1,0 +1,1049 @@
+// tie:library
+// compiler/lexer.tie：词法分析器（tie 语言自写，自举阶段 2 模块 1）
+//
+// 入口：lexer.tokenize(src) -> TOKENS 协议文本（见 compiler/PROTOCOL.md §3）
+// 行为与 Rust 版 crates/tie-frontend/src/lexer.rs 逐条对齐：
+//   - 字符扫描 / 行号列号（从 1 开始）
+//   - ASI 自动分号补全（行尾可结束集合 + 括号深度）
+//   - 注释（行注释 // 与块注释 /* */）
+//   - 字符串 / 字符字面量转义（\n \t \r \\ \" \' \0）
+//   - 数字（十进制 / 0x / 0b / 0o / 0t 进制 + 浮点指数 + 1..10 不误判）
+//   - 符号（三字符 <<= >>= / 双字符 / 单字符）
+//   - 关键字与类型关键字全量识别
+//
+// 设计约束（interp eval 注册，不能 import，自包含）：
+//   - 状态用模块级全局变量（顶层 var，tokenize 每次调用重置）；
+//   - 错误用全局 lex_err 标志（tie 无异常），主循环检测后返回 ERR 协议；
+//   - parse_int/parse_float 原语对非法输入报错，十进制/进制整数自实现
+//     防御性解析（溢出/非法回退 0，与 Rust unwrap_or(0) 一致）；浮点文本
+//     由 scan_number 保证合法，可安全用 parse_float（C 桥，精度与 Rust 版一致）；
+//   - 字符分类：ASCII 用字符串比较；多字节字符（中文等）按 Rust
+//     is_alphabetic/is_alphanumeric 视为字母/字母数字（len(c) > 1）。
+//   - 字符字面量的码点值用 char_code 原语（自举阶段 2 新增的语言底座原语，
+//     interp/IR 双路径走 C ABI 桥，空串返回 -1）——tie 内无字节访问原语，
+//     无法自行解码 UTF-8 求码点，这正是清扫掉的语言障碍（PROTOCOL.md §5）。
+
+// ==================== 全局状态（interp 注册时初始化，tokenize 重置） ====================
+// 注意：tie 语义层限制全局变量必须是标量类型（i8..u64/f32/f64/bool/char/string）——
+// 表不能作全局变量。因此 token 流不存表，而是**每产生一个 token 立即追加一行
+// 协议文本到全局字符串 lex_proto**（协议行本身就是 token 的字符串表示），
+// tokenize 结束时原样返回；token 计数用 lex_count 标量。后续 parser 阶段再
+// 解析协议文本还原为表（局部表不受限制）。
+
+var lex_src: string = ""      // 当前源码
+var lex_len: i64 = 0          // 源码码点数（str_len 语义）
+var lex_pos: i64 = 0          // 当前码点位置
+var lex_line: i64 = 1         // 当前行（从 1 开始）
+var lex_col: i64 = 1          // 当前列（从 1 开始）
+var lex_has_tok: bool = false // 当前行是否已产生 token（ASI 判定）
+var lex_last_kind: i64 = -1   // 行尾最后一个 token 种类（ASI 判定）
+var lex_depth: i64 = 0        // 括号深度（( 与 [ 计数）
+var lex_err: string = ""      // 错误消息（空 = 无错）
+var lex_err_line: i64 = 0     // 错误行
+var lex_err_col: i64 = 0      // 错误列
+var lex_proto: string = ""    // 协议文本累积（每行一个 token，见 PROTOCOL.md §3）
+var lex_count: i64 = 0        // 已产生的 token 数（含 Eof）
+
+namespace lexer {
+
+// ==================== 字符分类（ASCII 比较 + 多字节兜底） ====================
+
+// ASCII 数字 '0'-'9'（Rust is_ascii_digit）
+func is_digit(c: string) -> bool {
+    if c >= "0" && c <= "9" {
+        return true
+    }
+    return false
+}
+
+// 十六进制数字：0-9 / a-f / A-F
+func is_hex(c: string) -> bool {
+    if c >= "0" && c <= "9" {
+        return true
+    }
+    if c >= "a" && c <= "f" {
+        return true
+    }
+    if c >= "A" && c <= "F" {
+        return true
+    }
+    return false
+}
+
+// 字母：ASCII 字母或任意多字节字符（Rust is_alphabetic 含 Unicode 字母，
+// tie 无法枚举 Unicode 字母表，用「非 ASCII（len > 1）」兜底，与中文标识符行为一致）
+func is_alpha(c: string) -> bool {
+    if c >= "a" && c <= "z" {
+        return true
+    }
+    if c >= "A" && c <= "Z" {
+        return true
+    }
+    if len(c) > 1 {
+        return true
+    }
+    return false
+}
+
+// 字母数字：is_alpha 或 ASCII 数字（Rust is_alphanumeric）
+func is_alnum(c: string) -> bool {
+    if is_alpha(c) {
+        return true
+    }
+    if is_digit(c) {
+        return true
+    }
+    return false
+}
+
+// 单字符在字符串中的下标（自实现 find，不能 import std/string.tie）；未找到返回 -1
+func find_char(s: string, c: string) -> i64 {
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == c {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 字符串中是否含字符 e/E（scan_number 指数去重用）
+func has_e(s: string) -> bool {
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "e" || c == "E" {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ==================== 基础工具 ====================
+
+// 字符串字段转义（自举阶段 2 清扫的 C 边界障碍）：
+// 协议文本经 eval_call 的 C ABI 桥（tie_eval_call → CString）返回，字符串
+// 含真实 \0（源码 `"\0"` 字面量解码后）会被 CString 截断 → 调用方拿到空串。
+// 故协议中字符串字段一律**转义表示**：\n \t \r \\ \" \' \0 转为两个字符的
+// 可打印文本（\\n 等），其余字符原样——协议文本纯可打印、跨 C 边界安全、
+// 可调试；parser 端用 unescape_str 还原（PROTOCOL.md §3）。
+func escape_str(s: string) -> string {
+    var out: string = ""
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "\n" {
+            out = out + "\\n"
+        } else if c == "\t" {
+            out = out + "\\t"
+        } else if c == "\r" {
+            out = out + "\\r"
+        } else if c == "\\" {
+            out = out + "\\\\"
+        } else if c == "\"" {
+            out = out + "\\\""
+        } else if c == "'" {
+            out = out + "\\'"
+        } else if c == "\0" {
+            out = out + "\\0"
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 记录错误（首次错误保留；tie 无异常，靠全局标志 + 主循环 break 传播）
+func set_err(msg: string, line: i64, col: i64) {
+    if lex_err == "" {
+        lex_err = msg
+        lex_err_line = line
+        lex_err_col = col
+    }
+}
+
+// 消费当前字符并推进行列号（EOF 时空操作）
+func consume() {
+    var c = str_char(lex_src, lex_pos)
+    if c == "" {
+        return
+    }
+    lex_pos = lex_pos + 1
+    if c == "\n" {
+        lex_line = lex_line + 1
+        lex_col = 1
+    } else {
+        lex_col = lex_col + 1
+    }
+}
+
+// 记录一个 token：更新 ASI 状态 + 追加一行协议文本（PROTOCOL.md §3）
+func push_token(kind: i64, line: i64, col: i64, nval: i64, fval: f64, sval: string) {
+    lex_has_tok = true
+    // 括号深度：只统计 ( 与 [；{ } 是块边界，不参与换行补分号判定
+    if kind == 52 {
+        lex_depth = lex_depth + 1
+    }
+    if kind == 56 {
+        lex_depth = lex_depth + 1
+    }
+    if kind == 53 {
+        if lex_depth > 0 {
+            lex_depth = lex_depth - 1
+        }
+    }
+    if kind == 57 {
+        if lex_depth > 0 {
+            lex_depth = lex_depth - 1
+        }
+    }
+    lex_last_kind = kind
+    // 协议行：kind line col num float slen str（slen = 字符串码点数，长度前缀承载任意字符）
+    // 字符串字段转义表示（escape_str）：含真实 \0/换行等的字符串跨 C ABI 桥会被
+    // CString 截断，转义为可打印文本后协议文本纯安全（parser 端 unescape_str 还原）。
+    lex_proto = lex_proto + to_string(kind) + " " + to_string(line) + " " +
+                to_string(col) + " " + to_string(nval) + " " + to_string(fval) + " " +
+                to_string(str_len(sval)) + " " + escape_str(sval) + "\n"
+    lex_count = lex_count + 1
+}
+
+// 行尾 token 是否属「可结束语句」集合（ASI 补分号判定）
+// 排除集合：二元运算符（is_bin_op）、逗号/冒号/双冒号/点/范围/开括号/大括号/分号/else/in
+func should_insert_semi(kind: i64) -> bool {
+    if is_bin_op(kind) {
+        return false
+    }
+    if kind == 58 {
+        return false
+    } // Comma
+    if kind == 59 {
+        return false
+    } // Colon
+    if kind == 60 {
+        return false
+    } // DoubleColon
+    if kind == 62 {
+        return false
+    } // Dot
+    if kind == 63 {
+        return false
+    } // DotDot
+    if kind == 52 {
+        return false
+    } // LParen
+    if kind == 56 {
+        return false
+    } // LBracket
+    if kind == 54 {
+        return false
+    } // LBrace
+    if kind == 55 {
+        return false
+    } // RBrace
+    if kind == 61 {
+        return false
+    } // Semi
+    if kind == 9 {
+        return false
+    } // Else
+    if kind == 12 {
+        return false
+    } // In
+    return true
+}
+
+// 是否为二元运算符（ASI：行尾是运算符 → 语句未结束，不补分号）。
+// 自增自减 ++/-- 特意不加入（后缀 i++ 行尾应结束语句补分号，M4 语义）。
+func is_bin_op(kind: i64) -> bool {
+    // 算术 + - * / %
+    if kind == 65 {
+        return true
+    }
+    if kind == 66 {
+        return true
+    }
+    if kind == 67 {
+        return true
+    }
+    if kind == 68 {
+        return true
+    }
+    if kind == 69 {
+        return true
+    }
+    // 比较 == != < > <= >=
+    if kind == 71 {
+        return true
+    }
+    if kind == 72 {
+        return true
+    }
+    if kind == 73 {
+        return true
+    }
+    if kind == 74 {
+        return true
+    }
+    if kind == 75 {
+        return true
+    }
+    if kind == 76 {
+        return true
+    }
+    // 逻辑 && ||
+    if kind == 77 {
+        return true
+    }
+    if kind == 78 {
+        return true
+    }
+    // 赋值 = 与复合赋值 += -= *= /= %= &= |= ^= <<= >>=
+    if kind == 70 {
+        return true
+    }
+    if kind == 80 {
+        return true
+    }
+    if kind == 81 {
+        return true
+    }
+    if kind == 82 {
+        return true
+    }
+    if kind == 83 {
+        return true
+    }
+    if kind == 84 {
+        return true
+    }
+    if kind == 85 {
+        return true
+    }
+    if kind == 86 {
+        return true
+    }
+    if kind == 87 {
+        return true
+    }
+    if kind == 88 {
+        return true
+    }
+    if kind == 89 {
+        return true
+    }
+    // 位运算 & | ^ << >>
+    if kind == 90 {
+        return true
+    }
+    if kind == 91 {
+        return true
+    }
+    if kind == 92 {
+        return true
+    }
+    if kind == 93 {
+        return true
+    }
+    if kind == 94 {
+        return true
+    }
+    // 三目 ?（M4）
+    if kind == 97 {
+        return true
+    }
+    return false
+}
+
+// 处理行尾：按 ASI 规则决定是否补分号，并重置行内状态（对应 Rust finish_line）
+func finish_line() {
+    if lex_has_tok && lex_depth == 0 {
+        if lex_last_kind >= 0 && should_insert_semi(lex_last_kind) {
+            // 补出的分号位于下一行行首（finish_line 在消费换行后执行）
+            push_token(61, lex_line, lex_col, 0, 0.0, "") // Semi
+        }
+    }
+    lex_has_tok = false
+    lex_last_kind = -1
+}
+
+// ==================== 各 token 扫描 ====================
+
+// 行注释 // ...（不产生 token）
+func scan_line_comment() {
+    consume() // '/'
+    consume() // '/'
+    var c = str_char(lex_src, lex_pos)
+    while c != "" && c != "\n" {
+        consume()
+        c = str_char(lex_src, lex_pos)
+    }
+}
+
+// 块注释 /* ... */（不产生 token；未闭合报错）
+func scan_block_comment() {
+    var line = lex_line
+    var col = lex_col
+    consume() // '/'
+    consume() // '*'
+    var closed = false
+    while !closed {
+        var c = str_char(lex_src, lex_pos)
+        if c == "" {
+            set_err("块注释未闭合", line, col)
+            return
+        }
+        // 找到 * 且下一个是 / → 闭合
+        if c == "*" && str_char(lex_src, lex_pos + 1) == "/" {
+            consume()
+            consume()
+            closed = true
+        } else {
+            consume()
+        }
+    }
+}
+
+// 字符串字面量（支持 \n \t \r \\ \" \' \0 转义）
+func scan_string() {
+    var line = lex_line
+    var col = lex_col
+    consume() // 开引号
+    var s: string = ""
+    var done = false
+    while !done {
+        var c = str_char(lex_src, lex_pos)
+        if c == "" {
+            set_err("字符串未闭合", line, col)
+            return
+        }
+        if c == "\"" {
+            consume()
+            push_token(2, line, col, 0, 0.0, s) // Str
+            done = true
+        } else if c == "\\" {
+            consume()
+            var esc = str_char(lex_src, lex_pos)
+            if esc == "" {
+                set_err("转义符后缺少字符", line, col)
+                return
+            }
+            consume()
+            if esc == "n" {
+                s = s + "\n"
+            } else if esc == "t" {
+                s = s + "\t"
+            } else if esc == "r" {
+                s = s + "\r"
+            } else if esc == "\\" {
+                s = s + "\\"
+            } else if esc == "\"" {
+                s = s + "\""
+            } else if esc == "'" {
+                s = s + "'"
+            } else if esc == "0" {
+                s = s + "\0"
+            } else {
+                set_err("未知转义序列 \\" + esc, line, col)
+                return
+            }
+        } else {
+            s = s + c
+            consume()
+        }
+    }
+}
+
+// 字符字面量 'a' / '\n'（单引号包裹，恰好一个字符，支持转义）。
+// 码点值用 char_code 原语（C ABI 桥，UTF-32 标量，空串 -1）。
+func scan_char() {
+    var line = lex_line
+    var col = lex_col
+    consume() // 开引号
+    var ch: string = ""
+    var c = str_char(lex_src, lex_pos)
+    if c == "" {
+        set_err("字符字面量未闭合", line, col)
+        return
+    }
+    if c == "\\" {
+        consume()
+        var esc = str_char(lex_src, lex_pos)
+        if esc == "" {
+            set_err("转义符后缺少字符", line, col)
+            return
+        }
+        consume()
+        if esc == "n" {
+            ch = "\n"
+        } else if esc == "t" {
+            ch = "\t"
+        } else if esc == "r" {
+            ch = "\r"
+        } else if esc == "\\" {
+            ch = "\\"
+        } else if esc == "\"" {
+            ch = "\""
+        } else if esc == "'" {
+            ch = "'"
+        } else if esc == "0" {
+            ch = "\0"
+        } else {
+            set_err("未知转义序列 \\" + esc, line, col)
+            return
+        }
+    } else {
+        ch = c
+        consume()
+    }
+    // 闭合引号
+    var nc = str_char(lex_src, lex_pos)
+    if nc == "'" {
+        consume()
+        push_token(3, line, col, char_code(ch), 0.0, "") // CharLit（Unicode 标量）
+    } else if nc == "" {
+        set_err("字符字面量未闭合", line, col)
+    } else {
+        set_err("字符字面量只能包含一个字符", line, col)
+    }
+}
+
+// ==================== 数字扫描 ====================
+
+// 十进制整数防御解析（Rust s.parse::<i64>().unwrap_or(0)）：
+// 非法字符 / 溢出 → 回退 0（parse_int 原语会报错，这里自实现）
+func parse_dec(s: string) -> i64 {
+    var result: i64 = 0
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c < "0" || c > "9" {
+            return 0
+        }
+        var d = find_char("0123456789", c)
+        if d < 0 {
+            return 0
+        }
+        if result > (9223372036854775807 - d) / 10 {
+            return 0
+        }
+        result = result * 10 + d
+        i = i + 1
+    }
+    return result
+}
+
+// 按进制解析整数字面量文本（2/3/8/16，含 a-f/A-F；非法/溢出回退 0）——
+// 与 Rust parse_radix 语义一致（自实现，parse_int 原语对非法输入报错不可用）
+func parse_radix(s: string, radix: i64) -> i64 {
+    var result: i64 = 0
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        var digit: i64 = -1
+        var dpos = find_char("0123456789abcdef", c)
+        if dpos >= 0 {
+            digit = dpos
+        } else {
+            dpos = find_char("ABCDEF", c)
+            if dpos >= 0 {
+                digit = 10 + dpos
+            }
+        }
+        if digit < 0 {
+            return 0
+        }
+        if digit >= radix {
+            return 0
+        }
+        if result > (9223372036854775807 - digit) / radix {
+            return 0
+        }
+        result = result * radix + digit
+        i = i + 1
+    }
+    return result
+}
+
+// 数字字面量：整数（十进制/十六进制/二进制/八进制/三进制）或浮点数（含小数点与指数）。
+// 行为与 Rust scan_number 逐条对齐（进制前缀、1..10 不误判、指数去重）。
+func scan_number() {
+    var line = lex_line
+    var col = lex_col
+    var txt: string = ""
+    var is_float = false
+    var scanning = true
+    while scanning {
+        var c = str_char(lex_src, lex_pos)
+        if is_digit(c) {
+            txt = txt + c
+            consume()
+        } else if c == "." && !is_float {
+            // 仅当下一个字符也是数字时视作小数（避免 1..10 中的 ..）
+            var next = str_char(lex_src, lex_pos + 1)
+            if is_digit(next) {
+                is_float = true
+                txt = txt + c
+                consume()
+            } else {
+                scanning = false
+            }
+        } else if (c == "e" || c == "E") && !has_e(txt) {
+            // 指数：1e5 / 1.5e-3——e/E 后（可带符号）必须是数字才收
+            var ahead = lex_pos + 1
+            var ac = str_char(lex_src, ahead)
+            var sign = false
+            if ac == "-" || ac == "+" {
+                sign = true
+                ahead = ahead + 1
+                ac = str_char(lex_src, ahead)
+            }
+            if is_digit(ac) {
+                is_float = true
+                txt = txt + c
+                consume()
+                if sign {
+                    txt = txt + str_char(lex_src, lex_pos)
+                    consume()
+                }
+                var d = str_char(lex_src, lex_pos)
+                while is_digit(d) {
+                    txt = txt + d
+                    consume()
+                    d = str_char(lex_src, lex_pos)
+                }
+            }
+            scanning = false
+        } else {
+            scanning = false
+        }
+    }
+    // 进制前缀处理（主循环收齐后判断）：txt == "0" 且下一字符是 x/b/o/t
+    var radix: i64 = 10
+    if txt == "0" {
+        var nc = str_char(lex_src, lex_pos)
+        if nc == "x" || nc == "X" {
+            consume() // 吃掉 'x'
+            radix = 16
+            var d = str_char(lex_src, lex_pos)
+            while is_hex(d) {
+                txt = txt + d
+                consume()
+                d = str_char(lex_src, lex_pos)
+            }
+        } else if nc == "b" || nc == "B" {
+            consume() // 吃掉 'b'
+            radix = 2
+            var d = str_char(lex_src, lex_pos)
+            while is_digit(d) && d <= "1" {
+                txt = txt + d
+                consume()
+                d = str_char(lex_src, lex_pos)
+            }
+        } else if nc == "o" || nc == "O" {
+            consume() // 吃掉 'o'
+            radix = 8
+            var d = str_char(lex_src, lex_pos)
+            while is_digit(d) && d <= "7" {
+                txt = txt + d
+                consume()
+                d = str_char(lex_src, lex_pos)
+            }
+        } else if nc == "t" || nc == "T" {
+            consume() // 吃掉 't'
+            radix = 3
+            var d = str_char(lex_src, lex_pos)
+            while is_digit(d) && d <= "2" {
+                txt = txt + d
+                consume()
+                d = str_char(lex_src, lex_pos)
+            }
+        }
+    }
+    // 判定种类：浮点 / 进制整数 / 十进制整数
+    if is_float {
+        // 浮点文本由扫描保证合法（数字 + 可选.小数 + 可选e指数），
+        // parse_float 走 C ABI 桥与 Rust parse 精度一致，不会报错
+        push_token(1, line, col, 0, parse_float(txt), "") // Float
+    } else if radix != 10 {
+        push_token(0, line, col, parse_radix(txt, radix), 0.0, "") // Int
+    } else {
+        push_token(0, line, col, parse_dec(txt), 0.0, "") // Int
+    }
+}
+
+// ==================== 标识符 / 关键字 ====================
+
+// 标识符 / 关键字（全量关键字表与 Rust scan_ident 对齐）
+func scan_ident() {
+    var line = lex_line
+    var col = lex_col
+    var txt: string = ""
+    var c = str_char(lex_src, lex_pos)
+    while is_alnum(c) || c == "_" {
+        txt = txt + c
+        consume()
+        c = str_char(lex_src, lex_pos)
+    }
+    // 关键字识别（含类型关键字；非关键字为 Ident）
+    if txt == "func" {
+        push_token(5, line, col, 0, 0.0, "")
+    } else if txt == "var" {
+        push_token(6, line, col, 0, 0.0, "")
+    } else if txt == "const" {
+        push_token(7, line, col, 0, 0.0, "")
+    } else if txt == "if" {
+        push_token(8, line, col, 0, 0.0, "")
+    } else if txt == "else" {
+        push_token(9, line, col, 0, 0.0, "")
+    } else if txt == "while" {
+        push_token(10, line, col, 0, 0.0, "")
+    } else if txt == "for" {
+        push_token(11, line, col, 0, 0.0, "")
+    } else if txt == "in" {
+        push_token(12, line, col, 0, 0.0, "")
+    } else if txt == "return" {
+        push_token(13, line, col, 0, 0.0, "")
+    } else if txt == "break" {
+        push_token(14, line, col, 0, 0.0, "")
+    } else if txt == "continue" {
+        push_token(15, line, col, 0, 0.0, "")
+    } else if txt == "switch" {
+        push_token(16, line, col, 0, 0.0, "")
+    } else if txt == "case" {
+        push_token(17, line, col, 0, 0.0, "")
+    } else if txt == "default" {
+        push_token(18, line, col, 0, 0.0, "")
+    } else if txt == "when" {
+        push_token(19, line, col, 0, 0.0, "")
+    } else if txt == "import" {
+        push_token(20, line, col, 0, 0.0, "")
+    } else if txt == "as" {
+        push_token(21, line, col, 0, 0.0, "")
+    } else if txt == "struct" {
+        push_token(22, line, col, 0, 0.0, "")
+    } else if txt == "extends" {
+        push_token(23, line, col, 0, 0.0, "")
+    } else if txt == "namespace" {
+        push_token(24, line, col, 0, 0.0, "")
+    } else if txt == "pub" {
+        push_token(25, line, col, 0, 0.0, "")
+    } else if txt == "using" {
+        push_token(26, line, col, 0, 0.0, "")
+    } else if txt == "true" {
+        push_token(27, line, col, 0, 0.0, "")
+    } else if txt == "false" {
+        push_token(28, line, col, 0, 0.0, "")
+    } else if txt == "zero" {
+        push_token(29, line, col, 0, 0.0, "")
+    } else if txt == "i8" {
+        push_token(30, line, col, 0, 0.0, "")
+    } else if txt == "i16" {
+        push_token(31, line, col, 0, 0.0, "")
+    } else if txt == "i32" {
+        push_token(32, line, col, 0, 0.0, "")
+    } else if txt == "i64" {
+        push_token(33, line, col, 0, 0.0, "")
+    } else if txt == "u8" {
+        push_token(34, line, col, 0, 0.0, "")
+    } else if txt == "u16" {
+        push_token(35, line, col, 0, 0.0, "")
+    } else if txt == "u32" {
+        push_token(36, line, col, 0, 0.0, "")
+    } else if txt == "u64" {
+        push_token(37, line, col, 0, 0.0, "")
+    } else if txt == "f32" {
+        push_token(38, line, col, 0, 0.0, "")
+    } else if txt == "f64" {
+        push_token(39, line, col, 0, 0.0, "")
+    } else if txt == "bool" {
+        push_token(40, line, col, 0, 0.0, "")
+    } else if txt == "trit" {
+        push_token(41, line, col, 0, 0.0, "")
+    } else if txt == "char" {
+        push_token(42, line, col, 0, 0.0, "")
+    } else if txt == "string" {
+        push_token(43, line, col, 0, 0.0, "")
+    } else if txt == "void" {
+        push_token(44, line, col, 0, 0.0, "")
+    } else if txt == "code" {
+        push_token(45, line, col, 0, 0.0, "")
+    } else if txt == "num" {
+        push_token(46, line, col, 0, 0.0, "")
+    } else if txt == "text" {
+        push_token(47, line, col, 0, 0.0, "")
+    } else if txt == "misc" {
+        push_token(48, line, col, 0, 0.0, "")
+    } else if txt == "table" {
+        push_token(49, line, col, 0, 0.0, "")
+    } else if txt == "map" {
+        push_token(50, line, col, 0, 0.0, "")
+    } else {
+        push_token(4, line, col, 0, 0.0, txt) // Ident
+    }
+}
+
+// ==================== 符号扫描 ====================
+
+// 符号：三字符（<<= >>=）/ 双字符 / 单字符（编号见 PROTOCOL.md §2.4）
+func scan_symbol() {
+    var line = lex_line
+    var col = lex_col
+    var c = str_char(lex_src, lex_pos)
+    if c == "" {
+        return
+    }
+    var next = str_char(lex_src, lex_pos + 1)
+    // 三字符移位复合赋值 <<= >>=（与双字符移位拆开，避免 << 先命中）
+    if (c == "<" && next == "<") || (c == ">" && next == ">") {
+        consume() // 消费第一个 < / >
+        consume() // 消费第二个 < / >
+        var third = str_char(lex_src, lex_pos)
+        if third == "=" {
+            consume()
+            if c == "<" {
+                push_token(88, line, col, 0, 0.0, "") // ShlEq
+            } else {
+                push_token(89, line, col, 0, 0.0, "") // ShrEq
+            }
+        } else if c == "<" {
+            push_token(93, line, col, 0, 0.0, "") // Shl
+        } else {
+            push_token(94, line, col, 0, 0.0, "") // Shr
+        }
+        return
+    }
+    // 双字符符号
+    if c == "=" && next == "=" {
+        consume()
+        consume()
+        push_token(71, line, col, 0, 0.0, "") // EqEq
+        return
+    }
+    if c == "!" && next == "=" {
+        consume()
+        consume()
+        push_token(72, line, col, 0, 0.0, "") // NotEq
+        return
+    }
+    if c == "<" && next == "=" {
+        consume()
+        consume()
+        push_token(75, line, col, 0, 0.0, "") // Le
+        return
+    }
+    if c == ">" && next == "=" {
+        consume()
+        consume()
+        push_token(76, line, col, 0, 0.0, "") // Ge
+        return
+    }
+    if c == "&" && next == "&" {
+        consume()
+        consume()
+        push_token(77, line, col, 0, 0.0, "") // AndAnd
+        return
+    }
+    if c == "|" && next == "|" {
+        consume()
+        consume()
+        push_token(78, line, col, 0, 0.0, "") // OrOr
+        return
+    }
+    if c == "." && next == "." {
+        consume()
+        consume()
+        push_token(63, line, col, 0, 0.0, "") // DotDot
+        return
+    }
+    if c == "-" && next == ">" {
+        consume()
+        consume()
+        push_token(64, line, col, 0, 0.0, "") // Arrow
+        return
+    }
+    if c == ":" && next == ":" {
+        consume()
+        consume()
+        push_token(60, line, col, 0, 0.0, "") // DoubleColon
+        return
+    }
+    if c == "+" && next == "=" {
+        consume()
+        consume()
+        push_token(80, line, col, 0, 0.0, "") // PlusEq
+        return
+    }
+    if c == "-" && next == "=" {
+        consume()
+        consume()
+        push_token(81, line, col, 0, 0.0, "") // MinusEq
+        return
+    }
+    if c == "*" && next == "=" {
+        consume()
+        consume()
+        push_token(82, line, col, 0, 0.0, "") // StarEq
+        return
+    }
+    if c == "/" && next == "=" {
+        consume()
+        consume()
+        push_token(83, line, col, 0, 0.0, "") // SlashEq
+        return
+    }
+    if c == "%" && next == "=" {
+        consume()
+        consume()
+        push_token(84, line, col, 0, 0.0, "") // PercentEq
+        return
+    }
+    if c == "&" && next == "=" {
+        consume()
+        consume()
+        push_token(85, line, col, 0, 0.0, "") // AmpEq
+        return
+    }
+    if c == "|" && next == "=" {
+        consume()
+        consume()
+        push_token(86, line, col, 0, 0.0, "") // PipeEq
+        return
+    }
+    if c == "^" && next == "=" {
+        consume()
+        consume()
+        push_token(87, line, col, 0, 0.0, "") // CaretEq
+        return
+    }
+    if c == "+" && next == "+" {
+        consume()
+        consume()
+        push_token(95, line, col, 0, 0.0, "") // Inc
+        return
+    }
+    if c == "-" && next == "-" {
+        consume()
+        consume()
+        push_token(96, line, col, 0, 0.0, "") // Dec
+        return
+    }
+    // 单字符符号
+    consume()
+    if c == "(" {
+        push_token(52, line, col, 0, 0.0, "")
+    } else if c == ")" {
+        push_token(53, line, col, 0, 0.0, "")
+    } else if c == "{" {
+        push_token(54, line, col, 0, 0.0, "")
+    } else if c == "}" {
+        push_token(55, line, col, 0, 0.0, "")
+    } else if c == "[" {
+        push_token(56, line, col, 0, 0.0, "")
+    } else if c == "]" {
+        push_token(57, line, col, 0, 0.0, "")
+    } else if c == "," {
+        push_token(58, line, col, 0, 0.0, "")
+    } else if c == ":" {
+        push_token(59, line, col, 0, 0.0, "")
+    } else if c == ";" {
+        push_token(61, line, col, 0, 0.0, "")
+    } else if c == "." {
+        push_token(62, line, col, 0, 0.0, "")
+    } else if c == "+" {
+        push_token(65, line, col, 0, 0.0, "")
+    } else if c == "-" {
+        push_token(66, line, col, 0, 0.0, "")
+    } else if c == "*" {
+        push_token(67, line, col, 0, 0.0, "")
+    } else if c == "/" {
+        push_token(68, line, col, 0, 0.0, "")
+    } else if c == "%" {
+        push_token(69, line, col, 0, 0.0, "")
+    } else if c == "=" {
+        push_token(70, line, col, 0, 0.0, "")
+    } else if c == "<" {
+        push_token(73, line, col, 0, 0.0, "")
+    } else if c == ">" {
+        push_token(74, line, col, 0, 0.0, "")
+    } else if c == "!" {
+        push_token(79, line, col, 0, 0.0, "") // Bang
+    } else if c == "&" {
+        push_token(90, line, col, 0, 0.0, "") // Amp
+    } else if c == "|" {
+        push_token(91, line, col, 0, 0.0, "") // Pipe
+    } else if c == "^" {
+        push_token(92, line, col, 0, 0.0, "") // Caret
+    } else if c == "?" {
+        push_token(97, line, col, 0, 0.0, "") // Question
+    } else {
+        set_err("无法识别的字符 '" + c + "'", line, col)
+    }
+}
+
+// ==================== 主入口 ====================
+
+// 重置全局状态（tokenize 每次调用都必须重置）
+func reset_state(src: string) {
+    lex_src = src
+    lex_len = str_len(src)
+    lex_pos = 0
+    lex_line = 1
+    lex_col = 1
+    lex_has_tok = false
+    lex_last_kind = -1
+    lex_depth = 0
+    lex_err = ""
+    lex_err_line = 0
+    lex_err_col = 0
+    lex_proto = ""
+    lex_count = 0
+}
+
+// 词法分析入口：源码 → TOKENS 协议文本（成功）或 ERR 文本（出错）
+func tokenize(src: string) -> string {
+    reset_state(src)
+    var scanning = true
+    while scanning && lex_err == "" {
+        var c = str_char(lex_src, lex_pos)
+        if c == "" {
+            scanning = false
+        } else if c == "\n" {
+            consume()
+            finish_line()
+        } else if c == " " || c == "\t" || c == "\r" {
+            consume()
+        } else if c == "/" && str_char(lex_src, lex_pos + 1) == "/" {
+            scan_line_comment()
+        } else if c == "/" && str_char(lex_src, lex_pos + 1) == "*" {
+            scan_block_comment()
+        } else if c == "\"" {
+            scan_string()
+        } else if c == "'" {
+            scan_char()
+        } else if is_digit(c) {
+            scan_number()
+        } else if is_alpha(c) || c == "_" {
+            scan_ident()
+        } else {
+            scan_symbol()
+        }
+    }
+    // 文件末尾补 Eof（出错时也补，保证协议结构；错误信息优先返回）
+    push_token(98, lex_line, lex_col, 0, 0.0, "") // Eof
+    // 错误优先
+    if lex_err != "" {
+        return "ERR:" + to_string(lex_err_line) + " " + to_string(lex_err_col) + " " + lex_err
+    }
+    // 组装协议文本：首行 TOKENS:<n>，其后是已累积的逐行协议
+    return "TOKENS:" + to_string(lex_count) + "\n" + lex_proto
+}
+
+}

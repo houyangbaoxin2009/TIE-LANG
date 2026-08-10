@@ -219,6 +219,10 @@ impl<'p> IrGenerator<'p> {
         if self.used_externs.iter().any(|s| s == "tie_str_char") {
             self.out.push_str("declare ptr @tie_str_char(ptr, i64)\n");
         }
+        // char_code（自举阶段 2 新增）：首字符 → Unicode 标量（i64，UTF-32 码点）。
+        if self.used_externs.iter().any(|s| s == "tie_char_code") {
+            self.out.push_str("declare i64 @tie_char_code(ptr)\n");
+        }
         if self.used_externs.iter().any(|s| s == "tie_str_len") {
             self.out.push_str("declare i64 @tie_str_len(ptr)\n");
         }
@@ -3022,6 +3026,15 @@ impl<'p> IrGenerator<'p> {
             let tmp = self.new_reg();
             self.line(&format!("{tmp} = call ptr @tie_str_char(ptr {s}, i64 {i64})"));
             return Ok((tmp, "ptr"));
+        }
+        // 内置 char_code（自举阶段 2 新增）：字符串首字符 → Unicode 标量（i64）。
+        // 走 C ABI 桥（Rust chars().next() 解码），空串返回 -1，两路径一致。
+        if name == "char_code" {
+            self.mark_used("tie_char_code");
+            let (s, _t) = self.gen_expr(&args[0])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call i64 @tie_char_code(ptr {s})"));
+            return Ok((tmp, "i64"));
         }
         // 内置 to_string：单数字参数（i64/f64），返回 string（数字格式化）。
         // 按实参类型分派 i64/f64 桥（与解释路径一致）。
