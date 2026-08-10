@@ -735,20 +735,64 @@ pub extern "C" fn tie_table_set_ptr(t: *mut DynTable, i: i64, x: *mut DynTable, 
 // 键查找线性扫描（自举期符号表规模小；后续可换哈希——接口不变）。
 // 解释路径用 Value::Map(HashMap) 直接表达，行为一致（get/set/len）。
 
-/// 查找键的下标；不存在返回 -1（unsafe：t 必须是非空表指针）。
-unsafe fn map_find_index(t: *mut DynTable, key: *const c_char) -> i64 {
+/// C 字符串字节序比较（等价 C 库 strcmp；零分配）。
+///
+/// 逐字节按 unsigned char 比较，先分出大小者胜；均到 NUL 则相等。
+/// 安全：a/b 必须是 NUL 结尾的有效 C 字符串（键指针由 set 写入/调用方提供）。
+unsafe fn c_str_cmp(a: *const c_char, b: *const c_char) -> i32 {
+    let mut i = 0usize;
+    loop {
+        let ca = unsafe { *a.add(i) } as u8;
+        let cb = unsafe { *b.add(i) } as u8;
+        if ca != cb {
+            return ca as i32 - cb as i32;
+        }
+        if ca == 0 {
+            return 0;
+        }
+        i += 1;
+    }
+}
+
+/// 二分定位键：返回编码——>=0 为命中下标；<0 表示未命中，插入点 = -code - 1。
+///
+/// 键序约定：strcmp 字节序（C strcmp 语义），与表内「键恒有序」不变量一致。
+/// 零分配：比较直接用 C 指针 strcmp，不构造 Rust String（旧线性版每元素
+/// 一次 c_char_to_string 堆分配是本任务要消除的性能黑洞）。
+/// 安全：t 必须是非空表指针且 data 为有效缓冲区；key 必须非空。
+unsafe fn map_locate(t: *mut DynTable, key: *const c_char) -> i64 {
+    if key.is_null() {
+        // 空键视为不匹配（旧版 c_char_to_string(null) 也返回 Err 跳过）
+        return -1;
+    }
     let tbl = unsafe { &*t };
-    let key = unsafe { c_char_to_string(key) }.unwrap_or_default();
-    for i in 0..tbl.len {
-        let elem = unsafe { (tbl.data as *const u8).add((i as usize) * 16) };
+    let mut lo = 0i64;
+    let mut hi = tbl.len;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let elem = unsafe { (tbl.data as *const u8).add((mid as usize) * 16) };
         let kptr = unsafe { *(elem as *const *const c_char) };
-        if let Ok(ks) = unsafe { c_char_to_string(kptr) } {
-            if ks == key {
-                return i as i64;
-            }
+        if kptr.is_null() {
+            // 表内数据损坏的兜底：按未命中处理（不崩溃）
+            return -1;
+        }
+        let ord = unsafe { c_str_cmp(kptr, key) };
+        if ord < 0 {
+            lo = mid + 1;
+        } else if ord > 0 {
+            hi = mid;
+        } else {
+            return mid;
         }
     }
-    -1
+    // 未命中：lo 即第一个大于 key 的元素位置（插入点）
+    -lo - 1
+}
+
+/// 查找键的下标；不存在返回 -1（unsafe：t 必须是非空表指针）。
+unsafe fn map_find_index(t: *mut DynTable, key: *const c_char) -> i64 {
+    let code = unsafe { map_locate(t, key) };
+    if code >= 0 { code } else { -1 }
 }
 
 /// C ABI 桥：新建空键值表（等价 tie_table_new(16)）。
@@ -789,18 +833,25 @@ pub extern "C" fn tie_map_get_string(t: *mut DynTable, key: *const c_char, ok: *
     }
 }
 
-/// C ABI 桥：写入 i64 值。键存在 → 覆盖值；不存在 → 追加新元素。总成功置 ok=1。
+/// C ABI 桥：写入 i64 值。键存在 → 原位覆盖值；不存在 → 二分定位插入点，
+/// memmove 平移尾部元素腾位后写入（保持键恒有序）。总成功置 ok=1。
 #[unsafe(no_mangle)]
 pub extern "C" fn tie_map_set(t: *mut DynTable, key: *const c_char, val: i64, ok: *mut i8) {
     unsafe {
         let tbl = &mut *t;
-        let i = map_find_index(t, key);
-        if i >= 0 {
-            let elem = (tbl.data as *mut u8).add((i as usize) * 16);
+        let code = unsafe { map_locate(t, key) };
+        if code >= 0 {
+            // 命中：原位覆盖值
+            let elem = (tbl.data as *mut u8).add((code as usize) * 16);
             *(elem.add(8) as *mut i64) = val;
         } else {
+            // 未命中：插入点 pos = -code - 1（第一个大于 key 的元素位置）
+            let pos = -code - 1;
             dyn_table_grow(tbl);
-            let elem = (tbl.data as *mut u8).add((tbl.len as usize) * 16);
+            let base = tbl.data as *mut u8;
+            let elem = base.add((pos as usize) * 16);
+            // 把 [pos, len) 整体后移 16 字节（ptr::copy = memmove 语义，重叠安全）
+            std::ptr::copy(elem, elem.add(16), ((tbl.len - pos) as usize) * 16);
             *(elem as *mut *const c_char) = key;
             *(elem.add(8) as *mut i64) = val;
             tbl.len += 1;
@@ -809,7 +860,8 @@ pub extern "C" fn tie_map_set(t: *mut DynTable, key: *const c_char, val: i64, ok
     }
 }
 
-/// C ABI 桥：写入字符串值（存借用指针）。键存在 → 覆盖；不存在 → 追加。总成功置 ok=1。
+/// C ABI 桥：写入字符串值（存借用指针）。键存在 → 原位覆盖；不存在 →
+/// 二分定位插入点 + memmove 平移（保持键恒有序）。总成功置 ok=1。
 #[unsafe(no_mangle)]
 pub extern "C" fn tie_map_set_string(
     t: *mut DynTable,
@@ -819,13 +871,18 @@ pub extern "C" fn tie_map_set_string(
 ) {
     unsafe {
         let tbl = &mut *t;
-        let i = map_find_index(t, key);
-        if i >= 0 {
-            let elem = (tbl.data as *mut u8).add((i as usize) * 16);
+        let code = unsafe { map_locate(t, key) };
+        if code >= 0 {
+            // 命中：原位覆盖字符串指针
+            let elem = (tbl.data as *mut u8).add((code as usize) * 16);
             *(elem.add(8) as *mut *const c_char) = val;
         } else {
+            // 未命中：插入点 pos = -code - 1，平移后写入
+            let pos = -code - 1;
             dyn_table_grow(tbl);
-            let elem = (tbl.data as *mut u8).add((tbl.len as usize) * 16);
+            let base = tbl.data as *mut u8;
+            let elem = base.add((pos as usize) * 16);
+            std::ptr::copy(elem, elem.add(16), ((tbl.len - pos) as usize) * 16);
             *(elem as *mut *const c_char) = key;
             *(elem.add(8) as *mut *const c_char) = val;
             tbl.len += 1;
@@ -3828,14 +3885,20 @@ impl Value {
                 "[{}]",
                 cells.iter().map(|c| c.to_print_string()).collect::<Vec<_>>().join(", ")
             ),
-            // 键值表：输出键值集合（仅 REPL 展示）
-            Value::Map(m) => format!(
-                "{{{}}}",
-                m.iter()
-                    .map(|(k, v)| format!("{k}: {}", v.to_print_string()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+            // 键值表：输出键值集合（键排序——确定性；仅 REPL 展示）。
+            // T0.2 R1 修复：不再用 HashMap 随机迭代序（每次运行顺序不同，
+            // 破坏 G3 REPL parity），按键升序输出。
+            Value::Map(m) => {
+                let mut keys: Vec<&String> = m.keys().collect();
+                keys.sort();
+                format!(
+                    "{{{}}}",
+                    keys.iter()
+                        .map(|k| format!("{k}: {}", m[*k].to_print_string()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
             Value::Void => String::new(),
         }
     }
@@ -5387,5 +5450,139 @@ to_string(n) + ":" + names"#
         let _ = s.eval("g[0] = 9");
         assert_eq!(s.eval("g[0]").unwrap(), "9");
         assert_eq!(s.eval("len(g)").unwrap(), "2");
+    }
+
+    // ---------- T0.5：map 排序键二分（性能 + 确定性） ----------
+    // 设计：map 键恒按 strcmp 字节序有序存储；查找 = 二分（零分配，
+    // strcmp 直比 C 指针）；插入 = 二分定位 + memmove 平移。旧线性版
+    // 按插入序追加且每次比较都 c_char_to_string（堆分配）——以下
+    // map_插入后键恒有序 与 map_to_print_string键排序 两个测试在改前必红。
+
+    /// 测试辅助：读 DynTable 第 i 个元素的键字符串（表内部物理顺序）。
+    fn map_key_at(t: *mut DynTable, i: i64) -> String {
+        unsafe {
+            let tbl = &*t;
+            let elem = (tbl.data as *const u8).add((i as usize) * 16);
+            let kptr = *(elem as *const *const c_char);
+            CStr::from_ptr(kptr).to_str().unwrap().to_string()
+        }
+    }
+
+    #[test]
+    fn map_插入后键恒有序() {
+        // RED：插入序 z/a/m（乱序），二分版要求物理顺序 = 排序序 [a, m, z]；
+        // 旧线性版按插入序 [z, a, m] 存储 → 本测试在改前失败。
+        let t = tie_map_new();
+        let names = ["z", "a", "m"];
+        let cs: Vec<CString> = names.iter().map(|k| CString::new(*k).unwrap()).collect();
+        for (i, c) in cs.iter().enumerate() {
+            let mut ok: i8 = 0;
+            tie_map_set(t, c.as_ptr(), i as i64, &mut ok);
+            assert_eq!(ok, 1);
+        }
+        assert_eq!(tie_table_len(t), 3);
+        let got: Vec<String> = (0..tie_table_len(t)).map(|i| map_key_at(t, i)).collect();
+        assert_eq!(got, ["a", "m", "z"]);
+        tie_table_free(t);
+    }
+
+    #[test]
+    fn map_get全部键命中且值正确() {
+        // 行为契约：乱序插入后 get 对全部键命中（二分定位）且值正确。
+        let t = tie_map_new();
+        let pairs = [("z", 26i64), ("a", 1), ("m", 13), ("k", 11), ("b", 2)];
+        let cs: Vec<CString> = pairs.iter().map(|(k, _)| CString::new(*k).unwrap()).collect();
+        for ((_, v), c) in pairs.iter().zip(cs.iter()) {
+            let mut ok: i8 = 0;
+            tie_map_set(t, c.as_ptr(), *v, &mut ok);
+            assert_eq!(ok, 1);
+        }
+        for ((_, v), c) in pairs.iter().zip(cs.iter()) {
+            let mut ok: i8 = 0;
+            let got = tie_map_get(t, c.as_ptr(), &mut ok);
+            assert_eq!(ok, 1, "键应命中");
+            assert_eq!(got, *v);
+        }
+        tie_table_free(t);
+    }
+
+    #[test]
+    fn map缺失键ok0且set_string覆盖() {
+        // 行为契约：缺失键 get → ok=0 返回 0；set_string 命中覆盖字符串值。
+        let t = tie_map_new();
+        let k = CString::new("only").unwrap();
+        let mut ok: i8 = 0;
+        assert_eq!(tie_map_get(t, k.as_ptr(), &mut ok), 0);
+        assert_eq!(ok, 0);
+        // 缺失键写入后命中
+        tie_map_set(t, k.as_ptr(), 7, &mut ok);
+        assert_eq!(ok, 1);
+        let v1 = CString::new("v1").unwrap();
+        tie_map_set_string(t, k.as_ptr(), v1.as_ptr(), &mut ok);
+        assert_eq!(ok, 1);
+        let p = tie_map_get_string(t, k.as_ptr(), &mut ok);
+        assert_eq!(ok, 1);
+        assert_eq!(unsafe { CStr::from_ptr(p) }.to_str().unwrap(), "v1");
+        tie_table_free(t);
+    }
+
+    #[test]
+    fn map重复键覆盖且len不变() {
+        // 行为契约：相同键 set 两次 → 值为后者，表内无重复键（len 不变）。
+        let t = tie_map_new();
+        let k = CString::new("dup").unwrap();
+        let mut ok: i8 = 0;
+        tie_map_set(t, k.as_ptr(), 1, &mut ok);
+        tie_map_set(t, k.as_ptr(), 2, &mut ok);
+        assert_eq!(tie_table_len(t), 1);
+        assert_eq!(tie_map_get(t, k.as_ptr(), &mut ok), 2);
+        assert_eq!(ok, 1);
+        tie_table_free(t);
+    }
+
+    #[test]
+    fn map_to_print_string键排序() {
+        // RED（T0.2 R1）：Value::Map 打印按键排序（确定性），不再依赖
+        // HashMap 随机迭代序；REPL 展示稳定。
+        let mut m = std::collections::HashMap::new();
+        m.insert("z".to_string(), Value::Int(3));
+        m.insert("a".to_string(), Value::Int(1));
+        m.insert("m".to_string(), Value::Int(2));
+        assert_eq!(Value::Map(m).to_print_string(), "{a: 1, m: 2, z: 3}");
+    }
+
+    #[test]
+    fn bench_map_10k插入查找() {
+        // 性能验收：插入 10k 条 + 乱序查找 10k 次，输出查找总耗时。
+        // 改前（线性扫描 + 每元素 c_char_to_string 堆分配）为基线；
+        // 改后（二分 + strcmp 直比）应显著更快。耗时只输出不断言（防 flaky）。
+        unsafe {
+            let t = tie_map_new();
+            let n = 10_000usize;
+            // 插入：key 形如 k00000..k09999（有序键串）
+            let mut keys: Vec<CString> = Vec::with_capacity(n);
+            for i in 0..n {
+                let k = CString::new(format!("k{i:05}")).unwrap();
+                let mut ok: i8 = 0;
+                tie_map_set(t, k.as_ptr(), i as i64, &mut ok);
+                keys.push(k);
+            }
+            assert_eq!(tie_table_len(t), n as i64);
+            // 查找：固定步长跳转下标（乱序访问，规避缓存友好顺序）
+            let start = std::time::Instant::now();
+            for i in 0..n {
+                let idx = (i * 7919) % n;
+                let mut ok: i8 = 0;
+                let v = tie_map_get(t, keys[idx].as_ptr(), &mut ok);
+                assert_eq!(ok, 1);
+                assert_eq!(v, idx as i64);
+            }
+            let elapsed = start.elapsed();
+            println!(
+                "map 10k 次查找耗时: {elapsed:?}（{:.0} ns/次）",
+                elapsed.as_nanos() as f64 / n as f64
+            );
+            tie_table_free(t);
+        }
     }
 }

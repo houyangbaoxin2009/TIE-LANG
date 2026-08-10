@@ -1,0 +1,40 @@
+// tie:logic
+// T0.5 map 排序键二分基准脚本。
+//
+// 用法：tie scripts/bench/map-bench.tie（或 tie-llvm scripts/bench/map-bench.tie）
+//
+// 场景：编译器符号表规模——插入 10k 条键（k00000..k09999，乱序循环内的
+// 二分插入维持键有序），随后 200 轮 × 10k = 2M 次乱序查找。
+// 计时用 time_now()（Unix 秒，秒级粒度；精确微观对比见
+// crates/tie-interp 的 bench_map_10k插入查找 #[test]，std::time::Instant
+// 纳秒级：10k 次查找改前 ≈ 6.27s（线性 + 每元素 c_char_to_string 堆分配），
+// 改后 ≈ 2.7ms（二分 + strcmp 直比），约 2000×+）。
+func main() {
+    // 键值表：非空初始（空 map 字面量 [] 与空表字面量语法存在歧义，
+    // 与非空初始化等价，不改变行为契约）
+    var m: map = ["seed": 0]
+    // 插入 10k 条（二分插入 + memmove 平移，键保持 strcmp 有序）
+    var i = 0
+    while i < 10000 {
+        m["k" + to_string(i)] = i
+        i = i + 1
+    }
+    // 2M 次乱序查找（步长 7919 跳转下标，规避缓存友好顺序）
+    var hits = 0
+    var t0 = time_now()
+    var round = 0
+    while round < 200 {
+        i = 0
+        while i < 10000 {
+            var idx = (i * 7919) % 10000
+            hits = hits + m["k" + to_string(idx)]
+            i = i + 1
+        }
+        round = round + 1
+    }
+    var dt = time_now() - t0
+    // hits = 10000 条和 × 200 轮 = 9999000000 × 200 → i64 范围内
+    println("map-bench: 插入 10000 条 + 查找 200 万次")
+    println("hits=" + to_string(hits))
+    println("查找总耗时(秒)=" + to_string(dt))
+}
