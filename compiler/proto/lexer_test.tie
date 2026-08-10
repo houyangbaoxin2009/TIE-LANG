@@ -1,0 +1,124 @@
+// tie:logic
+// tie:opt=2
+// compiler/proto/lexer_test.tie —— T1.1 词法原型验收程序
+// ============================================================
+// 作用：
+//   1) 无参数运行：对内置样例 + examples/ + std/ + tests/language/ 下 16 个
+//      文件做 tokenize，断言 token 总数与 Rust tie-frontend --tokens 一致
+//      （期望值由 Rust 版实测硬编码，验收即回归基准），并抽样断言
+//      tag/位置/lexeme 正确。
+//   2) 带文件参数运行：lexer_test.exe <file> 打印该文件的 token 总数
+//      （首行与 Rust 同格式「共 N 个 token（含 Eof）:」）与逐 token 可读流，
+//      供对比脚本逐文件比对。
+// 编译运行：target/release/tie-llvm.exe compiler/proto/lexer_test.tie
+//           运行：compiler/proto/lexer_test.exe （从仓库根目录）
+// 全部断言通过输出「lexer 验收通过：16/16 文件 token 计数与 Rust 一致」。
+import "./lexer.tie"
+import "../../std/assert.tie"
+using lexer;
+using assert;
+
+// 内置样例的期望 token 数（含 Eof，Rust 实测）
+// 1) ASI 基础：语句行行尾补分号（var x = 42; var y = 8; = 10 token + Eof）
+var SRC1: string = "var x = 42\nvar y = 8\n"
+// 2) 行尾运算符不补分号（续行 a + / b）
+var SRC2: string = "a +\nb\n"
+// 3) 括号内换行不补分号 + 右括号行尾补
+var SRC3: string = "f(1,\n2)\n"
+// 4) 注释不产生 token（行注释/跨行块注释）
+var SRC4: string = "var x = 1 // 注释\n/* 块\n注释 */ y\n"
+// 5) 字符串转义 + 字符字面量 + 多进制数字 + 范围运算符
+var SRC5: string = "s = \"a\\nb\\tc\"\nc = '\\n'\nn = 0xFF\nr = 1..10\n"
+// 6) 关键字/类型关键字/整词边界（zero 保留字，tritx/i32x 是 Ident）
+var SRC6: string = "func f(x: i64) { return x }\nzero tritx i32x\n"
+
+func main() {
+    // ---------- 内置样例：token 总数断言（期望值 = Rust 实测）----------
+    lexer.tokenize(SRC1)
+    assert.assert_eq(lexer.token_count(), 11)
+    lexer.tokenize(SRC2)
+    assert.assert_eq(lexer.token_count(), 5)
+    lexer.tokenize(SRC3)
+    assert.assert_eq(lexer.token_count(), 8)
+    lexer.tokenize(SRC4)
+    assert.assert_eq(lexer.token_count(), 8)
+    lexer.tokenize(SRC5)
+    assert.assert_eq(lexer.token_count(), 19)
+    lexer.tokenize(SRC6)
+    assert.assert_eq(lexer.token_count(), 16)
+
+    // ---------- 抽样 token 正确性（tag/位置/lexeme 逐个断言）----------
+    // SRC1：var x = 42 ; var y = 8 ; Eof（ASI 分号在下一行行首）
+    lexer.tokenize(SRC1)
+    assert.assert_eq(lexer.token_tag(0), 6)
+    assert.assert_eq_str(lexer.token_lexeme(0), "var")
+    assert.assert_eq(lexer.token_tag(3), 0)
+    assert.assert_eq(lexer.token_tag(4), 42)
+    assert.assert_eq(lexer.token_line(4), 2)
+    assert.assert_eq(lexer.token_col(4), 1)
+    // SRC2：行尾 + 是二元运算符 → 不补分号，b 紧随其后
+    lexer.tokenize(SRC2)
+    assert.assert_eq(lexer.token_tag(1), 46)
+    assert.assert_eq(lexer.token_tag(2), 4)
+    // SRC3：括号内换行不补分号，右括号行尾补
+    lexer.tokenize(SRC3)
+    assert.assert_eq(lexer.token_tag(6), 42)
+    // SRC4：行注释后行尾补分号；块注释无 token
+    lexer.tokenize(SRC4)
+    assert.assert_eq(lexer.token_tag(4), 42)
+    assert.assert_eq_str(lexer.token_lexeme(5), "y")
+    // SRC5：字符串 lexeme 为原始切片（含引号与转义原样）；'0xFF' 单 token；1..10 拆三段
+    lexer.tokenize(SRC5)
+    assert.assert_eq_str(lexer.token_lexeme(2), "\"a\\nb\\tc\"")
+    assert.assert_eq(lexer.token_tag(6), 3)
+    assert.assert_eq(lexer.token_tag(10), 0)
+    assert.assert_eq(lexer.token_tag(15), 44)
+    // SRC6：关键字整词匹配（zero→30；tritx/i32x→Ident(4)）
+    lexer.tokenize(SRC6)
+    assert.assert_eq(lexer.token_tag(8), 13)
+    assert.assert_eq(lexer.token_tag(11), 30)
+    assert.assert_eq(lexer.token_tag(12), 4)
+    assert.assert_eq(lexer.token_tag(13), 4)
+
+    // ---------- 文件级 token 计数对比（期望值 = Rust tie-frontend --tokens 实测）----------
+    // 文件级走 run_lex（无协议序列化开销）——列式表即 parser 消费形态
+    var files: table<string> = ["examples/hello.tie", "examples/table.tie",
+        "examples/switch.tie", "examples/oop.tie", "examples/wide.tie",
+        "examples/char.tie", "examples/m4_ops.tie", "std/string.tie",
+        "std/assert.tie", "std/csv.tie", "std/sort.tie", "std/math.tie",
+        "std/intern.tie", "tests/language/byref_table.tie",
+        "tests/language/global_table.tie", "tests/language/intern.tie"]
+    var expect: table<i64> = [87, 49, 173, 363, 92, 38, 275, 1507, 192,
+        206, 1326, 593, 357, 139, 78, 305]
+    var n: i64 = len(files)
+    var i: i64 = 0
+    while i < n {
+        var src = file_read(files[i])
+        var ok = lexer.run_lex(src)
+        // 断言无词法错误
+        assert.assert(ok)
+        var got = lexer.token_count()
+        if got != expect[i] {
+            println("[" + files[i] + "] 期望 " + to_string(expect[i]) + " 实际 " + to_string(got))
+            assert.assert_eq(got, expect[i])
+        }
+        i = i + 1
+    }
+
+    // ---------- 带文件参数：打印单文件 token 数（与 Rust --tokens 首行同格式）----------
+    if arg_count() > 0 {
+        var path = arg_string(0)
+        var file_src = file_read(path)
+        lexer.run_lex(file_src)
+        println("共 " + to_string(lexer.token_count()) + " 个 token（含 Eof）:")
+        var k: i64 = 0
+        while k < lexer.token_count() {
+            println("  " + to_string(lexer.token_line(k)) + ":" + to_string(lexer.token_col(k))
+                + "  tag=" + to_string(lexer.token_tag(k)) + " '" + lexer.token_lexeme(k) + "'")
+            k = k + 1
+        }
+        return
+    }
+
+    println("lexer 验收通过：16/16 文件 token 计数与 Rust 一致")
+}

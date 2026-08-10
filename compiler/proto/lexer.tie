@@ -1,0 +1,1150 @@
+// tie:library
+// compiler/proto/lexer.tie —— 自举 v2 T1.1：用 tie 语言重写的词法分析原型
+// ============================================================
+// 里程碑：这是「用 tie 语言重写 tie 编译器」的第一行代码（自举 v2 计划 T1.1，
+// 见 .omo/plans/self-hosting-v2.md）。行为基准是 Rust 版
+// crates/tie-frontend/src/lexer.rs（tokenize 入口 + ASI 规则 + LexError）。
+//
+// 职责：源文本字符串 → **列式 token 表**（T0.4 全局表承载，下标对齐 = token 序号）：
+//   var tok_tags    : table<i64>    第 0 列：token 种类 tag（整数）
+//   var tok_lines   : table<i64>    第 1 列：起始行（1 起）
+//   var tok_cols    : table<i64>    第 2 列：起始列（1 起）
+//   var tok_lexemes : table<i64>    第 3 列：lexeme 的字符串池 id（T0.6 std/intern.tie）
+//
+// 分配敏感设计（G1 性能闸门前置）：
+//   - lexeme 统一存字符串池 id（intern(s)->i64），不逐 token 建堆串；
+//   - 源文本 → 码点表用 regex_find_all(src, "(?s).") 一次 O(N) 切分（替代
+//     str_char(s,i) 逐个取——其 chars().nth(i) 是 O(i)，整表扫是 O(N^2)）；
+//   - 列式 token 表全部 table_push O(1) 摊还；
+//   - 行/列号用「行起点表 + 二分」按位置反推，扫描器不沿途维护行列号。
+//
+// # tag 编号表（与 Rust TokenKind 枚举声明顺序严格对齐，供对比/分派）
+// 段 0-4 字面量： 0=Int 1=Float 2=Str 3=CharLit 4=Ident
+// 段 5-31 关键字：5=Func 6=Var 7=Const 8=If 9=Else 10=While 11=For 12=In
+//   13=Return 14=Break 15=Continue 16=Switch 17=Case 18=Default 19=When
+//   20=Import 21=As 22=Struct 23=Extends 24=Namespace 25=Pub 26=Using
+//   27=Extern 28=True 29=False 30=Zero 31=Ref
+// 32=TypeKw（类型关键字 bool/char/code/f32/f64/i8..u64/num/text/misc/string/
+//    table/map/trit/void —— 细分由 lexeme 文本区分，Rust 侧是单变体携带 TyKw）
+// 段 33-60 符号：33=LParen 34=RParen 35=LBrace 36=RBrace 37=LBracket
+//   38=RBracket 39=Comma 40=Colon 41=DoubleColon 42=Semi 43=Dot 44=DotDot
+//   45=Arrow 46=Plus 47=Minus 48=Star 49=Slash 50=Percent 51=Eq 52=EqEq
+//   53=NotEq 54=Lt 55=Gt 56=Le 57=Ge 58=AndAnd 59=OrOr 60=Bang
+// 段 61-78 M4 扩展：61=PlusEq 62=MinusEq 63=StarEq 64=SlashEq 65=PercentEq
+//   66=AmpEq 67=PipeEq 68=CaretEq 69=ShlEq 70=ShrEq 71=Amp 72=Pipe
+//   73=Caret 74=Shl 75=Shr 76=Inc 77=Dec 78=Question
+// 79=Eof
+//
+// # 关键字识别
+// 用「全局并行排序表（table<string> 键 + table<i64> 值）+ 手写二分」（T0.5
+// map 排序键二分同款思路；语言级 map 缺失键读取会运行时崩溃且无 contains
+// 内置，故不用 map；T0.4 又未放开 map 作全局）。48 个关键字 + 类型关键字
+// 升序排列（ASCII/strcmp 字节序），O(log n) 查找。
+//
+// # 协议（tokenize 返回值，T1.2 parser 将消费）
+//   首行 <N>:（N = 含 Eof 的 token 总数）
+//   之后每行一个 token：<tag> <line> <col> <lexeme_id>（四要素齐全）
+//   词法错误：ERR:<line> <col> <message>（对齐 Rust「词法错误 @行:列: 消息」）
+// tokenize_debug(src) 返回可读流（含 lexeme 文本），供抽查对比。
+//
+// # ASI（自动分号补全，与 Rust lexer.rs finish_line 一致）
+// 换行时若本行有 token、括号深度为 0、且行尾 token 可结束语句 → 补 Semi。
+// 不补：二元运算符、逗号/冒号/双冒号/点/点点/开括号/左右大括号/分号/else/in。
+
+// ---------- 字符串池与字符串库（T0.6 / 标准库）----------
+import "../../std/intern.tie"
+import "../../std/string.tie"
+using str;
+
+// ---------- tag 常量（与 Rust TokenKind 枚举顺序对齐）----------
+const T_INT: i64 = 0;
+const T_FLOAT: i64 = 1;
+const T_STR: i64 = 2;
+const T_CHARLIT: i64 = 3;
+const T_IDENT: i64 = 4;
+const T_FUNC: i64 = 5;
+const T_VAR: i64 = 6;
+const T_CONST: i64 = 7;
+const T_IF: i64 = 8;
+const T_ELSE: i64 = 9;
+const T_WHILE: i64 = 10;
+const T_FOR: i64 = 11;
+const T_IN: i64 = 12;
+const T_RETURN: i64 = 13;
+const T_BREAK: i64 = 14;
+const T_CONTINUE: i64 = 15;
+const T_SWITCH: i64 = 16;
+const T_CASE: i64 = 17;
+const T_DEFAULT: i64 = 18;
+const T_WHEN: i64 = 19;
+const T_IMPORT: i64 = 20;
+const T_AS: i64 = 21;
+const T_STRUCT: i64 = 22;
+const T_EXTENDS: i64 = 23;
+const T_NAMESPACE: i64 = 24;
+const T_PUB: i64 = 25;
+const T_USING: i64 = 26;
+const T_EXTERN: i64 = 27;
+const T_TRUE: i64 = 28;
+const T_FALSE: i64 = 29;
+const T_ZERO: i64 = 30;
+const T_REF: i64 = 31;
+const T_TYPEKW: i64 = 32;
+const T_LPAREN: i64 = 33;
+const T_RPAREN: i64 = 34;
+const T_LBRACE: i64 = 35;
+const T_RBRACE: i64 = 36;
+const T_LBRACKET: i64 = 37;
+const T_RBRACKET: i64 = 38;
+const T_COMMA: i64 = 39;
+const T_COLON: i64 = 40;
+const T_DOUBLE_COLON: i64 = 41;
+const T_SEMI: i64 = 42;
+const T_DOT: i64 = 43;
+const T_DOT_DOT: i64 = 44;
+const T_ARROW: i64 = 45;
+const T_PLUS: i64 = 46;
+const T_MINUS: i64 = 47;
+const T_STAR: i64 = 48;
+const T_SLASH: i64 = 49;
+const T_PERCENT: i64 = 50;
+const T_EQ: i64 = 51;
+const T_EQEQ: i64 = 52;
+const T_NOTEQ: i64 = 53;
+const T_LT: i64 = 54;
+const T_GT: i64 = 55;
+const T_LE: i64 = 56;
+const T_GE: i64 = 57;
+const T_ANDAND: i64 = 58;
+const T_OROR: i64 = 59;
+const T_BANG: i64 = 60;
+const T_PLUSEQ: i64 = 61;
+const T_MINUSEQ: i64 = 62;
+const T_STAREQ: i64 = 63;
+const T_SLASHEQ: i64 = 64;
+const T_PERCENTEQ: i64 = 65;
+const T_AMPEQ: i64 = 66;
+const T_PIPEEQ: i64 = 67;
+const T_CARETEQ: i64 = 68;
+const T_SHLEQ: i64 = 69;
+const T_SHREQ: i64 = 70;
+const T_AMP: i64 = 71;
+const T_PIPE: i64 = 72;
+const T_CARET: i64 = 73;
+const T_SHL: i64 = 74;
+const T_SHR: i64 = 75;
+const T_INC: i64 = 76;
+const T_DEC: i64 = 77;
+const T_QUESTION: i64 = 78;
+const T_EOF: i64 = 79;
+
+// ---------- 全局列式 token 表（T0.4 全局表：下标对齐 = token 序号）----------
+var tok_tags: table<i64>;
+var tok_lines: table<i64>;
+var tok_cols: table<i64>;
+var tok_lexemes: table<i64>;
+
+// ---------- 关键字排序表（全局并行表，build_kw 一次性构建）----------
+var kw_keys: table<string>;
+var kw_vals: table<i64>;
+
+// ---------- 扫描器共享状态（一次 tokenize 的生命周期）----------
+var g_codes: table<i64>;      // 当前源码码点表（regex O(N) 切分）
+var g_src: string = "";       // 当前源码（lexeme 切片用）
+var g_n: i64 = 0;             // 码点数
+var g_line_starts: table<i64>; // 各行起点位置（第 i 行起点 = g_line_starts[i]）
+
+// ---------- ASI 追踪状态（等价 Rust Lexer 的三个字段）----------
+var g_line_has_token: bool = false;  // 本行是否已产出过 token
+var g_last_line_tag: i64 = 0;       // 行尾最后一个 token 的 tag（-1 = 无，运行期重置）
+var g_paren_depth: i64 = 0;          // 括号深度（只统计 ( 与 [）
+
+// ---------- 词法错误槽位（tokenize 返回 ERR: 协议）----------
+var g_err_line: i64 = 0;
+var g_err_col: i64 = 0;
+var g_err_msg: string = "";
+
+namespace lexer {
+
+// 记录词法错误到全局槽位
+func set_err(line: i64, col: i64, msg: string) {
+    g_err_line = line
+    g_err_col = col
+    g_err_msg = msg
+}
+
+// 组装错误协议文本：ERR:<line> <col> <message>
+func err_protocol() -> string {
+    return "ERR:" + to_string(g_err_line) + " " + to_string(g_err_col) + " " + g_err_msg
+}
+
+// ---------- 字符分类 ----------
+
+// ASCII 数字 0-9
+func is_digit(c: i64) -> bool {
+    if c >= 48 {
+        if c <= 57 {
+            return true
+        }
+    }
+    return false
+}
+
+// 十六进制数字 0-9 a-f A-F
+func is_hex_digit(c: i64) -> bool {
+    if c >= 48 {
+        if c <= 57 {
+            return true
+        }
+    }
+    if c >= 97 {
+        if c <= 102 {
+            return true
+        }
+    }
+    if c >= 65 {
+        if c <= 70 {
+            return true
+        }
+    }
+    return false
+}
+
+// 字母（ASCII a-z A-Z；非 ASCII 视为字母——近似 Rust is_alphabetic 对中文
+// 等 Unicode 字母成立；对非字母非 ASCII 符号（如全角标点）两版行为会分歧，
+// 属已知近似，语料内仅注释/字符串出现非 ASCII）
+func is_alpha(c: i64) -> bool {
+    if c >= 97 {
+        if c <= 122 {
+            return true
+        }
+    }
+    if c >= 65 {
+        if c <= 90 {
+            return true
+        }
+    }
+    if c > 127 {
+        return true
+    }
+    return false
+}
+
+// 标识符续字符：字母 / 数字 / 下划线
+func is_ident_cont(c: i64) -> bool {
+    if is_digit(c) {
+        return true
+    }
+    if is_alpha(c) {
+        return true
+    }
+    if c == 95 {
+        return true
+    }
+    return false
+}
+
+// ---------- 行列号反推（行起点表 + 二分）----------
+
+// 扫描码点表构建行起点表：g_line_starts[i] = 第 (i+1) 行的起点位置
+func build_line_starts() {
+    g_line_starts = table_new_i64()
+    table_push(g_line_starts, 0)   // 第 1 行起点 = 0
+    var i: i64 = 0
+    while i < g_n {
+        if g_codes[i] == 10 {      // '\n'
+            table_push(g_line_starts, i + 1)
+        }
+        i = i + 1
+    }
+}
+
+// 位置 → 行号（1 起）：二分找最后一个 <= pos 的行起点，其下标 + 1
+func line_of(pos: i64) -> i64 {
+    var lo: i64 = 0
+    var hi: i64 = len(g_line_starts) - 1
+    var ans: i64 = 0
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if g_line_starts[mid] <= pos {
+            ans = mid
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return ans + 1
+}
+
+// 位置 → 列号（1 起）：pos - 该行起点 + 1
+func col_of(pos: i64) -> i64 {
+    var l = line_of(pos)
+    return pos - g_line_starts[l - 1] + 1
+}
+
+// ---------- ASI 判定 ----------
+
+// 是否二元运算符（行尾是运算符则语句未结束，不补分号）。
+// 注意 M4：++/--（Inc/Dec）与 !（Bang）特意不算——后缀 i++\n 应结束语句。
+// tag 区间 [T_PLUS(46) .. T_QUESTION(78)] 内的运算符除 Bang(60)/Inc(76)/Dec(77)
+// 外全部是二元运算符（与 Rust is_bin_op 的 matches! 列表逐一对应）。
+func is_bin_op(tag: i64) -> bool {
+    if tag >= T_PLUS {
+        if tag <= T_QUESTION {
+            if tag != T_BANG {
+                if tag != T_INC {
+                    if tag != T_DEC {
+                        return true
+                    }
+                }
+            }
+        }
+    }
+    return false
+}
+
+// 是否「行尾不可结束语句」集合（Rust finish_line 排除表；RBracket 不在其中）
+func no_semi_end(tag: i64) -> bool {
+    var bad: table<i64> = [T_COMMA, T_COLON, T_DOUBLE_COLON, T_DOT, T_DOT_DOT,
+        T_LPAREN, T_LBRACKET, T_LBRACE, T_RBRACE, T_SEMI, T_ELSE, T_IN]
+    var i: i64 = 0
+    while i < len(bad) {
+        if bad[i] == tag {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ---------- 关键字表构建与二分 ----------
+
+// 一次性构建关键字排序表（48 项，ASCII 升序）。用本地字面量表复制进全局
+// 动态表——全局表字面量初始化只允许空表 []，且字面量表直接赋给全局有 IR 缺陷。
+func build_kw() {
+    var k: table<string> = ["as", "bool", "break", "case", "char", "code",
+        "const", "continue", "default", "else", "extends", "extern", "f32",
+        "f64", "false", "for", "func", "i16", "i32", "i64", "i8", "if",
+        "import", "in", "map", "misc", "namespace", "num", "pub", "ref",
+        "return", "string", "struct", "switch", "table", "text", "trit",
+        "true", "u16", "u32", "u64", "u8", "using", "var", "void", "when",
+        "while", "zero"]
+    var v: table<i64> = [21, 32, 14, 17, 32, 32, 7, 15, 18, 9, 23, 27, 32,
+        32, 29, 11, 5, 32, 32, 32, 32, 8, 20, 12, 32, 32, 24, 32, 25, 31,
+        13, 32, 22, 16, 32, 32, 32, 28, 32, 32, 32, 32, 26, 6, 32, 19, 10, 30]
+    kw_keys = table_new_string()
+    kw_vals = table_new_i64()
+    var i: i64 = 0
+    while i < len(k) {
+        table_push(kw_keys, k[i])
+        table_push(kw_vals, v[i])
+        i = i + 1
+    }
+}
+
+// 惰性初始化：tokenize 首次调用时构建关键字表（后续调用跳过）
+pub func ensure_kw() {
+    if len(kw_keys) == 0 {
+        build_kw()
+    }
+}
+
+// 二分查找关键字 s 的 tag；未命中返回 -1（键表升序，字符串比较走 strcmp）
+func kw_lookup(s: string) -> i64 {
+    var lo: i64 = 0
+    var hi: i64 = len(kw_keys) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if kw_keys[mid] == s {
+            return kw_vals[mid]
+        }
+        if kw_keys[mid] < s {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+// ---------- 列式 token 表：重置 / 写入 / 读取 ----------
+
+// 重置列式 token 表（每列重绑定为全新空动态表）
+pub func reset_tokens() {
+    tok_tags = table_new_i64()
+    tok_lines = table_new_i64()
+    tok_cols = table_new_i64()
+    tok_lexemes = table_new_i64()
+}
+
+// 在位置 pos（token 起点）写入一个 token 的四列，并更新 ASI 追踪状态
+func push_token_at(tag: i64, pos: i64, lid: i64) {
+    var l = line_of(pos)
+    table_push(tok_tags, tag)
+    table_push(tok_lines, l)
+    table_push(tok_cols, pos - g_line_starts[l - 1] + 1)
+    table_push(tok_lexemes, lid)
+    g_line_has_token = true
+    // 括号深度只统计 ( 与 [（{ } 是块边界不参与换行补分号判定）
+    if tag == T_LPAREN {
+        g_paren_depth = g_paren_depth + 1
+    } else if tag == T_LBRACKET {
+        g_paren_depth = g_paren_depth + 1
+    } else if tag == T_RPAREN {
+        if g_paren_depth > 0 {
+            g_paren_depth = g_paren_depth - 1
+        }
+    } else if tag == T_RBRACKET {
+        if g_paren_depth > 0 {
+            g_paren_depth = g_paren_depth - 1
+        }
+    }
+    g_last_line_tag = tag
+}
+
+// 当前 token 总数（含 Eof）
+pub func token_count() -> i64 {
+    return len(tok_tags)
+}
+
+// 第 i 个 token 的 tag
+pub func token_tag(i: i64) -> i64 {
+    return tok_tags[i]
+}
+
+// 第 i 个 token 的行号
+pub func token_line(i: i64) -> i64 {
+    return tok_lines[i]
+}
+
+// 第 i 个 token 的列号
+pub func token_col(i: i64) -> i64 {
+    return tok_cols[i]
+}
+
+// 第 i 个 token 的 lexeme 文本（池 id → 字符串还原）
+pub func token_lexeme(i: i64) -> string {
+    return intern.lookup(tok_lexemes[i])
+}
+
+// ---------- 各 token 扫描器 ----------
+// 所有扫描器输入 pos（当前字符位置），返回扫描结束后的位置；
+// 出错置全局错误槽并返回 -1。扫描器只维护位置，行列号由 push_token_at 反推。
+
+// 行注释 // ...：不产生 token，停在换行符（由主循环处理 ASI）
+func scan_line_comment(pos: i64) -> i64 {
+    pos = pos + 2   // 吃掉 "//"
+    while pos < g_n {
+        if g_codes[pos] == 10 {
+            break
+        }
+        pos = pos + 1
+    }
+    return pos
+}
+
+// 块注释 /* ... */（可跨行）：不产生 token；未闭合报错（位置取注释起点）
+func scan_block_comment(pos: i64) -> i64 {
+    var start = pos
+    pos = pos + 2   // 吃掉 "/*"
+    var closed = false
+    while pos < g_n {
+        if g_codes[pos] == 42 {        // '*'
+            if pos + 1 < g_n {
+                if g_codes[pos + 1] == 47 {   // '*/'
+                    pos = pos + 2
+                    closed = true
+                    break
+                }
+            }
+        }
+        pos = pos + 1
+    }
+    if !closed {
+        set_err(line_of(start), col_of(start), "块注释未闭合")
+        return -1
+    }
+    return pos
+}
+
+// 转义序列合法性：\n \t \r \\ \" \' \0（与 Rust scan_string/scan_char 一致）
+func is_valid_escape(e: i64) -> bool {
+    if e == 110 {    // n
+        return true
+    }
+    if e == 116 {    // t
+        return true
+    }
+    if e == 114 {    // r
+        return true
+    }
+    if e == 92 {     // \
+        return true
+    }
+    if e == 34 {     // "
+        return true
+    }
+    if e == 39 {     // '
+        return true
+    }
+    if e == 48 {     // 0
+        return true
+    }
+    return false
+}
+
+// 字符串字面量（支持 \n \t \r \\ \" \' \0 转义；可跨行）
+func scan_string(pos: i64) -> i64 {
+    var start = pos
+    pos = pos + 1   // 开引号 '"'
+    var done = false
+    while pos < g_n {
+        if g_codes[pos] == 92 {        // 反斜杠
+            pos = pos + 1              // 吃掉 '\'
+            if pos >= g_n {
+                set_err(line_of(start), col_of(start), "转义符后缺少字符")
+                return -1
+            }
+            var e = g_codes[pos]
+            if !is_valid_escape(e) {
+                set_err(line_of(start), col_of(start), "未知转义序列 \\" + str_char(g_src, pos))
+                return -1
+            }
+            pos = pos + 1
+        } else if g_codes[pos] == 34 { // 闭引号 '"'
+            pos = pos + 1
+            done = true
+            break
+        } else {
+            pos = pos + 1
+        }
+    }
+    if !done {
+        set_err(line_of(start), col_of(start), "字符串未闭合")
+        return -1
+    }
+    // lexeme = 原始源码切片（含引号，解析器阶段再解码转义）
+    var lid = intern.intern(str.slice(g_src, start, pos))
+    push_token_at(T_STR, start, lid)
+    return pos
+}
+
+// 字符字面量 'a' / '\n' / '\''（单引号包裹恰好一个字符，支持转义）
+func scan_char(pos: i64) -> i64 {
+    var start = pos
+    pos = pos + 1   // 开引号 '\''
+    if pos >= g_n {
+        set_err(line_of(start), col_of(start), "字符字面量未闭合")
+        return -1
+    }
+    if g_codes[pos] == 92 {            // 反斜杠转义
+        pos = pos + 1
+        if pos >= g_n {
+            set_err(line_of(start), col_of(start), "转义符后缺少字符")
+            return -1
+        }
+        var e = g_codes[pos]
+        if !is_valid_escape(e) {
+            set_err(line_of(start), col_of(start), "未知转义序列 \\" + str_char(g_src, pos))
+            return -1
+        }
+        pos = pos + 1
+    } else {
+        pos = pos + 1   // 一个内容字符
+    }
+    // 期望闭引号
+    if pos >= g_n {
+        set_err(line_of(start), col_of(start), "字符字面量未闭合")
+        return -1
+    }
+    if g_codes[pos] == 39 {            // 闭引号 '\''
+        pos = pos + 1
+        var lid = intern.intern(str.slice(g_src, start, pos))
+        push_token_at(T_CHARLIT, start, lid)
+        return pos
+    }
+    set_err(line_of(start), col_of(start), "字符字面量只能包含一个字符")
+    return -1
+}
+
+// 数字字面量：整数（十进制/0x 十六进制/0b 二进制/0o 八进制/0t 三进制）或
+// 浮点数（含小数点与指数）。消费边界与 Rust scan_number 完全一致
+//（1..10 中第一个点是 DotDot 不被误吃；0xFF 等进制前缀只在恰好 "0" 时触发）。
+func scan_number(pos: i64) -> i64 {
+    var start = pos
+    var is_float = false
+    var saw_e = false
+    var digits_consumed: i64 = 0
+    var scanning = true
+    while scanning {
+        var c = g_codes[pos]
+        if is_digit(c) {
+            pos = pos + 1
+            digits_consumed = digits_consumed + 1
+        } else if c == 46 {            // '.'
+            if is_float {
+                scanning = false
+            } else {
+                // 仅当下一个字符也是数字时视作小数（避免 1..10 的 ..）
+                if pos + 1 < g_n {
+                    if is_digit(g_codes[pos + 1]) {
+                        is_float = true
+                        pos = pos + 1
+                    } else {
+                        scanning = false
+                    }
+                } else {
+                    scanning = false
+                }
+            }
+        } else if c == 101 {           // 'e'
+            if saw_e {
+                scanning = false
+            } else {
+                // 预读：可选符号 + 数字才认作指数
+                var j = pos + 1
+                var has_sign = false
+                if j < g_n {
+                    if g_codes[j] == 45 {      // '-'
+                        has_sign = true
+                        j = j + 1
+                    } else if g_codes[j] == 43 {   // '+'
+                        has_sign = true
+                        j = j + 1
+                    }
+                }
+                if j < g_n {
+                    if is_digit(g_codes[j]) {
+                        saw_e = true
+                        is_float = true
+                        pos = pos + 1           // 吃掉 'e'
+                        if has_sign {
+                            pos = pos + 1       // 吃掉符号
+                        }
+                        // 吃掉指数数字
+                        while pos < g_n {
+                            if is_digit(g_codes[pos]) {
+                                pos = pos + 1
+                            } else {
+                                break
+                            }
+                        }
+                    }
+                }
+                scanning = false
+            }
+        } else if c == 69 {            // 'E'（与 'e' 同路径）
+            if saw_e {
+                scanning = false
+            } else {
+                var j = pos + 1
+                var has_sign = false
+                if j < g_n {
+                    if g_codes[j] == 45 {
+                        has_sign = true
+                        j = j + 1
+                    } else if g_codes[j] == 43 {
+                        has_sign = true
+                        j = j + 1
+                    }
+                }
+                if j < g_n {
+                    if is_digit(g_codes[j]) {
+                        saw_e = true
+                        is_float = true
+                        pos = pos + 1
+                        if has_sign {
+                            pos = pos + 1
+                        }
+                        while pos < g_n {
+                            if is_digit(g_codes[pos]) {
+                                pos = pos + 1
+                            } else {
+                                break
+                            }
+                        }
+                    }
+                }
+                scanning = false
+            }
+        } else {
+            scanning = false
+        }
+    }
+    // 进制前缀：恰好单个 '0' 且未成浮点 → 查 0x/0b/0o/0t（大小写均可）
+    if digits_consumed == 1 {
+        if !is_float {
+            if g_codes[start] == 48 {   // '0'
+                if pos < g_n {
+                    var r = g_codes[pos]
+                    if r == 120 {       // 'x'
+                        pos = pos + 1
+                        while pos < g_n {
+                            if is_hex_digit(g_codes[pos]) {
+                                pos = pos + 1
+                            } else {
+                                break
+                            }
+                        }
+                    } else if r == 88 { // 'X'
+                        pos = pos + 1
+                        while pos < g_n {
+                            if is_hex_digit(g_codes[pos]) {
+                                pos = pos + 1
+                            } else {
+                                break
+                            }
+                        }
+                    } else if r == 98 { // 'b'
+                        pos = pos + 1
+                        while pos < g_n {
+                            if g_codes[pos] == 48 {
+                                pos = pos + 1
+                            } else if g_codes[pos] == 49 {
+                                pos = pos + 1
+                            } else {
+                                break
+                            }
+                        }
+                    } else if r == 66 { // 'B'
+                        pos = pos + 1
+                        while pos < g_n {
+                            if g_codes[pos] == 48 {
+                                pos = pos + 1
+                            } else if g_codes[pos] == 49 {
+                                pos = pos + 1
+                            } else {
+                                break
+                            }
+                        }
+                    } else if r == 111 { // 'o'
+                        pos = pos + 1
+                        while pos < g_n {
+                            if g_codes[pos] >= 48 {
+                                if g_codes[pos] <= 55 {
+                                    pos = pos + 1
+                                } else {
+                                    break
+                                }
+                            } else {
+                                break
+                            }
+                        }
+                    } else if r == 79 { // 'O'
+                        pos = pos + 1
+                        while pos < g_n {
+                            if g_codes[pos] >= 48 {
+                                if g_codes[pos] <= 55 {
+                                    pos = pos + 1
+                                } else {
+                                    break
+                                }
+                            } else {
+                                break
+                            }
+                        }
+                    } else if r == 116 { // 't'
+                        pos = pos + 1
+                        while pos < g_n {
+                            if g_codes[pos] >= 48 {
+                                if g_codes[pos] <= 50 {
+                                    pos = pos + 1
+                                } else {
+                                    break
+                                }
+                            } else {
+                                break
+                            }
+                        }
+                    } else if r == 84 { // 'T'
+                        pos = pos + 1
+                        while pos < g_n {
+                            if g_codes[pos] >= 48 {
+                                if g_codes[pos] <= 50 {
+                                    pos = pos + 1
+                                } else {
+                                    break
+                                }
+                            } else {
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    var tag = T_INT
+    if is_float {
+        tag = T_FLOAT
+    }
+    var lid = intern.intern(str.slice(g_src, start, pos))
+    push_token_at(tag, start, lid)
+    return pos
+}
+
+// 标识符 / 关键字：扫描完整标识符后切片 intern，再查关键字表转 tag
+func scan_ident(pos: i64) -> i64 {
+    var start = pos
+    while pos < g_n {
+        if is_ident_cont(g_codes[pos]) {
+            pos = pos + 1
+        } else {
+            break
+        }
+    }
+    var lex = str.slice(g_src, start, pos)
+    var lid = intern.intern(lex)
+    var tag = kw_lookup(lex)
+    if tag < 0 {
+        tag = T_IDENT
+    }
+    push_token_at(tag, start, lid)
+    return pos
+}
+
+// 符号扫描辅助：写符号 token 并返回结束位置
+func emit_symbol(tag: i64, txt: string, start: i64, end: i64) -> i64 {
+    var lid = intern.intern(txt)
+    push_token_at(tag, start, lid)
+    return end
+}
+
+// 符号：三字符（<<= >>=）/ 双字符 / 单字符；未知字符报错
+func scan_symbol(pos: i64) -> i64 {
+    var start = pos
+    var c = g_codes[pos]
+    if c == 60 {                    // '<'
+        if pos + 1 < g_n {
+            var n1 = g_codes[pos + 1]
+            if n1 == 60 {           // '<<'
+                if pos + 2 < g_n {
+                    if g_codes[pos + 2] == 61 {   // '<<='
+                        return emit_symbol(T_SHLEQ, "<<=", start, pos + 3)
+                    }
+                }
+                return emit_symbol(T_SHL, "<<", start, pos + 2)
+            }
+            if n1 == 61 {           // '<='
+                return emit_symbol(T_LE, "<=", start, pos + 2)
+            }
+        }
+        return emit_symbol(T_LT, "<", start, pos + 1)
+    }
+    if c == 62 {                    // '>'
+        if pos + 1 < g_n {
+            var n1 = g_codes[pos + 1]
+            if n1 == 62 {           // '>>'
+                if pos + 2 < g_n {
+                    if g_codes[pos + 2] == 61 {   // '>>='
+                        return emit_symbol(T_SHREQ, ">>=", start, pos + 3)
+                    }
+                }
+                return emit_symbol(T_SHR, ">>", start, pos + 2)
+            }
+            if n1 == 61 {           // '>='
+                return emit_symbol(T_GE, ">=", start, pos + 2)
+            }
+        }
+        return emit_symbol(T_GT, ">", start, pos + 1)
+    }
+    if c == 61 {                    // '='
+        if pos + 1 < g_n {
+            if g_codes[pos + 1] == 61 {   // '=='
+                return emit_symbol(T_EQEQ, "==", start, pos + 2)
+            }
+        }
+        return emit_symbol(T_EQ, "=", start, pos + 1)
+    }
+    if c == 33 {                    // '!'
+        if pos + 1 < g_n {
+            if g_codes[pos + 1] == 61 {   // '!='
+                return emit_symbol(T_NOTEQ, "!=", start, pos + 2)
+            }
+        }
+        return emit_symbol(T_BANG, "!", start, pos + 1)
+    }
+    if c == 38 {                    // '&'
+        if pos + 1 < g_n {
+            var n1 = g_codes[pos + 1]
+            if n1 == 38 {           // '&&'
+                return emit_symbol(T_ANDAND, "&&", start, pos + 2)
+            }
+            if n1 == 61 {           // '&='
+                return emit_symbol(T_AMPEQ, "&=", start, pos + 2)
+            }
+        }
+        return emit_symbol(T_AMP, "&", start, pos + 1)
+    }
+    if c == 124 {                   // '|'
+        if pos + 1 < g_n {
+            var n1 = g_codes[pos + 1]
+            if n1 == 124 {          // '||'
+                return emit_symbol(T_OROR, "||", start, pos + 2)
+            }
+            if n1 == 61 {           // '|='
+                return emit_symbol(T_PIPEEQ, "|=", start, pos + 2)
+            }
+        }
+        return emit_symbol(T_PIPE, "|", start, pos + 1)
+    }
+    if c == 94 {                    // '^'
+        if pos + 1 < g_n {
+            if g_codes[pos + 1] == 61 {   // '^='
+                return emit_symbol(T_CARETEQ, "^=", start, pos + 2)
+            }
+        }
+        return emit_symbol(T_CARET, "^", start, pos + 1)
+    }
+    if c == 46 {                    // '.'
+        if pos + 1 < g_n {
+            if g_codes[pos + 1] == 46 {   // '..'
+                return emit_symbol(T_DOT_DOT, "..", start, pos + 2)
+            }
+        }
+        return emit_symbol(T_DOT, ".", start, pos + 1)
+    }
+    if c == 45 {                    // '-'
+        if pos + 1 < g_n {
+            var n1 = g_codes[pos + 1]
+            if n1 == 62 {           // '->'
+                return emit_symbol(T_ARROW, "->", start, pos + 2)
+            }
+            if n1 == 61 {           // '-='
+                return emit_symbol(T_MINUSEQ, "-=", start, pos + 2)
+            }
+            if n1 == 45 {           // '--'
+                return emit_symbol(T_DEC, "--", start, pos + 2)
+            }
+        }
+        return emit_symbol(T_MINUS, "-", start, pos + 1)
+    }
+    if c == 43 {                    // '+'
+        if pos + 1 < g_n {
+            var n1 = g_codes[pos + 1]
+            if n1 == 61 {           // '+='
+                return emit_symbol(T_PLUSEQ, "+=", start, pos + 2)
+            }
+            if n1 == 43 {           // '++'
+                return emit_symbol(T_INC, "++", start, pos + 2)
+            }
+        }
+        return emit_symbol(T_PLUS, "+", start, pos + 1)
+    }
+    if c == 47 {                    // '/'
+        if pos + 1 < g_n {
+            if g_codes[pos + 1] == 61 {   // '/='
+                return emit_symbol(T_SLASHEQ, "/=", start, pos + 2)
+            }
+        }
+        return emit_symbol(T_SLASH, "/", start, pos + 1)
+    }
+    if c == 42 {                    // '*'
+        if pos + 1 < g_n {
+            if g_codes[pos + 1] == 61 {   // '*='
+                return emit_symbol(T_STAREQ, "*=", start, pos + 2)
+            }
+        }
+        return emit_symbol(T_STAR, "*", start, pos + 1)
+    }
+    if c == 37 {                    // '%'
+        if pos + 1 < g_n {
+            if g_codes[pos + 1] == 61 {   // '%='
+                return emit_symbol(T_PERCENTEQ, "%=", start, pos + 2)
+            }
+        }
+        return emit_symbol(T_PERCENT, "%", start, pos + 1)
+    }
+    if c == 63 {                    // '?'
+        return emit_symbol(T_QUESTION, "?", start, pos + 1)
+    }
+    if c == 40 {                    // '('
+        return emit_symbol(T_LPAREN, "(", start, pos + 1)
+    }
+    if c == 41 {                    // ')'
+        return emit_symbol(T_RPAREN, ")", start, pos + 1)
+    }
+    if c == 123 {                   // '{'
+        return emit_symbol(T_LBRACE, "{", start, pos + 1)
+    }
+    if c == 125 {                   // '}'
+        return emit_symbol(T_RBRACE, "}", start, pos + 1)
+    }
+    if c == 91 {                    // '['
+        return emit_symbol(T_LBRACKET, "[", start, pos + 1)
+    }
+    if c == 93 {                    // ']'
+        return emit_symbol(T_RBRACKET, "]", start, pos + 1)
+    }
+    if c == 44 {                    // ','
+        return emit_symbol(T_COMMA, ",", start, pos + 1)
+    }
+    if c == 58 {                    // ':'
+        if pos + 1 < g_n {
+            if g_codes[pos + 1] == 58 {   // '::'
+                return emit_symbol(T_DOUBLE_COLON, "::", start, pos + 2)
+            }
+        }
+        return emit_symbol(T_COLON, ":", start, pos + 1)
+    }
+    if c == 59 {                    // ';'
+        return emit_symbol(T_SEMI, ";", start, pos + 1)
+    }
+    // 无法识别的字符（对齐 Rust：错误消息含原字符）
+    set_err(line_of(start), col_of(start), "无法识别的字符 '" + str_char(g_src, pos) + "'")
+    return -1
+}
+
+// ---------- tokenize 主循环 ----------
+
+// 换行时按 ASI 规则决定是否补分号（Rust finish_line 语义）。
+// pos 为换行符之后的位置（下一行行首）；补出的分号 span 取该位置。
+func finish_line(pos: i64) {
+    var should = false
+    if g_line_has_token {
+        if g_paren_depth == 0 {
+            if g_last_line_tag >= 0 {
+                if !is_bin_op(g_last_line_tag) {
+                    if !no_semi_end(g_last_line_tag) {
+                        should = true
+                    }
+                }
+            }
+        }
+    }
+    if should {
+        var lid = intern.intern(";")
+        push_token_at(T_SEMI, pos, lid)
+    }
+    g_line_has_token = false
+    g_last_line_tag = -1
+}
+
+// 核心词法扫描：源文本 → 列式 token 表（含 Eof；不产生协议文本）。
+// 供 tokenize/tokenize_debug 调用；T1.2 parser 将直接消费列式表（走本函数）。
+// 出错置全局错误槽，返回 false。
+pub func run_lex(src: string) -> bool {
+    // 一次性构建关键字表（后续调用跳过）
+    ensure_kw()
+    // 重置列式 token 表与 ASI/错误状态
+    reset_tokens()
+    g_line_has_token = false
+    g_last_line_tag = -1
+    g_paren_depth = 0
+    g_err_msg = ""
+    // 源文本 → 码点表（regex 一次切分，O(N)）
+    g_src = src
+    var chars = regex_find_all(src, "(?s).")
+    g_codes = table_new_i64()
+    var i: i64 = 0
+    while i < len(chars) {
+        table_push(g_codes, char_code(chars[i]))
+        i = i + 1
+    }
+    g_n = len(g_codes)
+    build_line_starts()
+    // 主循环：逐码点分派
+    var pos: i64 = 0
+    while pos < g_n {
+        var c = g_codes[pos]
+        if c == 10 {                // '\n'：换行触发 ASI 判定
+            pos = pos + 1
+            finish_line(pos)
+        } else if c == 32 {         // ' '
+            pos = pos + 1
+        } else if c == 9 {          // '\t'
+            pos = pos + 1
+        } else if c == 13 {         // '\r'
+            pos = pos + 1
+        } else if c == 47 {         // '/'：注释或除号
+            if pos + 1 < g_n {
+                var n1 = g_codes[pos + 1]
+                if n1 == 47 {       // '//' 行注释
+                    pos = scan_line_comment(pos)
+                } else if n1 == 42 { // '/*' 块注释
+                    var r = scan_block_comment(pos)
+                    if r < 0 {
+                        return false
+                    }
+                    pos = r
+                } else {
+                    var r = scan_symbol(pos)
+                    if r < 0 {
+                        return false
+                    }
+                    pos = r
+                }
+            } else {
+                var r = scan_symbol(pos)
+                if r < 0 {
+                    return false
+                }
+                pos = r
+            }
+        } else if c == 34 {         // '"' 字符串
+            var r = scan_string(pos)
+            if r < 0 {
+                return false
+            }
+            pos = r
+        } else if c == 39 {         // '\'' 字符字面量
+            var r = scan_char(pos)
+            if r < 0 {
+                return false
+            }
+            pos = r
+        } else if is_digit(c) {     // 数字
+            pos = scan_number(pos)
+        } else if c == 95 {         // '_' 标识符
+            pos = scan_ident(pos)
+        } else if is_alpha(c) {     // 字母（含中文）标识符/关键字
+            pos = scan_ident(pos)
+        } else {
+            var r = scan_symbol(pos)
+            if r < 0 {
+                return false
+            }
+            pos = r
+        }
+    }
+    // 文件末尾补一个 Eof（span 取文件末尾位置；lexeme 为空串）
+    var lid_eof = intern.intern("")
+    push_token_at(T_EOF, g_n, lid_eof)
+    return true
+}
+
+// 源文本 → 列式 token 表；返回协议文本（首行 <N>: 计 token 数含 Eof）。
+// 词法错误返回 ERR:<line> <col> <message>。
+pub func tokenize(src: string) -> string {
+    var ok = run_lex(src)
+    if !ok {
+        return err_protocol()
+    }
+    // 组装协议：首行 <N>:，随后每行 <tag> <line> <col> <lexeme_id>
+    var out: string = to_string(len(tok_tags)) + ":\n"
+    var k: i64 = 0
+    while k < len(tok_tags) {
+        out = out + to_string(tok_tags[k]) + " " + to_string(tok_lines[k]) + " " +
+            to_string(tok_cols[k]) + " " + to_string(tok_lexemes[k]) + "\n"
+        k = k + 1
+    }
+    return out
+}
+
+// 调试模式：返回可读 token 流（含 lexeme 文本与 tag 数值，tag 表见文件头）
+pub func tokenize_debug(src: string) -> string {
+    var ok = run_lex(src)
+    if !ok {
+        return err_protocol()
+    }
+    var out: string = "共 " + to_string(len(tok_tags)) + " 个 token（含 Eof）:\n"
+    var k: i64 = 0
+    while k < len(tok_tags) {
+        out = out + "  " + to_string(tok_lines[k]) + ":" + to_string(tok_cols[k]) +
+            "  tag=" + to_string(tok_tags[k]) + " '" + intern.lookup(tok_lexemes[k]) + "'\n"
+        k = k + 1
+    }
+    return out
+}
+
+}
