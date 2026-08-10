@@ -189,6 +189,8 @@ pub enum TyKw {
     Misc,
     /// 表类型：数组与高级数组（表）
     Table,
+    /// 键值表类型（E3）：键恒为字符串，值为 i64（或 map<T> 显式值类型）
+    Map,
 }
 
 impl TyKw {
@@ -215,6 +217,7 @@ impl TyKw {
             TyKw::Text => "text",
             TyKw::Misc => "misc",
             TyKw::Table => "table",
+            TyKw::Map => "map",
         }
     }
 
@@ -824,6 +827,8 @@ impl<'a> Lexer<'a> {
             "misc" => TokenKind::TypeKw(TyKw::Misc),
             // 表类型（数组与高级数组）
             "table" => TokenKind::TypeKw(TyKw::Table),
+            // 键值表类型（E3）：键恒为字符串
+            "map" => TokenKind::TypeKw(TyKw::Map),
             _ => TokenKind::Ident(text),
         };
         Token::new(kind, line, col)

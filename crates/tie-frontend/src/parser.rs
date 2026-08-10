@@ -33,16 +33,17 @@ pub fn parse_program(tokens: &[Token]) -> Result<Program, ParseError> {
 }
 
 /// 递归下降解析器。
-struct Parser<'a> {
-    tokens: &'a [Token],
+struct Parser {
+    tokens: Vec<Token>,
     pos: usize,
     /// 解构 desugar 用的临时变量计数器（生成 `_tmpN` 唯一名）
     tmp_counter: usize,
 }
 
-impl<'a> Parser<'a> {
-    fn new(tokens: &'a [Token]) -> Self {
-        Self { tokens, pos: 0, tmp_counter: 0 }
+impl Parser {
+    fn new(tokens: &[Token]) -> Self {
+        // to_vec：类型参数闭括号分裂（E1，table<table<T>>）需要原地插入 token
+        Self { tokens: tokens.to_vec(), pos: 0, tmp_counter: 0 }
     }
 
     // ---------- 基础游标 ----------
@@ -737,16 +738,64 @@ impl<'a> Parser<'a> {
 
     // ---------- 类型解析 ----------
 
+    /// 类型参数闭括号 '>'（A1/E1）：支持复合 token 分裂。
+    ///
+    /// `table<table<i64>>` 的末尾 `>>` 在词法层被合成 Shr（C++/Rust 同款问题），
+    /// 类型参数解析到闭括号时必须把 Shr / Ge / ShrEq 拆开，剩余部分插入 token 流：
+    /// - `>>`  (Shr)   → '>' + '>'（剩余 '>' 供外层类型继续消费）；
+    /// - `>=`  (Ge)    → '>' + '='（剩余 '=' 供声明符消费，如 `var x: table<i64>=..`）；
+    /// - `>>=` (ShrEq) → '>' + '>='（剩余 '>=' 再经一轮 Ge 分裂消费）。
+    fn expect_type_gt(&mut self, what: &str) -> Result<(), ParseError> {
+        let span = self.peek().span;
+        match self.peek_kind() {
+            TokenKind::Gt => {
+                self.advance();
+                Ok(())
+            }
+            // 复合 token：当前位置保留 '>'（分裂），剩余部分插入下一位置
+            TokenKind::Shr => {
+                self.tokens[self.pos].kind = TokenKind::Gt;
+                self.tokens.insert(self.pos + 1, Token { kind: TokenKind::Gt, span });
+                self.advance();
+                Ok(())
+            }
+            TokenKind::Ge => {
+                self.tokens[self.pos].kind = TokenKind::Gt;
+                self.tokens.insert(self.pos + 1, Token { kind: TokenKind::Eq, span });
+                self.advance();
+                Ok(())
+            }
+            TokenKind::ShrEq => {
+                self.tokens[self.pos].kind = TokenKind::Gt;
+                self.tokens.insert(self.pos + 1, Token { kind: TokenKind::Ge, span });
+                self.advance();
+                Ok(())
+            }
+            other => Err(self.err(format!("{}，实际是 {}", what, self.describe(other)))),
+        }
+    }
+
     fn parse_type(&mut self) -> Result<TypeSpec, ParseError> {
         match self.peek_kind() {
             TokenKind::TypeKw(ty) => {
                 let ty = *ty;
                 self.advance();
-                // table<T>（A1）：表类型后跟 <元素类型> → 带元素类型的表
+                // table<T>（A1）：表类型后跟 <元素类型> → 带元素类型的表。
+                // 闭括号用 expect_type_gt：支持 `table<table<i64>>` 的 `>>` 分裂。
                 if ty == TyKw::Table && self.eat(&TokenKind::Lt) {
                     let elem = self.parse_type()?;
-                    self.expect(TokenKind::Gt, "表元素类型后需 '>'")?;
+                    self.expect_type_gt("表元素类型后需 '>'")?;
                     return Ok(TypeSpec::Table(Box::new(elem)));
+                }
+                // map<T>（E3）：键值表类型，键恒为字符串，<值类型> 可选。
+                // 裸 map = map<i64>（默认值类型）；`map<string>` 显式标注。
+                if ty == TyKw::Map {
+                    if self.eat(&TokenKind::Lt) {
+                        let val = self.parse_type()?;
+                        self.expect_type_gt("键值表值类型后需 '>'")?;
+                        return Ok(TypeSpec::Map(Box::new(val)));
+                    }
+                    return Ok(TypeSpec::Map(Box::new(TypeSpec::Named(TyKw::I64))));
                 }
                 Ok(TypeSpec::Named(ty))
             }

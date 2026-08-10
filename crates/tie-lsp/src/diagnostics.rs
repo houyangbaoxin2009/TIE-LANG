@@ -190,6 +190,8 @@ pub fn ty_to_str(ty: &TypeSpec) -> String {
         }
         // table<T>（A1）：带元素类型的表类型
         TypeSpec::Table(elem) => format!("table<{}>", ty_to_str(elem)),
+        // map<T>（E3）：键值表类型（键恒为字符串）
+        TypeSpec::Map(val) => format!("map<{}>", ty_to_str(val)),
     }
 }
 

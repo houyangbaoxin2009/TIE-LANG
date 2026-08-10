@@ -1,0 +1,60 @@
+// tie:logic
+// 表能力加强（E0/E1/E3）综合演示：嵌套表 table<table<T>> + 键值表 map。
+//
+// 编译运行：tie examples/table_enhance_demo.tie
+// 覆盖：嵌套表字面量/下标链/实参/遍历；map 字面量/下标读写/复合赋值/实参；
+//       嵌套表 + map 组合（符号表场景——自举编译器 AST 的落点）。
+
+// 嵌套表作实参：遍历 table<table<i64>> 求全部元素和
+func sum_all(t: table<table<i64>>) -> i64 {
+    var total: i64 = 0
+    var i: i64 = 0
+    while i < len(t) {
+        var sub = t[i]
+        var j: i64 = 0
+        while j < len(sub) {
+            total = total + sub[j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return total
+}
+
+// 键值表作实参：符号表查找（函数名 → 地址）
+func sym_lookup(symtab: map<string>, name: string) -> string {
+    return symtab[name]
+}
+
+func main() {
+    // ---- 嵌套表（E1）：AST 节点形状（§3.5 修订编码）——列式 arena + 字符串池 ----
+    // 节点池 = 并行表（节点 id = 下标）：tags（tag）/ names（池 id，-1=无）/
+    // vals（整数值字段）/ children（子节点 id 列表——嵌套表 table<table<i64>>）
+    var pool_names = ["add", "sub"]                    // 字符串池（id 0 = "add"）
+    var tags: table<i64> = [5, 0, 0, 0]                // Call, IntLit, IntLit, IntLit
+    var names: table<i64> = [0, -1, -1, -1]            // call 名 = 池 id 0
+    var vals: table<i64> = [-1, 42, 1, 2]              // IntLit 值
+    var children: table<table<i64>> = [[1, 2], [], [], []]  // Call 的子节点 id 表
+    println("IntLit tag=" + to_string(tags[1]) + " val=" + to_string(vals[1]))
+    println("Call name=" + pool_names[names[0]] + " children=" + to_string(len(children[0])) + " first_val=" + to_string(vals[children[0][0]]))
+    println("sum_all = " + to_string(sum_all([[1, 2], [3, 4, 5]])))
+
+    // ---- 键值表（E3）：符号表/关键字表 ----
+    var symtab: map<string> = ["main": "0x401000", "helper": "0x401200"]
+    symtab["entry"] = "0x400000"
+    symtab["main"] = symtab["main"]          // 复合赋值读旧值（+= 字符串拼接）
+    println("main@ " + sym_lookup(symtab, "main"))
+    println("entry@ " + symtab["entry"])
+    println("symbols = " + to_string(len(symtab)))
+
+    // 关键字表（i64 值）：判别 tag
+    var kw: map = ["func": 1, "var": 2, "return": 3]
+    kw["if"] = 4
+    println("kw var=" + to_string(kw["var"]) + " if=" + to_string(kw["if"]))
+
+    // ---- 嵌套表 + map 组合：节点表 + 字符串池 ----
+    var pool: map = ["add": 0, "sub": 1]
+    var ast_children = [[1, 2]]
+    println("ast child tags = " + to_string(tags[ast_children[0][0]]) + ", " + to_string(tags[ast_children[0][1]]))
+    println("pool id of sub = " + to_string(pool["sub"]))
+}

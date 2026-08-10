@@ -9,7 +9,7 @@
 //! - 函数入口块命名为 `entry`，控制流块命名为 `if.then`/`if.else`/`loop.cond` 等
 
 use tie_frontend::ast::{
-    BinaryOp, Expr, FieldAssignStmt, FnDefStmt, IndexAssignStmt, Program, Stmt, TableCell,
+    BinaryOp, Expr, FieldAssignStmt, FnDefStmt, IndexAssignStmt, Program, Stmt, TableCell, TableId,
     TypeSpec, UnaryOp,
 };
 use tie_frontend::lexer::TyKw;
@@ -326,6 +326,9 @@ impl<'p> IrGenerator<'p> {
         if self.used_externs.iter().any(|s| s == "tie_table_push_bool") {
             self.out.push_str("declare void @tie_table_push_bool(ptr, i1)\n");
         }
+        if self.used_externs.iter().any(|s| s == "tie_table_push_ptr") {
+            self.out.push_str("declare void @tie_table_push_ptr(ptr, ptr)\n");
+        }
         if self.used_externs.iter().any(|s| s == "tie_table_at_i64") {
             self.out.push_str("declare i64 @tie_table_at_i64(ptr, i64, ptr)\n");
         }
@@ -337,6 +340,9 @@ impl<'p> IrGenerator<'p> {
         }
         if self.used_externs.iter().any(|s| s == "tie_table_at_bool") {
             self.out.push_str("declare i1 @tie_table_at_bool(ptr, i64, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_table_at_ptr") {
+            self.out.push_str("declare ptr @tie_table_at_ptr(ptr, i64, ptr)\n");
         }
         // M4 补齐：动态表写入桥（下标赋值 t[i] = v）——与读取桥对称，带 ok 标志
         if self.used_externs.iter().any(|s| s == "tie_table_set_i64") {
@@ -350,6 +356,25 @@ impl<'p> IrGenerator<'p> {
         }
         if self.used_externs.iter().any(|s| s == "tie_table_set_bool") {
             self.out.push_str("declare void @tie_table_set_bool(ptr, i64, i1, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_table_set_ptr") {
+            self.out.push_str("declare void @tie_table_set_ptr(ptr, i64, ptr, ptr)\n");
+        }
+        // E3 键值表（map）桥：16 字节元素（键指针 + 8 字节值）动态表
+        if self.used_externs.iter().any(|s| s == "tie_map_new") {
+            self.out.push_str("declare ptr @tie_map_new()\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_map_get") {
+            self.out.push_str("declare i64 @tie_map_get(ptr, ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_map_get_string") {
+            self.out.push_str("declare ptr @tie_map_get_string(ptr, ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_map_set") {
+            self.out.push_str("declare void @tie_map_set(ptr, ptr, i64, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_map_set_string") {
+            self.out.push_str("declare void @tie_map_set_string(ptr, ptr, ptr, ptr)\n");
         }
         // ---------- M4 补齐：系统能力原语 C ABI 桥声明 ----------
         // 与 crates/tie-interp/src/lib.rs 的 #[unsafe(no_mangle)] 导出一一对应。
@@ -927,6 +952,72 @@ impl<'p> IrGenerator<'p> {
                 message: "内部错误：下标赋值的目标不是 Index（函数 {}）".into(),
             });
         };
+        // E3 键值表下标赋值：m["key"] = v → tie_map_set / tie_map_set_string。
+        // 必须在整数下标扩展之前判定（字符串键不能被 sext 成 i64——死代码会生成
+        // 非法 IR）。base 语义类型是 map（下标是字符串键，值按 map<T> 值类型选桥）。
+        if matches!(self.sem_ty_of(base), Some(t) if t.is_map()) {
+            let (mptr, _m_ty) = self.gen_expr(base)?;
+            let (k, _k_ty) = self.gen_expr(index)?;
+            let val_ty = self
+                .sem_ty_of(base)
+                .and_then(|t| t.map_val_ty().cloned())
+                .unwrap_or(TypeSpec::Named(TyKw::I64));
+            let is_str_val = matches!(val_ty, TypeSpec::Named(TyKw::Str));
+            self.mark_used(if is_str_val { "tie_map_set_string" } else { "tie_map_set" });
+            // 求右值（普通或复合）
+            let new_val = match ia.op {
+                None => {
+                    let (v, _t) = self.gen_expr(&ia.value)?;
+                    v
+                }
+                Some(op) => {
+                    // 复合赋值：读旧值（map_get 带 ok；键不存在 → 运行时错误）
+                    self.mark_used(if is_str_val { "tie_map_get_string" } else { "tie_map_get" });
+                    let ok = self.emit_alloca("i1");
+                    self.line(&format!("store i1 1, ptr {ok}"));
+                    let old = self.new_reg();
+                    self.line(&format!(
+                        "{old} = call {} @{}(ptr {mptr}, ptr {k}, ptr {ok})",
+                        if is_str_val { "ptr" } else { "i64" },
+                        if is_str_val { "tie_map_get_string" } else { "tie_map_get" }
+                    ));
+                    let okv = self.new_reg();
+                    self.line(&format!("{okv} = load i1, ptr {ok}"));
+                    let ok_label = self.new_label("map_assign.ok");
+                    let err_label = self.new_label("map_assign.err");
+                    self.line(&format!("br i1 {okv}, label %{ok_label}, label %{err_label}"));
+                    self.block_start(&err_label);
+                    self.gen_runtime_error("运行时错误: map_get 键不存在：'%s'", &[("ptr", k.clone())]);
+                    self.block_end();
+                    self.block_start(&ok_label);
+                    let (rv, _rty) = self.gen_expr(&ia.value)?;
+                    let lhs_is_str = is_str_val;
+                    let rhs_unsigned = matches!(
+                        self.sem_ty_of(&ia.value),
+                        Some(TypeSpec::Named(TyKw::U8 | TyKw::U16 | TyKw::U32 | TyKw::U64))
+                    );
+                    let (res, _t) = self.gen_binary_on_regs(
+                        op,
+                        lhs_is_str,
+                        old,
+                        if is_str_val { "ptr" } else { "i64" },
+                        rv,
+                        rhs_unsigned,
+                    )?;
+                    res
+                }
+            };
+            let ok = self.emit_alloca("i1");
+            self.line(&format!("store i1 1, ptr {ok}"));
+            if is_str_val {
+                self.line(&format!(
+                    "call void @tie_map_set_string(ptr {mptr}, ptr {k}, ptr {new_val}, ptr {ok})"
+                ));
+            } else {
+                self.line(&format!("call void @tie_map_set(ptr {mptr}, ptr {k}, i64 {new_val}, ptr {ok})"));
+            }
+            return Ok(());
+        }
         // 下标值：i64
         let (idx_val, idx_ty) = self.gen_expr(index)?;
         let idx_val = self.extend_int_to_i64(&idx_val, idx_ty, index)?;
@@ -941,18 +1032,21 @@ impl<'p> IrGenerator<'p> {
         })?;
         let base_ptr = bind.value;
         let base_ty = bind.ty;
-        // 动态表：tie_table_set_* 桥写入
-        let is_dynamic = self
-            .sem
-            .table_vars
-            .get(&(self.cur_fn.clone(), name.clone()))
-            .map(|info| info.dynamic)
-            .unwrap_or(false);
+        // 动态表：tie_table_set_* 桥写入。
+        // E1：**未登记** table_vars 的表变量（循环变量/下标链推导的表）同样按动态
+        // 表处理；已登记的定长表变量（dynamic=false）走数组 GEP。
+        let tv = self.sem.table_vars.get(&(self.cur_fn.clone(), name.clone()));
+        let is_dynamic = tv.map(|info| info.dynamic).unwrap_or(false)
+            || (tv.is_none() && matches!(self.sem_ty_of(base), Some(t) if t.is_table() || t.is_map()));
         if is_dynamic {
-            // 元素类型
-            let elem_ty = self.dyn_table_elem_ty(base)?;
+            // 元素类型（E1 未登记表变量：取语义推导类型的元素类型）
+            let elem_ty = if let Some(t) = self.sem_ty_of(base) {
+                t.table_elem_ty().cloned().unwrap_or(t)
+            } else {
+                self.dyn_table_elem_ty(base)?
+            };
             let elem_llvm = self.llvm_ty(&elem_ty);
-            let suffix = table_elem_suffix(elem_llvm);
+            let suffix = self.table_bridge_suffix(&elem_ty);
             self.mark_used(&format!("tie_table_set_{suffix}"));
             // t 是 alloca ptr → load 表指针
             let tptr = self.new_reg();
@@ -1061,6 +1155,8 @@ impl<'p> IrGenerator<'p> {
             .ok_or_else(|| IrError {
                 message: format!("内部错误：表变量 '{}' 缺少布局元数据", v.name),
             })?;
+        // 注：嵌套表（元素类型是表）不走到这里——语义层登记 dynamic=true，
+        // 分派走 gen_dyn_table_var（动态表化，元素为内层表指针，见其嵌套展开）。
         let elem_llvm = self.llvm_ty(&info.elem_ty);
         let arr_ty = format!("[{} x {}]", info.len, elem_llvm);
         let alloca = self.emit_alloca(&arr_ty);
@@ -1097,9 +1193,21 @@ impl<'p> IrGenerator<'p> {
                 message: format!("内部错误：动态表变量 '{}' 缺少布局元数据", v.name),
             })?;
         let elem_llvm = self.llvm_ty(&info.elem_ty);
-        let elem_size = match elem_llvm {
-            "i1" => 1,
-            _ => 8,
+        // E3 键值表：元素宽度 16 字节（键指针 + 8 字节值）——与 tie-interp 桥约定一致；
+        // 判定：变量标注 map / map<T>，或初始化是带字符串键的表字面量。
+        let is_map = v.ty.as_ref().map(|t| t.is_map()).unwrap_or(false)
+            || matches!(
+                &v.init,
+                Expr::TableLit { cells, .. }
+                    if cells.iter().any(|c| matches!(c.id, Some(TableId::Str(_))))
+            );
+        let elem_size = if is_map {
+            16
+        } else {
+            match elem_llvm {
+                "i1" => 1,
+                _ => 8,
+            }
         };
         // 初始化表达式决定表指针来源：
         // - 返回表的函数调用（裸调用 build_numbers(10) 或命名空间调用
@@ -1129,6 +1237,62 @@ impl<'p> IrGenerator<'p> {
                 self.mark_used("tie_table_new");
                 let t = self.new_reg();
                 self.line(&format!("{t} = call ptr @tie_table_new(i64 {elem_size})"));
+                // E3 键值表（带字符串键的表字面量）：逐对 tie_map_set 写入
+                //（键指针借用约定：字符串字面量是全局常量，比表存活更久）。
+                if is_map {
+                    let set_suffix = if matches!(info.elem_ty, TypeSpec::Named(TyKw::Str)) {
+                        "string"
+                    } else {
+                        ""
+                    };
+                    self.mark_used(if set_suffix.is_empty() {
+                        "tie_map_set"
+                    } else {
+                        "tie_map_set_string"
+                    });
+                    if let Expr::TableLit { cells, .. } = &v.init {
+                        for cell in cells {
+                            let Some(TableId::Str(key)) = &cell.id else {
+                                return Err(IrError {
+                                    message: format!(
+                                        "内部错误：键值表变量 '{}' 的元素缺少字符串键（函数 {}）",
+                                        v.name, self.cur_fn
+                                    ),
+                                });
+                            };
+                            let k = self.string_global(key);
+                            let (val, _vt) = self.gen_expr(&cell.value)?;
+                            let ok = self.emit_alloca("i1");
+                            self.line(&format!("store i1 0, ptr {ok}"));
+                            if set_suffix.is_empty() {
+                                self.line(&format!(
+                                    "call void @tie_map_set(ptr {t}, ptr @{k}, i64 {val}, ptr {ok})"
+                                ));
+                            } else {
+                                self.line(&format!(
+                                    "call void @tie_map_set_string(ptr {t}, ptr @{k}, ptr {val}, ptr {ok})"
+                                ));
+                            }
+                        }
+                    }
+                } else if let Expr::TableLit { cells, .. } = &v.init {
+                    // E1 嵌套表（元素是表，dynamic=true 走此分支）：表字面量初始化时
+                    // 逐元素递归展开为内层动态表并 push_ptr（[[0,1],[0,2]] → 外层表
+                    // 含两个内层 i64 表指针）。标量元素表（table_new_* 等）保持空表。
+                    for cell in cells {
+                        if let Expr::TableLit { cells: sub, .. } = &cell.value {
+                            let sub_t = self.gen_table_lit_arg(&cell.value, sub)?;
+                            self.line(&format!("call void @tie_table_push_ptr(ptr {t}, ptr {sub_t})"));
+                        } else {
+                            return Err(IrError {
+                                message: format!(
+                                    "内部错误：嵌套表变量 '{}' 的元素不是表字面量（函数 {}）",
+                                    v.name, self.cur_fn
+                                ),
+                            });
+                        }
+                    }
+                }
                 t
             }
         };
@@ -1216,15 +1380,17 @@ impl<'p> IrGenerator<'p> {
         }
         // 动态表遍历：`for item in t`（t 为 table_new_* 创建的动态表）。
         // 语义层 table_vars 标记 dynamic=true；循环 0..len(t)，每次 tie_table_at 读取。
+        // E1：未登记表变量（循环变量/下标链推导的表）语义推导类型是表 → 同样走此路径。
         if let Expr::Var(name) = &f.iter
             && let Some(bind) = self.lookup_var(name).cloned()
             && bind.ty == "ptr"
-            && self
+            && (self
                 .sem
                 .table_vars
                 .get(&(self.cur_fn.clone(), name.clone()))
                 .map(|info| info.dynamic)
                 .unwrap_or(false)
+                || matches!(self.sem_ty_of(&f.iter), Some(t) if t.is_table()))
         {
             return self.gen_for_dyn_table(f, &bind);
         }
@@ -1370,10 +1536,15 @@ impl<'p> IrGenerator<'p> {
         f: &tie_frontend::ast::ForStmt,
         tbl_bind: &VarBind,
     ) -> Result<(), IrError> {
-        // 元素类型：来自语义层 table_vars（动态表的 LLVM 类型恒为 "ptr"）
-        let elem_ty = self.dyn_table_elem_ty(&f.iter)?;
+        // 元素类型：来自语义层 table_vars（动态表的 LLVM 类型恒为 "ptr"）；
+        // E1 未登记表变量（循环变量）由语义推导类型取元素类型
+        let elem_ty = if let Some(t) = self.sem_ty_of(&f.iter) {
+            t.table_elem_ty().cloned().unwrap_or(t)
+        } else {
+            self.dyn_table_elem_ty(&f.iter)?
+        };
         let elem_llvm = self.llvm_ty(&elem_ty);
-        let suffix = table_elem_suffix(elem_llvm);
+        let suffix = self.table_bridge_suffix(&elem_ty);
         self.mark_used(&format!("tie_table_at_{suffix}"));
         // 表指针：变量是 alloca ptr，先 load 出表指针（在 entry 块，越界在此循环内已由 at 桥处理）
         let tptr = self.new_reg();
@@ -1948,16 +2119,65 @@ impl<'p> IrGenerator<'p> {
     /// VarBind 中保存的 alloca 指针做 GEP（与标量变量的 load 路径不同）。
     /// 字符串是 ptr 的 alloca（先 load 拿到串首指针），按字节 GEP + load + zext 成 char(i32)。
     fn gen_index(&mut self, base: &Expr, index: &Expr) -> Result<(String, &'static str), IrError> {
+        // E3 键值表下标：m["key"] → tie_map_get / tie_map_get_string（base 语义
+        // 类型是 map）。键不存在 → 运行时错误（ok 标志，与解释路径同文本）。
+        if matches!(self.sem_ty_of(base), Some(t) if t.is_map()) {
+            let (mptr, _m_ty) = self.gen_expr(base)?;
+            let (k, _k_ty) = self.gen_expr(index)?;
+            // 值类型：map<T> 的 T（string → get_string 返回 ptr；其余 → i64）
+            let val_ty = self
+                .sem_ty_of(base)
+                .and_then(|t| t.map_val_ty().cloned())
+                .unwrap_or(TypeSpec::Named(TyKw::I64));
+            let is_str_val = matches!(val_ty, TypeSpec::Named(TyKw::Str));
+            let ret_llvm = if is_str_val { "ptr" } else { "i64" };
+            self.mark_used(if is_str_val { "tie_map_get_string" } else { "tie_map_get" });
+            let ok = self.emit_alloca("i1");
+            self.line(&format!("store i1 1, ptr {ok}"));
+            let val = self.new_reg();
+            self.line(&format!(
+                "{val} = call {ret_llvm} @{} (ptr {mptr}, ptr {k}, ptr {ok})",
+                if is_str_val { "tie_map_get_string" } else { "tie_map_get" }
+            ));
+            let okv = self.new_reg();
+            self.line(&format!("{okv} = load i1, ptr {ok}"));
+            let ok_label = self.new_label("map_get.ok");
+            let err_label = self.new_label("map_get.err");
+            self.line(&format!("br i1 {okv}, label %{ok_label}, label %{err_label}"));
+            self.block_start(&err_label);
+            self.gen_runtime_error("运行时错误: map_get 键不存在：'%s'", &[("ptr", k)]);
+            self.block_end();
+            self.block_start(&ok_label);
+            return Ok((val, ret_llvm));
+        }
         // 下标值：整数（i64 直接使用，窄整数先扩展）
         let (idx_val, idx_ty) = self.gen_expr(index)?;
         let idx_val = self.extend_int_to_i64(&idx_val, idx_ty, index)?;
-        // base 是返回表的函数调用（csv.csv_cells(...)[0]）：求值得到动态表指针，
-        // 走 tie_table_at（与动态表变量同一路径；函数调用结果直接是 ptr，无需 load）。
-        if matches!(base, Expr::Call { .. } | Expr::MethodCall { .. }) {
+        // base 是返回表的函数调用（csv.csv_cells(...)[0]）或下标链（node[0][0]，
+        // E1 嵌套表）：递归求值得到动态表指针，走 tie_table_at（函数调用结果 /
+        // 内层下标结果直接是 ptr，无需 load）。
+        if matches!(base, Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Index { .. }) {
             let (tptr, _t_ty) = self.gen_expr(base)?;
-            let elem_ty = self.dyn_table_elem_ty(base)?;
+            // 元素类型：函数调用查返回表元数据；下标链查语义推导类型（infer_expr
+            // 已按表达式地址记录：node[0] 的推导类型 = 内层表的元素类型 = table<i64>，
+            // 其元素类型即本层结果——递归取型）。
+            let elem_ty = if matches!(base, Expr::Index { .. }) {
+                match self.sem_ty_of(base) {
+                    Some(t) => t.table_elem_ty().cloned().unwrap_or(t),
+                    None => {
+                        return Err(IrError {
+                            message: format!(
+                                "内部错误：下标链 base 缺少推导类型（函数 {}）",
+                                self.cur_fn
+                            ),
+                        })
+                    }
+                }
+            } else {
+                self.dyn_table_elem_ty(base)?
+            };
             let elem_llvm = self.llvm_ty(&elem_ty);
-            let suffix = table_elem_suffix(elem_llvm);
+            let suffix = self.table_bridge_suffix(&elem_ty);
             self.mark_used(&format!("tie_table_at_{suffix}"));
             let ok = self.emit_alloca("i1");
             self.line(&format!("store i1 1, ptr {ok}"));
@@ -1993,7 +2213,13 @@ impl<'p> IrGenerator<'p> {
         let base_ty = bind.ty;
         // 字符串下标：s[i] → 取第 i 个字节，zext 成 char（i32）。
         // 通过语义类型区分字符串（LLVM "ptr" 无法区分字符串与裸指针）。
-        if matches!(self.sem_ty_of(base), Some(TypeSpec::Named(TyKw::Str))) {
+        // 排除登记过 table_vars 的变量（E0 边界：string 元素表变量 scope 类型是
+        // 元素类型 Str——表身份优先，否则 ps[0] 被误当字符串取字符）。
+        let is_table_var = self
+            .sem
+            .table_vars
+            .contains_key(&(self.cur_fn.clone(), name.clone()));
+        if matches!(self.sem_ty_of(base), Some(TypeSpec::Named(TyKw::Str))) && !is_table_var {
             // 字符串变量是 alloca ptr，先 load 拿到串首指针
             let str_ptr = self.new_reg();
             self.line(&format!("{str_ptr} = load ptr, ptr {base_ptr}"));
@@ -2008,16 +2234,21 @@ impl<'p> IrGenerator<'p> {
         }
         // 动态表下标：t[i] → tie_table_at（运行时 {ptr,len,cap}，越界报错）。
         // 动态表变量绑定为 ptr，语义层 table_vars 标记 dynamic=true。
-        if self
-            .sem
-            .table_vars
-            .get(&(self.cur_fn.clone(), name.clone()))
-            .map(|info| info.dynamic)
-            .unwrap_or(false)
-        {
-            let elem_ty = self.dyn_table_elem_ty(base)?;
+        // E1：**未登记** table_vars 的表变量（循环变量/由下标推导的表变量，如
+        // `for sub in node` 的 sub、`var sub = t[i]`）语义推导类型是表 → 同样走
+        // 动态表 at 桥。注意兜底仅限未登记——标注 table<T> 的定长表变量已登记
+        // （dynamic=false，scope 类型也是 Table），必须走数组 GEP。
+        let tv = self.sem.table_vars.get(&(self.cur_fn.clone(), name.clone()));
+        let is_dynamic = tv.map(|info| info.dynamic).unwrap_or(false)
+            || (tv.is_none() && matches!(self.sem_ty_of(base), Some(t) if t.is_table()));
+        if is_dynamic {
+            let elem_ty = if let Some(t) = self.sem_ty_of(base) {
+                t.table_elem_ty().cloned().unwrap_or(t)
+            } else {
+                self.dyn_table_elem_ty(base)?
+            };
             let elem_llvm = self.llvm_ty(&elem_ty);
-            let suffix = table_elem_suffix(elem_llvm);
+            let suffix = self.table_bridge_suffix(&elem_ty);
             self.mark_used(&format!("tie_table_at_{suffix}"));
             // 表变量是 alloca ptr，先 load 出表指针
             let tptr = self.new_reg();
@@ -2514,6 +2745,9 @@ impl<'p> IrGenerator<'p> {
             }
             // 动态表变量：LLVM 类型为 ptr，语义层 table_vars 标记 dynamic=true。
             // 长度运行时求值：调用 tie_table_len。
+            // E1：**未登记** table_vars 的表/键值表变量（循环变量/下标推导的表，
+            // 如 `var sub = t[i]` 的 sub）语义推导类型是表 → 同样运行时求值
+            //（否则误入 strlen 产生垃圾长度）。已登记定长表变量走上方静态分支。
             if let Expr::Var(name) = &args[0]
                 && self
                     .sem
@@ -2522,6 +2756,21 @@ impl<'p> IrGenerator<'p> {
                     .map(|info| info.dynamic)
                     .unwrap_or(false)
             {
+                let len = self.table_len_reg(&v)?;
+                return Ok((len, "i64"));
+            }
+            // E1 兜底：未登记表/键值表变量（循环变量等）与表类型表达式（len(sub)）
+            // ——按语义推导类型判定；已登记的定长表变量走上方静态长度分支。
+            let is_table_ty = matches!(self.sem_ty_of(&args[0]), Some(t) if t.is_table() || t.is_map());
+            let is_unregistered = match &args[0] {
+                Expr::Var(name) => self
+                    .sem
+                    .table_vars
+                    .get(&(self.cur_fn.clone(), name.clone()))
+                    .is_none(),
+                _ => true,
+            };
+            if is_table_ty && is_unregistered {
                 let len = self.table_len_reg(&v)?;
                 return Ok((len, "i64"));
             }
@@ -2564,7 +2813,12 @@ impl<'p> IrGenerator<'p> {
             let tptr = self.new_reg();
             self.line(&format!("{tptr} = load ptr, ptr {}", bind.value));
             let (x, x_ty) = self.gen_expr(&args[1])?;
-            let suffix = table_elem_suffix(x_ty);
+            // E1：元素是表（嵌套表 push）→ push_ptr——LLVM 类型无法区分
+            // 字符串（ptr）与表元素（ptr，内层表指针），按语义类型选择桥
+            let suffix = match self.sem_ty_of(&args[1]) {
+                Some(t) if t.is_table() => "ptr",
+                _ => table_elem_suffix(x_ty),
+            };
             self.mark_used(&format!("tie_table_push_{suffix}"));
             self.line(&format!("call void @tie_table_push_{suffix}(ptr {tptr}, {x_ty} {x})"));
             return Ok((String::new(), "void"));
@@ -2577,7 +2831,7 @@ impl<'p> IrGenerator<'p> {
             // 元素类型来自语义元数据（表变量查 table_vars，返回表的函数查 table_ret_elems）
             let elem_ty = self.dyn_table_elem_ty(&args[0])?;
             let elem_llvm = self.llvm_ty(&elem_ty);
-            let suffix = table_elem_suffix(elem_llvm);
+            let suffix = self.table_bridge_suffix(&elem_ty);
             self.mark_used(&format!("tie_table_at_{suffix}"));
             // ok 标志：alloca i1，桥函数越界时置 0
             let ok = self.emit_alloca("i1");
@@ -3461,12 +3715,17 @@ impl<'p> IrGenerator<'p> {
                 arg_list.push(format!("ptr {ptr}"));
                 continue;
             }
-            // 表字面量实参：table 形参在 LLVM 中是不透明 ptr（动态表），
-            // 与定长表变量声明的数组布局不同，这里按动态表构造
-            // （tie_table_new + 逐元素 tie_table_push_*），返回表指针。
-            // 元素类型/长度来自语义布局元数据（infer_expr 已按表达式地址记录）。
+            // 表实参：table 形参在 LLVM 中是不透明 ptr（动态表），与定长表变量
+            // 声明的数组布局不同——统一按动态表构造/转换（tie_table_new +
+            // 逐元素 tie_table_push_*），返回表指针。
+            // - 表字面量实参：元素类型/长度来自语义布局元数据（gen_table_lit_arg）；
+            // - 表变量实参（E0 补齐）：定长表变量展开为动态表，动态表变量直接传
+            //   （gen_table_var_arg）。非表形参的 Var 实参仍走普通求值。
             let (v, _t) = if let Expr::TableLit { cells, .. } = a {
                 (self.gen_table_lit_arg(a, cells)?, "ptr")
+            } else if want_ty.is_table() && matches!(a, Expr::Var(_)) {
+                let Expr::Var(vname) = a else { unreachable!() };
+                (self.gen_table_var_arg(vname)?, "ptr")
             } else {
                 self.gen_expr(a)?
             };
@@ -3509,8 +3768,68 @@ impl<'p> IrGenerator<'p> {
         }
     }
 
-    /// 表字面量实参 → 动态表构造（tie_table_new + 逐元素 tie_table_push_*）。
+    /// 表变量实参 → 动态表（A6 补齐：定长表变量路径）。
     ///
+    /// 背景：表形参 LLVM 类型恒为 ptr（动态表指针），而定长表变量（表字面量
+    /// 初始化）布局是 `[N x T]` 数组（gen_table_var）。若按普通 Var 求值，
+    /// 会把数组值直接传给 ptr 形参 → IR 类型错误（`[N x i64]` 与 ptr 不匹配，
+    /// opt 阶段报 "defined with type but expected ptr"）。
+    ///
+    /// 处理：
+    /// - 动态表变量（table_new_* 初始化，绑定 ty = ptr）：load 表指针直接传；
+    /// - 定长表变量（绑定 ty = `[N x T]`）：按声明布局逐元素展开为动态表
+    ///   （tie_table_new + 逐元素 push，与字面量实参 gen_table_lit_arg 同路径，
+    ///   保证 interp/IR 两路径对表实参行为一致）。
+    fn gen_table_var_arg(&mut self, name: &str) -> Result<String, IrError> {
+        let bind = self.lookup_var(name).cloned().ok_or_else(|| IrError {
+            message: format!("内部错误：变量 '{name}' 未入作用域（函数 {}）", self.cur_fn),
+        })?;
+        // 动态表变量：绑定槽是 alloca ptr（存表指针），load 出表指针直接传
+        if bind.ty == "ptr" {
+            let t = self.new_reg();
+            self.line(&format!("{t} = load ptr, ptr {}", bind.value));
+            return Ok(t);
+        }
+        // 定长表变量：`[N x T]` 数组布局 → 展开为动态表
+        let Some((len, elem_llvm)) = parse_array_shape(&bind.ty) else {
+            return Err(IrError {
+                message: format!(
+                    "内部错误：表变量 '{name}' 布局异常（{}，函数 {}）",
+                    bind.ty, self.cur_fn
+                ),
+            });
+        };
+        let elem_size = if elem_llvm == "i1" { 1 } else { 8 };
+        let suffix = table_elem_suffix(elem_llvm);
+        self.mark_used("tie_table_new");
+        self.mark_used(&format!("tie_table_push_{suffix}"));
+        let t = self.new_reg();
+        self.line(&format!("{t} = call ptr @tie_table_new(i64 {elem_size})"));
+        let arr_ty = bind.ty;
+        for i in 0..len {
+            let p = self.new_reg();
+            self.line(&format!("{p} = getelementptr {arr_ty}, ptr {}, i64 0, i64 {i}", bind.value));
+            let v = self.new_reg();
+            self.line(&format!("{v} = load {elem_llvm}, ptr {p}"));
+            self.line(&format!("call void @tie_table_push_{suffix}(ptr {t}, {elem_llvm} {v})"));
+        }
+        Ok(t)
+    }
+
+    /// 表元素类型的桥后缀（E1）：元素是表（嵌套表）→ "ptr"（tie_table_at_ptr/
+    /// push_ptr/set_ptr）；字符串 → "string"；其余按 LLVM 元素类型映射。
+    ///
+    /// 与 table_elem_suffix(llvm_ty) 的区别：LLVM 类型无法区分字符串（ptr）与
+    /// 表元素（ptr，内层表指针）——必须按语义元素类型选桥。
+    fn table_bridge_suffix(&mut self, elem_ty: &TypeSpec) -> &'static str {
+        if elem_ty.is_table() {
+            "ptr"
+        } else {
+            table_elem_suffix(self.llvm_ty(elem_ty))
+        }
+    }
+
+    /// 表字面量实参 → 动态表构造（tie_table_new + 逐元素 tie_table_push_*）。    ///
     /// 背景：table 形参在 LLVM 中是不透明 ptr（运行时 {ptr,len,cap} 结构，见
     /// llvm_ty 的 Named(Table) => "ptr"），与定长表变量声明的数组布局
     /// `[N x T]` 不同——实参按动态表传递，函数体内用 table_len / table_at /
@@ -3524,12 +3843,52 @@ impl<'p> IrGenerator<'p> {
         // 查语义布局元数据（元素类型 + 长度）；空表可能无记录，按 i64 空表兜底
         let key = expr as *const Expr as usize;
         let info = self.sem.tables.get(&key);
+        // E3 键值表实参：cell 带字符串键 → tie_table_new(16) + tie_map_set 序列
+        //（与 gen_dyn_table_var 的 map 展开同构；键是全局常量借用指针）。
+        if cells.iter().any(|c| matches!(c.id, Some(TableId::Str(_)))) {
+            let val_is_str = matches!(
+                info.map(|i| &i.elem_ty),
+                Some(TypeSpec::Named(TyKw::Str))
+            );
+            self.mark_used("tie_table_new");
+            self.mark_used(if val_is_str { "tie_map_set_string" } else { "tie_map_set" });
+            let t = self.new_reg();
+            self.line(&format!("{t} = call ptr @tie_table_new(i64 16)"));
+            for cell in cells {
+                let Some(TableId::Str(kname)) = &cell.id else {
+                    return Err(IrError {
+                        message: format!(
+                            "内部错误：键值表实参的元素缺少字符串键（函数 {}）",
+                            self.cur_fn
+                        ),
+                    });
+                };
+                let k = self.string_global(kname);
+                let (val, _vt) = self.gen_expr(&cell.value)?;
+                let ok = self.emit_alloca("i1");
+                self.line(&format!("store i1 1, ptr {ok}"));
+                if val_is_str {
+                    self.line(&format!(
+                        "call void @tie_map_set_string(ptr {t}, ptr @{k}, ptr {val}, ptr {ok})"
+                    ));
+                } else {
+                    self.line(&format!(
+                        "call void @tie_map_set(ptr {t}, ptr @{k}, i64 {val}, ptr {ok})"
+                    ));
+                }
+            }
+            return Ok(t);
+        }
         let elem_llvm = match info {
             Some(i) => self.llvm_ty(&i.elem_ty),
             None => "i64",
         };
         let elem_size = if elem_llvm == "i1" { 1 } else { 8 };
-        let suffix = table_elem_suffix(elem_llvm);
+        // E1：桥后缀按语义元素类型选择（表元素 → push_ptr，字符串 → push_string）
+        let suffix = match info {
+            Some(i) => self.table_bridge_suffix(&i.elem_ty),
+            None => "i64",
+        };
         // 新建空动态表
         self.mark_used("tie_table_new");
         let t = self.new_reg();
@@ -3537,8 +3896,14 @@ impl<'p> IrGenerator<'p> {
         // 逐元素求值并 push（元素值 LLVM 类型与桥参数类型一致）
         self.mark_used(&format!("tie_table_push_{suffix}"));
         for cell in cells {
-            let (v, _vt) = self.gen_expr(&cell.value)?;
-            self.line(&format!("call void @tie_table_push_{suffix}(ptr {t}, {elem_llvm} {v})"));
+            // E1 嵌套表：元素是表字面量 → 递归展开为内层动态表，外层 push_ptr
+            if let Expr::TableLit { cells: sub, .. } = &cell.value {
+                let sub_t = self.gen_table_lit_arg(&cell.value, sub)?;
+                self.line(&format!("call void @tie_table_push_ptr(ptr {t}, ptr {sub_t})"));
+            } else {
+                let (v, _vt) = self.gen_expr(&cell.value)?;
+                self.line(&format!("call void @tie_table_push_{suffix}(ptr {t}, {elem_llvm} {v})"));
+            }
         }
         Ok(t)
     }
@@ -4134,6 +4499,9 @@ impl<'p> IrGenerator<'p> {
             // 定长表（字面量）不经过此路径（gen_table_var 直接按数组类型布局）。
             // table<T>（A1）：与裸 table 同（编译期元素类型不影响 LLVM 表示）。
             TypeSpec::Named(TyKw::Table) | TypeSpec::Table(_) => "ptr",
+            // 键值表（E3）：运行时动态表（16 字节元素：键指针+值），IR 层同以不透明
+            // 指针持有；map<T> 与裸 map 同（值类型只影响桥选择）。
+            TypeSpec::Named(TyKw::Map) | TypeSpec::Map(_) => "ptr",
             TypeSpec::Named(_) => t.llvm_ty(),
             TypeSpec::Tuple(fields) => {
                 let inner: Vec<&str> = fields.iter().map(|f| self.llvm_ty(&f.ty)).collect();
@@ -4234,6 +4602,7 @@ fn type_name_of(t: &TypeSpec) -> &'static str {
         TypeSpec::Tuple(_) => "元组",
         TypeSpec::Struct(_) => "struct",
         TypeSpec::Table(_) => "table<T>",
+        TypeSpec::Map(_) => "map<T>",
     }
 }
 

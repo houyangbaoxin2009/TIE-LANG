@@ -22,6 +22,10 @@ pub enum TypeSpec {
     /// 编译期概念（与 `table` 裸类型同语义），元素类型供表参数/动态表的布局推断——
     /// 函数内对表参数 `t[i]` 下标访问/遍历据此确定元素类型。
     Table(Box<TypeSpec>),
+    /// 键值表类型 `map<T>`（E3）：键恒为字符串，T 为值类型（i64/string）。
+    /// 编译期概念——运行时是 16 字节元素的动态表（键指针 + 8 字节值），
+    /// 下标访问 `m["key"]` 走 map_get/map_set 桥；`map` 裸类型 = map<i64>。
+    Map(Box<TypeSpec>),
 }
 
 /// 元组的一个字段：可选字段名 + 类型（名字进类型，供 `.x` 命名访问）。
@@ -63,9 +67,9 @@ impl TypeSpec {
             TypeSpec::Named(TyKw::Str) => "ptr",
             TypeSpec::Named(TyKw::Void) => "void",
             // 编译期类型，IR 生成阶段不应出现（前端应已展开/校验）。
-            TypeSpec::Named(TyKw::Code | TyKw::Num | TyKw::Text | TyKw::Misc | TyKw::Table) => {
+            TypeSpec::Named(TyKw::Code | TyKw::Num | TyKw::Text | TyKw::Misc | TyKw::Table | TyKw::Map) => {
                 unreachable!(
-                    "code/num/text/misc/table 是编译期类型，语义分析阶段应已展开为具体类型"
+                    "code/num/text/misc/table/map 是编译期类型，语义分析阶段应已展开为具体类型"
                 )
             }
             TypeSpec::Tuple(_) => {
@@ -77,6 +81,10 @@ impl TypeSpec {
             // table<T>（A1）：编译期概念，与 table 裸类型一致
             TypeSpec::Table(_) => {
                 unreachable!("table<T> 是编译期类型，语义分析阶段应已展开为动态表指针")
+            }
+            // map<T>（E3）：编译期概念，与 map 裸类型一致
+            TypeSpec::Map(_) => {
+                unreachable!("map<T> 是编译期类型，语义分析阶段应已展开为动态表指针")
             }
         }
     }
@@ -109,6 +117,19 @@ impl TypeSpec {
     /// 是否为表类型（table，代表数组与高级数组；含 table<T>，A1）。
     pub fn is_table(&self) -> bool {
         matches!(self, TypeSpec::Named(TyKw::Table) | TypeSpec::Table(_))
+    }
+
+    /// 是否为键值表类型（map；含 map<T>，E3）。
+    pub fn is_map(&self) -> bool {
+        matches!(self, TypeSpec::Named(TyKw::Map) | TypeSpec::Map(_))
+    }
+
+    /// 键值表值类型：map<T> 返回 T；map 裸类型返回 None（约定为 i64 由语义层补充）。
+    pub fn map_val_ty(&self) -> Option<&TypeSpec> {
+        match self {
+            TypeSpec::Map(val) => Some(val),
+            _ => None,
+        }
     }
 
     /// 表元素类型：table<T> 返回 T；table 裸类型返回 None（约定为 string 由语义层补充）。

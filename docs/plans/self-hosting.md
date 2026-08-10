@@ -43,19 +43,22 @@
 
 `tie-lsp` 与 `tie` 主入口可顺带自举（复用重写后的前端），但不作为自举的核心验收指标。
 
-## 2. 语言能力障碍与决策记录（2026-08-09 定）
+## 2. 语言能力障碍与决策记录（2026-08-09 定，2026-08-10 状态更新）
 
 重写编译器前，先补齐 tie 语言自身缺失的能力。以下决策已选定方案：
 
 | 编号 | 障碍 | 决策方案 | 状态 |
 | --- | --- | --- | --- |
-| A1/A6 | 表参数元素类型静态未知（`func f(t: table)` 无法知道元素是 i64 还是 string） | **A1 `table<T>` 类型参数** + **A6 实参先求值到临时动态表修拼接 UB** | 规划 |
-| B1 | 无 enum（编译器 AST 需要标签联合） | **tag 表 AST**：节点 = `[0]=tag, [1..]=字段` 的表，判别用 `switch` | 规划 |
-| C1 | 无函数指针（编译器各阶段需要分派回调） | **字符串分派表**：`table<string>` 存函数名 + `switch` 展开；`eval_call` 兜底 | 规划 |
-| D3 | 字符串 id 表不可用（`["a":1]` 语义未实现） | **排序数组 + 二分查找**（`std/sort.tie` 过渡）+ 后续 D1 完整字典 | 规划 |
-| E1/E5 | 无 `continue`/`break`（重写循环逻辑不可用） | **E1 `break`/`continue` 语句** + **E5 标签跳转**（`break L`/`continue L`） | E1 已实现，E5 规划 |
-| F1 | LLVM alloca 栈溢出（深层递归生成 IR 时 alloca 堆积在非 entry block） | **alloca 提升到 entry block** | 规划 |
-| C5 | switch 整数 case 生成低效分支 | **switch 整数 case 生成 LLVM `switch` 指令** | 规划（附增） |
+| A1/A6 | 表参数元素类型静态未知（`func f(t: table)` 无法知道元素是 i64 还是 string） | **A1 `table<T>` 类型参数** + **A6 实参先求值到临时动态表修拼接 UB** | ✅ 完成（E0 补定长表变量实参缺陷） |
+| B1 | 无 enum（编译器 AST 需要标签联合） | **tag 表 AST**：节点 = `[0]=tag, [1..]=字段` 的表，判别用 `switch` | 📋 规划（前提已就绪：E1 嵌套表 + E3 键值表，编码按 §3.5 修订） |
+| C1 | 无函数指针（编译器各阶段需要分派回调） | **字符串分派表**：`table<string>` 存函数名 + `switch` 展开；`eval_call` 兜底 | 📋 规划（前提已就绪：E3 map 可存分派表，字符串 switch 已支持） |
+| D3 | 字符串 id 表不可用（`["a":1]` 语义未实现） | **排序数组 + 二分查找**（`std/sort.tie` 过渡）+ 后续 E3 完整字典 | ✅ 完成（E3 键值表 map 已落地——符号表可直接用 map，D3 过渡仍可用） |
+| E1/E5 | 无 `continue`/`break`（重写循环逻辑不可用） | **E1 `break`/`continue` 语句** + **E5 标签跳转**（`break L`/`continue L`） | ✅ 完成 |
+| F1 | LLVM alloca 栈溢出（深层递归生成 IR 时 alloca 堆积在非 entry block） | **alloca 提升到 entry block** | ✅ 完成 |
+| C5 | switch 整数 case 生成低效分支 | **switch 整数 case 生成 LLVM `switch` 指令** | ✅ 完成 |
+| E0 | 定长表变量实参 IR 缺陷（`[N x T]` 数组直接传 ptr 形参） | **定长表变量实参展开为动态表**（与 A6 字面量同路径） | ✅ 完成（2026-08-10） |
+| E1' | 无嵌套表（AST 树形结构无法表表达） | **嵌套表 `table<table<T>>`**：元素类型可递归为表，`>>` 闭括号分裂 | ✅ 完成（2026-08-10） |
+| E3 | 无键值表（`["a":1]` 语义未实现） | **键值表 `map`/`map<T>`**：字面量/下标读写/实参，16 字节元素动态表 | ✅ 完成（2026-08-10） |
 
 ### 2.1 A1/A6 表参数元素类型静态未知
 
@@ -298,6 +301,61 @@ func main() {
    利于 interp/IR 两路径共享同一棵 AST）；
 6. **符号表/元数据分离**：tag 表只承载结构；类型推导结果、span、绑定信息
    存在旁路表（按节点 id 索引），不污染 AST 本体。
+
+### 3.5 实测修订（2026-08-10）：混合表与表套表的语言边界
+
+原 §3.1 假设「节点 = 一张表，字段可混合类型、子节点即嵌套表」。实测（用
+tie-llvm 编译验证）发现两条**语言硬约束**，编码方案据此修订：
+
+| 假设 | 实测结果 | 结论 |
+| --- | --- | --- |
+| 混合元素表字面量 `[5, "add", [...]]`（i64+string+表） | 语义层拒绝：「表是元素同构的容器」（即使标注 `: table`） | 节点不能直接混合字段类型 |
+| 表套表 `[[0,1],[0,2]]` 后 `node[0][0]` 二级下标 | 元素类型被拍平为内层标量（i64），二级下标报错 | 嵌套表下标链当时不可用 |
+
+**修订编码（已就绪的语言能力支撑，示例见 examples/table_enhance_demo.tie）**：
+
+1. **节点池 = 列式并行表（arena）**：所有节点扁平存储，**节点 id = 表下标**。
+   每字段一张同构表——天然满足「表元素同构」硬约束，且下标访问 O(1)：
+
+   ```tie
+   var node_tags: table<i64>             // 节点 id → tag（判别键）
+   var node_names: table<i64>            // 节点 id → 字符串池 id（-1 = 无）
+   var node_vals: table<i64>             // 节点 id → 整数值字段（字面量值/运算符编号）
+   var node_children: table<table<i64>>  // 节点 id → 子节点 id 列表（**嵌套表**）
+   ```
+
+   - 判别：`switch node_tags[id]`（C5 跳转表）；
+   - 子节点：`var child = node_children[id][i]` → `node_tags[child]` 递归（E1 下标链）；
+   - 字符串字段：存「字符串池 id」（`map` 或 `table<string>` 池，E3）；
+   - 增删节点 = push 各列（下标对齐），节点 id 即下标，天然稳定。
+
+2. **嵌套表 `table<table<i64>>` 的落点**：子节点 id 列表（`node_children`）——
+   元素全是 i64 表的嵌套表，编译/解释双路径实测可用（`node_children[id][i]` 链）；
+   不再作为「节点内部字段」（节点字段全 i64 标量）。
+
+3. **键值表 map（E3）直接可用**：符号表/关键字表/字符串池用 `map`（`m["add"]`
+   下标读写、`len(m)`、作实参传递全支持）——D3 排序数组过渡方案可平滑升级。
+
+4. **tag 编号表（§3.2）不变**：tag 是 i64 恒存 `node_tags[id]`，判别 `switch`
+   走 C5 跳转表。
+
+**修订后的节点访问（权威示例，与 examples/table_enhance_demo.tie 一致）**：
+
+```tie
+// Call("add", [IntLit(1), IntLit(2)]) 的列式编码：
+//   node_tags  = [5, 0, 0, 0]        // 0:Call  1..3:IntLit
+//   node_names = [0, -1, -1, -1]     // Call 的字符串池 id = 0（"add"）
+//   node_vals  = [-1, 42, 1, 2]      // IntLit 值
+//   node_children = [[1, 2], [], [], []]  // Call 的子节点 id 表（嵌套表）
+var call_id = 0
+var tag = node_tags[call_id]              // 5 → 判别
+var name = pool_names[node_names[call_id]] // "add"（池还原）
+var first_child_val = node_vals[node_children[call_id][0]]  // 1（E1 嵌套链）
+```
+
+> 结论：**B1 全部语言前提已就绪**——嵌套表（E1）、键值表（E3）、`>>` 类型参数
+> 分裂、递归函数、break/continue、alloca 栈安全。阶段 2（lexer/parser/semantic/IR
+> 用 tie 重写）可直接开工。
 
 ## 4. C1 字符串分派模式
 

@@ -888,11 +888,25 @@ impl Analyzer {
                                         message: "字符串 id 表（[\"a\":1]）的运行时留待 M3，当前仅支持数字下标".into(),
                                     });
                                 }
-                                // 记录布局元数据：元素类型 = init 推导类型，长度 = 元素个数
+                                // 记录布局元数据：元素类型 = 表字面量登记的元素类型
+                                // （E1 嵌套表：[[0,1],[0,2]] 的元素类型是 table<i64>，
+                                // 查 tables 元数据而非 init_ty——后者是整表类型），长度 = 元素个数
+                                let elem_ty = if let Some(ti) =
+                                    self.result.tables.get(&addr_of(&v.init))
+                                {
+                                    ti.elem_ty.clone()
+                                } else {
+                                    init_ty.clone()
+                                };
                                 let info = TableInfo {
-                                    elem_ty: init_ty.clone(),
+                                    elem_ty,
                                     len: cells.len(),
-                                    dynamic: false,
+                                    // E1 嵌套表：动态表化（元素是指针，见 TableLit 推断）
+                                    dynamic: matches!(
+                                        &v.init,
+                                        Expr::TableLit { cells, .. }
+                                            if matches!(&cells.first().map(|c| &c.value), Some(Expr::TableLit { .. }))
+                                    ),
                                 };
                                 self.result.tables.insert(addr_of(&v.init), info.clone());
                                 // 变量名 → 布局（下标访问/遍历时按变量名查询元素类型）
@@ -913,6 +927,24 @@ impl Analyzer {
                             }
                             // scope 存 Table 标记（表是容器，不是普通值）
                             scope.insert(v.name.clone(), TypeSpec::Named(TyKw::Table));
+                        } else if d.is_map() {
+                            // E3 键值表（map/map<T>）：登记布局元数据——值类型 + 
+                            // dynamic=true（运行时动态表，16 字节元素：键指针 + 值）。
+                            // 值类型取字面量元数据；无字面量（空 map 构造等）取标注值类型。
+                            let val_ty = if let Some(ti) = self.result.tables.get(&addr_of(&v.init)) {
+                                ti.elem_ty.clone()
+                            } else {
+                                d.map_val_ty()
+                                    .cloned()
+                                    .unwrap_or(TypeSpec::Named(TyKw::I64))
+                            };
+                            let info = TableInfo { elem_ty: val_ty, len: 0, dynamic: true };
+                            self.table_vars
+                                .insert((self.cur_fn.clone(), v.name.clone()), info.clone());
+                            self.result
+                                .table_vars
+                                .insert((self.cur_fn.clone(), v.name.clone()), info);
+                            scope.insert(v.name.clone(), d.clone());
                         } else if !types_match(d, &init_ty, Some(&v.init)) {
                             return Err(SemanticError {
                                 span: v.span,
@@ -957,15 +989,28 @@ impl Analyzer {
                                 .insert((self.cur_fn.clone(), v.name.clone()), info);
                         } else if let Expr::TableLit { cells, .. } = &v.init {
                             // 未标注表字面量：`var arr = [1,2,3]`（init_ty 是元素类型）。
-                            // 登记 table_vars 元数据（定长、元素类型 = 首个元素类型），
-                            // 使下标访问/下标赋值（t[i]=v）能定位表身份与元素类型。
-                            // scope 存元素类型（既有行为，保持 IR 定长表布局一致）。
+                            // 登记 table_vars 元数据（定长、元素类型 = 表字面量登记的元素
+                            // 类型——E1 嵌套表时从 tables 元数据取，避免把整表类型当元素
+                            // 类型），使下标访问/下标赋值（t[i]=v）能定位表身份与元素类型。
+                            // scope 存 init_ty（嵌套表时是表类型），保持 IR 布局一致。
                             let elem_ty = if cells.is_empty() {
                                 TypeSpec::Named(TyKw::I64)
+                            } else if let Some(ti) = self.result.tables.get(&addr_of(&v.init)) {
+                                ti.elem_ty.clone()
                             } else {
                                 init_ty.clone()
                             };
-                            let info = TableInfo { elem_ty, len: cells.len(), dynamic: false };
+                            let info = TableInfo {
+                                elem_ty,
+                                len: cells.len(),
+                                // E1/E3：嵌套表（元素是表）与键值表（带字符串键）都
+                                // 动态表化——嵌套表元素是指针走 ptr 桥；键值表是
+                                // 16 字节元素（键指针+值）走 map 桥。
+                                dynamic: matches!(
+                                    cells.first().map(|c| &c.value),
+                                    Some(Expr::TableLit { .. })
+                                ) || cells.iter().any(|c| matches!(c.id, Some(TableId::Str(_)))),
+                            };
                             self.table_vars
                                 .insert((self.cur_fn.clone(), v.name.clone()), info.clone());
                             self.result
@@ -1148,26 +1193,30 @@ impl Analyzer {
                 let iter_ty = self.infer_expr(&f.iter, scope)?;
                 self.result.expr_types.insert(addr_of(&f.iter), iter_ty.clone());
                 let elem_ty = if iter_ty.is_table() {
-                    // 表遍历：循环变量类型 = 表的元素类型
+                    // 表遍历：循环变量类型 = 表的元素类型。
+                    // E1：未登记表变量（循环变量/下标链推导的表，如 `for x in sub`）
+                    // 由 iter 的推导类型取元素类型兜底。
                     match &f.iter {
                         Expr::Var(name) => {
                             let key = (self.cur_fn.clone(), name.clone());
                             match self.table_vars.get(&key) {
                                 Some(info) => info.elem_ty.clone(),
-                                None => {
-                                    return Err(SemanticError {
-                                        span: f.span,
-                                        message: format!("遍历的表 '{name}' 缺少布局元数据（内部错误）"),
-                                    })
-                                }
+                                None => iter_ty
+                                    .table_elem_ty()
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        // 防御：is_table 已保证（Named(Table) 无元素类型时按 i64）
+                                        TypeSpec::Named(TyKw::I64)
+                                    }),
                             }
                         }
-                        _ => {
-                            return Err(SemanticError {
-                                span: f.span,
-                                message: "表遍历仅支持表变量（内联表字面量遍历留待后续）".into(),
-                            })
-                        }
+                        _ => iter_ty
+                            .table_elem_ty()
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                // 防御：同上
+                                TypeSpec::Named(TyKw::I64)
+                            }),
                     }
                 } else if matches!(f.iter, Expr::Range { .. }) {
                     TypeSpec::Named(TyKw::I64)
@@ -1380,17 +1429,56 @@ impl Analyzer {
                 // 表下标赋值（M4 补齐）：`t[i] = v`——target 是 Index 链
                 //（`t[i]` / `t[i][j]`）。校验：base 是表、下标是整数、
                 // 值类型与表元素类型匹配、复合赋值按运算符规则。
+                // E3 键值表：`m["key"] = v`——base 是 map、下标是字符串键。
                 let Expr::Index { base, index, .. } = ia.target.as_ref() else {
                     return Err(SemanticError {
                         span: ia.span,
                         message: "下标赋值的目标必须是表元素访问（t[i]）".into(),
                     });
                 };
+                // 0) 键值表下标赋值：base 推导类型是 map → 键必须是字符串、值类型匹配
+                let base_ty0 = self.infer_expr(base, scope)?;
+                self.result.expr_types.insert(addr_of(base), base_ty0.clone());
+                if base_ty0.is_map() {
+                    let idx_ty = self.infer_expr(index, scope)?;
+                    self.result.expr_types.insert(addr_of(index), idx_ty.clone());
+                    if !matches!(&idx_ty, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(index),
+                            message: format!("键值表下标必须是字符串键，实际是 {}", type_name(&idx_ty)),
+                        });
+                    }
+                    let val_ty = base_ty0
+                        .map_val_ty()
+                        .cloned()
+                        .unwrap_or(TypeSpec::Named(TyKw::I64));
+                    let value_ty = self.infer_expr(&ia.value, scope)?;
+                    self.result.expr_types.insert(addr_of(&ia.value), value_ty.clone());
+                    if ia.op.is_none() && !types_match(&val_ty, &value_ty, Some(&ia.value)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&ia.value),
+                            message: format!(
+                                "键值表值类型不匹配：map 值为 {}，表达式为 {}",
+                                type_name(&val_ty),
+                                type_name(&value_ty)
+                            ),
+                        });
+                    }
+                    if ia.op.is_some() {
+                        self.check_compound_assign(
+                            &val_ty,
+                            *ia.op.as_ref().expect("ia.op 已确认 is_some"),
+                            &value_ty,
+                            &ia.value,
+                            ia.span,
+                        )?;
+                    }
+                    return Ok(());
+                }
                 // 1) base 必须是表（查 table_vars 元数据；非表 → 报错）。
                 // 注：未标注表字面量变量（var arr = [1,2,3]）在 scope 推导为元素类型
                 //（既有行为），表身份由 table_vars 元数据决定——以此为准。
-                let base_ty = self.infer_expr(base, scope)?;
-                self.result.expr_types.insert(addr_of(base), base_ty.clone());
+                let base_ty = base_ty0;
                 let is_table = if let Expr::Var(vn) = base.as_ref() {
                     self.table_vars.contains_key(&(self.cur_fn.clone(), vn.clone()))
                         || matches!(&base_ty, TypeSpec::Named(TyKw::Table))
@@ -1409,7 +1497,7 @@ impl Analyzer {
                             "下标赋值的对象必须是表，实际是 {}",
                             type_name(&base_ty)
                         ),
-                    });
+                    })
                 };
                 // 2) 下标必须是整数
                 let idx_ty = self.infer_expr(index, scope)?;
@@ -1466,16 +1554,12 @@ impl Analyzer {
                 .tables
                 .get(&addr_of(expr))
                 .map(|info| info.elem_ty.clone())),
-            // 表变量：动态表（table_new_* 构造）查 table_vars；定长表查 tables
+            // 表变量：动态表（table_new_* 构造）与定长表（表字面量）都在
+            // table_vars 登记（键 = 函数+变量名）——直接查表即可；
+            // 查不到（非表变量或未登记）返回 None（放行元素类型校验）
             Expr::Var(name) => {
                 let key = (self.cur_fn.clone(), name.clone());
-                if let Some(info) = self.table_vars.get(&key) {
-                    return Ok(Some(info.elem_ty.clone()));
-                }
-                Ok(scope
-                    .get(name)
-                    .filter(|t| t.is_table())
-                    .map(|_| TypeSpec::Named(TyKw::Str)))
+                Ok(self.table_vars.get(&key).map(|info| info.elem_ty.clone()))
             }
             // 返回表的函数调用（裸调用/命名空间调用）：查 table_ret_elems
             Expr::Call { name, .. } | Expr::MethodCall { receiver: _, method: name, .. } => {
@@ -1637,13 +1721,16 @@ impl Analyzer {
                     if matches!(&args[0], Expr::TableLit { .. }) {
                         return Ok(TypeSpec::Named(TyKw::I64));
                     }
-                    // 表变量（scope 类型为 Table / table<T>，A1）或字符串
-                    if at.is_table() || matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                    // 表/键值表变量（scope 类型为 Table / table<T> / map<T>，E3）或字符串
+                    if at.is_table() || at.is_map() || matches!(&at, TypeSpec::Named(TyKw::Str)) {
                         return Ok(TypeSpec::Named(TyKw::I64));
                     }
                     return Err(SemanticError {
                         span: expr_span_of(&args[0]),
-                        message: format!("len() 参数必须是字符串或表，实际是 {}", type_name(&at)),
+                        message: format!(
+                            "len() 参数必须是字符串、表或键值表，实际是 {}",
+                            type_name(&at)
+                        ),
                     });
                 }
                 // 内置函数 str_len：单字符串参数，返回 i64（字符串的 Unicode 码点数）。
@@ -2653,7 +2740,19 @@ impl Analyzer {
                     });
                 }
                 for (a, want) in args.iter().zip(sig.param_tys.iter()) {
-                    let at = self.infer_expr(a, scope)?;
+                    let mut at = self.infer_expr(a, scope)?;
+                    // E0/E3：表/键值表变量实参的表身份还原——未标注表字面量变量
+                    // （var arr = [1,2,3]）scope 存的是元素类型（既有行为），传参时按
+                    // table_vars 元数据还原为表/键值表类型（与字面量实参一致）。
+                    if (want.is_table() || want.is_map()) && matches!(a, Expr::Var(_)) {
+                        if let Some(elem) = self.arg_table_elem_ty(a, scope)? {
+                            at = if want.is_map() {
+                                TypeSpec::Map(Box::new(elem))
+                            } else {
+                                TypeSpec::Table(Box::new(elem))
+                            };
+                        }
+                    }
                     if !types_match(want, &at, Some(a)) {
                         return Err(SemanticError {
                             span: expr_span_of(a),
@@ -2917,8 +3016,16 @@ impl Analyzer {
             Expr::TableLit { cells, span } => {
                 // 表字面量：所有元素类型必须一致（表是元素同构的容器）。
                 // 空表视作 i64 元素（类型后续由上下文确定）。
+                // E3 键值表：cell 带字符串 id（["a":1]）→ map，值类型 = 元素值类型。
                 if cells.is_empty() {
                     return Ok(TypeSpec::Named(TyKw::I64));
+                }
+                let is_map = cells.iter().any(|c| matches!(c.id, Some(TableId::Str(_))));
+                if is_map && cells.iter().any(|c| !matches!(c.id, Some(TableId::Str(_)))) {
+                    return Err(SemanticError {
+                        span: *span,
+                        message: "键值表元素必须全部带字符串键（[\"a\":1]），不能混用位置元素".into(),
+                    });
                 }
                 // 推导第一个元素的类型，其余元素必须与其一致
                 let first_ty = self.infer_expr(&cells[0].value, scope)?;
@@ -2937,36 +3044,91 @@ impl Analyzer {
                         });
                     }
                 }
-                // 表类型：元素类型（当前 IR 阶段仅支持数/字符串元素的同构表）
+                // E3 键值表：字面量类型 = map<值类型>；布局元数据 dynamic=true
+                //（运行时动态表，16 字节元素：键指针 + 值）。
+                if is_map {
+                    let info = TableInfo {
+                        elem_ty: first_ty.clone(),
+                        len: cells.len(),
+                        dynamic: true,
+                    };
+                    self.result.tables.insert(addr_of(expr), info);
+                    return Ok(TypeSpec::Map(Box::new(first_ty)));
+                }
+                // E1 嵌套表：元素是表字面量时，本表的元素类型 = 表（内层元素类型）——
+                // 如 `[[0,1],[0,2]]` 元素类型是 table<i64>，本表类型是 table<table<i64>>。
+                // 元素同为表字面量时 types_compatible 已按表类型递归比较（上方循环）。
+                // 嵌套表 dynamic=true：IR 层恒按动态表（元素指针）布局，走 ptr 桥。
+                let nested = matches!(&cells[0].value, Expr::TableLit { .. });
+                let elem_ty = if nested {
+                    TypeSpec::Table(Box::new(first_ty.clone()))
+                } else {
+                    first_ty.clone()
+                };
+                // 表类型：元素类型（当前 IR 阶段仅支持数/字符串/表元素的同构表）
                 // 记录布局元数据：元素类型 + 长度（len(表) 直接查；表变量声明分支同样插入，幂等）
-                let info = TableInfo { elem_ty: first_ty.clone(), len: cells.len(), dynamic: false };
+                let info = TableInfo {
+                    elem_ty: elem_ty.clone(),
+                    len: cells.len(),
+                    dynamic: nested,
+                };
                 self.result.tables.insert(addr_of(expr), info);
-                first_ty
+                // 表字面量类型：嵌套表返回表类型（表(表(内层))）；标量表沿用元素类型
+                // （既有约定——未标注标量表变量 scope 存元素类型）。
+                if nested {
+                    TypeSpec::Table(Box::new(elem_ty))
+                } else {
+                    first_ty
+                }
             }
             Expr::Index { base, index, span } => {
-                // 下标访问：base 必须是表（元素读取）或字符串（取字符），index 必须是整数
+                // 下标访问：base 必须是表（元素读取）、键值表（按键读取，E3）或
+                // 字符串（取字符），index 必须匹配（整数下标 / 字符串键）。
                 let base_ty = self.infer_expr(base, scope)?;
                 self.result.expr_types.insert(addr_of(base), base_ty.clone());
                 let index_ty = self.infer_expr(index, scope)?;
                 self.result.expr_types.insert(addr_of(index), index_ty.clone());
+                // 键值表下标：m["key"]——base 是 map 类型、下标是字符串字面量
+                //（map 键恒为字符串），返回 map 值类型。
+                if base_ty.is_map() {
+                    if !matches!(&index_ty, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("键值表下标必须是字符串键，实际是 {}", type_name(&index_ty)),
+                        });
+                    }
+                    // 值类型：map<T> 的 T；未登记 map（推导链）用 map_val_ty 兜底
+                    let val_ty = base_ty.map_val_ty().cloned().unwrap_or(TypeSpec::Named(TyKw::I64));
+                    return Ok(val_ty);
+                }
                 if !index_ty.is_int() {
                     return Err(SemanticError {
                         span: *span,
                         message: format!("下标必须是整数，实际是 {}", type_name(&index_ty)),
                     });
                 }
-                // 字符串下标：s[i] → 取第 i 个字符（char）
-                if matches!(&base_ty, TypeSpec::Named(TyKw::Str)) {
+                // 字符串下标：s[i] → 取第 i 个字符（char）。
+                // 排除登记过 table_vars 的变量（E0 边界：string 元素表变量
+                // `var ps = ["a","b"]` 的 scope 类型是元素类型 Str——表身份优先，
+                // 否则 ps[0] 被误当字符串取字符）。
+                if matches!(&base_ty, TypeSpec::Named(TyKw::Str))
+                    && !matches!(
+                        base.as_ref(),
+                        Expr::Var(vn)
+                            if self.table_vars.contains_key(&(self.cur_fn.clone(), vn.clone()))
+                    )
+                {
                     return Ok(TypeSpec::Named(TyKw::Char));
                 }
-                // 表身份判定：base_ty 是 Table，或 base 是登记过 table_vars 的变量
+                // 表身份判定：base_ty 是表（裸 table 或 table<T>，E1 嵌套链 node[0]
+                // 的 base_ty 是 Table(元素类型)），或 base 是登记过 table_vars 的变量
                 //（未标注表字面量变量 var arr = [1,2,3] 的 base_ty 是元素类型——既有行为，
                 // 表身份由 table_vars 元数据决定）。
                 let is_table = if let Expr::Var(name) = base.as_ref() {
                     self.table_vars.contains_key(&(self.cur_fn.clone(), name.clone()))
-                        || base_ty == TypeSpec::Named(TyKw::Table)
+                        || base_ty.is_table()
                 } else {
-                    base_ty == TypeSpec::Named(TyKw::Table)
+                    base_ty.is_table()
                 };
                 if !is_table {
                     return Err(SemanticError {
@@ -2977,19 +3139,29 @@ impl Analyzer {
                         ),
                     });
                 }
-                // 元素类型：base 是表变量 → 查其布局元数据；是内联表字面量 → 元素同构类型；
-                // 是返回表的函数调用（如 csv.csv_cells(...)[0]）→ 查 table_ret_elems
+                // 元素类型：base 是表变量 → 查其布局元数据；是内联表字面量 → 查其
+                // 布局元数据（E1 嵌套表：整表类型 ≠ 元素类型，必须查 tables）；
+                // 是返回表的函数调用（如 csv.csv_cells(...)[0]）→ 查 table_ret_elems；
+                // 是下标链（node[0][0]）→ base 推导类型（元素类型）的递归取型。
                 match base.as_ref() {
-                    Expr::TableLit { .. } => base_ty,
+                    Expr::TableLit { .. } => self
+                        .result
+                        .tables
+                        .get(&addr_of(base))
+                        .map(|info| info.elem_ty.clone())
+                        .unwrap_or(base_ty),
                     Expr::Var(name) => {
                         let key = (self.cur_fn.clone(), name.clone());
                         match self.table_vars.get(&key) {
                             Some(info) => info.elem_ty.clone(),
                             None => {
-                                return Err(SemanticError {
-                                    span: *span,
-                                    message: format!("下标访问的表 '{name}' 缺少布局元数据（内部错误）"),
-                                })
+                                // E1：未登记表变量（循环变量/由下标推导的表变量，
+                                // 如 `for sub in node` 的 sub、`var sub = t[i]`）——
+                                // base_ty 是表类型时取其元素类型兜底
+                                base_ty
+                                    .table_elem_ty()
+                                    .cloned()
+                                    .unwrap_or(base_ty)
                             }
                         }
                     }
@@ -3019,6 +3191,13 @@ impl Analyzer {
                             }
                         }
                     }
+                    // E1 嵌套链：base 是下标表达式（node[0][0]）——base 的推导类型
+                    // 即内层表的元素类型（如 table<i64>），本层元素类型 = 其元素类型；
+                    // base_ty 已是标量时 is_table 判定已在上方拦截（不可达防御兜底）。
+                    Expr::Index { .. } => base_ty
+                        .table_elem_ty()
+                        .cloned()
+                        .unwrap_or(base_ty),
                     _ => {
                         return Err(SemanticError {
                             span: *span,
@@ -3852,6 +4031,10 @@ fn types_compatible(a: &TypeSpec, b: &TypeSpec) -> bool {
         (TypeSpec::Named(TyKw::Table), TypeSpec::Table(_))
         | (TypeSpec::Table(_), TypeSpec::Named(TyKw::Table)) => true,
         (TypeSpec::Table(x), TypeSpec::Table(y)) => types_compatible(x, y),
+        // 键值表（E3）：裸 map 与 map<T> 互相兼容；map<T1> 与 map<T2> 值类型兼容。
+        (TypeSpec::Named(TyKw::Map), TypeSpec::Map(_))
+        | (TypeSpec::Map(_), TypeSpec::Named(TyKw::Map)) => true,
+        (TypeSpec::Map(x), TypeSpec::Map(y)) => types_compatible(x, y),
         _ => a == b,
     }
 }
@@ -4037,6 +4220,7 @@ fn type_name(t: &TypeSpec) -> &'static str {
         TypeSpec::Tuple(_) => "tuple",
         TypeSpec::Struct(name) => Box::leak(name.clone().into_boxed_str()),
         TypeSpec::Table(elem) => Box::leak(format!("table<{}>", type_name(elem)).into_boxed_str()),
+        TypeSpec::Map(val) => Box::leak(format!("map<{}>", type_name(val)).into_boxed_str()),
     }
 }
 

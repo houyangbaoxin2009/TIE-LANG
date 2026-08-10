@@ -21,7 +21,7 @@
 use std::ffi::{c_char, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use tie_frontend::ast::{BinaryOp, Expr, FnDefStmt, Stmt, TypeSpec};
+use tie_frontend::ast::{BinaryOp, Expr, FnDefStmt, Stmt, TableId, TypeSpec};
 use tie_frontend::lexer::{tokenize, TyKw};
 use tie_frontend::parser::parse_program;
 
@@ -664,6 +664,160 @@ pub extern "C" fn tie_table_set_bool(t: *mut DynTable, i: i64, x: i8, ok: *mut i
         }
         *ok = 1;
         (tbl.data as *mut i8).add(i as usize).write(x);
+    }
+}
+
+// ---------- E1：嵌套表（表元素）C ABI 桥 ----------
+//
+// 设计说明：`table<table<T>>`（元素是表的表）在编译路径用动态表表达——外层表
+// 元素宽度 8 字节、元素值 = 内层表指针（DynTable*）。新增 push/at/set 三个
+// ptr 变体桥，与 i64/f64/string/bool 桥同构（存借用指针，不复制、不释放：
+// 内层表由 tie_table_new 分配，随程序存活，无显式 free）。
+// 解释路径（Value::Table(Vec)）天然支持嵌套，无需桥——两路径行为一致。
+
+/// C ABI 桥：向动态表追加表元素（存内层表指针，元素宽度 8）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_table_push_ptr(t: *mut DynTable, x: *mut DynTable) {
+    unsafe {
+        let tbl = &mut *t;
+        dyn_table_grow(tbl);
+        (tbl.data as *mut *mut DynTable).add(tbl.len as usize).write(x);
+        tbl.len += 1;
+    }
+}
+
+/// C ABI 桥：读取动态表第 i 个表元素（返回内层表指针）。越界置 ok=0 并返回空指针。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_table_at_ptr(t: *mut DynTable, i: i64, ok: *mut i8) -> *mut DynTable {
+    unsafe {
+        let tbl = &*t;
+        if i < 0 || i >= tbl.len {
+            *ok = 0;
+            return std::ptr::null_mut();
+        }
+        *ok = 1;
+        (tbl.data as *const *mut DynTable).add(i as usize).read()
+    }
+}
+
+/// C ABI 桥：写动态表第 i 个表元素（存内层表指针）。越界置 ok=0，不写入。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_table_set_ptr(t: *mut DynTable, i: i64, x: *mut DynTable, ok: *mut i8) {
+    unsafe {
+        let tbl = &mut *t;
+        if i < 0 || i >= tbl.len {
+            *ok = 0;
+            return;
+        }
+        *ok = 1;
+        (tbl.data as *mut *mut DynTable).add(i as usize).write(x);
+    }
+}
+
+// ---------- E3：键值表（map）C ABI 桥 ----------
+//
+// 设计说明：键值表 = 16 字节元素的动态表（tie_table_new(16)），每元素布局：
+// [0..8) 键指针（*const c_char，借用约定与字符串表一致：比表存活更久）、
+// [8..16) 值（8 字节：i64 直存 / 字符串指针，按 map<T> 值类型解释）。
+// 键查找线性扫描（自举期符号表规模小；后续可换哈希——接口不变）。
+// 解释路径用 Value::Map(HashMap) 直接表达，行为一致（get/set/len）。
+
+/// 查找键的下标；不存在返回 -1（unsafe：t 必须是非空表指针）。
+unsafe fn map_find_index(t: *mut DynTable, key: *const c_char) -> i64 {
+    let tbl = unsafe { &*t };
+    let key = unsafe { c_char_to_string(key) }.unwrap_or_default();
+    for i in 0..tbl.len {
+        let elem = unsafe { (tbl.data as *const u8).add((i as usize) * 16) };
+        let kptr = unsafe { *(elem as *const *const c_char) };
+        if let Ok(ks) = unsafe { c_char_to_string(kptr) } {
+            if ks == key {
+                return i as i64;
+            }
+        }
+    }
+    -1
+}
+
+/// C ABI 桥：新建空键值表（等价 tie_table_new(16)）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_map_new() -> *mut DynTable {
+    tie_table_new(16)
+}
+
+/// C ABI 桥：按字符串键读取 i64 值。键不存在置 ok=0 并返回 0。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_map_get(t: *mut DynTable, key: *const c_char, ok: *mut i8) -> i64 {
+    unsafe {
+        let tbl = &*t;
+        let i = map_find_index(t, key);
+        if i < 0 {
+            *ok = 0;
+            return 0;
+        }
+        *ok = 1;
+        let elem = (tbl.data as *const u8).add((i as usize) * 16);
+        *(elem.add(8) as *const i64)
+    }
+}
+
+/// C ABI 桥：按字符串键读取字符串值（返回借用指针）。键不存在置 ok=0 并返回空指针。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_map_get_string(t: *mut DynTable, key: *const c_char, ok: *mut i8) -> *mut c_char {
+    unsafe {
+        let tbl = &*t;
+        let i = map_find_index(t, key);
+        if i < 0 {
+            *ok = 0;
+            return std::ptr::null_mut();
+        }
+        *ok = 1;
+        let elem = (tbl.data as *const u8).add((i as usize) * 16);
+        *(elem.add(8) as *const *mut c_char)
+    }
+}
+
+/// C ABI 桥：写入 i64 值。键存在 → 覆盖值；不存在 → 追加新元素。总成功置 ok=1。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_map_set(t: *mut DynTable, key: *const c_char, val: i64, ok: *mut i8) {
+    unsafe {
+        let tbl = &mut *t;
+        let i = map_find_index(t, key);
+        if i >= 0 {
+            let elem = (tbl.data as *mut u8).add((i as usize) * 16);
+            *(elem.add(8) as *mut i64) = val;
+        } else {
+            dyn_table_grow(tbl);
+            let elem = (tbl.data as *mut u8).add((tbl.len as usize) * 16);
+            *(elem as *mut *const c_char) = key;
+            *(elem.add(8) as *mut i64) = val;
+            tbl.len += 1;
+        }
+        *ok = 1;
+    }
+}
+
+/// C ABI 桥：写入字符串值（存借用指针）。键存在 → 覆盖；不存在 → 追加。总成功置 ok=1。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_map_set_string(
+    t: *mut DynTable,
+    key: *const c_char,
+    val: *const c_char,
+    ok: *mut i8,
+) {
+    unsafe {
+        let tbl = &mut *t;
+        let i = map_find_index(t, key);
+        if i >= 0 {
+            let elem = (tbl.data as *mut u8).add((i as usize) * 16);
+            *(elem.add(8) as *mut *const c_char) = val;
+        } else {
+            dyn_table_grow(tbl);
+            let elem = (tbl.data as *mut u8).add((tbl.len as usize) * 16);
+            *(elem as *mut *const c_char) = key;
+            *(elem.add(8) as *mut *const c_char) = val;
+            tbl.len += 1;
+        }
+        *ok = 1;
     }
 }
 
@@ -1931,6 +2085,33 @@ impl<'a> Env<'a> {
             // 表下标赋值（M4 补齐）：`t[i] = v` / `t[i] += v`。
             // target 是 Index 链：从最外层表变量逐层下钻到目标元素，写回。
             Stmt::IndexAssign(ia) => {
+                // 键值表下标赋值：m["k"] = v（E3）——base 是 map 变量、下标是字符串。
+                // 值类型由语义层保证与 map 值类型一致；复合赋值读旧值。
+                if let Expr::Index { base, index, .. } = ia.target.as_ref()
+                    && let Expr::Var(mname) = base.as_ref()
+                {
+                    let idx_val = self.eval_expr(index)?;
+                    if let Value::Str(key) = idx_val
+                        && let Value::Map(mut m) = self
+                            .lookup(mname)
+                            .ok_or_else(|| format!("变量 '{mname}' 未声明"))?
+                    {
+                        let new_val = match ia.op {
+                            Some(op) => {
+                                let old = m
+                                    .get(&key)
+                                    .cloned()
+                                    .unwrap_or(Value::Int(0));
+                                let rv = self.eval_expr(&ia.value)?;
+                                self.eval_binary(op, old, rv)?
+                            }
+                            None => self.eval_expr(&ia.value)?,
+                        };
+                        m.insert(key.clone(), new_val);
+                        self.assign(mname, Value::Map(m))?;
+                        return Ok(Flow::Normal(None));
+                    }
+                }
                 let (target_name, mut cells, idx) = self.resolve_index_target(&ia.target)?;
                 // 越界写：负数或超出长度 → 报错（与读取越界同文本）
                 if idx < 0 || idx as usize >= cells.len() {
@@ -2102,32 +2283,55 @@ impl<'a> Env<'a> {
                 self.call_fn(&resolved, arg_vals)
             }
             Expr::Index { base, index, .. } => {
-                // 表下标：t[i] 读取第 i 个元素（越界 → 运行时错误，文本与编译路径一致）
+                // 表下标：t[i] 读取第 i 个元素（越界 → 运行时错误，文本与编译路径一致）；
+                // 键值表下标：m["key"] 按键读取（键不存在 → 运行时错误，与编译路径 map_get 桥一致）。
                 let b = self.eval_expr(base)?;
                 let i = self.eval_expr(index)?;
-                let Value::Int(i) = i else {
-                    return Err("下标必须是整数".into());
-                };
-                match b {
-                    Value::Table(cells) => {
-                        if i < 0 || i as usize >= cells.len() {
-                            return Err(format!(
-                                "运行时错误: 下标越界：索引 {i} 超出长度 {}",
-                                cells.len()
-                            ));
+                match (b, i) {
+                    (Value::Map(m), Value::Str(key)) => {
+                        match m.get(&key) {
+                            Some(v) => Ok(v.clone()),
+                            None => Err(format!("运行时错误: map_get 键不存在：'{key}'")),
                         }
-                        Ok(cells[i as usize].clone())
                     }
-                    _ => Err("下标访问仅支持表".into()),
+                    (Value::Map(_), _) => Err("键值表下标必须是字符串键".into()),
+                    (b, Value::Int(i)) => match b {
+                        Value::Table(cells) => {
+                            if i < 0 || i as usize >= cells.len() {
+                                return Err(format!(
+                                    "运行时错误: 下标越界：索引 {i} 超出长度 {}",
+                                    cells.len()
+                                ));
+                            }
+                            Ok(cells[i as usize].clone())
+                        }
+                        _ => Err("下标访问仅支持表".into()),
+                    },
+                    _ => Err("下标访问仅支持表或键值表".into()),
                 }
             }
             Expr::TableLit { cells, .. } => {
-                // 表字面量：逐元素求值（M2 单行纯位置表；len 用）
-                let mut vals = Vec::with_capacity(cells.len());
-                for cell in cells {
-                    vals.push(self.eval_expr(&cell.value)?);
+                // 表字面量：逐元素求值。
+                // E3 键值表：cell 带字符串 id（["a":1]）→ 构造 Value::Map；
+                // 纯位置表（无 id）→ Value::Table（M2 单行纯位置表）。
+                let has_str_id = cells.iter().any(|c| matches!(c.id, Some(TableId::Str(_))));
+                if has_str_id {
+                    let mut m = std::collections::HashMap::new();
+                    for cell in cells {
+                        let Some(TableId::Str(key)) = &cell.id else {
+                            return Err("键值表元素必须全部带字符串键".into());
+                        };
+                        let v = self.eval_expr(&cell.value)?;
+                        m.insert(key.clone(), v);
+                    }
+                    Ok(Value::Map(m))
+                } else {
+                    let mut vals = Vec::with_capacity(cells.len());
+                    for cell in cells {
+                        vals.push(self.eval_expr(&cell.value)?);
+                    }
+                    Ok(Value::Table(vals))
                 }
-                Ok(Value::Table(vals))
             }
             Expr::TupleLit { .. } => Err("REPL v1 暂不支持元组".into()),
             Expr::FieldAccess { .. } => Err("REPL v1 暂不支持字段访问（类/元组）".into()),
@@ -2443,7 +2647,9 @@ impl<'a> Env<'a> {
                 match &args[0] {
                     Value::Str(s) => Ok(Value::Int(s.len() as i64)),
                     Value::Table(cells) => Ok(Value::Int(cells.len() as i64)),
-                    _ => Err("len 只支持字符串或表".into()),
+                    // E3：键值表返回条目数（与编译路径 tie_table_len 一致）
+                    Value::Map(m) => Ok(Value::Int(m.len() as i64)),
+                    _ => Err("len 只支持字符串、表或键值表".into()),
                 }
             }
             "str_len" => {
@@ -3459,6 +3665,10 @@ pub enum Value {
     Range(i64, i64),
     /// 表（单行元素集合；len 用，M2 范围）
     Table(Vec<Value>),
+    /// 键值表（E3）：键恒为字符串，值为任意类型（字面量推导值类型）。
+    /// 与编译路径的 DynTable（16 字节元素：键指针 + 8 字节值）行为一致：
+    /// get 按键线性扫描、set 覆盖/追加、len 返回条目数。
+    Map(std::collections::HashMap<String, Value>),
     /// 无值（void）
     Void,
 }
@@ -3475,6 +3685,7 @@ impl Value {
             Value::Str(_) => "字符串",
             Value::Range(_, _) => "范围",
             Value::Table(_) => "表",
+            Value::Map(_) => "键值表",
             Value::Void => "void",
         }
     }
@@ -3502,6 +3713,14 @@ impl Value {
             Value::Table(cells) => format!(
                 "[{}]",
                 cells.iter().map(|c| c.to_print_string()).collect::<Vec<_>>().join(", ")
+            ),
+            // 键值表：输出键值集合（仅 REPL 展示）
+            Value::Map(m) => format!(
+                "{{{}}}",
+                m.iter()
+                    .map(|(k, v)| format!("{k}: {}", v.to_print_string()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             Value::Void => String::new(),
         }
@@ -3536,6 +3755,8 @@ fn value_matches_ty(v: &Value, ty: &TypeSpec) -> bool {
         TypeSpec::Named(TyKw::Table) => matches!(v, Value::Table(_)),
         // table<T>（A1）：与裸 table 同（case 类型匹配按动态表）
         TypeSpec::Table(_) => matches!(v, Value::Table(_)),
+        // 键值表（E3）：map / map<T> 匹配 Value::Map
+        TypeSpec::Named(TyKw::Map) | TypeSpec::Map(_) => matches!(v, Value::Map(_)),
         TypeSpec::Named(TyKw::Void) => matches!(v, Value::Void),
         // 宽类型（类别框）：num 接受 Int/Float；text 接受 Str/Char；misc 接受其余
         TypeSpec::Named(TyKw::Num) => matches!(v, Value::Int(_) | Value::Float(_)),
@@ -4904,7 +5125,7 @@ to_string(n) + ":" + names"#
 
     #[test]
     fn dyn_table_bool_and_f64() {
-        // bool 表：push 后 table_at 读取
+        // bool 元素 push + table_at 读取
         let code = r#"
             var t: table = table_new_bool()
             table_push(t, true)
@@ -4912,7 +5133,7 @@ to_string(n) + ":" + names"#
             table_at(t, 0)
         "#;
         assert_eq!(ev(code).unwrap(), "true");
-        // f64 表：push 后 len 与 table_at
+        // f64 元素 push + len + table_at
         let code2 = r#"
             var t: table = table_new_f64()
             table_push(t, 1.5)
@@ -4920,5 +5141,74 @@ to_string(n) + ":" + names"#
             len(t)
         "#;
         assert_eq!(ev(code2).unwrap(), "2");
+    }
+
+    // ---------- E3：键值表 map（解释路径） ----------
+
+    #[test]
+    fn eval_map_literal_and_index() {
+        // 字面量 + 下标读取 + len（i64 值）
+        let code = r#"
+            var m = ["a": 1, "b": 2]
+            m["a"] + m["b"] + len(m)
+        "#;
+        assert_eq!(ev(code).unwrap(), "5");
+        // 字符串值 map
+        let code2 = r#"
+            var m = ["k": "v"]
+            m["k"]
+        "#;
+        assert_eq!(ev(code2).unwrap(), "v");
+        // 标注 map / map<string> 变量
+        let code3 = r#"
+            var m: map = ["x": 10]
+            m["x"]
+        "#;
+        assert_eq!(ev(code3).unwrap(), "10");
+    }
+
+    #[test]
+    fn eval_map_set_and_compound() {
+        // 下标赋值新增键 + 复合赋值（+= 读旧值）
+        let code = r#"
+            var m = ["a": 1]
+            m["b"] = 5
+            m["a"] += 10
+            m["a"] + m["b"] + len(m)
+        "#;
+        assert_eq!(ev(code).unwrap(), "18");
+        // 覆盖已有键
+        let code2 = r#"
+            var m = ["a": 1]
+            m["a"] = 99
+            m["a"]
+        "#;
+        assert_eq!(ev(code2).unwrap(), "99");
+    }
+
+    #[test]
+    fn eval_map_missing_key_errors() {
+        // 键不存在 → 运行时错误（文本与编译路径一致）
+        let err = ev(r#"var m = ["a": 1]; m["zzz"]"#).unwrap_err();
+        assert!(err.contains("map_get 键不存在"), "实际: {err}");
+        // 整数下标访问 map → 报错
+        let err2 = ev(r#"var m = ["a": 1]; m[0]"#).unwrap_err();
+        assert!(err2.contains("键值表"), "实际: {err2}");
+        // 混合元素（字符串键 + 位置元素）→ 报错
+        let err3 = ev(r#"var bad = ["a": 1, 2]"#).unwrap_err();
+        assert!(err3.contains("字符串键"), "实际: {err3}");
+    }
+
+    #[test]
+    fn eval_map_as_argument() {
+        // map 作实参传给 map 形参，函数内下标读取（ev 对顶层 func 走注册路径，
+        // 调用需在注册后单独 eval——与 tie:script 模块协议同款）
+        let mut s = Session::new();
+        s.eval("func f(m: map) -> i64 {\n    return m[\"x\"]\n}").unwrap();
+        let mut s2 = Session::new();
+        s2.eval("func g(m: map) -> i64 {\n    return m[\"q\"]\n}").unwrap();
+        assert_eq!(s.eval("f([\"x\": 9])").unwrap(), "9");
+        // map 字面量直接作实参
+        assert_eq!(s2.eval("g([\"q\": 7])").unwrap(), "7");
     }
 }

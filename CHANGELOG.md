@@ -3,6 +3,49 @@
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库、M3 = 预处理器自举、M4 = 标准库重构**。
 
+## [自举准备] 表能力加强（E0 + E1 + E3）— 2026-08-10
+
+自举障碍清零批：修复表变量传参缺陷（E0）、打通嵌套表 `table<table<T>>`（E1）、
+落地键值表 `map`（E3）——B1 tag 表 AST 的全部语言前提就绪（见 docs/plans/self-hosting.md §3 修订）。
+
+### 修复：定长表变量实参 IR 缺陷（E0）
+- **根因**：表字面量变量（`var nums: table<i64> = [1,2,3]`）布局是 `[N x T]` 数组，
+  作实参时直接传给 ptr 形参 → opt 报 "defined with type `[5 x i64]` but expected ptr"；
+- **IR**：`gen_table_var_arg`——定长表变量实参按声明布局逐元素展开为动态表
+  （`tie_table_new + push`，与字面量实参 A6 同路径）；动态表变量直接传指针；
+- **语义**：未标注表字面量变量（`var arr = [1,2,3]`）scope 存元素类型的既有行为下，
+  传参时按 table_vars 元数据还原表身份；`arg_table_elem_ty` 的 Str 错误兜底改放行；
+- 表变量（标注/未标注/动态）作 table\<T\> 实参六场景实测全过。
+
+### 新增：嵌套表 table\<table\<T\>\>（E1）
+- **语法**：`>>` 复合 token 分裂（`table<table<i64>>` 的闭括号，C++/Rust 同款问题）——
+  Shr/Ge/ShrEq 原地分裂并插入剩余 token（parser.rs `expect_type_gt`）；
+- **语义**：嵌套表字面量（元素是表字面量）元素类型 = 表（内层元素类型），
+  类型递归兼容；`dynamic=true` 登记——IR 恒按动态表（元素指针）布局；
+  下标链 `node[0][0]` 递归取型（Index base 是 Index 表达式）；for/len 对
+  未登记表变量（循环变量/下标推导的表）按语义类型兜底；
+- **IR**：表元素桥后缀按语义类型选择（`table_bridge_suffix`：表元素 → push/at/set_ptr）；
+  嵌套表字面量/变量/实参递归展开（外层 `tie_table_new(8)` + 内层动态表 push_ptr）；
+  Index 下标链生成（at_ptr → 递归下标）；len/for/IndexAssign 动态路径兜底；
+- **解释**：`Value::Table(Vec<Value>)` 天然嵌套，eval 下标链直接工作；
+- 新增 ptr 元素 C ABI 桥：`tie_table_push_ptr` / `tie_table_at_ptr` / `tie_table_set_ptr`；
+- 嵌套表七场景（字面量/标注/下标链/实参/嵌套 for/动态构造）编译+解释双路径全过。
+
+### 新增：键值表 map（E3）
+- **语法**：`map` 类型关键字 + `map<T>` 值类型（默认 map\<i64\>）；字面量
+  `["a":1, "b":2]`（cell 带字符串键）推导为 map；
+- **语义**：`TypeSpec::Map(Box<值类型>)` + 递归类型兼容；混合元素（字符串键 +
+  位置元素）报错；`m["key"]` 下标读/写校验（键必须字符串、值类型匹配）；
+  map 变量登记（值类型、dynamic=true）；map 形参/实参匹配；
+- **IR**：map = 16 字节元素动态表（键指针 + 8 字节值）——字面量/变量/实参
+  展开 `tie_table_new(16) + tie_map_set*` 序列；下标读写走 map_get/set 桥
+  （键不存在 → 运行时错误，与解释路径同文本）；len 走 tie_table_len；
+- **解释**：`Value::Map(HashMap)`——字面量/下标读/下标赋值/复合赋值/len/实参全支持；
+- 新增 C ABI 桥：`tie_map_new` / `tie_map_get(字符串)` / `tie_map_set(字符串)`
+  （线性扫描键查找——自举期符号表规模小，后续可换哈希，接口不变）；
+- 符号表场景实测（`map<string>` 存函数名 → 地址）；frontend 156 / interp 82
+  （+4 map 测试）/ llvm 41 / lsp 75 全绿。
+
 ## [自举准备] 语言能力补足（E1/E5 + F1 + A1/A6 + C5 + D3）— 2026-08-10
 
 自举前置方案落地（见 docs/plans/self-hosting.md）：六个障碍逐个解决，
