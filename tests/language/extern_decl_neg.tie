@@ -1,0 +1,10 @@
+// tie:logic
+
+// T0.7 负例：extern 声明带表参数 → 语义错误（extern 参数限标量类型，
+// 表/结构体等容器无法映射 C ABI 标量参数）。
+// 期望：`语义错误 @...: extern 函数 'foo' 的参数 't' 必须是标量类型（i8..u64/f32/f64/bool/char/string），实际是 table<i64>`，编译失败 exit 1。
+extern fn foo(t: table<i64>) -> i64;
+
+func main() {
+    println(1)
+}

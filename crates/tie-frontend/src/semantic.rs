@@ -65,6 +65,10 @@ pub struct SemanticResult {
     /// for 迭代/table_push/ref 实参）先查本地作用域与 table_vars，未命中
     /// 再回退查此表（键 = 全局变量名，无函数前缀）。
     pub global_table_vars: HashMap<String, TableInfo>,
+    /// extern 函数声明集合（T0.7）：顶层 `extern fn` 声明的符号名。
+    /// 只存名字——签名已注册在 funcs（extern 与普通函数共用签名表），
+    /// IR 层按名字查 funcs 发射 `declare`；解释层据此拒绝调用（仅编译路径可用）。
+    pub externs: std::collections::HashSet<String>,
 }
 
 /// 表（table）的布局信息：元素类型、元素个数与是否动态。
@@ -157,6 +161,55 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
             Stmt::Namespace(ns) => {
                 // 命名空间体内函数：递归注册全名（当前命名空间路径 + 函数名）
                 ctx.collect_ns_funcs(&ns.body, &ns.path)?;
+            }
+            // T0.7 extern 函数声明：注册签名（无体、无默认值、恒公有）并校验
+            // 类型约束——参数限标量、返回限标量或 void。extern 是"链接期符号"，
+            // 语义上像无体函数：调用点走普通 Call 检查（签名已知即可）。
+            Stmt::Extern(e) => {
+                // 参数类型校验：仅标量（i8..u64/f32/f64/bool/char/string）。
+                // 表/结构体/元组等容器类型无法直接映射 C ABI 标量参数。
+                for p in &e.params {
+                    if !is_scalar_extern_ty(&p.ty) {
+                        return Err(SemanticError {
+                            span: p.span,
+                            message: format!(
+                                "extern 函数 '{}' 的参数 '{}' 必须是标量类型 \
+                                 （i8..u64/f32/f64/bool/char/string），实际是 {}",
+                                e.name,
+                                p.name,
+                                type_name(&p.ty)
+                            ),
+                        });
+                    }
+                }
+                // 返回类型校验：标量或 void（链接期符号的返回值必须可直接映射）
+                if !is_scalar_extern_ty(&e.ret_ty) && !e.ret_ty.is_void() {
+                    return Err(SemanticError {
+                        span: e.span,
+                        message: format!(
+                            "extern 函数 '{}' 的返回类型必须是标量（i8..u64/f32/f64/bool/char/string）或 void，实际是 {}",
+                            e.name,
+                            type_name(&e.ret_ty)
+                        ),
+                    });
+                }
+                // 注册签名进 funcs（与普通函数同表）：重名冲突沿用 insert 检查。
+                // extern 无函数体 → 无默认值（param_defaults 全 None）、无 ref
+                // 参数（param_by_ref 全 false）；顶层声明恒公有。
+                let sig = FuncSig {
+                    param_tys: e.params.iter().map(|p| p.ty.clone()).collect(),
+                    param_defaults: vec![None; e.params.len()],
+                    param_by_ref: vec![false; e.params.len()],
+                    ret_ty: e.ret_ty.clone(),
+                    is_pub: true,
+                };
+                if ctx.result.funcs.insert(e.name.clone(), sig).is_some() {
+                    return Err(SemanticError {
+                        span: e.span,
+                        message: format!("extern 函数 '{}' 与已有函数重复定义", e.name),
+                    });
+                }
+                ctx.result.externs.insert(e.name.clone());
             }
             // 顶层全局持久变量（M4）：收集类型并校验（显式标量类型 + 字面量初始化 +
             // 命名不冲突）。函数体内 Var 解析/Assign 未命中作用域时查全局表。
@@ -1167,6 +1220,14 @@ impl Analyzer {
                     }
                 }
                 Ok(())
+            }
+            Stmt::Extern(_) => {
+                // extern 声明只允许出现在文件顶层（parser 已在函数体内拦截，
+                // 此处是防御性兜底——与 import/using/struct 同层级处理）
+                Err(SemanticError {
+                    span: stmt_span(stmt),
+                    message: "extern 声明只能出现在文件顶层".into(),
+                })
             }
             Stmt::Expr(e) => {
                 let ty = self.infer_expr(&e.expr, scope)?;
@@ -4157,6 +4218,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::Struct(c) => c.span,
         Stmt::FieldAssign(f) => f.span,
         Stmt::IndexAssign(i) => i.span,
+        Stmt::Extern(e) => e.span,
     }
 }
 
@@ -4402,6 +4464,22 @@ fn type_name(t: &TypeSpec) -> &'static str {
         TypeSpec::Table(elem) => Box::leak(format!("table<{}>", type_name(elem)).into_boxed_str()),
         TypeSpec::Map(val) => Box::leak(format!("map<{}>", type_name(val)).into_boxed_str()),
     }
+}
+
+/// extern 函数声明允许的类型（T0.7）：标量 i8..u64/f32/f64/bool/char/string。
+///
+/// 这些类型可直接映射 C ABI 标量参数/返回值（LLVM IR：整数/浮点/i1/i32/ptr）；
+/// 表/结构体/元组/键值表等容器无法映射（tie 动态表是 {ptr,len,cap} 运行时不透明
+/// 结构，非 C 兼容布局）。trit 也排除（三值编码是 tie 内部约定，非 C 类型）。
+fn is_scalar_extern_ty(t: &TypeSpec) -> bool {
+    matches!(
+        t,
+        TypeSpec::Named(
+            TyKw::I8 | TyKw::I16 | TyKw::I32 | TyKw::I64
+                | TyKw::U8 | TyKw::U16 | TyKw::U32 | TyKw::U64
+                | TyKw::F32 | TyKw::F64 | TyKw::Bool | TyKw::Char | TyKw::Str
+        )
+    )
 }
 
 #[cfg(test)]
@@ -6426,6 +6504,89 @@ mod tests {
         expect_err(
             "var g: table<i64> = table_new_i64()\nfunc main() {}",
             "初始化必须是空表",
+        );
+    }
+
+    // ---------- T0.7：extern 函数声明 ----------
+
+    /// extern 顶层声明注册签名进 funcs（无体、恒公有、无默认值），
+    /// 且函数体内调用走普通 Call 检查（签名已知）通过。
+    #[test]
+    fn extern顶层声明注册且调用检查通过() {
+        let sem = analyze_src(
+            "extern fn foo(a: i64, b: string) -> bool;\n\
+             func main() {\n\
+             \x20   var ok = foo(1, \"x\")\n\
+             \x20   println(ok)\n\
+             }\n",
+        )
+        .expect("extern 声明与调用应通过语义检查");
+        assert!(sem.externs.contains("foo"), "extern 名应登记进 externs");
+        let sig = sem.funcs.get("foo").expect("extern 应注册进 funcs");
+        assert_eq!(
+            sig.param_tys,
+            vec![TypeSpec::Named(TyKw::I64), TypeSpec::Named(TyKw::Str)],
+            "参数类型应完整登记"
+        );
+        assert_eq!(sig.ret_ty, TypeSpec::Named(TyKw::Bool));
+        assert!(sig.is_pub, "extern 顶层声明恒公有");
+        assert!(sig.param_defaults.iter().all(|d| d.is_none()), "extern 无默认值参数");
+        assert!(sig.param_by_ref.iter().all(|b| !b), "extern 无 ref 参数");
+    }
+
+    /// extern 缺省返回类型 → void；void 返回合法。
+    #[test]
+    fn extern缺省返回类型为void() {
+        let sem = analyze_src("extern fn beep();\nfunc main() {\n    beep()\n}\n")
+            .expect("void 返回的 extern 应通过");
+        assert_eq!(sem.funcs.get("beep").unwrap().ret_ty, TypeSpec::Named(TyKw::Void));
+    }
+
+    /// extern 参数限标量（i8..u64/f32/f64/bool/char/string）：表/键值表/结构体报错。
+    #[test]
+    fn extern表参数报错() {
+        expect_err(
+            "extern fn foo(t: table<i64>) -> i64;\nfunc main() {}",
+            "必须是标量类型",
+        );
+        expect_err(
+            "extern fn foo(m: map<string>) -> i64;\nfunc main() {}",
+            "必须是标量类型",
+        );
+        // 返回类型同样限标量或 void
+        expect_err(
+            "extern fn foo() -> table<i64>;\nfunc main() {}",
+            "返回类型必须是标量",
+        );
+    }
+
+    /// extern 与普通函数重名 → 重复定义报错（与普通函数互斥）。
+    #[test]
+    fn extern与普通函数重名报错() {
+        expect_err(
+            "extern fn foo(a: i64) -> i64;\nfunc foo() {}\nfunc main() {}",
+            "重复定义",
+        );
+        // 两个 extern 同名同样冲突
+        expect_err(
+            "extern fn foo() -> i64;\nextern fn foo() -> i64;\nfunc main() {}",
+            "重复定义",
+        );
+    }
+
+    /// extern 声明带默认值语法（parser 已拒绝）与 ref 修饰（parser 已拒绝）——
+    /// 语法层拦截，此处只验证 extern 正常形态不受影响（已由上例覆盖）。
+    #[test]
+    fn extern调用类型检查与普通函数一致() {
+        // 实参类型不匹配 → 报错（与普通函数同路径）
+        expect_err(
+            "extern fn foo(a: i64) -> i64;\nfunc main() {\n    foo(\"x\")\n}\n",
+            "类型不匹配",
+        );
+        // 未声明的 extern 调用 → 未定义函数
+        expect_err(
+            "func main() {\n    bar(1)\n}\n",
+            "未定义的函数",
         );
     }
 }

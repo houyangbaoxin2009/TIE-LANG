@@ -1,0 +1,49 @@
+// tie:library
+// process.tie：标准库——进程原语（命名空间 process，自举 T0.7）
+// 作用：用 extern 声明（链接期 libc 符号）重新实现进程原语，替代/补充
+// 内置 exec_code/exec_output 的 C ABI 桥——0-Rust 路径（阶段 4）的关键证明：
+// tie 程序直接声明并调用 libc 函数，不再依赖 Rust 桥实现。
+//
+// extern 声明（T0.7 语言特性）：`extern fn system(cmd: string) -> i32;`——
+// 声明链接期符号 system（libc system，Windows msvcrt 默认已链），无函数体，
+// 编译路径由 IR 层发射 LLVM `declare`，调用点生成普通 call，clang 链接时
+// 自动解析 msvcrt 符号。解释路径不支持调用 extern（报"仅编译路径可用"）。
+//
+// 返回类型说明：system 的 C 原型是 `int system(const char*)`——用 i32 声明
+// 与原型精确匹配。i64 声明在负退出码（如 -1）时有 RAX 高位未定义风险
+// （x86-64 写 eax 清零高 32 位是架构保证，但依赖实现细节不严谨）；且 tie
+// 无 i32→i64 隐式转换，包装函数与 extern 保持同类型最简。
+//
+// 为什么 exec_output 不用 popen？tie 无指针类型——popen 返回 FILE*、fgets
+// 需要 char* 缓冲区，tie 无法声明 ptr 参数/返回值、也无法解引用指针读取
+// 缓冲内容（extern 参数限标量）。故用「重定向 + 文件读回」等价实现：
+// `cmd > tmpfile 2>&1` → file_read(tmpfile) → file_delete(tmpfile)。
+//
+// 调用：import 后 process.exec_code(...) / process.exec_output(...)
+// 命名规范：命名空间内函数不加 process_ 前缀；pub func 显式导出。
+
+// extern 声明：libc system（执行命令，返回退出码）。仅顶层裸名（无命名空间限定）。
+extern fn system(cmd: string) -> i32;
+
+namespace process {
+// 执行命令并返回退出码（0 = 成功，非 0 = 失败；Windows 上为命令的退出码）。
+// 包装 libc system（extern 声明，编译路径走 LLVM declare + clang 链接 msvcrt）。
+pub func exec_code(cmd: string) -> i32 {
+    return system(cmd)
+}
+
+// 执行命令并返回其全部输出（stdout + stderr 合并；输出为空返回空串）。
+// 实现：重定向到唯一临时文件 → file_read 读回 → 删除临时文件。
+// 失败场景（命令不存在、文件读写失败）→ 返回空串（与内置 exec_output
+// 的桥实现差异：桥失败时报运行时错误；此处尽力而为返回已读内容）。
+pub func exec_output(cmd: string) -> string {
+    // 唯一临时文件名：时间戳（秒）+ 随机数（10000..99999）拼接，避免并发冲突
+    var tmp = ".tie_exec_" + to_string(time_now()) + "_" + to_string(rand_range(10000, 99999)) + ".tmp"
+    // 重定向命令 stdout + stderr 到临时文件（cmd.exe 的 `2>&1` 语法）
+    var full = cmd + " > " + tmp + " 2>&1"
+    system(full)
+    var out = file_read(tmp)
+    file_delete(tmp)
+    return out
+}
+}

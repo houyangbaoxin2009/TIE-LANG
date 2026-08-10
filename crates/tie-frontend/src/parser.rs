@@ -6,10 +6,10 @@
 //! 本解析器只处理清理后的正文源码。
 
 use super::ast::{
-    AssignStmt, BinaryOp, BreakStmt, ClassField, ContinueStmt, Expr, ExprStmt, FieldAssignStmt,
-    FnDefStmt, ForStmt, IfStmt, ImportStmt, IndexAssignStmt, NamespaceStmt, Param, Program,
-    ReturnStmt, Stmt, StructDefStmt, SwitchCase, SwitchStmt, TableCell, TableId, TupleField,
-    TypeSpec, UnaryOp, UsingStmt, VarDeclStmt, WhileStmt,
+    AssignStmt, BinaryOp, BreakStmt, ClassField, ContinueStmt, Expr, ExprStmt, ExternDeclStmt,
+    FieldAssignStmt, FnDefStmt, ForStmt, IfStmt, ImportStmt, IndexAssignStmt, NamespaceStmt, Param,
+    Program, ReturnStmt, Stmt, StructDefStmt, SwitchCase, SwitchStmt, TableCell, TableId,
+    TupleField, TypeSpec, UnaryOp, UsingStmt, VarDeclStmt, WhileStmt,
 };
 use super::lexer::{Span, Token, TokenKind, TyKw};
 use std::fmt;
@@ -120,8 +120,9 @@ impl Parser {
 
     fn parse_program(&mut self) -> Result<Program, ParseError> {
         let mut stmts = Vec::new();
-        // 顶层只允许函数定义、import、using、struct、命名空间声明与全局持久变量
-        //（var/const，M4：跨函数共享的可变状态；import 由 driver 递归展开为函数）。
+        // 顶层只允许函数定义、import、using、struct、命名空间声明、extern 声明
+        // 与全局持久变量（var/const，M4：跨函数共享的可变状态；import 由
+        // driver 递归展开为函数）。extern 仅顶层（函数体内由 parse_stmt 拦截）。
         while !matches!(self.peek_kind(), TokenKind::Eof) {
             match self.peek_kind() {
                 TokenKind::Func | TokenKind::Pub => stmts.push(Stmt::FnDef(self.parse_fn_def()?)),
@@ -129,6 +130,8 @@ impl Parser {
                 TokenKind::Using => stmts.push(Stmt::Using(self.parse_using()?)),
                 TokenKind::Struct => stmts.push(Stmt::Struct(self.parse_struct()?)),
                 TokenKind::Namespace => stmts.push(Stmt::Namespace(self.parse_namespace()?)),
+                // T0.7 extern 函数声明：`extern fn name(...) -> ret;`（仅顶层）
+                TokenKind::Extern => stmts.push(Stmt::Extern(self.parse_extern()?)),
                 // 顶层全局持久变量（跨函数共享；限标量类型 + 字面量初始化，语义层校验）
                 TokenKind::Var | TokenKind::Const => {
                     let is_const = matches!(self.peek_kind(), TokenKind::Const);
@@ -138,7 +141,7 @@ impl Parser {
                 }
                 other => {
                     return Err(self.err(format!(
-                        "顶层只允许函数定义、import、using、struct、命名空间声明或全局变量，实际是 {}",
+                        "顶层只允许函数定义、import、using、struct、命名空间声明、extern 声明或全局变量，实际是 {}",
                         self.describe(other)
                     )))
                 }
@@ -272,6 +275,11 @@ impl Parser {
             TokenKind::LBrace => {
                 // 裸块（后续版本），此处按语法错误处理
                 Err(self.err("函数体内不能有裸代码块".into()))
+            }
+            // T0.7 extern 声明：仅顶层合法（extern 是链接期符号声明，无函数体）——
+            // 函数体内直接报语法错误（与 FnDef 的"函数体内不支持嵌套函数"同层级拦截）
+            TokenKind::Extern => {
+                Err(self.err("extern 声明只能出现在文件顶层".into()))
             }
             _ => Ok(vec![self.parse_expr_or_assign()?]),
         }
@@ -477,9 +485,59 @@ impl Parser {
         Ok(decls)
     }
 
+    /// extern 函数声明（T0.7）：`extern fn name(a: i64, b: string) -> bool;`
+    ///
+    /// 语法与普通函数定义一致（含 `-> 返回类型`，缺省 void），但**无函数体**
+    /// （声明的是链接期外部符号）；以分号结束而非代码块。参数限标量类型、
+    /// 返回限标量或 void——parser 只负责解析，类型校验交给语义层。
+    fn parse_extern(&mut self) -> Result<ExternDeclStmt, ParseError> {
+        let span = self.advance().span; // extern
+        // extern 声明语法为 `extern fn name(...)`——`fn` 是 extern 声明的固定
+        // 前缀（与普通函数定义的 `func` 区分，贴近 C/Rust 风格）。不把 `fn`
+        // 引入全局关键字表（避免破坏现有以 fn 为标识符的代码），此处按固定
+        // 标识符文本匹配。
+        match self.peek_kind() {
+            TokenKind::Ident(s) if s == "fn" => {
+                self.advance();
+            }
+            other => {
+                return Err(self.err(format!(
+                    "extern 声明必须跟 'fn'，实际是 {}",
+                    self.describe(other)
+                )))
+            }
+        }
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::LParen, "'('")?;
+        let mut params = Vec::new();
+        if !self.eat(&TokenKind::RParen) {
+            loop {
+                let pspan = self.peek().span;
+                let pname = self.expect_ident()?;
+                self.expect(TokenKind::Colon, "':'")?;
+                // extern 形参不支持 ref/默认值（链接期声明无调用语义）；类型限标量
+                let pty = self.parse_type()?;
+                params.push(Param { name: pname, ty: pty, default: None, by_ref: false, span: pspan });
+                if self.eat(&TokenKind::Comma) {
+                    continue;
+                }
+                self.expect(TokenKind::RParen, "')'")?;
+                break;
+            }
+        }
+        // 返回类型：`-> Ty` 可省略（默认 void）
+        let ret_ty = if self.eat(&TokenKind::Arrow) {
+            self.parse_type()?
+        } else {
+            TypeSpec::Named(TyKw::Void)
+        };
+        // extern 声明以分号结束（无函数体）
+        self.expect(TokenKind::Semi, "extern 声明结束的分号")?;
+        Ok(ExternDeclStmt { name, params, ret_ty, span })
+    }
+
     /// `[pub] func name(params) -> Ty { stmts }`（pub 为 M2.1.7 可见性标记）。
-    fn parse_fn_def(&mut self) -> Result<FnDefStmt, ParseError> {
-        let span = self.peek().span; // pub 或 func 所在位置
+    fn parse_fn_def(&mut self) -> Result<FnDefStmt, ParseError> {        let span = self.peek().span; // pub 或 func 所在位置
         // 可选 pub 标记：`pub func name(...)`。命名空间内默认私有，pub 显式导出；
         // 顶层函数恒公有（pub 冗余但合法）。
         let is_pub = self.eat(&TokenKind::Pub);
@@ -2146,6 +2204,51 @@ mod tests {
         assert!(
             err.message.contains("无法") || err.message.contains("期望"),
             "错误：{}",
+            err.message
+        );
+    }
+
+    // ---------- T0.7：extern 函数声明 ----------
+
+    /// extern 声明（含返回类型、多参数、无参数、缺省 void）应解析为 Stmt::Extern。
+    #[test]
+    fn extern顶层声明解析() {
+        let prog = parse("extern fn foo(a: i64, b: string) -> bool;\nfunc main() {}\n");
+        let Stmt::Extern(e) = &prog.stmts[0] else { panic!("期望 extern 声明") };
+        assert_eq!(e.name, "foo");
+        assert_eq!(e.params.len(), 2, "应解析出 2 个参数");
+        assert_eq!(e.params[0].ty, TypeSpec::Named(TyKw::I64));
+        assert_eq!(e.params[1].ty, TypeSpec::Named(TyKw::Str));
+        assert_eq!(e.ret_ty, TypeSpec::Named(TyKw::Bool));
+        // 无参数 + 缺省返回类型（void）
+        let prog2 = parse("extern fn bar();\nfunc main() {}\n");
+        let Stmt::Extern(e2) = &prog2.stmts[0] else { panic!("期望 extern 声明") };
+        assert!(e2.params.is_empty(), "无参数 extern");
+        assert_eq!(e2.ret_ty, TypeSpec::Named(TyKw::Void), "缺省返回类型应为 void");
+    }
+
+    /// extern 出现在函数体内 → 语法错误（extern 仅顶层合法）。
+    #[test]
+    fn extern函数体内报错() {
+        let err = parse_err("func main() {\n    extern fn foo() -> i64;\n}\n");
+        assert!(
+            err.message.contains("只能出现在文件顶层"),
+            "错误消息：{}",
+            err.message
+        );
+    }
+
+    /// extern 声明遵循 ASI 规则：换行后自动补分号（与普通语句一致）。
+    #[test]
+    fn extern声明ASI分号插入() {
+        // 换行分隔 → ASI 补分号，extern 声明解析成功
+        let prog = parse("extern fn foo() -> i64\nfunc main() {}\n");
+        assert!(matches!(&prog.stmts[0], Stmt::Extern(_)), "ASI 后 extern 应成功");
+        // 同一行紧接下一语句且无分号 → 语法错误
+        let err = parse_err("extern fn foo() -> i64 func main() {}\n");
+        assert!(
+            err.message.contains("分号"),
+            "错误消息：{}",
             err.message
         );
     }

@@ -1638,6 +1638,9 @@ pub struct Session {
     globals: std::collections::HashMap<String, Value>,
     /// 顶层函数（REPL 中 `func f() {}` 后 `f()` 依赖）
     funcs: std::collections::HashMap<String, FnDefStmt>,
+    /// extern 函数声明名（T0.7）：`extern fn` 是链接期符号，无函数体——
+    /// 解释路径不注册为可调用函数；调用时据此报错（仅编译路径可用）。
+    externs: std::collections::HashSet<String>,
 }
 
 impl Session {
@@ -1791,7 +1794,12 @@ impl Session {
                 Stmt::Struct(_) => return Err("REPL v1 暂不支持 struct 定义".into()),
                 Stmt::Import(_) => return Err("REPL v1 暂不支持 import".into()),
                 Stmt::Using(_) => return Err("REPL v1 暂不支持 using".into()),
-                _ => return Err("顶层只允许函数/类/import/using/命名空间/全局变量定义".into()),
+                Stmt::Extern(e) => {
+                    // extern 声明（T0.7）：链接期符号，无函数体——解释路径不注册
+                    // 为可调用函数，只记录名字（调用时由 eval_expr 报明确错误）。
+                    self.externs.insert(e.name.clone());
+                }
+                _ => return Err("顶层只允许函数/类/import/using/命名空间/全局变量/extern 声明定义".into()),
             }
         }
         Ok(format!("已定义 {count} 个函数"))
@@ -2183,6 +2191,11 @@ impl<'a> Env<'a> {
                 Ok(Flow::Normal(None))
             }
             Stmt::Struct(_) => Err("REPL v1 暂不支持 struct 定义".into()),
+            Stmt::Extern(_) => {
+                // extern 声明（T0.7）：仅顶层合法，函数体内不应出现（parser 拦截）；
+                // 防御性报错（与 import/struct 同层级处理）。
+                Err("extern 声明只能出现在文件顶层".into())
+            }
             Stmt::FnDef(f) => {
                 // 函数体内的嵌套函数定义 → 注册进 funcs（从简）
                 self.session.funcs.insert(f.name.clone(), f.clone());
@@ -2394,6 +2407,13 @@ impl<'a> Env<'a> {
                 };
                 // 实参表达式一并传入（T0.3 by_ref：ref 形参需取实参变量名，
                 // 建立指向调用方变量槽的引用）
+                // T0.7 extern 调用检查：extern 是链接期符号（libc 函数），解释器
+                // 无实现体——调用报明确错误，指引用户走编译路径（tie-llvm）。
+                if self.session.externs.contains(&resolved) {
+                    return Err(format!(
+                        "REPL 不支持调用 extern 函数 '{resolved}'（仅编译路径可用，请用 tie-llvm 编译运行）"
+                    ));
+                }
                 self.call_fn(&resolved, arg_vals, Some(args))
             }
             Expr::Index { base, index, .. } => {
@@ -5584,5 +5604,51 @@ to_string(n) + ":" + names"#
             );
             tie_table_free(t);
         }
+    }
+
+    // ---------- T0.7：extern 函数声明（解释路径） ----------
+
+    /// extern 声明注册进会话（不注册为可调用函数）；调用 → 明确错误。
+    #[test]
+    fn eval_extern调用报错仅编译路径可用() {
+        let mut s = Session::new();
+        // 第一次 eval：顶层声明 extern（注册路径）
+        s.eval("extern fn foo(a: i64) -> i64;")
+            .expect("extern 声明应注册成功");
+        // 第二次 eval：普通语句（自动包装为 func main 执行）调用 extern → 报错
+        let err = s.eval("foo(1)").unwrap_err();
+        assert!(
+            err.contains("REPL 不支持调用 extern 函数 'foo'"),
+            "错误消息：{err}"
+        );
+        assert!(
+            err.contains("仅编译路径可用"),
+            "错误消息应指引编译路径：{err}"
+        );
+    }
+
+    /// extern 声明本身（不调用）→ 注册成功，不影响会话其他函数。
+    #[test]
+    fn eval_extern声明注册不影响其他函数() {
+        let mut s = Session::new();
+        s.eval("extern fn foo(a: i64) -> i64;")
+            .expect("extern 声明应注册成功");
+        s.eval("func f() { return 42; }").expect("普通函数应注册");
+        let out = s.eval("f()").unwrap();
+        assert_eq!(out, "42", "extern 声明不应影响普通函数");
+    }
+
+    /// extern 与普通函数重名：解释路径 funcs 注册按后到覆盖（不报错），
+    /// 但 extern 名登记后同名普通函数调用被误判——编译路径语义层已拦截重名，
+    /// REPL 无语义检查（与既有 REPL 简化一致），此处只验证 extern 名登记生效。
+    #[test]
+    fn eval_extern名字登记生效() {
+        let s = Session::new();
+        let mut s = s;
+        s.eval("extern fn foo() -> i64;").expect("extern 声明应注册");
+        let f = s
+            .funcs
+            .get("foo");
+        assert!(f.is_none(), "extern 不应注册进 funcs（无实现体）");
     }
 }

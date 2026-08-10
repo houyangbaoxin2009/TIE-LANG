@@ -27,6 +27,35 @@ pub struct IrOutput {
     pub used_externs: Vec<String>,
 }
 
+/// 模块头部无条件 declare 的 libc 符号（T0.7 去重用，与 run() 顶部声明一一对应）。
+///
+/// 用户 extern 声明与它们重名时**跳过**（如用户声明 `extern fn strlen(s: string) -> i64`）：
+/// 内置声明已覆盖相同原型，重复 emit 会导致 LLVM "invalid redefinition of global"。
+/// 用户 extern 的语义校验不感知内置声明名单，故在 IR 层统一去重。
+const UNCONDITIONAL_DECLARES: &[&str] = &[
+    "printf",
+    "strlen",
+    "strcmp",
+    "malloc",
+    "llvm.memcpy.p0.p0.i64",
+    "fopen",
+    "fwrite",
+    "fclose",
+    "fflush",
+    "exit",
+    "remove",
+    "sqrt",
+    "sin",
+    "cos",
+    "tan",
+    "exp",
+    "log",
+    "pow",
+    "floor",
+    "ceil",
+    "round",
+];
+
 /// IR 生成错误（一般来自语义结果的缺失，正常情况不应触发）。
 #[derive(Debug)]
 pub struct IrError {
@@ -152,6 +181,31 @@ impl<'p> IrGenerator<'p> {
         self.out.push_str("declare double @floor(double)\n");
         self.out.push_str("declare double @ceil(double)\n");
         self.out.push_str("declare double @round(double)\n\n");
+
+        // T0.7 用户 extern 函数声明：`declare <ret> @<name>(<param types>)`。
+        // extern 是**链接期符号**（libc 函数如 system/popen），无函数体——只声明，
+        // 链接由 clang 自动解析 libc（Windows msvcrt 默认已链，无需额外 -l）。
+        // - 参数名不参与声明（只输出类型）；string→ptr、bool→i1、char→i32。
+        // - 与无条件声明重名（如 extern fn strlen）→ 跳过（UNCONDITIONAL_DECLARES），
+        //   避免 LLVM 重复定义错误；未引用的声明对链接无害（无引用即不解析）。
+        // - 调用点走 gen_call_inner 用户函数分支（签名查 funcs，符号 = 裸名）。
+        for name in &self.sem.externs {
+            if UNCONDITIONAL_DECLARES.contains(&name.as_str()) {
+                continue;
+            }
+            let sig = self.sem.funcs.get(name).ok_or_else(|| IrError {
+                message: format!("内部错误：extern 函数 '{name}' 无签名（函数 {}）", self.cur_fn),
+            })?;
+            let params = sig
+                .param_tys
+                .iter()
+                .map(|t| self.llvm_ty(t))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let ret = self.llvm_ty(&sig.ret_ty);
+            self.out.push_str(&format!("declare {ret} @{name}({params})\n"));
+        }
+        self.out.push('\n');
 
         // 顶层全局持久变量（M4）：`@name = global Ty 字面量`（静态初始化，
         // 函数内 load/store 访问）。字符串全局存指向常量串的指针。
@@ -760,6 +814,7 @@ impl<'p> IrGenerator<'p> {
             Stmt::FnDef(_) => Ok(()), // 顶层函数，不在此生成
             Stmt::Namespace(_) => Ok(()), // 命名空间体内函数由顶层发射循环生成
             Stmt::Using(_) => Ok(()), // using 引入语句：仅顶层语义作用（可见性/裸调用解析），不生成 IR
+            Stmt::Extern(_) => Ok(()), // extern 声明：声明在模块头部已发射（declare），函数体内不可能出现（parser 拦截），防御跳过
             Stmt::Expr(e) => {
                 let (v, _ty) = self.gen_expr(&e.expr)?;
                 // REPL 内置作为独立语句（结果丢弃）：read_line()/eval() 返回
@@ -5442,5 +5497,63 @@ mod tests {
             "main 入口应 store 表指针到 @g（重编号后首个寄存器 %1）：\n{ir}"
         );
         assert!(ir.contains("load ptr, ptr @g"), "函数内表访问应 load @g：\n{ir}");
+    }
+
+    // ---------- T0.7：extern 函数声明（IR 生成） ----------
+
+    /// extern 被调用时：模块头部发射 `declare`，调用点生成普通 `call`。
+    /// 声明格式 = `declare <ret> @<name>(<param 类型>)`（参数名省略）；
+    /// 字符串参数映射 ptr（tie string 是 C 串，NUL 结尾）。
+    #[test]
+    fn extern声明发射declare且调用生成call() {
+        let ir = 编译(
+            "extern fn foo(a: i64) -> i64;\nfunc main() {\n    var r = foo(1)\n    println(r)\n}",
+        );
+        assert!(
+            ir.contains("declare i64 @foo(i64)"),
+            "extern 应发射 declare i64 @foo(i64)：\n{ir}"
+        );
+        assert!(
+            ir.contains("call i64 @foo(i64 1)"),
+            "调用点应生成 call i64 @foo(i64 1)：\n{ir}"
+        );
+        // 多参数 + 字符串映射 ptr + bool 参数映射 i1
+        let ir2 = 编译(
+            "extern fn bar(s: string, b: bool) -> void;\nfunc main() {\n    bar(\"x\", true)\n}",
+        );
+        assert!(
+            ir2.contains("declare void @bar(ptr, i1)"),
+            "string→ptr、bool→i1：\n{ir2}"
+        );
+        assert!(
+            ir2.contains("call void @bar(ptr @"),
+            "调用点应传字符串常量与布尔：\n{ir2}"
+        );
+    }
+
+    /// extern 声明但未被调用：declare 照常发射（未引用的声明对链接无害）。
+    #[test]
+    fn extern未调用也发射declare() {
+        let ir = 编译("extern fn foo(a: i64) -> i64;\nfunc main() {\n    println(1)\n}");
+        assert!(
+            ir.contains("declare i64 @foo(i64)"),
+            "未调用的 extern 也应 declare：\n{ir}"
+        );
+        assert!(!ir.contains("call i64 @foo"), "不应出现对 foo 的调用：\n{ir}");
+    }
+
+    /// 用户 extern 与无条件 declare 名单重名（如 strlen）→ 跳过，不产生重复声明。
+    #[test]
+    fn extern与内置声明重名跳过() {
+        // strlen 已在模块头部无条件 declare（i64 @strlen(ptr)）——
+        // 用户再声明 extern fn strlen 必须跳过（LLVM 不允许重复 define/declare）
+        let ir = 编译(
+            "extern fn strlen(s: string) -> i64;\nfunc main() {\n    println(strlen(\"abc\"))\n}",
+        );
+        let declare_count = ir.matches("declare i64 @strlen(ptr)").count();
+        assert_eq!(
+            declare_count, 1,
+            "strlen 应只声明一次（无条件声明 + 用户 extern 去重）：\n{ir}"
+        );
     }
 }

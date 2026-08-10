@@ -202,6 +202,11 @@ pub enum Stmt {
     FieldAssign(FieldAssignStmt),
     /// 表下标赋值 `t[i] = expr`（M4 补齐：对表/数组元素的写入，含复合赋值）
     IndexAssign(IndexAssignStmt),
+    /// extern 函数声明（T0.7）：`extern fn name(a: i64, b: string) -> bool;`
+    /// 仅顶层。声明链接期外部符号（libc 函数如 system/popen），无函数体；
+    /// 参数限标量类型、返回限标量或 void（语义层校验）。编译路径把它
+    /// 发射为 LLVM `declare`，链接由 clang 解析 libc；解释路径不支持调用。
+    Extern(ExternDeclStmt),
 }
 
 /// import 语句：把其他 tie 文件的顶层函数并入当前文件。
@@ -357,6 +362,26 @@ pub struct IndexAssignStmt {
     pub op: Option<BinaryOp>,
     /// 新值表达式
     pub value: Expr,
+    pub span: Span,
+}
+
+/// extern 函数声明（T0.7 自举前置）：`extern fn name(a: i64, b: string) -> bool;`
+///
+/// 仅允许出现在文件顶层；声明的是**链接期外部符号**（libc 函数等），无函数体。
+/// - 参数限标量类型（i8..u64/f32/f64/bool/char/string）；返回限标量或 void
+///   （语义层校验；参数名仅文档作用，IR declare 只输出类型）。
+/// - 不支持命名空间限定（仅顶层裸名）、表/结构体参数或返回值。
+/// - 编译路径：IR 层发射 `declare <ret> @<name>(<param types>)`，链接由
+///   clang 自动解析 libc 符号（Windows msvcrt 默认已链）。
+/// - 解释路径：不注册为可调用函数，调用时报错（仅编译路径可用）。
+#[derive(Debug, Clone)]
+pub struct ExternDeclStmt {
+    /// 外部符号名（LLVM 符号 = 该名字，与 libc 符号一一对应）
+    pub name: String,
+    /// 参数列表（类型限标量；参数名不参与 IR 声明）
+    pub params: Vec<Param>,
+    /// 返回类型（缺省 void；限标量或 void）
+    pub ret_ty: TypeSpec,
     pub span: Span,
 }
 

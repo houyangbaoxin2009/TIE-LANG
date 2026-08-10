@@ -1,0 +1,41 @@
+// tie:logic
+// tie:opt=2
+
+// T0.7 验收：extern 函数声明（链接 libc）+ std/process 进程原语。
+//
+// 验证点：
+// 1. 用户自定义 extern（顶层裸名）：extern fn rand() -> i32 链接 libc rand
+//    （msvcrt 提供）——证明"用户声明 extern → IR declare → clang 链接 libc"全链路；
+// 2. std/process.exec_code：包装 extern system（libc system，msvcrt 默认已链），
+//    exit 0 → 退出码 0；exit 3 → 3（Windows system 返回命令退出码）；
+// 3. std/process.exec_output：重定向 + 文件读回捕获 echo 输出（trim 去尾部换行）。
+//
+// 说明：exec_code 返回 i32（与 libc system 的 int 原型精确匹配——tie 无
+// i32→i64 隐式转换，i64 读负退出码还有 RAX 高位风险）；println 支持 i32。
+// tie 的二元运算要求两侧类型一致（字面量不做跨宽度适配），故此处只打印
+// 不比较。预期输出（rand 值随机，其余固定）：
+//   <rand() 的 [0,32767] 随机值>
+//   0
+//   3
+//   hello
+//   extern 验收通过
+import "../../std/string.tie"
+import "../../std/process.tie"
+using process;
+using str;
+
+// 用户自定义 extern 演示：libc rand（msvcrt 提供，无参数返回 int）。
+// 顶层裸名声明；参数为空，返回 i32。声明后被调用 → IR 发射
+// `declare i32 @rand()`，调用点 `call i32 @rand()`，clang 链接 msvcrt 解析。
+extern fn rand() -> i32;
+
+func main() {
+    // 1. 用户自定义 extern 调用：libc rand 返回值在 [0, 32767]（RAND_MAX）
+    println(rand())
+    // 2. std/process.exec_code：exit 0 → 退出码 0；exit 3 → 3
+    println(process.exec_code("exit 0"))
+    println(process.exec_code("exit 3"))
+    // 3. std/process.exec_output：echo hello → 捕获 "hello"（trim 去尾部换行）
+    println(str.trim(process.exec_output("echo hello")))
+    println("extern 验收通过")
+}

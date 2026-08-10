@@ -89,6 +89,9 @@ pub enum TokenKind {
     /// using 引入语句（M2.1.7）：`using fmt2;` 把已导入命名空间的公有函数
     /// 引入当前文件，之后可裸调用
     Using,
+    /// extern 函数声明（T0.7 自举前置）：`extern fn name(...) -> ret;` 顶层语句——
+    /// 声明链接期外部符号（libc 函数等），无函数体，仅编译路径可用
+    Extern,
     True,
     False,
     /// 平衡三进制 trit 的零值字面量（M4 补齐）：`zero`——trit 三值 true(+1)/zero(0)/false(-1)
@@ -804,6 +807,8 @@ impl<'a> Lexer<'a> {
             // M2.1.7 单文件命名空间：pub 可见性标记 + using 引入语句
             "pub" => TokenKind::Pub,
             "using" => TokenKind::Using,
+            // T0.7 extern 函数声明（链接期外部符号，libc 桥）
+            "extern" => TokenKind::Extern,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             // 平衡三进制 trit 零值（M4 补齐）：zero 是保留字
@@ -1344,6 +1349,17 @@ mod tests {
         let toks = tokenize("if i32").expect("不应报错");
         assert!(matches!(toks[0].kind, TokenKind::If));
         assert!(matches!(toks[1].kind, TokenKind::TypeKw(TyKw::I32)));
+    }
+
+    /// extern 关键字识别（T0.7）：完整拼写 → TokenKind::Extern。
+    #[test]
+    fn extern关键字识别() {
+        let toks = tokenize("extern").expect("不应报错");
+        assert!(matches!(toks[0].kind, TokenKind::Extern), "extern 应识别为关键字");
+        // externx 仍是标识符（关键字只匹配完整拼写）
+        let toks = tokenize("externx extern").expect("不应报错");
+        assert!(matches!(&toks[0].kind, TokenKind::Ident(s) if s == "externx"));
+        assert!(matches!(toks[1].kind, TokenKind::Extern));
     }
 
     // ---------- 符号 ----------
