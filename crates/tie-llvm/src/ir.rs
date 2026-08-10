@@ -448,6 +448,8 @@ impl<'p> IrGenerator<'p> {
     ///
     /// - 数值/布尔/字符：按类型直接写字面量值；字符串：指向常量串的指针
     ///   （`@name = global ptr @.str.N`，常量串由 string_global 延迟收集）；
+    /// - T0.4 全局表：`@name = global ptr null`——运行时表指针由 main 入口
+    ///   tie_table_new 创建后 store 填充（与局部动态表 alloca ptr 同布局）；
     /// - 函数内访问：读 `load Ty, ptr @name`、写 `store Ty %v, ptr @name`（见
     ///   gen_expr 的 Var 分支与 gen_stmt 的 Assign 分支的全局回退）。
     fn gen_globals(&mut self) -> Result<(), IrError> {
@@ -456,6 +458,13 @@ impl<'p> IrGenerator<'p> {
             let Some(ty) = self.sem.globals.get(&v.name) else {
                 continue; // 非全局（函数内声明不会到顶层）；语义层已收集全局
             };
+            // T0.4 全局表：ptr null 占位（main 入口运行时创建，见 gen_fn 的
+            // main 入口初始化块）
+            if self.sem.global_table_vars.contains_key(&v.name) {
+                self.out
+                    .push_str(&format!("@{} = global ptr null\n", v.name));
+                continue;
+            }
             let llvm_ty = self.llvm_ty(ty);
             let init = match &v.init {
                 Expr::IntLit(n) => n.to_string(),
@@ -596,6 +605,26 @@ impl<'p> IrGenerator<'p> {
             scope.insert(p.name.clone(), VarBind { value: alloca, ty, by_ptr: false });
         }
         self.scopes.push(scope);
+
+        // T0.4 全局表运行时初始化：main 入口第一行（任何使用之前）为每个全局表
+        // 创建空动态表并 store 到 @name。元素宽度与局部动态表 gen_dyn_table_var
+        // 的计算一致（i1=1 字节，其余 8 字节：i64/f64/ptr）。顺序按源码声明序
+        // （遍历 program.stmts，非 HashMap 迭代）——保证两轮编译初始化序列一致
+        // （自举 G2 逐字节相同的确定性要求）。
+        if is_main_entry && !self.sem.global_table_vars.is_empty() {
+            self.mark_used("tie_table_new");
+            for stmt in &self.program.stmts {
+                let Stmt::VarDecl(v) = stmt else { continue };
+                let Some(info) = self.sem.global_table_vars.get(&v.name) else {
+                    continue;
+                };
+                let elem_llvm = self.llvm_ty(&info.elem_ty);
+                let elem_size = if elem_llvm == "i1" { 1 } else { 8 };
+                let t = self.new_reg();
+                self.line(&format!("{t} = call ptr @tie_table_new(i64 {elem_size})"));
+                self.line(&format!("store ptr {t}, ptr @{}", v.name));
+            }
+        }
 
         // F1（alloca 提升）：函数体生成进临时缓冲，结束后把函数体内收集的全部
         // alloca 拼接到入口块（参数区之后、函数体之前）。LLVM 规范要求 alloca 位于
@@ -1038,16 +1067,22 @@ impl<'p> IrGenerator<'p> {
                 message: "下标赋值暂只支持单层表变量（t[i]）".into(),
             });
         };
-        let bind = self.lookup_var(name).cloned().ok_or_else(|| IrError {
-            message: format!("内部错误：下标赋值的变量 '{name}' 未入作用域（函数 {}）", self.cur_fn),
-        })?;
+        // T0.4：全局表变量（顶层 table<T>）→ 伪绑定 @name（与 Index 读取同路径）
+        let bind = match self.lookup_var(name).cloned() {
+            Some(b) => b,
+            None => self.global_table_bind(name).ok_or_else(|| IrError {
+                message: format!("内部错误：下标赋值的变量 '{name}' 未入作用域（函数 {}）", self.cur_fn),
+            })?,
+        };
         let base_ptr = bind.value;
         let base_ty = bind.ty;
         // 动态表：tie_table_set_* 桥写入。
         // E1：**未登记** table_vars 的表变量（循环变量/下标链推导的表）同样按动态
         // 表处理；已登记的定长表变量（dynamic=false）走数组 GEP。
+        // T0.4：全局表恒为动态表。
         let tv = self.sem.table_vars.get(&(self.cur_fn.clone(), name.clone()));
         let is_dynamic = tv.map(|info| info.dynamic).unwrap_or(false)
+            || self.sem.global_table_vars.contains_key(name)
             || (tv.is_none() && matches!(self.sem_ty_of(base), Some(t) if t.is_table() || t.is_map()));
         if is_dynamic {
             // 元素类型（E1 未登记表变量：取语义推导类型的元素类型）
@@ -1398,6 +1433,14 @@ impl<'p> IrGenerator<'p> {
                 .map(|info| info.dynamic)
                 .unwrap_or(false)
                 || matches!(self.sem_ty_of(&f.iter), Some(t) if t.is_table()))
+        {
+            return self.gen_for_dyn_table(f, &bind);
+        }
+        // T0.4：全局表遍历（`for x in g`）——@g 是 ptr 全局（global ptr null），
+        // 伪绑定后走动态表遍历（load ptr, ptr @g + tie_table_at）。
+        // 注意位于本地作用域查询之后：局部同名变量优先（遮蔽语义与编译路径一致）。
+        if let Expr::Var(name) = &f.iter
+            && let Some(bind) = self.global_table_bind(name)
         {
             return self.gen_for_dyn_table(f, &bind);
         }
@@ -2209,19 +2252,26 @@ impl<'p> IrGenerator<'p> {
                 message: "下标访问仅支持表/字符串变量、表字面量或返回表的函数调用".into(),
             });
         };
-        let bind = self.lookup_var(name).cloned().ok_or_else(|| IrError {
-            message: format!("内部错误：下标访问的变量 '{name}' 未入作用域（函数 {}）", self.cur_fn),
-        })?;
+        // T0.4：全局表变量（顶层 table<T>）→ 伪绑定 @name（ptr 全局），与局部
+        // 动态表 alloca 同构（load ptr, ptr @name 取表指针）
+        let bind = match self.lookup_var(name).cloned() {
+            Some(b) => b,
+            None => self.global_table_bind(name).ok_or_else(|| IrError {
+                message: format!("内部错误：下标访问的变量 '{name}' 未入作用域（函数 {}）", self.cur_fn),
+            })?,
+        };
         let base_ptr = bind.value;
         let base_ty = bind.ty;
         // 字符串下标：s[i] → 取第 i 个字节，zext 成 char（i32）。
         // 通过语义类型区分字符串（LLVM "ptr" 无法区分字符串与裸指针）。
         // 排除登记过 table_vars 的变量（E0 边界：string 元素表变量 scope 类型是
         // 元素类型 Str——表身份优先，否则 ps[0] 被误当字符串取字符）。
+        // T0.4：全局表同样排除（表身份由全局表元数据决定）。
         let is_table_var = self
             .sem
             .table_vars
-            .contains_key(&(self.cur_fn.clone(), name.clone()));
+            .contains_key(&(self.cur_fn.clone(), name.clone()))
+            || self.sem.global_table_vars.contains_key(name);
         if matches!(self.sem_ty_of(base), Some(TypeSpec::Named(TyKw::Str))) && !is_table_var {
             // 字符串变量是 alloca ptr，先 load 拿到串首指针
             let str_ptr = self.new_reg();
@@ -2242,7 +2292,9 @@ impl<'p> IrGenerator<'p> {
         // 动态表 at 桥。注意兜底仅限未登记——标注 table<T> 的定长表变量已登记
         // （dynamic=false，scope 类型也是 Table），必须走数组 GEP。
         let tv = self.sem.table_vars.get(&(self.cur_fn.clone(), name.clone()));
+        // T0.4：全局表恒为动态表（main 入口创建）
         let is_dynamic = tv.map(|info| info.dynamic).unwrap_or(false)
+            || self.sem.global_table_vars.contains_key(name)
             || (tv.is_none() && matches!(self.sem_ty_of(base), Some(t) if t.is_table()));
         if is_dynamic {
             let elem_ty = self.dyn_elem_ty_of(base)?;
@@ -2748,12 +2800,14 @@ impl<'p> IrGenerator<'p> {
             // 如 `var sub = t[i]` 的 sub）语义推导类型是表 → 同样运行时求值
             //（否则误入 strlen 产生垃圾长度）。已登记定长表变量走上方静态分支。
             if let Expr::Var(name) = &args[0]
-                && self
+                && (self
                     .sem
                     .table_vars
                     .get(&(self.cur_fn.clone(), name.clone()))
                     .map(|info| info.dynamic)
                     .unwrap_or(false)
+                    // T0.4：全局表恒为动态表 → 运行时求长度
+                    || self.sem.global_table_vars.contains_key(name))
             {
                 let len = self.table_len_reg(&v)?;
                 return Ok((len, "i64"));
@@ -2805,9 +2859,14 @@ impl<'p> IrGenerator<'p> {
                     message: format!("内部错误：table_push 第 1 个参数不是表变量（函数 {}）", self.cur_fn),
                 });
             };
-            let bind = self.lookup_var(tname).cloned().ok_or_else(|| IrError {
-                message: format!("内部错误：table_push 找不到表变量 '{}'（函数 {}）", tname, self.cur_fn),
-            })?;
+            // T0.4：全局表变量（顶层 table<T>）→ 伪绑定 @name（load ptr 取表指针，
+            // push 直接写运行时表结构——表指针本身不变，无需写回全局槽）
+            let bind = match self.lookup_var(tname).cloned() {
+                Some(b) => b,
+                None => self.global_table_bind(tname).ok_or_else(|| IrError {
+                    message: format!("内部错误：table_push 找不到表变量 '{}'（函数 {}）", tname, self.cur_fn),
+                })?,
+            };
             // 表变量绑定的是 alloca（存 ptr），需 load 出表指针
             let tptr = self.new_reg();
             self.line(&format!("{tptr} = load ptr, ptr {}", bind.value));
@@ -3778,9 +3837,13 @@ impl<'p> IrGenerator<'p> {
     ///   （tie_table_new + 逐元素 push，与字面量实参 gen_table_lit_arg 同路径，
     ///   保证 interp/IR 两路径对表实参行为一致）。
     fn gen_table_var_arg(&mut self, name: &str) -> Result<String, IrError> {
-        let bind = self.lookup_var(name).cloned().ok_or_else(|| IrError {
-            message: format!("内部错误：变量 '{name}' 未入作用域（函数 {}）", self.cur_fn),
-        })?;
+        // T0.4：全局表变量（顶层 table<T>）→ 伪绑定 @name（ptr 全局，load 表指针）
+        let bind = match self.lookup_var(name).cloned() {
+            Some(b) => b,
+            None => self.global_table_bind(name).ok_or_else(|| IrError {
+                message: format!("内部错误：变量 '{name}' 未入作用域（函数 {}）", self.cur_fn),
+            })?,
+        };
         // 动态表变量：绑定槽是 alloca ptr（存表指针），load 出表指针直接传
         if bind.ty == "ptr" {
             let t = self.new_reg();
@@ -3954,11 +4017,16 @@ impl<'p> IrGenerator<'p> {
     /// 语义层已保证表达式类型为 struct，此处仅内部防御。
     fn gen_class_addr(&mut self, expr: &Expr) -> Result<(String, &'static str), IrError> {
         match expr {
-            // 变量：绑定地址即对象地址（alloca 指针）
+            // 变量：绑定地址即对象地址（alloca 指针）；
+            // T0.4：全局表变量 → @name 全局槽地址（ref 实参传槽地址，被调函数
+            // by_ptr 绑定后 load/store 穿透到全局表）
             Expr::Var(name) => {
-                let bind = self.lookup_var(name).cloned().ok_or_else(|| IrError {
-                    message: format!("内部错误：变量 '{name}' 未入作用域（函数 {}）", self.cur_fn),
-                })?;
+                let bind = match self.lookup_var(name).cloned() {
+                    Some(b) => b,
+                    None => self.global_table_bind(name).ok_or_else(|| IrError {
+                        message: format!("内部错误：变量 '{name}' 未入作用域（函数 {}）", self.cur_fn),
+                    })?,
+                };
                 // 普通变量：alloca 指针，GEP 直接用绑定地址
                 let _ = bind.by_ptr;
                 Ok((bind.value, bind.ty))
@@ -4183,6 +4251,18 @@ impl<'p> IrGenerator<'p> {
         self.scopes.iter().rev().find_map(|s| s.get(name))
     }
 
+    /// T0.4：全局表变量的「伪绑定」——LLVM 中是 `@name = global ptr null`，
+    /// 函数内访问与局部动态表（alloca ptr）同构：
+    /// - 表访问路径统一 `load ptr, ptr @name` 取表指针；
+    /// - ref 实参传 `@name` 本身（全局槽地址，与局部 by_ptr 绑定传 alloca 地址
+    ///   语义一致：被调函数 load/store 都穿透到全局槽）。
+    fn global_table_bind(&self, name: &str) -> Option<VarBind> {
+        self.sem
+            .global_table_vars
+            .contains_key(name)
+            .then(|| VarBind { value: format!("@{name}"), ty: "ptr", by_ptr: false })
+    }
+
     /// 变量名是否已在作用域中（用于区分方法调用的 receiver 是变量还是类名）。
     fn scope_has(&self, name: &str) -> bool {
         self.lookup_var(name).is_some()
@@ -4197,7 +4277,12 @@ impl<'p> IrGenerator<'p> {
     /// 变量（循环变量/下标链推导）取语义推导类型；调用/下标链兜底查表。
     fn dyn_elem_ty_of(&self, expr: &Expr) -> Result<TypeSpec, IrError> {
         if let Expr::Var(name) = expr
-            && let Some(tv) = self.sem.table_vars.get(&(self.cur_fn.clone(), name.clone()))
+            && let Some(tv) = self
+                .sem
+                .table_vars
+                .get(&(self.cur_fn.clone(), name.clone()))
+                // T0.4：全局表（顶层 table<T>）→ 元素类型回退查全局表元数据
+                .or_else(|| self.sem.global_table_vars.get(name))
         {
             return Ok(tv.elem_ty.clone());
         }
@@ -4218,6 +4303,8 @@ impl<'p> IrGenerator<'p> {
                     .table_vars
                     .get(&key)
                     .map(|info| info.elem_ty.clone())
+                    // T0.4：全局表（顶层 table<T>）→ 回退查全局表元数据
+                    .or_else(|| self.sem.global_table_vars.get(name).map(|i| i.elem_ty.clone()))
                     .ok_or_else(|| IrError {
                         message: format!(
                             "内部错误：动态表变量 '{}' 缺少元素类型元数据（函数 {}）",
@@ -5331,5 +5418,29 @@ mod tests {
         );
         assert!(ir.contains("define void @f(ptr %x)"), "普通表形参也是 ptr 参数");
         assert!(!ir.contains("load ptr, ptr %x"), "普通表形参不得直接 load 参数寄存器：\n{ir}");
+    }
+
+    // ---------- T0.4：顶层表全局变量（IR 生成） ----------
+
+    #[test]
+    fn 顶层表全局变量global_ptr_null与main入口初始化() {
+        // 全局表 IR 布局：`@g = global ptr null`（运行时表指针由 main 入口创建）；
+        // main 入口第一行 call tie_table_new(8)（i64 元素）→ store ptr %1, ptr @g
+        // （重编号后 main 是首个函数，其首寄存器为 %1）；
+        // 函数内表访问 `load ptr, ptr @g`（与局部动态表 alloca ptr 同构）。
+        let ir = 编译(
+            "var g: table<i64>;\nfunc main() {\n    add(1)\n    add(2)\n    println(len(g))\n    println(g[0])\n}\nfunc add(x: i64) {\n    table_push(g, x)\n}",
+        );
+        assert!(ir.contains("@g = global ptr null"), "全局表应发射 ptr null 全局：\n{ir}");
+        assert!(
+            ir.contains("call ptr @tie_table_new(i64 8)"),
+            "main 入口应调用 tie_table_new(8) 创建 i64 元素动态表：\n{ir}"
+        );
+        assert!(
+            ir.lines()
+                .any(|l| l.trim().starts_with("store ptr %1, ptr @g")),
+            "main 入口应 store 表指针到 @g（重编号后首个寄存器 %1）：\n{ir}"
+        );
+        assert!(ir.contains("load ptr, ptr @g"), "函数内表访问应 load @g：\n{ir}");
     }
 }

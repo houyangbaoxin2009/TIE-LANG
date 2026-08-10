@@ -59,6 +59,12 @@ pub struct SemanticResult {
     pub globals: HashMap<String, TypeSpec>,
     /// 顶层全局不可变变量名（const 声明；赋值时校验，与函数内 const_vars 并列）。
     pub const_globals: std::collections::HashSet<String>,
+    /// 顶层全局表变量（T0.4）：变量名 → 布局元数据（元素类型 + 动态标志）。
+    /// 全局表 IR 布局为 `@name = global ptr null`（运行时表指针由 main 入口
+    /// tie_table_new 创建后 store 填充）；函数内表访问（len/下标/table_at/
+    /// for 迭代/table_push/ref 实参）先查本地作用域与 table_vars，未命中
+    /// 再回退查此表（键 = 全局变量名，无函数前缀）。
+    pub global_table_vars: HashMap<String, TableInfo>,
 }
 
 /// 表（table）的布局信息：元素类型、元素个数与是否动态。
@@ -162,6 +168,50 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
                         message: format!("全局变量 '{}' 必须显式标注类型（如 var x: i64）", v.name),
                     });
                 };
+                // T0.4 顶层表全局变量：`var g: table<i64>`（动态表，main 入口运行时
+                // 创建）。元素类型由标注决定（裸 table 约定 string）；初始化限空表
+                // []（缺省由解析层合成）；const 暂不支持（IR 需要 main 入口初始化）。
+                if ty.is_table() {
+                    if v.is_const {
+                        return Err(SemanticError {
+                            span: v.span,
+                            message: format!(
+                                "const 全局表暂不支持：'{}'（表在 main 入口运行时创建，无法静态初始化）",
+                                v.name
+                            ),
+                        });
+                    }
+                    let is_empty_lit = matches!(&v.init, Expr::TableLit { cells, .. } if cells.is_empty());
+                    if !is_empty_lit {
+                        return Err(SemanticError {
+                            span: v.span,
+                            message: format!("全局表 '{}' 的初始化必须是空表 []（元素类型由标注决定）", v.name),
+                        });
+                    }
+                    // 命名冲突：函数名 / 全局变量重名（与标量全局一致）
+                    if ctx.result.funcs.contains_key(&v.name) {
+                        return Err(SemanticError {
+                            span: v.span,
+                            message: format!("全局变量 '{}' 与函数名冲突", v.name),
+                        });
+                    }
+                    if ctx.result.globals.contains_key(&v.name) {
+                        return Err(SemanticError {
+                            span: v.span,
+                            message: format!("全局变量 '{}' 重复定义", v.name),
+                        });
+                    }
+                    // 元素类型：table<T> 用 T；裸 table 默认 string（兼容历史约定，
+                    // 与表形参登记同规则）。动态表（main 入口运行时创建）。
+                    let elem_ty = ty
+                        .table_elem_ty()
+                        .cloned()
+                        .unwrap_or(TypeSpec::Named(TyKw::Str));
+                    let info = TableInfo { elem_ty, len: 0, dynamic: true };
+                    ctx.result.global_table_vars.insert(v.name.clone(), info);
+                    ctx.result.globals.insert(v.name.clone(), ty);
+                    continue;
+                }
                 // 全局变量限标量类型（i64/f64/bool/char/string）——IR 需要静态初始化布局
                 let is_scalar = matches!(
                     &ty,
@@ -1541,6 +1591,8 @@ impl Analyzer {
                 let base_ty = base_ty0;
                 let is_table = if let Expr::Var(vn) = base.as_ref() {
                     self.table_vars.contains_key(&(self.cur_fn.clone(), vn.clone()))
+                        // T0.4：全局表（顶层 table<T>）→ 表身份由全局表元数据决定
+                        || self.result.global_table_vars.contains_key(vn)
                         || matches!(&base_ty, TypeSpec::Named(TyKw::Table))
                 } else {
                     matches!(&base_ty, TypeSpec::Named(TyKw::Table))
@@ -1616,10 +1668,15 @@ impl Analyzer {
                 .map(|info| info.elem_ty.clone())),
             // 表变量：动态表（table_new_* 构造）与定长表（表字面量）都在
             // table_vars 登记（键 = 函数+变量名）——直接查表即可；
+            // T0.4：全局表（顶层 table<T>）→ 回退查全局表元数据；
             // 查不到（非表变量或未登记）返回 None（放行元素类型校验）
             Expr::Var(name) => {
                 let key = (self.cur_fn.clone(), name.clone());
-                Ok(self.table_vars.get(&key).map(|info| info.elem_ty.clone()))
+                Ok(self
+                    .table_vars
+                    .get(&key)
+                    .or_else(|| self.result.global_table_vars.get(name))
+                    .map(|info| info.elem_ty.clone()))
             }
             // 返回表的函数调用（裸调用/命名空间调用）：查 table_ret_elems
             Expr::Call { name, .. } | Expr::MethodCall { receiver: _, method: name, .. } => {
@@ -1858,6 +1915,8 @@ impl Analyzer {
                     let info = self
                         .table_vars
                         .get(&(self.cur_fn.clone(), name0.clone()))
+                        // T0.4：全局表（顶层 table<T>）→ 回退查全局表元数据（动态表）
+                        .or_else(|| self.result.global_table_vars.get(name0))
                         .ok_or_else(|| SemanticError {
                             span: expr_span_of(&args[0]),
                             message: format!("table_push() 找不到表变量 '{}' 的元素类型", name0),
@@ -2840,6 +2899,8 @@ impl Analyzer {
                         let info = self
                             .table_vars
                             .get(&(self.cur_fn.clone(), vname.clone()))
+                            // T0.4：全局表（顶层 table<T>，动态表、可寻址）→ 回退放行
+                            .or_else(|| self.result.global_table_vars.get(vname))
                             .ok_or_else(|| SemanticError {
                                 span: expr_span_of(a),
                                 message: format!(
@@ -3756,8 +3817,12 @@ impl Analyzer {
                 Ok(info.elem_ty.clone())
             }
             Expr::Var(name) => {
-                // 表变量：查 table_vars（定长/动态统一）
+                // 表变量：查 table_vars（定长/动态统一）；
+                // T0.4：全局表（顶层 table<T>）→ 回退查全局表元数据
                 if let Some(info) = self.table_vars.get(&(self.cur_fn.clone(), name.clone())) {
+                    return Ok(info.elem_ty.clone());
+                }
+                if let Some(info) = self.result.global_table_vars.get(name) {
                     return Ok(info.elem_ty.clone());
                 }
                 // 函数参数（scope 类型为 Table，但无 table_vars 元数据）→ 元素类型未知
@@ -6280,6 +6345,87 @@ mod tests {
             }
             "#,
             "动态表",
+        );
+    }
+
+    // ---------- T0.4：顶层表全局变量（global table） ----------
+
+    #[test]
+    fn 顶层表全局变量跨函数持久化通过() {
+        // 顶层 var g: table<i64>（无初始化器 = 默认空动态表，解析层合成 []）：
+        // 两函数分别 table_push / len / 下标读取，跨调用持久化——语义层应通过，
+        // 且登记全局表元数据（元素类型 i64、动态表）供 IR 生成布局。
+        let sem = analyze_src(
+            r#"
+            var g: table<i64>;
+            func add(x: i64) {
+                table_push(g, x)
+            }
+            func dump() -> i64 {
+                return len(g)
+            }
+            func main() {
+                add(1)
+                add(2)
+                println(dump())
+                println(g[0])
+                println(g[1])
+            }
+            "#,
+        )
+        .expect("顶层表全局变量跨函数使用应通过语义检查");
+        // 全局表元数据：元素类型 + 动态标志（IR 查此表生成 @g = global ptr null）
+        let info = sem
+            .global_table_vars
+            .get("g")
+            .expect("应有全局表元数据");
+        assert_eq!(info.elem_ty, TypeSpec::Named(TyKw::I64));
+        assert!(info.dynamic, "全局表应为动态表");
+        // 全局变量类型表也登记（函数内 Var 类型解析走 globals 回退）
+        assert_eq!(
+            sem.globals.get("g"),
+            Some(&TypeSpec::Table(Box::new(TypeSpec::Named(TyKw::I64))))
+        );
+    }
+
+    #[test]
+    fn 顶层表全局变量可作ref实参() {
+        // ref 表形参的可寻址校验（T0.3）：全局表（动态表、可寻址）可作为 ref
+        // 实参——IR 传 @g 槽地址，内容修改/重绑定写回全局表。
+        analyze_src(
+            r#"
+            var g: table<i64>;
+            func fill(x: ref table<i64>) {
+                table_push(x, 99)
+            }
+            func main() {
+                fill(g)
+            }
+            "#,
+        )
+        .expect("全局表作为 ref 实参应通过语义检查");
+    }
+
+    #[test]
+    fn const全局表报错() {
+        // 设计决策：const 全局表暂不支持（IR 需要 main 入口运行时创建）
+        expect_err(
+            "const g: table<i64>;\nfunc main() {}",
+            "const 全局表暂不支持",
+        );
+    }
+
+    #[test]
+    fn 全局表非空初始化报错() {
+        // 全局表初始化限空表 []（元素类型由标注决定；运行时在 main 入口创建）。
+        // 非空字面量 / 运行时表达式都不允许。
+        expect_err(
+            "var g: table<i64> = [1, 2]\nfunc main() {}",
+            "初始化必须是空表",
+        );
+        expect_err(
+            "var g: table<i64> = table_new_i64()\nfunc main() {}",
+            "初始化必须是空表",
         );
     }
 }

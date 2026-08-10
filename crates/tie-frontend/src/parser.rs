@@ -393,10 +393,30 @@ impl Parser {
         } else {
             None
         };
-        self.expect(TokenKind::Eq, "'='")?;
-        let init = self.parse_expr()?;
-        self.expect(TokenKind::Semi, "语句结束符")?;
-        Ok(vec![VarDeclStmt { name, ty, init, span, is_const }])
+        // T0.4 顶层表全局变量：显式标注表类型（table<T> / 裸 table）时允许省略
+        // 初始化器（`var g: table<i64>;`）——解析层合成空表字面量 []（元素类型
+        // 由标注决定，语义层登记元数据；运行时在 main 入口创建）。
+        // 仅表类型允许省略；其余类型保持既有「期望 '='」错误行为（错误契约不变）。
+        if self.eat(&TokenKind::Eq) {
+            let init = self.parse_expr()?;
+            self.expect(TokenKind::Semi, "语句结束符")?;
+            Ok(vec![VarDeclStmt { name, ty, init, span, is_const }])
+        } else if matches!(
+            &ty,
+            Some(TypeSpec::Table(_)) | Some(TypeSpec::Named(TyKw::Table))
+        ) {
+            self.expect(TokenKind::Semi, "语句结束符")?;
+            Ok(vec![VarDeclStmt {
+                name,
+                ty,
+                init: Expr::TableLit { cells: Vec::new(), span },
+                span,
+                is_const,
+            }])
+        } else {
+            self.expect(TokenKind::Eq, "'='")?;
+            unreachable!("expect 失败已返回 Err")
+        }
     }
 
     /// 元组解构声明：`var (q, r) = expr;`（desugar 为临时变量 + 逐字段声明）。

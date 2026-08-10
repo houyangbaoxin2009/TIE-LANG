@@ -5362,4 +5362,30 @@ to_string(n) + ":" + names"#
         let err = s.eval("g([1, 2])").unwrap_err();
         assert!(err.contains("可寻址"), "错误消息：{err}");
     }
+
+    // ---------- T0.4：顶层表全局变量（解释路径） ----------
+
+    #[test]
+    fn eval_顶层表全局变量跨函数持久化() {
+        // 顶层 var g: table<i64>（无初始化器 → 解析层合成空表 []）落入
+        // session.globals（Value::Table）；函数内 table_push 经 assign 写回
+        // globals、len/下标读取经 lookup 回退 globals——跨调用持久化，
+        // 与编译路径行为一致。
+        let mut s = Session::new();
+        let _ = s.eval("var g: table<i64>;");
+        let _ = s.eval("func add(x: i64) {\n    table_push(g, x)\n}");
+        let _ = s.eval("func dump() -> i64 {\n    return len(g)\n}");
+        // 函数内 push 写回全局表：跨两次调用累加（add(1) + add(2)）
+        let _ = s.eval("add(1)");
+        let _ = s.eval("add(2)");
+        assert_eq!(s.eval("len(g)").unwrap(), "2");
+        assert_eq!(s.eval("g[0]").unwrap(), "1");
+        assert_eq!(s.eval("g[1]").unwrap(), "2");
+        // 跨函数读取：dump 返回 len(g)
+        assert_eq!(s.eval("dump()").unwrap(), "2");
+        // 下标赋值写回全局表（t[i] = v 经 assign 回退 globals）
+        let _ = s.eval("g[0] = 9");
+        assert_eq!(s.eval("g[0]").unwrap(), "9");
+        assert_eq!(s.eval("len(g)").unwrap(), "2");
+    }
 }

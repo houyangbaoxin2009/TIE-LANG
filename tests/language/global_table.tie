@@ -1,0 +1,24 @@
+// tie:logic
+// tie:opt=2
+
+// T0.4 验收：顶层表全局变量（global table）——table<i64> 动态表，main 入口运行时创建。
+//
+// g 是顶层全局表：add 跨多次调用 push 累加；dump 读取长度；main 直接下标读取。
+// 预期输出：2 / 1 / 2（len(g)=2、g[0]=1、g[1]=2）——跨函数持久化的动态表。
+var g: table<i64>;
+
+func add(x: i64) {
+    table_push(g, x)
+}
+
+func dump() -> i64 {
+    return len(g)
+}
+
+func main() {
+    add(1)
+    add(2)
+    println(dump())
+    println(g[0])
+    println(g[1])
+}
