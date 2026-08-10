@@ -82,9 +82,16 @@ ROLE:logic          ← 角色（logic/ui/db/data/library）
 HEADERS:2           ← 头部指令数量
 H:opt=2             ← 每条头部指令原文（剥离 // tie: 前缀后）
 H:target=win
-BODY:12             ← 正文字节数（tie len 语义）
-<正文恰好 12 字节>   ← 清理后的正文（不含头部行）
+BODY:12             ← 正文码点数（str_len 语义，Rust 侧按字符截取）
+<正文恰好 12 个字符> ← 清理后的正文（不含头部行）
 ```
+
+> 编码约定：BODY 声明的是**码点数**（`str_len`），非字节数。字符串在 tie 中
+> 是 UTF-8 编码，`len` 返回字节数而 `str_char`/`str_len` 按 Unicode 码点索引——
+> 中文等多字节字符下字节数 ≠ 码点数（一个汉字 3 字节、1 码点），字符串遍历
+> 边界必须用 `str_len` 才能保证中文文本不错位（`str_len("你好") == 2` 码点，
+> `len("你好") == 6` 字节；用 `len` 做 `str_char` 的循环上界会越界返回空串，
+> 导致 trim 尾随空白残留、slice 截取错乱）。
 
 **扩展性**：新增转换器/处理器 = 新增一个 tie 模块（约定顶层
 `func process(src: string) -> string`），Rust 侧零改动。
