@@ -4,7 +4,7 @@
 > 覆盖语法、语义、已实现/未实现边界与编译器架构。你（AI）应严格按本文件 +
 > [language.md](language.md) 工作，不得使用本文件未列出的特性（很可能未实现）。
 >
-> 更新于 2026-08-07（P8 class/OOP 完成后）。
+> 更新于 2026-08-10（自举 v2 阶段 0：ref 表参数 / 全局表 / map 排序 / intern / extern 完成后）。
 
 ## 0. 一句话定位
 
@@ -37,7 +37,7 @@ tie                             # 无参数 → REPL
 | `library` | 编译为库，不生成 main |
 | `ui` / `db` | 规划中（M4），**未实现** |
 
-## 2. 已实现特性清单（截至 P8）
+## 2. 已实现特性清单（截至 2026-08-10，含自举 v2 阶段 0）
 
 以下特性**可以使用**，示例均已验证：
 
@@ -101,9 +101,64 @@ func main() { println(add(1, 2)) }         // 入口
 
 - 返回类型 `-> Ty` 可省略（默认 `void`）。
 - **多值返回**用元组（见 2.6）。
-- **未实现**：一等函数、默认参数、重载、函数体内嵌套函数。
+- **默认值参数**（M2.1 已实现）：`func greet(name: string, prefix: string = "Hello")`，
+  调用时可省略可选参数（必须连续排在必选参数之后）。
+- **未实现**：一等函数、重载、函数体内嵌套函数。
 
-### 2.5 表 table（数组）
+### 2.4.1 ref 表参数按引用传递（T0.3 已实现）
+
+形参类型前加 `ref`，表参数**按引用传递**（仅限表，非表类型报错）：
+
+```c
+func fill(x: ref table<i64>) {
+    table_push(x, 99)
+    x[0] = 42
+}
+func replace(x: ref table<i64>) {
+    x = table_new_i64()        // 重绑定：调用方实参跟随指向新表
+    table_push(x, 7)
+}
+func main() {
+    var t = table_new_i64()
+    table_push(t, 1)
+    fill(t)                    // 内容修改写回：len=3，t[0]=42
+    println(len(t))            // 3
+    println(t[0])              // 42
+    replace(t)                 // 重绑定写回：t 现指向含 [7] 的新表
+    println(len(t))            // 1
+    println(t[0])              // 7
+}
+```
+
+**规则**：
+
+- 内容修改（push/下标写）与变量重绑定（`x = ...`）都**写回调用方实参槽**；
+- 实参必须是**可寻址的动态表变量**：表字面量 `g([1, 2])`、下标、调用结果 →
+  `调用 'g' 的 ref 参数需要可寻址的表变量实参（字面量/下标/调用结果不可取地址）`；
+- 非 ref 表参数保持值语义（重绑定隔离；interp 路径内容修改也隔离）。
+
+### 2.4.2 extern 函数声明（T0.7 已实现）
+
+顶层声明外部 C 函数符号（无函数体），编译路径链接 clang 解析 libc（msvcrt）：
+
+```c
+extern fn system(cmd: string) -> i32;   // libc system
+extern fn rand() -> i32;                // libc rand
+
+func main() {
+    println(rand())                     // [0, 32767] 随机值
+    println(system("exit 0"))           // 0
+}
+```
+
+**规则**：
+
+- `extern fn` 固定标识符；参数/返回仅标量（i8..u64/f32/f64/bool/char/string/void）；
+- 声明只能出现在**文件顶层**（函数体内 → 编译期报错）；
+- 表/结构体参数 → `extern 函数 'foo' 的参数 't' 必须是标量类型…实际是 table<i64>`；
+- **REPL / 解释路径不支持调用 extern**（仅编译路径）：`REPL 不支持调用 extern 函数 'foo'（仅编译路径可用，请用 tie-llvm 编译运行）`。
+
+### 2.5 表 table（数组）与键值表 map
 
 ```c
 var arr: table = [1, 2, 3]         // 单行 3 列（无 id）
@@ -112,9 +167,56 @@ var e = arr[1]                     // 下标访问（已实现）
 for item in arr { }                // 遍历（已实现）
 ```
 
-> **重要**：当前（M2）表运行时仅支持**单行纯位置表 + 数字下标**。
-> 字符串 id 表（`["a":1]`）、二维表（`[1,2;3,4]`）语法可解析，但语义阶段
-> 报"留待 M3"，**不要使用**。
+> **注意**：上方表字面量示例中，字符串 id 表（`["a":1]`）即**键值表 map**，
+> 已随 E3 + T0.5 落地可用（见 2.5.1）；二维表（`[1,2;3,4]`）语法可解析，
+> 但语义阶段报"留待 M3"，**不要使用**。
+
+### 2.5.1 键值表 map / map\<T\>（E3 + T0.5 排序键二分已实现）
+
+```c
+var m: map = ["a":1, "b":2]      // 键值表：string -> i64
+var n: map<string> = ["x":"hi"]  // 显式值类型（map 默认值类型 i64）
+var v = m["a"]                   // 下标读：1
+m["c"] = 3                       // 下标写：不存在则插入，存在则覆盖
+var k = len(m)                   // 条目数：3
+```
+
+**排序键二分（T0.5）**：map 键恒按 **strcmp 字节序**有序存储，查找/插入二分
+（零分配），10k 次查找由线性 ≈ 6.27s 降至 ≈ 2.7ms（~2295×，见
+`scripts/bench/map-bench.tie`）。
+
+**行为契约**：map 输出/打印**按键排序**（`{a: 1, m: 2, z: 3}`），
+**不依赖插入序**。依赖插入序的写法不可用。
+
+**约束**：键恒为字符串（必须加双引号）；值类型全表一致；**map 不能作全局变量**
+（语法层即拒绝，见 2.5.2）。
+
+### 2.5.2 顶层表全局变量（T0.4 已实现）
+
+顶层 `var g: table<T>;`（无初始化器 = 默认空动态表；也可 `= []`）：
+
+```c
+var g: table<i64>;               // 顶层全局表：跨函数持久，main 入口运行时创建
+
+func add(x: i64) {
+    table_push(g, x)
+}
+func main() {
+    add(1)
+    add(2)
+    println(len(g))              // 2（跨函数累加）
+    println(g[0])                // 1（main 直接下标读取）
+    println(g[1])                // 2
+}
+```
+
+**规则**：
+
+- 跨函数持久：push / 下标写 / len / for 遍历均可直接使用；
+- **可作 ref 实参**（§2.4.1）；元素类型可标注（`table<i64>`），省略约定 `string`；
+- **仅 `table<T>` 支持全局**；**map 不能作全局**（语法层拒绝）；
+- **const 全局表暂不支持**：`const g: table<i64>;` → `const 全局表暂不支持：'g'（表在 main 入口运行时创建，无法静态初始化）`；
+- 初始化器只能为空表 `[]`（或省略）；非表类型全局变量限标量。
 
 ### 2.6 元组（多值返回 / 异构值类型）
 
@@ -152,6 +254,49 @@ using math;                       // 引入命名空间：其公有函数可裸�
   - `using fmt;` / `using f2.inner;`：引入已导入命名空间的公有函数，可裸名调用；
     多 using 同名函数 → 裸调用歧义报错。
 - **未实现**：`data` 文件导入为只读数据表、按角色分派可见符号集。
+
+### 2.7.1 字符串池 intern（T0.6 已实现，std/intern.tie）
+
+字符串 → 稳定整数 id 的登记机制（命名空间 `intern`），编译器符号表把
+O(len) 字符串比较降为 O(1) 整数比较：
+
+```c
+import "../../std/intern.tie"
+using intern;
+
+func main() {
+    var a = intern.intern("abc")   // 首次登记 → id 0
+    var b = intern.intern("abc")   // 同串 → 同一 id 0
+    var c = intern.intern("xyz")   // 新串 → id 1（id 从 0 递增）
+    println(intern.lookup(a))      // "abc"
+    println(intern.lookup(999))    // ""（未登记 id 返回空串哨兵）
+    println(intern.interned_len()) // 2
+}
+```
+
+**接口**：`intern(s)->i64`（登记返回稳定 id，同串同 id）、
+`lookup(id)->string`（缺失返回空串哨兵）、`interned_len()->i64`。
+池为模块级全局状态，跨函数/跨模块 id 稳定。
+
+### 2.7.2 进程原语 process（T0.7 已实现，std/process.tie）
+
+用 extern 声明（链接期 libc 符号）实现的进程原语（命名空间 `process`），
+0-Rust 路径的关键证明——tie 直接声明并调用 libc 函数：
+
+```c
+import "../../std/process.tie"
+using process;
+
+func main() {
+    println(process.exec_code("exit 0"))        // 0（libc system 退出码）
+    println(process.exec_code("exit 3"))        // 3
+    println(process.exec_output("echo hello"))  // "hello\n"（重定向 + 文件读回）
+}
+```
+
+**接口**：`exec_code(cmd)->i32`（包装 extern `system`，返回退出码）、
+`exec_output(cmd)->string`（stdout+stderr 合并捕获，临时文件重定向读回）。
+依赖 extern 调用，**REPL 中不可用**（仅编译路径）。
 
 ### 2.8 struct 数据与逻辑分离（M2.1.8）
 
@@ -231,27 +376,43 @@ namespace Dog {
 | 元组空解构 `var () = ...` | 「空解构 () 不支持」 |
 | 表初始化非表字面量 | 「初始化必须是表字面量」 |
 | string 与 i64 直接拼接 | 类型不匹配错误 |
+| ref 表参数实参非可寻址（字面量/下标/调用结果） | 「调用 'g' 的 ref 参数需要可寻址的表变量实参（字面量/下标/调用结果不可取地址）」 |
+| ref 表参数实参非动态表（定长表变量） | 「调用 'g' 的 ref 参数实参 't' 必须是动态表变量（table_new_* 创建）」 |
+| ref 修饰非表类型参数 | 「ref 只能用于表参数」类错误 |
+| const 全局表 `const g: table<i64>;` | 「const 全局表暂不支持：'g'（表在 main 入口运行时创建，无法静态初始化）」 |
+| 全局表初始化非空表字面量 | 「全局变量 'g' 的初始化器必须是空表 []」 |
+| 顶层 map 全局变量 `var m: map;` | 语法层即拒绝 |
+| extern 参数/返回为表或结构体 | 「extern 函数 'foo' 的参数 't' 必须是标量类型…实际是 table<i64>」 |
+| extern 声明出现在函数体内 | 「extern 声明只能出现在文件顶层」 |
+| extern 与已有函数同名重复声明 | 「extern 函数 'foo' 与已有函数重复定义」 |
+| REPL 中调用 extern 声明的函数 | 「REPL 不支持调用 extern 函数 'foo'（仅编译路径可用，请用 tie-llvm 编译运行）」 |
 
 ## 4. 未实现 / 不要使用的特性
 
 - `ui` / `db` 文件角色（M4 规划）
-- 二维表、字符串 id 表**运行时**（语法能解析但语义报错）
+- 二维表（`[1,2;3,4]`）**运行时**（语法能解析但语义报错）；字符串 id 表（=map）已实现可用
 - `data` 文件的 import 数据表化
 - 库编译（`library` 角色声明可用，但编译为库的流程未完成）
 - `--target` 交叉编译、`--backend=gnu`
-- 一等函数、默认参数、函数重载
+- 一等函数、函数重载
 - 类：对象比较（`==`）、`println` 打印对象、方法重载、析构
 - 裸代码块（函数体内的 `{ }`）、空元组 `()`
+- **map 全局变量**（顶层 `var m: map;` 语法层拒绝）
+- **const 全局表**（`const g: table<i64>;` 报「const 全局表暂不支持」）
+- **extern 在 REPL/解释路径**（仅编译路径可用；含 std/process 的 exec_code/exec_output）
 
 ## 5. 编写 tie 代码的硬性规则
 
-1. **类、import、func 只出现在文件顶层**；函数体内只有语句。
+1. **类、import、func、extern 声明只出现在文件顶层**；函数体内只有语句。
 2. **行尾分号可省略**（ASI 自动补全）；同一行多条语句必须用 `;` 分隔。
 3. 类实例要访问字段/调方法，**必须先存入变量**（`var p = Point(0); p.x`），不能 `Point(0).x`。
 4. 继承字段跨链唯一；方法遮蔽允许（子类同名覆盖父类）。
 5. `string` 字面量加双引号；`char` 单引号。
 6. `logic` 文件必须含 `func main()`。
 7. 所有语句（变量声明、赋值、表达式、return）以换行或 `;` 结束。
+8. **ref 表参数**（§2.4.1）：只用于表形参；实参必须是可寻址的动态表变量。
+9. **extern 声明**（§2.4.2）：限标量类型；声明后仅编译路径可调用（REPL 不可用）。
+10. **全局表**（§2.5.2）：仅 `table<T>`、无初始化器或 `= []`；map 不能全局、const 暂不支持。
 
 ## 6. 完整可运行示例（可直接粘贴验证）
 

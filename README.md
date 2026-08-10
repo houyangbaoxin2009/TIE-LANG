@@ -248,10 +248,11 @@ tie/
 | M5 | 动态库编译：`// tie:library` 输出 `.dll`（win）/ `.so`（linux）——库公有函数 `dllexport` 导出、跨语言调用约定（标量直传/字符串 C ABI 桥）、C 程序 LoadLibrary/dlopen 消费示例（见 docs/plans/dynamic-library.md） | 📋 规划 |
 | M6 | 包管理器（E1/E2 ✅ + E3/E4 ✅）：tie 语言自写 CLI（`pkg/main.tie` → `pkg.exe`，自举）+ tie.pkg 清单解析（`manifest.tie`）+ 三源安装（path 复制 / git 浅克隆 / registry 下载解压，`deps.tie` + `fetch.tie`）+ tie.lock 锁文件幂等恢复（`lock.tie`）+ 递归依赖解析（去重/冲突检测）+ `tie update`/`publish`（打包 tar.gz + git tag/push，`publish.tie`）/`search`/`info`（注册表查询，`search.tie`）；Rust 入口 `crates/tie` 识别 11 个子命令并转发；`init → add（path/git/registry）→ install → build/run` 端到端跑通（见 examples/pkg_demo.md） | ✅ 完成（E1–E4） |
 
-### 自举（Self-hosting，规划中）
+### 自举（Self-hosting，进行中）
 
 **目标**：前端（词法/语法/语义）+ IR 生成完全用 tie 语言重写，tie 编译器能编译自身。
-规划见 [docs/plans/self-hosting.md](docs/plans/self-hosting.md)。
+规划见 [docs/plans/self-hosting.md](docs/plans/self-hosting.md)；自举 v2 阶段规划见
+`.omo/plans/self-hosting-v2.md`。
 
 **前置能力已落地（2026-08-10）**：
 
@@ -266,3 +267,14 @@ tie/
 | 字符串 id 表不可用（符号表） | E3 键值表 `map`/`map<T>`：字面量/下标读写/实参（D3 排序数组过渡并存） | ✅ 完成 |
 | 无嵌套表（AST 树形结构） | E1 嵌套表 `table<table<T>>`：`>>` 类型参数分裂 + 嵌套下标链 + ptr 元素桥 | ✅ 完成 |
 | 无 enum / 无函数指针 | B1 tag 表 AST + C1 字符串分派（前提已就绪，编码修订见规划文档 §3.5） | 📋 规划 |
+
+**自举 v2 阶段 0 语言特性（2026-08-10 收官 e816457）**：为 tie 语言自举
+补足的五项语言/标准库能力（T0.3–T0.7），全部已实现并验收：
+
+| 特性 | 内容 | 验收 | 状态 |
+| --- | --- | --- | --- |
+| T0.3 ref 表参数按引用传递 | `ref table<T>` 形参：内容修改与变量重绑定都写回调用方实参槽 | `tests/language/byref_table.tie`（3/42/99/100/1/7） | ✅ 完成 |
+| T0.4 顶层表全局变量 | 顶层 `var g: table<T>;`：跨函数持久动态表，可作 ref 实参；const 全局表暂不支持 | `tests/language/global_table.tie`（2/1/2） | ✅ 完成 |
+| T0.5 map 排序键二分 | map 查找由线性扫描升级为排序键二分（strcmp 字节序），10k 查找 ~2295×；输出按键排序 | `scripts/bench/map-bench.tie` | ✅ 完成 |
+| T0.6 字符串池 intern 库 | `std/intern.tie`：`intern(s)->i64` / `lookup(id)->string` / `interned_len()`，符号比较 O(1) id 化 | `tests/language/intern.tie` | ✅ 完成 |
+| T0.7 extern 函数声明 | 顶层 `extern fn` 声明外部 C 符号（IR `declare`，clang 链接 libc）；`std/process.tie` 进程原语 | `tests/language/extern_decl.tie`（rand/0/3/hello） | ✅ 完成 |
