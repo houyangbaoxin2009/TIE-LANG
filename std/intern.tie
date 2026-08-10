@@ -1,0 +1,105 @@
+// tie:library
+// intern.tie：标准库——字符串池（intern，命名空间 intern，自举 T0.6）
+// 作用：把字符串登记为稳定整数 id（相同串返回相同 id），供编译器符号表把
+// O(len) 字符串比较降为 O(1) 整数比较（阶段 2 compiler/lib/interner.tie 消费，
+// AST 名字字段存池 id——B1 列式设计依赖）。
+//
+// 数据结构（三个并行全局动态表，T0.4 全局表特性——本模块是它的首次生产消费）：
+// - intern_pool : table<string>  id -> 串（按登记序追加，pool[id] == 该 id 的串）
+// - intern_keys : table<string>  正查键：全部已登记串，升序（字符串 < 比较，strcmp 码点序）
+// - intern_vals : table<i64>     正查值：与 intern_keys 并行，keys[i] 对应 vals[i]（该串的 id）
+// 正查 = 对 intern_keys 二分（O(log n)）；反向 = intern_pool 下标 O(1)。
+// 说明：全局 map 未放开（顶层 `var m: map` 语法层即报错），故正查用并行排序表
+// 方案（同 D3 排序数组二分模式）；插入用「追加尾部 + 向前冒泡」保持升序（同
+// std/sort.tie 的 insert_sorted 算法），keys/vals 同步交换维持并行对应。
+//
+// 约定（接口稳定，消费者依赖）：
+// - id 从 0 递增分配（首次登记得 0，之后逐个 +1）；重复登记返回原 id，不新增条目；
+// - lookup(id) 对未登记 id（含负数、越界）返回空串 "" 哨兵；编译器侧另有
+//   -1 表示"无名字"，与本哨兵区分——调用方须先判空串再判 -1；
+// - 池为模块级全局状态：同一进程内跨函数、跨模块调用共享（import 文本内联，
+//   全局变量随内联进入消费文件顶层，main 入口运行时初始化）。
+// 调用：import 后 intern.intern(...) / intern.lookup(...) / intern.interned_len()
+// 命名规范：命名空间内函数不加 intern_ 前缀；内部工具私有（非 pub）。
+
+// 全局状态：id -> 串（反向表，按登记序）
+var intern_pool: table<string>;
+// 正查键表：已登记串升序（字符串 < 比较）
+var intern_keys: table<string>;
+// 正查值表：与 intern_keys 并行，keys[i] 对应串的 id
+var intern_vals: table<i64>;
+
+namespace intern {
+// 二分查找已登记串 s 在 intern_keys 中的下标（keys 升序）；未找到返回 -1。
+// 迭代式显式 lo/hi 下标，字符串比较直接用 < / > / == 运算符（IR 走 strcmp）。
+func binsearch(s: string) -> i64 {
+    var lo: i64 = 0
+    var hi: i64 = len(intern_keys) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if intern_keys[mid] == s {
+            return mid
+        }
+        if intern_keys[mid] < s {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+// 把字符串 s 登记进池，返回稳定 id：相同串返回相同 id（id 从 0 递增）。
+// 新串流程：id = 当前池长（追加前长度）→ pool 追加 → keys/vals 有序插入
+// （追加尾部后向前冒泡，两表同步交换保持并行对应）→ 返回 id。
+pub func intern(s: string) -> i64 {
+    var idx = binsearch(s)
+    if idx >= 0 {
+        return intern_vals[idx]
+    }
+    // 新串：id 为追加前池长（0 起始递增）
+    var id: i64 = len(intern_pool)
+    table_push(intern_pool, s)
+    // 有序插入 keys/vals：先追加尾部，再向前冒泡（同 insert_sorted 一步）
+    table_push(intern_keys, s)
+    table_push(intern_vals, id)
+    var i: i64 = len(intern_keys) - 1
+    var moving: bool = true
+    while moving {
+        // 已到表头：无需再前移
+        if i == 0 {
+            moving = false
+        } else if intern_keys[i] < intern_keys[i - 1] {
+            // 逆序：两表同步交换，继续向前搬移
+            var tmpk = intern_keys[i]
+            intern_keys[i] = intern_keys[i - 1]
+            intern_keys[i - 1] = tmpk
+            var tmpv: i64 = intern_vals[i]
+            intern_vals[i] = intern_vals[i - 1]
+            intern_vals[i - 1] = tmpv
+            i = i - 1
+        } else {
+            // 前一元素更小（或相等）：升序已满足
+            moving = false
+        }
+    }
+    return id
+}
+
+// id -> 串（pool 下标 O(1)）；id 未登记（负数或 >= 池长）返回约定哨兵空串 ""。
+// 注意：空串哨兵与编译器侧 -1"无名字"哨兵是不同约定——空串表示"该 id 未登记"。
+pub func lookup(id: i64) -> string {
+    if id < 0 {
+        return ""
+    }
+    if id >= len(intern_pool) {
+        return ""
+    }
+    return intern_pool[id]
+}
+
+// 池中当前条目数（已登记的不同串数量）。
+pub func interned_len() -> i64 {
+    return len(intern_pool)
+}
+}
