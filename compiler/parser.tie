@@ -1,0 +1,2197 @@
+// tie:library
+// compiler/parser.tie：语法分析器（tie 语言自写，自举阶段 2 模块 2）
+//
+// 入口：parser.parse(tokens_text) -> AST 协议文本（见 compiler/PROTOCOL.md §5）
+// 行为与 Rust 版 crates/tie-frontend/src/parser.rs 逐条对齐：
+//   - 顶层程序（函数/import/using/struct/命名空间/全局变量）
+//   - 语句（var/const/if/while/for/switch/return/break/continue/赋值/表达式）
+//   - 循环标签（E5）：`L: while/for` + `break L` / `continue L`
+//   - 表达式优先级链（三目→||→&&→|→^→&→==→比较→移位→加减→乘除→一元→后缀→原子）
+//   - 类型（基本/table<T>/map<T>/元组/struct 名，含 `>>` 闭括号分裂）
+//   - 表字面量（含 id:value）、元组字面量（命名/匿名）、分组表达式
+//
+// 设计约束（interp eval 注册，不能 import，自包含）：
+//   - 全局变量必须标量（表不能作全局变量）→ token 流存全局协议文本，
+//     用「三组前瞻缓存（tok0/tok1/tok2）+ 顺序扫描游标」实现 peek/advance/回退；
+//   - `>>`/`>=`/`>>=` 闭括号分裂（A1/E1）用 ghost token 模拟：协议层无法插入
+//     token，分裂时把剩余部分记为「幽灵 token」（peek/advance 优先消费幽灵，
+//     不推进真实游标）；
+//   - 节点池/字符串池 = 全局字符串累积（每行一个节点/池条目，行号即 id）；
+//     子节点 id 列表变长，行内空格分隔（纯数字无歧义）；
+//   - 字符串池条目用转义表示（escape_str/unescape_str，见 PROTOCOL.md §3）；
+//   - 最近构造节点字段用全局「单槽记录」（tag/line/col/name/前 3 子节点）——
+//     parse_expr_or_assign 需在解析 value 前快照 expr 字段（value 解析会覆盖记录）；
+//   - 错误用全局 par_err 标志 + 返回 -1 短路传播，主入口返回 ERR: 文本。
+
+// ==================== 全局状态（interp 注册时初始化，parse 重置） ====================
+
+var par_tokens: string = ""   // TOKENS 协议文本（输入）
+var par_n: i64 = 0            // token 总数（含 Eof）
+var par_pos: i64 = 0          // 当前 token 游标（0 起）
+var par_scan: i64 = 0         // 顺序扫描游标（par_tokens 中的文本位置）
+
+// 前瞻缓存：tok0=当前，tok1/tok2=后续
+var par_kind0: i64 = -1
+var par_line0: i64 = 0
+var par_col0: i64 = 0
+var par_num0: i64 = 0
+var par_float0: string = "0"
+var par_str0: string = ""
+var par_kind1: i64 = -1
+var par_line1: i64 = 0
+var par_col1: i64 = 0
+var par_num1: i64 = 0
+var par_float1: string = "0"
+var par_str1: string = ""
+var par_kind2: i64 = -1
+var par_line2: i64 = 0
+var par_col2: i64 = 0
+var par_num2: i64 = 0
+var par_float2: string = "0"
+var par_str2: string = ""
+var par_has2: bool = false          // 是否有 tok2（token 数不足时为 false）
+
+// ghost token（类型参数闭括号分裂模拟）：非 -1 时 peek/advance 优先消费幽灵
+var par_ghost: i64 = -1       // 幽灵 token 种类（Gt/Eq/Ge）
+
+// 节点池（全局字符串累积，行号即节点 id）
+var par_nodes: string = ""    // 每行：tag line col name_id val aux nchild c1 c2 ...
+var par_nnodes: i64 = 0
+// 字符串池（全局字符串累积，行号即池 id）
+var par_pool: string = ""     // 每行：转义后的字符串
+var par_npool: i64 = 0
+
+// 最近构造节点字段（单槽记录；多槽节点只存前 3 子节点）
+var par_last_tag: i64 = -1
+var par_last_line: i64 = 0
+var par_last_col: i64 = 0
+var par_last_name: i64 = -1
+var par_last_kid0: i64 = -1
+var par_last_kid1: i64 = -1
+var par_last_kid2: i64 = -1
+
+// 解构 desugar 临时变量计数器
+var par_tmp_counter: i64 = 0
+
+// 错误状态
+var par_err: string = ""
+var par_err_line: i64 = 0
+var par_err_col: i64 = 0
+
+namespace parser {
+
+// ==================== 字符/字符串工具（自包含） ====================
+
+// 在 s 中从 pos 起找单字符 c；未找到返回 -1
+func find_char_at(s: string, c: string, pos: i64) -> i64 {
+    var n: i64 = str_len(s)
+    var i: i64 = pos
+    while i < n {
+        if str_char(s, i) == c {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 在 s 中找单字符 c；未找到返回 -1
+func find_char(s: string, c: string) -> i64 {
+    return find_char_at(s, c, 0)
+}
+
+// 截取 [start, end) 码点区间子串
+func slice(s: string, start: i64, end: i64) -> string {
+    var n: i64 = str_len(s)
+    var lo = start
+    if lo < 0 {
+        lo = 0
+    }
+    var hi = end
+    if hi > n {
+        hi = n
+    }
+    if lo >= hi {
+        return ""
+    }
+    var r: string = ""
+    var i: i64 = lo
+    while i < hi {
+        r = r + str_char(s, i)
+        i = i + 1
+    }
+    return r
+}
+
+// 字符串转义（与 lexer.escape_str 同规则）：\n \t \r \\ \" \' \0 → 两字符可打印文本
+func escape_str(s: string) -> string {
+    var out: string = ""
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "\n" {
+            out = out + "\\n"
+        } else if c == "\t" {
+            out = out + "\\t"
+        } else if c == "\r" {
+            out = out + "\\r"
+        } else if c == "\\" {
+            out = out + "\\\\"
+        } else if c == "\"" {
+            out = out + "\\\""
+        } else if c == "'" {
+            out = out + "\\'"
+        } else if c == "\0" {
+            out = out + "\\0"
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 字符串反转义（escape_str 的逆）
+func unescape_str(s: string) -> string {
+    var out: string = ""
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "\\" && i + 1 < n {
+            var e = str_char(s, i + 1)
+            if e == "n" {
+                out = out + "\n"
+                i = i + 2
+            } else if e == "t" {
+                out = out + "\t"
+                i = i + 2
+            } else if e == "r" {
+                out = out + "\r"
+                i = i + 2
+            } else if e == "\\" {
+                out = out + "\\"
+                i = i + 2
+            } else if e == "\"" {
+                out = out + "\""
+                i = i + 2
+            } else if e == "'" {
+                out = out + "'"
+                i = i + 2
+            } else if e == "0" {
+                out = out + "\0"
+                i = i + 2
+            } else {
+                out = out + c
+                i = i + 1
+            }
+        } else {
+            out = out + c
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ==================== 错误 ====================
+
+// 记录错误（首次保留）
+func set_err(msg: string, line: i64, col: i64) {
+    if par_err == "" {
+        par_err = msg
+        par_err_line = line
+        par_err_col = col
+    }
+}
+
+// 当前 token 位置上的错误（对齐 Rust Parser::err）
+func err_here(msg: string) {
+    set_err(msg, par_line0, par_col0)
+}
+
+// 类型关键字编号 → 名称（PROTOCOL.md §2.3）
+func type_kw_name(kind: i64) -> string {
+    var names = "i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool trit char string void code num text misc table map"
+    // 按空格切分取第 (kind-30) 个
+    var idx: i64 = 0
+    var start: i64 = 0
+    var n: i64 = str_len(names)
+    var target = kind - 30
+    var i: i64 = 0
+    while i < n && idx <= target {
+        if str_char(names, i) == " " {
+            if idx == target {
+                return slice(names, start, i)
+            }
+            idx = idx + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return slice(names, start, n)
+}
+
+// 符号编号 → 名称（PROTOCOL.md §2.4，错误消息用）
+func sym_name(kind: i64) -> string {
+    if kind == 52 {
+        return "LParen"
+    }
+    if kind == 53 {
+        return "RParen"
+    }
+    if kind == 54 {
+        return "LBrace"
+    }
+    if kind == 55 {
+        return "RBrace"
+    }
+    if kind == 56 {
+        return "LBracket"
+    }
+    if kind == 57 {
+        return "RBracket"
+    }
+    if kind == 58 {
+        return "Comma"
+    }
+    if kind == 59 {
+        return "Colon"
+    }
+    if kind == 60 {
+        return "DoubleColon"
+    }
+    if kind == 61 {
+        return "分号"
+    }
+    if kind == 62 {
+        return "Dot"
+    }
+    if kind == 63 {
+        return "DotDot"
+    }
+    if kind == 64 {
+        return "Arrow"
+    }
+    if kind == 65 {
+        return "Plus"
+    }
+    if kind == 66 {
+        return "Minus"
+    }
+    if kind == 67 {
+        return "Star"
+    }
+    if kind == 68 {
+        return "Slash"
+    }
+    if kind == 69 {
+        return "Percent"
+    }
+    if kind == 70 {
+        return "Eq"
+    }
+    if kind == 71 {
+        return "EqEq"
+    }
+    if kind == 72 {
+        return "NotEq"
+    }
+    if kind == 73 {
+        return "Lt"
+    }
+    if kind == 74 {
+        return "Gt"
+    }
+    if kind == 75 {
+        return "Le"
+    }
+    if kind == 76 {
+        return "Ge"
+    }
+    if kind == 77 {
+        return "AndAnd"
+    }
+    if kind == 78 {
+        return "OrOr"
+    }
+    if kind == 79 {
+        return "Bang"
+    }
+    if kind == 80 {
+        return "PlusEq"
+    }
+    if kind == 81 {
+        return "MinusEq"
+    }
+    if kind == 82 {
+        return "StarEq"
+    }
+    if kind == 83 {
+        return "SlashEq"
+    }
+    if kind == 84 {
+        return "PercentEq"
+    }
+    if kind == 85 {
+        return "AmpEq"
+    }
+    if kind == 86 {
+        return "PipeEq"
+    }
+    if kind == 87 {
+        return "CaretEq"
+    }
+    if kind == 88 {
+        return "ShlEq"
+    }
+    if kind == 89 {
+        return "ShrEq"
+    }
+    if kind == 90 {
+        return "Amp"
+    }
+    if kind == 91 {
+        return "Pipe"
+    }
+    if kind == 92 {
+        return "Caret"
+    }
+    if kind == 93 {
+        return "Shl"
+    }
+    if kind == 94 {
+        return "Shr"
+    }
+    if kind == 95 {
+        return "Inc"
+    }
+    if kind == 96 {
+        return "Dec"
+    }
+    if kind == 97 {
+        return "Question"
+    }
+    if kind == 98 {
+        return "Eof"
+    }
+    return "Unknown(" + to_string(kind) + ")"
+}
+
+// token 种类的可读描述（错误消息用，对齐 Rust Parser::describe）
+func describe(kind: i64) -> string {
+    if kind == 0 {
+        return "整数 " + to_string(par_num0)
+    }
+    if kind == 1 {
+        return "浮点数 " + par_float0
+    }
+    if kind == 2 {
+        return "字符串"
+    }
+    if kind == 3 {
+        return "字符"
+    }
+    if kind == 4 {
+        return "标识符 '" + par_str0 + "'"
+    }
+    if kind == 61 {
+        return "分号"
+    }
+    if kind == 98 {
+        return "文件结束"
+    }
+    if kind >= 30 && kind <= 50 {
+        return "类型 '" + type_kw_name(kind) + "'"
+    }
+    return sym_name(kind)
+}
+
+// ==================== token 流（协议文本解析 + 前瞻缓存） ====================
+
+// 重置全部状态（parse 每次调用）
+func reset_state(tokens_text: string) {
+    par_tokens = tokens_text
+    par_n = 0
+    par_pos = 0
+    par_scan = 0
+    par_kind0 = -1
+    par_line0 = 0
+    par_col0 = 0
+    par_num0 = 0
+    par_float0 = "0"
+    par_str0 = ""
+    par_kind1 = -1
+    par_line1 = 0
+    par_col1 = 0
+    par_num1 = 0
+    par_float1 = "0"
+    par_str1 = ""
+    par_kind2 = -1
+    par_line2 = 0
+    par_col2 = 0
+    par_num2 = 0
+    par_float2 = "0"
+    par_str2 = ""
+    par_has2 = false
+    par_ghost = -1
+    par_nodes = ""
+    par_nnodes = 0
+    par_pool = ""
+    par_npool = 0
+    par_last_tag = -1
+    par_last_line = 0
+    par_last_col = 0
+    par_last_name = -1
+    par_last_kid0 = -1
+    par_last_kid1 = -1
+    par_last_kid2 = -1
+    par_tmp_counter = 0
+    par_err = ""
+    par_err_line = 0
+    par_err_col = 0
+}
+
+// 十进制解析（防御，非法回退 0）
+func parse_dec(s: string) -> i64 {
+    var result: i64 = 0
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c < "0" || c > "9" {
+            return 0
+        }
+        var d = find_char("0123456789", c)
+        if result > (9223372036854775807 - d) / 10 {
+            return 0
+        }
+        result = result * 10 + d
+        i = i + 1
+    }
+    return result
+}
+
+// 解析 TOKENS:n 头：返回 token 总数；协议格式非法返回 -1
+func parse_header() -> i64 {
+    var nl = find_char(par_tokens, "\n")
+    if nl < 0 {
+        return -1
+    }
+    var head = slice(par_tokens, 0, nl)
+    if str_len(head) < 8 {
+        return -1
+    }
+    if slice(head, 0, 7) != "TOKENS:" {
+        return -1
+    }
+    var v = parse_dec(slice(head, 7, str_len(head)))
+    par_scan = nl + 1
+    return v
+}
+
+// 从 par_scan 处读取下一个 token 的字段填入全局缓存；返回是否成功
+// 协议行：kind line col num float slen str（str 转义文本，行尾字段）
+func scan_next() -> bool {
+    if par_scan >= str_len(par_tokens) {
+        return false
+    }
+    var nl = find_char_at(par_tokens, "\n", par_scan)
+    var line_end = str_len(par_tokens)
+    if nl >= 0 {
+        line_end = nl
+    }
+    var line = slice(par_tokens, par_scan, line_end)
+    par_scan = line_end + 1
+    // 解析 6 个空格分隔字段（kind line col num float slen）
+    var start: i64 = 0
+    var ln = str_len(line)
+    var f = read_field(line, start)
+    var k = parse_dec(f[0])
+    start = parse_dec(f[1])
+    f = read_field(line, start)
+    var l = parse_dec(f[0])
+    start = parse_dec(f[1])
+    f = read_field(line, start)
+    var c = parse_dec(f[0])
+    start = parse_dec(f[1])
+    f = read_field(line, start)
+    var nv = parse_dec(f[0])
+    start = parse_dec(f[1])
+    f = read_field(line, start)
+    var fv = f[0]
+    start = parse_dec(f[1])
+    // str 字段：剩余内容（转义文本）
+    var sval = ""
+    if start < ln {
+        sval = slice(line, start, ln)
+    }
+    par_kind0 = k
+    par_line0 = l
+    par_col0 = c
+    par_num0 = nv
+    par_float0 = fv
+    par_str0 = unescape_str(sval)
+    return true
+}
+
+// 读取一个空格分隔字段，返回 [字段文本, 下一位置文本]
+func read_field(s: string, pos: i64) -> table {
+    var n: i64 = str_len(s)
+    var end = find_char_at(s, " ", pos)
+    if end < 0 {
+        end = n
+    }
+    var t = table_new_string()
+    table_push(t, slice(s, pos, end))
+    table_push(t, to_string(end + 1))
+    return t
+}
+
+// peek：当前 token 种类（优先幽灵 token）
+func peek() -> i64 {
+    if par_ghost >= 0 {
+        return par_ghost
+    }
+    return par_kind0
+}
+
+// peek 下一 token 种类（tok1）
+func peek1() -> i64 {
+    return par_kind1
+}
+
+// peek 下下 token 种类（tok2）
+func peek2() -> i64 {
+    return par_kind2
+}
+
+// 消费当前 token（幽灵优先：清幽灵不推进真实游标）
+// 注意：scan_next 把新 token 写入 par_kind0——必须先保存旧 tok1（→新 tok0）
+// 与旧 tok2（→新 tok1），scan_next 后写回，避免被覆盖。
+func advance() {
+    if par_ghost >= 0 {
+        par_ghost = -1
+        return
+    }
+    par_pos = par_pos + 1
+    // 保存旧 tok1（将成新 tok0）与旧 tok2（将成新 tok1）
+    var nk0 = par_kind1
+    var nl0 = par_line1
+    var nc0 = par_col1
+    var nn0 = par_num1
+    var nf0 = par_float1
+    var ns0 = par_str1
+    var nk1 = par_kind2
+    var nl1 = par_line2
+    var nc1 = par_col2
+    var nn1 = par_num2
+    var nf1 = par_float2
+    var ns1 = par_str2
+    // 扫描新 tok2（scan_next 写入 par_kind0，随后写回 tok2）
+    if par_has2 {
+        if scan_next() {
+            par_kind2 = par_kind0
+            par_line2 = par_line0
+            par_col2 = par_col0
+            par_num2 = par_num0
+            par_float2 = par_float0
+            par_str2 = par_str0
+        } else {
+            par_has2 = false
+            par_kind2 = -1
+        }
+    } else {
+        par_kind2 = -1
+    }
+    // 写回 tok0/tok1（scan_next 已覆盖 par_kind0）
+    par_kind0 = nk0
+    par_line0 = nl0
+    par_col0 = nc0
+    par_num0 = nn0
+    par_float0 = nf0
+    par_str0 = ns0
+    par_kind1 = nk1
+    par_line1 = nl1
+    par_col1 = nc1
+    par_num1 = nn1
+    par_float1 = nf1
+    par_str1 = ns1
+}
+
+// 当前 token 是否匹配某类（并消费）
+func eat(kind: i64) -> bool {
+    if peek() == kind {
+        advance()
+        return true
+    }
+    return false
+}
+
+// 期望当前 token 为某类，否则报错
+func expect(kind: i64, what: string) -> bool {
+    if peek() == kind {
+        advance()
+        return true
+    }
+    err_here("期望 " + what + "，实际是 " + describe(peek()))
+    return false
+}
+
+// 期望当前 token 为标识符，返回名字；否则报错返回 ""
+func expect_ident() -> string {
+    if peek() == 4 {
+        var name = par_str0
+        advance()
+        return name
+    }
+    err_here("期望标识符，实际是 " + describe(peek()))
+    return ""
+}
+
+// 全量重扫：解析前 i+1 个 token，tok0=第 i 个，tok1/tok2=后续（回退用）
+// 注意：
+// 1. tie 的 && 非短路，循环条件不能写 `idx <= i && scan_next()`；
+// 2. scan_next 把新 token 写入 par_kind0——读 tok1/tok2 前必须先把
+//    tok0 的字段保存到局部变量，否则被 scan_next 覆盖（tok0 丢失）。
+func rewind_full(i: i64) {
+    var nl = find_char(par_tokens, "\n")
+    par_scan = nl + 1
+    par_ghost = -1
+    var idx: i64 = 0
+    var t_kind: i64 = -1
+    var t_line: i64 = 0
+    var t_col: i64 = 0
+    var t_num: i64 = 0
+    var t_float: string = "0"
+    var t_str: string = ""
+    var cont = true
+    while cont {
+        if idx <= i {
+            if scan_next() {
+                t_kind = par_kind0
+                t_line = par_line0
+                t_col = par_col0
+                t_num = par_num0
+                t_float = par_float0
+                t_str = par_str0
+                idx = idx + 1
+            } else {
+                cont = false
+            }
+        } else {
+            cont = false
+        }
+    }
+    // tok0 = 第 i 个 token（先存局部，避免后续 scan_next 覆盖）
+    var k0 = t_kind
+    var l0 = t_line
+    var c0 = t_col
+    var n0 = t_num
+    var f0 = t_float
+    var s0 = t_str
+    // tok1 = 第 i+1 个
+    if scan_next() {
+        par_kind1 = par_kind0
+        par_line1 = par_line0
+        par_col1 = par_col0
+        par_num1 = par_num0
+        par_float1 = par_float0
+        par_str1 = par_str0
+        par_has2 = true
+    } else {
+        par_kind1 = -1
+        par_has2 = false
+        par_kind2 = -1
+        // 写回 tok0（scan_next 已覆盖 par_kind0）
+        par_kind0 = k0
+        par_line0 = l0
+        par_col0 = c0
+        par_num0 = n0
+        par_float0 = f0
+        par_str0 = s0
+        return
+    }
+    // tok2 = 第 i+2 个
+    if scan_next() {
+        par_kind2 = par_kind0
+        par_line2 = par_line0
+        par_col2 = par_col0
+        par_num2 = par_num0
+        par_float2 = par_float0
+        par_str2 = par_str0
+        par_has2 = true
+    } else {
+        par_kind2 = -1
+        par_has2 = false
+    }
+    // 写回 tok0（scan_next 已覆盖 par_kind0）
+    par_kind0 = k0
+    par_line0 = l0
+    par_col0 = c0
+    par_num0 = n0
+    par_float0 = f0
+    par_str0 = s0
+}
+
+// 回退一个 token（表单元格 id 探测用）：重扫到 par_pos
+func back() {
+    par_pos = par_pos - 1
+    rewind_full(par_pos)
+}
+
+// ==================== 节点池 / 字符串池 ====================
+
+// 往字符串池加条目，返回池 id
+func pool_add(s: string) -> i64 {
+    par_pool = par_pool + escape_str(s) + "\n"
+    var id = par_npool
+    par_npool = par_npool + 1
+    return id
+}
+
+// 新建节点，返回节点 id；children 为子节点 id 表（可空表）。
+// 同时记录最近节点字段（单槽：tag/line/col/name/前 3 子节点）
+func new_node(tag: i64, line: i64, col: i64, name_id: i64, val: i64, aux: i64, children: table<i64>) -> i64 {
+    var id = par_nnodes
+    var line_text = to_string(tag) + " " + to_string(line) + " " + to_string(col) + " " +
+                    to_string(name_id) + " " + to_string(val) + " " + to_string(aux) + " " +
+                    to_string(len(children))
+    var i: i64 = 0
+    while i < len(children) {
+        line_text = line_text + " " + to_string(children[i])
+        i = i + 1
+    }
+    par_nodes = par_nodes + line_text + "\n"
+    par_nnodes = par_nnodes + 1
+    // 记录最近节点字段
+    par_last_tag = tag
+    par_last_line = line
+    par_last_col = col
+    par_last_name = name_id
+    par_last_kid0 = -1
+    par_last_kid1 = -1
+    par_last_kid2 = -1
+    if len(children) > 0 {
+        par_last_kid0 = children[0]
+    }
+    if len(children) > 1 {
+        par_last_kid1 = children[1]
+    }
+    if len(children) > 2 {
+        par_last_kid2 = children[2]
+    }
+    return id
+}
+
+// 空子节点表
+func no_children() -> table<i64> {
+    return table_new_i64()
+}
+
+// 单子节点表
+func one_child(c: i64) -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, c)
+    return t
+}
+
+// ==================== 程序解析 ====================
+
+// 主入口：TOKENS 协议文本 → AST 协议文本（或 ERR: 文本）
+func parse(tokens_text: string) -> string {
+    reset_state(tokens_text)
+    par_n = parse_header()
+    if par_n < 0 {
+        return "ERR:1 1 无效的 TOKENS 协议文本"
+    }
+    rewind_full(0)
+    // 顶层程序
+    var stmts = table_new_i64()
+    while peek() != 98 && par_err == "" {
+        if peek() == 5 || peek() == 25 {
+            table_push(stmts, parse_fn_def())
+        } else if peek() == 20 {
+            table_push(stmts, parse_import())
+        } else if peek() == 26 {
+            table_push(stmts, parse_using())
+        } else if peek() == 22 {
+            table_push(stmts, parse_struct())
+        } else if peek() == 24 {
+            table_push(stmts, parse_namespace())
+        } else if peek() == 6 || peek() == 7 {
+            var vds = parse_var_decl(peek() == 7)
+            var i: i64 = 0
+            while i < len(vds) {
+                table_push(stmts, vds[i])
+                i = i + 1
+            }
+        } else {
+            err_here("顶层只允许函数定义、import、using、struct、命名空间声明或全局变量，实际是 " + describe(peek()))
+        }
+    }
+    if par_err != "" {
+        return "ERR:" + to_string(par_err_line) + " " + to_string(par_err_col) + " " + par_err
+    }
+    return "AST:" + to_string(par_nnodes) + " " + to_string(par_npool) + "\n" +
+           par_nodes + "POOL:" + to_string(par_npool) + "\n" + par_pool
+}
+
+// 命名空间声明：namespace a.b { ... }
+func parse_namespace() -> i64 {
+    var line = par_line0
+    var col = par_col0
+    advance() // namespace
+    var segs = table_new_i64()
+    var seg = pool_add(expect_ident())
+    table_push(segs, seg)
+    while eat(62) {
+        var s2 = pool_add(expect_ident())
+        table_push(segs, s2)
+    }
+    if !expect(54, "命名空间声明必须跟 '{'") {
+        return -1
+    }
+    var body = table_new_i64()
+    while (peek() != 55 && peek() != 98) && par_err == "" {
+        if peek() == 5 || peek() == 25 {
+            table_push(body, parse_fn_def())
+        } else if peek() == 22 {
+            table_push(body, parse_struct())
+        } else if peek() == 24 {
+            table_push(body, parse_namespace())
+        } else {
+            err_here("命名空间体内只允许函数定义、类定义或嵌套命名空间，实际是 " + describe(peek()))
+        }
+    }
+    if !expect(55, "命名空间声明必须跟 '}'") {
+        return -1
+    }
+    var nspath = new_node(307, line, col, -1, -1, -1, segs)
+    var blk = new_node(306, line, col, -1, -1, -1, body)
+    var kids = table_new_i64()
+    table_push(kids, nspath)
+    table_push(kids, blk)
+    return new_node(114, line, col, -1, -1, -1, kids)
+}
+
+// import 语句
+func parse_import() -> i64 {
+    var line = par_line0
+    var col = par_col0
+    advance() // import
+    var path = ""
+    if peek() == 2 {
+        path = par_str0
+        advance()
+    } else {
+        err_here("import 后必须是字符串路径，实际是 " + describe(peek()))
+        return -1
+    }
+    var alias_id: i64 = -1
+    if eat(21) {
+        if peek() == 4 {
+            alias_id = pool_add(par_str0)
+            advance()
+        } else {
+            err_here("as 后必须是别名标识符，实际是 " + describe(peek()))
+            return -1
+        }
+    }
+    expect(61, "语句结束符")
+    var path_id = pool_add(path)
+    return new_node(113, line, col, path_id, -1, alias_id, no_children())
+}
+
+// using 语句：using f2.inner;（点分路径，与 Rust parse_using 一致）
+func parse_using() -> i64 {
+    var line = par_line0
+    var col = par_col0
+    advance() // using
+    var segs = table_new_i64()
+    var seg = pool_add(expect_ident())
+    table_push(segs, seg)
+    while eat(62) {
+        // Dot
+        var s2 = pool_add(expect_ident())
+        table_push(segs, s2)
+    }
+    expect(61, "using 语句结束的分号")
+    var nspath = new_node(307, line, col, -1, -1, -1, segs)
+    var kids = table_new_i64()
+    table_push(kids, nspath)
+    return new_node(115, line, col, -1, -1, -1, kids)
+}
+
+// ==================== 语句解析 ====================
+
+// 语句分派（可返回多条：var 解构 desugar）
+func parse_stmt() -> table<i64> {
+    var out = table_new_i64()
+    if peek() == 6 || peek() == 7 {
+        var vds = parse_var_decl(peek() == 7)
+        var i: i64 = 0
+        while i < len(vds) {
+            table_push(out, vds[i])
+            i = i + 1
+        }
+        return out
+    }
+    if peek() == 8 {
+        table_push(out, parse_if())
+        return out
+    }
+    if peek() == 10 {
+        table_push(out, parse_while(-1))
+        return out
+    }
+    if peek() == 11 {
+        table_push(out, parse_for(-1))
+        return out
+    }
+    if peek() == 16 {
+        table_push(out, parse_switch())
+        return out
+    }
+    if peek() == 13 {
+        table_push(out, parse_return())
+        return out
+    }
+    if peek() == 14 {
+        table_push(out, parse_loop_jump(false))
+        return out
+    }
+    if peek() == 15 {
+        table_push(out, parse_loop_jump(true))
+        return out
+    }
+    // 循环标签（E5）：标识符 + 冒号 + while/for
+    if peek() == 4 && is_loop_label_ahead() {
+        var label = par_str0
+        advance()
+        advance() // 冒号
+        if peek() == 10 {
+            table_push(out, parse_while(pool_add(label)))
+            return out
+        }
+        if peek() == 11 {
+            table_push(out, parse_for(pool_add(label)))
+            return out
+        }
+        err_here("标签 '" + label + "' 后必须是 while 或 for")
+        return out
+    }
+    if peek() == 54 {
+        err_here("函数体内不能有裸代码块")
+        return out
+    }
+    table_push(out, parse_expr_or_assign())
+    return out
+}
+
+// 循环标签探测：当前标识符 + 冒号 + while/for
+func is_loop_label_ahead() -> bool {
+    if peek1() != 59 {
+        return false
+    }
+    if peek2() == 10 || peek2() == 11 {
+        return true
+    }
+    return false
+}
+
+// 表达式语句与赋值语句统一入口
+func parse_expr_or_assign() -> i64 {
+    // 快速路径：变量名后紧跟赋值运算符 → Assign
+    if peek() == 4 && is_assign_op_kind(peek1()) {
+        var line = par_line0
+        var col = par_col0
+        var name = par_str0
+        advance()
+        var op = eat_assign_op()
+        var value = parse_expr()
+        expect(61, "语句结束符")
+        var name_id = pool_add(name)
+        return new_node(101, line, col, name_id, op, -1, one_child(value))
+    }
+    // 通用路径：解析表达式，快照字段（value 解析会覆盖单槽记录），再判断赋值
+    var expr = parse_expr()
+    var e_tag = par_last_tag
+    var e_line = par_last_line
+    var e_col = par_last_col
+    var e_name = par_last_name
+    var e_k0 = par_last_kid0
+    var e_k1 = par_last_kid1
+    if is_assign_op_kind(peek()) {
+        var op = eat_assign_op()
+        if e_tag == 8 {
+            // IndexAssign
+            var kids = table_new_i64()
+            table_push(kids, e_k0)
+            table_push(kids, e_k1)
+            var value = parse_expr()
+            table_push(kids, value)
+            expect(61, "语句结束符")
+            return new_node(108, e_line, e_col, -1, op, -1, kids)
+        }
+        if e_tag == 9 {
+            // FieldAssign
+            var kids = table_new_i64()
+            table_push(kids, e_k0)
+            var value = parse_expr()
+            table_push(kids, value)
+            expect(61, "语句结束符")
+            return new_node(109, e_line, e_col, e_name, op, -1, kids)
+        }
+        if e_tag == 4 {
+            // 变量赋值（防御）
+            var value = parse_expr()
+            expect(61, "语句结束符")
+            return new_node(101, e_line, e_col, e_name, op, -1, one_child(value))
+        }
+        err_here("赋值目标必须是变量或对象字段")
+        return -1
+    }
+    // 纯表达式语句
+    expect(61, "语句结束符")
+    return new_node(107, e_line, e_col, -1, -1, -1, one_child(expr))
+}
+
+// 是否为赋值运算符 token
+func is_assign_op_kind(kind: i64) -> bool {
+    if kind == 70 {
+        return true
+    }
+    if kind >= 80 && kind <= 89 {
+        return true
+    }
+    return false
+}
+
+// 消费赋值运算符，返回运算符编号（= → -1；复合 → 0..15）
+func eat_assign_op() -> i64 {
+    var k = peek()
+    if k == 70 {
+        advance()
+        return -1
+    }
+    if k == 80 {
+        advance()
+        return 0
+    }
+    if k == 81 {
+        advance()
+        return 1
+    }
+    if k == 82 {
+        advance()
+        return 2
+    }
+    if k == 83 {
+        advance()
+        return 3
+    }
+    if k == 84 {
+        advance()
+        return 4
+    }
+    if k == 85 {
+        advance()
+        return 12
+    }
+    if k == 86 {
+        advance()
+        return 13
+    }
+    if k == 87 {
+        advance()
+        return 14
+    }
+    if k == 88 {
+        advance()
+        return 15
+    }
+    if k == 89 {
+        advance()
+        return 16
+    }
+    return -1
+}
+
+// ==================== 变量声明 ====================
+
+// var/const 声明（可返回多条：元组解构 desugar）
+func parse_var_decl(is_const: bool) -> table<i64> {
+    var out = table_new_i64()
+    var line = par_line0
+    var col = par_col0
+    advance() // var / const
+    // 元组解构：var (q, r) = expr
+    if peek() == 52 {
+        advance()
+        if peek() == 53 {
+            set_err("空解构 () 不支持", line, col)
+            return out
+        }
+        var names = table_new_string()
+        while true {
+            var nm = expect_ident()
+            table_push(names, nm)
+            if eat(58) {
+                continue
+            }
+            break
+        }
+        if !expect(53, "')'") {
+            return out
+        }
+        if !expect(70, "'='") {
+            return out
+        }
+        var init = parse_expr()
+        expect(61, "语句结束符")
+        // desugar：var _tmpN = init; var q = _tmpN.Item1; ...
+        var tmp_name = "_tmp" + to_string(par_tmp_counter)
+        par_tmp_counter = par_tmp_counter + 1
+        var tmp_id = pool_add(tmp_name)
+        var tmp_node = new_node(100, line, col, tmp_id, -1, bool_to_i64(is_const), one_child(init))
+        table_push(out, tmp_node)
+        var i: i64 = 0
+        while i < len(names) {
+            var item_field = "Item" + to_string(i + 1)
+            var fid = pool_add(item_field)
+            var fa = new_node(9, line, col, fid, -1, -1, one_child(tmp_node))
+            var nm_id = pool_add(names[i])
+            var vd = new_node(100, line, col, nm_id, -1, bool_to_i64(is_const), one_child(fa))
+            table_push(out, vd)
+            i = i + 1
+        }
+        return out
+    }
+    // 普通声明
+    var name = expect_ident()
+    var ty: i64 = -1
+    if eat(59) {
+        ty = parse_type()
+    }
+    if !expect(70, "'='") {
+        return out
+    }
+    var init = parse_expr()
+    expect(61, "语句结束符")
+    var name_id = pool_add(name)
+    var kids = table_new_i64()
+    if ty >= 0 {
+        table_push(kids, ty)
+    }
+    table_push(kids, init)
+    var vd = new_node(100, line, col, name_id, -1, bool_to_i64(is_const), kids)
+    table_push(out, vd)
+    return out
+}
+
+func bool_to_i64(b: bool) -> i64 {
+    if b {
+        return 1
+    }
+    return 0
+}
+
+// ==================== 函数定义 ====================
+
+func parse_fn_def() -> i64 {
+    var line = par_line0
+    var col = par_col0
+    var is_pub = false
+    if peek() == 25 {
+        is_pub = true
+        advance()
+    }
+    if !expect(5, "'func'") {
+        return -1
+    }
+    var name = expect_ident()
+    if !expect(52, "'('") {
+        return -1
+    }
+    var params = table_new_i64()
+    if !eat(53) {
+        while true {
+            var p_line = par_line0
+            var p_col = par_col0
+            var pname = expect_ident()
+            if !expect(59, "':'") {
+                return -1
+            }
+            var pty = parse_type()
+            var p_default: i64 = -1
+            if eat(70) {
+                p_default = parse_expr()
+            }
+            var pn_id = pool_add(pname)
+            var pk = table_new_i64()
+            table_push(pk, pty)
+            if p_default >= 0 {
+                table_push(pk, p_default)
+            }
+            var pnode = new_node(302, p_line, p_col, pn_id, -1, -1, pk)
+            table_push(params, pnode)
+            if eat(58) {
+                continue
+            }
+            if !expect(53, "')'") {
+                return -1
+            }
+            break
+        }
+    }
+    // 返回类型：-> Ty（可省略 → void）
+    var ret_ty: i64 = -1
+    if eat(64) {
+        ret_ty = parse_type()
+    } else {
+        ret_ty = new_node(213, line, col, -1, -1, -1, no_children())
+    }
+    var body = parse_block()
+    var kids = table_new_i64()
+    var i: i64 = 0
+    while i < len(params) {
+        table_push(kids, params[i])
+        i = i + 1
+    }
+    table_push(kids, ret_ty)
+    table_push(kids, body)
+    var name_id = pool_add(name)
+    return new_node(110, line, col, name_id, -1, bool_to_i64(is_pub), kids)
+}
+
+// struct 定义
+func parse_struct() -> i64 {
+    var line = par_line0
+    var col = par_col0
+    advance() // struct
+    var name = expect_ident()
+    var parent_id: i64 = -1
+    if eat(23) {
+        parent_id = pool_add(expect_ident())
+    }
+    if !expect(54, "'{'") {
+        return -1
+    }
+    var fields = table_new_i64()
+    while (peek() != 55 && peek() != 98) && par_err == "" {
+        if peek() == 6 {
+            var f_line = par_line0
+            var f_col = par_col0
+            advance()
+            var fname = expect_ident()
+            var fty: i64 = -1
+            if eat(59) {
+                fty = parse_type()
+            }
+            var finit: i64 = -1
+            if eat(70) {
+                finit = parse_expr()
+            }
+            expect(61, "字段声明结束符")
+            var fn_id = pool_add(fname)
+            var fk = table_new_i64()
+            if fty >= 0 {
+                table_push(fk, fty)
+            }
+            if finit >= 0 {
+                table_push(fk, finit)
+            }
+            var fnode = new_node(303, f_line, f_col, fn_id, -1, -1, fk)
+            table_push(fields, fnode)
+        } else if peek() == 5 || peek() == 25 {
+            set_err("struct 体不允许方法定义：逻辑请用绑定 struct 名的命名空间函数定义 " +
+                    "（namespace 数据名 { pub func 方法名(首参: 数据名) ... }），调用仍写 obj.method()",
+                    par_line0, par_col0)
+            return -1
+        } else {
+            err_here("struct 体内只允许字段(var)，实际是 " + describe(peek()))
+            return -1
+        }
+    }
+    if !expect(55, "'}'") {
+        return -1
+    }
+    var name_id = pool_add(name)
+    return new_node(116, line, col, name_id, -1, parent_id, fields)
+}
+
+// 代码块：{ stmts } → Block(306)
+func parse_block() -> i64 {
+    var line = par_line0
+    var col = par_col0
+    if !expect(54, "'{'") {
+        return -1
+    }
+    var stmts = table_new_i64()
+    while (peek() != 55 && peek() != 98) && par_err == "" {
+        var ss = parse_stmt()
+        var i: i64 = 0
+        while i < len(ss) {
+            table_push(stmts, ss[i])
+            i = i + 1
+        }
+    }
+    if !expect(55, "'}'") {
+        return -1
+    }
+    return new_node(306, line, col, -1, -1, -1, stmts)
+}
+
+// if 语句（else if 折叠为嵌套 If）
+func parse_if() -> i64 {
+    var line = par_line0
+    var col = par_col0
+    advance() // if
+    var cond = parse_expr()
+    var then_branch = parse_block()
+    var else_branch: i64 = -1
+    if eat(9) {
+        if peek() == 8 {
+            var nested = parse_if()
+            var inner = table_new_i64()
+            table_push(inner, nested)
+            else_branch = new_node(306, line, col, -1, -1, -1, inner)
+        } else {
+            else_branch = parse_block()
+        }
+    }
+    var kids = table_new_i64()
+    table_push(kids, cond)
+    table_push(kids, then_branch)
+    if else_branch >= 0 {
+        table_push(kids, else_branch)
+    } else {
+        table_push(kids, new_node(306, line, col, -1, -1, -1, no_children()))
+    }
+    return new_node(103, line, col, -1, -1, -1, kids)
+}
+
+// while 语句
+func parse_while(label_id: i64) -> i64 {
+    var line = par_line0
+    var col = par_col0
+    advance() // while
+    var cond = parse_expr()
+    var body = parse_block()
+    var kids = table_new_i64()
+    table_push(kids, cond)
+    table_push(kids, body)
+    return new_node(104, line, col, -1, -1, label_id, kids)
+}
+
+// for 语句
+func parse_for(label_id: i64) -> i64 {
+    var line = par_line0
+    var col = par_col0
+    advance() // for
+    var var_name = expect_ident()
+    if !expect(12, "'in'") {
+        return -1
+    }
+    var iter = parse_expr()
+    var body = parse_block()
+    var kids = table_new_i64()
+    table_push(kids, iter)
+    table_push(kids, body)
+    var vn_id = pool_add(var_name)
+    return new_node(105, line, col, vn_id, -1, label_id, kids)
+}
+
+// break/continue（可选标签）
+func parse_loop_jump(is_continue: bool) -> i64 {
+    var line = par_line0
+    var col = par_col0
+    advance() // break / continue
+    var label_id: i64 = -1
+    if peek() == 4 && (peek1() == 61 || peek1() == 98 || peek1() == 55) {
+        label_id = pool_add(par_str0)
+        advance()
+    }
+    expect(61, "语句结束符")
+    if is_continue {
+        return new_node(112, line, col, -1, -1, label_id, no_children())
+    }
+    return new_node(111, line, col, -1, -1, label_id, no_children())
+}
+
+// switch 语句
+func parse_switch() -> i64 {
+    var line = par_line0
+    var col = par_col0
+    advance() // switch
+    var subject = parse_expr()
+    if !expect(54, "'{'") {
+        return -1
+    }
+    var cases = table_new_i64()
+    var default_body: i64 = -1
+    while par_err == "" {
+        if peek() == 17 {
+            // case
+            var c_line = par_line0
+            var c_col = par_col0
+            advance()
+            var patterns = table_new_i64()
+            table_push(patterns, parse_case_pattern())
+            while eat(58) {
+                table_push(patterns, parse_case_pattern())
+            }
+            var when_node: i64 = -1
+            if eat(19) {
+                when_node = parse_expr()
+            }
+            if !expect(59, "':'") {
+                return -1
+            }
+            var body = parse_switch_body()
+            var pl = new_node(305, c_line, c_col, -1, -1, -1, patterns)
+            var ck = table_new_i64()
+            table_push(ck, pl)
+            if when_node >= 0 {
+                table_push(ck, when_node)
+            } else {
+                table_push(ck, new_node(306, c_line, c_col, -1, -1, -1, no_children()))
+            }
+            table_push(ck, body)
+            var cnode = new_node(304, c_line, c_col, -1, -1, -1, ck)
+            table_push(cases, cnode)
+        } else if peek() == 18 {
+            // default
+            advance()
+            if !expect(59, "':'") {
+                return -1
+            }
+            default_body = parse_switch_body()
+        } else if peek() == 55 {
+            advance()
+            break
+        } else {
+            err_here("switch 体内只允许 case/default/右花括号，实际是 " + describe(peek()))
+        }
+    }
+    var kids = table_new_i64()
+    table_push(kids, subject)
+    var i: i64 = 0
+    while i < len(cases) {
+        table_push(kids, cases[i])
+        i = i + 1
+    }
+    if default_body >= 0 {
+        table_push(kids, default_body)
+    } else {
+        table_push(kids, new_node(306, line, col, -1, -1, -1, no_children()))
+    }
+    return new_node(106, line, col, -1, -1, -1, kids)
+}
+
+// case 匹配模式：类型关键字 → TypeLit；否则 parse_expr
+func parse_case_pattern() -> i64 {
+    if peek() >= 30 && peek() <= 50 {
+        var line = par_line0
+        var col = par_col0
+        var ty_node = parse_type()
+        return new_node(18, line, col, -1, -1, -1, one_child(ty_node))
+    }
+    return parse_expr()
+}
+
+// case/default 分支体：连续语句直到 case/default/右花括号/Eof
+func parse_switch_body() -> i64 {
+    var line = par_line0
+    var col = par_col0
+    var stmts = table_new_i64()
+    while peek() != 17 && peek() != 18 && peek() != 55 && peek() != 98 && par_err == "" {
+        var ss = parse_stmt()
+        var i: i64 = 0
+        while i < len(ss) {
+            table_push(stmts, ss[i])
+            i = i + 1
+        }
+    }
+    return new_node(306, line, col, -1, -1, -1, stmts)
+}
+
+// return [expr]
+func parse_return() -> i64 {
+    var line = par_line0
+    var col = par_col0
+    advance() // return
+    var expr_node: i64 = -1
+    if peek() != 61 {
+        expr_node = parse_expr()
+    }
+    expect(61, "语句结束符")
+    var kids = table_new_i64()
+    if expr_node >= 0 {
+        table_push(kids, expr_node)
+    }
+    return new_node(102, line, col, -1, -1, -1, kids)
+}
+
+// ==================== 类型解析 ====================
+
+// 类型参数闭括号 '>'（支持 >> >= >>= 分裂，A1/E1）：
+// 协议层无法插入 token，分裂时把剩余部分记为幽灵 token（Gt/Eq/Ge），
+// peek/advance 优先消费幽灵（不推进真实游标）。
+func expect_type_gt(what: string) -> bool {
+    var k = peek()
+    if k == 74 {
+        advance()
+        return true
+    }
+    if k == 94 {
+        // Shr（>>）：当前 '>' 消费，分裂出第二个 '>' 为幽灵
+        advance()
+        par_ghost = 74
+        return true
+    }
+    if k == 76 {
+        // Ge（>=）：当前 '>' 消费，分裂出 '=' 为幽灵
+        advance()
+        par_ghost = 70
+        return true
+    }
+    if k == 89 {
+        // ShrEq（>>=）：当前 '>' 消费，分裂出 '>=' 为幽灵（再经 Ge 分裂）
+        advance()
+        par_ghost = 76
+        return true
+    }
+    err_here(what + "，实际是 " + describe(k))
+    return false
+}
+
+// 类型关键字编号 → AST 类型 tag（显式映射，PROTOCOL.md §5.4）：
+// lexer 编号是 Rust TyKw 枚举顺序（30=i8..50=map），AST tag 是 B1 §3.2
+// 顺序（200=i64..224=map<T>）——两者非线性对应，必须查表。
+func type_tag(lex_kind: i64) -> i64 {
+    if lex_kind == 30 {
+        return 205
+    } // i8
+    if lex_kind == 31 {
+        return 204
+    } // i16
+    if lex_kind == 32 {
+        return 203
+    } // i32
+    if lex_kind == 33 {
+        return 200
+    } // i64
+    if lex_kind == 34 {
+        return 209
+    } // u8
+    if lex_kind == 35 {
+        return 208
+    } // u16
+    if lex_kind == 36 {
+        return 207
+    } // u32
+    if lex_kind == 37 {
+        return 206
+    } // u64
+    if lex_kind == 38 {
+        return 202
+    } // f32
+    if lex_kind == 39 {
+        return 201
+    } // f64
+    if lex_kind == 40 {
+        return 210
+    } // bool
+    if lex_kind == 41 {
+        return 214
+    } // trit
+    if lex_kind == 42 {
+        return 211
+    } // char
+    if lex_kind == 43 {
+        return 212
+    } // string
+    if lex_kind == 44 {
+        return 213
+    } // void
+    if lex_kind == 45 {
+        return 218
+    } // code
+    if lex_kind == 46 {
+        return 215
+    } // num
+    if lex_kind == 47 {
+        return 216
+    } // text
+    if lex_kind == 48 {
+        return 217
+    } // misc
+    if lex_kind == 49 {
+        return 219
+    } // table
+    return 223 // map
+}
+
+// 类型解析：返回类型节点 id
+func parse_type() -> i64 {
+    var k = peek()
+    if k >= 30 && k <= 50 {
+        var line = par_line0
+        var col = par_col0
+        var ty_kind = k
+        advance()
+        // table<T>
+        if ty_kind == 49 {
+            if eat(73) {
+                var elem = parse_type()
+                if !expect_type_gt("表元素类型后需 '>'") {
+                    return -1
+                }
+                return new_node(220, line, col, -1, -1, -1, one_child(elem))
+            }
+            // 裸 table
+            return new_node(219, line, col, -1, -1, -1, no_children())
+        }
+        // map<T> / map
+        if ty_kind == 50 {
+            if eat(73) {
+                var val_ty = parse_type()
+                if !expect_type_gt("键值表值类型后需 '>'") {
+                    return -1
+                }
+                return new_node(224, line, col, -1, -1, -1, one_child(val_ty))
+            }
+            return new_node(223, line, col, -1, -1, -1, no_children())
+        }
+        // 基本类型：显式映射（lexer 编号 ≠ AST tag）
+        return new_node(type_tag(ty_kind), line, col, -1, -1, -1, no_children())
+    }
+    // 元组类型
+    if k == 52 {
+        return parse_tuple_type()
+    }
+    // struct 类型：标识符
+    if k == 4 {
+        var line = par_line0
+        var col = par_col0
+        var name = par_str0
+        advance()
+        var name_id = pool_add(name)
+        return new_node(222, line, col, name_id, -1, -1, no_children())
+    }
+    err_here("期望类型，实际是 " + describe(k))
+    return -1
+}
+
+// 元组类型：(T1, T2) / (x: T1, y: T2)
+func parse_tuple_type() -> i64 {
+    var line = par_line0
+    var col = par_col0
+    if !expect(52, "'('") {
+        return -1
+    }
+    var fields = table_new_i64()
+    if peek() == 53 {
+        set_err("空元组 () 不支持", line, col)
+        return -1
+    }
+    while true {
+        var fname_id: i64 = -1
+        if peek() == 4 && peek1() == 59 {
+            fname_id = pool_add(par_str0)
+            advance()
+            advance()
+        }
+        var fty = parse_type()
+        var fk = table_new_i64()
+        table_push(fk, fty)
+        var fnode = new_node(305, line, col, fname_id, -1, -1, fk)
+        table_push(fields, fnode)
+        if eat(58) {
+            continue
+        }
+        if !expect(53, "')'") {
+            return -1
+        }
+        break
+    }
+    return new_node(221, line, col, -1, -1, -1, fields)
+}
+
+// ==================== 表达式解析（优先级链） ====================
+
+// 表达式：范围（优先级最低）
+func parse_expr() -> i64 {
+    var lhs = parse_ternary()
+    if eat(63) {
+        var end = parse_expr()
+        var kids = table_new_i64()
+        table_push(kids, lhs)
+        table_push(kids, end)
+        return new_node(13, par_last_line, par_last_col, -1, -1, -1, kids)
+    }
+    return lhs
+}
+
+// 三目：cond ? then : else（右结合）
+func parse_ternary() -> i64 {
+    var lhs = parse_or()
+    if eat(97) {
+        var then_expr = parse_expr()
+        if !expect(59, "':'") {
+            return -1
+        }
+        var else_expr = parse_expr()
+        var kids = table_new_i64()
+        table_push(kids, lhs)
+        table_push(kids, then_expr)
+        table_push(kids, else_expr)
+        return new_node(14, par_last_line, par_last_col, -1, -1, -1, kids)
+    }
+    return lhs
+}
+
+// 二元表达式通用构造（op 编号见 PROTOCOL.md §5.5）
+func bin_expr(op: i64, lhs: i64, rhs: i64) -> i64 {
+    var kids = table_new_i64()
+    table_push(kids, lhs)
+    table_push(kids, rhs)
+    return new_node(6, par_last_line, par_last_col, -1, op, -1, kids)
+}
+
+func parse_or() -> i64 {
+    var lhs = parse_and()
+    while eat(78) {
+        var rhs = parse_and()
+        lhs = bin_expr(11, lhs, rhs)
+    }
+    return lhs
+}
+
+func parse_and() -> i64 {
+    var lhs = parse_bit_or()
+    while eat(77) {
+        var rhs = parse_bit_or()
+        lhs = bin_expr(10, lhs, rhs)
+    }
+    return lhs
+}
+
+func parse_bit_or() -> i64 {
+    var lhs = parse_bit_xor()
+    while eat(91) {
+        var rhs = parse_bit_xor()
+        lhs = bin_expr(13, lhs, rhs)
+    }
+    return lhs
+}
+
+func parse_bit_xor() -> i64 {
+    var lhs = parse_bit_and()
+    while eat(92) {
+        var rhs = parse_bit_and()
+        lhs = bin_expr(14, lhs, rhs)
+    }
+    return lhs
+}
+
+func parse_bit_and() -> i64 {
+    var lhs = parse_equality()
+    while eat(90) {
+        var rhs = parse_equality()
+        lhs = bin_expr(12, lhs, rhs)
+    }
+    return lhs
+}
+
+func parse_equality() -> i64 {
+    var lhs = parse_comparison()
+    while true {
+        var op: i64 = -1
+        if peek() == 71 {
+            op = 5
+        } else if peek() == 72 {
+            op = 6
+        } else {
+            break
+        }
+        advance()
+        var rhs = parse_comparison()
+        lhs = bin_expr(op, lhs, rhs)
+    }
+    return lhs
+}
+
+func parse_comparison() -> i64 {
+    var lhs = parse_shift()
+    while true {
+        var op: i64 = -1
+        if peek() == 73 {
+            op = 7
+        } else if peek() == 74 {
+            op = 8
+        } else if peek() == 75 {
+            op = 9
+        } else if peek() == 76 {
+            op = 16
+        } else {
+            break
+        }
+        advance()
+        var rhs = parse_shift()
+        lhs = bin_expr(op, lhs, rhs)
+    }
+    return lhs
+}
+
+func parse_shift() -> i64 {
+    var lhs = parse_term()
+    while true {
+        var op: i64 = -1
+        if peek() == 93 {
+            op = 15
+        } else if peek() == 94 {
+            op = 16
+        } else {
+            break
+        }
+        advance()
+        var rhs = parse_term()
+        lhs = bin_expr(op, lhs, rhs)
+    }
+    return lhs
+}
+
+func parse_term() -> i64 {
+    var lhs = parse_factor()
+    while true {
+        var op: i64 = -1
+        if peek() == 65 {
+            op = 0
+        } else if peek() == 66 {
+            op = 1
+        } else {
+            break
+        }
+        advance()
+        var rhs = parse_factor()
+        lhs = bin_expr(op, lhs, rhs)
+    }
+    return lhs
+}
+
+func parse_factor() -> i64 {
+    var lhs = parse_unary()
+    while true {
+        var op: i64 = -1
+        if peek() == 67 {
+            op = 2
+        } else if peek() == 68 {
+            op = 3
+        } else if peek() == 69 {
+            op = 4
+        } else {
+            break
+        }
+        advance()
+        var rhs = parse_unary()
+        lhs = bin_expr(op, lhs, rhs)
+    }
+    return lhs
+}
+
+// 一元：- ! ++ --（前缀）+ 后缀访问（下标/字段/方法/自增自减）
+func parse_unary() -> i64 {
+    var line = par_line0
+    var col = par_col0
+    if peek() == 66 {
+        advance()
+        var operand = parse_unary()
+        return new_node(7, line, col, -1, 17, -1, one_child(operand))
+    }
+    if peek() == 79 {
+        advance()
+        var operand = parse_unary()
+        return new_node(7, line, col, -1, 18, -1, one_child(operand))
+    }
+    if peek() == 95 {
+        advance()
+        var operand = parse_unary()
+        return new_node(7, line, col, -1, 19, -1, one_child(operand))
+    }
+    if peek() == 96 {
+        advance()
+        var operand = parse_unary()
+        return new_node(7, line, col, -1, 20, -1, one_child(operand))
+    }
+    var expr = parse_primary()
+    // 后缀访问链
+    var loop = true
+    while loop && par_err == "" {
+        if eat(56) {
+            var index = parse_expr()
+            if !expect(57, "']'") {
+                return -1
+            }
+            var kids = table_new_i64()
+            table_push(kids, expr)
+            table_push(kids, index)
+            expr = new_node(8, par_last_line, par_last_col, -1, -1, -1, kids)
+        } else if eat(62) {
+            // Dot：字段名/方法名/数字下标
+            var field = ""
+            if peek() == 4 {
+                field = par_str0
+                advance()
+            } else if peek() == 0 {
+                field = to_string(par_num0)
+                advance()
+            } else {
+                err_here("字段访问 '.' 后必须是字段名/方法名/数字下标，实际是 " + describe(peek()))
+                return -1
+            }
+            var fid = pool_add(field)
+            if eat(52) {
+                // 方法调用：children=[receiver, ...args]
+                var args = table_new_i64()
+                if !eat(53) {
+                    while true {
+                        table_push(args, parse_expr())
+                        if eat(58) {
+                            continue
+                        }
+                        if !expect(53, "')'") {
+                            return -1
+                        }
+                        break
+                    }
+                }
+                var mkids = table_new_i64()
+                table_push(mkids, expr)
+                var i: i64 = 0
+                while i < len(args) {
+                    table_push(mkids, args[i])
+                    i = i + 1
+                }
+                expr = new_node(10, par_last_line, par_last_col, fid, -1, -1, mkids)
+            } else {
+                // 字段访问
+                expr = new_node(9, par_last_line, par_last_col, fid, -1, -1, one_child(expr))
+            }
+        } else if eat(95) {
+            expr = new_node(7, par_last_line, par_last_col, -1, 21, -1, one_child(expr))
+        } else if eat(96) {
+            expr = new_node(7, par_last_line, par_last_col, -1, 22, -1, one_child(expr))
+        } else {
+            loop = false
+        }
+    }
+    return expr
+}
+
+// 原子表达式
+func parse_primary() -> i64 {
+    var line = par_line0
+    var col = par_col0
+    var k = peek()
+    if k == 0 {
+        var v = par_num0
+        advance()
+        return new_node(0, line, col, -1, v, -1, no_children())
+    }
+    if k == 1 {
+        var fid = pool_add(par_float0)
+        advance()
+        return new_node(1, line, col, fid, -1, -1, no_children())
+    }
+    if k == 2 {
+        var sid = pool_add(par_str0)
+        advance()
+        return new_node(2, line, col, sid, -1, -1, no_children())
+    }
+    if k == 3 {
+        var c = par_num0
+        advance()
+        return new_node(15, line, col, -1, c, -1, no_children())
+    }
+    if k == 27 {
+        advance()
+        return new_node(3, line, col, -1, 1, -1, no_children())
+    }
+    if k == 28 {
+        advance()
+        return new_node(3, line, col, -1, 0, -1, no_children())
+    }
+    if k == 29 {
+        advance()
+        return new_node(16, line, col, -1, 0, -1, no_children())
+    }
+    if k == 4 {
+        var name = par_str0
+        advance()
+        // 命名空间路径
+        if peek() == 60 {
+            var segs = table_new_i64()
+            table_push(segs, pool_add(name))
+            while eat(60) {
+                var seg = expect_ident()
+                table_push(segs, pool_add(seg))
+            }
+            return new_node(17, line, col, -1, -1, -1, segs)
+        }
+        // 函数调用
+        if eat(52) {
+            var args = table_new_i64()
+            if !eat(53) {
+                while true {
+                    table_push(args, parse_expr())
+                    if eat(58) {
+                        continue
+                    }
+                    if !expect(53, "')'") {
+                        return -1
+                    }
+                    break
+                }
+            }
+            var name_id = pool_add(name)
+            return new_node(5, line, col, name_id, -1, -1, args)
+        }
+        // 变量
+        var name_id = pool_add(name)
+        return new_node(4, line, col, name_id, -1, -1, no_children())
+    }
+    if k == 52 {
+        return parse_paren_or_tuple()
+    }
+    if k == 56 {
+        return parse_table_lit()
+    }
+    err_here("无法以 " + describe(k) + " 开始表达式")
+    return -1
+}
+
+// ( 起始：元组字面量或分组表达式
+func parse_paren_or_tuple() -> i64 {
+    var line = par_line0
+    var col = par_col0
+    if !expect(52, "'('") {
+        return -1
+    }
+    if peek() == 53 {
+        set_err("空元组 () 不支持", line, col)
+        return -1
+    }
+    var first = parse_tuple_field()
+    if eat(58) {
+        var fields = table_new_i64()
+        table_push(fields, first)
+        while true {
+            table_push(fields, parse_tuple_field())
+            if eat(58) {
+                continue
+            }
+            if !expect(53, "')'") {
+                return -1
+            }
+            break
+        }
+        return new_node(11, line, col, -1, -1, -1, fields)
+    }
+    if !expect(53, "')'") {
+        return -1
+    }
+    // 命名字段不允许出现在分组里
+    if par_last_name >= 0 {
+        set_err("命名字段必须作为元组元素（如 (x: 1, y: 2)），单个 (x: 1) 不是合法表达式", line, col)
+        return -1
+    }
+    return first
+}
+
+// 元组字段：name: expr 或 expr → TupleField(300)
+func parse_tuple_field() -> i64 {
+    var line = par_line0
+    var col = par_col0
+    if peek() == 4 && peek1() == 59 {
+        var name = par_str0
+        advance()
+        advance()
+        var value = parse_expr()
+        var kids = table_new_i64()
+        table_push(kids, value)
+        return new_node(300, line, col, pool_add(name), -1, -1, kids)
+    }
+    var value = parse_expr()
+    var kids = table_new_i64()
+    table_push(kids, value)
+    return new_node(300, line, col, -1, -1, -1, kids)
+}
+
+// 表字面量 [col, col; row, row]
+func parse_table_lit() -> i64 {
+    var line = par_line0
+    var col = par_col0
+    if !expect(56, "'['") {
+        return -1
+    }
+    var cells = table_new_i64()
+    if eat(57) {
+        return new_node(12, line, col, -1, -1, -1, cells)
+    }
+    var row: i64 = 0
+    while par_err == "" {
+        var cell = parse_table_cell(row)
+        table_push(cells, cell)
+        if eat(58) {
+        } else if eat(61) {
+            row = row + 1
+        } else if peek() == 57 {
+            advance()
+            break
+        } else {
+            err_here("期望 , 或 ; 或 ]，实际是 " + describe(peek()))
+        }
+    }
+    return new_node(12, line, col, -1, -1, -1, cells)
+}
+
+// 表单元格：id:value 或 value → TableCell(301)
+func parse_table_cell(row: i64) -> i64 {
+    var line = par_line0
+    var col = par_col0
+    var id_id: i64 = -1
+    var id_type: i64 = 0
+    // 数字 id 探测：Int + Colon
+    if peek() == 0 && peek1() == 59 {
+        var save = par_pos
+        var v = par_num0
+        advance()
+        if eat(59) {
+            id_id = pool_add(to_string(v))
+            id_type = 1
+        } else {
+            back()
+        }
+    }
+    // 字符串 id 探测：Str + Colon
+    if id_type == 0 && peek() == 2 && peek1() == 59 {
+        var save = par_pos
+        var s = par_str0
+        advance()
+        if eat(59) {
+            id_id = pool_add(s)
+            id_type = 2
+        } else {
+            back()
+        }
+    }
+    var value = parse_expr()
+    var kids = table_new_i64()
+    table_push(kids, value)
+    return new_node(301, line, col, id_id, row, id_type, kids)
+}
+
+}

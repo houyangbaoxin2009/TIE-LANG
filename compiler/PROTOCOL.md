@@ -153,7 +153,158 @@ ERR:<line> <col> <message>
 
 - 出错即返回此行（无其他段落）；`<message>` 为错误描述文本（可含空格）。
 
-## 5. 模块清单与接口（阶段 2 全貌）
+## 5. AST 协议（parser 输出 / semantic + ir 输入）
+
+### 5.1 格式总览
+
+```
+AST:<node_count> <pool_count>
+<tag> <line> <col> <name_id> <val> <aux> <nchild> <child1> <child2> ...   ← node_count 行
+POOL:<pool_count>
+<转义字符串>                                                        ← pool_count 行
+```
+
+- 节点 id = 行序（从 0 起），children 引用节点 id（均为 i64）；
+- `<name_id>`：字符串池 id（`-1` = 无）；`<val>` / `<aux>`：i64 字段（`-1` = 无）；
+- `<nchild>`：子节点个数，其后跟恰好 nchild 个节点 id；
+- 字符串池条目用 §3 的转义表示（跨 C 边界安全），行号即池 id；
+- 行/列 = 节点起始位置（错误报告用）；出错返回 §4 的 `ERR:` 文本。
+
+### 5.2 表达式节点（tag 0–18，字段语义）
+
+| tag | 节点 | name_id | val | aux | children |
+| --- | --- | --- | --- | --- | --- |
+| 0 | IntLit | -1 | 整数值 | -1 | - |
+| 1 | FloatLit | 浮点文本池 id（如 "3.14"，parse_float 还原） | -1 | -1 | - |
+| 2 | StrLit | 字符串池 id | -1 | -1 | - |
+| 3 | BoolLit | -1 | 0/1 | -1 | - |
+| 4 | Var | 名字池 id | -1 | -1 | - |
+| 5 | Call | 函数名池 id | -1 | -1 | 实参节点 |
+| 6 | Binary | -1 | 运算符编号（§5.5） | -1 | [lhs, rhs] |
+| 7 | Unary | -1 | 运算符编号 | -1 | [operand] |
+| 8 | Index | -1 | -1 | -1 | [base, index] |
+| 9 | FieldAccess | 字段名池 id | -1 | -1 | [base] |
+| 10 | MethodCall | 方法名池 id | -1 | -1 | [receiver, ...args] |
+| 11 | TupleLit | -1 | -1 | -1 | [TupleField(300)...] |
+| 12 | TableLit | -1 | -1 | -1 | [TableCell(301)...] |
+| 13 | Range | -1 | -1 | -1 | [start, end] |
+| 14 | Ternary | -1 | -1 | -1 | [cond, then, else] |
+| 15 | CharLit | -1 | Unicode 码点 | -1 | - |
+| 16 | TritLit | -1 | -1/0/1 | -1 | - |
+| 17 | Path | -1 | -1 | -1 | [PathSeg(308)...] |
+| 18 | TypeLit | -1 | -1 | -1 | [类型节点] |
+
+### 5.3 语句节点（tag 100–116，字段语义）
+
+| tag | 节点 | name_id | val | aux | children |
+| --- | --- | --- | --- | --- | --- |
+| 100 | VarDecl | 变量名池 id | -1 | is_const(0/1) | 无类型→[init]；有类型→[ty, init] |
+| 101 | Assign | 目标名池 id | 复合 op 编号（-1=普通 `=`） | -1 | [value] |
+| 102 | Return | -1 | -1 | -1 | 无值→[]；有值→[expr] |
+| 103 | If | -1 | -1 | -1 | [cond, Block(then), Block(else 可为空)] |
+| 104 | While | -1 | -1 | 标签池 id（-1=无） | [cond, Block(body)] |
+| 105 | For | 迭代变量池 id | -1 | 标签池 id（-1=无） | [iter, Block(body)] |
+| 106 | Switch | -1 | -1 | -1 | [subject, SwitchCase(304)..., Block(default 可为空)] |
+| 107 | Expr | -1 | -1 | -1 | [expr] |
+| 108 | IndexAssign | -1 | 复合 op（-1=普通） | -1 | [base, index, value] |
+| 109 | FieldAssign | 字段名池 id | 复合 op（-1=普通） | -1 | [base, value] |
+| 110 | FnDef | 函数名池 id | -1 | is_pub(0/1) | [Param(302)..., 返回类型节点, Block(body)] |
+| 111 | Break | -1 | -1 | 标签池 id（-1=无） | - |
+| 112 | Continue | -1 | -1 | 标签池 id（-1=无） | - |
+| 113 | Import | 路径池 id | -1 | 别名池 id（-1=无） | - |
+| 114 | Namespace | -1 | -1 | -1 | [NsPath(307), Block(body)] |
+| 115 | Using | -1 | -1 | -1 | [NsPath(307)] |
+| 116 | Struct | 结构名池 id | -1 | 父名池 id（-1=无） | [StructField(303)...] |
+
+### 5.4 类型节点（tag 200–224）
+
+| tag | 类型 | lexer 编号 | 字段 |
+| --- | --- | --- | --- |
+| 200 | i64 | 33 | 无字段 |
+| 201 | f64 | 39 | 无字段 |
+| 202 | f32 | 38 | 无字段 |
+| 203 | i32 | 32 | 无字段 |
+| 204 | i16 | 31 | 无字段 |
+| 205 | i8 | 30 | 无字段 |
+| 206 | u64 | 37 | 无字段 |
+| 207 | u32 | 36 | 无字段 |
+| 208 | u16 | 35 | 无字段 |
+| 209 | u8 | 34 | 无字段 |
+| 210 | bool | 40 | 无字段 |
+| 211 | char | 42 | 无字段 |
+| 212 | string | 43 | 无字段 |
+| 213 | void | 44 | 无字段 |
+| 214 | trit | 41 | 无字段 |
+| 215 | num | 46 | 无字段 |
+| 216 | text | 47 | 无字段 |
+| 217 | misc | 48 | 无字段 |
+| 218 | code | 45 | 无字段 |
+| 219 | table（裸） | 49 | 无字段 |
+| 220 | table\<T\> | 49 + `<` | children=[元素类型节点] |
+| 221 | 元组类型 | `(` | children=[TypeField(305)...] |
+| 222 | struct 名 | 标识符 | name_id=结构名池 id |
+| 223 | map（裸，值类型默认 i64） | 50 | 无字段 |
+| 224 | map\<T\> | 50 + `<` | children=[值类型节点] |
+
+> **类型编号映射（重要）**：lexer 的类型关键字编号（§2.3，Rust TyKw 枚举顺序：
+> 30=i8, 31=i16, 32=i32, 33=i64, 34=u8, 35=u16, 36=u32, 37=u64, 38=f32, 39=f64,
+> 40=bool, 41=trit, 42=char, 43=string, 44=void, 45=code, 46=num, 47=text,
+> 48=misc, 49=table, 50=map）与 AST 类型 tag（上表，B1 §3.2 顺序）**不是线性对应**，
+> parser 需用显式映射表（type_tag 函数）转换——`i64` 在 lexer 是 33、在 AST 是 200，
+> `string` 在 lexer 是 43、在 AST 是 212。
+
+### 5.5 运算符编号（Binary/Unary 的 val 字段）
+
+| 编号 | 运算符 | 编号 | 运算符 |
+| --- | --- | --- | --- |
+| 0 | `+` Add | 10 | `&&` And |
+| 1 | `-` Sub | 11 | `\|\|` Or |
+| 2 | `*` Mul | 12 | `&` BitAnd |
+| 3 | `/` Div | 13 | `\|` BitOr |
+| 4 | `%` Mod | 14 | `^` BitXor |
+| 5 | `==` Eq | 15 | `<<` Shl |
+| 6 | `!=` NotEq | 16 | `>>` Shr |
+| 7 | `<` Lt | 17 | `-`(一元) Neg |
+| 8 | `>` Gt | 18 | `!`(一元) Not |
+| 9 | `<=` Le | 19–22 | PreInc/PreDec/PostInc/PostDec |
+
+### 5.6 辅助节点（tag 300+，协议内部，非源码节点）
+
+| tag | 节点 | name_id | val | aux | children |
+| --- | --- | --- | --- | --- | --- |
+| 300 | TupleField | 字段名池 id（-1=匿名） | -1 | -1 | [value] |
+| 301 | TableCell | id 文本池 id（-1=无 id） | 行号 row | id 类型(0=无/1=数字/2=字符串) | [value] |
+| 302 | Param | 参数名池 id | -1 | -1 | 无默认→[ty]；有默认→[ty, default] |
+| 303 | StructField | 字段名池 id | -1 | -1 | 无类型→[]；有类型→[ty]；有默认→追加 [default] |
+| 304 | SwitchCase | -1 | -1 | -1 | [PatternList(305), when 或空, Block(body)] |
+| 305 | PatternList | -1 | -1 | -1 | [pattern 节点...]（可为空） |
+| 306 | Block | -1 | -1 | -1 | [stmt...]（可为空块） |
+| 307 | NsPath | -1 | -1 | -1 | [PathSeg(308)...] |
+| 308 | PathSeg | 段名池 id | -1 | -1 | - |
+
+> 辅助节点统一规则：Block 包裹一切语句列表（if 分支/循环体/函数体/switch 分支体/命名空间体），
+> 使语句列表成为单一节点，children 引用无歧义；空列表 = 空 Block（0 子节点）。
+
+### 5.7 示例（`var x = 1 + 2` 的 AST 输出）
+
+```
+AST:7 4
+100 1 1 0 -1 -1 2 4 3
+4 1 5 1 -1 -1 0
+6 1 9 -1 5 -1 2 0 1
+0 1 13 -1 1 -1 0
+0 1 17 -1 2 -1 0
+306 1 1 -1 -1 -1 1 0
+POOL:4
+x
+1
+2
++→（注：示例字符串池为示意，实际运算符不占池）
+```
+
+> 注：上例为结构示意，实际池条目与节点 id 由 parser 生成；运算符编号存 val 字段。
+
+## 6. 模块清单与接口（阶段 2 全貌）
 
 | 文件 | 命名空间 | 入口函数 | 输入 → 输出 |
 | --- | --- | --- | --- |
@@ -164,10 +315,7 @@ ERR:<line> <col> <message>
 | compiler/ir.tie | ir | `gen(ast_text) -> string` | `AST:` → LLVM IR 文本 |
 | compiler/main.tie | compiler | `compile(src) -> string` | 源码 → `.ll` 文本（Rust 壳入口） |
 
-> parser/semantic/ir 的 `AST:` 协议与 B1 tag 表编码（self-hosting.md §3.5
-> 列式并行表）在对应模块实现时再细化，本文件先定 token 层。
-
-## 6. 与 Rust 版行为的对齐基准
+## 7. 与 Rust 版行为的对齐基准
 
 - token 编号表 ↔ `crates/tie-frontend/src/lexer.rs` `TokenKind`；
 - ASI 补分号规则 ↔ lexer.rs `finish_line`（行尾可结束集合、括号深度）；
