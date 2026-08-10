@@ -1,0 +1,935 @@
+{
+  "generated_at": "2026-08-10T15:47:22.7789009+08:00",
+  "cpu": "12th Gen Intel(R) Core(TM) i5-12490F",
+  "machine": "JIRO-MAIN",
+  "corpus_total": 101,
+  "corpus_file": "scripts/bench/corpus.txt",
+  "frontend_exe": "F:\\Projects\\tie\\target\\release\\tie-frontend.exe",
+  "frontend_ir_exe": "F:\\Projects\\tie\\target\\release\\tie-llvm.exe",
+  "runs_per_file": 5,
+  "warmup_runs": 1,
+  "files": [
+    {
+      "path": "examples/args_demo.tie",
+      "role": "pass",
+      "frontend_ms": 61.2,
+      "frontend_ir_ms": 87.2,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/assign.tie",
+      "role": "pass",
+      "frontend_ms": 54.1,
+      "frontend_ir_ms": 150.8,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/brotli_demo.tie",
+      "role": "pass",
+      "frontend_ms": 65.9,
+      "frontend_ir_ms": 74.7,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/byte_demo.tie",
+      "role": "pass",
+      "frontend_ms": 49.7,
+      "frontend_ir_ms": 73.5,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/char.tie",
+      "role": "pass",
+      "frontend_ms": 49.4,
+      "frontend_ir_ms": 70.2,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/compress_demo.tie",
+      "role": "pass",
+      "frontend_ms": 63.4,
+      "frontend_ir_ms": 68.0,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/csv_demo.tie",
+      "role": "pass",
+      "frontend_ms": 61.5,
+      "frontend_ir_ms": 75.6,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/demo_pkg/.tie/deps/lib_colors/lib_colors.tie",
+      "role": "pass",
+      "frontend_ms": 49.2,
+      "frontend_ir_ms": 64.9,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/demo_pkg/main.tie",
+      "role": "pass",
+      "frontend_ms": 50.1,
+      "frontend_ir_ms": 82.2,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/exmath_demo.tie",
+      "role": "pass",
+      "frontend_ms": 60.2,
+      "frontend_ir_ms": 75.5,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/exmath_num_demo.tie",
+      "role": "pass",
+      "frontend_ms": 63.5,
+      "frontend_ir_ms": 89.1,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/format_demo.tie",
+      "role": "pass",
+      "frontend_ms": 69.6,
+      "frontend_ir_ms": 70.9,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/graph_demo.tie",
+      "role": "pass",
+      "frontend_ms": 58.1,
+      "frontend_ir_ms": 77.2,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/hello.tie",
+      "role": "pass",
+      "frontend_ms": 50.9,
+      "frontend_ir_ms": 62.8,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/import_main.tie",
+      "role": "pass",
+      "frontend_ms": 59.8,
+      "frontend_ir_ms": 64.9,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/import_nested.tie",
+      "role": "pass",
+      "frontend_ms": 73.8,
+      "frontend_ir_ms": 87.0,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/index_assign_demo.tie",
+      "role": "pass",
+      "frontend_ms": 52.4,
+      "frontend_ir_ms": 74.2,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/jpeg_demo.tie",
+      "role": "pass",
+      "frontend_ms": 59.9,
+      "frontend_ir_ms": 109.0,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/lib_colors/lib_colors.tie",
+      "role": "pass",
+      "frontend_ms": 52.9,
+      "frontend_ir_ms": 64.6,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/lib_math.tie",
+      "role": "pass",
+      "frontend_ms": 51.7,
+      "frontend_ir_ms": 66.2,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/lib_math2.tie",
+      "role": "pass",
+      "frontend_ms": 71.9,
+      "frontend_ir_ms": 98.6,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/lib_ns_tools.tie",
+      "role": "pass",
+      "frontend_ms": 53.7,
+      "frontend_ir_ms": 105.1,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/lib_util.tie",
+      "role": "pass",
+      "frontend_ms": 95.2,
+      "frontend_ir_ms": 90.9,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/linalg_demo.tie",
+      "role": "pass",
+      "frontend_ms": 62.2,
+      "frontend_ir_ms": 72.9,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/list_dir_demo.tie",
+      "role": "pass",
+      "frontend_ms": 62.5,
+      "frontend_ir_ms": 63.4,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/log_demo.tie",
+      "role": "pass",
+      "frontend_ms": 59.3,
+      "frontend_ir_ms": 73.2,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/log_enhance_demo.tie",
+      "role": "pass",
+      "frontend_ms": 61.1,
+      "frontend_ir_ms": 70.0,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/loop_control_demo.tie",
+      "role": "pass",
+      "frontend_ms": 51.1,
+      "frontend_ir_ms": 67.1,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/lz4_demo.tie",
+      "role": "pass",
+      "frontend_ms": 58.0,
+      "frontend_ir_ms": 67.7,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/m4_ops.tie",
+      "role": "pass",
+      "frontend_ms": 50.5,
+      "frontend_ir_ms": 72.2,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/ml_demo.tie",
+      "role": "pass",
+      "frontend_ms": 61.4,
+      "frontend_ir_ms": 69.5,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/namespace_demo.tie",
+      "role": "pass",
+      "frontend_ms": 58.1,
+      "frontend_ir_ms": 62.1,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/ns_import_demo.tie",
+      "role": "pass",
+      "frontend_ms": 59.6,
+      "frontend_ir_ms": 65.3,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/oop_neg_a.tie",
+      "role": "fail",
+      "frontend_ms": null,
+      "frontend_ir_ms": null,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 1,
+      "skipped_for_time": true
+    },
+    {
+      "path": "examples/oop_neg_b.tie",
+      "role": "fail",
+      "frontend_ms": null,
+      "frontend_ir_ms": null,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 1,
+      "skipped_for_time": true
+    },
+    {
+      "path": "examples/oop_neg_c.tie",
+      "role": "fail",
+      "frontend_ms": null,
+      "frontend_ir_ms": null,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 1,
+      "skipped_for_time": true
+    },
+    {
+      "path": "examples/oop_neg_d.tie",
+      "role": "fail",
+      "frontend_ms": null,
+      "frontend_ir_ms": null,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 1,
+      "skipped_for_time": true
+    },
+    {
+      "path": "examples/oop_neg_e.tie",
+      "role": "fail",
+      "frontend_ms": null,
+      "frontend_ir_ms": null,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 1,
+      "skipped_for_time": true
+    },
+    {
+      "path": "examples/oop.tie",
+      "role": "pass",
+      "frontend_ms": 54.2,
+      "frontend_ir_ms": 76.3,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/optsearch_demo.tie",
+      "role": "pass",
+      "frontend_ms": 62.3,
+      "frontend_ir_ms": 73.6,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/radix_demo.tie",
+      "role": "pass",
+      "frontend_ms": 60.6,
+      "frontend_ir_ms": 73.2,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/regex_demo.tie",
+      "role": "pass",
+      "frontend_ms": 55.6,
+      "frontend_ir_ms": 70.9,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/registry_demo.tie",
+      "role": "pass",
+      "frontend_ms": 61.6,
+      "frontend_ir_ms": 74.6,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/script_demo.tie",
+      "role": "pass",
+      "frontend_ms": 53.0,
+      "frontend_ir_ms": 77.4,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/sort_demo.tie",
+      "role": "pass",
+      "frontend_ms": 64.5,
+      "frontend_ir_ms": 91.2,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/std_demo.tie",
+      "role": "pass",
+      "frontend_ms": 67.3,
+      "frontend_ir_ms": 78.7,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/std_math_demo.tie",
+      "role": "pass",
+      "frontend_ms": 63.6,
+      "frontend_ir_ms": 89.1,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/std_math_primitives.tie",
+      "role": "pass",
+      "frontend_ms": 57.8,
+      "frontend_ir_ms": 86.9,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/std_primitives.tie",
+      "role": "pass",
+      "frontend_ms": 62.3,
+      "frontend_ir_ms": 71.9,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/std_refactor_demo.tie",
+      "role": "pass",
+      "frontend_ms": 61.2,
+      "frontend_ir_ms": 100.1,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/strings.tie",
+      "role": "pass",
+      "frontend_ms": 93.2,
+      "frontend_ir_ms": 87.1,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/switch_pattern.tie",
+      "role": "pass",
+      "frontend_ms": 59.1,
+      "frontend_ir_ms": 85.6,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/switch_table_demo.tie",
+      "role": "pass",
+      "frontend_ms": 56.1,
+      "frontend_ir_ms": 66.4,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/switch.tie",
+      "role": "pass",
+      "frontend_ms": 60.7,
+      "frontend_ir_ms": 68.1,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/table_dynamic.tie",
+      "role": "pass",
+      "frontend_ms": 53.9,
+      "frontend_ir_ms": 73.3,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/table_enhance_demo.tie",
+      "role": "fail",
+      "frontend_ms": null,
+      "frontend_ir_ms": null,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 1,
+      "skipped_for_time": true
+    },
+    {
+      "path": "examples/table_param_demo.tie",
+      "role": "pass",
+      "frontend_ms": 59.2,
+      "frontend_ir_ms": 68.0,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/table.tie",
+      "role": "pass",
+      "frontend_ms": 57.5,
+      "frontend_ir_ms": 61.2,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/test_wide.tie",
+      "role": "pass",
+      "frontend_ms": 55.7,
+      "frontend_ir_ms": 61.1,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/trit_demo.tie",
+      "role": "pass",
+      "frontend_ms": 53.7,
+      "frontend_ir_ms": 75.1,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/tuple.tie",
+      "role": "pass",
+      "frontend_ms": 57.3,
+      "frontend_ir_ms": 73.3,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/version_demo.tie",
+      "role": "pass",
+      "frontend_ms": 60.6,
+      "frontend_ir_ms": 76.6,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/wide.tie",
+      "role": "pass",
+      "frontend_ms": 61.2,
+      "frontend_ir_ms": 74.8,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "examples/zstd_demo.tie",
+      "role": "pass",
+      "frontend_ms": 60.6,
+      "frontend_ir_ms": 71.9,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "ext/cache.tie",
+      "role": "pass",
+      "frontend_ms": 59.4,
+      "frontend_ir_ms": 78.4,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "ext/codec/brotli.tie",
+      "role": "pass",
+      "frontend_ms": 52.0,
+      "frontend_ir_ms": 213.1,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "ext/codec/jpeg.tie",
+      "role": "pass",
+      "frontend_ms": 58.4,
+      "frontend_ir_ms": 416.0,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "ext/codec/lz4.tie",
+      "role": "pass",
+      "frontend_ms": 57.4,
+      "frontend_ir_ms": 116.1,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "ext/codec/zstd.tie",
+      "role": "pass",
+      "frontend_ms": 57.2,
+      "frontend_ir_ms": 694.2,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "ext/compress.tie",
+      "role": "pass",
+      "frontend_ms": 54.6,
+      "frontend_ir_ms": 239.4,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "ext/log.tie",
+      "role": "pass",
+      "frontend_ms": 63.6,
+      "frontend_ir_ms": 115.9,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "ext/ml.tie",
+      "role": "pass",
+      "frontend_ms": 53.4,
+      "frontend_ir_ms": 205.8,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "ext/registry.tie",
+      "role": "pass",
+      "frontend_ms": 54.3,
+      "frontend_ir_ms": 71.7,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "pkg/deps.tie",
+      "role": "pass",
+      "frontend_ms": 64.7,
+      "frontend_ir_ms": 649.2,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "pkg/fetch.tie",
+      "role": "pass",
+      "frontend_ms": 68.5,
+      "frontend_ir_ms": 323.1,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "pkg/lock.tie",
+      "role": "pass",
+      "frontend_ms": 52.8,
+      "frontend_ir_ms": 214.3,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "pkg/main.tie",
+      "role": "pass",
+      "frontend_ms": 61.7,
+      "frontend_ir_ms": 409.1,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "pkg/manifest.tie",
+      "role": "pass",
+      "frontend_ms": 51.6,
+      "frontend_ir_ms": 193.1,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "pkg/publish.tie",
+      "role": "pass",
+      "frontend_ms": 51.2,
+      "frontend_ir_ms": 128.1,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "pkg/search.tie",
+      "role": "pass",
+      "frontend_ms": 51.3,
+      "frontend_ir_ms": 129.0,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "prep/core.tie",
+      "role": "pass",
+      "frontend_ms": 52.2,
+      "frontend_ir_ms": 143.5,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "prep/indent.tie",
+      "role": "pass",
+      "frontend_ms": 49.4,
+      "frontend_ir_ms": 72.3,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "prep/rename_enl_to_ext_prog.tie",
+      "role": "pass",
+      "frontend_ms": 49.7,
+      "frontend_ir_ms": 70.5,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "prep/rename_enl_to_ext.tie",
+      "role": "pass",
+      "frontend_ms": 51.8,
+      "frontend_ir_ms": 64.4,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "prep/rename_tcmsg_to_log.tie",
+      "role": "pass",
+      "frontend_ms": 52.9,
+      "frontend_ir_ms": 67.3,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "prep/test_cn.tie",
+      "role": "pass",
+      "frontend_ms": 52.4,
+      "frontend_ir_ms": 61.4,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "prep/test_std_cn.tie",
+      "role": "fail",
+      "frontend_ms": null,
+      "frontend_ir_ms": null,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 1,
+      "skipped_for_time": true
+    },
+    {
+      "path": "prep/test_trim.tie",
+      "role": "pass",
+      "frontend_ms": 52.2,
+      "frontend_ir_ms": 72.0,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "repl/repl.tie",
+      "role": "pass",
+      "frontend_ms": 51.7,
+      "frontend_ir_ms": 67.1,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "std/assert.tie",
+      "role": "pass",
+      "frontend_ms": 52.3,
+      "frontend_ir_ms": 68.0,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "std/csv.tie",
+      "role": "pass",
+      "frontend_ms": 63.7,
+      "frontend_ir_ms": 78.3,
+      "exit_code": 1,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "std/exmath.tie",
+      "role": "pass",
+      "frontend_ms": 51.8,
+      "frontend_ir_ms": 516.3,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "std/format.tie",
+      "role": "pass",
+      "frontend_ms": 53.8,
+      "frontend_ir_ms": 76.4,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "std/graph.tie",
+      "role": "pass",
+      "frontend_ms": 54.5,
+      "frontend_ir_ms": 164.9,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "std/linalg.tie",
+      "role": "pass",
+      "frontend_ms": 53.2,
+      "frontend_ir_ms": 213.1,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "std/math.tie",
+      "role": "pass",
+      "frontend_ms": 51.9,
+      "frontend_ir_ms": 85.3,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "std/optsearch.tie",
+      "role": "pass",
+      "frontend_ms": 53.1,
+      "frontend_ir_ms": 170.9,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "std/radix.tie",
+      "role": "pass",
+      "frontend_ms": 55.4,
+      "frontend_ir_ms": 81.9,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "std/sort.tie",
+      "role": "pass",
+      "frontend_ms": 52.9,
+      "frontend_ir_ms": 125.7,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "std/string.tie",
+      "role": "pass",
+      "frontend_ms": 51.3,
+      "frontend_ir_ms": 150.8,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    },
+    {
+      "path": "std/version.tie",
+      "role": "pass",
+      "frontend_ms": 53.4,
+      "frontend_ir_ms": 94.6,
+      "exit_code": 0,
+      "frontend_ir_exit_code": 0,
+      "skipped_for_time": false
+    }
+  ],
+  "totals": {
+    "pass_count": 94,
+    "fail_count": 7,
+    "timed_count": 94,
+    "check_success_count": 62,
+    "frontend_total_ms": 5446.4,
+    "frontend_ir_total_ms": 11114.1,
+    "frontend_median_ms": 57.3,
+    "frontend_ir_median_ms": 76.3,
+    "frontend_max_ms": 95.2,
+    "frontend_ir_max_ms": 694.2,
+    "unexpected_exit_count": 0
+  }
+}

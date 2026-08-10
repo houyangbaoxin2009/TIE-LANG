@@ -1,0 +1,127 @@
+# tie 基准语料清单（自举 v2 计划 T0.1，冻结 101 个 .tie 文件）
+#
+# 格式：<路径> <pass|fail>
+#   - 路径为相对仓库根的 POSIX 风格路径（如 examples/hello.tie）
+#   - pass = 期望编译通过，参与耗时对比
+#   - fail = 期望编译失败（如 oop_neg_* 负例），只记录退出码，不参与耗时对比
+#   - '#' 开头的行为注释
+#
+# 生成方式（仓库根执行，排除 target/dist/archive/.git/.omo/compiler）：
+#   Get-ChildItem -Recurse -Filter *.tie -File |
+#     Where-Object { $_.FullName -notmatch '\\target\\|\\dist\\|\\archive\\|\\\.git\\|\\\.omo\\|\\compiler\\' }
+#
+# 注：compiler/ 为 tie 自举编译器新骨架，单独基准（self-compile），不混入 Rust-vs-tie 对比。
+# 新文件加入时保持本清单按目录分组、字典序排列。
+
+# ---- examples/（64 个）----
+examples/args_demo.tie pass
+examples/assign.tie pass
+examples/brotli_demo.tie pass
+examples/byte_demo.tie pass
+examples/char.tie pass
+examples/compress_demo.tie pass
+examples/csv_demo.tie pass
+examples/demo_pkg/.tie/deps/lib_colors/lib_colors.tie pass
+examples/demo_pkg/main.tie pass
+examples/exmath_demo.tie pass
+examples/exmath_num_demo.tie pass
+examples/format_demo.tie pass
+examples/graph_demo.tie pass
+examples/hello.tie pass
+examples/import_main.tie pass
+examples/import_nested.tie pass
+examples/index_assign_demo.tie pass
+examples/jpeg_demo.tie pass
+examples/lib_colors/lib_colors.tie pass
+examples/lib_math.tie pass
+examples/lib_math2.tie pass
+examples/lib_ns_tools.tie pass
+examples/lib_util.tie pass
+examples/linalg_demo.tie pass
+examples/list_dir_demo.tie pass
+examples/log_demo.tie pass
+examples/log_enhance_demo.tie pass
+examples/loop_control_demo.tie pass
+examples/lz4_demo.tie pass
+examples/m4_ops.tie pass
+examples/ml_demo.tie pass
+examples/namespace_demo.tie pass
+examples/ns_import_demo.tie pass
+examples/oop_neg_a.tie fail
+examples/oop_neg_b.tie fail
+examples/oop_neg_c.tie fail
+examples/oop_neg_d.tie fail
+examples/oop_neg_e.tie fail
+examples/oop.tie pass
+examples/optsearch_demo.tie pass
+examples/radix_demo.tie pass
+examples/regex_demo.tie pass
+examples/registry_demo.tie pass
+examples/script_demo.tie pass
+examples/sort_demo.tie pass
+examples/std_demo.tie pass
+examples/std_math_demo.tie pass
+examples/std_math_primitives.tie pass
+examples/std_primitives.tie pass
+examples/std_refactor_demo.tie pass
+examples/strings.tie pass
+examples/switch_pattern.tie pass
+examples/switch_table_demo.tie pass
+examples/switch.tie pass
+examples/table_dynamic.tie pass
+examples/table_enhance_demo.tie fail
+examples/table_param_demo.tie pass
+examples/table.tie pass
+examples/test_wide.tie pass
+examples/trit_demo.tie pass
+examples/tuple.tie pass
+examples/version_demo.tie pass
+examples/wide.tie pass
+examples/zstd_demo.tie pass
+
+# ---- ext/（9 个）----
+ext/cache.tie pass
+ext/codec/brotli.tie pass
+ext/codec/jpeg.tie pass
+ext/codec/lz4.tie pass
+ext/codec/zstd.tie pass
+ext/compress.tie pass
+ext/log.tie pass
+ext/ml.tie pass
+ext/registry.tie pass
+
+# ---- pkg/（7 个）----
+pkg/deps.tie pass
+pkg/fetch.tie pass
+pkg/lock.tie pass
+pkg/main.tie pass
+pkg/manifest.tie pass
+pkg/publish.tie pass
+pkg/search.tie pass
+
+# ---- prep/（8 个）----
+prep/core.tie pass
+prep/indent.tie pass
+prep/rename_enl_to_ext_prog.tie pass
+prep/rename_enl_to_ext.tie pass
+prep/rename_tcmsg_to_log.tie pass
+prep/test_cn.tie pass
+prep/test_std_cn.tie fail
+prep/test_trim.tie pass
+
+# ---- repl/（1 个）----
+repl/repl.tie pass
+
+# ---- std/（12 个）----
+std/assert.tie pass
+std/csv.tie pass
+std/exmath.tie pass
+std/format.tie pass
+std/graph.tie pass
+std/linalg.tie pass
+std/math.tie pass
+std/optsearch.tie pass
+std/radix.tie pass
+std/sort.tie pass
+std/string.tie pass
+std/version.tie pass
