@@ -1,0 +1,369 @@
+// tie:library
+// compiler/middle/pass/passmanager.tie —— 自举 v2 T2.3：AnalysisManager
+// ============================================================
+// 里程碑：自举 v2 计划 T2.3 Pass 基础设施（LLVM new pass manager 借鉴，
+// 用户决策：不做简化）。本模块 = pass 管线核心：
+//   1. AnalysisManager：分析结果缓存（analysis_id -> 结果 id）+
+//      脏标记（analysis_dirty 0/1）+ 依赖者集合（analysis_dependents，
+//      嵌套段：off/cnt + 扁平段）——惰性计算 + 失效追踪传播；
+//   2. run_pass / run_pipeline：转换 pass 执行前自动满足全部声明
+//      依赖（get_analysis），执行后按 pass_inv 声明失效对应分析；
+//   3. 注册表强制：pass 执行上下文内只允许 get_analysis 它声明过
+//      的依赖，越权请求置内部错误标记并返回 -1。
+//
+// # 惰性计算（对齐 LLVM AnalysisManager::getResult）
+//   get_analysis(analysis_id, ir_unit)：
+//     - 缓存命中（cache >= 0 且不 dirty）→ 直接返回，不重算；
+//     - 否则经 passes.dispatch_pass（C1 字符串分派表）调用该分析的
+//       compute_* 函数 → 缓存结果 + 清脏 → 返回。计算计数 +1
+//       （pm_calc_cnt，测试断言「首次计算、二次命中缓存」的依据）。
+//
+// # 失效传播（对齐 LLVM InvalidateAnalyses 依赖图）
+//   invalidate(analysis_id)：置脏 + 沿 analysis_dependents（分析 id
+//   -> 依赖它的分析集合，只收录分析 pass）递归传播——依赖者连带失效，
+//   下次 get_analysis 重算。dependents 由 sync() 从注册表重建：
+//   对每个分析 pass B，其声明的每个依赖 D → dependents[D] += B。
+//
+// # 注册表强制（本任务验收点之一）
+//   begin_pass(pass_id) 置执行上下文（pm_cur_pass = pass_id + 1；
+//   0 = 无上下文，直接调用 get_analysis 放行——测试惰性/失效用）。
+//   上下文内 get_analysis(aid) 先检查 aid 在该 pass 声明的 deps 中，
+//   越权 → pm_err_flag = 1 并返回 -1（负例断言路径）。
+//
+// # 语言边界（实测 2026-08-11）
+//   - 全局标量初始化必须是字面量：哨兵/标志一律 0；
+//   - table<string> 不能作函数参数：run_pipeline 收 pass id 的
+//     table<i64>（调用方先 find_pass 转 id，名字→id 映射在注册表）；
+//   - 顶层常量/全局变量加 pm_ 前缀（import 内联后顶层同作用域，
+//     防跨文件重名；常量复用 pass_registry 的 PASS_* 顶层常量）。
+//
+// 调用：import 后 pm.init() / pm.get_analysis(...) / pm.run_pipeline(...)
+// 命名规范：命名空间内函数不加 pm_ 前缀；内部工具私有（非 pub）。
+
+import "./pass_registry.tie"
+import "./passes.tie"
+
+// ---------- 全局状态（显式分号；哨兵/标志初始 0 字面量）----------
+var pm_analysis_cache: table<i64>;   // 分析 id -> 结果 id（-1 = 未计算）
+var pm_analysis_dirty: table<i64>;   // 分析 id -> 脏标记（0 干净 / 1 脏）
+var pm_dep_off: table<i64>;          // 依赖者段偏移（pm_dep_flat 内）
+var pm_dep_cnt: table<i64>;          // 依赖者个数
+var pm_dep_flat: table<i64>;         // 依赖者扁平段（追加式）
+var pm_cur_pass: i64 = 0;            // 执行上下文（pass_id + 1；0 = 无）
+var pm_err_flag: i64 = 0;            // 内部错误标记（0 无 / 1 有）
+var pm_calc_cnt: i64 = 0;            // 分析实际计算次数（惰性断言用）
+
+namespace pm {
+
+// ---------- 初始化 / 同步 ----------
+
+// 复位全部状态（空表 + 标志清零）。**调用时机：注册表建好之后**
+// 首次 get_analysis/invalidate/run_pass 会自动 sync 对齐，但显式
+// 复位语义更清晰（测试开头调用一次即可）。
+pub func init() {
+    pm_analysis_cache = table_new_i64()
+    pm_analysis_dirty = table_new_i64()
+    pm_dep_off = table_new_i64()
+    pm_dep_cnt = table_new_i64()
+    pm_dep_flat = table_new_i64()
+    pm_cur_pass = 0
+    pm_err_flag = 0
+    pm_calc_cnt = 0
+}
+
+// 同步：对齐各表长度到注册表行数（新注册的 pass 自动纳入），
+// 并从注册表重建依赖者图。pass 数小（个位~十位），全量重建
+// 开销可忽略（LLVM 侧为增量维护，tie 侧以正确性优先）。
+func sync() {
+    var n = passreg.pass_count()
+    while len(pm_analysis_cache) < n {
+        table_push(pm_analysis_cache, -1)   // 未计算哨兵
+        table_push(pm_analysis_dirty, 0)    // 干净
+        table_push(pm_dep_off, 0)
+        table_push(pm_dep_cnt, 0)
+    }
+    rebuild_dependents()
+}
+
+// 重建依赖者图：对每个**分析** pass B（kind == PASS_ANALYSIS），
+// 其声明的每个依赖 D → dependents[D] += B（转换 pass 不被缓存，
+// 不进依赖者图）。三遍法：① 计数 ② 前缀和定段起点 ③ 写游标填充。
+func rebuild_dependents() {
+    var n = len(pm_analysis_cache)
+    var i: i64 = 0
+    while i < n {
+        pm_dep_cnt[i] = 0
+        i = i + 1
+    }
+    // ① 计数每个分析被多少个分析依赖
+    i = 0
+    while i < n {
+        if passreg.pass_kind_of(i) == PASS_ANALYSIS {
+            var m = passreg.pass_deps_of(i)
+            var j: i64 = 0
+            while j < m {
+                var d = passreg.pass_deps_at(i, j)
+                if d >= 0 {
+                    if d < n {
+                        pm_dep_cnt[d] = pm_dep_cnt[d] + 1
+                    }
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    // ② 段起点 = 前缀和
+    var acc: i64 = 0
+    i = 0
+    while i < n {
+        pm_dep_off[i] = acc
+        acc = acc + pm_dep_cnt[i]
+        i = i + 1
+    }
+    // ③ 按段起点填充扁平段（写游标逐行推进）
+    pm_dep_flat = table_new_i64()
+    var k: i64 = 0
+    while k < acc {
+        table_push(pm_dep_flat, 0)
+        k = k + 1
+    }
+    var wcur: table<i64> = table_new_i64()
+    k = 0
+    while k < n {
+        table_push(wcur, 0)
+        k = k + 1
+    }
+    i = 0
+    while i < n {
+        if passreg.pass_kind_of(i) == PASS_ANALYSIS {
+            var m = passreg.pass_deps_of(i)
+            var j: i64 = 0
+            while j < m {
+                var d = passreg.pass_deps_at(i, j)
+                if d >= 0 {
+                    if d < n {
+                        var pos = pm_dep_off[d] + wcur[d]
+                        pm_dep_flat[pos] = i
+                        wcur[d] = wcur[d] + 1
+                    }
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ---------- 状态访问器（测试断言用）----------
+
+// 分析实际计算次数（每次「真算」+1；缓存命中不增）。
+pub func calc_count() -> i64 {
+    return pm_calc_cnt
+}
+
+// 内部错误标记（0 无 / 1 有——越权请求、未知 pass、分析失败等）。
+pub func error_flag() -> i64 {
+    return pm_err_flag
+}
+
+// 复位内部错误标记（负例断言后清场，避免污染后续断言）。
+pub func reset_error() {
+    pm_err_flag = 0
+}
+
+// 分析 id -> 脏标记（0 干净 / 1 脏；越界 0）。
+pub func dirty_of(analysis_id: i64) -> i64 {
+    if analysis_id < 0 || analysis_id >= len(pm_analysis_dirty) {
+        return 0
+    }
+    return pm_analysis_dirty[analysis_id]
+}
+
+// 分析 id -> 缓存结果（-1 = 未计算；越界 -1）。
+pub func cache_of(analysis_id: i64) -> i64 {
+    if analysis_id < 0 || analysis_id >= len(pm_analysis_cache) {
+        return -1
+    }
+    return pm_analysis_cache[analysis_id]
+}
+
+// ---------- 执行上下文（注册表强制）----------
+// begin_pass 置执行上下文（内部 = pass_id + 1，0 哨兵 = 无上下文）。
+// run_pass 内部调用；测试用 begin_pass/end_pass 构造负例
+// （越权 get_analysis 未声明的分析）。越界 pass_id 忽略（不建上下文）。
+
+pub func begin_pass(pass_id: i64) {
+    if pass_id < 0 {
+        return
+    }
+    if pass_id >= passreg.pass_count() {
+        return
+    }
+    pm_cur_pass = pass_id + 1
+}
+
+pub func end_pass() {
+    pm_cur_pass = 0
+}
+
+// ---------- 注册表强制辅助 ----------
+// 检查 analysis_id 是否在当前执行上下文 pass 声明的依赖中
+// （嵌套段线性扫描；依赖个数少，无需排序二分）。
+
+func pass_in_deps(pass_id: i64, analysis_id: i64) -> bool {
+    var n = passreg.pass_deps_of(pass_id)
+    var i: i64 = 0
+    while i < n {
+        if passreg.pass_deps_at(pass_id, i) == analysis_id {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ---------- 惰性计算 ----------
+
+// 取分析结果（LLVM getAnalysis<T> 的 tie 版）：
+//   1. 执行上下文内先做注册表强制（越权 → 内部错误 + 返回 -1）；
+//   2. 缓存命中（cache >= 0 且不脏）→ 直接返回（不重算）；
+//   3. 否则经 passes.dispatch_pass（C1 分派）调用 compute_* →
+//      缓存结果 + 清脏 + 计算计数 +1 → 返回。
+// 分析 id 即 pass id（注册表行号）；ir_unit 当前为占位（单模块
+// IR 全局表，传 0；T2.8 多模块时传模块句柄）。
+pub func get_analysis(analysis_id: i64, ir_unit: i64) -> i64 {
+    sync()
+    if analysis_id < 0 {
+        pm_err_flag = 1
+        return -1
+    }
+    if analysis_id >= passreg.pass_count() {
+        pm_err_flag = 1
+        return -1
+    }
+    // 注册表强制：执行上下文内只允许声明过的依赖
+    if pm_cur_pass > 0 {
+        var pid = pm_cur_pass - 1
+        if !pass_in_deps(pid, analysis_id) {
+            pm_err_flag = 1
+            return -1
+        }
+    }
+    // 缓存命中（干净且已计算）→ 惰性返回
+    if pm_analysis_cache[analysis_id] >= 0 {
+        if pm_analysis_dirty[analysis_id] == 0 {
+            return pm_analysis_cache[analysis_id]
+        }
+    }
+    // 真算：C1 分派到 compute_xxx
+    var nm = passreg.pass_name_of(analysis_id)
+    var r = passes.dispatch_pass(nm, ir_unit)
+    if r < 0 {
+        pm_err_flag = 1
+        return -1
+    }
+    pm_analysis_cache[analysis_id] = r
+    pm_analysis_dirty[analysis_id] = 0
+    pm_calc_cnt = pm_calc_cnt + 1
+    return r
+}
+
+// ---------- 失效传播 ----------
+
+// 失效分析：置脏 + 沿依赖者图递归传播（依赖它的分析连带失效，
+// 下次 get_analysis 各自重算）。对齐 LLVM 的 invalidate 级联。
+// 越界 id 忽略（无状态可失效）。
+pub func invalidate(analysis_id: i64) {
+    sync()
+    if analysis_id < 0 {
+        return
+    }
+    if analysis_id >= len(pm_analysis_dirty) {
+        return
+    }
+    pm_analysis_dirty[analysis_id] = 1
+    // 递归传播到依赖它的分析（分析依赖图无环，必然终止）
+    var off = pm_dep_off[analysis_id]
+    var cnt = pm_dep_cnt[analysis_id]
+    var i: i64 = 0
+    while i < cnt {
+        invalidate(pm_dep_flat[off + i])
+        i = i + 1
+    }
+}
+
+// ---------- 管线执行 ----------
+
+// 执行单个转换 pass：
+//   1. 校验类别（只允许转换 pass）；
+//   2. 建执行上下文（注册表强制生效）；
+//   3. 自动满足全部声明依赖（get_analysis，惰性/缓存命中皆可）；
+//   4. 经 C1 分派执行转换（run_*）；
+//   5. 置执行标志 + 退出上下文；
+//   6. 按 pass_inv 声明失效对应分析（后续 get_analysis 重算）。
+// 任一步失败：置内部错误标记并返回 -1。
+pub func run_pass(pass_id: i64) -> i64 {
+    sync()
+    if pass_id < 0 {
+        pm_err_flag = 1
+        return -1
+    }
+    if pass_id >= passreg.pass_count() {
+        pm_err_flag = 1
+        return -1
+    }
+    if passreg.pass_kind_of(pass_id) != PASS_TRANSFORM {
+        pm_err_flag = 1
+        return -1
+    }
+    begin_pass(pass_id)
+    // 依赖自动满足（LLVM runOnFunction 前的 getAnalysis<T> 调度）
+    var n = passreg.pass_deps_of(pass_id)
+    var i: i64 = 0
+    while i < n {
+        var d = passreg.pass_deps_at(pass_id, i)
+        var r = get_analysis(d, 0)
+        if r < 0 {
+            end_pass()
+            pm_err_flag = 1
+            return -1
+        }
+        i = i + 1
+    }
+    // 执行转换
+    var nm = passreg.pass_name_of(pass_id)
+    var res = passes.dispatch_pass(nm, 0)
+    end_pass()
+    if res < 0 {
+        pm_err_flag = 1
+        return -1
+    }
+    passreg.pass_has_run_set(pass_id, 1)
+    // 按声明失效（preserved 分析的反面）
+    var m = passreg.pass_invalidates_of(pass_id)
+    i = 0
+    while i < m {
+        invalidate(passreg.pass_inv_at(pass_id, i))
+        i = i + 1
+    }
+    return res
+}
+
+// 按序执行 pass 链（调试/测试用）：逐个 run_pass，任一失败返回 -1。
+// 参数为 pass id 表（table<string> 不能作函数参数——语言边界，
+// 调用方先 find_pass 把名字转 id）。
+pub func run_pipeline(pass_ids: table<i64>) -> i64 {
+    var n = len(pass_ids)
+    var i: i64 = 0
+    while i < n {
+        var r = run_pass(pass_ids[i])
+        if r < 0 {
+            return -1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+}   // namespace pm

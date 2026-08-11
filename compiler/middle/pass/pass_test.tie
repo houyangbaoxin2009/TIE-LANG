@@ -1,0 +1,208 @@
+// tie:logic
+// compiler/middle/pass/pass_test.tie —— 自举 v2 T2.3：Pass 基础设施验收
+// ============================================================
+// 里程碑：自举 v2 计划 T2.3 验收（LLVM AnalysisManager 行为等价测试）。
+// 覆盖五个验收点：
+//   1. 惰性：get_analysis 首次真算（计算计数 1），再次调用命中缓存
+//      （计数不增，结果相同）；
+//   2. 失效传播：invalidate(externrefs) 置脏 + 沿依赖者图传播到
+//      refsummary（依赖它的分析）；pruneglobals 执行后按 inv 声明
+//      使 globalrefs 失效 → 下次 get_analysis 重算（计数 +1）；
+//   3. 注册表强制：执行上下文内 get_analysis 未声明的分析 →
+//      返回 -1 且内部错误标记置 1（负例断言）；声明过的依赖放行
+//      （正例断言）；
+//   4. run_pipeline：按序跑 pruneexterns + pruneglobals 两个转换，
+//      各自依赖（externrefs/globalrefs）自动满足（分析被计算）；
+//   5. 注册表/访问器：pass_count、kind、deps/inv 嵌套段读回一致。
+// 全部通过输出「pass 自检通过」exit 0；任一失败打印明细 exit 1。
+//
+// # 演示 IR（喂给分析的指令表）
+//   函数 f() 内 5 条指令：extern_call(42) + printf(43) → externrefs=2；
+//   const_global(64) → globalrefs=1；const_i(60)、ret(32) 为干扰项。
+//   类型 id 用字面量（3=i64，-1=无结果；types.tie 不在 import 树内，
+//   经 ir 展开树仅 interner/ir/dispatch/passreg/passes/pm 可见）。
+//
+// # 语言边界（同 T2.3 各文件头）
+//   - import 树唯一性：本文件只 import passmanager（树形无重复）；
+//   - 前缀调用（pm.xxx / passreg.xxx / ir.xxx / interner.xxx）；
+//   - 断言失败累积用嵌套 if（&& 非短路，不依赖求值序）；
+//   - string + i64 不允许：数字拼消息用 to_string()；
+//   - 顶层常量沿用 pass_registry 的 PASS_*（import 内联后同作用域）。
+//
+// 运行（repo 根，pwsh）：
+//   target\release\tie-llvm.exe compiler\middle\pass\pass_test.tie -o <tmp>\passtest.exe
+//   <tmp>\passtest.exe        # -> 「pass 自检通过」exit 0
+
+import "./passmanager.tie"
+
+// 断言辅助：失败打印明细并返回 false；main 累积全部结果。
+func check(ok: bool, what: string) -> bool {
+    if !ok {
+        println("自检失败: " + what)
+    }
+    return ok
+}
+
+func main() {
+    var ok: bool = true
+
+    // ---------- 初始化（先复位，注册后再首次访问自动同步）----------
+    pm.init()
+
+    // ---------- 注册 6 个 pass ----------
+    // 分析：externrefs（无依赖）、globalrefs（无依赖）、
+    //       refsummary（依赖 externrefs——依赖者图传播的载体）
+    // 转换：pruneexterns（依赖 externrefs，不失效）、
+    //       pruneglobals（依赖 globalrefs，失效 globalrefs）、
+    //       forcetest（无依赖——注册表强制负例用）
+    var eid = passreg.reg_pass("externrefs", PASS_ANALYSIS, table_new_i64(), table_new_i64())
+    var gid = passreg.reg_pass("globalrefs", PASS_ANALYSIS, table_new_i64(), table_new_i64())
+    var rsdeps: table<i64> = table_new_i64()
+    table_push(rsdeps, eid)
+    var rsid = passreg.reg_pass("refsummary", PASS_ANALYSIS, rsdeps, table_new_i64())
+    var pedeps: table<i64> = table_new_i64()
+    table_push(pedeps, eid)
+    var peid = passreg.reg_pass("pruneexterns", PASS_TRANSFORM, pedeps, table_new_i64())
+    var pgdeps: table<i64> = table_new_i64()
+    table_push(pgdeps, gid)
+    var pginv: table<i64> = table_new_i64()
+    table_push(pginv, gid)
+    var pgid = passreg.reg_pass("pruneglobals", PASS_TRANSFORM, pgdeps, pginv)
+    var ftid = passreg.reg_pass("forcetest", PASS_TRANSFORM, table_new_i64(), table_new_i64())
+
+    // ---------- 构造演示 IR（见文件头；单模块全局 IR，ir_unit 传 0）----------
+    ir.new_module()
+    var params: table<i64> = table_new_i64()
+    var f = ir.new_func(interner.intern("f"), 3, params)
+    var b = ir.new_block(f, interner.intern("entry"))
+    ir.new_inst(b, 42, 3)    // extern_call（extern 引用 +1）
+    ir.new_inst(b, 43, 3)    // printf（桥函数引用 +1）
+    ir.new_inst(b, 64, 3)    // const_global（全局引用 +1）
+    ir.new_inst(b, 60, 3)    // const_i（干扰项）
+    ir.new_inst(b, 32, -1)   // ret（干扰项，无结果）
+
+    // ---------- 注册表访问器 ----------
+    if !check(passreg.pass_count() == 6, "pass 注册数 = 6") {
+        ok = false
+    }
+    if !check(passreg.find_pass("externrefs") == eid, "find_pass 反查") {
+        ok = false
+    }
+    if !check(passreg.find_pass("不存在") == -1, "find_pass 未登记 -1") {
+        ok = false
+    }
+    if !check(passreg.pass_kind_of(eid) == PASS_ANALYSIS, "externrefs 是分析") {
+        ok = false
+    }
+    if !check(passreg.pass_kind_of(peid) == PASS_TRANSFORM, "pruneexterns 是转换") {
+        ok = false
+    }
+    if !check(passreg.pass_deps_of(peid) == 1 && passreg.pass_deps_at(peid, 0) == eid, "pruneexterns 依赖 externrefs") {
+        ok = false
+    }
+    if !check(passreg.pass_invalidates_of(pgid) == 1 && passreg.pass_inv_at(pgid, 0) == gid, "pruneglobals 失效 globalrefs") {
+        ok = false
+    }
+    if !check(passreg.pass_has_run_of(peid) == 0, "初始执行标志 0") {
+        ok = false
+    }
+
+    // ---------- 验收 1：惰性（首次真算 / 二次命中缓存）----------
+    var r = pm.get_analysis(eid, 0)
+    if !check(r == 2, "externrefs 首次计算 = 2（extern_call+printf）") {
+        ok = false
+    }
+    if !check(pm.calc_count() == 1, "首次计算计数 = 1") {
+        ok = false
+    }
+    if !check(pm.cache_of(eid) == 2, "结果已入缓存") {
+        ok = false
+    }
+    r = pm.get_analysis(eid, 0)
+    if !check(r == 2, "二次调用结果一致") {
+        ok = false
+    }
+    if !check(pm.calc_count() == 1, "二次命中缓存（计数不增）") {
+        ok = false
+    }
+    if !check(pm.dirty_of(eid) == 0, "命中缓存后仍干净") {
+        ok = false
+    }
+
+    // ---------- 验收 2：失效传播 ----------
+    pm.invalidate(eid)
+    if !check(pm.dirty_of(eid) == 1, "invalidate 后 externrefs 置脏") {
+        ok = false
+    }
+    if !check(pm.dirty_of(rsid) == 1, "失效传播到依赖它的 refsummary") {
+        ok = false
+    }
+    r = pm.get_analysis(eid, 0)
+    if !check(r == 2, "失效后重算结果一致") {
+        ok = false
+    }
+    if !check(pm.calc_count() == 2, "失效后重算（计数 +1 = 2）") {
+        ok = false
+    }
+    if !check(pm.dirty_of(eid) == 0, "重算后清脏") {
+        ok = false
+    }
+
+    // ---------- 验收 3：注册表强制 ----------
+    // 负例：forcetest 未声明任何依赖，执行上下文内请求 externrefs →
+    // 越权 → 返回 -1 + 内部错误标记
+    pm.begin_pass(ftid)
+    var rv = pm.get_analysis(eid, 0)
+    pm.end_pass()
+    if !check(rv == -1, "强制负例：越权请求返回 -1") {
+        ok = false
+    }
+    if !check(pm.error_flag() == 1, "强制负例：内部错误标记置 1") {
+        ok = false
+    }
+    pm.reset_error()
+    // 正例：pruneexterns 声明过 externrefs，上下文内请求放行
+    pm.begin_pass(peid)
+    rv = pm.get_analysis(eid, 0)
+    pm.end_pass()
+    if !check(rv == 2, "强制正例：声明过的依赖放行") {
+        ok = false
+    }
+
+    // ---------- 验收 4：run_pipeline（依赖自动满足 + 失效声明）----------
+    var pipe: table<i64> = table_new_i64()
+    table_push(pipe, peid)
+    table_push(pipe, pgid)
+    var pr = pm.run_pipeline(pipe)
+    if !check(pr == 0, "run_pipeline 按序执行成功") {
+        ok = false
+    }
+    if !check(passreg.pass_has_run_of(peid) == 1 && passreg.pass_has_run_of(pgid) == 1, "两个转换都已执行") {
+        ok = false
+    }
+    // pipeline 中 pruneglobals 首次计算 globalrefs（依赖自动满足）
+    if !check(pm.calc_count() == 3, "pipeline 依赖自动满足（globalrefs 首算，计数 3）") {
+        ok = false
+    }
+    // pruneglobals 执行后按 inv 声明使 globalrefs 失效 → 下次重算
+    if !check(pm.dirty_of(gid) == 1, "pruneglobals 失效 globalrefs") {
+        ok = false
+    }
+    r = pm.get_analysis(gid, 0)
+    if !check(r == 1, "globalrefs 失效后重算 = 1（const_global）") {
+        ok = false
+    }
+    if !check(pm.calc_count() == 4, "globalrefs 重算（计数 4）") {
+        ok = false
+    }
+    // 未被失效的分析仍命中缓存（pruneexterns 无 inv 声明）
+    if !check(pm.calc_count() == 4, "externrefs 未被失效（计数仍 4）") {
+        ok = false
+    }
+
+    // ---------- 汇总 ----------
+    if !ok {
+        exit(1)
+    }
+    println("pass 自检通过")
+}

@@ -1,0 +1,234 @@
+// tie:library
+// compiler/middle/pass/pass_registry.tie —— 自举 v2 T2.3：pass 注册表
+// ============================================================
+// 里程碑：自举 v2 计划 T2.3 Pass 基础设施（LLVM new pass manager 借鉴，
+// 用户决策：不做简化——分析/转换分离、依赖声明、失效声明全量实现）。
+// 本模块 = pass 注册表：行式并行表，行号即 pass id。
+//
+// # 列布局（每行 = 一个 pass；行号 = 注册顺序，恒稳定）
+//   pass_names   pass 名字（按注册序追加；名字 → id 查找走升序映射表）
+//   pass_kind    类别（PASS_ANALYSIS=0 分析 / PASS_TRANSFORM=1 转换）
+//   pass_deps_off/cnt + pass_deps_flat   必需的分析依赖（嵌套段）
+//   pass_inv_off/cnt  + pass_inv_flat    转换执行后失效的分析（嵌套段）
+//   pass_has_run  执行标志（0 未执行 / 1 已执行）
+// 嵌套段布局与 ir.tie 操作数段同款：行存 off/cnt，内容进扁平段。
+//
+// # 名字查找映射（升序表 + 二分，O(log n)）
+//   pass_lookup_keys（名字升序）+ pass_lookup_vals（并行 pass id）。
+//   **id 稳定不变量**：pass id = 注册顺序（0 起），注册完成后永不
+//   改变（与 lib/dispatch.tie 的序号语义一致）。后续注册只追加，
+//   不移动既有行——若以「排序行号」为 id，后注册的 pass 插入中间
+//   会挤动既有行、使已派发的 id 失效（实测 2026-08-11 踩坑）。
+//
+// # 与 LLVM 的对应
+//   PassBuilder 的 registerAnalysis/registerPass → reg_pass；
+//   分析的 getAnalysis<T>() 声明 → pass_deps；pass 的 preserved analyses
+//   → pass_inv（LLVM 反着声明"保留集"，tie 直接声明"失效集"，语义等价）。
+//
+// # 语言边界（实测 2026-08-11，本文件关键约束）
+//   - import 文本内联不查重：同一文件被 import 两次即「重复定义」报错。
+//     interner 的唯一入口是 ir.tie（MUST NOT 修改），columnar 的入口在
+//     passmanager——故本模块**零依赖**（不 import 任何库），字符串键
+//     的二分/有序插入自持实现（同 lib/dispatch.tie 的 d_keys/d_vals
+//     模式：字符串全局表 + strcmp 码点序比较）。
+//   - 名字存 string 而非字符串池 id：语义等价（名字即键），且免去
+//     interner 双入口的重复包含冲突；
+//   - 全局标量初始化必须是字面量：哨兵/初始值一律 0；
+//   - table<string> 不能作函数参数：reg_pass 的 deps/inval 用
+//     table<i64>（只读拷贝进扁平段）；
+//   - 顶层常量加 pass_ 前缀：import 内联后顶层同作用域，防跨文件重名。
+//
+// 调用：import 后 passreg.reg_pass(...) / passreg.find_pass(...)
+// 命名规范：命名空间内函数不加 passreg_ 前缀；内部工具私有（非 pub）。
+
+// ---------- 常量（pass_ 前缀，防 import 内联后的顶层重名）----------
+const PASS_ANALYSIS: i64 = 0;     // pass 类别：分析 pass（结果被缓存）
+const PASS_TRANSFORM: i64 = 1;    // pass 类别：转换 pass（改写 IR）
+
+// ---------- 全局并行表（行号 = pass id = 注册顺序；显式分号）----------
+var pass_names: table<string>;    // pass 名字（按注册序，id 行）
+var pass_kind: table<i64>;        // 类别（PASS_ANALYSIS / PASS_TRANSFORM）
+var pass_deps_off: table<i64>;    // 依赖段偏移（pass_deps_flat 内）
+var pass_deps_cnt: table<i64>;    // 依赖个数（0 = 无依赖）
+var pass_deps_flat: table<i64>;   // 依赖扁平段（全部 pass 共享，追加式）
+var pass_inv_off: table<i64>;     // 失效段偏移（pass_inv_flat 内）
+var pass_inv_cnt: table<i64>;     // 失效分析个数（0 = 不失效任何分析）
+var pass_inv_flat: table<i64>;    // 失效扁平段（追加式）
+var pass_has_run: table<i64>;     // 执行标志（0 未执行 / 1 已执行）
+// 名字查找映射（升序 + 二分；与行表并列的独立结构）
+var pass_lookup_keys: table<string>;  // 名字（升序，strcmp 码点序）
+var pass_lookup_vals: table<i64>;     // 并行 pass id
+
+namespace passreg {
+
+// ---------- 名字键二分（自持，同 lib/dispatch.tie bs_find 模式）----------
+// pass_lookup_keys 恒升序（reg_pass 有序插入维护），字符串比较用
+// < / > / == 运算符（IR 走 strcmp，按码点序）。
+
+func bs_find_name(nm: string) -> i64 {
+    var lo: i64 = 0
+    var hi: i64 = len(pass_lookup_keys) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if pass_lookup_keys[mid] == nm {
+            return mid
+        }
+        if pass_lookup_keys[mid] < nm {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+// 映射表有序插入（尾部追加 + 向前冒泡，两表同步交换；同
+// lib/dispatch.tie register 的插入流程）。
+
+func map_insert(nm: string, id: i64) {
+    table_push(pass_lookup_keys, nm)
+    table_push(pass_lookup_vals, id)
+    var i: i64 = len(pass_lookup_keys) - 1
+    var moving: bool = true
+    while moving {
+        if i == 0 {
+            moving = false
+        } else if pass_lookup_keys[i] < pass_lookup_keys[i - 1] {
+            var tmpk = pass_lookup_keys[i]
+            pass_lookup_keys[i] = pass_lookup_keys[i - 1]
+            pass_lookup_keys[i - 1] = tmpk
+            var tmpv: i64 = pass_lookup_vals[i]
+            pass_lookup_vals[i] = pass_lookup_vals[i - 1]
+            pass_lookup_vals[i - 1] = tmpv
+            i = i - 1
+        } else {
+            moving = false
+        }
+    }
+}
+
+// ---------- 注册 ----------
+
+// 登记一个 pass：name 名字、kind 类别（PASS_*）、deps 必需的分析
+// （只读拷贝进扁平段）、inval 执行后失效的分析（同上）。返回 pass id
+// （= 注册顺序，0 起，**恒稳定**——后续注册不改变已派发 id）。
+// 重复登记同名返回原 id（幂等，不覆盖——同 dispatch.register 约定）。
+pub func reg_pass(name: string, kind: i64, deps: table<i64>, inval: table<i64>) -> i64 {
+    var idx = bs_find_name(name)
+    if idx >= 0 {
+        return pass_lookup_vals[idx]
+    }
+    var id = len(pass_names)
+    // 行表尾部追加（id = 行号，无需位移——既有行永不移动）
+    table_push(pass_names, name)
+    table_push(pass_kind, kind)
+    table_push(pass_deps_off, len(pass_deps_flat))
+    table_push(pass_deps_cnt, len(deps))
+    table_push(pass_inv_off, len(pass_inv_flat))
+    table_push(pass_inv_cnt, len(inval))
+    table_push(pass_has_run, 0)
+    // 依赖/失效内容追加进扁平段
+    var i: i64 = 0
+    while i < len(deps) {
+        table_push(pass_deps_flat, deps[i])
+        i = i + 1
+    }
+    i = 0
+    while i < len(inval) {
+        table_push(pass_inv_flat, inval[i])
+        i = i + 1
+    }
+    // 名字 → id 映射（升序维护）
+    map_insert(name, id)
+    return id
+}
+
+// 按名字查 pass id（二分 O(log n)）；未登记返回 -1。
+pub func find_pass(name: string) -> i64 {
+    var idx = bs_find_name(name)
+    if idx < 0 {
+        return -1
+    }
+    return pass_lookup_vals[idx]
+}
+
+// 已登记 pass 总数。
+pub func pass_count() -> i64 {
+    return len(pass_names)
+}
+
+// 访问器：pass id -> 名字（越界返回空串）。
+pub func pass_name_of(pass_id: i64) -> string {
+    if pass_id < 0 || pass_id >= len(pass_names) {
+        return ""
+    }
+    return pass_names[pass_id]
+}
+
+// 访问器：pass id -> 类别（PASS_ANALYSIS / PASS_TRANSFORM；越界 -1）。
+pub func pass_kind_of(pass_id: i64) -> i64 {
+    if pass_id < 0 || pass_id >= len(pass_kind) {
+        return -1
+    }
+    return pass_kind[pass_id]
+}
+
+// 访问器：pass id -> 必需分析个数（0 = 无依赖）。
+pub func pass_deps_of(pass_id: i64) -> i64 {
+    if pass_id < 0 || pass_id >= len(pass_deps_cnt) {
+        return 0
+    }
+    return pass_deps_cnt[pass_id]
+}
+
+// 访问器：pass id -> 第 k 个必需分析 id（越界 -1）。
+pub func pass_deps_at(pass_id: i64, k: i64) -> i64 {
+    if pass_id < 0 || pass_id >= len(pass_deps_off) {
+        return -1
+    }
+    var off = pass_deps_off[pass_id]
+    var cnt = pass_deps_cnt[pass_id]
+    if k < 0 || k >= cnt {
+        return -1
+    }
+    return pass_deps_flat[off + k]
+}
+
+// 访问器：pass id -> 执行后失效的分析个数（0 = 不失效任何分析）。
+pub func pass_invalidates_of(pass_id: i64) -> i64 {
+    if pass_id < 0 || pass_id >= len(pass_inv_cnt) {
+        return 0
+    }
+    return pass_inv_cnt[pass_id]
+}
+
+// 访问器：pass id -> 第 k 个失效分析 id（越界 -1）。
+pub func pass_inv_at(pass_id: i64, k: i64) -> i64 {
+    if pass_id < 0 || pass_id >= len(pass_inv_off) {
+        return -1
+    }
+    var off = pass_inv_off[pass_id]
+    var cnt = pass_inv_cnt[pass_id]
+    if k < 0 || k >= cnt {
+        return -1
+    }
+    return pass_inv_flat[off + k]
+}
+
+// 访问器：pass id -> 执行标志（0 未执行 / 1 已执行；越界 0）。
+pub func pass_has_run_of(pass_id: i64) -> i64 {
+    if pass_id < 0 || pass_id >= len(pass_has_run) {
+        return 0
+    }
+    return pass_has_run[pass_id]
+}
+
+// 置执行标志（run_pass 成功执行转换后调用；越界忽略）。
+pub func pass_has_run_set(pass_id: i64, v: i64) {
+    if pass_id < 0 || pass_id >= len(pass_has_run) {
+        return
+    }
+    pass_has_run[pass_id] = v
+}
+
+}   // namespace passreg

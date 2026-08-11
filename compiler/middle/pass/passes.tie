@@ -1,0 +1,203 @@
+// tie:library
+// compiler/middle/pass/passes.tie —— 自举 v2 T2.3：具体 pass 实现
+// ============================================================
+// 里程碑：自举 v2 计划 T2.3 Pass 基础设施（LLVM new pass manager 借鉴，
+// 用户决策：不做简化——分析/转换分离、依赖声明、失效声明全量实现）。
+// 本模块 = 演示 pass 族（验证基础设施可用，T2.8 接入真实 IR 前的最小
+// 样板），全部函数签名统一为 C1 分派约定 `(ir_unit: i64) -> i64`：
+//   分析 pass 返回「结果 id」（本阶段结果 = 引用计数，数字即结果）；
+//   转换 pass 返回「执行标记」（成功 = 1）。
+//
+// # 演示 pass 清单
+//   externrefs  分析：扫描 IR 指令表统计 extern 调用 + 桥函数
+//               （printf/println/print）引用数 → 返回计数
+//   globalrefs  分析：统计全局符号引用（const_global 指令）数
+//   pruneexterns 转换：依赖 externrefs，剪除未引用 extern 声明
+//               ——本阶段仅演示执行 + 打印统计（T2.8 接真实 IR）
+//   pruneglobals 转换：依赖 globalrefs，剪除未引用全局符号（同上）
+//
+// # 与 LLVM pass 的对应（不做简化的直接映射）
+//   - 分析 pass ≈ LLVM 的 Analysis（FunctionAnalysisManager 里注册，
+//     惰性计算、结果缓存、失效级联——AnalysisManager 在本项目
+//     passmanager.tie 实现）；
+//   - 转换 pass ≈ LLVM 的 ModulePass/FunctionPass（run 前自动
+//     getAnalysis 满足依赖，执行后声明 preserved analyses——tie 版
+//     反向声明「失效集」pass_inv，语义等价）；
+//   - getAnalysis<T> 的「按类型取结果」在 tie 版 = 按名字（pass id）
+//     get_analysis + C1 字符串分派（无函数指针的语言替代方案）。
+//
+// # C1 字符串分派（本模块是分派表的唯一登记方）
+//   - 登记顺序**固定**：externrefs=0 globalrefs=1 pruneexterns=2
+//     pruneglobals=3（ensure_dispatch 幂等注册，重复调用返回原序号）；
+//     dispatch_pass 的 switch case 常量 0-3 必须与登记顺序一致
+//     （C1 模式：整数 case 走 C5 LLVM switch 跳转表 O(1) 分派）。
+//   - 新增 pass 的接入步骤（T2.8 沿用）：
+//     ① 在 ensure_dispatch 尾部 register 新名字（case 常量 = 登记
+//        顺序，**只允许尾部追加，不得调整既有顺序**）；
+//     ② 在 dispatch_pass 的 switch 尾部追加对应 case（常量 = 该名字
+//        的登记序号）；
+//     ③ compute_* / run_* 函数保持 `(ir_unit: i64) -> i64` 签名。
+//   - passmanager 不直接持有分派表（import 文本内联不查重，重复
+//     import 即「重复定义」报错），统一经 passes.dispatch_pass 调用：
+//     get_analysis/run_pass 解析 pass 名 → 本函数 → dispatch.find
+//     → switch 静态展开。default 返回 -1（未知 pass，调用方报内部错误）。
+//
+// # 为什么 passes 不 import pass_registry / passmanager
+//   import 树唯一性约束（同文件被 import 两次即重复定义）：本模块
+//   只被 passmanager import，若再反向 import passmanager 即成环；
+//   reg_pass 登记由调用方（pass_test）完成，本模块只提供 compute/
+//   run 函数与分派表，职责单一。
+//
+// # IR 消费（当前仅扫描，T2.8 接真实消费）
+//   opcode 字面量对齐 ir.tie opcode 数据表（权威 53 条，ensure_opcodes）：
+//   42=extern_call 43=printf 44=println 45=print 64=const_global；
+//   ir_unit 参数当前为占位（单模块 IR 全局表，传 0；多模块时传模块句柄）。
+//
+// # 结果形态的演进（T2.8 前置说明）
+//   本阶段分析结果 = 引用计数（i64 即结果，便于验收断言）；T2.8
+//   将改为「引用集合的列式 blob id」（extern 引用 id 列表 → 独立
+//   结果表，返回表 id）——AnalysisManager 的缓存/失效机制不变，
+//   只换结果内容，接口 `(ir_unit) -> i64` 保持。
+//
+// # 错误契约
+//   - 分析/转换函数本身不打印错误（C1 约定：处理器只返回结果，
+//     错误判定归调用方）；本模块唯一的 println 是转换的演示统计；
+//   - dispatch_pass 对未知名字返回 -1，passmanager 置内部错误标记
+//     （越权请求/漏登记 dispatch 名都走这条路，显式暴露不静默）。
+//
+// 调用：import 后 passes.dispatch_pass(name, ir_unit)
+// 命名规范：命名空间内函数不加 passes_ 前缀；内部工具私有（非 pub）。
+//
+// # 验收运行（repo 根，pwsh；完整断言见 pass_test.tie）
+//   target\release\tie-llvm.exe compiler\middle\pass\pass_test.tie -o <tmp>\passtest.exe
+//   <tmp>\passtest.exe   # -> 「pass 自检通过」exit 0
+
+import "../../lib/dispatch.tie"
+import "../ir.tie"
+
+namespace passes {
+
+// ---------- 分派表登记（幂等；顺序即 switch case 常量）----------
+// 首次 dispatch_pass 时登记 4 个名字；已登记（find >= 0）直接返回，
+// 序号 = 首次登记顺序（externrefs=0 globalrefs=1 pruneexterns=2
+// pruneglobals=3）。若其他模块先占用了分派表，本模块的名字序号
+// 不受影响（dispatch.register 按名幂等）——但 switch case 常量是
+// 编译期写死的，**登记顺序必须保持与 case 常量一致**（本程序内
+// passes 是唯一登记方，顺序确定；新增 pass 时只能尾部追加并同步
+// 更新 switch 常量，不得调整既有顺序）。
+//
+// # 分派表与注册表的关系（两个「表」的分工）
+//   - 本模块的 dispatch 表（lib/dispatch.tie）：**名字 → 处理函数
+//     序号**，C1 分派用——只有这里登记过名字，dispatch_pass 才能
+//     分派到对应 compute_*/run_*；
+//   - passreg 注册表：**名字 → pass id + 类别 + 依赖/失效声明**，
+//     管线调度用——get_analysis/run_pass 用它做依赖满足与强制校验；
+//   - 两表通过名字字符串互操作（dispatch_pass 按名查），不直接
+//     共享 id：分析 pass 必须同时在两处登记（reg_pass + register），
+//     漏登记 dispatch 名会导致 dispatch_pass 走 default 返回 -1
+//     （调用方报内部错误，漏登记即显式暴露，不静默失败）。
+
+func ensure_dispatch() {
+    if dispatch.find("externrefs") >= 0 {
+        return
+    }
+    dispatch.register("externrefs")    // case 0
+    dispatch.register("globalrefs")    // case 1
+    dispatch.register("pruneexterns")  // case 2
+    dispatch.register("pruneglobals")  // case 3
+}
+
+// ---------- 分析 pass ----------
+
+// externrefs 分析：扫描 IR 指令表，统计 extern 调用与桥函数
+// （printf/println/print）引用数。结果 id = 引用计数（本阶段
+// 计数即结果；T2.8 改为引用集合的列式 blob id）。
+// 统计口径说明：42=extern_call 是显式 extern 符号调用；
+// 43/44/45（printf/println/print）是编译器内置桥函数调用，
+// 语义上也属于「外部符号依赖」，一并计入——pruneexterns 判断
+// 哪些 extern 声明可删时，被桥函数调用的声明同样必须保留。
+pub func compute_externrefs(ir_unit: i64) -> i64 {
+    var n = ir.inst_count()
+    var cnt: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var op = ir.ins_op(i)
+        // 42=extern_call 43=printf 44=println 45=print
+        if op == 42 {
+            cnt = cnt + 1
+        }
+        if op == 43 {
+            cnt = cnt + 1
+        }
+        if op == 44 {
+            cnt = cnt + 1
+        }
+        if op == 45 {
+            cnt = cnt + 1
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// globalrefs 分析：扫描 IR 指令表，统计全局符号引用
+// （64=const_global 指令）数。结果 id = 引用计数。
+// 统计口径说明：const_global 是「取全局符号地址」的常量指令
+// （对齐 ir.tie opcode 表 64 的说明：生成 @g，变量/函数名）；
+// 全局变量被引用的唯一指令形态就是它——pruneglobals 据此
+// 判定哪些全局声明可剪除（引用数为 0 的候选）。
+pub func compute_globalrefs(ir_unit: i64) -> i64 {
+    var n = ir.inst_count()
+    var cnt: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        if ir.ins_op(i) == 64 {
+            cnt = cnt + 1
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ---------- 转换 pass ----------
+
+// pruneexterns 转换：依赖 externrefs（由 AnalysisManager 自动满足）。
+// 正式实现（T2.8）：从 IR 移除未被引用的 extern 声明，并按其
+// preserved/pass_inv 声明失效下游分析。本阶段仅演示执行：
+// 重新统计引用数打印（演示：正式实现应从缓存读分析结果，此处
+// 重扫仅为输出演示统计），返回执行标记 1。
+pub func run_pruneexterns(ir_unit: i64) -> i64 {
+    println("[passes] pruneexterns 执行：extern/桥函数引用数=" + to_string(compute_externrefs(ir_unit)))
+    return 1
+}
+
+// pruneglobals 转换：依赖 globalrefs（同上）。执行后按 pass_inv
+// 声明使 globalrefs 失效（下次 get_analysis 重算——测试验证点）。
+pub func run_pruneglobals(ir_unit: i64) -> i64 {
+    println("[passes] pruneglobals 执行：全局符号引用数=" + to_string(compute_globalrefs(ir_unit)))
+    return 1
+}
+
+// ---------- C1 字符串分派（唯一入口）----------
+// passmanager 经本函数调用任意 pass：按名字查分派表序号 → switch
+// 静态展开（case 常量 0-3 与 ensure_dispatch 登记顺序一一对应，
+// 见文件头说明）。分析走 compute_*，转换走 run_*；未知名字（未
+// 登记或越权）返回 -1，调用方置内部错误标记。
+pub func dispatch_pass(name: string, ir_unit: i64) -> i64 {
+    ensure_dispatch()
+    var did = dispatch.find(name)
+    switch did {
+        case 0:
+            return compute_externrefs(ir_unit)
+        case 1:
+            return compute_globalrefs(ir_unit)
+        case 2:
+            return run_pruneexterns(ir_unit)
+        case 3:
+            return run_pruneglobals(ir_unit)
+        default:
+            return -1
+    }
+}
+
+}   // namespace passes
