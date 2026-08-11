@@ -1,0 +1,302 @@
+// tie:library
+// compiler/middle/types.tie —— 自举 v2 T2.1：类型系统（type id 自编码）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.1 模块化地基。从阶段 1 原型
+// compiler/proto/semantic.tie 提炼（文件头注释的类型编码方案 +
+// ty_named/ty_table/ty_map/ty_struct_idx/ty_tuple_idx/ty_kind/
+// ty_low/判据族/type_name + S_T_*/S_K_* 常量）。
+//
+// # 类型编码（type id 自编码，O(1) 构造/比较，高位分离防冲突）
+//   Named 类型：id = TyKw 索引（0=i8 1=i16 2=i32 3=i64 4=u8 5=u16
+//     6=u32 7=u64 8=f32 9=f64 10=bool 11=trit 12=char 13=string
+//     14=void 15=code 16=num 17=text 18=misc 19=table 20=map）
+//   table<T> ：id = 1<<40 | T
+//   map<V>   ：id = 2<<40 | V
+//   struct S ：id = 3<<40 | struct_索引（struct 表行号）
+//   tuple    ：id = 4<<40 | tuple_索引（tuple 表行号）
+//   高位分离保证任意嵌套组合不冲突（负载 < 2^40）。
+//   解码：kind(id) 判类别（0=Named 1=Table 2=Map 3=Struct 4=Tuple），
+//   low(id) 取负载（元素类型/索引）。
+//
+// # 判据族（语义检查/IR 生成共用，从 semantic 提炼）
+//   is_int / is_float / is_number / is_bool_like / is_wide
+//   （num/text/misc 宽类型框）/ is_table / is_map / table_elem
+//   注意：裸关键字 table(19)/map(20) 与参数化 table<T>/map<V>
+//   都算 is_table / is_map（与 semantic 行为一致）。
+//
+// # struct 名登记（type_name 递归还原用）
+//   struct 名表（st_names，索引 -> 名字）由本模块维护，语义阶段
+//   登记 struct 后调用 set_struct_name(idx, name)，type_name 即可
+//   还原完整名字（无该登记时回退 "struct"）。
+//   tuple 类型名固定 "tuple"（semantic 同款，无字段名表）。
+//
+// 调用：import 后 types.named(...) / types.type_name(...)
+// 命名规范：命名空间内函数不加 types_ 前缀；内部工具私有（非 pub）。
+
+// ---------- 类型类别常量（kind(id) 返回值）----------
+const K_NAMED: i64 = 0;
+const K_TABLE: i64 = 1;
+const K_MAP: i64 = 2;
+const K_STRUCT: i64 = 3;
+const K_TUPLE: i64 = 4;
+const K_SHIFT: i64 = 40;           // 高位分离位移量（负载 < 2^40）
+
+// ---------- TyKw 索引常量（0..20，对齐 Rust TyKw 变体顺序）----------
+const TK_I8: i64 = 0;
+const TK_I16: i64 = 1;
+const TK_I32: i64 = 2;
+const TK_I64: i64 = 3;
+const TK_U8: i64 = 4;
+const TK_U16: i64 = 5;
+const TK_U32: i64 = 6;
+const TK_U64: i64 = 7;
+const TK_F32: i64 = 8;
+const TK_F64: i64 = 9;
+const TK_BOOL: i64 = 10;
+const TK_TRIT: i64 = 11;
+const TK_CHAR: i64 = 12;
+const TK_STR: i64 = 13;
+const TK_VOID: i64 = 14;
+const TK_CODE: i64 = 15;
+const TK_NUM: i64 = 16;
+const TK_TEXT: i64 = 17;
+const TK_MISC: i64 = 18;
+const TK_TABLE: i64 = 19;
+const TK_MAP: i64 = 20;
+
+// 高位基数常量（= 1<<40 / 2<<40 / 3<<40 / 4<<40，写死字面量避免运行期位移）
+const BASE_TABLE: i64 = 1099511627776;
+const BASE_MAP: i64 = 2199023255552;
+const BASE_STRUCT: i64 = 3298534883328;
+const BASE_TUPLE: i64 = 4398046511104;
+
+// ---------- 全局状态（懒构建）----------
+var tykw_names: table<string>;   // TyKw 索引 -> 类型名（错误消息用）
+var st_names: table<string>;     // struct 名表（索引 -> 名字；type_name 还原用）
+
+namespace types {
+
+// ---------- 类型 id 构造（编码，O(1)）----------
+
+// Named 类型：id = TyKw 索引（0..20，见 TK_* 常量）。
+pub func named(kw: i64) -> i64 {
+    return kw
+}
+
+// table<T>：id = 1<<40 | T（T 为任意 type id，含嵌套）。
+pub func table_of(elem: i64) -> i64 {
+    return BASE_TABLE + elem
+}
+
+// map<V>：id = 2<<40 | V。
+pub func map_of(v: i64) -> i64 {
+    return BASE_MAP + v
+}
+
+// struct S：id = 3<<40 | struct_索引（struct 表行号）。
+pub func struct_of(idx: i64) -> i64 {
+    return BASE_STRUCT + idx
+}
+
+// tuple：id = 4<<40 | tuple_索引（tuple 表行号）。
+pub func tuple_of(idx: i64) -> i64 {
+    return BASE_TUPLE + idx
+}
+
+// ---------- 类型 id 解码 ----------
+
+// 类型类别：0=Named 1=Table 2=Map 3=Struct 4=Tuple。
+// Named 判定用 id < 100（TyKw 索引 0..20，留余量）；
+// 其余按高位阈值顺序判别（>= 4<<40 -> Tuple，>= 3<<40 -> Struct，
+// >= 2<<40 -> Map，其余为 Table——与 semantic ty_kind 一致）。
+pub func kind(id: i64) -> i64 {
+    if id < 100 {
+        return K_NAMED
+    }
+    if id >= BASE_TUPLE {
+        return K_TUPLE
+    }
+    if id >= BASE_STRUCT {
+        return K_STRUCT
+    }
+    if id >= BASE_MAP {
+        return K_MAP
+    }
+    return K_TABLE
+}
+
+// 类型负载：Table/Map 的元素类型 id、Struct/Tuple 的索引；
+// Named 类型无意义（调用方先判 kind）。
+pub func low(id: i64) -> i64 {
+    if id >= BASE_TUPLE {
+        return id - BASE_TUPLE
+    }
+    if id >= BASE_STRUCT {
+        return id - BASE_STRUCT
+    }
+    if id >= BASE_MAP {
+        return id - BASE_MAP
+    }
+    return id - BASE_TABLE
+}
+
+// ---------- 判据族（语义检查/IR 生成共用）----------
+
+// 整数类型：i8/i16/i32/i64/u8/u16/u32/u64（Named 且 TyKw 在整数区间）。
+pub func is_int(t: i64) -> bool {
+    if t >= 100 {
+        return false
+    }
+    if t == TK_I8 || t == TK_I16 || t == TK_I32 || t == TK_I64 {
+        return true
+    }
+    if t == TK_U8 || t == TK_U16 || t == TK_U32 || t == TK_U64 {
+        return true
+    }
+    return false
+}
+
+// 浮点类型：f32/f64。
+pub func is_float(t: i64) -> bool {
+    if t == TK_F32 || t == TK_F64 {
+        return true
+    }
+    return false
+}
+
+// 数值类型：整数或浮点（算术运算合法域）。
+pub func is_number(t: i64) -> bool {
+    if is_int(t) {
+        return true
+    }
+    return is_float(t)
+}
+
+// 布尔类：bool/trit（条件语境合法域，trit 三值逻辑）。
+pub func is_bool_like(t: i64) -> bool {
+    if t == TK_BOOL || t == TK_TRIT {
+        return true
+    }
+    return false
+}
+
+// 宽类型：num/text/misc（类别框，未细化的泛化类型）。
+pub func is_wide(t: i64) -> bool {
+    if t == TK_NUM || t == TK_TEXT || t == TK_MISC {
+        return true
+    }
+    return false
+}
+
+// 表类：裸 table 关键字或参数化 table<T>/map<V>（含裸 map）。
+// 注意与 map 判据的区分：is_table 覆盖 map（semantic 同款，
+// 表/映射统一按表处理，迭代/下标语义一致）。
+pub func is_table(t: i64) -> bool {
+    if t == TK_TABLE {
+        return true
+    }
+    var k = kind(t)
+    if k == K_TABLE {
+        return true
+    }
+    if k == K_MAP {
+        return true
+    }
+    return false
+}
+
+// 映射类：裸 map 关键字或参数化 map<V>。
+pub func is_map(t: i64) -> bool {
+    if t == TK_MAP {
+        return true
+    }
+    if kind(t) == K_MAP {
+        return true
+    }
+    return false
+}
+
+// 表元素类型：参数化 table<T>/map<V> 返回负载 T；
+// 裸 table/map 关键字返回 -1（元素类型未知）。
+pub func table_elem(t: i64) -> i64 {
+    var k = kind(t)
+    if k == K_TABLE {
+        return low(t)
+    }
+    if k == K_MAP {
+        return low(t)
+    }
+    return -1
+}
+
+// ---------- struct 名登记（type_name 还原用）----------
+
+// 登记 struct 索引 -> 名字（语义阶段收集 struct 时调用；
+// 追加式，索引 = 登记顺序，与语义 struct 表行号对应）。
+pub func set_struct_name(idx: i64, nm: string) {
+    while len(st_names) < idx {
+        table_push(st_names, "")
+    }
+    table_push(st_names, nm)
+}
+
+// ---------- 类型名字（错误消息用；递归还原）----------
+
+// 构建 TyKw 索引 -> 类型名表（懒构建，仅 type_name 使用）。
+func ensure_tykw_names() {
+    if len(tykw_names) > 0 {
+        return
+    }
+    tykw_names = table_new_string()
+    table_push(tykw_names, "i8")
+    table_push(tykw_names, "i16")
+    table_push(tykw_names, "i32")
+    table_push(tykw_names, "i64")
+    table_push(tykw_names, "u8")
+    table_push(tykw_names, "u16")
+    table_push(tykw_names, "u32")
+    table_push(tykw_names, "u64")
+    table_push(tykw_names, "f32")
+    table_push(tykw_names, "f64")
+    table_push(tykw_names, "bool")
+    table_push(tykw_names, "trit")
+    table_push(tykw_names, "char")
+    table_push(tykw_names, "string")
+    table_push(tykw_names, "void")
+    table_push(tykw_names, "code")
+    table_push(tykw_names, "num")
+    table_push(tykw_names, "text")
+    table_push(tykw_names, "misc")
+    table_push(tykw_names, "table")
+    table_push(tykw_names, "map")
+}
+
+// 类型 id -> 名字（递归）：Named 查 tykw_names；Table/Map 递归
+// 拼 "table<T>"/"map<V>"；Struct 查 st_names（未登记回退 "struct"）；
+// Tuple 固定 "tuple"。错误消息用（与 semantic type_name 一致）。
+pub func type_name(t: i64) -> string {
+    var k = kind(t)
+    if k == K_NAMED {
+        ensure_tykw_names()
+        if t >= 0 && t < len(tykw_names) {
+            return tykw_names[t]
+        }
+        return "?"
+    }
+    if k == K_TABLE {
+        return "table<" + type_name(low(t)) + ">"
+    }
+    if k == K_MAP {
+        return "map<" + type_name(low(t)) + ">"
+    }
+    if k == K_STRUCT {
+        var idx = low(t)
+        if idx >= 0 && idx < len(st_names) {
+            return st_names[idx]
+        }
+        return "struct"
+    }
+    return "tuple"
+}
+
+}   // namespace types

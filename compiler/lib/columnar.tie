@@ -1,0 +1,209 @@
+// tie:library
+// compiler/lib/columnar.tie —— 自举 v2 T2.1：列式并列表辅助库
+// ============================================================
+// 里程碑：自举 v2 计划 T2.1（见 .omo/plans/self-hosting-v2.md）模块化地基，
+// 从阶段 1 原型 compiler/proto/semantic.tie 提炼（bs_find / sorted_insert /
+// 并行符号表维护模式），供阶段 2 各模块统一复用，避免每模块重复实现。
+//
+// # 职责：并行排序表（keys 升序 + vals 并行对齐）的通用操作
+//   编译器内部大量使用「排序键表 + 并行值表」结构（B1 列式设计）：
+//     - 符号表（函数名池 id -> 签名 id、变量名池 id -> 类型 id、
+//       struct 名池 id -> struct 索引，semantic 侧）
+//     - 关键字表（关键字文本 -> token tag，lexer 侧）
+//     - 数据表（tag 编号 -> 名称/段，middle/data.tie 侧）
+//   本文件封装这些操作的公共部分：二分查找、有序插入、覆盖式写入。
+//
+// # 键类型设计（语言边界约束，实测 2026-08-10）
+//   - 键统一用 i64：编译器符号表键恒为字符串池 id（T0.6 std/intern.tie），
+//     比较 O(1)；字符串键的二分/插入由各消费者自持全局表实现
+//     （std/intern.tie、lib/dispatch.tie 同款——table<string> 不能作
+//     函数参数，见 parser 设计修订注释）。
+//   - 表参数形态：需要写回调用方的表用 ref table<i64>（T0.3 by_ref
+//     表参数，先例：parser.collect_stmt / parse_args_after_lparen）；
+//     只读表用 table<i64>（值语义拷贝，先例：parser.set_children）。
+//
+// # sorted_insert 性能说明（G1 热点，接口可替换实现）
+//   proto 的 sorted_insert 每次插入做 O(n) 尾部追加 + 位移（总 O(n²)），
+//   是 G1 前端性能热点（ratio 4.47× 的主要成分之一，阶段 2 中期需优化）。
+//   本文件保持**接口稳定**（调用方无感知）：
+//     - 查找：bs_find_i64 / find_pair（O(log n) 二分）
+//     - 插入：sorted_insert_i64（返回插入位置）
+//   实现先与 proto 行为一致（二分定位 + 尾部追加 + 位移）；
+//   后续可替换为批量重建（先无序收集 + 一次性排序）、块索引
+//   （分桶二分）或平摊重构，均无需改动调用方。
+//
+// # 接口约定
+//   - 未找到：bs_find_i64 / find_pair 返回 -1 / dflt（调用方自定哨兵）
+//   - 键不得重复插入（sorted_insert_i64 不查重，调用方先 find 再决定；
+//     覆盖式写入用 find_pair 读值 + 下标赋值，或调用方自管）
+//
+// # 设计决策记录（ADR，防回归）
+//   D1 键为什么是 i64 而不是 string？
+//      语言边界：table<string> 不能作函数参数（parser 设计修订实测）；
+//      性能：编译器符号表键恒为字符串池 id（T0.6 intern），池 id 比较
+//      是 O(1) 整数比较，字符串比较是 O(len) strcmp——G1 净胜点。
+//      需要字符串键的场景（关键字表/分派表）由各模块自持全局表
+//      内部实现二分（std/intern.tie 与 lib/dispatch.tie 同款），
+//      本模块不提供字符串版，避免无法参数化的死接口。
+//   D2 为什么插入用 ref 表参数、查找用只读表参数？
+//      插入必须写回调用方的 keys/vals（by_ref 语义，T0.3 支持，
+//      先例：parser.collect_stmt(list: ref table<i64>)）；
+//      查找只读，值语义拷贝即可（先例：parser.set_children 的
+//      children 参数）。ref 形参调用方实参须是可寻址的变量——
+//      局部表变量与全局表变量均可（T0.4 全局表可作 ref 实参）。
+//   D3 sorted_insert 复杂度演进（G1 热点，本任务只保行为一致）：
+//      现状：二分定位 O(log n) + 尾部追加 + 位移 O(n) → 单次 O(n)，
+//      连续 n 次插入总 O(n²)。proto 实测（G1 ratio 4.47×）已确认
+//      是前端热点之一。阶段 2 中期替换方案（调用方无感）：
+//      (a) 批量重建：收集期全部 push_pair_i64（O(1)），完成后再
+//          一次性排序（std/optsearch.tie 的 merge_sort/quick_sort
+//          已存在可复用），整体 O(n log n)；
+//      (b) 块索引：keys 分桶（每 64 键一桶，桶间升序），桶内线性，
+//          插入定位 O(log(n/64)) + 桶内位移 O(64)；
+//      (c) 平摊重构：表增长到 2 倍时全量重建。
+//      三者都保持本文件的 pub 接口签名不变，替换点在函数体内。
+//   D4 为什么不内置查重？
+//      sorted_insert 查重需要额外的二分（调用方通常刚 find 过，
+//      重复二分浪费）；契约改为「调用方负责唯一性」——语义层
+//      符号表用 set_pair_i64（覆盖语义）或 find 后分支，两表
+//      路径都清晰。proto 的 sorted_insert 亦不查重，行为对齐。
+//   D5 与 std/sort.tie 的关系：
+//      std/sort.tie 因「表参数元素类型静态未知」用逗号分隔串传参
+//      （A1 之前的过渡方案）；A1/T0.3 落地后 table<i64> 参数已
+//      支持，本模块用原生表参数替代串方案——编译器内部性能敏感
+//      路径不再走 parse/拼接往返。std/sort.tie 保留给用户程序用。
+//
+// # 表参数行为速查（调用方容易踩的坑）
+//   - ref table<i64> 实参必须是**变量**（表变量或全局表），
+//     传表达式（如函数返回值）语义层会报「不可寻址」；
+//   - 只读 table<i64> 实参传什么都可以（值拷贝，不写回）；
+//   - 同一对表变量在插入期间不得被其他逻辑并发修改
+//     （tie 单线程，指逻辑上穿插修改——保持插入/查找分离）；
+//   - sorted_insert_i64 后 keys/vals 长度同时 +1，调用方若维护
+//     第三张并行表，用返回的 pos 在该位置对齐插入。
+//
+// # 性能与内存说明
+//   - 表容量随表长自动增长（table_push 摊还 O(1)）；
+//   - 位移插入只搬 i64（8 字节/元素），无字符串拷贝——
+//     键/值都是标量，这是比 std/sort.tie 串方案快的结构原因；
+//   - 本模块函数无任何堆分配（除表自身增长外），可在
+//     热路径安全调用；
+//   - sorted_insert 的位移循环是唯一 O(n) 段，G1 已标注——
+//     优化替换方案见 D3，替换时保持本接口不变。
+//
+// # 扩展阅读
+//   - 排序键二分 + strcmp 直比：docs/plans/self-hosting.md §2.4（D3）；
+//   - 表参数 by_ref：tests/language/byref_table.tie；
+//   - 批量排序实现：std/optsearch.tie（merge_sort/quick_sort）。
+//
+// # 与 proto 源码的对应关系（提炼来源追踪）
+//   | 本模块函数          | proto semantic.tie 出处               | 差异 |
+//   | bs_find_i64        | bs_find(keys, k) @644                | 参数化（proto 操作全局表） |
+//   | sorted_insert_i64  | sorted_insert(keys, vals, k, v) @662 | ref 参数 + 返回 pos（同） |
+//   | find_pair          | lv_find @1980 / gb_find @2019         | 合一 + dflt 哨兵 |
+//   | set_pair_i64       | lv_insert @2043（覆盖语义）           | 抽出通用（proto 内联五表） |
+//   | push_pair_i64      | （无直接对应）                        | 批量重建优化预留 |
+//   proto 的并行表用法（lv_keys/lv_vals/lv_const/lv_telem/lv_dyn 五表
+//   同步插入）在 T2.6 语义重写时统一收敛为本模块的 set_pair_i64 +
+//   第三并行表自行对齐（返回 pos 已暴露）。
+//
+// 调用：import 后 columnar.bs_find_i64(...) / columnar.sorted_insert_i64(...)
+// 命名规范：命名空间内函数不加 columnar_ 前缀；内部工具私有（非 pub）。
+
+namespace columnar {
+
+// 二分查找升序 keys，返回键 k 的下标；未找到返回 -1。
+// 与 proto semantic.bs_find 行为一致（lo/hi 显式游标，迭代式无递归）。
+// 键为池 id（i64），比较用整数运算符；keys 必须严格升序。
+pub func bs_find_i64(keys: table<i64>, k: i64) -> i64 {
+    var lo: i64 = 0
+    var hi: i64 = len(keys) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        var kv = keys[mid]
+        if kv == k {
+            return mid
+        }
+        if kv < k {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+// 有序插入（keys/vals 并行）：把键值对 k/v 插入升序 keys 的
+// 正确位置，返回插入位置。实现：二分定位 pos → 尾部追加 →
+// 从尾部向前位移（keys/vals 同步交换），与 proto sorted_insert 一致。
+// 注意：当前实现每次插入 O(n) 位移（总 O(n²)），G1 已标注热点；
+// **接口保持稳定，实现可替换**（调用方只依赖返回的插入位置）。
+// 前置条件：k 尚未存在于 keys（重复插入会破坏唯一性，调用方负责查重）。
+pub func sorted_insert_i64(keys: ref table<i64>, vals: ref table<i64>, k: i64, v: i64) -> i64 {
+    var n = len(keys)
+    var lo: i64 = 0
+    var hi: i64 = n - 1
+    var pos: i64 = n
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if keys[mid] < k {
+            lo = mid + 1
+        } else {
+            pos = mid
+            hi = mid - 1
+        }
+    }
+    // 尾部追加占位（表只支持追加 + 下标赋值）
+    table_push(keys, 0)
+    table_push(vals, 0)
+    var i: i64 = n
+    while i > pos {
+        keys[i] = keys[i - 1]
+        vals[i] = vals[i - 1]
+        i = i - 1
+    }
+    keys[pos] = k
+    vals[pos] = v
+    return pos
+}
+
+// 查键得值：在升序 keys 中二分 k，命中返回并行 vals[i]；
+// 未找到返回调用方给的默认值 dflt（哨兵约定由调用方定义，
+// 常见 dflt = -1 表示「无」）。
+pub func find_pair(keys: table<i64>, vals: table<i64>, k: i64, dflt: i64) -> i64 {
+    var idx = bs_find_i64(keys, k)
+    if idx < 0 {
+        return dflt
+    }
+    return vals[idx]
+}
+
+// 覆盖式写入：k 已存在则更新 vals 为 v（返回原下标）；
+// 不存在则有序插入（返回新下标）。对齐 proto lv_insert 的
+// 覆盖语义（局部变量重复声明覆盖而非报错，M2.1 实测）。
+// 返回的下标即该键当前所在位置，调用方可据此同步维护
+// 第三张并行表（若存在）。
+pub func set_pair_i64(keys: ref table<i64>, vals: ref table<i64>, k: i64, v: i64) -> i64 {
+    var idx = bs_find_i64(keys, k)
+    if idx >= 0 {
+        vals[idx] = v
+        return idx
+    }
+    return sorted_insert_i64(keys, vals, k, v)
+}
+
+// 无序追加对：把 k/v 追加到两表尾部（不保证有序），返回新下标。
+// 适用场景：仅需后续顺序遍历、或收集后一次性排序（批量重建优化
+// 的采集端）；不要与二分查找混用（破坏升序）。
+pub func push_pair_i64(keys: ref table<i64>, vals: ref table<i64>, k: i64, v: i64) -> i64 {
+    table_push(keys, k)
+    table_push(vals, v)
+    return len(keys) - 1
+}
+
+// 行数辅助：当前并行表条目数（keys 与 vals 恒等长，取 keys 长度）。
+pub func row_count(keys: table<i64>) -> i64 {
+    return len(keys)
+}
+
+}   // namespace columnar

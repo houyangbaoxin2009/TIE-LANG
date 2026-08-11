@@ -1,0 +1,210 @@
+// tie:library
+// compiler/lib/interner.tie —— 自举 v2 T2.1：编译器字符串池统一接口
+// ============================================================
+// 里程碑：自举 v2 计划 T2.1 模块化地基，包装阶段 0 标准库
+// std/intern.tie（T0.6 字符串池：intern/lookup），为编译器内部
+// 提供统一的字符串池接口与哨兵约定。编译器所有字符串字段
+// （AST 名字、符号表键、lexeme）都经本模块登记为稳定 i64 id，
+// 符号比较从 O(len) 字符串比较降为 O(1) 整数比较（B1 列式设计依赖）。
+//
+// # 为什么需要统一包装（本模块存在的理由）
+//   - **单一入口**：整个编译器只有本模块直接 import std/intern.tie
+//     （import 是树式展开，同文件被 import 两次即重复定义报错），
+//     其他模块经本模块间接获得字符串池能力，依赖图保持树形；
+//   - **哨兵约定固化**：-1「无名字」/ ""「未登记」两套哨兵的判别
+//     顺序封装在 name_str 里，消费方不会踩「先判空串再判 -1」的坑；
+//   - **接口稳定层**：std 库可能演进（如池实现换成 map/哈希），
+//     只要本模块转发函数签名不变，编译器其余模块零改动。
+//
+// # 字符串池语义（继承 std/intern.tie，接口稳定）
+//   - intern(s)：登记字符串，相同串返回相同 id；id 从 0 递增分配，
+//     重复登记不新增条目（幂等）。
+//   - lookup(id)：id -> 串（池下标 O(1)）。
+//   - 池为模块级全局状态：import 文本内联后随消费文件顶层运行，
+//     main 入口运行时初始化，跨函数/跨模块共享（与 std 版一致）。
+//
+// # id 生命周期约定（消费方必须遵守）
+//   - id 在**单个编译进程**内稳定有效；编译多个源文件时池持续增长，
+//     id 不回退（不需要时可由消费方记录 len() 做局部快照）；
+//   - 相同字符串文本的 id 全局唯一（幂等），跨模块共享；
+//   - 不要在模块顶层缓存 id（main 初始化前池可能为空）——在
+//     init() 或首次使用时登记。
+//
+// # 哨兵约定（编译器内部统一，消费方必须遵守）
+//   - 名字字段无名字：-1（池外约定，AST node_names / 字段槽位用）
+//   - 未登记 id 查询："" 空串（池返回哨兵）
+//   - 合法 id 范围：[0, len())，len() = 已登记不同串数量
+//   - 判别顺序：先判 -1 再查 lookup（name_str 已封装该顺序）
+//
+// # 与 std/intern 的接口对照
+//   | 本模块（interner）        | std/intern（intern）        | 说明 |
+//   | intern(s)                | intern(s)                   | 登记，返回 id |
+//   | lookup(id)               | lookup(id)                  | id 反查串 |
+//   | len()                    | interned_len()              | 池条目数 |
+//   | name_str(id)             | （无）                       | -1 哨兵封装 |
+//   | is_valid(id)             | （无）                       | 合法范围判定 |
+//   | init()                   | （无）                       | 预登记常用符号 |
+//
+// # 常见误用与纠正（防回归）
+//   - 误用：把 lookup(id) 的返回值（""）与 -1 哨兵混在一起判。
+//     纠正：槽位判断一律 name_str（先 -1 再查池）；需要区分
+//     「无名字」与「名字恰好登记成空串」时——编译器内部约定
+//     不登记空串，两者语义等同，无需区分；
+//   - 误用：在模块顶层（main 之前）调 intern 缓存 id 到 const。
+//     纠正：池在 main 运行时初始化，顶层常量求值期池为空；
+//     先登记（init 或首次使用）再缓存；
+//   - 误用：跨文件直接 import std/intern.tie 造成重复定义。
+//     纠正：字符串池一律经本模块（树式 import 唯一入口）；
+//   - 误用：把池 id 写进 .tieir 序列化产物（阶段 6）当稳定标识。
+//     纠正：序列化须经 lookup 还原文本再编码（id 是进程内句柄，
+//     不同进程/不同编译顺序的 id 分配不同）。
+//
+// # 性能与内存说明
+//   - intern 正查走 std 层排序键二分 O(log n)；lookup 下标 O(1)；
+//   - 池只增不减（无回收），编译器单进程运行峰值 = 全语料
+//     lexeme + 名字总量（数万级），i64 id 空间充裕；
+//   - init() 预登记 8 个高频名，其余懒登记（首次出现时）；
+//   - 本模块本身零状态（无自己的全局表）——状态全在 std 层池，
+//     转发开销仅一次函数调用，热路径可安全使用。
+//
+// # 扩展阅读
+//   - 字符串池原语：std/intern.tie（T0.6，正查二分实现细节）；
+//   - 符号表 id 化动机：docs/plans/self-hosting.md §3（B1 列式设计）；
+//   - 编译器内统一接口约定：.omo/plans/self-hosting-v2.md T2.1。
+//
+// # 与 std/intern.tie 的对应关系（提炼来源追踪）
+//   | 本模块函数    | std/intern.tie 出处          | 差异 |
+//   | intern        | intern @55                  | 直接转发 |
+//   | lookup        | lookup @91                  | 直接转发 |
+//   | len           | interned_len @102           | 改名（编译器内统一短名） |
+//   | name_str      | （无）                       | 新增：-1 哨兵封装 |
+//   | is_valid      | （无）                       | 新增：合法区间判定 |
+//   | init          | （无）                       | 新增：常用符号预登记 |
+//   std/intern 内部的正查（intern_keys 二分）+ 反查（intern_pool
+//   下标）实现在 std 层，本模块不重复实现——只做接口与哨兵约定。
+//   若 std 层后续演进（如改用 map），仅本文件转发体需调整。
+//
+// 调用：import 后 interner.intern(...) / interner.name_str(...)
+// 命名规范：命名空间内函数不加 interner_ 前缀；内部工具私有（非 pub）。
+
+// # 编译器中的使用场景（id 的数据流）
+//   ```
+//   lexer    tok_lexemes[token] = interner.intern(lexeme 文本)   // lexeme 池
+//   parser   node_names[node]   = interner.intern(标识符文本)     // 名字字段
+//   semantic fn_keys / lv_keys  = interner.intern(全名)          // 符号表键
+//   llvmgen  interner.lookup(id) -> 文本                         // 输出名字
+//   ```
+//   全流程只有「文本 -> id」与「id -> 文本」两个方向，id 是
+//   编译器的通用字符串句柄（B1 列式设计的前提：列全部存 i64）。
+//
+// # 与 Rust 种子侧的差异（行为对齐参考）
+//   Rust 版 semantic.rs 的符号表直接用 String 键（每次比较 O(len)）；
+//   tie 版改用池 id 键（O(1) 比较）——这是 G1 性能净胜点之一。
+//   协议文本（--ast/--tokens 输出）需要还原文本，统一走 lookup。
+//
+// # 本模块演进方向（阶段 2 中期）
+//   若 G4 显示池查询成为热点，可在此处为 intern 增加「哈希短路」
+//   （先比长度再 strcmp）或改用 map——接口不变，消费方无感。
+//
+// # 防御性编程约定（编译器崩溃面收窄）
+//   - 编译器内部所有「id -> 槽位」读取前，先经 name_str/is_valid
+//     判哨兵，禁止裸 lookup 未登记 id 后直接拼接进错误消息；
+//   - intern 的入参恒为合法字符串（源文件 lexeme/关键字文本），
+//     不做空串拦截——空串 "" 也可登记（id 有效，lookup 返回 ""），
+//     但编译器内部约定不登记空串（无意义），省 id；
+//   - 池增长方向单调：单进程内 len() 只增不减（无回收），
+//     长期驻留进程（LSP）会持续增长——编译器阶段 2 中期若做
+//     LSP 内存回收，需在此层加「代际快照」接口（预留演进点）。
+//
+// # 与本模块配套的验收要点（driver 自检覆盖）
+//   - 幂等：intern("abc") == intern("abc")；
+//   - 反查：lookup(intern("abc")) == "abc"；
+//   - 哨兵：name_str(-1) == ""；is_valid(-1) == false；
+//   - 预登记：init() 后 intern("main") >= 0。
+
+import "../../std/intern.tie"
+
+namespace interner {
+
+// 登记字符串，返回稳定 id（0 递增；重复登记返回原 id）。
+// 转发 std/intern.intern，编译器内部唯一入口。
+// 用法示例（AST 名字字段登记）：
+//   var nid = interner.intern("add")   // 首次返回新 id
+//   var nid2 = interner.intern("add")  // 重复登记返回同一 id
+// 断言等价性：nid == nid2 恒成立；lookup(nid) == "add"。
+// 入参约定：源文件 lexeme/关键字/标识符文本；编译器内部约定
+// 不登记空串（见防御性编程约定节）。
+pub func intern(s: string) -> i64 {
+    return intern.intern(s)
+}
+
+// id -> 串（O(1)）；未登记 id（负数或越界）返回约定哨兵空串 ""。
+// 转发 std/intern.lookup；调用方应先判 -1 再判空串（见文件头约定）。
+// 注意：空串哨兵与 -1 哨兵语义不同——"" 表示「该 id 未登记」，
+// -1 表示「该槽位无名字」；两者不能混用。
+pub func lookup(id: i64) -> string {
+    return intern.lookup(id)
+}
+
+// 池中当前条目数（已登记的不同串数量）。
+// 转发 std/intern.interned_len；合法 id 上界。
+// 用法：调试输出池规模、或做「池快照」记录编译某文件前的 id 基数。
+pub func len() -> i64 {
+    return intern.interned_len()
+}
+
+// 名字字段 -> 串：封装「-1 无名字」哨兵约定。
+//   id >= 0 -> lookup(id)（未登记返回 ""）
+//   id == -1 -> ""（无名字，AST 槽位约定）
+// 语义检查/IR 生成遍历 AST 时统一用它取节点名字文本。
+// 典型调用：interner.name_str(ast.name(node_id))
+// 判别顺序已封装：先判 -1（无名字）再查池（未登记）——
+// 消费方无需自行区分两套哨兵。
+// 应用场景举例：
+//   - 语义：函数调用节点的函数名（Call[name]）查符号表；
+//   - IR：全局变量名/函数全名输出（ns::fn → ns$fn）；
+//   - 错误消息：把池 id 还原为可读文本拼进「@行:列」消息。
+pub func name_str(id: i64) -> string {
+    if id < 0 {
+        return ""
+    }
+    return intern.lookup(id)
+}
+
+// id 是否合法：0 <= id < len()（已登记范围内）。
+// 用于防御性校验（如外部输入的下标反查）。
+// 注：未登记但非法的 id（如 100 万）返回 false——池 id 恒连续
+// （0 起递增），不存在「空洞」，故只需区间判定。
+// 实现要点：与 std/intern 的 lookup 哨兵（负数/越界返回 ""）不同，
+// 本函数返回显式布尔，供「判合法性后走不同分支」的调用方使用。
+pub func is_valid(id: i64) -> bool {
+    if id < 0 {
+        return false
+    }
+    if id >= intern.interned_len() {
+        return false
+    }
+    return true
+}
+
+// 预登记编译器常用符号（可选调用，非必须）：
+// 把编译器各阶段高频出现的名字提前 intern，确保它们在池中
+// 获得**稳定的小 id**（0 起连续），便于调试输出与协议文本对齐。
+// 幂等：重复调用无害（intern 幂等）；应在 main 早期调用一次。
+// 注：此处仅登记最基础符号；各阶段特有符号由各模块自行 intern
+// （如 parser 的运算符名、semantic 的类型关键字名）。
+// 预登记的意义：
+//   - 编译器错误消息/调试输出中出现这些名字时，id 恒定可复现；
+//   - 与 Rust 种子侧的字符串池布局对齐时，小 id 便于对照。
+pub func init() {
+    intern.intern("main")
+    intern.intern("print")
+    intern.intern("println")
+    intern.intern("len")
+    intern.intern("str_len")
+    intern.intern("table_push")
+    intern.intern("i64")
+    intern.intern("string")
+}
+
+}   // namespace interner

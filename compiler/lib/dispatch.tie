@@ -1,0 +1,208 @@
+// tie:library
+// compiler/lib/dispatch.tie —— 自举 v2 T2.1：C1 字符串分派表辅助
+// ============================================================
+// 里程碑：自举 v2 计划 T2.1 模块化地基。C1 字符串分派模式
+// 见 docs/plans/self-hosting.md §4（无函数指针时的按名分派）；
+// 提炼自 proto semantic.tie 的 builtin_call 按名分派逻辑
+// （一组 if fn_name == "..." 链）与 parser 的关键字排序表。
+//
+// # C1 分派模式（本模块解决的问题）
+//   编译器各阶段（词法状态机、语义语句/表达式分派、IR 生成遍历）
+//   需要「按一个名字把工作交给对应处理函数」。tie 无函数指针，
+//   方案：处理器函数名登记进**升序分派表**，调用点用
+//   switch 静态展开（编译期确定分支，C5 可优化为跳转表）。
+//
+// # 使用样板（调用方约定）
+//   // 阶段启动时登记全部处理器（幂等，重复登记返回原序号）
+//   var id_lexer = dispatch.register("handle_lexer")
+//   var id_parser = dispatch.register("handle_parser")
+//   var id_semantic = dispatch.register("handle_semantic")
+//
+//   // 调用点：按名查序号 → switch 序号静态展开
+//   // （推荐整数 switch：C5 跳转表友好；字符串 switch 亦可）
+//   var idx = dispatch.find(name)
+//   switch idx {
+//       case 0:
+//           return handle_lexer(...)
+//       case 1:
+//           return handle_parser(...)
+//       case 2:
+//           return handle_semantic(...)
+//       default:
+//           return "unknown handler: " + name   // 兜底约定
+//   }
+//
+// # 设计要点（语言边界约束）
+//   - 分派表是**编译器级唯一**的（C1 模式：各阶段共用一张表），
+//     故用模块内全局表自持（table<string> 不能作函数参数，
+//     同 std/intern.tie 设计，见 parser 设计修订注释）；
+//   - d_keys 恒升序（登记时有序插入，尾部追加 + 冒泡前移），
+//     find 二分 O(log n)；
+//   - 序号 = 登记顺序（0 起），插入不改变已登记序号（值随键走），
+//     调用方 switch 的 case 常量不受后续登记影响。
+//
+// # 设计决策记录（ADR，防回归）
+//   D1 为什么分派表是「编译器级唯一」一张？
+//      C1 模式（docs/plans/self-hosting.md §4）的典型用法是每阶段
+//      一张自己的分派表；但 tie 的 import 树式展开下，每张表都要
+//      一个模块持全局状态。合并为一张表（本模块）的理由：
+//      序号全编译器唯一 → 调用方 switch case 编号不会跨阶段撞车；
+//      登记集中在启动期一次完成 → 表构建成本可忽略。
+//      若后续某阶段表过大（>32 条），可拆分为第二张表（再开一个
+//      模块），不影响本模块契约。
+//   D2 字符串 switch 与整数 switch 展开，用哪个？
+//      本模块 find 返回**序号**，调用方对序号做整数 switch：
+//      `switch dispatch.find(name) { case 0: ... default: ... }`
+//      理由：整数 case 走 C5 LLVM switch 跳转表（O(1) 分派），
+//      字符串 case 是逐串比较链（O(k)）；且序号由登记顺序固定，
+//      与函数名字符串解耦。纯字符串 switch 仅用于未登记兜底
+//      （find 返回 -1 走 default）。
+//   D3 与 eval_call 兜底的区别（C1 vs eval）：
+//      eval_call 运行时查函数表 + 参数装箱，慢几个数量级且只能传
+//      字符串；C1 静态展开编译期定分支、类型安全。编译器内部
+//      一律用 C1（本模块）；eval_call 仅保留给 tie:script 协议
+//      与 REPL 的跨层回调（规划 §4.3 明确）。
+//   D4 与 proto builtin_call 的迁移对应：
+//      proto semantic.builtin_call 是 if fn_name == "..." 链
+//      （30+ 分支）；T2.6 语义重写时，内置函数分派改为：
+//      `var i = data.builtin_lookup(fn_name)` 查签名表 +
+//      `switch dispatch.find(处理名)` 分派实现——本模块与
+//      middle/data.tie 分工：data 管「签名数据」，dispatch 管
+//      「处理器分派」，互不重叠。
+//   D5 登记的处理器函数签名约束：
+//      C1 要求同签名处理器（便于 switch 统一调用）；本模块不校验
+//      签名（tie 无函数指针，编译器无法在运行时比对），由调用方
+//      在登记处保证——约定注释写死：处理器为 (节点参数...) -> 结果
+//      形式的同名族，按阶段分组登记，避免误登记。
+//
+// # 使用约束与反模式（防误用）
+//   - 登记发生在**编译启动期**（一次）：不要在热路径（每节点
+//     每 token）调用 register——find 才是热路径查询；
+//   - 不要手工向 d_keys/d_vals 表写入（本模块全局表由 register
+//     独占维护，直接写会破坏升序不变量导致 find 二分结果错误）；
+//   - 反模式：把「每个 AST 节点类型」都登记为处理器——节点分派
+//     用 tag 整数 switch（C5 跳转表）而非字符串分派，本表只服务
+//     于「按名字」分派的场景（阶段处理函数/内置函数族）；
+//   - find 返回 -1 时调用方必须走 default 兜底（报未知处理器），
+//     不得静默跳过——漏登记是编译器阶段对接最常见的 bug。
+//
+// # 性能与内存说明
+//   - find 为二分 O(log n)，n = 已登记处理器数（编译器级 < 64）；
+//   - register 只在启动期调用（数十次），冒泡成本可忽略；
+//   - 分派调用本身是调用方的 switch 序号展开（C5 跳转表 O(1)），
+//     本模块只负责「名字 -> 序号」的映射查询，不做实际分派。
+//
+// # 扩展阅读
+//   - C1 字符串分派模式全述：docs/plans/self-hosting.md §4；
+//   - 整数 case 跳转表：docs/plans/self-hosting.md §2.7（C5）；
+//   - 字符串 switch 语义：examples/strings.tie（switch name）；
+//   - 关键字排序表（同款全局表 + 二分）：compiler/proto/lexer.tie
+//     （kw_keys/kw_vals + build_kw）。
+//
+// # 与既有实现的对应关系（提炼来源追踪）
+//   | 本模块函数   | 出处                                                   | 差异 |
+//   | register     | docs/plans/self-hosting.md §4.2 build_dispatch_table    | 有序插入 + 幂等序号 |
+//   | find         | （§4.2 dispatch() 的 switch 前键名比较）                | 二分 O(log n) |
+//   | bs_find      | std/intern.tie binsearch @35（字符串键二分模板）        | 操作本模块全局表 |
+//   | 冒泡插入     | std/intern.tie intern @66（追加尾部 + 向前冒泡）        | 两表同步交换 |
+//   | at           | §4.2 主流程 for 遍历分派表                                | 序号反查名 |
+//   proto semantic.builtin_call @1548 的 if fn_name 链是 C1 的
+//   「预分派」雏形：T2.6 重写时「名字 → 签名数据」走 middle/data.tie，
+//   「名字 → 处理器」走本模块，两条链分离。
+//
+// 调用：import 后 dispatch.register(...) / dispatch.find(...)
+// 命名规范：命名空间内函数不加 dispatch_ 前缀；内部工具私有（非 pub）。
+
+// 分派表全局状态（懒初始化：首次 register 时建表）
+var d_keys: table<string>;   // 处理器函数名（升序，strcmp 码点序）
+var d_vals: table<i64>;      // 登记序号（与 d_keys 并行对齐）
+
+namespace dispatch {
+
+// 二分查找函数名 s 在 d_keys 中的下标；未登记返回 -1。
+// 与 std/intern.tie binsearch 同款（迭代式 lo/hi，字符串比较
+// 用 < / > / == 运算符，IR 走 strcmp，按码点序）。
+func bs_find(s: string) -> i64 {
+    var lo: i64 = 0
+    var hi: i64 = len(d_keys) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if d_keys[mid] == s {
+            return mid
+        }
+        if d_keys[mid] < s {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+// 登记处理器函数名：返回稳定序号（0 起，按首次登记顺序）。
+// 已登记（重复调用）返回原序号，不新增条目（幂等）。
+// 新名字：有序插入 keys/vals（追加尾部 + 向前冒泡，两表同步
+// 交换保持并行对应——同 std/intern.tie intern 的插入流程）。
+pub func register(name: string) -> i64 {
+    var idx = bs_find(name)
+    if idx >= 0 {
+        return d_vals[idx]
+    }
+    // 首次使用分派表：惰性建表
+    if len(d_keys) == 0 {
+        d_keys = table_new_string()
+        d_vals = table_new_i64()
+    }
+    var seq = len(d_vals)
+    table_push(d_keys, name)
+    table_push(d_vals, seq)
+    // 向前冒泡保持升序（插入排序一步）
+    var i: i64 = len(d_keys) - 1
+    var moving: bool = true
+    while moving {
+        if i == 0 {
+            moving = false
+        } else if d_keys[i] < d_keys[i - 1] {
+            var tmpk = d_keys[i]
+            d_keys[i] = d_keys[i - 1]
+            d_keys[i - 1] = tmpk
+            var tmpv: i64 = d_vals[i]
+            d_vals[i] = d_vals[i - 1]
+            d_vals[i - 1] = tmpv
+            i = i - 1
+        } else {
+            moving = false
+        }
+    }
+    return seq
+}
+
+// 按名查分派序号（二分 O(log n)）；未登记返回 -1。
+// 调用方对返回值做 switch 展开（见文件头样板），
+// -1 走 default 兜底（未知处理器）。
+pub func find(name: string) -> i64 {
+    var idx = bs_find(name)
+    if idx < 0 {
+        return -1
+    }
+    return d_vals[idx]
+}
+
+// 分派表条目总数（已登记处理器个数）。
+pub func count() -> i64 {
+    return len(d_keys)
+}
+
+// 第 i 个登记序号的函数名（与 find 互逆；i 越界返回空串）。
+// 供遍历分派表批量调用（C1 文档示例：for 遍历逐项分派）。
+pub func at(i: i64) -> string {
+    if i < 0 {
+        return ""
+    }
+    if i >= len(d_keys) {
+        return ""
+    }
+    return d_keys[i]
+}
+
+}   // namespace dispatch

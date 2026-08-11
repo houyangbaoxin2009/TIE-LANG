@@ -1,0 +1,184 @@
+// tie:logic
+// compiler/driver.tie —— 自举 v2 T2.1：临时验收驱动（可随后删除）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.1 模块化地基验收。import 全部 6 个新模块
+// （lib/{columnar,dispatch,interner} + frontend/ast +
+// middle/{types,data}），逐模块做代表性功能自检：
+//   - 编译验证：import 文本内联 + 全部命名空间/全局表/常量合并，
+//     能通过 tie-llvm 编译即证明模块布局与依赖链（无环、树式无
+//     重复 import）正确；
+//   - 运行验证：每模块代表性调用 + 断言（数据表条目数、往返一致、
+//     编码解码正确），失败 exit(1)，成功打印汇总 exit(0)。
+//
+// # import 树（tie 的 import 是**树式展开**：同文件被 import 两次即
+//   重复定义报错，DAG 共享不可用——故每个模块只被一个父 import）：
+//   driver
+//   ├── lib/dispatch   （叶子）
+//   ├── lib/interner   （叶子；其下 std/intern，唯一入口）
+//   ├── frontend/ast   （叶子，自包含）
+//   └── middle/data    （其下 middle/types + lib/columnar）
+//   columnar / types 命名空间经 data 的 import 链**传递可见**（实证：
+//   T1.4 main 经 semantic→parser→lexer 链调用 lexer.token_count）。
+//
+// 自检内容与 B1 权威定义的对应关系（防回归）：
+//   - ast/data tag 表：52 条目、tag_name 抽查（0/101/200）、
+//     段判断（expr/stmt/type）；
+//   - data 运算符表：18 二元 + 6 一元、符号抽查（==、&&、++）；
+//   - data 内置函数表：72 条目、len 签名、table_new_i64 返回
+//     table<i64>、未识别名 -1；
+//   - types：type id 自编码往返（named/table_of/kind/low）、
+//     type_name 递归还原、struct 名登记。
+//
+// 验收命令（repo 根，pwsh）：
+//   target\release\tie-llvm.exe compiler\driver.tie -o <tmp>\driver.exe
+//   <tmp>\driver.exe        # → 全部模块自检通过（exit 0）
+// 说明：本文件是 T2.1 临时验收壳，T2.9 集成后将由正式 driver 取代。
+
+import "./lib/dispatch.tie"
+import "./lib/interner.tie"
+import "./frontend/ast.tie"
+import "./middle/data.tie"
+
+// 断言辅助：失败打印具体项并返回 false（main 累积，全过才 exit 0）。
+func check(ok: bool, what: string) -> bool {
+    if !ok {
+        println("自检失败: " + what)
+    }
+    return ok
+}
+
+// ---------- 自检：columnar（并列表：插入/查找/覆盖） ----------
+func check_columnar() -> bool {
+    var ck: table<i64> = table_new_i64()
+    var cv: table<i64> = table_new_i64()
+    var ok: bool = true
+    // 逆序插入验证升序与返回位置：10 插 0 位，5 插 0 位（前移），7 插 1 位
+    ok = check(columnar.sorted_insert_i64(ck, cv, 10, 1) == 0, "columnar 插 10")
+    ok = check(columnar.sorted_insert_i64(ck, cv, 5, 2) == 0, "columnar 插 5")
+    ok = check(columnar.sorted_insert_i64(ck, cv, 7, 3) == 1, "columnar 插 7")
+    ok = check(columnar.bs_find_i64(ck, 7) == 1, "columnar 二分 7")
+    ok = check(columnar.bs_find_i64(ck, 99) == -1, "columnar 二分未命中")
+    ok = check(columnar.find_pair(ck, cv, 10, -1) == 1, "columnar 查值")
+    ok = check(columnar.find_pair(ck, cv, 99, -1) == -1, "columnar 查值缺省")
+    ok = check(columnar.set_pair_i64(ck, cv, 7, 99) == 1, "columnar 覆盖位置")
+    ok = check(columnar.find_pair(ck, cv, 7, -1) == 99, "columnar 覆盖值")
+    return ok
+}
+
+// ---------- 自检：dispatch（C1 分派表：登记/查序/幂等） ----------
+func check_dispatch() -> bool {
+    var ok: bool = true
+    var d0 = dispatch.register("handle_lexer")
+    var d1 = dispatch.register("handle_parser")
+    var d2 = dispatch.register("handle_semantic")
+    ok = check(d0 == 0 && d1 == 1 && d2 == 2, "dispatch 登记序号")
+    ok = check(dispatch.register("handle_parser") == 1, "dispatch 重复登记幂等")
+    ok = check(dispatch.find("handle_semantic") == 2, "dispatch 按名查序")
+    ok = check(dispatch.find("no_such_handler") == -1, "dispatch 未登记 -1")
+    ok = check(dispatch.count() == 3, "dispatch 条目数")
+    ok = check(dispatch.at(0) == "handle_lexer", "dispatch 序号反查名")
+    return ok
+}
+
+// ---------- 自检：interner（字符串池：幂等/哨兵/预登记） ----------
+func check_interner() -> bool {
+    var ok: bool = true
+    var a1 = interner.intern("abc")
+    var a2 = interner.intern("abc")
+    ok = check(a1 == a2, "interner 幂等")
+    ok = check(interner.lookup(a1) == "abc", "interner 反查")
+    ok = check(interner.name_str(-1) == "", "interner -1 哨兵")
+    ok = check(interner.name_str(a1) == "abc", "interner name_str")
+    ok = check(interner.is_valid(a1), "interner 合法 id")
+    ok = check(!interner.is_valid(-1), "interner 非法 id")
+    interner.init()
+    ok = check(interner.intern("main") >= 0, "interner 预登记 main")
+    return ok
+}
+
+// ---------- 自检：ast（节点池：创建/链接/读取） ----------
+func check_ast() -> bool {
+    ast.reset()
+    var ok: bool = true
+    var n0 = ast.new_node(7, interner.intern("add"), -1, 0, 1, 1)  // Call
+    var n1 = ast.new_node(0, -1, 42, 0, 1, 5)                      // IntLit(42)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, n1)
+    ast.set_children(n0, kids)
+    ok = check(ast.count() == 2, "ast 节点数")
+    ok = check(ast.tag(n0) == 7 && ast.val(n1) == 42, "ast tag/val")
+    ok = check(ast.child_count(n0) == 1, "ast 子节点数")
+    ok = check(ast.child_at(n0, 0) == n1, "ast 子节点读取")
+    ok = check(ast.child_at(n0, 1) == -1, "ast 子节点越界哨兵")
+    ok = check(interner.name_str(ast.name(n0)) == "add", "ast 名字文本")
+    ok = check(ast.line(n0) == 1 && ast.col(n1) == 5, "ast span")
+    var sl = ast.new_node(122, -1, 0, 0, 1, 1)                      // StmtList
+    ok = check(ast.is_stmt_list(sl), "ast StmtList 判别")
+    ok = check(!ast.is_stmt_list(n0), "ast 非 StmtList")
+    return ok
+}
+
+// ---------- 自检：types（自编码：构造/解码/判据/名字） ----------
+func check_types() -> bool {
+    var ok: bool = true
+    var ti = types.named(3)
+    ok = check(types.kind(ti) == 0 && types.is_int(ti), "types i64")
+    ok = check(types.type_name(ti) == "i64", "types i64 名")
+    var tt = types.table_of(types.named(13))
+    ok = check(types.kind(tt) == 1, "types table kind")
+    ok = check(types.table_elem(tt) == 13, "types table 元素")
+    ok = check(types.type_name(tt) == "table<string>", "types table 递归名")
+    ok = check(types.is_table(tt) && !types.is_map(tt), "types table/map 判别")
+    var tm = types.map_of(types.named(3))
+    ok = check(types.is_map(tm) && types.is_table(tm), "types map 判别")
+    ok = check(types.is_number(ti) && !types.is_bool_like(ti), "types 数值判别")
+    ok = check(types.is_wide(types.named(17)), "types 宽类型")
+    types.set_struct_name(0, "Point")
+    ok = check(types.type_name(types.struct_of(0)) == "Point", "types struct 名")
+    ok = check(types.type_name(types.tuple_of(0)) == "tuple", "types tuple 名")
+    return ok
+}
+
+// ---------- 自检：data（B1 数据表：条目/抽查/签名） ----------
+func check_data() -> bool {
+    var ok: bool = true
+    ok = check(data.tag_count() == 52, "data tag 表 52 条目")
+    ok = check(data.tag_name(0) == "IntLit", "data tag 0 名")
+    ok = check(data.tag_name(101) == "FnDef", "data tag 101 名")
+    ok = check(data.tag_name(200) == "NamedType", "data tag 200 名")
+    ok = check(data.tag_name(204) == "MapType", "data tag 204 名")
+    ok = check(data.is_expr_tag(7) && data.is_expr_tag(22), "data expr 段")
+    ok = check(data.is_stmt_tag(100) && data.is_stmt_tag(124), "data stmt 段")
+    ok = check(data.is_type_tag(200) && data.is_type_tag(204), "data type 段")
+    ok = check(!data.is_expr_tag(101), "data 段互斥")
+    ok = check(data.binop_count() == 18, "data 二元 op 18")
+    ok = check(data.binop_sym(5) == "==" && data.binop_name(11) == "And", "data 二元抽查")
+    ok = check(data.binop_sym(16) == "<<", "data Shl 符号")
+    ok = check(data.unop_count() == 6, "data 一元 op 6")
+    ok = check(data.unop_sym(2) == "++" && data.unop_name(1) == "Not", "data 一元抽查")
+    ok = check(data.builtin_count() == 72, "data 内置函数 72")
+    var bl = data.builtin_lookup("len")
+    ok = check(bl >= 0 && data.builtin_nargs(bl) == 1, "data len 签名")
+    ok = check(types.type_name(data.builtin_ret(bl)) == "i64", "data len 返回")
+    var bt = data.builtin_lookup("table_new_i64")
+    ok = check(bt >= 0 && data.builtin_nargs(bt) == 0, "data table_new_i64 签名")
+    ok = check(types.type_name(data.builtin_ret(bt)) == "table<i64>", "data table_new_i64 返回")
+    ok = check(data.builtin_lookup("no_such_fn") == -1, "data 未识别 -1")
+    var be = data.builtin_lookup("byte_concat")
+    ok = check(types.type_name(data.builtin_ret(be)) == "table", "data byte_concat 裸表")
+    return ok
+}
+
+func main() {
+    var ok: bool = true
+    ok = check_columnar() && ok
+    ok = check_dispatch() && ok
+    ok = check_interner() && ok
+    ok = check_ast() && ok
+    ok = check_types() && ok
+    ok = check_data() && ok
+    if !ok {
+        exit(1)
+    }
+    println("全部模块自检通过（columnar/dispatch/interner/ast/types/data）")
+}
