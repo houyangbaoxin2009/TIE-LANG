@@ -1,0 +1,374 @@
+// tie:library
+// compiler/frontend/lex_scan.tie —— T2.4 token 扫描器（模块拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.4（.omo/plans/self-hosting-v2.md）完整词法器
+// lexer.tie 拆分为 5 模块之一（本文件 = 各 token 扫描器 + 错误槽写入）。
+// 共享状态（g_codes/g_n/g_src/g_line_starts/g_err_*）来自 ./lex_state.tie
+// （经 ./lex_tokdefs.tie 传递可达），tag 常量来自 ./lex_tokdefs.tie，
+// 关键字/符号查表走 ./lex_symtab.tie，错误消息走 ./errors.tie，
+// 字符串函数走 ../../std/string.tie，池化走 ../lib/interner.tie。
+// 依赖：./lex_tokdefs.tie（tag 常量 + 列式表 + 字符分类 + 行列反推，
+// 经其传递可达 ./lex_state.tie 共享全局 + ../lib/interner.tie 池 +
+// ../../std/string.tie 字符串函数）+ ./lex_symtab.tie（关键字/符号查表）
+// + ./errors.tie（错误消息）。树状无环，唯一 import 路径。
+// 由 lexer.tie import。
+
+import "./lex_tokdefs.tie"
+import "./lex_symtab.tie"
+import "./errors.tie"
+
+namespace lexscan {
+
+// ---------- 错误槽位 ----------
+// 记录词法错误（line/col 1 起；msg 为 errors 表消息或格式函数结果）
+func set_err(line: i64, col: i64, msg: string) {
+    g_err_line = line
+    g_err_col = col
+    g_err_msg = msg
+}
+
+// ---------- 各 token 扫描器 ----------
+// 输入 pos（当前字符位置），返回扫描结束后的位置；出错置全局错误槽返回 -1。
+
+// 行尾定位：返回本行最后一个字符之后的位置（停在 '\n'，不消费）
+func line_end(pos: i64) -> i64 {
+    while pos < g_n {
+        if g_codes[pos] == 10 {
+            break
+        }
+        pos = pos + 1
+    }
+    return pos
+}
+
+// 块注释闭合定位：从 pos 起找 "*/"，返回其后位置；未闭合返回 -1
+func find_block_close(pos: i64) -> i64 {
+    while pos < g_n {
+        if g_codes[pos] == 42 {        // '*'
+            if pos + 1 < g_n {
+                if g_codes[pos + 1] == 47 {   // '*/'
+                    return pos + 2
+                }
+            }
+        }
+        pos = pos + 1
+    }
+    return -1
+}
+
+// 行注释 //...：不产 token，停在换行符
+func scan_line_comment(pos: i64) -> i64 {
+    return line_end(pos + 2)
+}
+
+// doc 行注释 ///...：内容收集为 doc
+func scan_doc_line(pos: i64) -> i64 {
+    var end = line_end(pos + 3)
+    lextok.collect_doc(str.slice(g_src, pos + 3, end))
+    return end
+}
+
+// 块注释 /*...*/：未闭合报错（位置取注释起点）
+func scan_block_comment(pos: i64) -> i64 {
+    var close = find_block_close(pos + 2)
+    if close < 0 {
+        set_err(lextok.line_of(pos), lextok.col_of(pos), errors.err_msg("lex_block_unclosed"))
+        return -1
+    }
+    return close
+}
+
+// doc 块注释 /**...*/：内容收集为 doc；未闭合同报「块注释未闭合」
+func scan_doc_block(pos: i64) -> i64 {
+    var close = find_block_close(pos + 3)
+    if close < 0 {
+        set_err(lextok.line_of(pos), lextok.col_of(pos), errors.err_msg("lex_block_unclosed"))
+        return -1
+    }
+    lextok.collect_doc(str.slice(g_src, pos + 3, close - 2))
+    return close
+}
+
+// 合法转义：\n \t \r \\ \" \' \0（与 Rust scan_string/scan_char 一致）
+func is_valid_escape(e: i64) -> bool {
+    return e == 110 || e == 116 || e == 114 || e == 92 || e == 34 || e == 39 || e == 48
+}
+
+// 字符串（可跨行；lexeme = 原始切片含引号，parser 阶段再解码转义）
+pub func scan_string(pos: i64) -> i64 {
+    var start = pos
+    pos = pos + 1   // 开引号 '"'
+    var done = false
+    while pos < g_n {
+        if g_codes[pos] == 92 {        // 反斜杠
+            pos = pos + 1
+            if pos >= g_n {
+                set_err(lextok.line_of(start), lextok.col_of(start), errors.err_msg("lex_escape_missing"))
+                return -1
+            }
+            var e = g_codes[pos]
+            if !is_valid_escape(e) {
+                set_err(lextok.line_of(start), lextok.col_of(start),
+                    errors.lex_unknown_escape(str_char(g_src, pos)))
+                return -1
+            }
+            pos = pos + 1
+        } else if g_codes[pos] == 34 { // 闭引号 '"'
+            pos = pos + 1
+            done = true
+            break
+        } else {
+            pos = pos + 1
+        }
+    }
+    if !done {
+        set_err(lextok.line_of(start), lextok.col_of(start), errors.err_msg("lex_str_unclosed"))
+        return -1
+    }
+    var lid = interner.intern(str.slice(g_src, start, pos))
+    lextok.push_token_at(lex_str, start, lid)
+    return pos
+}
+
+// 字符字面量 'a' / '\n' / '\''（单引号包裹恰好一个字符，支持转义）
+pub func scan_char(pos: i64) -> i64 {
+    var start = pos
+    pos = pos + 1   // 开引号 '\''
+    if pos >= g_n {
+        set_err(lextok.line_of(start), lextok.col_of(start), errors.err_msg("lex_char_unclosed"))
+        return -1
+    }
+    if g_codes[pos] == 92 {            // 反斜杠转义
+        pos = pos + 1
+        if pos >= g_n {
+            set_err(lextok.line_of(start), lextok.col_of(start), errors.err_msg("lex_escape_missing"))
+            return -1
+        }
+        var e = g_codes[pos]
+        if !is_valid_escape(e) {
+            set_err(lextok.line_of(start), lextok.col_of(start),
+                errors.lex_unknown_escape(str_char(g_src, pos)))
+            return -1
+        }
+        pos = pos + 1
+    } else {
+        pos = pos + 1   // 一个内容字符
+    }
+    if pos >= g_n {
+        set_err(lextok.line_of(start), lextok.col_of(start), errors.err_msg("lex_char_unclosed"))
+        return -1
+    }
+    if g_codes[pos] == 39 {            // 闭引号 '\''
+        pos = pos + 1
+        var lid = interner.intern(str.slice(g_src, start, pos))
+        lextok.push_token_at(lex_charlit, start, lid)
+        return pos
+    }
+    set_err(lextok.line_of(start), lextok.col_of(start), errors.err_msg("lex_char_multi"))
+    return -1
+}
+
+// 消费 [lo,hi] 码点区间的进制数字（0b/0o/0t 共用）
+func scan_digit_range(pos: i64, lo: i64, hi: i64) -> i64 {
+    while pos < g_n {
+        var c = g_codes[pos]
+        if c >= lo {
+            if c <= hi {
+                pos = pos + 1
+            } else {
+                break
+            }
+        } else {
+            break
+        }
+    }
+    return pos
+}
+
+// 消费十六进制数字（0-9 a-f A-F）
+func scan_hex_digits(pos: i64) -> i64 {
+    while pos < g_n {
+        if lextok.is_hex_digit(g_codes[pos]) {
+            pos = pos + 1
+        } else {
+            break
+        }
+    }
+    return pos
+}
+
+// 尝试解析指数 e/E [+-] 数字：成功返回消费后位置，失败返回 -1
+func scan_exponent(pos: i64) -> i64 {
+    var j = pos + 1
+    if j >= g_n {
+        return -1
+    }
+    if g_codes[j] == 45 || g_codes[j] == 43 {   // '-' / '+'
+        j = j + 1
+    }
+    if j >= g_n {
+        return -1
+    }
+    if !lextok.is_digit(g_codes[j]) {
+        return -1
+    }
+    var end = j + 1
+    while end < g_n {
+        if lextok.is_digit(g_codes[end]) {
+            end = end + 1
+        } else {
+            break
+        }
+    }
+    return end
+}
+
+// 数字：整数（十进制/0x/0b/0o/0t）或浮点（小数点与指数）。边界对齐 Rust
+// scan_number（1..10 的 .. 不被误吃；0xFF 等进制前缀只在恰好单个 "0" 时触发）。
+pub func scan_number(pos: i64) -> i64 {
+    var start = pos
+    var is_float = false
+    var saw_e = false
+    var digits_consumed: i64 = 0
+    var scanning = true
+    while scanning {
+        var c: i64 = 0
+        if pos < g_n {              // 防护：消费完即终止（防 OOB 读）
+            c = g_codes[pos]
+        }
+        if lextok.is_digit(c) {
+            pos = pos + 1
+            digits_consumed = digits_consumed + 1
+        } else if c == 46 {         // '.'
+            if is_float {
+                scanning = false
+            } else if pos + 1 < g_n {
+                if lextok.is_digit(g_codes[pos + 1]) {   // 下一位是数字才视作小数
+                    is_float = true
+                    pos = pos + 1
+                } else {
+                    scanning = false
+                }
+            } else {
+                scanning = false
+            }
+        } else if c == 101 || c == 69 {   // 'e' / 'E' 指数
+            if saw_e {
+                scanning = false
+            } else {
+                var eend = scan_exponent(pos)
+                if eend > 0 {
+                    saw_e = true
+                    is_float = true
+                    pos = eend
+                }
+                scanning = false
+            }
+        } else {
+            scanning = false
+        }
+    }
+    // 进制前缀：恰好单个 '0' 且未成浮点 → 查 0x/0b/0o/0t（大小写均可）
+    if digits_consumed == 1 {
+        if !is_float {
+            if g_codes[start] == 48 {
+                if pos < g_n {
+                    var r = g_codes[pos]
+                    if r == 120 || r == 88 {          // x/X → 十六进制
+                        pos = scan_hex_digits(pos + 1)
+                    } else if r == 98 || r == 66 {    // b/B → 二进制
+                        pos = scan_digit_range(pos + 1, 48, 49)
+                    } else if r == 111 || r == 79 {   // o/O → 八进制
+                        pos = scan_digit_range(pos + 1, 48, 55)
+                    } else if r == 116 || r == 84 {   // t/T → 三进制
+                        pos = scan_digit_range(pos + 1, 48, 50)
+                    }
+                }
+            }
+        }
+    }
+    var tag = lex_int
+    if is_float {
+        tag = lex_float
+    }
+    var lid = interner.intern(str.slice(g_src, start, pos))
+    lextok.push_token_at(tag, start, lid)
+    return pos
+}
+
+// 标识符 / 关键字：切片 intern 后查关键字表转 tag
+pub func scan_ident(pos: i64) -> i64 {
+    var start = pos
+    while pos < g_n {
+        if lextok.is_ident_cont(g_codes[pos]) {
+            pos = pos + 1
+        } else {
+            break
+        }
+    }
+    var lex = str.slice(g_src, start, pos)
+    var lid = interner.intern(lex)
+    var tag = lexsym.kw_lookup(lex)
+    if tag < 0 {
+        tag = lex_ident
+    }
+    lextok.push_token_at(tag, start, lid)
+    return pos
+}
+
+// 符号：3→2→1 字符最长匹配查符号表；未命中报「无法识别的字符」
+pub func scan_symbol(pos: i64) -> i64 {
+    var start = pos
+    var want: i64 = 3
+    while want >= 1 {
+        if pos + want <= g_n {
+            var lex = str.slice(g_src, pos, pos + want)
+            var tag = lexsym.sym_lookup(lex)
+            if tag >= 0 {
+                var lid = interner.intern(lex)
+                lextok.push_token_at(tag, start, lid)
+                return pos + want
+            }
+        }
+        want = want - 1
+    }
+    set_err(lextok.line_of(start), lextok.col_of(start), errors.lex_unrecognized(str_char(g_src, pos)))
+    return -1
+}
+
+// ---------- 主循环 '/' 分派 ----------
+// '/' 分派：行注释 / doc 行 / 块注释 / doc 块 / 除号符号（返回新位置，-1 出错）。
+// doc 块判定：'/**' 且第三字符不是 '/'——'/**/' 的空闭合按普通块注释。
+pub func scan_slash(pos: i64) -> i64 {
+    var n1: i64 = 0
+    if pos + 1 < g_n {
+        n1 = g_codes[pos + 1]
+    }
+    if n1 == 47 {                // '//'
+        if pos + 2 < g_n {
+            if g_codes[pos + 2] == 47 {   // '///'
+                return scan_doc_line(pos)
+            }
+        }
+        return scan_line_comment(pos)
+    }
+    if n1 == 42 {                // '/*'
+        var is_doc: bool = false
+        if pos + 2 < g_n {
+            if g_codes[pos + 2] == 42 {   // '/**'
+                if pos + 3 >= g_n {
+                    is_doc = true
+                } else if g_codes[pos + 3] != 47 {
+                    is_doc = true
+                }
+            }
+        }
+        if is_doc {
+            return scan_doc_block(pos)
+        }
+        return scan_block_comment(pos)
+    }
+    return scan_symbol(pos)      // '/' 单字符或 '/=' 等符号
+}
+
+}

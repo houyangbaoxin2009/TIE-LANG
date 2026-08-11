@@ -1,0 +1,145 @@
+// tie:library
+// compiler/frontend/lexer.tie —— 自举 v2 T2.4：完整词法器（模块拆分后主入口）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.4（.omo/plans/self-hosting-v2.md）。由 T1.1 原型
+// compiler/proto/lexer.tie 升版（16/16 文件 token 已验证一致），行为基准
+// Rust crates/tie-frontend/src/lexer.rs（错误消息逐字对齐）。相比原型：
+// 错误消息走 ./errors.tie 数据表；符号扫描改 **46 条升序符号表 + 二分**
+// （3→2→1 最长匹配）；新增 **doc 注释保留**（/// 行 / /** 块）。
+// # 模块拆分（2026-08-11）：原 845 行单文件按「无环 import 树」拆为 5 模块——
+//   lex_state.tie（共享全局）/ lex_symtab.tie（关键字符号表）/
+//   lex_tokdefs.tie（tag 常量+列式表+ASI）/ lex_scan.tie（扫描器）/
+//   本文件（主循环 run_lex + 协议 tokenize + 错误对外接口）。
+//   本文件只 import ./lex_scan.tie，其余经树传递可达（唯一路径防重复定义）。
+// # 输出：列式 token 表 tok_tags/tok_lines/tok_cols/tok_lexemes(池 id)。
+// # tag 0-79 对齐 Rust TokenKind（lex_ 前缀防 import 合并冲突）。
+// # 性能：lexeme 存池 id 不建堆串；regex_find_all O(N) 切码点表；行起点表
+//   + 二分反推行列号（码点列号，对齐 Rust Chars 计数）。
+// # doc：内容 strip 一前导空格 + trim 尾空白 → g_doc_pending（空串=无，
+//   连续 doc 用 \n 拼接）；声明起始 token（func/var/const/extern/struct/
+//   namespace/import/using）发射时 flush（ordinal=len(doc_keys) →
+//   doc_keys/doc_vals）；EOF 未 flush 丢弃；/**/ 空闭合按普通块注释；
+//   doc 不产 token、不影响 ASI 与错误。
+// # ASI：行尾自动补分号；行尾二元运算符/逗号/冒号/点/开括号/大括号/分号/
+//   else/in 不补（++/-- 不算二元运算符，后缀 i++ 行尾应补）。
+import "./lex_scan.tie"
+
+namespace lexer {
+
+// ---------- 错误槽位 ----------
+// 组装错误协议文本：ERR:<line> <col> <message>（errors 模块统一拼装）
+func err_protocol() -> string {
+    return errors.err_lex_err(g_err_line, g_err_col, g_err_msg)
+}
+
+// 错误行/列/消息（run_lex 返回 false 后读取；行/列 0 = 无错误）
+pub func lex_err_line() -> i64 {
+    return g_err_line
+}
+pub func lex_err_col() -> i64 {
+    return g_err_col
+}
+pub func lex_err_msg() -> string {
+    return g_err_msg
+}
+
+// 列式 token 表读取（转发 lextok；token_count 含 Eof）
+pub func token_count() -> i64 {
+    return lextok.token_count()
+}
+pub func token_tag(i: i64) -> i64 {
+    return lextok.token_tag(i)
+}
+pub func token_line(i: i64) -> i64 {
+    return lextok.token_line(i)
+}
+pub func token_col(i: i64) -> i64 {
+    return lextok.token_col(i)
+}
+pub func token_lexeme_id(i: i64) -> i64 {
+    return lextok.token_lexeme_id(i)
+}
+pub func token_lexeme(i: i64) -> string {
+    return lextok.token_lexeme(i)
+}
+pub func dump_docs() -> string {
+    return lextok.dump_docs()
+}
+
+// ---------- 核心词法扫描 ----------
+// 核心词法扫描：源文本 → 列式 token 表（含 Eof；不产生协议文本）。
+// 供 tokenize 与 T2.5 parser 直接消费；出错置全局错误槽，返回 false。
+pub func run_lex(src: string) -> bool {
+    lexsym.ensure_kw()
+    lexsym.ensure_sym()
+    lextok.reset_tokens()
+    g_line_has_token = false
+    g_last_line_tag = -1
+    g_paren_depth = 0
+    g_err_msg = ""
+    // 源文本 → 码点表（regex 一次切分 O(N)；替代 str_char 逐位取 O(N²)）
+    g_src = src
+    var chars = regex_find_all(src, "(?s).")
+    g_codes = table_new_i64()
+    var i: i64 = 0
+    while i < len(chars) {
+        table_push(g_codes, char_code(chars[i]))
+        i = i + 1
+    }
+    g_n = len(g_codes)
+    lextok.build_line_starts()
+    var pos: i64 = 0
+    while pos < g_n {
+        var c = g_codes[pos]
+        var r: i64 = 0
+        if c == 10 {                       // '\n'：换行触发 ASI 判定
+            pos = pos + 1
+            lextok.finish_line(pos)
+            continue
+        } else if c == 32 || c == 9 || c == 13 {   // 空格 / 制表 / 回车
+            pos = pos + 1
+            continue
+        } else if c == 47 {                // '/'：注释或除号
+            r = lexscan.scan_slash(pos)
+        } else if c == 34 {                // '"' 字符串
+            r = lexscan.scan_string(pos)
+        } else if c == 39 {                // '\'' 字符字面量
+            r = lexscan.scan_char(pos)
+        } else if lextok.is_digit(c) {     // 数字
+            r = lexscan.scan_number(pos)
+        } else if c == 95 || lextok.is_alpha(c) { // '_' / 字母（含中文）→ 标识符/关键字
+            r = lexscan.scan_ident(pos)
+        } else {
+            r = lexscan.scan_symbol(pos)
+        }
+        if r < 0 {
+            return false
+        }
+        pos = r
+    }
+    // 文件末尾补一个 Eof（span 取文件末尾位置；lexeme 为空串）
+    var lid_eof = interner.intern("")
+    lextok.push_token_at(lex_eof, g_n, lid_eof)
+    return true
+}
+
+// ---------- 协议输出 ----------
+// 协议文本：首行 <N>:（N = 含 Eof 的 token 总数），随后每行 tag line col
+// lexeme_id；词法错误返回 ERR:<line> <col> <message>（T1.2 协议）。
+pub func tokenize(src: string) -> string {
+    var ok = run_lex(src)
+    if !ok {
+        return err_protocol()
+    }
+    // 直接裸名访问 tok_* 全局（来自 ./lex_state.tie，经 import 树传递可达）
+    var out: string = to_string(len(tok_tags)) + ":\n"
+    var k: i64 = 0
+    while k < len(tok_tags) {
+        out = out + to_string(tok_tags[k]) + " " + to_string(tok_lines[k]) + " " +
+            to_string(tok_cols[k]) + " " + to_string(tok_lexemes[k]) + "\n"
+        k = k + 1
+    }
+    return out
+}
+
+}

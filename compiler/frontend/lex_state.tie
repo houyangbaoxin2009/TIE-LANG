@@ -1,0 +1,44 @@
+// tie:library
+// compiler/frontend/lex_state.tie —— T2.4 词法器共享状态（模块拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.4（.omo/plans/self-hosting-v2.md）完整词法器
+// lexer.tie 拆分为 5 模块之一（本文件 = 共享全局状态，零依赖叶节点）。
+// tie 语言约束：全局变量只能在文件顶层声明（命名空间体内只允许函数/类/
+// 嵌套命名空间），故本文件全部共享全局变量放顶层，供各模块函数**裸名**
+// 访问（跨文件裸名访问可行性待实测验证；若不可行则调整归属）。
+// namespace lexst 为本模块身份占位。
+// 依赖：无。由 lex_tokdefs.tie import（传递可达 lex_scan/lexer）。
+
+// ---------- 全局列式 token 表（T0.4 全局表：下标对齐 = token 序号）----------
+var tok_tags: table<i64>;
+var tok_lines: table<i64>;
+var tok_cols: table<i64>;
+var tok_lexemes: table<i64>;
+
+// ---------- doc 注释表（ordinal 单调递增，push 即排序对）----------
+var doc_keys: table<i64>;
+var doc_vals: table<i64>;
+
+// ---------- 扫描器共享状态（一次 run_lex 的生命周期）----------
+var g_codes: table<i64>;        // 源码码点表
+var g_src: string = "";         // 源码（lexeme 切片用）
+var g_n: i64 = 0;               // 码点数
+var g_line_starts: table<i64>;  // 各行起点（第 i 行起点 = g_line_starts[i]）
+
+// ---------- ASI 追踪状态（等价 Rust Lexer 字段）----------
+var g_line_has_token: bool = false;
+var g_last_line_tag: i64 = 0;   // 行尾最后 token 的 tag（-1 = 无）
+var g_paren_depth: i64 = 0;     // 括号深度（只统计 ( 与 [）
+
+// ---------- doc pending（空串 = 无；全局 -1 初始化被语义层拦截，实测 2026-08-11
+// 改用空串哨兵——collect_doc 保证永不写入空串，两哨兵语义等价）----------
+var g_doc_pending: string = "";
+
+// ---------- 词法错误槽位（run_lex 失败后读取）----------
+var g_err_line: i64 = 0;
+var g_err_col: i64 = 0;
+var g_err_msg: string = "";
+
+// 模块身份占位（全局变量按 tie 约束留顶层；本 namespace 保持模块边界清晰）
+namespace lexst {
+}

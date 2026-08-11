@@ -1,0 +1,115 @@
+// tie:library
+// compiler/frontend/lex_symtab.tie —— T2.4 关键字/符号表（模块拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.4（.omo/plans/self-hosting-v2.md）完整词法器
+// lexer.tie 拆分为 5 模块之一（本文件 = 关键字/符号表，零依赖叶节点）。
+// 表全局变量（kw_keys/kw_vals/sym_keys/sym_vals）按 tie 约束放文件顶层，
+// 本 namespace 内函数裸名访问；由 lex_scan.tie import（传递可达 lexer）。
+// 依赖：无。
+// 表全局变量（kw_keys/kw_vals/sym_keys/sym_vals）按 tie 约束放本文件顶层，
+// namespace 内函数裸名访问（同文件顶层全局，已验证可行）。
+
+// ---------- 关键字/符号排序表（懒构建；键升序 + 二分）----------
+var kw_keys: table<string>;
+var kw_vals: table<i64>;
+var sym_keys: table<string>;
+var sym_vals: table<i64>;
+
+namespace lexsym {
+
+// ---------- 关键字表构建与二分 ----------
+// 48 项 ASCII/strcmp 升序（TypeKw 值=32，具体类型由 lexeme 区分——同 Rust 单变体）
+func build_kw() {
+    var k: table<string> = ["as", "bool", "break", "case", "char", "code",
+        "const", "continue", "default", "else", "extends", "extern", "f32",
+        "f64", "false", "for", "func", "i16", "i32", "i64", "i8", "if",
+        "import", "in", "map", "misc", "namespace", "num", "pub", "ref",
+        "return", "string", "struct", "switch", "table", "text", "trit",
+        "true", "u16", "u32", "u64", "u8", "using", "var", "void", "when",
+        "while", "zero"]
+    var v: table<i64> = [21, 32, 14, 17, 32, 32, 7, 15, 18, 9, 23, 27, 32,
+        32, 29, 11, 5, 32, 32, 32, 32, 8, 20, 12, 32, 32, 24, 32, 25, 31,
+        13, 32, 22, 16, 32, 32, 32, 28, 32, 32, 32, 32, 26, 6, 32, 19, 10, 30]
+    kw_keys = table_new_string()
+    kw_vals = table_new_i64()
+    var i: i64 = 0
+    while i < len(k) {
+        table_push(kw_keys, k[i])
+        table_push(kw_vals, v[i])
+        i = i + 1
+    }
+}
+
+// 懒构建保证：首次调用前表为空，构建后复用
+pub func ensure_kw() {
+    if len(kw_keys) == 0 {
+        build_kw()
+    }
+}
+
+// 二分查找关键字 s 的 tag；未命中返回 -1（键表升序，比较走 strcmp）
+pub func kw_lookup(s: string) -> i64 {
+    var lo: i64 = 0
+    var hi: i64 = len(kw_keys) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if kw_keys[mid] == s {
+            return kw_vals[mid]
+        }
+        if kw_keys[mid] < s {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+// ---------- 符号表构建与二分 ----------
+// 46 项 strcmp 升序（'<'=60 < '='=61 < '>'=62，故 '<'组："<"<"<<"<"<<="<"<="，
+// '>'组：">"<">="<">>"<">>="——必须严格升序否则二分错乱，2026-08-11 实测踩坑）
+func build_sym() {
+    var k: table<string> = ["!", "!=", "%", "%=", "&", "&&", "&=", "(",
+        ")", "*", "*=", "+", "++", "+=", ",", "-", "--", "-=", "->", ".",
+        "..", "/", "/=", ":", "::", ";", "<", "<<", "<<=", "<=", "=", "==",
+        ">", ">=", ">>", ">>=", "?", "[", "]", "^", "^=", "{", "|", "|=",
+        "||", "}"]
+    var v: table<i64> = [60, 53, 50, 65, 71, 58, 66, 33, 34, 48, 63, 46, 76,
+        61, 39, 47, 77, 62, 45, 43, 44, 49, 64, 40, 41, 42, 54, 74, 69, 56,
+        51, 52, 55, 57, 75, 70, 78, 37, 38, 73, 68, 35, 72, 67, 59, 36]
+    sym_keys = table_new_string()
+    sym_vals = table_new_i64()
+    var i: i64 = 0
+    while i < len(k) {
+        table_push(sym_keys, k[i])
+        table_push(sym_vals, v[i])
+        i = i + 1
+    }
+}
+
+// 懒构建保证：首次调用前表为空，构建后复用
+pub func ensure_sym() {
+    if len(sym_keys) == 0 {
+        build_sym()
+    }
+}
+
+// 二分查找符号文本 s 的 tag；未命中返回 -1
+pub func sym_lookup(s: string) -> i64 {
+    var lo: i64 = 0
+    var hi: i64 = len(sym_keys) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if sym_keys[mid] == s {
+            return sym_vals[mid]
+        }
+        if sym_keys[mid] < s {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+}

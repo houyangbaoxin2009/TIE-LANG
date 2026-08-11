@@ -1,0 +1,103 @@
+// tie:library
+// compiler/frontend/errors.tie —— 自举 v2 T2.4：共享错误消息数据表（leaf）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.4（见 .omo/plans/self-hosting-v2.md）完整词法器。
+// 本模块是编译器**共享的错误消息数据表**：词法/语法/语义三阶段共用一个
+// 消息登记处（T2.5 parser / T2.6 semantic 的错误消息将登记于此，本任务
+// 只登记词法 7 类）。消息文本逐字对齐 Rust crates/tie-frontend/src/lexer.rs
+// （权威错误消息，见下方对照表）。
+//
+// # 职责
+//   1. 消息表：错误名（升序键）→ 消息文本（data 风格表，懒构建 + 二分）；
+//   2. 参数化消息格式化函数（无法识别的字符/未知转义序列需内插字符，消息表
+//      无法模板化 %s，单独函数实现）；
+//   3. err_lex_err(line, col, msg) → 统一协议 "ERR:<line> <col> <msg>"
+//      （T1.2 词法/语法错误协议；stderr 的「词法错误 @行:列: 消息」由上层
+//      CLI 用 fmt_error 拼装，见 proto/main.tie 先例）。
+//
+// # 词法错误消息清单（对照 lexer.rs 逐条核对，权威文本）
+//   | 错误名                | 消息文本                           | lexer.rs 出处       |
+//   | lex_str_unclosed      | 字符串未闭合                        | scan_string @519   |
+//   | lex_char_unclosed     | 字符字面量未闭合                    | scan_char @566/611 |
+//   | lex_char_multi        | 字符字面量只能包含一个字符          | scan_char @607     |
+//   | lex_escape_missing    | 转义符后缺少字符                    | scan_string @532   |
+//   | lex_block_unclosed    | 块注释未闭合                        | scan_block_comment @493 |
+//   （参数化，函数实现）    | 无法识别的字符 'x'                 | scan_symbol @927   |
+//   （参数化，函数实现）    | 未知转义序列 \q                     | scan_string @545   |
+//
+// # 设计要点（语言边界约束）
+//   - 本模块**不 import 任何库**（leaf）：消息表键为 string，columnar 只
+//     支持 i64 键，故内联字符串二分（同 lib/dispatch.tie 的 bs_find 模式）；
+//   - 全局变量一律 err_ 前缀（防 import 文本内联顶层同名冲突）；
+//   - 消息表懒构建（首次 err_msg 查询时建表，与 middle/data.tie ensure_* 同款）；
+//   - 键名约定：lex_ 词法 / syn_ 语法 / sem_ 语义（T2.5/T2.6 追加时沿用）。
+//
+// 调用：import 后 errors.err_msg(...) / errors.err_lex_err(...)
+// 命名规范：命名空间内函数不加 errors_ 前缀；内部工具私有（非 pub）。
+
+// ---------- 错误消息表全局状态（懒构建；表字面量无法作全局初始化，运行时构建）----------
+var err_keys: table<string>;   // 错误名（升序，strcmp 码点序）
+var err_vals: table<string>;   // 消息文本（与 err_keys 并行对齐）
+
+namespace errors {
+
+// 一次性构建错误消息表（5 条静态消息，按错误名字典序升序）。
+// 参数化消息（无法识别的字符/未知转义序列）不进表，走下方格式函数。
+func ensure_msg() {
+    if len(err_keys) > 0 {
+        return
+    }
+    var k: table<string> = ["lex_block_unclosed", "lex_char_multi",
+        "lex_char_unclosed", "lex_escape_missing", "lex_str_unclosed"]
+    var v: table<string> = ["块注释未闭合", "字符字面量只能包含一个字符",
+        "字符字面量未闭合", "转义符后缺少字符", "字符串未闭合"]
+    err_keys = table_new_string()
+    err_vals = table_new_string()
+    var i: i64 = 0
+    while i < len(k) {
+        table_push(err_keys, k[i])
+        table_push(err_vals, v[i])
+        i = i + 1
+    }
+}
+
+// 按错误名查消息文本（二分 O(log n)）；未登记返回 ""（调用方兜底）。
+// 与 lib/dispatch.tie 的 bs_find 同款迭代式二分（字符串比较走 strcmp）。
+pub func err_msg(name: string) -> string {
+    ensure_msg()
+    var lo: i64 = 0
+    var hi: i64 = len(err_keys) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if err_keys[mid] == name {
+            return err_vals[mid]
+        }
+        if err_keys[mid] < name {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return ""
+}
+
+// 参数化消息：无法识别的字符 'x'（c 为单码点字符串）。
+// 对齐 lexer.rs scan_symbol 的 format!("无法识别的字符 '{other}'")。
+pub func lex_unrecognized(c: string) -> string {
+    return "无法识别的字符 '" + c + "'"
+}
+
+// 参数化消息：未知转义序列 \q（e 为转义符后的字符）。
+// 对齐 lexer.rs scan_string/scan_char 的 format!("未知转义序列 \\{other}")。
+// 注意：消息里的反斜杠是字面字符——tie 字符串中 \\ 转义为单个 '\'。
+pub func lex_unknown_escape(e: string) -> string {
+    return "未知转义序列 \\" + e
+}
+
+// 统一错误协议：ERR:<line> <col> <message>（T1.2 词法/语法错误协议）。
+// stderr 显示格式「词法错误 @行:列: 消息」由上层 CLI 拼装（fmt_error）。
+pub func err_lex_err(line: i64, col: i64, msg: string) -> string {
+    return "ERR:" + to_string(line) + " " + to_string(col) + " " + msg
+}
+
+}   // namespace errors

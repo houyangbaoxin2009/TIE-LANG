@@ -1,0 +1,266 @@
+// tie:library
+// compiler/frontend/lex_tokdefs.tie —— T2.4 token 定义与列式表（模块拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.4（.omo/plans/self-hosting-v2.md）完整词法器
+// lexer.tie 拆分为 5 模块之一（本文件 = tag 常量/字符分类/行列反推/ASI/
+// 列式 token 表/doc 收集）。tag 常量与全局变量（tok_*/doc_*/g_* 来自
+// ./lex_state.tie）按 tie 约束留顶层，namespace lextok 内函数裸名访问。
+// 依赖：./lex_state.tie（共享状态）+ ../lib/interner.tie（字符串池）
+// + ../../std/string.tie（str 前缀字符串函数）。
+// 由 lex_scan.tie import（传递可达 lexer）。
+
+import "./lex_state.tie"
+import "../lib/interner.tie"
+import "../../std/string.tie"
+
+// ---------- tag 常量（与 Rust TokenKind 顺序对齐，lex_ 前缀防冲突）----------
+const lex_int: i64 = 0; const lex_float: i64 = 1;
+const lex_str: i64 = 2; const lex_charlit: i64 = 3;
+const lex_ident: i64 = 4; const lex_func: i64 = 5;
+const lex_var: i64 = 6; const lex_const: i64 = 7;
+const lex_if: i64 = 8; const lex_else: i64 = 9;
+const lex_while: i64 = 10; const lex_for: i64 = 11;
+const lex_in: i64 = 12; const lex_return: i64 = 13;
+const lex_break: i64 = 14; const lex_continue: i64 = 15;
+const lex_switch: i64 = 16; const lex_case: i64 = 17;
+const lex_default: i64 = 18; const lex_when: i64 = 19;
+const lex_import: i64 = 20; const lex_as: i64 = 21;
+const lex_struct: i64 = 22; const lex_extends: i64 = 23;
+const lex_namespace: i64 = 24; const lex_pub: i64 = 25;
+const lex_using: i64 = 26; const lex_extern: i64 = 27;
+const lex_true: i64 = 28; const lex_false: i64 = 29;
+const lex_zero: i64 = 30; const lex_ref: i64 = 31;
+const lex_typekw: i64 = 32; const lex_lparen: i64 = 33;
+const lex_rparen: i64 = 34; const lex_lbrace: i64 = 35;
+const lex_rbrace: i64 = 36; const lex_lbracket: i64 = 37;
+const lex_rbracket: i64 = 38; const lex_comma: i64 = 39;
+const lex_colon: i64 = 40; const lex_dcolon: i64 = 41;
+const lex_semi: i64 = 42; const lex_dot: i64 = 43;
+const lex_dotdot: i64 = 44; const lex_arrow: i64 = 45;
+const lex_plus: i64 = 46; const lex_minus: i64 = 47;
+const lex_star: i64 = 48; const lex_slash: i64 = 49;
+const lex_percent: i64 = 50; const lex_eq: i64 = 51;
+const lex_eqeq: i64 = 52; const lex_noteq: i64 = 53;
+const lex_lt: i64 = 54; const lex_gt: i64 = 55;
+const lex_le: i64 = 56; const lex_ge: i64 = 57;
+const lex_andand: i64 = 58; const lex_oror: i64 = 59;
+const lex_bang: i64 = 60; const lex_pluseq: i64 = 61;
+const lex_minuseq: i64 = 62; const lex_stareq: i64 = 63;
+const lex_slasheq: i64 = 64; const lex_percenteq: i64 = 65;
+const lex_ampeq: i64 = 66; const lex_pipeeq: i64 = 67;
+const lex_careteq: i64 = 68; const lex_shleq: i64 = 69;
+const lex_shreq: i64 = 70; const lex_amp: i64 = 71;
+const lex_pipe: i64 = 72; const lex_caret: i64 = 73;
+const lex_shl: i64 = 74; const lex_shr: i64 = 75;
+const lex_inc: i64 = 76; const lex_dec: i64 = 77;
+const lex_question: i64 = 78; const lex_eof: i64 = 79;
+
+namespace lextok {
+
+// ---------- 字符分类 ----------
+pub func is_digit(c: i64) -> bool {   // 0-9
+    return c >= 48 && c <= 57
+}
+pub func is_hex_digit(c: i64) -> bool {   // 0-9 a-f A-F
+    return (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70)
+}
+pub func is_alpha(c: i64) -> bool {   // a-z A-Z + 中文等非 ASCII
+    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c > 127
+}
+pub func is_ident_cont(c: i64) -> bool {   // 字母/数字/_
+    return is_digit(c) || is_alpha(c) || c == 95
+}
+
+// ---------- 行列号反推（行起点表 + 二分；码点列号）----------
+// 构建行起点表：g_line_starts[i] = 第 (i+1) 行的起点位置
+pub func build_line_starts() {
+    g_line_starts = table_new_i64()
+    table_push(g_line_starts, 0)
+    var i: i64 = 0
+    while i < g_n {
+        if g_codes[i] == 10 {
+            table_push(g_line_starts, i + 1)
+        }
+        i = i + 1
+    }
+}
+
+// 位置 → 行号（1 起）：二分找最后一个 <= pos 的行起点，其下标 + 1
+pub func line_of(pos: i64) -> i64 {
+    var lo: i64 = 0
+    var hi: i64 = len(g_line_starts) - 1
+    var ans: i64 = 0
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if g_line_starts[mid] <= pos {
+            ans = mid
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return ans + 1
+}
+
+// 位置 → 列号（1 起）：pos - 该行起点 + 1（码点计数，非字节）
+pub func col_of(pos: i64) -> i64 {
+    var l = line_of(pos)
+    return pos - g_line_starts[l - 1] + 1
+}
+
+// ---------- ASI 判定 ----------
+// 是否二元运算符（区间 [lex_plus..lex_question] 内除 Bang/Inc/Dec 外全部是，
+// 与 Rust is_bin_op 对齐；++/-- 特意不算——后缀 i++\n 应补分号）
+func is_bin_op(tag: i64) -> bool {
+    return tag >= lex_plus && tag <= lex_question &&
+        tag != lex_bang && tag != lex_inc && tag != lex_dec
+}
+
+// 是否「行尾不可结束语句」集合（Rust finish_line 排除表；RBracket 不在其中）
+func no_semi_end(tag: i64) -> bool {
+    var bad: table<i64> = [lex_comma, lex_colon, lex_dcolon, lex_dot, lex_dotdot,
+        lex_lparen, lex_lbracket, lex_lbrace, lex_rbrace, lex_semi, lex_else, lex_in]
+    var i: i64 = 0
+    while i < len(bad) {
+        if bad[i] == tag {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 是否声明起始 token（doc 附着点；pub 只是修饰符，不算声明起始）
+func is_decl_start(tag: i64) -> bool {
+    if tag == lex_func || tag == lex_var || tag == lex_const || tag == lex_extern {
+        return true
+    }
+    if tag == lex_struct || tag == lex_namespace || tag == lex_import || tag == lex_using {
+        return true
+    }
+    return false
+}
+
+// ---------- 列式 token 表：重置 / 写入 / 读取 ----------
+// 重置列式 token 表与 doc 表（每次 run_lex 调用前）
+pub func reset_tokens() {
+    tok_tags = table_new_i64()
+    tok_lines = table_new_i64()
+    tok_cols = table_new_i64()
+    tok_lexemes = table_new_i64()
+    doc_keys = table_new_i64()
+    doc_vals = table_new_i64()
+    g_doc_pending = ""
+}
+
+// 在位置 pos 写入 token 四列并更新 ASI；声明起始 token 且有 pending doc 先 flush
+pub func push_token_at(tag: i64, pos: i64, lid: i64) {
+    if is_decl_start(tag) {
+        flush_doc()
+    }
+    var l = line_of(pos)
+    table_push(tok_tags, tag)
+    table_push(tok_lines, l)
+    table_push(tok_cols, pos - g_line_starts[l - 1] + 1)
+    table_push(tok_lexemes, lid)
+    g_line_has_token = true
+    // 括号深度只统计 ( 与 [（{ } 是块边界，不参与换行补分号判定）
+    if tag == lex_lparen || tag == lex_lbracket {
+        g_paren_depth = g_paren_depth + 1
+    } else if tag == lex_rparen || tag == lex_rbracket {
+        if g_paren_depth > 0 {
+            g_paren_depth = g_paren_depth - 1
+        }
+    }
+    g_last_line_tag = tag
+}
+
+// 列式表读取（token_count 含 Eof；lexeme 还原串 / 原始池 id）
+pub func token_count() -> i64 {
+    return len(tok_tags)
+}
+pub func token_tag(i: i64) -> i64 {
+    return tok_tags[i]
+}
+pub func token_line(i: i64) -> i64 {
+    return tok_lines[i]
+}
+pub func token_col(i: i64) -> i64 {
+    return tok_cols[i]
+}
+pub func token_lexeme_id(i: i64) -> i64 {
+    return tok_lexemes[i]
+}
+pub func token_lexeme(i: i64) -> string {
+    return interner.lookup(tok_lexemes[i])
+}
+
+// ---------- doc 注释收集 ----------
+// 收集一条 doc：strip 一前导空格 + trim 尾空白；空串不收集；连续 doc 用 \n 拼接
+pub func collect_doc(txt: string) {
+    var t = txt
+    var n = str_len(t)
+    if n > 0 {
+        if str_char(t, 0) == " " {
+            t = str.slice(t, 1, n)
+        }
+    }
+    t = str.trim_end(t)
+    if str_len(t) == 0 {
+        return
+    }
+    if str_len(g_doc_pending) > 0 {
+        g_doc_pending = g_doc_pending + "\n" + t
+    } else {
+        g_doc_pending = t
+    }
+}
+
+// 把 pending doc 附着到当前声明（ordinal = len(doc_keys)，push 即排序对）
+func flush_doc() {
+    if str_len(g_doc_pending) == 0 {
+        return
+    }
+    var ord = len(doc_keys)
+    table_push(doc_keys, ord)
+    table_push(doc_vals, interner.intern(g_doc_pending))
+    g_doc_pending = ""
+}
+
+// doc 清单输出：共 N 条 + 逐条 doc[ordinal] = 文本（--dump-docs 调试标志）
+pub func dump_docs() -> string {
+    var out: string = "共 " + to_string(len(doc_keys)) + " 条 doc:\n"
+    var i: i64 = 0
+    while i < len(doc_keys) {
+        out = out + "  doc[" + to_string(doc_keys[i]) + "] = '" +
+            interner.name_str(doc_vals[i]) + "'\n"
+        i = i + 1
+    }
+    return out
+}
+
+// ---------- ASI 换行处理 ----------
+// 换行时按 ASI 规则决定是否补分号（Rust finish_line 语义）；pos 为下一行行首，
+// 补出的分号 span 取该位置。
+pub func finish_line(pos: i64) {
+    var should = false
+    if g_line_has_token {
+        if g_paren_depth == 0 {
+            if g_last_line_tag >= 0 {
+                if !is_bin_op(g_last_line_tag) {
+                    if !no_semi_end(g_last_line_tag) {
+                        should = true
+                    }
+                }
+            }
+        }
+    }
+    if should {
+        var lid = interner.intern(";")
+        push_token_at(lex_semi, pos, lid)
+    }
+    g_line_has_token = false
+    g_last_line_tag = -1
+}
+
+}

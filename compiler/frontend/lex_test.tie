@@ -1,0 +1,213 @@
+// tie:logic
+// compiler/frontend/lex_test.tie —— T2.4 完整词法器验收程序
+// ============================================================
+// 作用：
+//   1) 无参数运行：内置样例 + examples/ + std/ + tests/language/ 下 16 个
+//      文件做 tokenize，断言 token 总数与 Rust tie-frontend --tokens 一致
+//      （期望值由 Rust 版实测硬编码，验收即回归基准）；抽样断言 tag/位置/
+//      lexeme 正确；词法错误 golden 与 Rust 逐字对照（9 例 7 类错误，期望
+//      值经 target\release\tie-frontend.exe --check 实测）；doc 注释保留
+//      样例 dump_docs 附随验证。
+//   2) 带文件参数运行：lex_test.exe <file> 打印该文件 token 总数（首行与
+//      Rust 同格式「共 N 个 token（含 Eof）:」）与逐 token 可读流，供
+//      compare_tokens.ps1 逐文件比对（proto 同款模式）。
+// 编译运行：target\release\tie-llvm.exe compiler\frontend\lex_test.tie
+//           运行：compiler\frontend\lex_test.exe （从仓库根目录）
+// 全部断言通过输出「lexer 自检通过」exit 0。
+import "./lexer.tie"
+
+// ---------- 断言辅助 ----------
+// 失败打印具体项并累积，main 全过才 exit 0（driver.tie 同款模式）
+func check(ok: bool, what: string) -> bool {
+    if !ok {
+        println("自检失败: " + what)
+    }
+    return ok
+}
+
+// 字符串断言：失败打印期望/实际（错误消息对照用）
+func check_str(got: string, want: string, what: string) -> bool {
+    if got != want {
+        println("自检失败: " + what)
+        println("  期望: [" + want + "]")
+        println("  实际: [" + got + "]")
+        return false
+    }
+    return true
+}
+
+// 错误槽位 → Rust 显示格式「词法错误 @行:列: 消息」（负例 golden 对照）
+func fmt_lex_err() -> string {
+    return "词法错误 @" + to_string(lexer.lex_err_line()) + ":" +
+        to_string(lexer.lex_err_col()) + ": " + lexer.lex_err_msg()
+}
+
+// ---------- 内置样例的期望 token 数（含 Eof，Rust 实测）----------
+// 1) ASI 基础：语句行行尾补分号（var x = 42; var y = 8; = 10 token + Eof）
+var SRC1: string = "var x = 42\nvar y = 8\n"
+// 2) 行尾运算符不补分号（续行 a + / b）
+var SRC2: string = "a +\nb\n"
+// 3) 括号内换行不补分号 + 右括号行尾补
+var SRC3: string = "f(1,\n2)\n"
+// 4) 注释不产生 token（行注释/跨行块注释）
+var SRC4: string = "var x = 1 // 注释\n/* 块\n注释 */ y\n"
+// 5) 字符串转义 + 字符字面量 + 多进制数字 + 范围运算符
+var SRC5: string = "s = \"a\\nb\\tc\"\nc = '\\n'\nn = 0xFF\nr = 1..10\n"
+// 6) 关键字/类型关键字/整词边界（zero 保留字，tritx/i32x 是 Ident）
+var SRC6: string = "func f(x: i64) { return x }\nzero tritx i32x\n"
+
+// ---------- 词法错误负例（期望值 = Rust tie-frontend --check 实测逐字）----------
+// 7 类错误各一例 + 多行行号/码点列号边界
+var NEG_STR: string = "var s = \"abc";            // 无尾换行 → 字符串未闭合
+var NEG_CHAR: string = "var c = 'a";              // 无尾换行 → 字符字面量未闭合
+var NEG_MULTI: string = "var c = 'ab'";           // 多字符 → 只能包含一个字符
+var NEG_ESC: string = "var s = \"\\q\"";          // 未知转义 → 未知转义序列 \q
+var NEG_COMMENT: string = "var x = 1 /* oops";    // 块注释未闭合
+var NEG_CHAR2: string = "var x = 1 @";            // 无法识别的字符 '@'
+var NEG_LINE: string = "var a = 1\nvar b = \"oops"; // 第 2 行字符串未闭合
+var NEG_ESCMISS: string = "var s = \"\\";          // 反斜杠后 EOF → 转义符后缺少字符
+var NEG_CP: string = "var 你好x = 1 @\n";          // 码点列号：@ 在 col 13（非字节 15）
+
+// ---------- doc 注释保留样例（全局初始化须为字面量，故在 main 内拼接）----------
+var DOCSRC_P1: string = "/// 计算 a+b\n/// 并输出结果\nfunc add(a: i64, b: i64) -> i64 {\n"
+var DOCSRC_P2: string = "    return a + b\n}\n"
+var DOCSRC_P3: string = "/** 点结构\n * 坐标 */\nstruct Point {\n}\n"
+var DOCSRC_P4: string = "// 普通注释不算 doc\nvar counter: i64 = 0\n"
+
+func main() {
+    var ok: bool = true
+
+    // ---------- 内置样例：token 总数断言（期望值 = Rust 实测）----------
+    lexer.tokenize(SRC1)
+    ok = check(lexer.token_count() == 11, "SRC1 token 数") && ok
+    lexer.tokenize(SRC2)
+    ok = check(lexer.token_count() == 5, "SRC2 token 数") && ok
+    lexer.tokenize(SRC3)
+    ok = check(lexer.token_count() == 8, "SRC3 token 数") && ok
+    lexer.tokenize(SRC4)
+    ok = check(lexer.token_count() == 8, "SRC4 token 数") && ok
+    lexer.tokenize(SRC5)
+    ok = check(lexer.token_count() == 19, "SRC5 token 数") && ok
+    lexer.tokenize(SRC6)
+    ok = check(lexer.token_count() == 16, "SRC6 token 数") && ok
+
+    // ---------- 抽样 token 正确性（tag/位置/lexeme 逐个断言）----------
+    // SRC1：var x = 42 ; var y = 8 ; Eof（ASI 分号在下一行行首）
+    lexer.tokenize(SRC1)
+    ok = check(lexer.token_tag(0) == 6, "SRC1 tag var") && ok
+    ok = check_str(lexer.token_lexeme(0), "var", "SRC1 lexeme var") && ok
+    ok = check(lexer.token_tag(3) == 0, "SRC1 tag Int") && ok
+    ok = check(lexer.token_tag(4) == 42, "SRC1 ASI 分号 tag") && ok
+    ok = check(lexer.token_line(4) == 2, "SRC1 分号行") && ok
+    ok = check(lexer.token_col(4) == 1, "SRC1 分号列") && ok
+    // SRC2：行尾 + 是二元运算符 → 不补分号，b 紧随其后
+    lexer.tokenize(SRC2)
+    ok = check(lexer.token_tag(1) == 46, "SRC2 行尾加号") && ok
+    ok = check(lexer.token_tag(2) == 4, "SRC2 续行标识符") && ok
+    // SRC3：括号内换行不补分号，右括号行尾补
+    lexer.tokenize(SRC3)
+    ok = check(lexer.token_tag(6) == 42, "SRC3 右括号后分号") && ok
+    // SRC4：行注释后行尾补分号；块注释无 token
+    lexer.tokenize(SRC4)
+    ok = check(lexer.token_tag(4) == 42, "SRC4 行注释后分号") && ok
+    ok = check_str(lexer.token_lexeme(5), "y", "SRC4 块注释后标识符") && ok
+    // SRC5：字符串 lexeme 为原始切片（含引号与转义原样）；'0xFF' 单 token；1..10 拆三段
+    lexer.tokenize(SRC5)
+    ok = check_str(lexer.token_lexeme(2), "\"a\\nb\\tc\"", "SRC5 字符串原始切片") && ok
+    ok = check(lexer.token_tag(6) == 3, "SRC5 字符字面量") && ok
+    ok = check(lexer.token_tag(10) == 0, "SRC5 十六进制 Int") && ok
+    ok = check(lexer.token_tag(15) == 44, "SRC5 范围运算符 DotDot") && ok
+    // SRC6：关键字整词匹配（zero→30；tritx/i32x→Ident(4)）
+    lexer.tokenize(SRC6)
+    ok = check(lexer.token_tag(8) == 13, "SRC6 return") && ok
+    ok = check(lexer.token_tag(11) == 30, "SRC6 zero 保留字") && ok
+    ok = check(lexer.token_tag(12) == 4, "SRC6 tritx 标识符") && ok
+    ok = check(lexer.token_tag(13) == 4, "SRC6 i32x 标识符") && ok
+
+    // ---------- 词法错误 golden（与 Rust tie-frontend --check 逐字对照）----------
+    // 每例：run_lex 应失败 + fmt_lex_err() 应与 Rust 实测输出一致
+    var okn = lexer.run_lex(NEG_STR)
+    ok = check(!okn, "负例 字符串未闭合 应报错") && ok
+    ok = check_str(fmt_lex_err(), "词法错误 @1:9: 字符串未闭合", "负例 字符串未闭合") && ok
+    okn = lexer.run_lex(NEG_CHAR)
+    ok = check(!okn, "负例 字符未闭合 应报错") && ok
+    ok = check_str(fmt_lex_err(), "词法错误 @1:9: 字符字面量未闭合", "负例 字符未闭合") && ok
+    okn = lexer.run_lex(NEG_MULTI)
+    ok = check(!okn, "负例 多字符 应报错") && ok
+    ok = check_str(fmt_lex_err(), "词法错误 @1:9: 字符字面量只能包含一个字符", "负例 多字符") && ok
+    okn = lexer.run_lex(NEG_ESC)
+    ok = check(!okn, "负例 未知转义 应报错") && ok
+    ok = check_str(fmt_lex_err(), "词法错误 @1:9: 未知转义序列 \\q", "负例 未知转义") && ok
+    okn = lexer.run_lex(NEG_COMMENT)
+    ok = check(!okn, "负例 块注释未闭合 应报错") && ok
+    ok = check_str(fmt_lex_err(), "词法错误 @1:11: 块注释未闭合", "负例 块注释未闭合") && ok
+    okn = lexer.run_lex(NEG_CHAR2)
+    ok = check(!okn, "负例 无法识别字符 应报错") && ok
+    ok = check_str(fmt_lex_err(), "词法错误 @1:11: 无法识别的字符 '@'", "负例 无法识别字符") && ok
+    okn = lexer.run_lex(NEG_LINE)
+    ok = check(!okn, "负例 多行未闭合 应报错") && ok
+    ok = check_str(fmt_lex_err(), "词法错误 @2:9: 字符串未闭合", "负例 多行行号") && ok
+    okn = lexer.run_lex(NEG_ESCMISS)
+    ok = check(!okn, "负例 转义符后缺少字符 应报错") && ok
+    ok = check_str(fmt_lex_err(), "词法错误 @1:9: 转义符后缺少字符", "负例 转义符后缺少字符") && ok
+    okn = lexer.run_lex(NEG_CP)
+    ok = check(!okn, "负例 码点列号 应报错") && ok
+    ok = check_str(fmt_lex_err(), "词法错误 @1:13: 无法识别的字符 '@'", "负例 码点列号") && ok
+
+    // ---------- doc 注释保留（dump_docs 附随验证）----------
+    // DOCSRC：两段 doc（/// 连续拼接 + /** */ 块）附着到 func add / struct Point；
+    // 普通 // 注释不产生 doc；var counter 无 doc 不附着
+    var DOCSRC: string = DOCSRC_P1 + DOCSRC_P2 + DOCSRC_P3 + DOCSRC_P4
+    var dok = lexer.run_lex(DOCSRC)
+    ok = check(dok, "doc 样例应无词法错误") && ok
+    var dump = lexer.dump_docs()
+    ok = check(str.contains(dump, "共 2 条 doc:"), "doc 条数 = 2") && ok
+    ok = check(str.contains(dump, "计算 a+b\n并输出结果"), "doc[0] 连续 doc 拼接") && ok
+    ok = check(str.contains(dump, "点结构\n * 坐标"), "doc[1] 块注释 doc") && ok
+    ok = check(!str.contains(dump, "普通注释"), "普通 // 注释不收集") && ok
+
+    // ---------- 文件级 token 计数对比（期望值 = Rust tie-frontend --tokens 实测）----------
+    // 文件级走 run_lex（无协议序列化开销）——列式表即 parser 消费形态
+    var files: table<string> = ["examples/hello.tie", "examples/table.tie",
+        "examples/switch.tie", "examples/oop.tie", "examples/wide.tie",
+        "examples/char.tie", "examples/m4_ops.tie", "std/string.tie",
+        "std/assert.tie", "std/csv.tie", "std/sort.tie", "std/math.tie",
+        "std/intern.tie", "tests/language/byref_table.tie",
+        "tests/language/global_table.tie", "tests/language/intern.tie"]
+    var expect: table<i64> = [87, 49, 173, 363, 92, 38, 275, 1507, 192,
+        206, 1326, 593, 357, 139, 78, 305]
+    var n: i64 = len(files)
+    var i: i64 = 0
+    while i < n {
+        var src = file_read(files[i])
+        var fok = lexer.run_lex(src)
+        ok = check(fok, "[" + files[i] + "] 无词法错误") && ok
+        var got = lexer.token_count()
+        if got != expect[i] {
+            println("[" + files[i] + "] 期望 " + to_string(expect[i]) + " 实际 " + to_string(got))
+            ok = false
+        }
+        i = i + 1
+    }
+
+    if !ok {
+        exit(1)
+    }
+
+    // ---------- 带文件参数：打印单文件 token 流（与 Rust --tokens 同格式）----------
+    if arg_count() > 0 {
+        var path = arg_string(0)
+        var file_src = file_read(path)
+        lexer.run_lex(file_src)
+        println("共 " + to_string(lexer.token_count()) + " 个 token（含 Eof）:")
+        var k: i64 = 0
+        while k < lexer.token_count() {
+            println("  " + to_string(lexer.token_line(k)) + ":" + to_string(lexer.token_col(k))
+                + "  tag=" + to_string(lexer.token_tag(k)) + " '" + lexer.token_lexeme(k) + "'")
+            k = k + 1
+        }
+        return
+    }
+
+    println("lexer 自检通过")
+}
