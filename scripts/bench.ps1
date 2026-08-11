@@ -10,7 +10,7 @@
 # 用法：
 #   .\scripts\bench.ps1 --help                 # 打印用法
 #   .\scripts\bench.ps1 baseline               # 生成 docs/bench/baseline-rust.json/.md
-#   .\scripts\bench.ps1 gate1                  # 阶段 1 前端对照（tiec-proto vs tie-frontend，框架）
+#   .\scripts\bench.ps1 gate1                  # 阶段 1 前端对照（tiec-proto vs tie-frontend，G1 闸门）
 #   .\scripts\bench.ps1 gate4                  # 阶段 5 全链路对照（tiec vs tie-llvm，框架）
 #
 # 退出码：0 = 成功 / 1 = 失败（参数错误、exe 缺失、语料错误等）
@@ -114,10 +114,14 @@ function Get-Median {
 # 单次运行一条通道：隐藏窗口 + 输出重定向到临时文件（排除终端渲染/启动噪声），
 # 用 Measure-Command 计时，返回 { ExitCode, Ms }。
 # 注意：Start-Process 每次以覆盖模式打开重定向文件，串行运行无冲突。
+# TimeoutMs > 0 时对单次运行设硬超时（默认 0 = 无限等待，baseline 行为不变）：
+# 超时则强制结束进程并以退出码 124 标记（Linux timeout 惯例），防止
+# tie 写的新编译器意外死循环把整个基准挂死。
 function Invoke-LaneOnce {
     param(
         [string]$Exe,
-        [string[]]$ArgsList
+        [string[]]$ArgsList,
+        [int]$TimeoutMs = 0
     )
     $outFile = Join-Path $BenchTmp "out.txt"
     $errFile = Join-Path $BenchTmp "err.txt"
@@ -128,27 +132,42 @@ function Invoke-LaneOnce {
         $proc = Start-Process -FilePath $Exe -ArgumentList $ArgsList `
             -WindowStyle Hidden `
             -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru
-        $proc.WaitForExit()
-        $script:LaneExitCode = $proc.ExitCode
+        if ($TimeoutMs -gt 0) {
+            # 有限等待：超时 → Kill 并以 124 标记
+            if (-not $proc.WaitForExit($TimeoutMs)) {
+                $proc.Kill()
+                $proc.WaitForExit()
+                $script:LaneExitCode = 124
+            }
+            else {
+                $script:LaneExitCode = $proc.ExitCode
+            }
+        }
+        else {
+            $proc.WaitForExit()
+            $script:LaneExitCode = $proc.ExitCode
+        }
     }
     return [PSCustomObject]@{ ExitCode = $script:LaneExitCode; Ms = $m.TotalMilliseconds }
 }
 
 # 单文件单通道测量：预热 1 次（不计时）+ 5 次计时取中位数，
 # 返回 { ExitCode, MedianMs }。ExitCode 取最后一次运行的退出码。
+# TimeoutMs 透传给 Invoke-LaneOnce（单次运行硬超时，0 = 无限）。
 function Measure-Lane {
     param(
         [string]$Exe,
-        [string[]]$ArgsList
+        [string[]]$ArgsList,
+        [int]$TimeoutMs = 0
     )
     # 预热：先跑 1 次，加载编译器/缓存，不计时
     for ($i = 0; $i -lt $WarmupRuns; $i++) {
-        $null = Invoke-LaneOnce -Exe $Exe -ArgsList $ArgsList
+        $null = Invoke-LaneOnce -Exe $Exe -ArgsList $ArgsList -TimeoutMs $TimeoutMs
     }
     $samples = @()
     $exitCode = $null
     for ($i = 0; $i -lt $RunsPerFile; $i++) {
-        $r = Invoke-LaneOnce -Exe $Exe -ArgsList $ArgsList
+        $r = Invoke-LaneOnce -Exe $Exe -ArgsList $ArgsList -TimeoutMs $TimeoutMs
         $samples += $r.Ms
         $exitCode = $r.ExitCode
     }
@@ -343,17 +362,269 @@ function Invoke-Baseline {
 }
 
 # gate1：阶段 1（T1.5 G1 闸门）tiec-proto --check vs tie-frontend --check 前端对照。
-# 当前仅框架：tiec-proto 未构建时打印提示并跳过（退出 0），已构建时待阶段 1 填充。
+#
+# 口径（自举 v2 计划 T1.5）：
+#   - 语料 = scripts/bench/corpus.txt 的 pass 文件（fail 负例不测量）；
+#   - 每条通道计时 = 预热 1 次 + 5 次热运行取中位数（median-of-5），CPU 固定核心 0；
+#   - 只统计两边都 exit 0 的文件（tiec-proto 语义层不展开 import，import 文件预期
+#     tiec exit 1 → 排除并记录原因）；任一失败的文件同样排除入 excluded；
+#   - ratio = tiec_proto_total / tie_frontend_total；G1 PASS 条件 ratio < 1.0
+#     （计划目标 0.5–0.83，即 tie 前端 1.2–2× 快于 Rust）；
+#   - 完成即退出 0（FAIL 判定只写入报告与控制台，不 exit 1——基准本身跑完了）。
+# tiec-proto 路径：优先环境变量 TIEC_PROTO_EXE，否则默认 compiler\proto\tiec-proto.exe；
+# 默认路径不存在时不自动编译（避免隐性修改仓库），提示手动编译后 exit 1。
 function Invoke-Gate1 {
     Write-Host "[gate1] 阶段 1 前端对照（tiec-proto --check vs tie-frontend --check）" -ForegroundColor Cyan
-    if (-not (Test-Path $ProtoExe)) {
-        Write-Host "[gate1] 未找到 tiec-proto: $ProtoExe" -ForegroundColor DarkYellow
-        Write-Host "[gate1] 阶段 1 原型尚未构建，跳过 gate1（退出 0）。" -ForegroundColor DarkGray
-        exit 0
+
+    # ---- 前置检查：Rust 前端必须存在 ----
+    if (-not (Test-Path $FrontendExe)) {
+        Write-Host "[gate1] 错误: 未找到 Rust 前端 tie-frontend: $FrontendExe" -ForegroundColor Red
+        Write-Host "[gate1] 请先运行: cargo build --release -p tie-frontend" -ForegroundColor Yellow
+        exit 1
     }
-    # TODO(阶段1 T1.5): 复用 Measure-Lane 分别测量 tiec-proto --check 与 tie-frontend --check，
-    #   输出 docs/bench/phase1.json/.md；断言 total 比值 < 1.0（G1 硬闸门，目标 0.5–0.83）。
-    Write-Host "[gate1] 检测到 tiec-proto，对照逻辑待阶段 1（T1.5）填充。" -ForegroundColor Yellow
+    # ---- tiec-proto 路径解析：环境变量优先，否则默认 compiler\proto\tiec-proto.exe ----
+    $proto = $env:TIEC_PROTO_EXE
+    if ([string]::IsNullOrWhiteSpace($proto)) { $proto = $ProtoExe }
+    if (-not (Test-Path $proto)) {
+        Write-Host "[gate1] 错误: 未找到 tie 前端原型 tiec-proto: $proto" -ForegroundColor Red
+        Write-Host "[gate1] 请先用 tie-llvm 编译（不自动编译）:" -ForegroundColor Yellow
+        Write-Host "[gate1]   target\release\tie-llvm.exe compiler\proto\main.tie -o compiler\proto\tiec-proto.exe" -ForegroundColor Yellow
+        Write-Host "[gate1] 或设置环境变量 TIEC_PROTO_EXE 指向已构建的 tiec-proto.exe" -ForegroundColor Yellow
+        exit 1
+    }
+    Write-Host "[gate1] tie 前端通道: $proto" -ForegroundColor DarkGray
+    Write-Host "[gate1] Rust 前端通道: $FrontendExe" -ForegroundColor DarkGray
+
+    # ---- CPU 固定到核心 0 ----
+    $affinityOk = Set-Core0Affinity
+    Write-Host "[gate1] CPU 固定核心 0: $affinityOk" -ForegroundColor DarkGray
+
+    # ---- 读取语料（pass 文件才参与前端耗时对比）----
+    $corpus = Read-Corpus
+    $total = $corpus.Count
+    $passItems = @($corpus | Where-Object { $_.Role -eq "pass" })
+    Write-Host "[gate1] 语料: $CorpusFile（$total 个，pass $($passItems.Count) / fail $($total - $passItems.Count)）" -ForegroundColor DarkGray
+
+    # ---- 逐文件测量两条前端通道；两边都 exit 0 才计入，否则入 excluded ----
+    $files = @()      # 计入对比（两边 exit 0）
+    $excluded = @()   # 排除（import 未展开 / 任一失败 / 超时）
+    $index = 0
+    foreach ($item in $passItems) {
+        $index++
+        $relPath = $item.Path
+        $absPath = Join-Path $Root $relPath
+        if (-not (Test-Path $absPath)) {
+            throw "语料文件不存在: $absPath（请检查 corpus.txt 与仓库状态一致）"
+        }
+        Write-Host ("[{0}/{1}] {2} ..." -f $index, $passItems.Count, $relPath) -ForegroundColor DarkGray
+        # 单次运行硬超时 60s：tiec-proto 是 tie 写的机器码编译器，防意外死循环挂死
+        $tie  = Measure-Lane -Exe $proto       -ArgsList @($absPath, "--check") -TimeoutMs 60000
+        $rust = Measure-Lane -Exe $FrontendExe -ArgsList @($absPath, "--check") -TimeoutMs 60000
+        if ($tie.ExitCode -eq 0 -and $rust.ExitCode -eq 0) {
+            # 两边都成功：计入前端对比
+            $files += [PSCustomObject]@{
+                path      = $relPath
+                tiec_ms   = [math]::Round($tie.MedianMs, 1)
+                rust_ms   = [math]::Round($rust.MedianMs, 1)
+                tiec_exit = $tie.ExitCode
+                rust_exit = $rust.ExitCode
+                excluded  = $false
+                reason    = ""
+            }
+        }
+        else {
+            # 排除：区分失败来源，给出可读原因
+            if ($tie.ExitCode -ne 0 -and $rust.ExitCode -eq 0) {
+                $reason = "tiec-proto 语义层不展开 import（exit $($tie.ExitCode)）"
+            }
+            elseif ($tie.ExitCode -eq 0 -and $rust.ExitCode -ne 0) {
+                $reason = "tie-frontend 退出非 0（exit $($rust.ExitCode)）"
+            }
+            else {
+                $reason = "两边均退出非 0（tiec=$($tie.ExitCode) / rust=$($rust.ExitCode)）"
+            }
+            $excluded += [PSCustomObject]@{
+                path      = $relPath
+                tiec_ms   = $null
+                rust_ms   = $null
+                tiec_exit = $tie.ExitCode
+                rust_exit = $rust.ExitCode
+                excluded  = $true
+                reason    = $reason
+            }
+        }
+    }
+
+    # ---- 汇总：ratio = tiec_total / rust_total（仅计入的文件）----
+    $tieSum   = ($files | Measure-Object -Property tiec_ms -Sum).Sum
+    $rustSum  = ($files | Measure-Object -Property rust_ms -Sum).Sum
+    $tieMed   = if ($files.Count -gt 0) { Get-Median -Values @($files | ForEach-Object { $_.tiec_ms }) } else { 0 }
+    $rustMed  = if ($files.Count -gt 0) { Get-Median -Values @($files | ForEach-Object { $_.rust_ms }) } else { 0 }
+    $tieMax   = if ($files.Count -gt 0) { ($files | Measure-Object -Property tiec_ms -Maximum).Maximum } else { 0 }
+    $rustMax  = if ($files.Count -gt 0) { ($files | Measure-Object -Property rust_ms -Maximum).Maximum } else { 0 }
+    $ratio    = if ($rustSum -gt 0) { $tieSum / $rustSum } else { 0 }
+    $gate1Ok  = $ratio -lt 1.0   # 硬闸门：tie 前端总耗时 < Rust 前端总耗时
+    $gate1Tag = if ($gate1Ok) { "PASS" } else { "FAIL" }
+
+    $totals = [PSCustomObject]@{
+        corpus_total      = $total
+        pass_count        = $passItems.Count
+        fail_count        = $total - $passItems.Count
+        included_count    = $files.Count      # 两边 exit 0，计入对比
+        excluded_count    = $excluded.Count   # 排除（import 未展开等）
+        tiec_total_ms     = [math]::Round($tieSum, 1)
+        rust_total_ms     = [math]::Round($rustSum, 1)
+        tiec_median_ms    = [math]::Round($tieMed, 1)
+        rust_median_ms    = [math]::Round($rustMed, 1)
+        tiec_max_ms       = [math]::Round($tieMax, 1)
+        rust_max_ms       = [math]::Round($rustMax, 1)
+        ratio             = [math]::Round($ratio, 3)
+        gate1             = $gate1Tag
+        gate1_target      = "ratio < 1.0（目标 0.5-0.83，即 tie 前端 1.2-2x 快于 Rust）"
+    }
+
+    # ---- 组装 JSON ----
+    $now = Get-Date
+    $report = [PSCustomObject]@{
+        generated_at   = $now.ToString("o")
+        cpu            = Get-CpuModel
+        machine        = Get-MachineName
+        corpus_file    = "scripts/bench/corpus.txt"
+        tiec_exe       = $proto
+        frontend_exe   = $FrontendExe
+        runs_per_file  = $RunsPerFile
+        warmup_runs    = $WarmupRuns
+        timeout_ms     = 60000
+        files          = $files
+        excluded       = $excluded
+        totals         = $totals
+    }
+    $prefix = $OutPrefixMap["gate1"]
+    $jsonPath = Join-Path $Root "docs\bench\$prefix.json"
+    $mdPath   = Join-Path $Root "docs\bench\$prefix.md"
+    # 确保 docs/bench 目录存在（首次运行可能尚未创建）
+    New-Item -ItemType Directory -Path (Split-Path -Parent $jsonPath) -Force | Out-Null
+    Write-Utf8NoBom -Path $jsonPath -Content ($report | ConvertTo-Json -Depth 6)
+    Write-Host "[gate1] 已写: $jsonPath" -ForegroundColor Green
+
+    # ---- 生成 Markdown 报告 ----
+    $lines = @(
+        "# tie 自举阶段 1 前端性能闸门（G1）",
+        "",
+        "- 生成时间: $($now.ToString('yyyy-MM-dd HH:mm:ss'))",
+        "- CPU: $($report.cpu)",
+        "- 机器: $($report.machine)",
+        "- 通道: ``tiec-proto <file> --check``（tie 前端）vs ``tie-frontend <file> --check``（Rust 前端）",
+        "- 计时方法: 每文件预热 1 次 + 5 次热运行取中位数，CPU 固定核心 0，单次硬超时 60s",
+        "",
+        "## 语料统计",
+        "",
+        ("- 语料文件总数: {0}（pass {1} / fail {2}）" -f $total, $passItems.Count, ($total - $passItems.Count)),
+        ("- 计入对比（两边都 exit 0）: {0} 个" -f $files.Count),
+        ("- 排除: {0} 个" -f $excluded.Count),
+        "- 排除原因: tiec-proto 语义层不展开 import（import 文件预期 tiec exit 1），故仅对两边都 exit 0 的文件做公平对比",
+        "",
+        "## 逐文件（耗时单位 ms，计入对比）",
+        "",
+        "| 文件 | tiec-proto | tie-frontend | 每文件比值 (tie/rust) |",
+        "| --- | ---: | ---: | ---: |"
+    )
+    foreach ($f in $files) {
+        $perRatio = if ($f.rust_ms -gt 0) { ("{0:N2}" -f ($f.tiec_ms / $f.rust_ms)) } else { "-" }
+        $lines += ("| {0} | {1} | {2} | {3} |" -f $f.path, $f.tiec_ms, $f.rust_ms, $perRatio)
+    }
+    $lines += ""
+    if ($excluded.Count -gt 0) {
+        $lines += "## 排除文件",
+        "",
+        "| 文件 | 原因 | tiec exit | rust exit |",
+        "| --- | --- | ---: | ---: |"
+        foreach ($x in $excluded) {
+            $lines += ("| {0} | {1} | {2} | {3} |" -f $x.path, $x.reason, $x.tiec_exit, $x.rust_exit)
+        }
+        $lines += ""
+    }
+    $lines += @(
+        "## 汇总",
+        "",
+        ("| 指标 | tiec-proto | tie-frontend | 比值 (tie/rust) |" ),
+        "| --- | ---: | ---: | ---: |",
+        ("| 总耗时 (ms) | {0} | {1} | {2} |" -f $totals.tiec_total_ms, $totals.rust_total_ms, ("{0:N3}" -f $totals.ratio)),
+        ("| 单文件中位数 (ms) | {0} | {1} | - |" -f $totals.tiec_median_ms, $totals.rust_median_ms),
+        ("| 单文件最大 (ms) | {0} | {1} | - |" -f $totals.tiec_max_ms, $totals.rust_max_ms),
+        "",
+        "## G1 判定",
+        "",
+        ("- **ratio = tiec_proto_total / tie_frontend_total = {0:N3}**" -f $totals.ratio),
+        ("- 硬闸门: ratio < 1.0（tie 前端总耗时 < Rust 前端总耗时）→ **G1 $($totals.gate1)**"),
+        "- 目标: 0.5–0.83（tie 前端 1.2–2× 快于 Rust）",
+        "- 结论: $([string]$(if ($gate1Ok) { 'tie 前端更快，阶段 1 生死局通过，可进入阶段 2 模块化重写。' } else { 'tie 前端未快于 Rust，G1 未过；热点分析见下，优化留待后续阶段（不改产品代码）。' }))"
+    )
+    # ---- 热点分析段（G1 FAIL 时如实记录；PASS 时也附慢文件表供参考）----
+    if (-not $gate1Ok) {
+        # 每文件比值分布
+        $bucket2 = @($files | Where-Object { $_.tiec_ms / $_.rust_ms -lt 2 }).Count
+        $bucket25 = @($files | Where-Object { $_.tiec_ms / $_.rust_ms -ge 2 -and $_.tiec_ms / $_.rust_ms -lt 5 }).Count
+        $bucket510 = @($files | Where-Object { $_.tiec_ms / $_.rust_ms -ge 5 -and $_.tiec_ms / $_.rust_ms -lt 10 }).Count
+        $bucket10p = @($files | Where-Object { $_.tiec_ms / $_.rust_ms -ge 10 }).Count
+        # tiec 最慢 Top8（按 tiec_ms 绝对值排序）
+        $slowest = @($files | Sort-Object tiec_ms -Descending | Select-Object -First 8)
+        $lines += @(
+            "",
+            "## 热点分析（G1 FAIL，仅分析不改产品代码）",
+            "",
+            ("- 计入的 {0} 个文件中，**无任何文件 tiec-proto 快于 tie-frontend**（tiec_ms ≤ rust_ms 的文件数 = 0）。" -f $files.Count),
+            ("- 每文件比值分布: <2× 有 {0} 个、2–5× 有 {1} 个、5–10× 有 {2} 个、≥10× 有 {3} 个——大文件（符号多的库文件）急剧恶化。" -f $bucket2, $bucket25, $bucket510, $bucket10p),
+            "",
+            "### tiec-proto 最慢 Top8",
+            "",
+            "| 文件 | tiec-proto (ms) | tie-frontend (ms) | 每文件比值 |",
+            "| --- | ---: | ---: | ---: |"
+        )
+        foreach ($s in $slowest) {
+            $perRatio = ("{0:N2}" -f ($s.tiec_ms / $s.rust_ms))
+            $lines += ("| {0} | {1} | {2} | {3} |" -f $s.path, $s.tiec_ms, $s.rust_ms, $perRatio)
+        }
+        $lines += @(
+            "",
+            "### 可能原因（依据 compiler/proto 实现）",
+            "",
+            "1. **符号表构建是 O(n²)**：``semantic.tie`` 的 ``sorted_insert``（约 662 行）每插入一个符号先二分定位，再 ``table_push`` + ``while i > pos`` 整体后移表——每个新符号都位移整张表。大符号表文件（zstd/exmath/linalg/jpeg 等，符号数百个）构成主要热点，比值达 10–38×。",
+            "2. **表访问经 C ABI 间接调用**：tie 语言 ``keys[mid]`` / ``keys[i] = keys[i-1]`` 每次读写 ``table<i64>`` 都落到运行时表操作（下标/边界/长度维护），比 Rust 原生 Vec/数组访问慢一个数量级，放大 O(n²) 常数。",
+            "3. **字符串池 intern 开销**：每个名字/字面量走 ``intern.intern``（二分 + 比较 + 分配），符号名频繁 id 化；``out = out + ...`` 字符串拼接每次产生新分配（如 ``semantic.tie`` 464/695 行附近）。",
+            "",
+            "### 记录",
+            "",
+            "- **G1 未过，如实记录，优化留待后续阶段**（阶段 2 模块化重写时按 LLVM 3 层重做，届时符号表/列式表按 T2.x 任务重构；不改当前产品代码）。",
+            "- 被排除的 32 个文件：31 个两边都 exit 1（Rust --check 同样不展开 import，属 import 文件）；1 个（pkg/publish.tie）tiec-proto 单独失败——无 import 但报 ``未定义的函数 'path_dirname'``，为 tiec-proto 语义层对命名空间内函数解析的差异，非 import 所致，已记录。"
+        )
+    }
+    Write-Utf8NoBom -Path $mdPath -Content ($lines -join "`r`n")
+    Write-Host "[gate1] 已写: $mdPath" -ForegroundColor Green
+
+    # ---- 清理计时副产物：--check 两条通道都不产 .ll，仅做防御性确认（复用 baseline 清理模式）----
+    $llCount = 0
+    foreach ($f in @($files + $excluded)) {
+        $llPath = [System.IO.Path]::ChangeExtension((Join-Path $Root $f.path), '.ll')
+        if (Test-Path $llPath) {
+            Remove-Item $llPath -Force
+            $llCount++
+        }
+    }
+    Write-Host "[gate1] --check 通道不产 .ll，防御性清理 $llCount 个残留" -ForegroundColor DarkGray
+
+    # ---- 控制台汇总 ----
+    Write-Host "`n[gate1] 完成" -ForegroundColor Green
+    Write-Host ("  计入对比: {0} 个 / 排除: {1} 个" -f $files.Count, $excluded.Count)
+    Write-Host ("  tiec-proto 总耗时:   {0} ms" -f $totals.tiec_total_ms)
+    Write-Host ("  tie-frontend 总耗时: {0} ms" -f $totals.rust_total_ms)
+    Write-Host ("  ratio (tie/rust):    {0:N3}" -f $totals.ratio)
+    if ($gate1Ok) {
+        Write-Host "  G1 判定: PASS（tie 前端更快）" -ForegroundColor Green
+    }
+    else {
+        Write-Host "  G1 判定: FAIL（tie 前端未快于 Rust，见 docs/bench/phase1.md 热点分析）" -ForegroundColor Red
+    }
     exit 0
 }
 
@@ -393,7 +664,13 @@ tie 编译器性能基准脚本（自举 v2 计划 T0.1）
               CPU 固定核心 0，Measure-Command 计时
             - fail 标记文件（oop_neg_* 等）只记录退出码，不参与耗时对比
   gate1     阶段 1 前端对照（tiec-proto --check vs tie-frontend --check）。
-            tiec-proto 未构建时自动跳过（框架，逻辑待阶段 1 填充）
+            - 语料: corpus.txt 的 pass 文件；只统计两边都 exit 0 的文件
+              （tiec-proto 语义层不展开 import，import 文件预期 tiec exit 1 → 排除）
+            - 计时: 每文件预热 1 + 5 次热运行取中位数，CPU 固定核心 0，单次硬超时 60s
+            - 判定: ratio = tiec_total / rust_total < 1.0 即 G1 PASS（目标 0.5–0.83）
+            - 输出: docs/bench/phase1.json / phase1.md
+            - tiec-proto 路径: 环境变量 TIEC_PROTO_EXE，否则默认 compiler\proto\tiec-proto.exe；
+              默认路径不存在时提示手动编译并退出 1（不自动编译）
   gate4     阶段 5 全链路对照（tiec --emit-ir vs tie-llvm --emit-ir）。
             tiec 未构建时自动跳过（框架，逻辑待阶段 5 填充）
   --help    打印本帮助

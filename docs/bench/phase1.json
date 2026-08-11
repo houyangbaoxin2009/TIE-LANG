@@ -1,0 +1,877 @@
+{
+  "generated_at": "2026-08-11T11:21:37.8099889+08:00",
+  "cpu": "12th Gen Intel(R) Core(TM) i5-12490F",
+  "machine": "JIRO-MAIN",
+  "corpus_file": "scripts/bench/corpus.txt",
+  "tiec_exe": "C:\\Users\\Jiro\\AppData\\Local\\Temp\\opencode\\tiec-proto.exe",
+  "frontend_exe": "F:\\Projects\\tie\\target\\release\\tie-frontend.exe",
+  "runs_per_file": 5,
+  "warmup_runs": 1,
+  "timeout_ms": 60000,
+  "files": [
+    {
+      "path": "examples/args_demo.tie",
+      "tiec_ms": 67.7,
+      "rust_ms": 56.3,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/assign.tie",
+      "tiec_ms": 65.3,
+      "rust_ms": 60.9,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/byte_demo.tie",
+      "tiec_ms": 249.6,
+      "rust_ms": 55.1,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/char.tie",
+      "tiec_ms": 63.0,
+      "rust_ms": 51.5,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/demo_pkg/.tie/deps/lib_colors/lib_colors.tie",
+      "tiec_ms": 57.4,
+      "rust_ms": 55.8,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/demo_pkg/main.tie",
+      "tiec_ms": 63.7,
+      "rust_ms": 49.4,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/hello.tie",
+      "tiec_ms": 56.0,
+      "rust_ms": 47.5,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/index_assign_demo.tie",
+      "tiec_ms": 91.2,
+      "rust_ms": 47.9,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/lib_colors/lib_colors.tie",
+      "tiec_ms": 55.2,
+      "rust_ms": 46.9,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/lib_math.tie",
+      "tiec_ms": 58.0,
+      "rust_ms": 47.8,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/lib_ns_tools.tie",
+      "tiec_ms": 53.0,
+      "rust_ms": 46.7,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/lib_util.tie",
+      "tiec_ms": 52.1,
+      "rust_ms": 46.1,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/list_dir_demo.tie",
+      "tiec_ms": 55.5,
+      "rust_ms": 47.9,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/loop_control_demo.tie",
+      "tiec_ms": 69.2,
+      "rust_ms": 45.1,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/m4_ops.tie",
+      "tiec_ms": 68.0,
+      "rust_ms": 45.7,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/namespace_demo.tie",
+      "tiec_ms": 55.4,
+      "rust_ms": 47.8,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/oop.tie",
+      "tiec_ms": 77.4,
+      "rust_ms": 48.8,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/regex_demo.tie",
+      "tiec_ms": 70.0,
+      "rust_ms": 47.4,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/script_demo.tie",
+      "tiec_ms": 59.7,
+      "rust_ms": 47.3,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/std_math_primitives.tie",
+      "tiec_ms": 104.6,
+      "rust_ms": 45.9,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/std_primitives.tie",
+      "tiec_ms": 81.1,
+      "rust_ms": 47.5,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/strings.tie",
+      "tiec_ms": 68.7,
+      "rust_ms": 47.4,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/switch_pattern.tie",
+      "tiec_ms": 61.8,
+      "rust_ms": 47.1,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/switch_table_demo.tie",
+      "tiec_ms": 55.4,
+      "rust_ms": 45.5,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/switch.tie",
+      "tiec_ms": 61.0,
+      "rust_ms": 48.8,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/table_dynamic.tie",
+      "tiec_ms": 65.2,
+      "rust_ms": 46.6,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/table_param_demo.tie",
+      "tiec_ms": 61.1,
+      "rust_ms": 48.7,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/table.tie",
+      "tiec_ms": 54.9,
+      "rust_ms": 47.9,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/test_wide.tie",
+      "tiec_ms": 52.2,
+      "rust_ms": 48.1,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/trit_demo.tie",
+      "tiec_ms": 81.8,
+      "rust_ms": 47.7,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/tuple.tie",
+      "tiec_ms": 68.2,
+      "rust_ms": 48.1,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "examples/wide.tie",
+      "tiec_ms": 56.9,
+      "rust_ms": 50.5,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "ext/cache.tie",
+      "tiec_ms": 55.3,
+      "rust_ms": 48.2,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "ext/codec/brotli.tie",
+      "tiec_ms": 352.2,
+      "rust_ms": 47.5,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "ext/codec/jpeg.tie",
+      "tiec_ms": 915.3,
+      "rust_ms": 49.3,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "ext/codec/lz4.tie",
+      "tiec_ms": 187.3,
+      "rust_ms": 47.4,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "ext/codec/zstd.tie",
+      "tiec_ms": 1884.5,
+      "rust_ms": 48.3,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "ext/compress.tie",
+      "tiec_ms": 287.4,
+      "rust_ms": 47.3,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "ext/ml.tie",
+      "tiec_ms": 462.0,
+      "rust_ms": 47.1,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "ext/registry.tie",
+      "tiec_ms": 53.5,
+      "rust_ms": 46.9,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "pkg/lock.tie",
+      "tiec_ms": 531.1,
+      "rust_ms": 49.5,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "pkg/manifest.tie",
+      "tiec_ms": 350.1,
+      "rust_ms": 47.1,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "pkg/search.tie",
+      "tiec_ms": 263.2,
+      "rust_ms": 45.1,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "prep/core.tie",
+      "tiec_ms": 212.9,
+      "rust_ms": 47.4,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "prep/indent.tie",
+      "tiec_ms": 60.0,
+      "rust_ms": 52.0,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "prep/rename_enl_to_ext_prog.tie",
+      "tiec_ms": 58.8,
+      "rust_ms": 47.9,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "prep/rename_enl_to_ext.tie",
+      "tiec_ms": 54.6,
+      "rust_ms": 48.5,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "prep/rename_tcmsg_to_log.tie",
+      "tiec_ms": 61.4,
+      "rust_ms": 48.4,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "prep/test_cn.tie",
+      "tiec_ms": 53.4,
+      "rust_ms": 49.4,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "prep/test_trim.tie",
+      "tiec_ms": 78.9,
+      "rust_ms": 49.6,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "repl/repl.tie",
+      "tiec_ms": 56.4,
+      "rust_ms": 47.9,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "std/assert.tie",
+      "tiec_ms": 62.4,
+      "rust_ms": 47.4,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "std/exmath.tie",
+      "tiec_ms": 1892.9,
+      "rust_ms": 48.3,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "std/format.tie",
+      "tiec_ms": 74.3,
+      "rust_ms": 49.6,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "std/graph.tie",
+      "tiec_ms": 539.3,
+      "rust_ms": 48.5,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "std/linalg.tie",
+      "tiec_ms": 1084.2,
+      "rust_ms": 50.8,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "std/math.tie",
+      "tiec_ms": 107.1,
+      "rust_ms": 46.8,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "std/optsearch.tie",
+      "tiec_ms": 551.8,
+      "rust_ms": 48.5,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "std/radix.tie",
+      "tiec_ms": 80.8,
+      "rust_ms": 46.8,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "std/sort.tie",
+      "tiec_ms": 273.5,
+      "rust_ms": 49.3,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "std/string.tie",
+      "tiec_ms": 322.7,
+      "rust_ms": 47.8,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    },
+    {
+      "path": "std/version.tie",
+      "tiec_ms": 125.5,
+      "rust_ms": 44.9,
+      "tiec_exit": 0,
+      "rust_exit": 0,
+      "excluded": false,
+      "reason": ""
+    }
+  ],
+  "excluded": [
+    {
+      "path": "examples/brotli_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/compress_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/csv_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/exmath_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/exmath_num_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/format_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/graph_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/import_main.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/import_nested.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/jpeg_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/lib_math2.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/linalg_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/log_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/log_enhance_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/lz4_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/ml_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/ns_import_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/optsearch_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/radix_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/registry_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/sort_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/std_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/std_math_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/std_refactor_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/version_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "examples/zstd_demo.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "ext/log.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "pkg/deps.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "pkg/fetch.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "pkg/main.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    },
+    {
+      "path": "pkg/publish.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 0,
+      "excluded": true,
+      "reason": "tiec-proto 语义层不展开 import（exit 1）"
+    },
+    {
+      "path": "std/csv.tie",
+      "tiec_ms": null,
+      "rust_ms": null,
+      "tiec_exit": 1,
+      "rust_exit": 1,
+      "excluded": true,
+      "reason": "两边均退出非 0（tiec=1 / rust=1）"
+    }
+  ],
+  "totals": {
+    "corpus_total": 101,
+    "pass_count": 94,
+    "fail_count": 7,
+    "included_count": 62,
+    "excluded_count": 32,
+    "tiec_total_ms": 13353.1,
+    "rust_total_ms": 3005.2,
+    "tiec_median_ms": 68.2,
+    "rust_median_ms": 47.9,
+    "tiec_max_ms": 1892.9,
+    "rust_max_ms": 60.9,
+    "ratio": 4.443,
+    "gate1": "FAIL",
+    "gate1_target": "ratio < 1.0（目标 0.5-0.83，即 tie 前端 1.2-2x 快于 Rust）"
+  }
+}
