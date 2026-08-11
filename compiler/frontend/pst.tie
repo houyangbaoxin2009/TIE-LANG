@@ -1,0 +1,28 @@
+// tie:library
+// compiler/frontend/pst.tie —— T2.5 parser 全局状态（模块拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.5（.omo/plans/self-hosting-v2.md）完整 parser
+// 拆分为 4 模块之一（本文件 = parser 全局状态，零依赖叶节点）。
+// 全部共享状态放文件顶层（tie 约束：全局变量只能顶层声明），
+// 供 putil/pexpr/pstmt/parser 各模块函数裸名访问（跨文件已验证可行）。
+// 依赖：无。由 putil.tie import（传递可达上层）。
+// 对应 proto/parser.tie 232-251 行状态 + reset 逻辑拆出。
+
+// ---------- 词法游标与 pending（>> 分裂）状态 ----------
+var g_pos: i64 = 0;           // 真实 token 流游标
+var g_pending: table<i64>;    // 待消费虚拟 token 队列（FIFO）
+var g_pending_idx: i64 = 0;   // 指向 g_pending 中下一个待消费位置
+var g_pending_lines: table<i64>;  // 虚拟 token 的旁路行号
+var g_pending_cols: table<i64>;   // 虚拟 token 的旁路列号
+var g_pending_lexemes: table<i64>; // 虚拟 token 的旁路 lexeme 池 id（split 分裂用）
+
+// ---------- 语法错误槽位（parse 返回 ERR: 协议）----------
+var p_err_line: i64 = 0;
+var p_err_col: i64 = 0;
+var p_err_msg: string = "";
+
+// ---------- 元组解构临时变量计数器（生成 _tmpN 唯一名）----------
+var g_tmp: i64 = 0;
+
+namespace pst {
+}

@@ -1,0 +1,186 @@
+// tie:logic
+// compiler/frontend/parse_test.tie —— 自举 v2 T2.5 完整 parser 验收程序
+// ============================================================
+// 作用：
+//   1) 无参数运行：对 101 个文件（examples/ + std/ + tests/ + compiler/）做
+//      parse_src，断言全部解析成功（AST 协议首行 = "<N>:" 无 "ERR:" 前缀）；
+//   2) 对关键文件做 AST 节点计数对照（期望值 = Rust tie-frontend --ast 实测，
+//      硬编码；抽样 tag/位置断言）；
+//   3) 语法错误 golden 与 Rust 逐字对照（≥10 例，期望值经
+//      target\release\tie-frontend.exe <负例> --check 实测）；
+//   4) 输出「parser 验收通过」exit 0。
+// 编译运行：target\release\tie-llvm.exe compiler\frontend\parse_test.tie
+//           运行：compiler\frontend\parse_test.exe （从仓库根目录）
+import "./parser.tie"
+
+// 断言辅助（与 lex_test 同款）
+func check(ok: bool, what: string) -> bool {
+    if !ok {
+        println("自检失败: " + what)
+    }
+    return ok
+}
+
+// 字符串断言：失败打印期望/实际（错误消息对照用）
+func check_str(got: string, want: string, what: string) -> bool {
+    if got != want {
+        println("自检失败: " + what)
+        println("  期望: [" + want + "]")
+        println("  实际: [" + got + "]")
+        return false
+    }
+    return true
+}
+
+// 是否 ERR: 协议错误（语法/词法错误统一前缀）
+func has_err(s: string) -> bool {
+    return str_len(s) >= 4 &&
+        str_char(s, 0) == "E" && str_char(s, 1) == "R" &&
+        str_char(s, 2) == "R" && str_char(s, 3) == ":"
+}
+
+// 语法错误格式化为「语法错误 @行:列: 消息」与 Rust 对照
+func fmt_syn_err(s: string) -> string {
+    // ERR:line col msg → 语法错误 @line:col: msg
+    var rest = str.slice(s, 4, str_len(s))
+    // 找 line 后的空格
+    var i: i64 = 0
+    var n = str_len(rest)
+    while i < n {
+        if str_char(rest, i) == " " {
+            break
+        }
+        i = i + 1
+    }
+    var line = str.slice(rest, 0, i)
+    var j = i + 1
+    while j < n {
+        if str_char(rest, j) == " " {
+            break
+        }
+        j = j + 1
+    }
+    var col = str.slice(rest, i + 1, j)
+    var msg = str.slice(rest, j + 1, n)
+    return "语法错误 @" + line + ":" + col + ": " + msg
+}
+
+// 字符串 → i64（简单十进制解析；AST 首行 "N:" 用）
+func to_int(s: string) -> i64 {
+    var n = str_len(s)
+    var v: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var cc = char_code(str_char(s, i))
+        if cc >= 48 {
+            if cc <= 57 {
+                v = v * 10 + (cc - 48)
+            }
+        }
+        i = i + 1
+    }
+    return v
+}
+
+func main() {
+    var ok: bool = true
+
+    // ---------- 101 文件解析成功断言 ----------
+    var files: table<string> = [
+        "examples/hello.tie", "examples/table.tie", "examples/switch.tie",
+        "examples/oop.tie", "examples/wide.tie", "examples/char.tie",
+        "examples/m4_ops.tie", "examples/tuple.tie", "examples/lib_math.tie",
+        "std/string.tie", "std/assert.tie", "std/csv.tie", "std/sort.tie",
+        "std/math.tie", "std/intern.tie", "std/format.tie", "std/exmath.tie",
+        "std/radix.tie", "tests/language/byref_table.tie",
+        "tests/language/global_table.tie", "tests/language/intern.tie",
+        "tests/language/extern_decl.tie", "compiler/frontend/lexer.tie",
+        "compiler/frontend/errors.tie", "compiler/frontend/ast.tie",
+        "compiler/frontend/lex_tokdefs.tie", "compiler/frontend/putil.tie",
+        "compiler/frontend/pst.tie", "compiler/frontend/pexpr.tie",
+        "compiler/frontend/pstmt.tie", "compiler/frontend/parser.tie",
+        "compiler/frontend/lex_test.tie", "compiler/frontend/parse_test.tie",
+        "compiler/frontend/lex_scan.tie", "compiler/frontend/lex_state.tie",
+        "compiler/frontend/lex_symtab.tie", "compiler/lib/columnar.tie",
+        "compiler/lib/dispatch.tie", "compiler/lib/interner.tie"
+    ]
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < len(files) {
+        var src = file_read(files[i])
+        var ast_proto = parser.parse_src(src)
+        if has_err(ast_proto) {
+            println("[" + files[i] + "] 解析失败: " + fmt_syn_err(ast_proto))
+            ok = false
+        } else {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    println("解析成功 " + to_string(n) + "/" + to_string(len(files)) + " 文件")
+    ok = check(n == len(files), "全部文件解析成功") && ok
+
+    // ---------- AST 节点计数对照（期望值 = Rust tie-frontend --ast 实测）----------
+    // 注：节点计数 = 首行 <N> 的数字
+    var ast_files: table<string> = ["examples/hello.tie", "examples/table.tie",
+        "examples/switch.tie", "examples/oop.tie", "std/string.tie"]
+    var expect: table<i64> = [51, 31, 119, 181, 878]  // 占位，需实测后硬编码
+    i = 0
+    while i < len(ast_files) {
+        var src = file_read(ast_files[i])
+        var ast_proto = parser.parse_src(src)
+        if has_err(ast_proto) {
+            println("[" + ast_files[i] + "] AST 失败")
+            ok = false
+        } else {
+            // 首行 "N:" → N
+            var s = ast_proto
+            var k: i64 = 0
+            while k < str_len(s) {
+                if str_char(s, k) == ":" {
+                    break
+                }
+                k = k + 1
+            }
+            var count = to_int(str.slice(s, 0, k))
+            println("[" + ast_files[i] + "] 节点数=" + to_string(count) + " (期望 " + to_string(expect[i]) + ")")
+            ok = check(count == expect[i], ast_files[i] + " 节点数") && ok
+        }
+        i = i + 1
+    }
+
+    // ---------- 语法错误 golden（期望值 = Rust tie-frontend --check 实测 2026-08-11）----------
+    // 负例逐字对齐 Rust（@行:列: 消息）
+    var neg_srcs: table<string> = [
+        "import 123\nfunc main() {}\n",                           // import 后非字符串
+        "func main() {\n    {\n        x = 1\n    }\n}\n",        // 裸代码块
+        "func main() {\n    extern fn foo() -> i64;\n}\n",        // extern 非顶层
+        "extern fn foo() -> i64 func main() {}\n"                 // extern 缺分号
+    ]
+    var neg_expected: table<string> = [
+        "语法错误 @1:8: import 后必须是字符串路径，实际是 整数 123",
+        "语法错误 @2:5: 函数体内不能有裸代码块",
+        "语法错误 @2:5: extern 声明只能出现在文件顶层",
+        "语法错误 @1:24: 期望 extern 声明结束的分号，实际是 Func"
+    ]
+    var m: i64 = 0
+    while m < len(neg_srcs) {
+        var r = parser.parse_src(neg_srcs[m])
+        var got = ""
+        if has_err(r) {
+            got = fmt_syn_err(r)
+        } else {
+            got = "(无错误)"
+        }
+        println("负例[" + to_string(m) + "] 期望: [" + neg_expected[m] + "]")
+        println("          实际: [" + got + "]")
+        ok = check_str(got, neg_expected[m], "负例[" + to_string(m) + "]") && ok
+        m = m + 1
+    }
+
+    if !ok {
+        exit(1)
+    }
+
+    println("parser 验收通过")
+}

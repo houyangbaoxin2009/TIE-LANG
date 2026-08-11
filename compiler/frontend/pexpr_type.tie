@@ -1,0 +1,118 @@
+// tie:library
+// compiler/frontend/pexpr_type.tie — T2.5 parser 类型解析（再拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.5 完整 parser 再拆分（2026-08-11）：
+// 原 pexpr.tie 拆出「类型解析 parse_type + parse_tuple_type」部分。
+// 依赖：./pexpr.tie（优先级链，经其传递可达 putil/pst/ast/errors/interner/string）。
+// 树式无环：由 pstmt.tie import（传递可达上层）。
+import "./pexpr.tie"
+
+namespace pexpr_type {
+
+pub func parse_type() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    var tag = putil.peek_tag()
+    if tag == lex_typekw {
+        var lex = putil.peek_lexeme()
+        var tk = putil.typekw_index(lex)
+        putil.advance()
+        if tk == TK_TABLE {
+            if putil.eat(lex_lt) {
+                var elem = parse_type()
+                if elem < 0 {
+                    return -1
+                }
+                if !putil.expect_type_gt("表元素类型后需 '>'") {
+                    return -1
+                }
+                var t = ast.new_node(N_TABLE_TYPE, -1, -1, -1, line, col)
+                var kids: table<i64> = table_new_i64()
+                table_push(kids, elem)
+                ast.set_children(t, kids)
+                return t
+            }
+            return ast.new_node(N_NAMED_TYPE, interner.intern(lex), TK_TABLE, -1, line, col)
+        }
+        if tk == TK_MAP {
+            if putil.eat(lex_lt) {
+                var val = parse_type()
+                if val < 0 {
+                    return -1
+                }
+                if !putil.expect_type_gt("键值表值类型后需 '>'") {
+                    return -1
+                }
+                var t = ast.new_node(N_MAP_TYPE, -1, -1, -1, line, col)
+                var kids: table<i64> = table_new_i64()
+                table_push(kids, val)
+                ast.set_children(t, kids)
+                return t
+            }
+            // 裸 map = map<i64>
+            var i64node = ast.new_node(N_NAMED_TYPE, interner.intern("i64"), TK_I64, -1, line, col)
+            var t = ast.new_node(N_MAP_TYPE, -1, -1, -1, line, col)
+            var kids: table<i64> = table_new_i64()
+            table_push(kids, i64node)
+            ast.set_children(t, kids)
+            return t
+        }
+        return ast.new_node(N_NAMED_TYPE, interner.intern(lex), tk, -1, line, col)
+    }
+    if tag == lex_lparen {
+        return parse_tuple_type(line, col)
+    }
+    if tag == lex_ident {
+        var name = interner.intern(putil.peek_lexeme())
+        putil.advance()
+        return ast.new_node(N_STRUCT_TYPE, name, -1, -1, line, col)
+    }
+    putil.set_err(line, col, "期望类型，实际是 " + putil.describe(tag))
+    return -1
+}
+
+// 元组类型：`(T1, T2, ...)` / `(name: T1, name: T2, ...)`
+func parse_tuple_type(line: i64, col: i64) -> i64 {
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    if putil.eat(lex_rparen) {
+        putil.set_err(line, col, "空元组类型 () 不支持")
+        return -1
+    }
+    var fields: table<i64> = table_new_i64()
+    var d = false
+    while !d {
+        var name = -1
+        if putil.peek_tag() == lex_ident {
+            if putil.peek_n(1) == lex_colon {
+                name = interner.intern(putil.peek_lexeme())
+                putil.advance()
+                if !putil.expect(lex_colon, "':'") {
+                    return -1
+                }
+            }
+        }
+        var fty = parse_type()
+        if fty < 0 {
+            return -1
+        }
+        var f = ast.new_node(N_TUPLE_TYPE_FIELD, name, -1, -1, line, col)
+        var fkids: table<i64> = table_new_i64()
+        table_push(fkids, fty)
+        ast.set_children(f, fkids)
+        table_push(fields, f)
+        if putil.eat(lex_comma) {
+            // 继续
+        } else {
+            if !putil.expect(lex_rparen, "')'") {
+                return -1
+            }
+            d = true
+        }
+    }
+    var t = ast.new_node(N_TUPLE_TYPE, -1, -1, -1, line, col)
+    ast.set_children(t, fields)
+
+}
+}

@@ -1,0 +1,714 @@
+// tie:library
+// compiler/frontend/pexpr.tie —— T2.5 parser 表达式/类型解析（模块拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.5（.omo/plans/self-hosting-v2.md）完整 parser
+// 拆分为 4 模块之一（本文件 = 表达式优先级链 + 一元/主表达式 + 元组/表
+// 字面量 + 类型解析）。对应 proto/parser.tie 1726-2636 行逻辑搬移。
+// 依赖：./putil.tie（token 流/工具，经其传递可达 pst 状态 + ast 节点池 +
+// errors/interner/string）。树式无环，由 pstmt.tie import。
+import "./putil.tie"
+
+namespace pexpr {
+
+// 构造二元节点（span 取左操作数起点，对齐 Rust expr_span 行为）
+func mk_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
+    var n = ast.new_node(N_BINARY, -1, op, -1, ast.line(lhs), ast.col(lhs))
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, lhs)
+    table_push(kids, rhs)
+    ast.set_children(n, kids)
+    return n
+}
+
+// 构造一元节点
+func mk_unary(op: i64, operand: i64, line: i64, col: i64) -> i64 {
+    var n = ast.new_node(N_UNARY, -1, op, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, operand)
+    ast.set_children(n, kids)
+    return n
+}
+
+// 构造下标节点（span 取基址起点）
+func mk_index(base: i64, index: i64) -> i64 {
+    var n = ast.new_node(N_INDEX, -1, -1, -1, ast.line(base), ast.col(base))
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, base)
+    table_push(kids, index)
+    ast.set_children(n, kids)
+    return n
+}
+
+// ---------- 表达式优先级链（从低到高）----------
+
+// 表达式：三目 → 可选范围 `..`
+pub func parse_expr() -> i64 {
+    var lhs = parse_ternary()
+    if lhs < 0 {
+        return -1
+    }
+    if putil.eat(lex_dotdot) {
+        var line = ast.line(lhs)
+        var col = ast.col(lhs)
+        var end = parse_expr()
+        if end < 0 {
+            return -1
+        }
+        var n = ast.new_node(N_RANGE, -1, -1, -1, line, col)
+        var kids: table<i64> = table_new_i64()
+        table_push(kids, lhs)
+        table_push(kids, end)
+        ast.set_children(n, kids)
+        return n
+    }
+    return lhs
+}
+
+// 三目运算符（右结合）：cond ? then : else
+func parse_ternary() -> i64 {
+    var lhs = parse_or()
+    if lhs < 0 {
+        return -1
+    }
+    if putil.eat(lex_question) {
+        var line = ast.line(lhs)
+        var col = ast.col(lhs)
+        var then_expr = parse_expr()
+        if then_expr < 0 {
+            return -1
+        }
+        if !putil.expect(lex_colon, "':'") {
+            return -1
+        }
+        var else_expr = parse_expr()
+        if else_expr < 0 {
+            return -1
+        }
+        var n = ast.new_node(N_TERNARY, -1, -1, -1, line, col)
+        var kids: table<i64> = table_new_i64()
+        table_push(kids, lhs)
+        table_push(kids, then_expr)
+        table_push(kids, else_expr)
+        ast.set_children(n, kids)
+        return n
+    }
+    return lhs
+}
+
+// 逻辑或 ||
+func parse_or() -> i64 {
+    var lhs = parse_and()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        if putil.peek_tag() != lex_oror {
+            d = true
+        } else {
+            putil.advance()
+            var rhs = parse_and()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(B_OR, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 逻辑与 &&
+func parse_and() -> i64 {
+    var lhs = parse_bit_or()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        if putil.peek_tag() != lex_andand {
+            d = true
+        } else {
+            putil.advance()
+            var rhs = parse_bit_or()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(B_AND, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 按位或 |
+func parse_bit_or() -> i64 {
+    var lhs = parse_bit_xor()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        if putil.peek_tag() != lex_pipe {
+            d = true
+        } else {
+            putil.advance()
+            var rhs = parse_bit_xor()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(B_BITOR, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 按位异或 ^
+func parse_bit_xor() -> i64 {
+    var lhs = parse_bit_and()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        if putil.peek_tag() != lex_caret {
+            d = true
+        } else {
+            putil.advance()
+            var rhs = parse_bit_and()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(B_BITXOR, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 按位与 &
+func parse_bit_and() -> i64 {
+    var lhs = parse_equality()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        if putil.peek_tag() != lex_amp {
+            d = true
+        } else {
+            putil.advance()
+            var rhs = parse_equality()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(B_BITAND, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 相等 == !=
+func parse_equality() -> i64 {
+    var lhs = parse_comparison()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        var op = -1
+        if putil.peek_tag() == lex_eqeq {
+            op = B_EQ
+        } else if putil.peek_tag() == lex_noteq {
+            op = B_NOTEQ
+        } else {
+            d = true
+        }
+        if !d {
+            putil.advance()
+            var rhs = parse_comparison()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(op, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 比较 < > <= >=
+func parse_comparison() -> i64 {
+    var lhs = parse_shift()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        var op = -1
+        if putil.peek_tag() == lex_lt {
+            op = B_LT
+        } else if putil.peek_tag() == lex_gt {
+            op = B_GT
+        } else if putil.peek_tag() == lex_le {
+            op = B_LE
+        } else if putil.peek_tag() == lex_ge {
+            op = B_GE
+        } else {
+            d = true
+        }
+        if !d {
+            putil.advance()
+            var rhs = parse_shift()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(op, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 移位 << >>
+func parse_shift() -> i64 {
+    var lhs = parse_term()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        var op = -1
+        if putil.peek_tag() == lex_shl {
+            op = B_SHL
+        } else if putil.peek_tag() == lex_shr {
+            op = B_SHR
+        } else {
+            d = true
+        }
+        if !d {
+            putil.advance()
+            var rhs = parse_term()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(op, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 加减 + -
+func parse_term() -> i64 {
+    var lhs = parse_factor()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        var op = -1
+        if putil.peek_tag() == lex_plus {
+            op = B_ADD
+        } else if putil.peek_tag() == lex_minus {
+            op = B_SUB
+        } else {
+            d = true
+        }
+        if !d {
+            putil.advance()
+            var rhs = parse_factor()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(op, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// 乘除模 * / %
+func parse_factor() -> i64 {
+    var lhs = parse_unary()
+    if lhs < 0 {
+        return -1
+    }
+    var d = false
+    while !d {
+        var op = -1
+        if putil.peek_tag() == lex_star {
+            op = B_MUL
+        } else if putil.peek_tag() == lex_slash {
+            op = B_DIV
+        } else if putil.peek_tag() == lex_percent {
+            op = B_MOD
+        } else {
+            d = true
+        }
+        if !d {
+            putil.advance()
+            var rhs = parse_unary()
+            if rhs < 0 {
+                return -1
+            }
+            lhs = mk_binary(op, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// ---------- 一元与主表达式 ----------
+
+// 一元（前缀 - ! ++ --）+ 后缀访问链（[index] .field/.method ++ --）
+pub func parse_unary() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    var expr = -1
+    var tag = putil.peek_tag()
+    if tag == lex_minus {
+        putil.advance()
+        var operand = parse_unary()
+        if operand < 0 {
+            return -1
+        }
+        expr = mk_unary(U_NEG, operand, line, col)
+    } else if tag == lex_bang {
+        putil.advance()
+        var operand = parse_unary()
+        if operand < 0 {
+            return -1
+        }
+        expr = mk_unary(U_NOT, operand, line, col)
+    } else if tag == lex_inc {
+        putil.advance()
+        var operand = parse_unary()
+        if operand < 0 {
+            return -1
+        }
+        expr = mk_unary(U_PRE_INC, operand, line, col)
+    } else if tag == lex_dec {
+        putil.advance()
+        var operand = parse_unary()
+        if operand < 0 {
+            return -1
+        }
+        expr = mk_unary(U_PRE_DEC, operand, line, col)
+    } else {
+        expr = parse_primary()
+        if expr < 0 {
+            return -1
+        }
+    }
+    // 后缀访问链
+    var d = false
+    while !d {
+        var t = putil.peek_tag()
+        if t == lex_lbracket {
+            putil.advance()
+            var index = parse_expr()
+            if index < 0 {
+                return -1
+            }
+            if !putil.expect(lex_rbracket, "']'") {
+                return -1
+            }
+            expr = mk_index(expr, index)
+        } else if t == lex_dot {
+            putil.advance()
+            var field = -1
+            if putil.peek_tag() == lex_ident {
+                field = interner.intern(putil.peek_lexeme())
+                putil.advance()
+            } else if putil.peek_tag() == lex_int {
+                field = interner.intern(putil.peek_lexeme())
+                putil.advance()
+            } else {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "字段访问 '.' 后必须是字段名/方法名/数字下标，实际是 " + putil.describe(putil.peek_tag()))
+                return -1
+            }
+            if putil.eat(lex_lparen) {
+                // 方法调用：obj.m(args)
+                var args: table<i64> = table_new_i64()
+                if !parse_args_after_lparen(args) {
+                    return -1
+                }
+                var mc = ast.new_node(N_METHOD_CALL, field, -1, -1, ast.line(expr), ast.col(expr))
+                var mkids: table<i64> = table_new_i64()
+                table_push(mkids, expr)
+                var k: i64 = 0
+                while k < len(args) {
+                    table_push(mkids, args[k])
+                    k = k + 1
+                }
+                ast.set_children(mc, mkids)
+                expr = mc
+            } else {
+                var fa = ast.new_node(N_FIELD_ACCESS, field, -1, -1, ast.line(expr), ast.col(expr))
+                var fkids: table<i64> = table_new_i64()
+                table_push(fkids, expr)
+                ast.set_children(fa, fkids)
+                expr = fa
+            }
+        } else if t == lex_inc {
+            putil.advance()
+            expr = mk_unary(U_POST_INC, expr, ast.line(expr), ast.col(expr))
+        } else if t == lex_dec {
+            putil.advance()
+            expr = mk_unary(U_POST_DEC, expr, ast.line(expr), ast.col(expr))
+        } else {
+            d = true
+        }
+    }
+    return expr
+}
+
+// 解析实参列表到 args（前提：'(' 已消费；以 ')' 结束）
+pub func parse_args_after_lparen(args: ref table<i64>) -> bool {
+    if putil.eat(lex_rparen) {
+        return true
+    }
+    var d = false
+    while !d {
+        var a = parse_expr()
+        if a < 0 {
+            return false
+        }
+        table_push(args, a)
+        if putil.eat(lex_comma) {
+            // 继续
+        } else {
+            if !putil.expect(lex_rparen, "')'") {
+                return false
+            }
+            d = true
+        }
+    }
+    return true
+}
+
+// 原子表达式：字面量 / 标识符（路径/调用/变量）/ 括号元组 / 表字面量
+func parse_primary() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    var tag = putil.peek_tag()
+    if tag == lex_int {
+        var v = putil.parse_int_lit(putil.peek_lexeme())
+        putil.advance()
+        return ast.new_node(N_INT_LIT, -1, v, -1, line, col)
+    }
+    if tag == lex_float {
+        var lid = interner.intern(putil.peek_lexeme())
+        putil.advance()
+        return ast.new_node(N_FLOAT_LIT, lid, -1, -1, line, col)
+    }
+    if tag == lex_str {
+        var lid = interner.intern(putil.peek_lexeme())
+        putil.advance()
+        return ast.new_node(N_STR_LIT, lid, -1, -1, line, col)
+    }
+    if tag == lex_charlit {
+        var lid = interner.intern(putil.peek_lexeme())
+        putil.advance()
+        return ast.new_node(N_CHAR_LIT, lid, -1, -1, line, col)
+    }
+    if tag == lex_true {
+        putil.advance()
+        return ast.new_node(N_BOOL_LIT, -1, 1, -1, line, col)
+    }
+    if tag == lex_false {
+        putil.advance()
+        return ast.new_node(N_BOOL_LIT, -1, 0, -1, line, col)
+    }
+    if tag == lex_zero {
+        putil.advance()
+        return ast.new_node(N_TRIT_LIT, -1, 0, -1, line, col)
+    }
+    if tag == lex_ident {
+        var name = interner.intern(putil.peek_lexeme())
+        putil.advance()
+        // 命名空间路径：a::b::c
+        if putil.peek_tag() == lex_dcolon {
+            var segs: table<i64> = table_new_i64()
+            table_push(segs, name)
+            while putil.eat(lex_dcolon) {
+                var s = putil.expect_ident()
+                if s < 0 {
+                    return -1
+                }
+                table_push(segs, s)
+            }
+            var path = ast.new_node(N_PATH, -1, -1, -1, line, col)
+            var pkids: table<i64> = table_new_i64()
+            var i: i64 = 0
+            while i < len(segs) {
+                table_push(pkids, ast.new_node(N_SEGMENT, segs[i], -1, -1, line, col))
+                i = i + 1
+            }
+            ast.set_children(path, pkids)
+            return path
+        }
+        // 函数调用
+        if putil.eat(lex_lparen) {
+            var args: table<i64> = table_new_i64()
+            if !parse_args_after_lparen(args) {
+                return -1
+            }
+            var call = ast.new_node(N_CALL, name, -1, -1, line, col)
+            ast.set_children(call, args)
+            return call
+        }
+        return ast.new_node(N_VAR, name, -1, -1, line, col)
+    }
+    if tag == lex_lparen {
+        return parse_paren_or_tuple(line, col)
+    }
+    if tag == lex_lbracket {
+        return parse_table_lit(line, col)
+    }
+    putil.set_err(line, col, "无法以 " + putil.describe(tag) + " 开始表达式")
+    return -1
+}
+
+// `(` 起始：元组字面量 `(1, "a")` / `(x: 1, y: 2)`，或分组表达式 `(expr)`
+func parse_paren_or_tuple(line: i64, col: i64) -> i64 {
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    if putil.eat(lex_rparen) {
+        putil.set_err(line, col, "空元组 () 不支持")
+        return -1
+    }
+    var first = parse_tuple_field()
+    if first < 0 {
+        return -1
+    }
+    if putil.eat(lex_comma) {
+        var fields: table<i64> = table_new_i64()
+        table_push(fields, first)
+        var d = false
+        while !d {
+            var f = parse_tuple_field()
+            if f < 0 {
+                return -1
+            }
+            table_push(fields, f)
+            if putil.eat(lex_comma) {
+                // 继续
+            } else {
+                if !putil.expect(lex_rparen, "')'") {
+                    return -1
+                }
+                d = true
+            }
+        }
+        var tup = ast.new_node(N_TUPLE_LIT, -1, -1, -1, line, col)
+        ast.set_children(tup, fields)
+        return tup
+    }
+    // 无逗号 → 分组表达式
+    if !putil.expect(lex_rparen, "')'") {
+        return -1
+    }
+    if ast.name(first) != -1 {
+        putil.set_err(line, col, "命名字段必须作为元组元素（如 (x: 1, y: 2)），单个 (x: 1) 不是合法表达式")
+        return -1
+    }
+    return ast.child_at(first, 0)
+}
+
+// 元组字段：`name: expr`（命名字段）或 `expr`（匿名）——返回 TupleField 节点
+func parse_tuple_field() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    if putil.peek_tag() == lex_ident {
+        if putil.peek_n(1) == lex_colon {
+            var name = interner.intern(putil.peek_lexeme())
+            putil.advance()
+            if !putil.expect(lex_colon, "':'") {
+                return -1
+            }
+            var value = parse_expr()
+            if value < 0 {
+                return -1
+            }
+            var f = ast.new_node(N_TUPLE_FIELD, name, -1, -1, line, col)
+            var kids: table<i64> = table_new_i64()
+            table_push(kids, value)
+            ast.set_children(f, kids)
+            return f
+        }
+    }
+    var value = parse_expr()
+    if value < 0 {
+        return -1
+    }
+    var f = ast.new_node(N_TUPLE_FIELD, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, value)
+    ast.set_children(f, kids)
+    return f
+}
+
+// 表字面量 `[col, col; row, row]`（逗号分列、分号分行；空表 [] 合法）
+func parse_table_lit(line: i64, col: i64) -> i64 {
+    if !putil.expect(lex_lbracket, "'['") {
+        return -1
+    }
+    var cells: table<i64> = table_new_i64()
+    if putil.eat(lex_rbracket) {
+        return ast.new_node(N_TABLE_LIT, -1, -1, -1, line, col)
+    }
+    var row: i64 = 0
+    var d = false
+    while !d {
+        var cell = parse_table_cell(row)
+        if cell < 0 {
+            return -1
+        }
+        table_push(cells, cell)
+        var tag = putil.peek_tag()
+        if tag == lex_comma {
+            putil.advance()
+        } else if tag == lex_semi {
+            putil.advance()
+            row = row + 1
+        } else if tag == lex_rbracket {
+            putil.advance()
+            d = true
+        } else {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "期望 , 或 ; 或 ]，实际是 " + putil.describe(tag))
+            return -1
+        }
+    }
+    var t = ast.new_node(N_TABLE_LIT, -1, -1, -1, line, col)
+    ast.set_children(t, cells)
+    return t
+}
+
+// 表单元格：`id:value`（id 为数字或字符串键）或普通 `value`
+func parse_table_cell(row: i64) -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    var id_node = -1
+    if putil.peek_tag() == lex_int {
+        if putil.peek_n(1) == lex_colon {
+            var v = putil.parse_int_lit(putil.peek_lexeme())
+            putil.advance()   // 数字
+            putil.advance()   // 冒号
+            id_node = ast.new_node(N_TABLE_ID, -1, v, -1, line, col)
+        }
+    } else if putil.peek_tag() == lex_str {
+        if putil.peek_n(1) == lex_colon {
+            var lid = interner.intern(putil.peek_lexeme())
+            putil.advance()   // 字符串
+            putil.advance()   // 冒号
+            id_node = ast.new_node(N_TABLE_ID, lid, -1, -1, line, col)
+        }
+    }
+    var value = parse_expr()
+    if value < 0 {
+        return -1
+    }
+    var c = ast.new_node(N_TABLE_CELL, -1, row, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, id_node)
+    table_push(kids, value)
+    ast.set_children(c, kids)
+    return c
+}
+
+}

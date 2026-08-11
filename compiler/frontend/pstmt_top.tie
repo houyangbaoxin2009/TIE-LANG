@@ -1,0 +1,474 @@
+// tie:library
+// compiler/frontend/pstmt_top.tie — T2.5 parser 顶层声明（再拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.5 完整 parser 再拆分（2026-08-11）：
+// 原 pstmt.tie（1091 行）拆为 pstmt_top（本文件：程序入口 + 顶层声明
+// import/using/namespace/extern/fn/struct）+ pstmt_flow（语句分派+控制流）
+// + pstmt（var 声明/表达式赋值）。
+// 依赖：./pstmt_flow.tie（语句分派/控制流，经其传递可达 pstmt/pexpr/putil/ast）。
+// 树式无环：由 parser.tie import。
+import "./pstmt_flow.tie"
+
+namespace pstmt_top {
+
+pub func parse_program() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    var stmts: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        var tag = putil.peek_tag()
+        if tag == lex_eof {
+            done = true
+        } else if tag == lex_func {
+            var s = parse_fn_def()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_pub {
+            var s = parse_fn_def()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_import {
+            var s = parse_import()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_using {
+            var s = parse_using()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_struct {
+            var s = parse_struct()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_namespace {
+            var s = parse_namespace()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_extern {
+            var s = parse_extern()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_var {
+            var s = pstmt.parse_var_decl(0)
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_const {
+            var s = pstmt.parse_var_decl(1)
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "顶层只允许函数定义、import、using、struct、命名空间声明、extern 声明或全局变量，实际是 " + putil.describe(tag))
+            return -1
+        }
+    }
+    var root = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+    ast.set_children(root, stmts)
+    return root
+}
+
+// ---------- 语句分派 ----------
+
+// 解析一条或多条语句（var 解构可能产生多条，返回 StmtList；单条返回语句节点）
+func parse_import() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // import
+    var path = -1
+    if putil.peek_tag() == lex_str {
+        path = interner.intern(putil.peek_lexeme())
+        putil.advance()
+    } else {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "import 后必须是字符串路径，实际是 " + putil.describe(putil.peek_tag()))
+        return -1
+    }
+    var alias = -1
+    if putil.eat(lex_as) {
+        if putil.peek_tag() == lex_ident {
+            alias = interner.intern(putil.peek_lexeme())
+            putil.advance()
+        } else {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "as 后必须是别名标识符，实际是 " + putil.describe(putil.peek_tag()))
+            return -1
+        }
+    }
+    if !putil.expect(lex_semi, "import 语句结束的分号") {
+        return -1
+    }
+    return ast.new_node(N_IMPORT, path, -1, alias, line, col)
+}
+
+// using 引入语句：`using fmt2;` / `using fmt.error;`（仅顶层）
+func parse_using() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // using
+    var segs: table<i64> = table_new_i64()
+    var s = putil.expect_ident()
+    if s < 0 {
+        return -1
+    }
+    table_push(segs, s)
+    while putil.eat(lex_dot) {
+        s = putil.expect_ident()
+        if s < 0 {
+            return -1
+        }
+        table_push(segs, s)
+    }
+    if !putil.expect(lex_semi, "using 语句结束的分号") {
+        return -1
+    }
+    var n = ast.new_node(N_USING, -1, -1, len(segs), line, col)
+    var kids: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < len(segs) {
+        table_push(kids, ast.new_node(N_SEGMENT, segs[i], -1, -1, line, col))
+        i = i + 1
+    }
+    ast.set_children(n, kids)
+    return n
+}
+
+// 命名空间声明：`namespace tcmsg { ... }` / `namespace tcmsg.error { ... }`
+func parse_namespace() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // namespace
+    var segs: table<i64> = table_new_i64()
+    var s = putil.expect_ident()
+    if s < 0 {
+        return -1
+    }
+    table_push(segs, s)
+    while putil.eat(lex_dot) {
+        s = putil.expect_ident()
+        if s < 0 {
+            return -1
+        }
+        table_push(segs, s)
+    }
+    if !putil.expect(lex_lbrace, "命名空间声明必须跟 '{'") {
+        return -1
+    }
+    var body_stmts: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        var tag = putil.peek_tag()
+        if tag == lex_rbrace {
+            putil.advance()
+            done = true
+        } else if tag == lex_eof {
+            if !putil.expect(lex_rbrace, "命名空间声明必须跟 '}'") {
+                return -1
+            }
+            done = true
+        } else if tag == lex_func {
+            var st = parse_fn_def()
+            if st < 0 {
+                return -1
+            }
+            table_push(body_stmts, st)
+        } else if tag == lex_pub {
+            var st = parse_fn_def()
+            if st < 0 {
+                return -1
+            }
+            table_push(body_stmts, st)
+        } else if tag == lex_struct {
+            var st = parse_struct()
+            if st < 0 {
+                return -1
+            }
+            table_push(body_stmts, st)
+        } else if tag == lex_namespace {
+            var st = parse_namespace()
+            if st < 0 {
+                return -1
+            }
+            table_push(body_stmts, st)
+        } else {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "命名空间体内只允许函数定义、类定义或嵌套命名空间，实际是 " + putil.describe(tag))
+            return -1
+        }
+    }
+    var n = ast.new_node(N_NAMESPACE, -1, -1, len(segs), line, col)
+    var kids: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < len(segs) {
+        table_push(kids, ast.new_node(N_SEGMENT, segs[i], -1, -1, line, col))
+        i = i + 1
+    }
+    table_push(kids, ast.new_node(N_STMTLIST, -1, -1, -1, line, col))
+    ast.set_children(n, kids)
+    // 最后一个子节点（body StmtList）填充体语句
+    ast.set_children(ast.child_at(n, len(segs)), body_stmts)
+    return n
+}
+
+// extern 函数声明（T0.7）：`extern fn name(a: i64, b: string) -> bool;`
+func parse_extern() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // extern
+    if putil.peek_tag() == lex_ident {
+        if putil.peek_lexeme() == "fn" {
+            putil.advance()
+        } else {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "extern 声明必须跟 'fn'，实际是 " + putil.describe(lex_ident))
+            return -1
+        }
+    } else {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "extern 声明必须跟 'fn'，实际是 " + putil.describe(putil.peek_tag()))
+        return -1
+    }
+    var name = putil.expect_ident()
+    if name < 0 {
+        return -1
+    }
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var params: table<i64> = table_new_i64()
+    if !putil.eat(lex_rparen) {
+        var d = false
+        while !d {
+            var pname = putil.expect_ident()
+            if pname < 0 {
+                return -1
+            }
+            if !putil.expect(lex_colon, "':'") {
+                return -1
+            }
+            var pty = pexpr_type.parse_type()
+            if pty < 0 {
+                return -1
+            }
+            var p = ast.new_node(N_PARAM, pname, 0, -1, putil.peek_line(), putil.peek_col())
+            var pkids: table<i64> = table_new_i64()
+            table_push(pkids, pty)
+            table_push(pkids, -1)
+            ast.set_children(p, pkids)
+            table_push(params, p)
+            if putil.eat(lex_comma) {
+                // 继续
+            } else {
+                if !putil.expect(lex_rparen, "')'") {
+                    return -1
+                }
+                d = true
+            }
+        }
+    }
+    var ret_ty = -1
+    if putil.eat(lex_arrow) {
+        ret_ty = pexpr_type.parse_type()
+        if ret_ty < 0 {
+            return -1
+        }
+    } else {
+        ret_ty = ast.new_node(N_NAMED_TYPE, interner.intern("void"), TK_VOID, -1, line, col)
+    }
+    if !putil.expect(lex_semi, "extern 声明结束的分号") {
+        return -1
+    }
+    var e = ast.new_node(N_EXTERN, name, -1, len(params), line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, ret_ty)
+    var i: i64 = 0
+    while i < len(params) {
+        table_push(kids, params[i])
+        i = i + 1
+    }
+    ast.set_children(e, kids)
+    return e
+}
+
+// ---------- 函数 / struct 定义 ----------
+
+// `[pub] func name(params) -> Ty { stmts }`
+func parse_fn_def() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    var is_pub: i64 = 0
+    if putil.eat(lex_pub) {
+        is_pub = 1
+    }
+    if !putil.expect(lex_func, "'func'") {
+        return -1
+    }
+    var name = putil.expect_ident()
+    if name < 0 {
+        return -1
+    }
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var params: table<i64> = table_new_i64()
+    if !putil.eat(lex_rparen) {
+        var d = false
+        while !d {
+            var pname = putil.expect_ident()
+            if pname < 0 {
+                return -1
+            }
+            if !putil.expect(lex_colon, "':'") {
+                return -1
+            }
+            var by_ref: i64 = 0
+            if putil.eat(lex_ref) {
+                by_ref = 1
+            }
+            var pty = pexpr_type.parse_type()
+            if pty < 0 {
+                return -1
+            }
+            var pdef = -1
+            if putil.eat(lex_eq) {
+                pdef = pexpr.parse_expr()
+                if pdef < 0 {
+                    return -1
+                }
+            }
+            var p = ast.new_node(N_PARAM, pname, by_ref, -1, putil.peek_line(), putil.peek_col())
+            var pkids: table<i64> = table_new_i64()
+            table_push(pkids, pty)
+            table_push(pkids, pdef)
+            ast.set_children(p, pkids)
+            table_push(params, p)
+            if putil.eat(lex_comma) {
+                // 继续
+            } else {
+                if !putil.expect(lex_rparen, "')'") {
+                    return -1
+                }
+                d = true
+            }
+        }
+    }
+    var ret_ty = -1
+    if putil.eat(lex_arrow) {
+        ret_ty = pexpr_type.parse_type()
+        if ret_ty < 0 {
+            return -1
+        }
+    } else {
+        ret_ty = ast.new_node(N_NAMED_TYPE, interner.intern("void"), TK_VOID, -1, line, col)
+    }
+    var body = pstmt_flow.parse_block()
+    if body < 0 {
+        return -1
+    }
+    var f = ast.new_node(N_FN_DEF, name, is_pub, len(params), line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, ret_ty)
+    var i: i64 = 0
+    while i < len(params) {
+        table_push(kids, params[i])
+        i = i + 1
+    }
+    table_push(kids, body)
+    ast.set_children(f, kids)
+    return f
+}
+
+// `struct Name [extends Parent] { 字段 }`（纯数据）
+func parse_struct() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // struct
+    var name = putil.expect_ident()
+    if name < 0 {
+        return -1
+    }
+    var parent = -1
+    if putil.eat(lex_extends) {
+        parent = putil.expect_ident()
+        if parent < 0 {
+            return -1
+        }
+    }
+    if !putil.expect(lex_lbrace, "'{'") {
+        return -1
+    }
+    var fields: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        var tag = putil.peek_tag()
+        if tag == lex_rbrace {
+            putil.advance()
+            done = true
+        } else if tag == lex_eof {
+            if !putil.expect(lex_rbrace, "'}'") {
+                return -1
+            }
+            done = true
+        } else if tag == lex_var {
+            var fl = putil.peek_line()
+            var fc = putil.peek_col()
+            putil.advance()   // var
+            var fname = putil.expect_ident()
+            if fname < 0 {
+                return -1
+            }
+            var fty = -1
+            if putil.eat(lex_colon) {
+                fty = pexpr_type.parse_type()
+                if fty < 0 {
+                    return -1
+                }
+            }
+            var finit = -1
+            if putil.eat(lex_eq) {
+                finit = pexpr.parse_expr()
+                if finit < 0 {
+                    return -1
+                }
+            }
+            if !putil.expect(lex_semi, "字段声明结束符") {
+                return -1
+            }
+            var f = ast.new_node(N_CLASS_FIELD, fname, -1, -1, fl, fc)
+            var fkids: table<i64> = table_new_i64()
+            table_push(fkids, fty)
+            table_push(fkids, finit)
+            ast.set_children(f, fkids)
+            table_push(fields, f)
+        } else if tag == lex_func {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "struct 体不允许方法定义：逻辑请用绑定 struct 名的命名空间函数定义（namespace 数据名 { pub func 方法名(首参: 数据名) ... }），调用仍写 obj.method()")
+            return -1
+        } else if tag == lex_pub {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "struct 体不允许方法定义：逻辑请用绑定 struct 名的命名空间函数定义（namespace 数据名 { pub func 方法名(首参: 数据名) ... }），调用仍写 obj.method()")
+            return -1
+        } else {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "struct 体内只允许字段(var)，实际是 " + putil.describe(tag))
+            return -1
+        }
+    }
+    var s = ast.new_node(N_STRUCT, name, -1, parent, line, col)
+    ast.set_children(s, fields)
+    return s
+}
+
+// ---------- 块 / 控制流语句 ----------
+
+// `{ stmts }` 代码块：返回 StmtList 节点
+
+}

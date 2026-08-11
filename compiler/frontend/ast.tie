@@ -126,6 +126,61 @@ const N_STRUCT_TYPE: i64 = 202;
 const N_TABLE_TYPE: i64 = 203;
 const N_MAP_TYPE: i64 = 204;
 
+// ---------- 二元/一元 op 码（对齐 Rust BinaryOp/UnaryOp 顺序，T2.5 补）----------
+// 二元：0=Add 1=Sub 2=Mul 3=Div 4=Mod 5=Eq 6=NotEq 7=Lt 8=Gt 9=Le 10=Ge
+//   11=And 12=Or 13=BitAnd 14=BitOr 15=BitXor 16=Shl 17=Shr
+const B_ADD: i64 = 0;
+const B_SUB: i64 = 1;
+const B_MUL: i64 = 2;
+const B_DIV: i64 = 3;
+const B_MOD: i64 = 4;
+const B_EQ: i64 = 5;
+const B_NOTEQ: i64 = 6;
+const B_LT: i64 = 7;
+const B_GT: i64 = 8;
+const B_LE: i64 = 9;
+const B_GE: i64 = 10;
+const B_AND: i64 = 11;
+const B_OR: i64 = 12;
+const B_BITAND: i64 = 13;
+const B_BITOR: i64 = 14;
+const B_BITXOR: i64 = 15;
+const B_SHL: i64 = 16;
+const B_SHR: i64 = 17;
+
+// 一元：0=Neg 1=Not 2=PreInc 3=PreDec 4=PostInc 5=PostDec
+const U_NEG: i64 = 0;
+const U_NOT: i64 = 1;
+const U_PRE_INC: i64 = 2;
+const U_PRE_DEC: i64 = 3;
+const U_POST_INC: i64 = 4;
+const U_POST_DEC: i64 = 5;
+
+// ---------- 类型关键字 TyKw 索引（对齐 Rust TyKw 顺序，T2.5 补）----------
+// 0=i8 1=i16 2=i32 3=i64 4=u8 5=u16 6=u32 7=u64 8=f32 9=f64 10=bool
+// 11=trit 12=char 13=string 14=void 15=code 16=num 17=text 18=misc 19=table 20=map
+const TK_I8: i64 = 0;
+const TK_I16: i64 = 1;
+const TK_I32: i64 = 2;
+const TK_I64: i64 = 3;
+const TK_U8: i64 = 4;
+const TK_U16: i64 = 5;
+const TK_U32: i64 = 6;
+const TK_U64: i64 = 7;
+const TK_F32: i64 = 8;
+const TK_F64: i64 = 9;
+const TK_BOOL: i64 = 10;
+const TK_TRIT: i64 = 11;
+const TK_CHAR: i64 = 12;
+const TK_STR: i64 = 13;
+const TK_VOID: i64 = 14;
+const TK_CODE: i64 = 15;
+const TK_NUM: i64 = 16;
+const TK_TEXT: i64 = 17;
+const TK_MISC: i64 = 18;
+const TK_TABLE: i64 = 19;
+const TK_MAP: i64 = 20;
+
 // ---------- 全局列式节点池（T0.4 全局表：下标对齐 = 节点 id）----------
 var node_tags: table<i64>;       // 第 0 列：节点 tag
 var node_names: table<i64>;      // 第 1 列：字符串池 id（-1 = 无名字）

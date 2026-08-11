@@ -100,4 +100,58 @@ pub func err_lex_err(line: i64, col: i64, msg: string) -> string {
     return "ERR:" + to_string(line) + " " + to_string(col) + " " + msg
 }
 
+// ---------- 语法错误消息（T2.5，对齐 Rust parser.rs）----------
+// 参数化消息：期望 {what}，实际是 {describe}（parser.rs expect 的
+// format!("期望 {what}，实际是 {}", self.describe(self.peek_kind()))）。
+pub func syn_expect(what: string, actual: string) -> string {
+    return "期望 " + what + "，实际是 " + actual
+}
+
+// 参数化消息：期望标识符，实际是 {describe}
+// （parser.rs expect_ident 的 format!("期望标识符，实际是 {}", ...)）。
+pub func syn_expect_ident(actual: string) -> string {
+    return "期望标识符，实际是 " + actual
+}
+
+// 参数化消息：标签 '{label}' 只能用于 while 或 for
+// （parser.rs 的 format!("标签 '{label}' 只能用于 while 或 for")）。
+pub func syn_label_only(label: string) -> string {
+    return "标签 '" + label + "' 只能用于 while 或 for"
+}
+
+// 固定消息：不能在这里嵌套代码块
+// （parser.rs 的 err("不能在这里嵌套代码块".into())）。
+pub func syn_no_nested_block() -> string {
+    return "不能在这里嵌套代码块"
+}
+
+// 固定消息：extern 声明只能出现在文件顶层
+// （parser.rs 的 err("extern 声明只能出现在文件顶层".into())）。
+pub func syn_extern_top_level() -> string {
+    return "extern 声明只能出现在文件顶层"
+}
+
+// 固定消息：赋值目标必须是变量或字段
+// （parser.rs 的 err("赋值目标必须是变量或字段".into())）。
+pub func syn_assign_target() -> string {
+    return "赋值目标必须是变量或字段"
+}
+
+// 参数化消息：期望类型，实际是 {describe}
+// （parser.rs 类型解析的 format!("期望类型，实际是 {}", ...)）。
+pub func syn_expect_type(actual: string) -> string {
+    return "期望类型，实际是 " + actual
+}
+
+// 参数化消息：无法在 {describe} 后开始表达式
+// （parser.rs parse_primary 的 format!("无法在 {} 后开始表达式", ...)）。
+pub func syn_cannot_start(actual: string) -> string {
+    return "无法在 " + actual + " 后开始表达式"
+}
+
+// 参数化消息：无法从 {describe} 初始化（var 初始化器缺失的格式）。
+pub func syn_no_init(actual: string) -> string {
+    return "无法从 " + actual + " 初始化"
+}
+
 }   // namespace errors

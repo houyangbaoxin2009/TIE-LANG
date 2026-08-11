@@ -1,0 +1,231 @@
+// tie:library
+// compiler/frontend/pstmt.tie — T2.5 parser var声明/表达式赋值（再拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.5 完整 parser 再拆分（2026-08-11）：
+// 原 pstmt.tie 拆出「var/const 声明 + 元组解构 + 表达式赋值语句」部分。
+// 依赖：./pexpr_type.tie（类型解析，经其传递可达 pexpr 表达式链 + putil/ast）。
+// 树式无环：由 pstmt_flow.tie import。
+import "./pexpr_type.tie"
+
+namespace pstmt {
+
+pub func parse_var_decl(is_const: i64) -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // var / const
+    if putil.peek_tag() == lex_lparen {
+        return parse_tuple_destructure(line, col, is_const)
+    }
+    var name = putil.expect_ident()
+    if name < 0 {
+        return -1
+    }
+    var ty = -1
+    if putil.eat(lex_colon) {
+        ty = pexpr_type.parse_type()
+        if ty < 0 {
+            return -1
+        }
+    }
+    var init = -1
+    if putil.eat(lex_eq) {
+        init = pexpr.parse_expr()
+        if init < 0 {
+            return -1
+        }
+        if !putil.expect(lex_semi, "语句结束符") {
+            return -1
+        }
+    } else if putil.is_table_type(ty) {
+        // T0.4 顶层表全局变量：表类型可省略初始化，合成空表 []（元素类型由标注决定）
+        if !putil.expect(lex_semi, "语句结束符") {
+            return -1
+        }
+        init = ast.new_node(N_TABLE_LIT, -1, -1, -1, line, col)
+    } else {
+        if !putil.expect(lex_eq, "'='") {
+            return -1
+        }
+        return -1
+    }
+    var v = ast.new_node(N_VAR_DECL, name, is_const, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, ty)
+    table_push(kids, init)
+    ast.set_children(v, kids)
+    return v
+}
+
+// 元组解构声明：`var (q, r) = expr;` → _tmpN + 逐字段声明（StmtList）
+func parse_tuple_destructure(line: i64, col: i64, is_const: i64) -> i64 {
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var names: table<i64> = table_new_i64()
+    if putil.eat(lex_rparen) {
+        putil.set_err(line, col, "空解构 () 不支持")
+        return -1
+    }
+    var d = false
+    while !d {
+        var nm = putil.expect_ident()
+        if nm < 0 {
+            return -1
+        }
+        table_push(names, nm)
+        if putil.eat(lex_comma) {
+            // 继续
+        } else {
+            if !putil.expect(lex_rparen, "')'") {
+                return -1
+            }
+            d = true
+        }
+    }
+    if !putil.expect(lex_eq, "'='") {
+        return -1
+    }
+    var init = pexpr.parse_expr()
+    if init < 0 {
+        return -1
+    }
+    if !putil.expect(lex_semi, "语句结束符") {
+        return -1
+    }
+    var tmp_name = interner.intern("_tmp" + to_string(g_tmp))
+    g_tmp = g_tmp + 1
+    var list = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+    var decls: table<i64> = table_new_i64()
+    // 第一条：临时变量持有元组值（可写）
+    var tv = ast.new_node(N_VAR_DECL, tmp_name, 0, -1, line, col)
+    var tkids: table<i64> = table_new_i64()
+    table_push(tkids, -1)
+    table_push(tkids, init)
+    ast.set_children(tv, tkids)
+    table_push(decls, tv)
+    // 逐字段：var q = _tmpN.Item1; var r = _tmpN.Item2;
+    var i: i64 = 0
+    while i < len(names) {
+        var var_node = ast.new_node(N_VAR, tmp_name, -1, -1, line, col)
+        var fa = ast.new_node(N_FIELD_ACCESS, interner.intern("Item" + to_string(i + 1)), -1, -1, line, col)
+        var fkids: table<i64> = table_new_i64()
+        table_push(fkids, var_node)
+        ast.set_children(fa, fkids)
+        var fv = ast.new_node(N_VAR_DECL, names[i], is_const, -1, line, col)
+        var vkids: table<i64> = table_new_i64()
+        table_push(vkids, -1)
+        table_push(vkids, fa)
+        ast.set_children(fv, vkids)
+        table_push(decls, fv)
+        i = i + 1
+    }
+    ast.set_children(list, decls)
+    return list
+}
+
+// ---------- 表达式与赋值语句 ----------
+
+// 表达式语句与赋值语句统一入口：Ident op= → Assign；否则解析表达式后按目标分派
+pub func parse_expr_or_assign() -> i64 {
+    // 快速路径：变量名后紧跟赋值运算符 → Assign
+    if putil.peek_tag() == lex_ident {
+        var n1 = putil.peek_n(1)
+        if putil.is_assign_op_tag(n1) {
+            var line = putil.peek_line()
+            var col = putil.peek_col()
+            var name = interner.intern(putil.peek_lexeme())
+            putil.advance()   // 目标变量名
+            var op = putil.eat_assign_op()
+            if op == -2 {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "期望赋值运算符")
+                return -1
+            }
+            var value = pexpr.parse_expr()
+            if value < 0 {
+                return -1
+            }
+            if !putil.expect(lex_semi, "语句结束符") {
+                return -1
+            }
+            var a = ast.new_node(N_ASSIGN, name, op, -1, line, col)
+            var kids: table<i64> = table_new_i64()
+            table_push(kids, value)
+            ast.set_children(a, kids)
+            return a
+        }
+    }
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    var expr = pexpr.parse_expr()
+    if expr < 0 {
+        return -1
+    }
+    var op = putil.eat_assign_op()
+    if op != -2 {
+        var tag = ast.tag(expr)
+        if tag == N_INDEX {
+            // 表下标赋值：t[i] op= v / t[i][j] op= v
+            var value = pexpr.parse_expr()
+            if value < 0 {
+                return -1
+            }
+            if !putil.expect(lex_semi, "语句结束符") {
+                return -1
+            }
+            var ia = ast.new_node(N_INDEX_ASSIGN, -1, op, -1, line, col)
+            var kids: table<i64> = table_new_i64()
+            table_push(kids, expr)
+            table_push(kids, value)
+            ast.set_children(ia, kids)
+            return ia
+        }
+        if tag == N_FIELD_ACCESS {
+            // 字段赋值：obj.field op= v（base 需可寻址）
+            var base = ast.child_at(expr, 0)
+            if putil.is_addressable_base(base) {
+                var value = pexpr.parse_expr()
+                if value < 0 {
+                    return -1
+                }
+                if !putil.expect(lex_semi, "语句结束符") {
+                    return -1
+                }
+                var fa = ast.new_node(N_FIELD_ASSIGN, ast.name(expr), op, -1, line, col)
+                var kids: table<i64> = table_new_i64()
+                table_push(kids, base)
+                table_push(kids, value)
+                ast.set_children(fa, kids)
+                return fa
+            }
+        }
+        if tag == N_VAR {
+            // 变量赋值（防御：快速路径已拦截，此处兜底）
+            var value = pexpr.parse_expr()
+            if value < 0 {
+                return -1
+            }
+            if !putil.expect(lex_semi, "语句结束符") {
+                return -1
+            }
+            var a = ast.new_node(N_ASSIGN, ast.name(expr), op, -1, line, col)
+            var kids: table<i64> = table_new_i64()
+            table_push(kids, value)
+            ast.set_children(a, kids)
+            return a
+        }
+        putil.set_err(putil.peek_line(), putil.peek_col(), "赋值目标必须是变量或对象字段")
+        return -1
+    }
+    // 普通表达式语句
+    if !putil.expect(lex_semi, "语句结束符") {
+        return -1
+    }
+    var e = ast.new_node(N_EXPR_STMT, -1, -1, -1, line, col)
+    var ekids: table<i64> = table_new_i64()
+    table_push(ekids, expr)
+    ast.set_children(e, ekids)
+    return e
+}
+
+
+}

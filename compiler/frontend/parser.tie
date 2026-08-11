@@ -1,0 +1,260 @@
+// tie:library
+// compiler/frontend/parser.tie —— 自举 v2 T2.5：完整语法分析器（模块拆分后主入口）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.5（.omo/plans/self-hosting-v2.md）。由 T1.2 原型
+// compiler/proto/parser.tie 升版（6/6 文件 AST 与 Rust 一致），行为基准
+// Rust crates/tie-frontend/src/parser.rs（语法错误消息逐字对齐）。
+// # 模块拆分（2026-08-11）：原 2877 行单文件按「无环 import 树」拆为 4 模块——
+//   pst.tie（全局状态）/ putil.tie（token 流/工具/describe）/
+//   pexpr.tie（表达式/类型解析）/ pstmt.tie（语句解析）/
+//   本文件（parse 主入口 + 协议输出 + parse_debug）。
+//   本文件只 import ./pstmt.tie，其余经树传递可达（唯一路径防重复定义）。
+// # 相比原型改造：
+//   - 节点池复用 ast.tie（T2.1，删除 proto 自带 9 表）；
+//   - token 流由「协议文本 re-parse」改为 putil.fill_pending 直接消费
+//     lexer 列式表（T2.4 正式版）；
+//   - 语法错误消息统一走 errors.tie syn_*（对齐 Rust parser.rs）。
+// # 协议（parse 返回值，T2.6 语义单遍将消费）：
+//   首行 <N>:（N = 节点总数）
+//   之后每行：<id> <tag> <name_id> <val> <aux> <line> <col> <nchild> <c1> <c2>...
+//   语法错误：ERR:<line> <col> <message>（对齐 Rust「语法错误 @行:列: 消息」）。
+import "./pstmt_top.tie"
+
+namespace parser {
+
+// ---------- 主入口 ----------
+
+// 主入口：token 流 → AST 协议文本。
+// 前提：lexer 列式 token 表已被 lexer.tokenize/run_lex 填充（parse_src 内部完成）。
+// proto_text 仅用于调试透传（词法错误 ERR 原样返回）。
+pub func parse(proto_text: string) -> string {
+    if putil.has_prefix(proto_text, "ERR:") {
+        return proto_text
+    }
+    ast.reset()
+    g_pos = 0
+    g_pending_idx = 0
+    g_tmp = 0
+    p_err_msg = ""
+    putil.fill_pending()
+    var root = pstmt_top.parse_program()
+    if root < 0 {
+        return putil.err_protocol()
+    }
+    return build_protocol()
+}
+
+// 便捷入口：源码字符串 → 词法 + 语法 → AST 协议文本（T2.6/验收程序用）
+pub func parse_src(src: string) -> string {
+    var ok = lexer.run_lex(src)
+    if !ok {
+        // 词法错误：直接读 lexer 的全局错误槽（词法失败时 token 表不可靠）
+        return "ERR:" + to_string(g_err_line) + " " + to_string(g_err_col) + " " + g_err_msg
+    }
+    return parse("")
+}
+
+// 可读 AST 树形输出（缩进展示 tag 名 + lexeme + span + 顶层语句序列），供人工对比
+pub func parse_debug(src: string) -> string {
+    var ok = lexer.run_lex(src)
+    if !ok {
+        return "ERR:" + to_string(g_err_line) + " " + to_string(g_err_col) + " " + g_err_msg
+    }
+    ast.reset()
+    g_pos = 0
+    g_pending_idx = 0
+    g_tmp = 0
+    p_err_msg = ""
+    putil.fill_pending()
+    var root = pstmt_top.parse_program()
+    if root < 0 {
+        return putil.err_protocol()
+    }
+    var out: string = "共 " + to_string(ast.count()) + " 个节点，顶层 " +
+        to_string(ast.child_count(root)) + " 条语句\n"
+    out = out + "顶层语句 tag 序列: " + top_seq(root) + "\n"
+    out = out + dump_node(root, 0) + "\n"
+    return out
+}
+
+// ---------- 树形输出（parse_debug 用）----------
+
+// 顶层语句 tag 序列（Rust --ast 顶层语句变体对照用）
+func top_seq(root: i64) -> string {
+    var s: string = ""
+    var k: i64 = 0
+    while k < ast.child_count(root) {
+        var c = ast.child_at(root, k)
+        s = s + pnames.node_tag_name(ast.tag(c))
+        if k + 1 < ast.child_count(root) {
+            s = s + " "
+        }
+        k = k + 1
+    }
+    return s
+}
+
+// 递归树形输出：节点文本 + 子节点缩进
+func dump_node(id: i64, depth: i64) -> string {
+    var indent: string = ""
+    var d: i64 = 0
+    while d < depth {
+        indent = indent + "  "
+        d = d + 1
+    }
+    var txt: string = indent + node_text(id)
+    var k: i64 = 0
+    while k < ast.child_count(id) {
+        var c = ast.child_at(id, k)
+        if c >= 0 {
+            txt = txt + "\n" + dump_node(c, depth + 1)
+        } else {
+            txt = txt + "\n" + indent + "  -1(空)"
+        }
+        k = k + 1
+    }
+    return txt
+}
+
+// 节点单行文本：tag 名 + 名字 lexeme + 关键标量字段 + span
+func node_text(id: i64) -> string {
+    var tag = ast.tag(id)
+    var s: string = pnames.node_tag_name(tag)
+    var nm = ast.name(id)
+    if nm >= 0 {
+        s = s + " '" + interner.lookup(nm) + "'"
+    }
+    var v = ast.val(id)
+    if tag == N_BINARY {
+        s = s + " " + op_symbol(v, false)
+    } else if tag == N_UNARY {
+        s = s + " " + op_symbol(v, true)
+    } else if tag == N_INT_LIT {
+        s = s + " " + to_string(v)
+    } else if tag == N_BOOL_LIT {
+        s = s + " " + to_string(v)
+    } else if tag == N_TRIT_LIT {
+        s = s + " " + to_string(v)
+    } else if tag == N_ASSIGN {
+        if v >= 0 {
+            s = s + " " + op_symbol(v, false) + "="
+        }
+    } else if tag == N_FIELD_ASSIGN {
+        if v >= 0 {
+            s = s + " " + op_symbol(v, false) + "="
+        }
+    } else if tag == N_INDEX_ASSIGN {
+        if v >= 0 {
+            s = s + " " + op_symbol(v, false) + "="
+        }
+    } else if v >= 0 {
+        s = s + " v=" + to_string(v)
+    }
+    s = s + " @" + to_string(ast.line(id)) + ":" + to_string(ast.col(id))
+    return s
+}
+
+// 运算符编号 → 符号文本（parse_debug 展示用）
+func op_symbol(op: i64, is_unary: bool) -> string {
+    if is_unary {
+        if op == 0 {
+            return "-"
+        }
+        if op == 1 {
+            return "!"
+        }
+        if op == 2 {
+            return "++"
+        }
+        if op == 3 {
+            return "--"
+        }
+        if op == 4 {
+            return "++"
+        }
+        if op == 5 {
+            return "--"
+        }
+        return "?" + to_string(op)
+    }
+    if op == 0 {
+        return "+"
+    }
+    if op == 1 {
+        return "-"
+    }
+    if op == 2 {
+        return "*"
+    }
+    if op == 3 {
+        return "/"
+    }
+    if op == 4 {
+        return "%"
+    }
+    if op == 5 {
+        return "=="
+    }
+    if op == 6 {
+        return "!="
+    }
+    if op == 7 {
+        return "<"
+    }
+    if op == 8 {
+        return ">"
+    }
+    if op == 9 {
+        return "<="
+    }
+    if op == 10 {
+        return ">="
+    }
+    if op == 11 {
+        return "&&"
+    }
+    if op == 12 {
+        return "||"
+    }
+    if op == 13 {
+        return "&"
+    }
+    if op == 14 {
+        return "|"
+    }
+    if op == 15 {
+        return "^"
+    }
+    if op == 16 {
+        return "<<"
+    }
+    if op == 17 {
+        return ">>"
+    }
+    return "?" + to_string(op)
+}
+
+// ---------- AST 协议输出 ----------
+
+// 组装 AST 协议文本：首行 <N>:（节点总数），随后每行一个节点
+// <id> <tag> <name_id> <val> <aux> <line> <col> <nchild> <c1> <c2> ...
+func build_protocol() -> string {
+    var out: string = to_string(ast.count()) + ":\n"
+    var i: i64 = 0
+    while i < ast.count() {
+        var line: string = to_string(i) + " " + to_string(ast.tag(i)) + " " +
+            to_string(ast.name(i)) + " " + to_string(ast.val(i)) + " " +
+            to_string(ast.aux(i)) + " " + to_string(ast.line(i)) + " " +
+            to_string(ast.col(i)) + " " + to_string(ast.child_count(i))
+        var k: i64 = 0
+        while k < ast.child_count(i) {
+            line = line + " " + to_string(ast.child_at(i, k))
+            k = k + 1
+        }
+        out = out + line + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+}

@@ -1,0 +1,413 @@
+// tie:library
+// compiler/frontend/pstmt_flow.tie — T2.5 parser 语句分派+控制流（再拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.5 完整 parser 再拆分（2026-08-11）：
+// 原 pstmt.tie 拆出的「语句分派 parse_stmt + 块/if/while/for/标签/
+// switch/return 控制流」部分。
+// 依赖：./pstmt.tie（var 声明/表达式赋值，经其传递可达 pexpr/putil/ast）。
+// 树式无环：由 pstmt_top.tie import。
+import "./pstmt.tie"
+
+namespace pstmt_flow {
+
+pub func parse_stmt() -> i64 {
+    var tag = putil.peek_tag()
+    if tag == lex_var {
+        return pstmt.parse_var_decl(0)
+    }
+    if tag == lex_const {
+        return pstmt.parse_var_decl(1)
+    }
+    if tag == lex_if {
+        return parse_if()
+    }
+    if tag == lex_while {
+        return parse_while(-1)
+    }
+    if tag == lex_for {
+        return parse_for(-1)
+    }
+    if tag == lex_switch {
+        return parse_switch()
+    }
+    if tag == lex_return {
+        return parse_return()
+    }
+    if tag == lex_break {
+        return parse_loop_jump(false)
+    }
+    if tag == lex_continue {
+        return parse_loop_jump(true)
+    }
+    if tag == lex_ident {
+        if is_loop_label_ahead() {
+            return parse_labeled_loop()
+        }
+        return pstmt.parse_expr_or_assign()
+    }
+    if tag == lex_lbrace {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "函数体内不能有裸代码块")
+        return -1
+    }
+    if tag == lex_extern {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "extern 声明只能出现在文件顶层")
+        return -1
+    }
+    return pstmt.parse_expr_or_assign()
+}
+
+// ---------- 顶层 import / using / namespace / extern ----------
+
+// import 语句：`import "./x.tie"` 或 `import "./x.tie" as 别名`
+pub func parse_block() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    if !putil.expect(lex_lbrace, "'{'") {
+        return -1
+    }
+    var stmts: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        if putil.peek_tag() == lex_rbrace {
+            putil.advance()
+            done = true
+        } else if putil.peek_tag() == lex_eof {
+            if !putil.expect(lex_rbrace, "'}'") {
+                return -1
+            }
+            done = true
+        } else {
+            var s = parse_stmt()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        }
+    }
+    var list = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+    ast.set_children(list, stmts)
+    return list
+}
+
+// `if cond { } else { }` / else if 链
+func parse_if() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // if
+    var cond = pexpr.parse_expr()
+    if cond < 0 {
+        return -1
+    }
+    var then_list = parse_block()
+    if then_list < 0 {
+        return -1
+    }
+    var else_list = -1
+    if putil.eat(lex_else) {
+        if putil.peek_tag() == lex_if {
+            var inner = parse_if()
+            if inner < 0 {
+                return -1
+            }
+            var tmp: table<i64> = table_new_i64()
+            table_push(tmp, inner)
+            else_list = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+            ast.set_children(else_list, tmp)
+        } else {
+            else_list = parse_block()
+            if else_list < 0 {
+                return -1
+            }
+        }
+    } else {
+        else_list = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+    }
+    var n = ast.new_node(N_IF, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, cond)
+    table_push(kids, then_list)
+    table_push(kids, else_list)
+    ast.set_children(n, kids)
+    return n
+}
+
+// `while cond { }`（label 为循环标签，E5）
+func parse_while(label: i64) -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // while
+    var cond = pexpr.parse_expr()
+    if cond < 0 {
+        return -1
+    }
+    var body = parse_block()
+    if body < 0 {
+        return -1
+    }
+    var n = ast.new_node(N_WHILE, label, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, cond)
+    table_push(kids, body)
+    ast.set_children(n, kids)
+    return n
+}
+
+// `for var in expr { }`（label 为循环标签，E5）
+func parse_for(label: i64) -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // for
+    var var_id = putil.expect_ident()
+    if var_id < 0 {
+        return -1
+    }
+    if !putil.expect(lex_in, "'in'") {
+        return -1
+    }
+    var iter = pexpr.parse_expr()
+    if iter < 0 {
+        return -1
+    }
+    var body = parse_block()
+    if body < 0 {
+        return -1
+    }
+    var n = ast.new_node(N_FOR, var_id, -1, label, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, iter)
+    table_push(kids, body)
+    ast.set_children(n, kids)
+    return n
+}
+
+// 探测「循环标签前缀」：当前标识符 + 冒号 + while/for（E5）
+func is_loop_label_ahead() -> bool {
+    if putil.peek_tag() != lex_ident {
+        return false
+    }
+    if putil.peek_n(1) != lex_colon {
+        return false
+    }
+    var n2 = putil.peek_n(2)
+    if n2 == lex_while {
+        return true
+    }
+    if n2 == lex_for {
+        return true
+    }
+    return false
+}
+
+// `L: while/for` 带标签循环（E5）
+func parse_labeled_loop() -> i64 {
+    var label = putil.expect_ident()
+    if label < 0 {
+        return -1
+    }
+    putil.advance()   // 冒号
+    var tag = putil.peek_tag()
+    if tag == lex_while {
+        return parse_while(label)
+    }
+    if tag == lex_for {
+        return parse_for(label)
+    }
+    putil.set_err(putil.peek_line(), putil.peek_col(), "标签 '" + interner.lookup(label) + "' 后必须是 while 或 for")
+    return -1
+}
+
+// `break` / `continue`（可选标签 break L / continue L，E1+E5）
+func parse_loop_jump(is_continue: bool) -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // break / continue
+    var label = -1
+    if putil.peek_tag() == lex_ident {
+        var n1 = putil.peek_n(1)
+        if n1 == lex_semi {
+            label = interner.intern(putil.peek_lexeme())
+            putil.advance()
+        } else if n1 == lex_eof {
+            label = interner.intern(putil.peek_lexeme())
+            putil.advance()
+        } else if n1 == lex_rbrace {
+            label = interner.intern(putil.peek_lexeme())
+            putil.advance()
+        }
+    }
+    if !putil.expect(lex_semi, "语句结束符") {
+        return -1
+    }
+    if is_continue {
+        return ast.new_node(N_CONTINUE, label, -1, -1, line, col)
+    }
+    return ast.new_node(N_BREAK, label, -1, -1, line, col)
+}
+
+// `switch subject { case ...: ... default: ... }`
+func parse_switch() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // switch
+    var subject = pexpr.parse_expr()
+    if subject < 0 {
+        return -1
+    }
+    if !putil.expect(lex_lbrace, "'{'") {
+        return -1
+    }
+    var cases: table<i64> = table_new_i64()
+    var default_list = -1
+    var done = false
+    while !done {
+        var tag = putil.peek_tag()
+        if tag == lex_case {
+            var cl = putil.peek_line()
+            var cc = putil.peek_col()
+            putil.advance()   // case
+            var pats: table<i64> = table_new_i64()
+            var p = parse_case_pattern()
+            if p < 0 {
+                return -1
+            }
+            table_push(pats, p)
+            while putil.eat(lex_comma) {
+                p = parse_case_pattern()
+                if p < 0 {
+                    return -1
+                }
+                table_push(pats, p)
+            }
+            var when_expr = -1
+            if putil.eat(lex_when) {
+                when_expr = pexpr.parse_expr()
+                if when_expr < 0 {
+                    return -1
+                }
+            }
+            if !putil.expect(lex_colon, "':'") {
+                return -1
+            }
+            var body = parse_switch_body()
+            if body < 0 {
+                return -1
+            }
+            var c = ast.new_node(N_SWITCH_CASE, -1, -1, -1, cl, cc)
+            var pl = ast.new_node(N_PATTERN_LIST, -1, -1, -1, cl, cc)
+            ast.set_children(pl, pats)
+            var ckids: table<i64> = table_new_i64()
+            table_push(ckids, pl)
+            table_push(ckids, when_expr)
+            table_push(ckids, body)
+            ast.set_children(c, ckids)
+            table_push(cases, c)
+        } else if tag == lex_default {
+            putil.advance()   // default
+            if !putil.expect(lex_colon, "':'") {
+                return -1
+            }
+            default_list = parse_switch_body()
+            if default_list < 0 {
+                return -1
+            }
+        } else if tag == lex_rbrace {
+            putil.advance()
+            done = true
+        } else if tag == lex_eof {
+            if !putil.expect(lex_rbrace, "'}'") {
+                return -1
+            }
+            done = true
+        } else {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "switch 体内只允许 case/default/右花括号，实际是 " + putil.describe(tag))
+            return -1
+        }
+    }
+    if default_list < 0 {
+        default_list = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+    }
+    var n = ast.new_node(N_SWITCH, -1, -1, len(cases), line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, subject)
+    var i: i64 = 0
+    while i < len(cases) {
+        table_push(kids, cases[i])
+        i = i + 1
+    }
+    table_push(kids, default_list)
+    ast.set_children(n, kids)
+    return n
+}
+
+// case/default 分支体：连续语句直到下一个 case/default/右花括号/文件结束
+func parse_switch_body() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    var stmts: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        var tag = putil.peek_tag()
+        if tag == lex_case {
+            done = true
+        } else if tag == lex_default {
+            done = true
+        } else if tag == lex_rbrace {
+            done = true
+        } else if tag == lex_eof {
+            done = true
+        } else {
+            var s = parse_stmt()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        }
+    }
+    var list = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
+    ast.set_children(list, stmts)
+    return list
+}
+
+// case 匹配模式：类型匹配（case string:）或值/区间表达式
+func parse_case_pattern() -> i64 {
+    if putil.peek_tag() == lex_typekw {
+        var line = putil.peek_line()
+        var col = putil.peek_col()
+        var lid = interner.intern(putil.peek_lexeme())
+        var tk = putil.typekw_index(putil.peek_lexeme())
+        putil.advance()
+        var t = ast.new_node(N_NAMED_TYPE, lid, tk, -1, line, col)
+        var tl = ast.new_node(N_TYPE_LIT, -1, -1, -1, line, col)
+        var kids: table<i64> = table_new_i64()
+        table_push(kids, t)
+        ast.set_children(tl, kids)
+        return tl
+    }
+    return pexpr.parse_expr()
+}
+
+// `return [expr]`
+func parse_return() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // return
+    var expr = -1
+    if putil.peek_tag() != lex_semi {
+        expr = pexpr.parse_expr()
+        if expr < 0 {
+            return -1
+        }
+    }
+    if !putil.expect(lex_semi, "语句结束符") {
+        return -1
+    }
+    var n = ast.new_node(N_RETURN, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, expr)
+    ast.set_children(n, kids)
+    return n
+}
+
+// `var name[: Ty] [= expr]` / `const ...`（解构返回 StmtList）
+
+}
