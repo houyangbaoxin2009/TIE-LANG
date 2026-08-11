@@ -1,0 +1,400 @@
+// tie:library
+// compiler/middle/ir.tie —— 自举 v2 T2.2：列式 tie-IR（LLVM 三层架构中端核心）
+// ============================================================
+// tie 版编译器的**中端中间表示**：前端（T2.4-T2.6）产出本 IR，供 pass
+// 管线（T2.3）与后端 llvmgen（T2.8）消费。Rust 种子 ir.rs（5111 行，
+// AST 直生 .ll、无显式 IR 中间结构）是行为基准——本文件把其指令种类
+// 提炼为列式指令表，成为自举编译器中真正的中间层。
+//
+// # 列式设计（id = 表下标，B1 arena）
+//   函数表 ir_funcs_*（名字/返回类型/参数段/入口块/指令总数/导出
+//   标记）、块表 ir_blocks_*（所属函数/块名/指令段 [start, end)）、
+//   指令表 ir_insts_*（opcode/结果类型/结果值 id/操作数段）、操作数
+//   段 ir_ops 扁平 i64 + ir_ops_kind 类别（0=值 1=块 2=立即数）。
+//
+// # 值编号单调递增（性能净胜点）
+//   SSA 值经 new_value 领单调递增编号（0 起，对齐 LLVM 参数 0..）；
+//
+// # 操作数段约定（kind 列）
+//   算术：①② 值；icmp/fcmp：①② 值 + ③ 比较码立即数（0=eq 1=ne
+//   2=lt 3=gt 4=le 5=ge）；br：① 块；cond_br：① 条件值 ② then 块
+//   ③ else 块；ret：① 返回值（void 无）；switch：① 值 + 成对立即数+
+//   块；call 族：① 被调方 + 实参值；常量指令：立即数即常量值
+//   （const_str 为字符串池 id）。
+//
+// # opcode 数据表（data 风格，权威 53 条，T2.8 消费说明见 op_desc）
+//   数值 0-18 / 内存 20-26 / 控制流 30-36 / 调用 40-45 / 表字符串
+//   （op_find，不 import columnar——ir_meta 已 import，重复包含冲突）。
+//
+// # 语言边界（实测 2026-08-11）
+//   全局表 + 懒构建；table<string> 不能作函数参数；常量跨文件不可见；
+//
+// 命名规范：命名空间内函数不加 ir_ 前缀；内部工具私有（非 pub）。
+
+import "../lib/interner.tie"
+
+
+// ---------- 常量：分组 / 操作数类别 / 比较码 ----------
+const OP_GRP_NUM: i64 = 0;     // 数值运算组
+const OP_GRP_MEM: i64 = 1;     // 内存组
+const OP_GRP_CTL: i64 = 2;     // 控制流组
+const OP_GRP_CALL: i64 = 3;    // 调用组
+const OP_GRP_TBL: i64 = 4;     // 表/字符串组
+const OP_GRP_CONST: i64 = 5;   // 常量组
+const OK_VALUE: i64 = 0;       // 操作数类别：SSA 值 id
+const OK_BLOCK: i64 = 1;       // 操作数类别：块 id
+const OK_IMM: i64 = 2;         // 操作数类别：立即数
+const CMP_EQ: i64 = 0;         // 比较码：==（LLVM: eq / oeq）
+const CMP_NE: i64 = 1;         // 比较码：!=（ne / one）
+const CMP_LT: i64 = 2;         // 比较码：<（slt / olt）
+const CMP_GT: i64 = 3;         // 比较码：>（sgt / ogt）
+const CMP_LE: i64 = 4;         // 比较码：<=（sle / ole）
+const CMP_GE: i64 = 5;         // 比较码：>=（sge / oge）
+
+// ---------- opcode 常量说明 ----------
+// 数字含义以数据表 ensure_opcodes 为权威（调用方用字面量 + op_name
+// 校验，或本地定义常量——常量跨文件不可见，勿与顶层重名）。
+
+// ---------- 全局列式表（id = 下标；显式分号）----------
+var ir_funcs_names: table<i64>;        // 函数名（字符串池 id）
+var ir_funcs_rets: table<i64>;         // 返回类型（types 自编码 id）
+var ir_funcs_params_off: table<i64>;   // 参数段偏移（ir_ops 内）
+var ir_funcs_params_cnt: table<i64>;   // 参数个数（0 = 无参）
+var ir_funcs_entry: table<i64>;        // 入口块 id（-1 = 未建块）
+var ir_funcs_inst_total: table<i64>;   // 函数内指令总数（llvmgen 统计）
+var ir_funcs_exported: table<i64>;     // 导出标记（0 私有 / 1 导出）
+var ir_blocks_func: table<i64>;        // 块表：所属函数 id
+var ir_blocks_name: table<i64>;        // 块表：块名（池 id；-1 = 无名字）
+var ir_blocks_start: table<i64>;       // 块表：指令段起始（含）
+var ir_blocks_end: table<i64>;         // 块表：指令段结束（不含）
+var ir_insts_op: table<i64>;           // 指令表：opcode
+var ir_insts_ty: table<i64>;           // 指令表：结果类型（无结果 -1）
+var ir_insts_val: table<i64>;          // 指令表：结果值 id（单调；无结果 -1）
+var ir_insts_ops_off: table<i64>;      // 指令表：操作数段偏移
+var ir_insts_ops_cnt: table<i64>;      // 指令表：操作数个数
+var ir_ops: table<i64>;                // 操作数段：扁平 i64
+var ir_ops_kind: table<i64>;           // 操作数段：类别（OK_*）
+var ir_val_cnt: i64 = 0;               // 值计数器（new_value 后置自增）
+var op_keys: table<i64>;               // opcode 表：码（升序）
+var op_names: table<string>;           // opcode 表：名
+var op_groups: table<i64>;             // opcode 表：组号（OP_GRP_*）
+var op_descs: table<string>;           // opcode 表：T2.8 消费说明
+
+namespace ir {
+// ---------- opcode 数据表（懒构建，权威 53 条）----------
+
+func ensure_opcodes() {
+    if len(op_keys) > 0 {
+        return
+    }
+    var ks: table<i64> = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+        15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 30, 31, 32, 33, 34, 35,
+        36, 40, 41, 42, 43, 44, 45, 50, 51, 52, 53, 54, 55, 56, 57, 58, 60,
+        61, 62, 63, 64]
+    var ns: table<string> = ["add", "sub", "mul", "div", "mod", "neg",
+        "and", "or", "xor", "not", "shl", "shr", "icmp", "fadd", "fsub",
+        "fmul", "fdiv", "fmod", "fcmp", "alloca", "load", "store", "gep",
+        "ptrtoint", "inttoptr", "bitcast", "br", "cond_br", "ret", "switch",
+        "unreachable", "phi", "select", "call", "call_vararg",
+        "extern_call", "printf", "println", "print", "table_new",
+        "table_push", "table_at", "table_set", "table_len",
+        "table_elem_ptr", "str_cat", "str_len", "table_copy", "const_i",
+        "const_f", "const_str", "const_null", "const_global"]
+    var gs: table<i64> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
+        3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5]
+    var ds: table<string> = ["整数加，生成 add i64（ty 选宽度）",
+        "整数减，生成 sub i64", "整数乘，生成 mul i64",
+        "整数除，生成 sdiv i64", "整数模，生成 srem i64",
+        "取负，生成 sub i64 0, 操作数①", "位与/逻辑与（i64/i1，生成 and）",
+        "位或/逻辑或（i64/i1，生成 or）", "位异或，生成 xor i64",
+        "按位非，生成 xor -1（i1 用 xor true）", "左移，生成 shl i64",
+        "算术右移，生成 ashr i64（tie 有符号）",
+        "整数比较，生成 icmp cc（cc=操作数③立即数）",
+        "浮点加，生成 fadd double", "浮点减，生成 fsub double",
+        "浮点乘，生成 fmul double", "浮点除，生成 fdiv double",
+        "浮点模，生成 frem double", "浮点比较，生成 fcmp cc",
+        "栈分配，生成 alloca Ty（入口块提升，F1 方案）",
+        "读内存，生成 load Ty, ptr 操作数①",
+        "写内存，生成 store Ty, ptr（无结果，ty=-1）",
+        "元素指针，生成 getelementptr Ty, ptr, i64 下标",
+        "指针转整数，生成 ptrtoint i64",
+        "整数转指针，生成 inttoptr ptr",
+        "位重解释，生成 bitcast Ty to Ty2",
+        "无条件跳，生成 br label 操作数①（块）",
+        "条件跳，生成 br i1 条件, label then, label else（①②③）",
+        "返回，生成 ret Ty / ret void（无操作数）",
+        "跳转表，生成 switch i64, label dflt（case 成对=立即数+块）",
+        "不可达，生成 unreachable",
+        "汇合，生成 phi Ty [值, 块]（预留，T2.3 后启用）",
+        "三目，生成 select i1, Ty, Ty",
+        "普通调用，生成 call Ty @f（结果=值 id）",
+        "变参调用（printf 族），生成 call i32 (ptr, ...)，编号占 2 槽",
+        "外部符号调用，生成 call Ty @ext（extern 已声明）",
+        "printf 归约（gen_printf 同款）",
+        "打印并换行，printf + 换行格式",
+        "打印不换行，printf 原样输出（附 fflush）",
+        "建表，生成 call ptr @tie_table_new(elem_size)（操作数①=元素大小）",
+        "表追加，生成 call void @tie_table_push(ptr, val)",
+        "表取元素，gep+load（越界走运行时错误）",
+        "表写元素，gep+store", "表长，load len 字段",
+        "表元素指针，gep 取地址（by_ref/by_ptr 传参路径）",
+        "字符串拼接，memcpy 内联（ir.rs 同款）",
+        "字符串长，生成 call @strlen",
+        "表实参展开拷贝，建新表+逐元素拷贝（A6 路径）",
+        "整数常量，内联常量操作数（无独立值编号）",
+        "浮点常量，全局常量或内联",
+        "字符串常量，生成字符串全局常量 + 地址值",
+        "空指针，生成 null", "全局符号地址，生成 @g（变量/函数名）"]
+    op_keys = table_new_i64()
+    op_names = table_new_string()
+    op_groups = table_new_i64()
+    op_descs = table_new_string()
+    var i: i64 = 0
+    while i < len(ks) {
+        table_push(op_keys, ks[i])
+        table_push(op_names, ns[i])
+        table_push(op_groups, gs[i])
+        table_push(op_descs, ds[i])
+        i = i + 1
+    }
+}
+
+// ---------- opcode 表访问器 ----------
+
+func op_find(op: i64) -> i64 {
+    var lo: i64 = 0
+    var hi: i64 = len(op_keys) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        var kv = op_keys[mid]
+        if kv == op {
+            return mid
+        }
+        if kv < op {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+pub func op_count() -> i64 {
+    ensure_opcodes()
+    return len(op_keys)
+}
+pub func op_name(op: i64) -> string {
+    ensure_opcodes()
+    var idx = op_find(op)
+    if idx < 0 {
+        return ""
+    }
+    return op_names[idx]
+}
+pub func op_group(op: i64) -> i64 {
+    ensure_opcodes()
+    var idx = op_find(op)
+    if idx < 0 {
+        return -1
+    }
+    return op_groups[idx]
+}
+pub func op_desc(op: i64) -> string {
+    ensure_opcodes()
+    var idx = op_find(op)
+    if idx < 0 {
+        return ""
+    }
+    return op_descs[idx]
+}
+// ---------- 新建/复位 ----------
+// ir_meta.reset_meta 配套复位（避免循环依赖）。
+pub func new_module() -> i64 {
+    ir_funcs_names = table_new_i64()
+    ir_funcs_rets = table_new_i64()
+    ir_funcs_params_off = table_new_i64()
+    ir_funcs_params_cnt = table_new_i64()
+    ir_funcs_entry = table_new_i64()
+    ir_funcs_inst_total = table_new_i64()
+    ir_funcs_exported = table_new_i64()
+    ir_blocks_func = table_new_i64()
+    ir_blocks_name = table_new_i64()
+    ir_blocks_start = table_new_i64()
+    ir_blocks_end = table_new_i64()
+    ir_insts_op = table_new_i64()
+    ir_insts_ty = table_new_i64()
+    ir_insts_val = table_new_i64()
+    ir_insts_ops_off = table_new_i64()
+    ir_insts_ops_cnt = table_new_i64()
+    ir_ops = table_new_i64()
+    ir_ops_kind = table_new_i64()
+    ir_val_cnt = 0
+    return 0
+}
+
+// ---------- 值编号（单调递增，后端无需 renumber）----------
+pub func new_value() -> i64 {
+    var v = ir_val_cnt
+    ir_val_cnt = ir_val_cnt + 1
+    return v
+}
+
+// ---------- builder：函数 ----------
+// 新建函数：name_id 函数名（池 id）、ret_ty 返回类型（types 自编码；
+pub func new_func(name_id: i64, ret_ty: i64, params: table<i64>) -> i64 {
+    var fid = len(ir_funcs_names)
+    table_push(ir_funcs_names, name_id)
+    table_push(ir_funcs_rets, ret_ty)
+    table_push(ir_funcs_params_off, len(ir_ops))
+    table_push(ir_funcs_params_cnt, len(params))
+    table_push(ir_funcs_entry, -1)
+    table_push(ir_funcs_inst_total, 0)
+    table_push(ir_funcs_exported, 0)
+    var i: i64 = 0
+    while i < len(params) {
+        var pv = new_value()
+        table_push(ir_ops, pv)
+        table_push(ir_ops_kind, OK_VALUE)
+        i = i + 1
+    }
+    return fid
+}
+
+pub func new_block(func_id: i64, name_id: i64) -> i64 {
+    var bid = len(ir_blocks_func)
+    table_push(ir_blocks_func, func_id)
+    table_push(ir_blocks_name, name_id)
+    table_push(ir_blocks_start, len(ir_insts_op))
+    table_push(ir_blocks_end, len(ir_insts_op))
+    if ir_funcs_entry[func_id] < 0 {
+        ir_funcs_entry[func_id] = bid
+    }
+    return bid
+}
+
+// 新建指令：block_id 所在块、opcode、ty 结果类型（types 自编码；
+pub func new_inst(block_id: i64, opcode: i64, ty: i64) -> i64 {
+    var iid = len(ir_insts_op)
+    table_push(ir_insts_op, opcode)
+    table_push(ir_insts_ty, ty)
+    if ty < 0 {
+        table_push(ir_insts_val, -1)
+    } else {
+        table_push(ir_insts_val, new_value())
+    }
+    table_push(ir_insts_ops_off, len(ir_ops))
+    table_push(ir_insts_ops_cnt, 0)
+    if ir_blocks_end[block_id] == ir_blocks_start[block_id] {
+        ir_blocks_start[block_id] = iid
+    }
+    ir_blocks_end[block_id] = iid + 1
+    var fid = ir_blocks_func[block_id]
+    ir_funcs_inst_total[fid] = ir_funcs_inst_total[fid] + 1
+    return iid
+}
+
+pub func add_operand(inst_id: i64, operand: i64, kind: i64) {
+    table_push(ir_ops, operand)
+    table_push(ir_ops_kind, kind)
+    ir_insts_ops_cnt[inst_id] = ir_insts_ops_cnt[inst_id] + 1
+}
+
+// ---------- 导出标记 ----------
+pub func func_export_set(func_id: i64, v: i64) {
+    ir_funcs_exported[func_id] = v
+}
+
+pub func func_count() -> i64 {
+    return len(ir_funcs_names)
+}
+pub func block_count() -> i64 {
+    return len(ir_blocks_func)
+}
+pub func inst_count() -> i64 {
+    return len(ir_insts_op)
+}
+pub func value_count() -> i64 {
+    return ir_val_cnt
+}
+
+// ---------- 函数表访问器 ----------
+
+pub func func_name(func_id: i64) -> i64 {
+    return ir_funcs_names[func_id]
+}
+pub func func_ret(func_id: i64) -> i64 {
+    return ir_funcs_rets[func_id]
+}
+pub func func_params_off(func_id: i64) -> i64 {
+    return ir_funcs_params_off[func_id]
+}
+pub func func_params_cnt(func_id: i64) -> i64 {
+    return ir_funcs_params_cnt[func_id]
+}
+pub func func_entry(func_id: i64) -> i64 {
+    return ir_funcs_entry[func_id]
+}
+pub func func_inst_total(func_id: i64) -> i64 {
+    return ir_funcs_inst_total[func_id]
+}
+pub func func_exported(func_id: i64) -> i64 {
+    return ir_funcs_exported[func_id]
+}
+
+// ---------- 块表访问器 ----------
+
+pub func block_func(block_id: i64) -> i64 {
+    return ir_blocks_func[block_id]
+}
+pub func block_name(block_id: i64) -> i64 {
+    return ir_blocks_name[block_id]
+}
+pub func block_start(block_id: i64) -> i64 {
+    return ir_blocks_start[block_id]
+}
+pub func block_end(block_id: i64) -> i64 {
+    return ir_blocks_end[block_id]
+}
+
+// ---------- 指令表访问器 ----------
+
+pub func ins_op(inst_id: i64) -> i64 {
+    return ir_insts_op[inst_id]
+}
+pub func ins_ty(inst_id: i64) -> i64 {
+    return ir_insts_ty[inst_id]
+}
+// 指令结果值 id（无结果指令 -1）。llvmgen 直读生成寄存器名，无需 renumber。
+pub func ins_val(inst_id: i64) -> i64 {
+    return ir_insts_val[inst_id]
+}
+pub func ins_ops_off(inst_id: i64) -> i64 {
+    return ir_insts_ops_off[inst_id]
+}
+pub func ins_ops_cnt(inst_id: i64) -> i64 {
+    return ir_insts_ops_cnt[inst_id]
+}
+
+
+pub func ins_opnd(inst_id: i64, k: i64) -> i64 {
+    var off = ir_insts_ops_off[inst_id]
+    var cnt = ir_insts_ops_cnt[inst_id]
+    if k < 0 || k >= cnt {
+        return -1
+    }
+    return ir_ops[off + k]
+}
+pub func ins_opnd_kind(inst_id: i64, k: i64) -> i64 {
+    var off = ir_insts_ops_off[inst_id]
+    var cnt = ir_insts_ops_cnt[inst_id]
+    if k < 0 || k >= cnt {
+        return -1
+    }
+    return ir_ops_kind[off + k]
+}
+pub func get_value(inst_id: i64) -> i64 {
+    return ir_insts_val[inst_id]
+}
+
+}   // namespace ir

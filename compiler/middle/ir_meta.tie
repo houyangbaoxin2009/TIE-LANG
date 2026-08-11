@@ -1,0 +1,400 @@
+// tie:library
+// compiler/middle/ir_meta.tie —— 自举 v2 T2.2：tie-IR 元信息侧表
+// ============================================================
+// 里程碑：自举 v2 计划 T2.2（用户决策 2026-08-10：IR 保留源元数据，
+// pkg 分发从源码切换为二进制 IR——侧表是 .tieir 序列化（T6.1）的
+// 数据源）。本模块与 ir.tie（IR 本体）配套：**本体只管结构，侧表管
+// 元信息**，两者通过指令/符号 id 关联。llvmgen（T2.8）消费本体，
+// 错误定位/包导出/文档工具链消费本模块。
+//
+// # 侧表清单（全部 id = 下标或经 columnar 排序对）
+//   1. inst_span 表：指令/声明 id -> 文件/行/列（错误定位，对齐 Rust
+//      「@行:列」约定；file 为字符串池 id，行/列 1-based）
+//   2. sym_table：函数/struct/命名空间 -> 符号名（池 id）+ 签名
+//      （池 id）+ 类别 + 可见性 + 源 span——跨包 import 契约的基础
+//   3. export_table：包级公开 API 清单（install/build 链接目标，
+//      .tieir 导出节数据源）
+//   4. doc_comment 表：符号/节点 id -> 文档字符串池 id（**词法保留
+//      /// 注释是 T2.4 的事**，本任务先建表结构 + setter/getter）
+//   5. 模块头元数据：包名/版本/依赖图/IR 版本/编译器版本
+//   6. dump_meta() -> string：调试输出元信息摘要（--dump-ir-meta 用）
+//
+// # 与 ir.tie 的关系（正向依赖，无环）
+//   本模块 import ir.tie 读取 IR 本体（如 export_func 取函数名）；
+//   ir.tie 不反向 import 本模块。复位分两步：ir.new_module() 复位
+//   本体，ir_meta.reset_meta() 复位侧表（测试/多模块编译时先调）。
+//
+// # 关键设计
+//   - span/sym/export 表按「追加式 + 下标访问」，行号即 id；同名符号
+//     set_sym 为覆盖式（对齐语义层符号表覆盖语义）；
+//   - doc/dep 表用 columnar 排序对（键升序 + 二分），查询 O(log n)；
+//   - 字符串一律池 id（interner.intern），比较/序列化经池；
+//   - 模块头标量为 i64（池 id / 版本号），-1/0 = 未设置哨兵。
+//
+// # 与 Rust ir.rs 的对应（行为基准）
+//   Rust 侧错误定位直接内嵌在生成文本中（gen_runtime_error @4222）；
+//   tie 版改为侧表后由 llvmgen/解释器统一消费，行/列语义一致
+//   （1-based，字节列，见 docs/bench/audit.md T0.2 结论）。
+//
+// 调用：import 后 ir_meta.set_inst_span(...) / ir_meta.dump_meta()
+// 命名规范：命名空间内函数不加 ir_meta_ 前缀；内部工具私有（非 pub）。
+
+import "./ir.tie"
+import "../lib/columnar.tie"
+
+// ---------- 符号类别常量（sym_table kind 列）----------
+const SYM_FUNC: i64 = 0;       // 函数
+const SYM_STRUCT: i64 = 1;     // struct
+const SYM_NAMESPACE: i64 = 2;  // 命名空间
+const SYM_GLOBAL: i64 = 3;     // 顶层全局变量（var/const）
+
+// ---------- 可见性常量（sym_table vis 列）----------
+const VIS_PRIV: i64 = 0;       // 私有（默认，命名空间内私有边界）
+const VIS_PUB: i64 = 1;        // 公开（pub 导出）
+
+// ---------- 全局侧表（显式分号）----------
+// inst_span 表（行号 = 指令/声明 id；未设置 = 0/0/0）
+var meta_span_file: table<i64>;   // 文件（字符串池 id；0 = 未设置）
+var meta_span_line: table<i64>;   // 行（1-based；0 = 未设置）
+var meta_span_col: table<i64>;    // 列（1-based；0 = 未设置）
+// sym_table（行号 = 符号 id；追加式 + 同名覆盖）
+var sym_names: table<i64>;        // 符号名（池 id）
+var sym_sigs: table<i64>;         // 签名文本（池 id；-1 = 未提供）
+var sym_kinds: table<i64>;        // 类别（SYM_*）
+var sym_vis: table<i64>;          // 可见性（VIS_*）
+var sym_lines: table<i64>;        // 声明行（1-based）
+var sym_cols: table<i64>;         // 声明列（1-based）
+// export_table（行号 = 导出 id；追加式）
+var exp_names: table<i64>;        // 导出名（池 id）
+var exp_sigs: table<i64>;         // 导出签名（池 id；-1 = 未提供）
+var exp_lines: table<i64>;        // 导出行（1-based）
+var exp_cols: table<i64>;         // 导出列（1-based）
+// doc_comment 表（columnar 排序对：符号/节点 id -> 文档池 id）
+var doc_keys: table<i64>;         // 关联 id（符号 id/节点 id，升序）
+var doc_vals: table<i64>;         // 文档字符串池 id
+// 模块头元数据（标量；0 = 未设置哨兵——全局初始化须为字面量，
+// -1 是表达式会被语义层拦截，实测 2026-08-11；dump 时按 0 判未设置）
+var meta_pkg_name: i64 = 0;        // 包名（池 id；0 = 未设置）
+var meta_pkg_version: i64 = 0;     // 包版本（池 id，如 "0.1.0"）
+var meta_ir_version: i64 = 0;      // IR 格式版本号（.tieir 头校验用）
+var meta_compiler_version: i64 = 0;// 编译器版本（池 id）
+// 依赖图（columnar 排序对：包名池 id -> 版本池 id）
+var dep_keys: table<i64>;         // 依赖包名（升序）
+var dep_vals: table<i64>;         // 依赖版本
+
+namespace ir_meta {
+
+// ---------- 复位 ----------
+
+// 复位全部侧表（配合 ir.new_module 使用；多模块编译时每个模块前调用）。
+pub func reset_meta() {
+    meta_span_file = table_new_i64()
+    meta_span_line = table_new_i64()
+    meta_span_col = table_new_i64()
+    sym_names = table_new_i64()
+    sym_sigs = table_new_i64()
+    sym_kinds = table_new_i64()
+    sym_vis = table_new_i64()
+    sym_lines = table_new_i64()
+    sym_cols = table_new_i64()
+    exp_names = table_new_i64()
+    exp_sigs = table_new_i64()
+    exp_lines = table_new_i64()
+    exp_cols = table_new_i64()
+    doc_keys = table_new_i64()
+    doc_vals = table_new_i64()
+    dep_keys = table_new_i64()
+    dep_vals = table_new_i64()
+    meta_pkg_name = 0
+    meta_pkg_version = 0
+    meta_ir_version = 0
+    meta_compiler_version = 0
+}
+
+// ---------- inst_span 表（错误定位）----------
+// 语义/IR 生成阶段为每条指令记录源位置；llvmgen 生成运行时错误
+// 消息、T6.1 序列化 span 节时按指令 id 直读。
+
+// 表长对齐到 >= id+1（未设置的槽位保持哨兵）。
+func ensure_span_len(id: i64) {
+    while len(meta_span_line) <= id {
+        table_push(meta_span_file, 0)
+        table_push(meta_span_line, 0)
+        table_push(meta_span_col, 0)
+    }
+}
+
+// 设置指令/声明 id 的行/列（1-based）。调用方（frontend）在生成
+// 每条指令后调用；重复设置覆盖。
+pub func set_inst_span(inst_id: i64, line: i64, col: i64) {
+    ensure_span_len(inst_id)
+    meta_span_line[inst_id] = line
+    meta_span_col[inst_id] = col
+}
+
+// 设置指令所属文件（字符串池 id；默认 -1 未设置，单文件编译可省）。
+pub func set_inst_file(inst_id: i64, file_id: i64) {
+    ensure_span_len(inst_id)
+    meta_span_file[inst_id] = file_id
+}
+
+// 读取行（0 = 未设置）。
+pub func inst_line(inst_id: i64) -> i64 {
+    if inst_id < 0 || inst_id >= len(meta_span_line) {
+        return 0
+    }
+    return meta_span_line[inst_id]
+}
+
+// 读取列（0 = 未设置）。
+pub func inst_col(inst_id: i64) -> i64 {
+    if inst_id < 0 || inst_id >= len(meta_span_col) {
+        return 0
+    }
+    return meta_span_col[inst_id]
+}
+
+// 读取文件 id（0 = 未设置）。
+pub func inst_file(inst_id: i64) -> i64 {
+    if inst_id < 0 || inst_id >= len(meta_span_file) {
+        return 0
+    }
+    return meta_span_file[inst_id]
+}
+
+// 已登记 span 条数（= 侧表长度）。
+pub func span_count() -> i64 {
+    return len(meta_span_line)
+}
+
+// ---------- sym_table（符号表：函数/struct/命名空间）----------
+
+// 登记/覆盖符号：name_id 符号名（池 id）、sig_id 签名文本（池 id，
+// 如 "fn(a: i64, b: i64) -> i64"；-1 = 无签名）、kind 类别（SYM_*）、
+// vis 可见性（VIS_*）、line/col 声明位置。同名符号覆盖式更新
+// （对齐语义层符号表覆盖语义）；返回符号 id（下标）。
+pub func set_sym(name_id: i64, sig_id: i64, kind: i64, vis: i64, line: i64, col: i64) -> i64 {
+    var idx = sym_find(name_id)
+    if idx >= 0 {
+        sym_sigs[idx] = sig_id
+        sym_kinds[idx] = kind
+        sym_vis[idx] = vis
+        sym_lines[idx] = line
+        sym_cols[idx] = col
+        return idx
+    }
+    var nid = len(sym_names)
+    table_push(sym_names, name_id)
+    table_push(sym_sigs, sig_id)
+    table_push(sym_kinds, kind)
+    table_push(sym_vis, vis)
+    table_push(sym_lines, line)
+    table_push(sym_cols, col)
+    return nid
+}
+
+// 按符号名查 id（线性扫描；符号数量级小）。未找到返回 -1。
+pub func sym_find(name_id: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(sym_names) {
+        if sym_names[i] == name_id {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 符号总数。
+pub func sym_count() -> i64 {
+    return len(sym_names)
+}
+
+// 访问器：符号 id -> 各列（越界返回哨兵）。
+pub func sym_name(sym_id: i64) -> i64 {
+    return sym_names[sym_id]
+}
+
+pub func sym_sig(sym_id: i64) -> i64 {
+    return sym_sigs[sym_id]
+}
+
+pub func sym_kind(sym_id: i64) -> i64 {
+    return sym_kinds[sym_id]
+}
+
+pub func sym_vis(sym_id: i64) -> i64 {
+    return sym_vis[sym_id]
+}
+
+pub func sym_line(sym_id: i64) -> i64 {
+    return sym_lines[sym_id]
+}
+
+pub func sym_col(sym_id: i64) -> i64 {
+    return sym_cols[sym_id]
+}
+
+// ---------- export_table（包级公开 API 清单）----------
+
+// 登记导出：func_id 为 IR 函数 id（函数名/签名自动从 IR 本体与
+// sym_table 读取），line/col 为声明位置。同时把 IR 侧函数导出
+// 标记置 1（llvmgen 可见）。返回导出 id。
+pub func export_func(func_id: i64, line: i64, col: i64) -> i64 {
+    ir.func_export_set(func_id, 1)
+    var name_id = ir.func_name(func_id)
+    // 签名从符号表取（未登记符号时回退 -1，防御越界）
+    var sid = sym_find(name_id)
+    var sig_id: i64 = -1
+    if sid >= 0 {
+        sig_id = sym_sigs[sid]
+    }
+    var eid = len(exp_names)
+    table_push(exp_names, name_id)
+    table_push(exp_sigs, sig_id)
+    table_push(exp_lines, line)
+    table_push(exp_cols, col)
+    return eid
+}
+
+// 直接登记导出（名字/签名为显式池 id；跨模块导入的符号导出用）。
+pub func export_add(name_id: i64, sig_id: i64, line: i64, col: i64) -> i64 {
+    var eid = len(exp_names)
+    table_push(exp_names, name_id)
+    table_push(exp_sigs, sig_id)
+    table_push(exp_lines, line)
+    table_push(exp_cols, col)
+    return eid
+}
+
+// 导出总数。
+pub func export_count() -> i64 {
+    return len(exp_names)
+}
+
+// 访问器：导出 id -> 各列（越界返回 -1）。
+pub func exp_name(exp_id: i64) -> i64 {
+    return exp_names[exp_id]
+}
+
+pub func exp_sig(exp_id: i64) -> i64 {
+    return exp_sigs[exp_id]
+}
+
+pub func exp_line(exp_id: i64) -> i64 {
+    return exp_lines[exp_id]
+}
+
+pub func exp_col(exp_id: i64) -> i64 {
+    return exp_cols[exp_id]
+}
+
+// ---------- doc_comment 表（节点/符号 -> 文档池 id）----------
+// 表结构 + setter/getter 先行；**词法保留 /// 注释是 T2.4 的任务**，
+// 届时 lexer 把文档字符串登记进池，frontend 调 set_doc 关联到节点。
+
+pub func set_doc(key: i64, doc_id: i64) {
+    columnar.set_pair_i64(doc_keys, doc_vals, key, doc_id)
+}
+
+pub func get_doc(key: i64) -> i64 {
+    var idx = columnar.bs_find_i64(doc_keys, key)
+    if idx < 0 {
+        return -1
+    }
+    return doc_vals[idx]
+}
+
+// 已登记文档条数。
+pub func doc_count() -> i64 {
+    return len(doc_keys)
+}
+
+// ---------- 模块头元数据（.tieir 头节数据源）----------
+
+// 设置包名（池 id）。
+pub func set_pkg_name(name_id: i64) {
+    meta_pkg_name = name_id
+}
+
+pub func get_pkg_name() -> i64 {
+    return meta_pkg_name
+}
+
+// 设置包版本（池 id，如 "0.1.0"）。
+pub func set_pkg_version(ver_id: i64) {
+    meta_pkg_version = ver_id
+}
+
+pub func get_pkg_version() -> i64 {
+    return meta_pkg_version
+}
+
+// 设置 IR 格式版本号（.tieir 头校验；本模块初版 = 1）。
+pub func set_ir_version(v: i64) {
+    meta_ir_version = v
+}
+
+pub func get_ir_version() -> i64 {
+    return meta_ir_version
+}
+
+// 设置编译器版本（池 id）。
+pub func set_compiler_version(ver_id: i64) {
+    meta_compiler_version = ver_id
+}
+
+pub func get_compiler_version() -> i64 {
+    return meta_compiler_version
+}
+
+// ---------- 依赖图（包名 -> 版本，升序 + 二分）----------
+
+// 登记依赖：包名池 id -> 版本池 id（覆盖式；key 必须为池 id）。
+pub func set_dep(name_id: i64, ver_id: i64) {
+    columnar.set_pair_i64(dep_keys, dep_vals, name_id, ver_id)
+}
+
+// 依赖总数。
+pub func dep_count() -> i64 {
+    return len(dep_keys)
+}
+
+// 访问器：依赖 id -> 包名/版本（越界返回 -1）。
+pub func dep_name(dep_id: i64) -> i64 {
+    return dep_keys[dep_id]
+}
+
+pub func dep_ver(dep_id: i64) -> i64 {
+    return dep_vals[dep_id]
+}
+
+// ---------- dump_meta（--dump-ir-meta 调试输出）----------
+
+// 池 id -> 串；0（未设置哨兵）显示 "-"。
+func name_or_dash(id: i64) -> string {
+    if id <= 0 {
+        return "-"
+    }
+    return interner.name_str(id)
+}
+
+pub func dump_meta() -> string {
+    var s = "[IR 元信息] "
+    s = s + "包=" + name_or_dash(meta_pkg_name)
+    s = s + " 版本=" + name_or_dash(meta_pkg_version)
+    s = s + " IR版本=" + to_string(meta_ir_version)
+    s = s + " 编译器=" + name_or_dash(meta_compiler_version)
+    s = s + " 依赖=" + to_string(dep_count())
+    s = s + " | IR 规模: 函数=" + to_string(ir.func_count())
+    s = s + " 块=" + to_string(ir.block_count())
+    s = s + " 指令=" + to_string(ir.inst_count())
+    s = s + " 值=" + to_string(ir.value_count())
+    s = s + " | 侧表: span=" + to_string(span_count())
+    s = s + " 符号=" + to_string(sym_count())
+    s = s + " 导出=" + to_string(export_count())
+    s = s + " doc=" + to_string(doc_count())
+    return s
+}
+
+}   // namespace ir_meta

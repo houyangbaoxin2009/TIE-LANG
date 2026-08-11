@@ -1,0 +1,270 @@
+// tie:logic
+// compiler/middle/ir_test.tie —— 自举 v2 T2.2：列式 tie-IR 单元验收
+// ============================================================
+// 里程碑：自举 v2 计划 T2.2 验收（builder 单元测试）。构造一个 2 块
+// 小函数 f(a: i64, b: i64) -> i64（entry + if.then），逐一检查：
+//   - 各表计数（函数/块/指令/值）
+//   - 值编号单调递增（参数 %0 %1 → add %2 → icmp %3，ret 无结果 -1）
+//   - span 记录（set_inst_span 后按指令 id 读回）
+//   - export 登记（ir_meta.export_func → 导出清单 + IR 侧标记）
+//   - 符号表 / doc 表 / 模块头元数据 / 依赖图 / dump_meta
+// 全部通过输出「ir 自检通过」exit 0；任一失败打印明细 exit 1。
+//
+// # 构造的 IR（对应 LLVM 形态，便于人工核对）
+//   define i64 @f(i64 %0, i64 %1) {
+//     entry:                               ; 块 0
+//       %2 = add i64 %0, %1                ; 指令 0（值 2）
+//       %3 = icmp slt i64 %0, %1           ; 指令 1（值 3；比较码 2=lt）
+//       br i1 %3, label %if.then, label %entry ; 指令 2（无结果）
+//     if.then:                             ; 块 1
+//       ret i64 %2                         ; 指令 3（无结果）
+//   }
+//   值编号 0..3 单调，ret 无结果值 → ins_val = -1。
+//
+// # 语言边界应用（同 ir.tie 文件头）
+//   - import 文本内联后顶层常量与 ir.tie/ir_meta.tie 全局定义同作用域：
+//     重名即「重复定义」报错，故本文件**不定义本地常量**，opcode/
+//     类别/类型一律字面量 + 注释（op_name/op_desc 访问器防漂移）；
+//   - 前缀调用（ir.xxx / ir_meta.xxx），不用 using；
+//   - 断言失败累积用嵌套 if（&& 非短路，不依赖求值序）。
+//
+// 运行（repo 根，pwsh）：
+//   target\release\tie-llvm.exe compiler\middle\ir_test.tie -o <tmp>\irtest.exe
+//   <tmp>\irtest.exe        # -> 「ir 自检通过」exit 0
+
+import "./ir_meta.tie"
+import "./types.tie"
+
+// 常量说明（不用本地 const 重定义——import 文本内联后顶层常量与
+// ir.tie/ir_meta.tie 的全局定义同作用域，重名即「重复定义」报错，
+// 实测 2026-08-11）：
+//   opcode：add=0 icmp=12 cond_br=31 ret=32（对齐 ir.tie OP_*）
+//   操作数类别：0=值 1=块 2=立即数（对齐 ir.tie OK_*）
+//   符号类别/可见性：0=函数 1=pub（对齐 ir_meta SYM_*/VIS_*）
+//   类型 id：i64=3 bool=10（TyKw 索引，types.tie；调用 types.named 验证）
+
+// 断言辅助：失败打印明细并返回 false；main 累积全部结果。
+func check(ok: bool, what: string) -> bool {
+    if !ok {
+        println("自检失败: " + what)
+    }
+    return ok
+}
+
+func main() {
+    // 新建 module + 复位侧表（本体与元信息配套复位）
+    ir.new_module()
+    ir_meta.reset_meta()
+    var ok: bool = true
+
+    // ---------- 模块头元数据 ----------
+    ir_meta.set_pkg_name(interner.intern("demo_pkg"))
+    ir_meta.set_pkg_version(interner.intern("0.1.0"))
+    ir_meta.set_ir_version(1)
+    ir_meta.set_compiler_version(interner.intern("tiec-0.0.1"))
+    ir_meta.set_dep(interner.intern("std"), interner.intern("1.0.0"))
+    if !check(ir_meta.get_pkg_name() == interner.intern("demo_pkg"), "包名登记") {
+        ok = false
+    }
+    if !check(ir_meta.get_ir_version() == 1, "IR 版本登记") {
+        ok = false
+    }
+    if !check(ir_meta.get_compiler_version() == interner.intern("tiec-0.0.1"), "编译器版本登记") {
+        ok = false
+    }
+    if !check(ir_meta.dep_count() == 1, "依赖登记") {
+        ok = false
+    }
+
+    // ---------- 函数 f(a: i64, b: i64) -> i64 ----------
+    var nm_f = interner.intern("f")
+    var params: table<i64> = table_new_i64()
+    table_push(params, types.named(3))
+    table_push(params, types.named(3))
+    var f = ir.new_func(nm_f, types.named(3), params)
+    if !check(f == 0, "函数 id 从 0 起") {
+        ok = false
+    }
+    if !check(ir.value_count() == 2, "参数领号（两个参数）") {
+        ok = false
+    }
+    if !check(ir.func_params_cnt(f) == 2, "参数个数") {
+        ok = false
+    }
+
+    // ---------- 两个块：entry + if.then ----------
+    var blk_entry = ir.new_block(f, interner.intern("entry"))
+    var blk_then = ir.new_block(f, interner.intern("if.then"))
+    if !check(ir.block_count() == 2, "块数 2") {
+        ok = false
+    }
+    if !check(ir.func_entry(f) == blk_entry, "首块自动为入口") {
+        ok = false
+    }
+    if !check(ir.block_func(blk_then) == f, "块所属函数") {
+        ok = false
+    }
+
+    // ---------- entry 块指令：add / icmp / cond_br ----------
+    var i0 = ir.new_inst(blk_entry, 0, types.named(3))
+    ir.add_operand(i0, 0, 0)     // %0 = a
+    ir.add_operand(i0, 1, 0)     // %1 = b
+    var i1 = ir.new_inst(blk_entry, 12, types.named(10))
+    ir.add_operand(i1, 0, 0)     // %0
+    ir.add_operand(i1, 1, 0)     // %1
+    ir.add_operand(i1, 2, 2)       // 比较码 2 = lt（slt）
+    var i2 = ir.new_inst(blk_entry, 31, -1)
+    ir.add_operand(i2, ir.get_value(i1), 0)  // %3 条件
+    ir.add_operand(i2, blk_then, 1)          // then 块
+    ir.add_operand(i2, blk_entry, 1)         // else 块（自环）
+
+    // ---------- if.then 块指令：ret ----------
+    var i3 = ir.new_inst(blk_then, 32, -1)
+    ir.add_operand(i3, ir.get_value(i0), 0)  // %2 返回值
+
+    // ---------- 计数断言 ----------
+    if !check(ir.func_count() == 1, "函数计数") {
+        ok = false
+    }
+    if !check(ir.inst_count() == 4, "指令数 ≥3（实际 4）") {
+        ok = false
+    }
+    if !check(ir.value_count() == 4, "值编号 0..3 共 4 个") {
+        ok = false
+    }
+
+    // ---------- 值编号单调递增（后端无需 renumber 的基础）----------
+    if !check(ir.ins_val(i0) == 2, "add 结果值 = 2") {
+        ok = false
+    }
+    if !check(ir.ins_val(i1) == 3, "icmp 结果值 = 3（单调递增）") {
+        ok = false
+    }
+    if !check(ir.ins_val(i2) == -1, "cond_br 无结果值 -1") {
+        ok = false
+    }
+    if !check(ir.ins_val(i3) == -1, "ret 无结果值 -1") {
+        ok = false
+    }
+
+    // ---------- 指令表内容 ----------
+    if !check(ir.ins_op(i0) == 0 && ir.op_name(0) == "add", "add opcode/名") {
+        ok = false
+    }
+    if !check(ir.op_name(31) == "cond_br", "cond_br 名") {
+        ok = false
+    }
+    if !check(ir.op_desc(0) != "", "opcode T2.8 说明非空") {
+        ok = false
+    }
+    if !check(ir.op_group(64) == 5, "常量组号（60-64）") {
+        ok = false
+    }
+    if !check(ir.ins_ops_cnt(i0) == 2, "add 操作数 2 个") {
+        ok = false
+    }
+    if !check(ir.ins_opnd(i0, 0) == 0, "add 操作数① = 参数 a") {
+        ok = false
+    }
+    if !check(ir.ins_opnd(i1, 2) == 2, "icmp 操作数③ = 比较码 2") {
+        ok = false
+    }
+    if !check(ir.ins_opnd_kind(i1, 2) == 2, "icmp 比较码为立即数") {
+        ok = false
+    }
+    if !check(ir.ins_opnd(i2, 1) == blk_then, "cond_br then 块") {
+        ok = false
+    }
+    if !check(ir.ins_opnd_kind(i2, 1) == 1, "cond_br 块操作数类别") {
+        ok = false
+    }
+    if !check(ir.ins_opnd(i3, 0) == ir.get_value(i0), "ret 操作数 = add 结果值") {
+        ok = false
+    }
+
+    // ---------- 块表指令段（含边界）----------
+    if !check(ir.block_start(blk_entry) == 0 && ir.block_end(blk_entry) == 3, "entry 指令段 0..2") {
+        ok = false
+    }
+    if !check(ir.block_start(blk_then) == 3 && ir.block_end(blk_then) == 4, "if.then 指令段 3") {
+        ok = false
+    }
+    if !check(ir.func_inst_total(f) == 4, "函数指令总数") {
+        ok = false
+    }
+    if !check(ir.func_ret(f) == types.named(3), "函数返回类型") {
+        ok = false
+    }
+
+    // ---------- span 记录（错误定位侧表）----------
+    ir_meta.set_inst_span(i0, 10, 5)
+    ir_meta.set_inst_span(i2, 12, 3)
+    if !check(ir_meta.inst_line(i0) == 10 && ir_meta.inst_col(i0) == 5, "add span 记录") {
+        ok = false
+    }
+    if !check(ir_meta.inst_line(i2) == 12 && ir_meta.inst_col(i2) == 3, "cond_br span 记录") {
+        ok = false
+    }
+    if !check(ir_meta.inst_line(i3) == 0, "未设置 span 哨兵 0") {
+        ok = false
+    }
+    if !check(ir_meta.span_count() == 3, "span 表长度") {
+        ok = false
+    }
+
+    // ---------- 符号表（函数/struct/命名空间）----------
+    var sig_id = interner.intern("fn(a: i64, b: i64) -> i64")
+    var sid = ir_meta.set_sym(nm_f, sig_id, 0, 1, 1, 1)
+    if !check(ir_meta.sym_count() == 1, "符号登记") {
+        ok = false
+    }
+    if !check(ir_meta.sym_find(nm_f) == sid, "符号按名查找") {
+        ok = false
+    }
+    if !check(ir_meta.sym_sig(sid) == sig_id, "符号签名") {
+        ok = false
+    }
+    if !check(ir_meta.sym_vis(sid) == 1, "符号可见性 pub") {
+        ok = false
+    }
+
+    // ---------- export 登记（包级公开 API）----------
+    var eid = ir_meta.export_func(f, 1, 1)
+    if !check(ir_meta.export_count() == 1, "导出登记") {
+        ok = false
+    }
+    if !check(ir_meta.exp_name(eid) == nm_f, "导出名 = 函数名") {
+        ok = false
+    }
+    if !check(ir.func_exported(f) == 1, "IR 侧导出标记置 1") {
+        ok = false
+    }
+
+    // ---------- doc_comment 表（结构先行，T2.4 词法接入）----------
+    var doc_id = interner.intern("/// 计算 a+b 并比较")
+    ir_meta.set_doc(sid, doc_id)
+    if !check(ir_meta.get_doc(sid) == doc_id, "doc 登记/查询") {
+        ok = false
+    }
+    if !check(ir_meta.doc_count() == 1, "doc 条数") {
+        ok = false
+    }
+    if !check(ir_meta.get_doc(999) == -1, "doc 未设置哨兵 -1") {
+        ok = false
+    }
+
+    // ---------- dump_meta（--dump-ir-meta 调试输出）----------
+    var dump = ir_meta.dump_meta()
+    if !check(len(dump) > 40, "dump_meta 摘要输出") {
+        ok = false
+    }
+    if !check(ir.op_count() == 53, "opcode 表 53 条目") {
+        ok = false
+    }
+
+    // ---------- 汇总 ----------
+    if !ok {
+        exit(1)
+    }
+    println("ir 自检通过")
+}
