@@ -1,0 +1,1 @@
+语义错误 @1:15: extern 函数 'foo' 的参数 't' 必须是标量类型 （i8..u64/f32/f64/bool/char/string），实际是 table<i64>

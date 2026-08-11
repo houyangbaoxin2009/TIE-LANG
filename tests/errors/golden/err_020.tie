@@ -1,0 +1,13 @@
+
+            struct Counter {
+                var count: i64
+            }
+            namespace Counter {
+                pub func bad(c: Counter) {
+                    println(this.count)
+                }
+            }
+            func main() {
+                println(1)
+            }
+            

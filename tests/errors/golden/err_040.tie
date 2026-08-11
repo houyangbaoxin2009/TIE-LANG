@@ -1,0 +1,6 @@
+
+            func main() {
+                var t = table_new_i64()
+                var x = table_at(t, "a")
+            }
+            

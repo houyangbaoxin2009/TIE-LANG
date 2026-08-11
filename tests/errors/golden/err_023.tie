@@ -1,0 +1,6 @@
+
+            func main() {
+                var p = (x: 3, y: 4)
+                println(p.z)
+            }
+            

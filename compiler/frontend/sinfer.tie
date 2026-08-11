@@ -149,6 +149,57 @@ pub func table_ret_elem(fn_name: string) -> i64 {
     return -1
 }
 
+// 从实参表达式节点推断表元素类型（对齐 Rust arg_table_elem_ty）：
+// - 表字面量 TableLit：取首单元格值类型（空表 → i64）
+// - 变量 Var：查局部/全局表的元素类型（lv_telem/gb_telem）
+// - 调用 Call：查返回表元素类型（table_ret_elem）
+// 返回元素类型 id；-1 = 无法推断（非表实参或裸表）
+pub func arg_table_elem_ty(a: i64) -> i64 {
+    var tag = s_tags[a]
+    if tag == S_N_TABLE_LIT {
+        var nc = sstate.nchild(a)
+        if nc == 0 {
+            return types.named(TK_I64)
+        }
+        // 表字面量：取首元素值类型（cell 结构 [id, 值]）
+        var first = sstate.child(a, 0)
+        var vt = infer_expr(sstate.child(first, 1))
+        if vt < 0 {
+            return -1
+        }
+        return vt
+    }
+    if tag == S_N_VAR {
+        var nm = sstate.name_str(a)
+        var nid = intern.intern(nm)
+        var te = var_table_elem(nid)
+        if te >= 0 {
+            return te
+        }
+        return -1
+    }
+    if tag == S_N_CALL {
+        var fnm = sstate.name_str(a)
+        // 动态表构造：table_new_i64 → i64 等
+        if fnm == "table_new_i64" {
+            return types.named(TK_I64)
+        }
+        if fnm == "table_new_f64" {
+            return types.named(TK_F64)
+        }
+        if fnm == "table_new_string" {
+            return types.named(TK_STR)
+        }
+        if fnm == "table_new_bool" {
+            return types.named(TK_BOOL)
+        }
+        // 返回表的函数：用解析后全名查
+        var full = resolve_call_name(fnm)
+        return table_ret_elem(full)
+    }
+    return -1
+}
+
 // ==================== 裸调用名解析（M2.1.7） ====================
 // 候选 1：顶层裸名；候选 2：当前命名空间前缀补全（逐级外层）；
 // 候选 3：using 引入的命名空间。返回实际注册键（全名）。
@@ -457,9 +508,11 @@ pub func infer_expr(id: i64) -> i64 {
     }
     // Path：不能作值
     if tag == S_N_PATH {
+        // Path 名字在 Segment children 中（name 字段为空），拼接完整路径
+        var pname = recv_path_name(id)
         sm_err_line = s_lines[id]
         sm_err_col = s_cols[id]
-        sm_err_msg = "命名空间路径 '" + sstate.name_str(id) + "' 不能作为值使用（只能用于调用，如 'x::f()'）"
+        sm_err_msg = "命名空间路径 '" + pname + "' 不能作为值使用（只能用于调用，如 'x::f()'）"
         return -1
     }
     // TypeLit：仅 switch case
@@ -757,6 +810,68 @@ pub func infer_call(id: i64) -> i64 {
             }
             ka = ka + 1
         }
+        // table_push 特殊检查（对齐 Rust）：第 1 参数必须表变量 + 动态表 + 元素类型匹配
+        if fnm == "table_push" {
+            var t0 = s_tags[args[0]]
+            if t0 != S_N_VAR {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "table_push() 第 1 个参数必须是表变量（不能是字面量/下标）"
+                return -1
+            }
+            var tnm = sstate.name_str(args[0])
+            var tnid = intern.intern(tnm)
+            var elem = var_table_elem(tnid)
+            if elem < 0 {
+                // 查找失败：默认 i64
+                elem = types.named(TK_I64)
+            }
+            var x_ty = infer_expr(args[1])
+            if x_ty < 0 {
+                return -1
+            }
+            if !stype.types_match(elem, x_ty, args[1]) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "table_push() 元素类型不匹配：表 '" + tnm + "' 的元素是 " + types.type_name(elem) + "，推入的是 " + types.type_name(x_ty)
+                return -1
+            }
+            node_types[id] = types.named(TK_VOID)
+            g_typed = g_typed + 1
+            return types.named(TK_VOID)
+        }
+        // table_at 特殊检查（对齐 Rust）：下标必须整数
+        if fnm == "table_at" {
+            var i_ty = infer_expr(args[1])
+            if i_ty < 0 {
+                return -1
+            }
+            if !types.is_int(i_ty) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "table_at() 下标必须是整数，实际是 " + types.type_name(i_ty)
+                return -1
+            }
+            node_types[id] = br
+            g_typed = g_typed + 1
+            return br
+        }
+        // eval 特殊检查（对齐 Rust）：参数必须是字符串
+        if fnm == "eval" {
+            var e_ty = infer_expr(args[0])
+            if e_ty < 0 {
+                return -1
+            }
+            if e_ty != TK_STR {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "eval() 参数必须是字符串，实际是 " + types.type_name(e_ty)
+                return -1
+            }
+            node_types[id] = types.named(TK_STR)
+            g_typed = g_typed + 1
+            return types.named(TK_STR)
+        }
         if br == -1 {
             // void
             node_types[id] = types.named(TK_VOID)
@@ -821,7 +936,13 @@ pub func infer_call(id: i64) -> i64 {
     if nc < req || nc > total {
         sm_err_line = s_lines[id]
         sm_err_col = s_cols[id]
-        sm_err_msg = "函数 '" + fnm + "' 期望 " + to_string(req) + " 到 " + to_string(total) + " 个参数，实际 " + to_string(nc) + " 个"
+        var cnt_desc = ""
+        if req == total {
+            cnt_desc = to_string(total)
+        } else {
+            cnt_desc = to_string(req) + "-" + to_string(total)
+        }
+        sm_err_msg = "函数 '" + fnm + "' 期望 " + cnt_desc + " 个参数，实际 " + to_string(nc) + " 个"
         return -1
     }
     var off = sg_off[sig]
@@ -832,11 +953,50 @@ pub func infer_call(id: i64) -> i64 {
             return -1
         }
         var want = sp_tys[off + j2]
+        // 表形参（table<T>）的元素不匹配留给 A1 专用检查；非表类型 mismatch 报通用消息
+        var want_is_tbl = types.kind(want) == K_TABLE
+        var at_is_tbl = types.kind(at) == K_TABLE
         if !stype.types_compatible(want, at) && !stype.types_match(want, at, args[j2]) {
-            sm_err_line = s_lines[id]
-            sm_err_col = s_cols[id]
-            sm_err_msg = "调用 '" + fnm + "' 参数类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(at)
-            return -1
+            if !(want_is_tbl && at_is_tbl) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "调用 '" + fnm + "' 参数类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(at)
+                return -1
+            }
+        }
+        // A1：形参 table<T> 的元素类型校验——实参表字面量/动态表变量/返回表的调用，
+        // 其元素类型须与 T 一致（裸 table 形参不校验，对齐 Rust）
+        if want_is_tbl && !(want == TK_TABLE) {
+            var want_elem = types.low(want)
+            var got_elem = arg_table_elem_ty(args[j2])
+            if got_elem >= 0 {
+                if !stype.types_compatible(want_elem, got_elem) {
+                    sm_err_line = s_lines[id]
+                    sm_err_col = s_cols[id]
+                    sm_err_msg = "调用 '" + fnm + "' 表参数元素类型不匹配：期望 table<" + types.type_name(want_elem) + ">，实际 table<" + types.type_name(got_elem) + ">"
+                    return -1
+                }
+            }
+        }
+        // ref 参数实参校验（对齐 Rust T0.3 by_ref）：实参必须是可寻址变量（变量/字段链），
+        // 且必须是动态表（table_new_* 创建）——IR 需取地址写回
+        if sp_refs[off + j2] == 1 {
+            if !sstate.is_addressable(args[j2]) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "调用 '" + fnm + "' 的 ref 参数需要可寻址的变量实参（不能是字面量/下标/调用结果等不可取地址）"
+                return -1
+            }
+            if s_tags[args[j2]] == S_N_VAR {
+                var vname = sstate.name_str(args[j2])
+                var vnid = intern.intern(vname)
+                if var_dyn(vnid) != 1 {
+                    sm_err_line = s_lines[id]
+                    sm_err_col = s_cols[id]
+                    sm_err_msg = "调用 '" + fnm + "' 的 ref 参数实参 '" + vname + "' 必须是动态表（table_new_* 创建），'" + vname + "' 是定长表"
+                    return -1
+                }
+            }
         }
         j2 = j2 + 1
     }
@@ -898,9 +1058,15 @@ pub func infer_method_call(id: i64) -> i64 {
     var req = sg_required[sig]
     var total = sg_nparams[sig]
     if len(args) < req || len(args) > total {
+        var cnt_desc2 = ""
+        if req == total {
+            cnt_desc2 = to_string(total)
+        } else {
+            cnt_desc2 = to_string(req) + "-" + to_string(total)
+        }
         sm_err_line = s_lines[id]
         sm_err_col = s_cols[id]
-        sm_err_msg = "命名空间函数 '" + full + "' 期望 " + to_string(req) + " 到 " + to_string(total) + " 个参数，实际 " + to_string(len(args)) + " 个"
+        sm_err_msg = "命名空间函数 '" + full + "' 期望 " + cnt_desc2 + " 个参数，实际 " + to_string(len(args)) + " 个"
         return -1
     }
     var off = sg_off[sig]
@@ -993,12 +1159,15 @@ pub func infer_struct_method(recv: i64, recv_ty: i64, mname: string, args: table
     if vr < 0 {
         return -1
     }
-    // 方法：首参 = 接收者（按引用）
+    // 方法：首参 = 接收者（按引用）。参数个数（含接收者对象，对齐 Rust）：
+    // required = sg_required（含接收者必选数），total = 形参数，n_args = args+1
+    var req_m = sg_required[sig]
     var total = sg_nparams[sig]
-    if len(args) + 1 > total {
+    var n_args = len(args) + 1
+    if n_args < req_m || n_args > total {
         sm_err_line = s_lines[id]
         sm_err_col = s_cols[id]
-        sm_err_msg = "方法 '" + full + "' 期望 " + to_string(total - 1) + " 个参数（不含接收者），实际 " + to_string(len(args)) + " 个"
+        sm_err_msg = "方法 '" + full + "' 期望 " + to_string(req_m) + "-" + to_string(total) + " 个参数（含接收者对象），实际 " + to_string(n_args) + " 个"
         return -1
     }
     // 接收者类型匹配（首参）

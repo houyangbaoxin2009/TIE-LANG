@@ -1,0 +1,7 @@
+
+            func g(t: ref table<i64> = []) {}
+            func main() {
+                var t = table_new_i64()
+                g(t)
+            }
+            

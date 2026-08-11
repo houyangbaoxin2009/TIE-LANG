@@ -1,0 +1,8 @@
+
+            func f() -> i64 {
+                return "hello"
+            }
+            func main() {
+                println(1)
+            }
+            

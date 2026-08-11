@@ -26,7 +26,22 @@ pub func tre_bi_init() {
     sstate.sorted_insert(tre_bi_keys, tre_bi_vals, intern.intern("regex_find_all"), types.named(TK_STR))
 }
 
-// 顶层函数签名收集（含参数/返回类型解析）
+// extern 返回类型标量判定（对齐 Rust is_scalar_extern_ty：i8..u64/f32/f64/bool/char/string）
+func is_scalar_t(t: i64) -> bool {
+    if types.kind(t) != K_NAMED {
+        return false
+    }
+    // Named 且 TyKw 在标量集（0-10, 12-13；排除 trit=11, void=14+）
+    if t >= 0 && t <= 10 {
+        return true
+    }
+    if t == TK_CHAR || t == TK_STR {
+        return true
+    }
+    return false
+}
+
+// 顶层函数签名收集（含参数/返回类型解析 + 默认值/ref 校验）
 pub func collect_fn(fn_node: i64, full: string) -> i64 {
     var nparams = s_aux[fn_node]
     var is_pub = s_vals[fn_node]
@@ -39,6 +54,8 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
     var p_refs: table<i64> = table_new_i64()
     var p_defs: table<i64> = table_new_i64()
     var required: i64 = nparams
+    // 默认值校验：ref 不能带默认值 + 可选参数必须连续 + 默认值必须字面量 + 类型匹配
+    var seen_default: bool = false
     var k: i64 = 0
     while k < nparams {
         var p = sstate.child(fn_node, 1 + k)
@@ -46,14 +63,79 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
         if pt < 0 {
             return -1
         }
-        table_push(p_tys, pt)
-        table_push(p_refs, s_vals[p])
+        var is_ref = s_vals[p]
         var has_def: i64 = 0
+        var def_node: i64 = -1
         if sstate.nchild(p) > 1 {
-            if sstate.child(p, 1) >= 0 {
+            def_node = sstate.child(p, 1)
+            if def_node >= 0 {
                 has_def = 1
             }
         }
+        // ref 参数不能有默认值（对齐 Rust：必须在调用点传实参）
+        if is_ref == 1 && has_def == 1 {
+            sm_err_line = s_lines[p]
+            sm_err_col = s_cols[p]
+            sm_err_msg = "参数 '" + sstate.name_str(p) + "' 的 ref 参数不能有默认值（必须在调用点传实参）"
+            return -1
+        }
+        // ref 形参仅支持表参数（对齐 Rust：标量/字符串/struct 形参引用无实义）
+        if is_ref == 1 && !types.is_table(pt) {
+            sm_err_line = s_lines[p]
+            sm_err_col = s_cols[p]
+            sm_err_msg = "参数 '" + sstate.name_str(p) + "' 的 ref 修饰仅支持表参数（table/table<T>），实际是 " + types.type_name(pt)
+            return -1
+        }
+        // 可选参数（带默认值）必须连续排在必选参数之后
+        if has_def == 1 {
+            seen_default = true
+        } else if seen_default {
+            sm_err_line = s_lines[p]
+            sm_err_col = s_cols[p]
+            sm_err_msg = "参数 '" + sstate.name_str(p) + "' 缺少默认值：可选参数（带默认值）必须连续排在必选参数之后"
+            return -1
+        }
+        // 默认值必须是字面量（数/布尔/字符/字符串或空表 []）
+        if has_def == 1 {
+            var dt = def_node
+            var dtag = s_tags[dt]
+            var is_ok: bool = false
+            if dtag == S_N_INT_LIT || dtag == S_N_FLOAT_LIT || dtag == S_N_BOOL_LIT || dtag == S_N_CHAR_LIT || dtag == S_N_STR_LIT {
+                is_ok = true
+            } else if dtag == S_N_TABLE_LIT {
+                if sstate.nchild(dt) == 0 {
+                    is_ok = true
+                }
+            }
+            if !is_ok {
+                sm_err_line = s_lines[p]
+                sm_err_col = s_cols[p]
+                sm_err_msg = "参数 '" + sstate.name_str(p) + "' 的默认值必须是字面量（数/布尔/字符/字符串或空表 []）"
+                return -1
+            }
+            // 默认值类型匹配：默认值推导类型必须与参数类型兼容
+            // 空表字面量 [] 默认值：直接通过（对齐 Rust：空表 → 任意表类型）
+            var dt_ty = sinfer.infer_expr(dt)
+            if dt_ty < 0 {
+                return -1
+            }
+            var is_empty_tbl: bool = false
+            if dtag == S_N_TABLE_LIT {
+                if sstate.nchild(dt) == 0 {
+                    is_empty_tbl = true
+                }
+            }
+            if !is_empty_tbl {
+                if !stype.types_match(pt, dt_ty, dt) {
+                    sm_err_line = s_lines[p]
+                    sm_err_col = s_cols[p]
+                    sm_err_msg = "参数 '" + sstate.name_str(p) + "' 默认值类型不匹配：期望 " + types.type_name(pt) + "，实际 " + types.type_name(dt_ty)
+                    return -1
+                }
+            }
+        }
+        table_push(p_tys, pt)
+        table_push(p_refs, is_ref)
         table_push(p_defs, has_def)
         if has_def == 0 {
             required = k + 1
@@ -88,6 +170,36 @@ pub func find_struct_node(name: string) -> i64 {
 pub func collect_struct_fields(si: i64) -> i64 {
     if cls_done[si] == 1 {
         return 0
+    }
+    // 继承环检测（对齐 Rust check_inheritance_cycle）：沿 cls_parent 链走，
+    // 若回到自身（si）则成环。A extends B、B extends A → A→B→A。
+    var start_si = si
+    var cur: i64 = si
+    var guard: i64 = 0
+    var has_cycle: bool = false
+    while guard < 1000 {
+        var pp = cls_parent[cur]
+        if pp < 0 {
+            break
+        }
+        var pidx = sstate.bs_find(st_keys, pp)
+        if pidx < 0 {
+            break
+        }
+        var psi = st_vals[pidx]
+        if psi == start_si {
+            has_cycle = true
+            break
+        }
+        cur = psi
+        guard = guard + 1
+    }
+    if has_cycle {
+        var nm = intern.lookup(st_keys[si])
+        sm_err_line = s_lines[find_struct_node(nm)]
+        sm_err_col = s_cols[find_struct_node(nm)]
+        sm_err_msg = "struct 继承形成环（含 '" + nm + "'）"
+        return -1
     }
     cls_done[si] = 1
     var p = cls_parent[si]
@@ -345,6 +457,14 @@ pub func collect_ns(ns_node: i64) -> i64 {
             if p >= 0 {
                 parent = intern.lookup(p)
             }
+            // struct 与函数名冲突（对齐 Rust：struct 名不能与同命名空间函数同名）
+            var snid = intern.intern(nm)
+            if sstate.bs_find(fn_keys, snid) >= 0 {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "struct 名 '" + nm + "' 与函数名冲突"
+                return -1
+            }
             var idx = sstate.reg_struct(nm, parent)
             if idx < 0 {
                 sm_err_line = s_lines[s]
@@ -399,8 +519,25 @@ pub func collect_global_var(v: i64) -> i64 {
         if is_const == 1 {
             sm_err_line = s_lines[v]
             sm_err_col = s_cols[v]
-            sm_err_msg = "const 全局表暂不支持：'" + nm + "'需要 main 入口运行时创建，无法静态初始化"
+                sm_err_msg = "const 全局表暂不支持：'" + nm + "'（表在 main 入口运行时创建，无法静态初始化）"
             return -1
+        }
+        // 初始化若非空表字面量（对齐 Rust：元素类型可由标注推导，非空表
+        // 的静态布局与调用点克隆不一致）——拦截
+        if init >= 0 {
+            var itag = s_tags[init]
+            var init_ok: bool = false
+            if itag == S_N_TABLE_LIT {
+                if sstate.nchild(init) == 0 {
+                    init_ok = true
+                }
+            }
+            if !init_ok {
+                sm_err_line = s_lines[v]
+                sm_err_col = s_cols[v]
+                sm_err_msg = "全局表 '" + nm + "' 的初始化必须是空表 []（元素类型由标注决定）"
+                return -1
+            }
         }
         var elem: i64 = -1
         if ty == TK_TABLE {
@@ -461,6 +598,15 @@ pub func collect_top() -> i64 {
             if p >= 0 {
                 parent = intern.lookup(p)
             }
+            // struct 与函数名冲突（对齐 Rust check_struct_namespace：struct 名
+            // 不能与顶层函数同名——构造调用 vs 函数调用的歧义）
+            var snid = intern.intern(nm)
+            if sstate.bs_find(fn_keys, snid) >= 0 {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "struct 名 '" + nm + "' 与函数名冲突"
+                return -1
+            }
             var idx = sstate.reg_struct(nm, parent)
             if idx < 0 {
                 sm_err_line = s_lines[s]
@@ -475,8 +621,28 @@ pub func collect_top() -> i64 {
         } else if tag == S_N_EXTERN {
             var full = sstate.name_str(s)
             var nparams = s_aux[s]
+            // extern 与已有函数重复定义（对齐 Rust：extern 专用消息）
+            if sstate.fn_sig(full) >= 0 {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "extern 函数 '" + full + "' 与已有函数重复定义"
+                return -1
+            }
             var ret_ty = stype.parse_type_node(sstate.child(s, 0))
             if ret_ty < 0 {
+                return -1
+            }
+            // extern 返回类型必须是标量（i8..u64/f32/f64/bool/char/string）或 void
+            var ret_ok: bool = false
+            if types.kind(ret_ty) == K_NAMED {
+                if ret_ty == TK_VOID || is_scalar_t(ret_ty) {
+                    ret_ok = true
+                }
+            }
+            if !ret_ok {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "extern 函数 '" + full + "' 的返回类型必须是标量（i8..u64/f32/f64/bool/char/string）或 void，实际是 " + types.type_name(ret_ty)
                 return -1
             }
             var p_tys: table<i64> = table_new_i64()
@@ -487,6 +653,13 @@ pub func collect_top() -> i64 {
                 var p = sstate.child(s, 1 + k)
                 var pt = stype.parse_type_node(sstate.child(p, 0))
                 if pt < 0 {
+                    return -1
+                }
+                // extern 参数必须是标量（对齐 Rust is_scalar_extern_ty）
+                if !is_scalar_t(pt) {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    sm_err_msg = "extern 函数 '" + full + "' 的参数 '" + sstate.name_str(p) + "' 必须是标量类型（i8..u64/f32/f64/bool/char/string），实际是 " + types.type_name(pt)
                     return -1
                 }
                 table_push(p_tys, pt)

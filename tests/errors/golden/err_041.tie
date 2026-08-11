@@ -1,0 +1,7 @@
+
+            func bad() -> table {
+                var x = 1
+                return x
+            }
+            func main() {}
+            

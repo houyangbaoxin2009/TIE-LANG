@@ -1,0 +1,2 @@
+extern fn foo(t: table<i64>) -> i64;
+func main() {}

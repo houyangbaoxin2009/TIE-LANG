@@ -1,0 +1,6 @@
+func join(t: table<string>) -> string {
+    return ""
+}
+func main() {
+    join([1, 2])
+}

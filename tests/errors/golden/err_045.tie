@@ -1,0 +1,9 @@
+
+            func main() {
+                var x: i64 = 1
+                switch x {
+                    case string:
+                        println("字符串")
+                }
+            }
+            

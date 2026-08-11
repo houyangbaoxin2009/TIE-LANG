@@ -1,0 +1,9 @@
+
+            func main() {
+                var s: string = "hi"
+                switch s {
+                    case 1..3:
+                        println("x")
+                }
+            }
+            

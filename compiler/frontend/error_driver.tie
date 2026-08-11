@@ -1,0 +1,93 @@
+// tie:logic
+// compiler/frontend/error_driver.tie —— T2.7 错误 golden 对比驱动
+// ============================================================
+// 遍历 tests/errors/golden/*.tie，对每个文件跑 semantic.check_src，
+// 将语义/语法错误输出为 Rust 同格式「语义错误 @行:列: 消息」，
+// 供 scripts/test-errors.ps1 与 .stderr golden 逐字节对比。
+// 输出格式：每文件一行错误消息（与 Rust tie-frontend --check 对齐）。
+import "./semantic.tie"
+
+// 从 "ERR:line col msg" 提取 line/col/msg，并根据消息内容判断错误类型前缀：
+// 词法错误（lexer 消息特征）/ 语法错误（parser 消息特征）/ 语义错误（其余）
+func fmt_err(r: string) -> string {
+    // ERR:line col msg
+    var rest = str.slice(r, 4, str_len(r))
+    var n = str_len(rest)
+    var i: i64 = 0
+    while i < n {
+        if str_char(rest, i) == " " {
+            break
+        }
+        i = i + 1
+    }
+    var line = str.slice(rest, 0, i)
+    var j = i + 1
+    while j < n {
+        if str_char(rest, j) == " " {
+            break
+        }
+        j = j + 1
+    }
+    var col = str.slice(rest, i + 1, j)
+    var msg = str.slice(rest, j + 1, n)
+    // 词法错误特征（对齐 lexer.rs 消息）
+    var prefix = "语义错误"
+    if str.contains(msg, "无法识别") || str.contains(msg, "未闭合") ||
+        str.contains(msg, "未知转义") || str.contains(msg, "转义符后缺少") {
+        prefix = "词法错误"
+    }
+    return prefix + " @" + line + ":" + col + ": " + msg
+}
+
+func main() {
+    var files: table<string> = [
+        "tests/errors/golden/err_000.tie", "tests/errors/golden/err_001.tie",
+        "tests/errors/golden/err_002.tie", "tests/errors/golden/err_003.tie",
+        "tests/errors/golden/err_004.tie", "tests/errors/golden/err_005.tie",
+        "tests/errors/golden/err_006.tie", "tests/errors/golden/err_007.tie",
+        "tests/errors/golden/err_008.tie", "tests/errors/golden/err_009.tie",
+        "tests/errors/golden/err_010.tie", "tests/errors/golden/err_011.tie",
+        "tests/errors/golden/err_012.tie", "tests/errors/golden/err_013.tie",
+        "tests/errors/golden/err_014.tie", "tests/errors/golden/err_015.tie",
+        "tests/errors/golden/err_016.tie", "tests/errors/golden/err_017.tie",
+        "tests/errors/golden/err_018.tie", "tests/errors/golden/err_019.tie",
+        "tests/errors/golden/err_020.tie", "tests/errors/golden/err_021.tie",
+        "tests/errors/golden/err_022.tie", "tests/errors/golden/err_023.tie",
+        "tests/errors/golden/err_024.tie", "tests/errors/golden/err_025.tie",
+        "tests/errors/golden/err_026.tie", "tests/errors/golden/err_027.tie",
+        "tests/errors/golden/err_028.tie", "tests/errors/golden/err_029.tie",
+        "tests/errors/golden/err_030.tie", "tests/errors/golden/err_031.tie",
+        "tests/errors/golden/err_032.tie", "tests/errors/golden/err_033.tie",
+        "tests/errors/golden/err_034.tie", "tests/errors/golden/err_035.tie",
+        "tests/errors/golden/err_036.tie", "tests/errors/golden/err_037.tie",
+        "tests/errors/golden/err_038.tie", "tests/errors/golden/err_039.tie",
+        "tests/errors/golden/err_040.tie", "tests/errors/golden/err_041.tie",
+        "tests/errors/golden/err_042.tie", "tests/errors/golden/err_043.tie",
+        "tests/errors/golden/err_044.tie", "tests/errors/golden/err_045.tie",
+        "tests/errors/golden/err_046.tie", "tests/errors/golden/err_047.tie",
+        "tests/errors/golden/err_048.tie", "tests/errors/golden/err_049.tie",
+        "tests/errors/golden/err_050.tie", "tests/errors/golden/err_051.tie",
+        "tests/errors/golden/err_052.tie", "tests/errors/golden/err_053.tie",
+        "tests/errors/golden/err_054.tie", "tests/errors/golden/err_055.tie",
+        "tests/errors/golden/err_056.tie", "tests/errors/golden/err_057.tie",
+        "tests/errors/golden/err_058.tie", "tests/errors/golden/err_059.tie",
+        "tests/errors/golden/err_060.tie", "tests/errors/golden/err_061.tie",
+        "tests/errors/golden/err_062.tie"
+    ]
+    var i: i64 = 0
+    while i < len(files) {
+        var src = file_read(files[i])
+        var r = semantic.check_src(src, "tests/errors/golden/")
+        var out = ""
+        if str_len(r) >= 3 {
+            if str_char(r, 0) == "E" {
+                out = fmt_err(r)
+            }
+        }
+        if out == "" {
+            out = "（无错误输出）"
+        }
+        println(out)
+        i = i + 1
+    }
+}

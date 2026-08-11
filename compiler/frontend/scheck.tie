@@ -9,6 +9,9 @@
 // ./sinfer.tie（表达式推断）。树式无环：由 semantic.tie import。
 import "./scollect.tie"
 
+// switch case 值去重表（跨 case 检测重复；switch 分支检查时重置）
+var g_case_seen: table<string>;
+
 namespace scheck {
 
 // 语句块检查（StmtList）
@@ -24,6 +27,83 @@ pub func check_block(blk: i64) -> i64 {
         i = i + 1
     }
     return 0
+}
+
+// 字面量节点 → 整数值（IntLit 取 val；CharLit 取 name 池 id 对应码点；
+// Unary NEG + IntLit 取负值）。用于 switch case 区间的 start < end 比较
+// （对齐 Rust literal_cmp/literal_value）。
+func int_lit_val(n: i64) -> i64 {
+    var tag = s_tags[n]
+    if tag == S_N_INT_LIT {
+        return s_vals[n]
+    }
+    if tag == S_N_CHAR_LIT {
+        var lid = s_names[n]
+        if lid >= 0 {
+            var txt = intern.lookup(lid)
+            if str_len(txt) >= 3 {
+                // 引号剥掉后取第一个码点
+                return char_code(str_char(txt, 1))
+            }
+        }
+        return 0
+    }
+    if tag == S_N_UNARY {
+        // 前缀负号 + 整数 → 取负值（case -1 等）
+        var op = s_vals[n]
+        var operand = sstate.child(n, 0)
+        if op == 0 {
+            var v = int_lit_val(operand)
+            return 0 - v
+        }
+    }
+    return 0
+}
+
+// 字面量 key（重复检测用）：int → "i:<val>"，char → "c:<code>"，str → "s:<lexeme>"，bool → "b:<0/1>"
+func lit_key(n: i64) -> string {
+    var tag = s_tags[n]
+    if tag == S_N_INT_LIT {
+        return "i:" + to_string(s_vals[n])
+    }
+    if tag == S_N_UNARY {
+        // case -1：前缀负号 + 整数 → "i:-<val>"
+        var op = s_vals[n]
+        if op == 0 {
+            var v = int_lit_val(n)
+            return "i:" + to_string(v)
+        }
+    }
+    if tag == S_N_CHAR_LIT {
+        return "c:" + to_string(int_lit_val(n))
+    }
+    if tag == S_N_BOOL_LIT {
+        return "b:" + to_string(s_vals[n])
+    }
+    if tag == S_N_STR_LIT {
+        return "s:" + sstate.name_str(n)
+    }
+    return "?"
+}
+
+// case 值是否编译期字面量（对齐 Rust is_const_literal：整数/浮点/字符/布尔/字符串；
+// 前缀负号 + 数字字面量也算——case -1 是 Unary NEG + IntLit）
+func is_case_literal(n: i64) -> bool {
+    var tag = s_tags[n]
+    if tag == S_N_INT_LIT || tag == S_N_FLOAT_LIT || tag == S_N_CHAR_LIT || tag == S_N_BOOL_LIT || tag == S_N_STR_LIT {
+        return true
+    }
+    if tag == S_N_UNARY {
+        var op = s_vals[n]
+        if op == 0 {
+            var operand = sstate.child(n, 0)
+            var otag = s_tags[operand]
+            if otag == S_N_INT_LIT || otag == S_N_FLOAT_LIT {
+                return true
+            }
+        }
+    }
+    return false
 }
 
 // switch case 检查
@@ -55,6 +135,15 @@ pub func check_switch_case(c: i64, subj_ty: i64) -> i64 {
                 sm_err_msg = "case 区间两端必须是整数或字符字面量（浮点区间不支持）"
                 return -1
             }
+            // start < end（对齐 Rust：左闭右开，字符按码点比较）
+            var stv = int_lit_val(sstate.child(p, 0))
+            var env = int_lit_val(sstate.child(p, 1))
+            if stv >= env {
+                sm_err_line = s_lines[c]
+                sm_err_col = s_cols[c]
+                sm_err_msg = "case 区间必须 start < end（左闭右开）"
+                return -1
+            }
             if (st_chr && subj_ty != TK_CHAR) || (st_int && !types.is_int(subj_ty)) {
                 sm_err_line = s_lines[c]
                 sm_err_col = s_cols[c]
@@ -64,8 +153,26 @@ pub func check_switch_case(c: i64, subj_ty: i64) -> i64 {
             i = i + 1
             continue
         }
+        // case 类型匹配 pattern（对齐 Rust）：仅宽类型/动态容器对象上有意义，
+        // 当前 switch subject 限定静态类型 → 一律报错（须在 infer_expr 前拦截，
+        // 因为 infer_expr 对 TypeLit 直接报通用错误）
+        if s_tags[p] == S_N_TYPE_LIT {
+            var tynode = sstate.child(p, 0)
+            var tyname = types.type_name(stype.parse_type_node(tynode))
+            sm_err_line = s_lines[c]
+            sm_err_col = s_cols[c]
+            sm_err_msg = "case 类型匹配（" + tyname + "）仅支持宽类型或动态容器对象，当前 switch 对象是静态类型 " + types.type_name(subj_ty)
+            return -1
+        }
         var pt = sinfer.infer_expr(p)
         if pt < 0 {
+            return -1
+        }
+        // case 值必须是编译期字面量（对齐 Rust is_const_literal）
+        if !is_case_literal(p) {
+            sm_err_line = s_lines[c]
+            sm_err_col = s_cols[c]
+            sm_err_msg = "case 值必须是字面量（整数/浮点/字符/布尔/字符串）"
             return -1
         }
         if !stype.types_compatible(subj_ty, pt) && !stype.types_match(subj_ty, pt, p) {
@@ -74,6 +181,24 @@ pub func check_switch_case(c: i64, subj_ty: i64) -> i64 {
             sm_err_msg = "case 值类型 " + types.type_name(pt) + " 与 switch 对象类型 " + types.type_name(subj_ty) + " 不匹配"
             return -1
         }
+        // 重复 case 检测（对齐 Rust seen 表）
+        var key = lit_key(p)
+        var d: i64 = 0
+        var dup: bool = false
+        while d < len(g_case_seen) {
+            if g_case_seen[d] == key {
+                dup = true
+                break
+            }
+            d = d + 1
+        }
+        if dup {
+            sm_err_line = s_lines[c]
+            sm_err_col = s_cols[c]
+            sm_err_msg = "重复的 case 值 " + key
+            return -1
+        }
+        table_push(g_case_seen, key)
         i = i + 1
     }
     if when_n >= 0 {
@@ -143,6 +268,68 @@ pub func check_stmt(s: i64) -> i64 {
         if vt < 0 {
             return -1
         }
+        // 复合赋值校验（对齐 Rust check_compound_assign，M4）：op >= 0 为复合
+        var op = s_vals[s]
+        if op >= 0 {
+            // `+=` 对 string：value 必须 string（拼接）
+            if op == 0 && target_ty == TK_STR {
+                if !stype.types_match(target_ty, vt, sstate.child(s, 0)) {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    sm_err_msg = "复合赋值类型不匹配：目标类型 " + types.type_name(target_ty) + " 与表达式 " + types.type_name(vt)
+                    return -1
+                }
+                return 0
+            }
+            // `+=` `-=` `*=` `/=`：target 必须 number
+            if op >= 0 && op <= 3 {
+                if !types.is_number(target_ty) {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    sm_err_msg = "复合赋值运算符不能用于 " + types.type_name(target_ty)
+                    return -1
+                }
+                if !stype.types_match(target_ty, vt, sstate.child(s, 0)) {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    sm_err_msg = "复合赋值类型不匹配：目标类型 " + types.type_name(target_ty) + " 与表达式 " + types.type_name(vt)
+                    return -1
+                }
+                return 0
+            }
+            // `%=`：target 必须 int
+            if op == 4 {
+                if !types.is_int(target_ty) {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    sm_err_msg = "复合赋值取模只支持整数，目标类型是 " + types.type_name(target_ty)
+                    return -1
+                }
+                if !stype.types_match(target_ty, vt, sstate.child(s, 0)) {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    sm_err_msg = "复合赋值类型不匹配：目标类型 " + types.type_name(target_ty) + " 与表达式 " + types.type_name(vt)
+                    return -1
+                }
+                return 0
+            }
+            // 位运算复合 `&=` `|=` `^=` `<<=` `>>=`：target 必须 int
+            if op >= 13 && op <= 17 {
+                if !types.is_int(target_ty) {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    sm_err_msg = "复合赋值位运算只支持整数，目标类型是 " + types.type_name(target_ty)
+                    return -1
+                }
+                if !stype.types_match(target_ty, vt, sstate.child(s, 0)) {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    sm_err_msg = "复合赋值类型不匹配：目标类型 " + types.type_name(target_ty) + " 与表达式 " + types.type_name(vt)
+                    return -1
+                }
+                return 0
+            }
+        }
         if !stype.types_compatible(target_ty, vt) && !stype.types_match(target_ty, vt, sstate.child(s, 0)) {
             sm_err_line = s_lines[s]
             sm_err_col = s_cols[s]
@@ -173,7 +360,7 @@ pub func check_stmt(s: i64) -> i64 {
         if cond < 0 {
             return -1
         }
-        if !types.is_bool_like(cond) && !types.is_number(cond) {
+        if !types.is_bool_like(cond) {
             sm_err_line = s_lines[s]
             sm_err_col = s_cols[s]
             sm_err_msg = "if 条件必须是 bool"
@@ -314,6 +501,8 @@ pub func check_stmt(s: i64) -> i64 {
         }
         var ncases = s_aux[s]
         var i: i64 = 0
+        // 重置 case 去重表（每个 switch 独立）
+        g_case_seen = table_new_string()
         while i < ncases {
             var c = sstate.child(s, 1 + i)
             var r = check_switch_case(c, subj)

@@ -1,0 +1,6 @@
+
+            func main() {
+                var a: i64 = 1
+                var b = a > 0 ? 1 : "x"
+            }
+            

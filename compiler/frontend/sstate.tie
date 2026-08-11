@@ -574,7 +574,15 @@ pub func reg_fn(full_name: string, is_pub: i64, nparams: i64, required: i64, ret
     if bs_find(fn_keys, nid) >= 0 {
         sm_err_line = 1
         sm_err_col = 1
-        sm_err_msg = "函数 '" + full_name + "' 重复定义"
+        // 命名空间函数 vs 顶层函数措辞（对齐 Rust）：A::f → 函数 'f' 在命名空间 'A' 内重复定义
+        var last = rfind_ns(full_name)
+        if last >= 0 {
+            var bare = str.slice(full_name, last + 2, str_len(full_name))
+            var prefix = str.slice(full_name, 0, last)
+            sm_err_msg = "函数 '" + bare + "' 在命名空间 '" + prefix + "' 中重复定义"
+        } else {
+            sm_err_msg = "函数 '" + full_name + "' 重复定义"
+        }
         return -1
     }
     var sig = len(sg_nparams)

@@ -1,0 +1,10 @@
+
+            func main() {
+                var x: i64 = 2
+                var y: i64 = 3
+                switch x {
+                    case 1, y:
+                        println("x")
+                }
+            }
+            

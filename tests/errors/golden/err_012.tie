@@ -1,0 +1,7 @@
+
+            func f() {}
+            func f() {}
+            func main() {
+                println(1)
+            }
+            

@@ -1,0 +1,7 @@
+
+            func g(t: ref i64) {}
+            func main() {
+                var x = 1
+                g(x)
+            }
+            

@@ -1,0 +1,9 @@
+
+            func main() {
+                var x: i64 = 5
+                switch x {
+                    case 7..3:
+                        println("x")
+                }
+            }
+            

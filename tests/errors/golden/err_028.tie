@@ -1,0 +1,14 @@
+
+            struct Counter {
+                var count: i64
+            }
+            namespace Counter {
+                pub func make() -> i64 {
+                    return 1
+                }
+            }
+            func main() {
+                var c = Counter(0)
+                println(c.make())
+            }
+            

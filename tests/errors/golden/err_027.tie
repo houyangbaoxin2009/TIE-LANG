@@ -1,0 +1,7 @@
+
+            func main() {
+                if 1 {
+                    println(1)
+                }
+            }
+            

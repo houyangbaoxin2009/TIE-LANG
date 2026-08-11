@@ -1,0 +1,1 @@
+语义错误 @1:1: extern 函数 'foo' 的返回类型必须是标量（i8..u64/f32/f64/bool/char/string）或 void，实际是 table<i64>

@@ -1,0 +1,7 @@
+
+            func main() {
+                var f: f64 = 1.0
+                var g: f64 = 2.0
+                var y = f & g
+            }
+            

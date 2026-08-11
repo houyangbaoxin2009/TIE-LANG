@@ -1,0 +1,12 @@
+
+            struct A {
+                var x: i64
+            }
+            namespace A {
+                pub func f(a: A) {}
+                pub func f(a: A) {}
+            }
+            func main() {
+                println(1)
+            }
+            

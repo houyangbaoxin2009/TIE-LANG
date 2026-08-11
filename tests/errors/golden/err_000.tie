@@ -1,0 +1,6 @@
+func sum(t: table<i64>) -> i64 {
+    return 0
+}
+func main() {
+    sum(["a", "b"])
+}

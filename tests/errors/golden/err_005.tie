@@ -1,0 +1,4 @@
+func f(a: i64 = "x") {
+}
+func main() {
+}

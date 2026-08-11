@@ -1,0 +1,11 @@
+
+            func Point() -> i64 {
+                return 1
+            }
+            struct Point {
+                var x: i64
+            }
+            func main() {
+                println(1)
+            }
+            

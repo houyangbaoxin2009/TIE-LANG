@@ -1,0 +1,4 @@
+func f(t: table = [1, 2]) {
+}
+func main() {
+}

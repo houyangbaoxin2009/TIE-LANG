@@ -1,0 +1,5 @@
+namespace tcmsg {
+    func main() {
+        var m = tcmsg::error.no_file()
+    }
+}
