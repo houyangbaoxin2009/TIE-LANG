@@ -391,6 +391,109 @@ func name_str(id: i64) -> string {
     return intern.lookup(nid)
 }
 
+// ==================== 可寻址与可见性辅助（对齐 Rust 版）====================
+// P8 可寻址判定（对齐 Rust is_addressable_expr）：只有变量或字段访问链
+// （obj.a.b 的 GEP 链天然有内存地址）可寻址；构造调用/方法调用/下标等
+// 结果在寄存器中不可取地址，IR 层无法生成字段地址 → 语义层提前报错。
+func is_addressable(id: i64) -> bool {
+    var tag = s_tags[id]
+    if tag == S_N_VAR {
+        return true
+    }
+    if tag == S_N_FIELD_ACCESS {
+        return is_addressable(child(id, 0))
+    }
+    return false
+}
+
+// struct 索引 -> 名字（st_keys 按名字排序，须经 st_vals 反查索引位置）
+func struct_name_of(idx: i64) -> string {
+    var n = len(st_keys)
+    var i: i64 = 0
+    while i < n {
+        if st_vals[i] == idx {
+            return intern.lookup(st_keys[i])
+        }
+        i = i + 1
+    }
+    return "?"
+}
+
+// 字符串前缀判定（s 是否以 pre 开头）
+func has_prefix_str(s: string, pre: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(pre)
+    if n < m {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(pre, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 查找最后一个 "::" 的位置（命名空间分隔；返回 ':' 下标，-1 = 无）
+func rfind_ns(s: string) -> i64 {
+    var n = str_len(s)
+    var i: i64 = 0
+    var last: i64 = -1
+    while i + 1 < n {
+        if str_char(s, i) == ":" {
+            if str_char(s, i + 1) == ":" {
+                last = i
+            }
+        }
+        i = i + 1
+    }
+    return last
+}
+
+// 当前函数命名空间前缀（可见性校验用）：check_fn 期间 ns_stack 即当前函数
+// 所属命名空间段栈（check_fn_walk 递归压栈），顶层函数为空串。
+func cur_ns_prefix() -> string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < ns_top {
+        if i > 0 {
+            out = out + "::"
+        }
+        out = out + intern.lookup(ns_stack[i])
+        i = i + 1
+    }
+    return out
+}
+
+// 私有函数可见性校验（对齐 Rust check_visibility，M2.1.7）：
+// 返回 0 = 可见 / -1 = 私有拦截（sm_err_* 已置）。
+// 规则：显式 pub 放行；顶层函数（全名无 ::）恒放行；同命名空间或**子命名空间**
+// 放行（ns_stack 前缀匹配 prefix，如 tcmsg::error 内可访问 tcmsg 的私有函数，
+// 与 Rust ns_stack[..own.len] 比对等价）；否则报私有调用错误。
+func check_visibility(full_name: string, sig: i64, call_node: i64) -> i64 {
+    if sg_pub[sig] == 1 {
+        return 0
+    }
+    var last = rfind_ns(full_name)
+    if last < 0 {
+        return 0
+    }
+    var prefix = str.slice(full_name, 0, last)
+    var cur = cur_ns_prefix()
+    if cur == prefix {
+        return 0
+    }
+    if has_prefix_str(cur, prefix + "::") {
+        return 0
+    }
+    sm_err_line = s_lines[call_node]
+    sm_err_col = s_cols[call_node]
+    sm_err_msg = "函数 '" + full_name + "' 是命名空间 '" + prefix + "' 的私有函数（默认私有，`pub func` 显式导出），不可在命名空间之外调用"
+    return -1
+}
+
 // ==================== 类型系统 ====================
 // 自编码 type id：Named = TyKw 索引；table = 1<<40|T；map = 2<<40|V；
 // struct = 3<<40|idx；tuple = 4<<40|idx
@@ -914,6 +1017,23 @@ func collect_struct_fields(si: i64) -> i64 {
             return -1
         }
         var fnid = intern.intern(name_str(f))
+        // 字段名跨继承链唯一（对齐 Rust flatten_struct）：当前已拍平段（父字段 +
+        // 已追加的自身字段）内查重——子 struct 字段与父字段重名即布局歧义报错
+        var d: i64 = 0
+        var dup: bool = false
+        while d < cls_nfld[si] {
+            if fld_names[cls_fldoff[si] + d] == fnid {
+                dup = true
+                break
+            }
+            d = d + 1
+        }
+        if dup {
+            sm_err_line = s_lines[f]
+            sm_err_col = s_cols[f]
+            sm_err_msg = "字段 '" + nm + "." + name_str(f) + "' 与继承链中的字段重名（字段名必须跨继承链唯一）"
+            return -1
+        }
         table_push(fld_names, fnid)
         table_push(fld_tys, fty)
         cls_nfld[si] = cls_nfld[si] + 1
@@ -2344,6 +2464,17 @@ func infer_expr(id: i64) -> i64 {
             return -1
         }
         if bk == S_K_STRUCT {
+            // P8 对齐 Rust 版 is_addressable_expr：struct 字段访问的 base 必须可寻址
+            // （变量/字段链）。构造调用/方法调用/下标等结果在寄存器中不可取地址，
+            // IR 层无法 GEP 取字段 → 语义层提前报错（对齐 Rust「需要可寻址对象」）。
+            var base_node = child(id, 0)
+            if !is_addressable(base_node) {
+                var cls_name = struct_name_of(ty_low(base))
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "struct 实例 '" + cls_name + "' 的字段访问需要可寻址对象（变量/字段链），"
+                return -1
+            }
             var si = ty_low(base)
             // 沿继承链查字段（拍平后直接查 cls 表）
             var off = cls_fldoff[si]
@@ -2648,6 +2779,12 @@ func infer_call(id: i64) -> i64 {
         sm_err_msg = "未定义的函数 '" + fnm + "'"
         return -1
     }
+    // 可见性校验（M2.1.7 对齐 Rust check_visibility）：裸名解析到命名空间
+    // 函数（含 :: 全名）时，私有函数仅同命名空间内可调，跨命名空间拦截
+    var vr = check_visibility(full_name, sig, id)
+    if vr < 0 {
+        return -1
+    }
     var req = sg_required[sig]
     var total = sg_nparams[sig]
     if nc < req || nc > total {
@@ -2720,6 +2857,11 @@ func infer_method_call(id: i64) -> i64 {
         sm_err_line = s_lines[id]
         sm_err_col = s_cols[id]
         sm_err_msg = "命名空间函数 '" + full + "' 未定义"
+        return -1
+    }
+    // 可见性校验（M2.1.7 对齐 Rust check_visibility）：命名空间函数私有拦截
+    var vr = check_visibility(full, sig, id)
+    if vr < 0 {
         return -1
     }
     // 可见性：pub 或同命名空间
@@ -2814,6 +2956,12 @@ func infer_struct_method(recv: i64, recv_ty: i64, mname: string, args: table<i64
         sm_err_line = s_lines[id]
         sm_err_col = s_cols[id]
         sm_err_msg = "struct '" + sname + "'（含继承链）没有方法 '" + mname + "'"
+        return -1
+    }
+    // 方法函数必须 pub（M2.1.8 对齐 Rust 注释「私有 → 拦截」）：struct 方法
+    // 实际是绑定 struct 名的命名空间函数，跨命名空间调用私有方法须拦截
+    var vr = check_visibility(full, sig, id)
+    if vr < 0 {
         return -1
     }
     // 方法：首参 = 接收者（按引用）

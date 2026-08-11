@@ -1,0 +1,184 @@
+// tie:logic
+// compiler/proto/main.tie —— 自举 v2 T1.4：原型编译器 CLI（tiec-proto）
+// ============================================================
+// 用法：tiec-proto <input.tie> [--check] [--emit-ir] [--debug]
+//   --check      只做前端检查（词法 + 语法 + 语义）。成功静默退出 0（对齐 Rust
+//               tie-frontend --check：成功无输出，实测确认）；失败打印首个错误到
+//               stderr 并退出 1。
+//   --emit-ir    stub：T1.4 只做前端，IR 生成留待阶段 2。当前输出前端检查结果 +
+//               阶段 2 说明（可运行但只到前端）。
+//   --debug      额外打印 lexer token 数 / parser 节点数（供调试）。
+//   （默认无标志 = --check：T1.4 前端检查路径）
+//
+// 退出码：0 = 成功 / 1 = 编译/检查失败 / 2 = 参数错误（对齐 Rust tie-frontend 约定）
+//
+// 流程：读文件 → parser.parse_src（词法+语法，内部完成）→ semantic.check（语义）
+//   parse_src   返回 AST 协议文本，或 ERR:<line> <col> <message>（词法/语法错误）
+//   semantic.check 返回 OK:<expr_type_count>，或 ERR:<line> <col> <message>
+//   错误按 Rust 格式输出：<类别> @<line>:<col>: <message>（print_err → stderr）。
+//   注意：parse_src 的词法错误与语法错误共用 ERR 协议，原型不细分，统标「语法错误」。
+//
+// 依赖：只 import "./semantic.tie"（链式：semantic → parser → lexer → intern/string），
+// 不重复 import；不用 using；全用前缀调用 parser.parse_src / semantic.check /
+// lexer.token_count / parser.node_count。
+
+import "./semantic.tie"
+
+// ---------- 全局参数状态（T0.4 标量全局：显式类型 + 字面量初始化） ----------
+var g_input: string = ""    // 输入文件路径
+var g_emit_ir: i64 = 0      // --emit-ir 标志（stub 输出模式）
+var g_debug: i64 = 0        // --debug 标志（统计输出）
+
+// ---------- 参数解析 ----------
+// 逐个参数扫描：第一个位置参数 = 输入文件；其余须为已知标志。
+// 返回 0 = 成功 / -1 = 参数错误（调用方打印用法并退出 2）。
+func parse_args() -> i64 {
+    var n = arg_count()
+    var i: i64 = 0
+    while i < n {
+        var a = arg_string(i)
+        if a == "--check" {
+            // 默认路径即前端检查；标志仅记录（不改变行为）
+        } else if a == "--emit-ir" {
+            g_emit_ir = 1
+        } else if a == "--debug" {
+            g_debug = 1
+        } else {
+            // 以 '-' 开头 = 未知选项（对齐 Rust「错误: 未知选项」→ 退出 2）
+            if a != "" {
+                if str_char(a, 0) == "-" {
+                    print_err("错误: 未知选项: " + a)
+                    return -1
+                }
+            }
+            // 位置参数：第一个 = 输入文件，第二个起为多余参数
+            if g_input == "" {
+                g_input = a
+            } else {
+                print_err("错误: 多余的位置参数: " + a)
+                return -1
+            }
+        }
+        i = i + 1
+    }
+    if g_input == "" {
+        print_err("错误: 缺少输入文件")
+        return -1
+    }
+    return 0
+}
+
+// 打印用法（参数错误时输出到 stderr）
+func print_usage() {
+    print_err("用法: tiec-proto <input.tie> [--check] [--emit-ir] [--debug]")
+    print_err("  --check    前端检查（词法+语法+语义）；成功静默，失败退出 1")
+    print_err("  --emit-ir  stub：当前只到前端（IR 生成留待阶段 2）")
+    print_err("  --debug    打印 lexer token 数 / parser 节点数")
+    print_err("退出码: 0=成功 / 1=检查失败 / 2=参数错误")
+}
+
+// ---------- 错误协议工具 ----------
+// 判断是否以 "ERR:" 开头（parse_src / semantic.check 统一错误协议）
+func has_err(s: string) -> bool {
+    var n = str_len(s)
+    if n < 4 {
+        return false
+    }
+    if str_char(s, 0) == "E" {
+        if str_char(s, 1) == "R" {
+            if str_char(s, 2) == "R" {
+                if str_char(s, 3) == ":" {
+                    return true
+                }
+            }
+        }
+    }
+    return false
+}
+
+// 找第一个空格下标（-1 = 无）
+func find_space(s: string) -> i64 {
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == " " {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 错误协议 → Rust 格式：<类别> @<line>:<col>: <message>
+// 输入 e = "ERR:<line> <col> <message>"；cat = "语义错误" / "语法错误"。
+func fmt_error(e: string, cat: string) -> string {
+    // 去掉 "ERR:" 前缀（4 字节）
+    var body = str.slice(e, 4, str_len(e))
+    // 字段 1：行号
+    var sp1 = find_space(body)
+    var line = ""
+    var rest = ""
+    if sp1 >= 0 {
+        line = str.slice(body, 0, sp1)
+        rest = str.slice(body, sp1 + 1, str_len(body))
+    } else {
+        line = body
+    }
+    // 字段 2：列号；剩余 = 消息
+    var sp2 = find_space(rest)
+    var col = ""
+    var msg = ""
+    if sp2 >= 0 {
+        col = str.slice(rest, 0, sp2)
+        msg = str.slice(rest, sp2 + 1, str_len(rest))
+    } else {
+        col = rest
+    }
+    return cat + " @" + line + ":" + col + ": " + msg
+}
+
+// ---------- --debug 输出 ----------
+// 打印 lexer token 数 / parser 节点数（parse_src 成功后调用：run_lex 与 reset_nodes
+// 各自重置内部表，token_count / node_count 反映本次源码的真实计数）
+func print_debug() {
+    println("[debug] lexer token 数: " + to_string(lexer.token_count()))
+    println("[debug] parser 节点数: " + to_string(parser.node_count()))
+}
+
+// ---------- 主入口 ----------
+func main() -> i64 {
+    var r = parse_args()
+    if r != 0 {
+        print_usage()
+        return 2
+    }
+    // 读文件：先 file_exists 判定（读失败打印前缀并退出 1，对齐 Rust 约定）
+    if !file_exists(g_input) {
+        print_err("读取源码失败: " + g_input)
+        return 1
+    }
+    var src = file_read(g_input)
+    // 词法 + 语法（parse_src 内部完成，出错返回 ERR 协议）
+    var ast = parser.parse_src(src)
+    if has_err(ast) {
+        print_err(fmt_error(ast, "语法错误"))
+        return 1
+    }
+    // 语义检查
+    var res = semantic.check(ast)
+    if has_err(res) {
+        print_err(fmt_error(res, "语义错误"))
+        if g_debug == 1 {
+            print_debug()
+        }
+        return 1
+    }
+    // 成功：--debug 打印统计；--emit-ir 输出 stub 说明；默认/--check 静默（对齐 Rust）
+    if g_debug == 1 {
+        print_debug()
+    }
+    if g_emit_ir == 1 {
+        println("; IR 生成留待阶段 2（T1.4 只做前端）-- 前端检查通过: " + res)
+    }
+    return 0
+}
