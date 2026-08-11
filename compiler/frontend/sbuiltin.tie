@@ -1,0 +1,444 @@
+// tie:library
+// compiler/frontend/sbuiltin.tie —— T2.6 内置函数签名检查（模块拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.6（.omo/plans/self-hosting-v2.md）完整语义分析
+// 拆分为 8 模块之一（本文件 = 内置函数参数个数 + 返回类型校验）。
+// 对应 proto/semantic.tie 1548-1976（builtin_call）逻辑搬移。
+// 返回约定：类型 id = 正常返回；-1 = void；-2 = 参数错误已报；-3 = 非内置。
+// 依赖：./sstate.tie（AST 全局 + 错误槽）+ ./stype.tie（类型构造/查询，
+// 经其传递可达 ../middle/data.tie 内置表与 types 类型系统）。
+// 树式无环：由 sinfer.tie import。
+import "./stype.tie"
+
+namespace sbuiltin {
+
+// 内置函数签名检查（参数个数 + 返回类型）
+pub func builtin_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
+    var nargs = len(args)
+    // 精确个数匹配组
+    if fn_name == "println" || fn_name == "print" {
+        return types.named(TK_VOID)
+    }
+    if fn_name == "len" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "len() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+    }
+    if fn_name == "str_len" || fn_name == "str_char" || fn_name == "char_code" {
+        if fn_name == "str_len" {
+            if nargs != 1 {
+                sm_err_line = s_lines[call_node]
+                sm_err_col = s_cols[call_node]
+                sm_err_msg = "str_len() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+                return -2
+            }
+            return types.named(TK_I64)
+        }
+        if fn_name == "str_char" {
+            if nargs != 2 {
+                sm_err_line = s_lines[call_node]
+                sm_err_col = s_cols[call_node]
+                sm_err_msg = "str_char() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+                return -2
+            }
+            return types.named(TK_STR)
+        }
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "char_code() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+    }
+    if fn_name == "to_string" || fn_name == "parse_int" || fn_name == "parse_float" || fn_name == "parse_trit" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        if fn_name == "to_string" {
+            return types.named(TK_STR)
+        }
+        if fn_name == "parse_float" {
+            return types.named(TK_F64)
+        }
+        return types.named(TK_I64)
+    }
+    if fn_name == "table_new_i64" || fn_name == "table_new_f64" || fn_name == "table_new_string" || fn_name == "table_new_bool" {
+        if nargs != 0 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 0 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        // 元素化动态表：table_new_i64 -> table<i64>（for 迭代取元素类型用）
+        if fn_name == "table_new_i64" {
+            return types.table_of(types.named(TK_I64))
+        }
+        if fn_name == "table_new_f64" {
+            return types.table_of(types.named(TK_F64))
+        }
+        if fn_name == "table_new_bool" {
+            return types.table_of(types.named(TK_BOOL))
+        }
+        return types.table_of(types.named(TK_STR))
+    }
+    if fn_name == "table_push" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "table_push() 期望 2 个参数（表, 元素），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+    }
+    if fn_name == "table_at" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "table_at() 期望 2 个参数（表, 下标），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+    }
+    if fn_name == "exit" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "exit() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+    }
+    if fn_name == "read_line" || fn_name == "file_read" || fn_name == "file_delete" || fn_name == "file_exists" {
+        if fn_name == "read_line" {
+            if nargs != 0 {
+                sm_err_line = s_lines[call_node]
+                sm_err_col = s_cols[call_node]
+                sm_err_msg = "read_line() 期望 0 个参数，实际 " + to_string(nargs) + " 个"
+                return -2
+            }
+            return types.named(TK_STR)
+        }
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        if fn_name == "file_exists" {
+            return types.named(TK_BOOL)
+        }
+        if fn_name == "file_delete" {
+            return types.named(TK_BOOL)
+        }
+        return types.named(TK_STR)
+    }
+    if fn_name == "file_write" || fn_name == "file_append" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_BOOL)
+    }
+    if fn_name == "time_now" || fn_name == "arg_count" {
+        if nargs != 0 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 0 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+    }
+    if fn_name == "rand_range" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "rand_range() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+    }
+    if fn_name == "arg_string" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "arg_string() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+    }
+    if fn_name == "list_dir" || fn_name == "walk_dir" || fn_name == "byte_read" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        // 返回元素化表：list_dir/walk_dir 是 string 表，byte_read 是 i64 表
+        if fn_name == "byte_read" {
+            return types.table_of(types.named(TK_I64))
+        }
+        return types.table_of(types.named(TK_STR))
+    }
+    if fn_name == "sqrt" || fn_name == "sin" || fn_name == "cos" || fn_name == "tan" ||
+        fn_name == "exp" || fn_name == "log" || fn_name == "floor" || fn_name == "ceil" || fn_name == "round" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_F64)
+    }
+    if fn_name == "pow" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "pow() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_F64)
+    }
+    if fn_name == "regex_match" || fn_name == "regex_find" || fn_name == "regex_replace" || fn_name == "regex_group" || fn_name == "regex_find_all" {
+        if fn_name == "regex_find_all" {
+            if nargs != 2 {
+                sm_err_line = s_lines[call_node]
+                sm_err_col = s_cols[call_node]
+                sm_err_msg = "regex_find_all() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+                return -2
+            }
+            return types.table_of(types.named(TK_STR))
+        }
+        if fn_name == "regex_replace" || fn_name == "regex_group" {
+            if nargs != 3 {
+                sm_err_line = s_lines[call_node]
+                sm_err_col = s_cols[call_node]
+                sm_err_msg = fn_name + "() 期望 3 个参数，实际 " + to_string(nargs) + " 个"
+                return -2
+            }
+            return types.named(TK_STR)
+        }
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        if fn_name == "regex_match" {
+            return types.named(TK_BOOL)
+        }
+        return types.named(TK_STR)
+    }
+    if fn_name == "exec_code" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "exec_code() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+    }
+    if fn_name == "exec_output" || fn_name == "get_env" || fn_name == "cwd" {
+        if fn_name == "cwd" {
+            if nargs != 0 {
+                sm_err_line = s_lines[call_node]
+                sm_err_col = s_cols[call_node]
+                sm_err_msg = "cwd() 期望 0 个参数，实际 " + to_string(nargs) + " 个"
+                return -2
+            }
+            return types.named(TK_STR)
+        }
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+    }
+    // 路径工具（M4）：path_basename/path_dirname/path_abs → string
+    if fn_name == "path_basename" || fn_name == "path_dirname" || fn_name == "path_abs" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+    }
+    if fn_name == "byte_write" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "byte_write() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_BOOL)
+    }
+    if fn_name == "bit_read" || fn_name == "bit_write" {
+        if nargs != 2 && fn_name == "bit_read" {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "bit_read() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        if nargs != 3 && fn_name == "bit_write" {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "bit_write() 期望 3 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        if fn_name == "bit_write" {
+            return types.named(TK_BOOL)
+        }
+        return types.named(TK_I64)
+    }
+    if fn_name == "eval" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "eval() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+    }
+    if fn_name == "eval_call" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "eval_call() 期望 2 个参数（函数名, 参数），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+    }
+    if fn_name == "byte_concat" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "byte_concat() 期望 2 个参数（字节表, 字节表），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_TABLE)
+    }
+    if fn_name == "mkdir_all" || fn_name == "remove_dir_all" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_BOOL)
+    }
+    if fn_name == "path_join" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "path_join() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+    }
+    if fn_name == "set_env" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "set_env() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+    }
+    if fn_name == "print_err" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "print_err() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+    }
+    if fn_name == "msg_set_lang" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "msg_set_lang() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+    }
+    if fn_name == "msg_get_lang" {
+        if nargs != 0 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "msg_get_lang() 期望 0 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+    }
+    if fn_name == "msg_register" {
+        if nargs != 3 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "msg_register() 期望 3 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+    }
+    if fn_name == "msg_t" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "msg_t() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+    }
+    if fn_name == "msg_t_lang" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "msg_t_lang() 期望 2 个参数（键, 语言），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+    }
+    if fn_name == "http_get" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "http_get() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+    }
+    if fn_name == "http_get_file" || fn_name == "untar_gz" || fn_name == "unzip" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_BOOL)
+    }
+    if fn_name == "copy_dir" || fn_name == "file_copy" || fn_name == "file_move" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_BOOL)
+    }
+    // 未识别：按用户函数处理（返回 -3 表示不是内置）
+    return -3
+}
+
+}

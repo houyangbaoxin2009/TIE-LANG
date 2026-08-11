@@ -1,0 +1,677 @@
+// tie:library
+// compiler/frontend/sstate.tie —— T2.6 语义分析全局状态（模块拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.6（.omo/plans/self-hosting-v2.md）完整语义分析
+// 拆分为 8 模块之一（本文件 = AST 9 列 + 符号表全局 + 协议解析 + 节点访问 +
+// 工具/登记函数，零依赖除 interner/string/lex 原语）。import 树最深层。
+// 对应 proto/semantic.tie 142-231（状态）+ 238-377（load_ast）+ 380-520
+// （节点访问/可寻址/可见性）+ 642-755（bs_find/sorted_insert/reg_fn/
+// reg_struct/fn_sig）+ 1250-1264（ns_push/ns_pop）逻辑搬移。
+// 依赖：无（intern/str 原语直接可用，与 T2.4/T2.5 一致不显式 import）。
+// 由 stype.tie import（传递可达上层全部）。
+
+// ==================== AST 全局列式表（协议解析结果）====================
+var s_tags: table<i64>;       // 节点 tag
+var s_names: table<i64>;      // 字符串池 id（-1=无）
+var s_vals: table<i64>;       // 主整数值（字面量值/运算符/标志）
+var s_aux: table<i64>;        // 次整数值（nparams/nsegs/ncases/label）
+var s_coff: table<i64>;       // 子节点偏移（s_children 段起点）
+var s_nchild: table<i64>;     // 子节点数
+var s_children: table<i64>;   // 扁平子节点 id 段
+var s_lines: table<i64>;      // 起始行（1-based）
+var s_cols: table<i64>;       // 起始列（1-based）
+var s_n: i64 = 0;             // 节点总数
+
+// ==================== 符号表全局 ====================
+var fn_keys: table<i64>;      // 函数全名 id（升序）
+var fn_vals: table<i64>;      // 签名 id
+var sg_nparams: table<i64>;   // 签名表：参数总数
+var sg_required: table<i64>;  // 必选参数数（默认值前）
+var sg_ret: table<i64>;       // 返回类型 id
+var sg_pub: table<i64>;       // 0/1
+var sg_off: table<i64>;       // 参数段偏移（sp_tys/sp_refs/sp_defs）
+var sp_tys: table<i64>;       // 参数类型 id（扁平段）
+var sp_refs: table<i64>;      // 参数 by_ref 标志（扁平段）
+var sp_defs: table<i64>;      // 参数有默认值（扁平段）
+
+var st_keys: table<i64>;      // struct 名 id（升序）
+var st_vals: table<i64>;      // struct 索引
+var cls_parent: table<i64>;   // struct 父名 id（-1=无）
+var cls_fldoff: table<i64>;   // 字段段偏移（fld_names/fld_tys）
+var cls_nfld: table<i64>;     // 字段数（含继承拍平）
+var cls_done: table<i64>;     // struct 字段收集完成标志（0/1，拍平递归防重）
+var fld_names: table<i64>;    // 拍平字段名 id
+var fld_tys: table<i64>;      // 拍平字段类型 id
+
+var gb_keys: table<i64>;      // 全局变量名 id（升序）
+var gb_vals: table<i64>;      // 类型 id
+var gb_const: table<i64>;     // 0/1
+var gb_telem: table<i64>;     // 全局表元素类型 id（-1=非表）
+
+var ext_keys: table<i64>;     // extern 函数名 id（升序）
+
+var tre_keys: table<i64>;     // 返回表的函数名 id（升序）
+var tre_vals: table<i64>;     // 元素类型 id
+
+var node_types: table<i64>;   // 节点 id -> 类型 id（-1=未推断）
+
+// ==================== 每函数重置的局部状态 ====================
+var lv_keys: table<i64>;      // 作用域变量名 id（升序）
+var lv_vals: table<i64>;      // 类型 id
+var lv_const: table<i64>;     // 0/1
+var lv_telem: table<i64>;     // 表变量元素类型 id（-1=非表）
+var lv_dyn: table<i64>;       // 表变量动态标志（0/1）
+
+var lp_stack: table<i64>;     // 循环标签栈（break/continue 上下文；-1=无标签）
+var lp_top: i64 = 0;          // lp_stack 逻辑栈顶游标（tie 表无法截断，用游标模拟 pop）
+var ns_stack: table<i64>;     // 命名空间段栈（全名补全）
+var ns_top: i64 = 0;          // ns_stack 逻辑栈顶游标（同 lp_top）
+var using_prefixes: table<i64>;  // using 引入的命名空间段名 id（扁平段 + 长度表）
+var using_lens: table<i64>;      // using 前缀段数（与 using_prefixes 并行，按段号分组）
+
+// 返回表的内置函数预登记（元素类型 id）
+var tre_bi_keys: table<i64>;  // 内置名 id
+var tre_bi_vals: table<i64>;  // 元素类型 id
+
+// ==================== 错误状态 ====================
+var sm_err_line: i64 = 0;
+var sm_err_col: i64 = 0;
+var sm_err_msg: string = "";
+
+// 当前函数全名 id（check_fn 期间；IR 全局初始化不支持负数）
+var g_curfn: i64 = 0;
+// 当前扫描函数节点（collect 阶段返回表元素预扫描用）
+var g_cur_scan_fn: i64 = 0;
+// 当前命名空间深度（裸名解析用）
+var g_ns_depth: i64 = 0;
+// 表达式类型计数（OK: 返回）
+var g_typed: i64 = 0;
+
+// struct/tuple 类型 id 缓存与 tuple 字段段
+var struct_tys: table<i64>;   // struct 索引 -> 3<<40|idx
+var tuple_tys: table<i64>;    // tuple 索引 -> 4<<40|idx
+var tup_names: table<i64>;    // tuple 字段名 id（扁平段）
+var tup_tys: table<i64>;      // tuple 字段类型 id（扁平段）
+var tup_offs: table<i64>;     // tuple 字段段偏移
+var tup_n: table<i64>;        // tuple 字段数
+
+// 顶层 StmtList 根（parse_program 创建的最后节点 id）
+var g_root: i64 = 0;
+
+// ==================== import 展开状态（semantic 主入口驱动）====================
+var g_imported: table<string>;   // 已导入文件路径集合（去重/防环）
+var g_extra_tops: table<i64>;    // 全部文件顶层语句 id（主 + 被导入；collect/查找统一遍历）
+
+const S_N_INT_LIT: i64 = 0;
+const S_N_FLOAT_LIT: i64 = 1;
+const S_N_STR_LIT: i64 = 2;
+const S_N_CHAR_LIT: i64 = 3;
+const S_N_BOOL_LIT: i64 = 4;
+const S_N_TRIT_LIT: i64 = 5;
+const S_N_VAR: i64 = 6;
+const S_N_CALL: i64 = 7;
+const S_N_UNARY: i64 = 8;
+const S_N_BINARY: i64 = 9;
+const S_N_TERNARY: i64 = 10;
+const S_N_RANGE: i64 = 11;
+const S_N_TABLE_LIT: i64 = 12;
+const S_N_INDEX: i64 = 13;
+const S_N_TUPLE_LIT: i64 = 14;
+const S_N_FIELD_ACCESS: i64 = 15;
+const S_N_PATH: i64 = 16;
+const S_N_TYPE_LIT: i64 = 17;
+const S_N_METHOD_CALL: i64 = 18;
+const S_N_TABLE_CELL: i64 = 19;
+const S_N_TABLE_ID: i64 = 20;
+const S_N_TUPLE_FIELD: i64 = 21;
+const S_N_SEGMENT: i64 = 22;
+const S_N_VAR_DECL: i64 = 100;
+const S_N_FN_DEF: i64 = 101;
+const S_N_EXPR_STMT: i64 = 102;
+const S_N_ASSIGN: i64 = 103;
+const S_N_RETURN: i64 = 104;
+const S_N_IF: i64 = 105;
+const S_N_WHILE: i64 = 106;
+const S_N_FOR: i64 = 107;
+const S_N_BREAK: i64 = 108;
+const S_N_CONTINUE: i64 = 109;
+const S_N_SWITCH: i64 = 110;
+const S_N_IMPORT: i64 = 111;
+const S_N_NAMESPACE: i64 = 112;
+const S_N_USING: i64 = 113;
+const S_N_STRUCT: i64 = 114;
+const S_N_FIELD_ASSIGN: i64 = 115;
+const S_N_INDEX_ASSIGN: i64 = 116;
+const S_N_EXTERN: i64 = 117;
+const S_N_PARAM: i64 = 118;
+const S_N_SWITCH_CASE: i64 = 120;
+const S_N_PATTERN_LIST: i64 = 121;
+const S_N_STMTLIST: i64 = 122;
+const S_N_CLASS_FIELD: i64 = 123;
+const S_N_TUPLE_TYPE_FIELD: i64 = 124;
+const S_N_NAMED_TYPE: i64 = 200;
+const S_N_TUPLE_TYPE: i64 = 201;
+const S_N_STRUCT_TYPE: i64 = 202;
+const S_N_TABLE_TYPE: i64 = 203;
+const S_N_MAP_TYPE: i64 = 204;
+namespace sstate {
+
+// ==================== 工具：协议解析 ====================
+// 读取协议行字段（空格分隔，返回第 k 个字段字符串；k 从 0）
+pub func pf(line: string, k: i64) -> string {
+    var start: i64 = 0
+    var cur: i64 = 0
+    var n = str_len(line)
+    var i: i64 = 0
+    var seg: i64 = 0
+    while i <= n {
+        var at_end: bool = false
+        if i == n {
+            at_end = true
+        } else {
+            if str_char(line, i) == " " {
+                at_end = true
+            }
+        }
+        if at_end {
+            if seg == k {
+                return str.slice(line, start, i)
+            }
+            seg = seg + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 十进制字符串 → i64（协议字段解析用；支持负号）
+pub func parse_dec(s: string) -> i64 {
+    var n = str_len(s)
+    var v: i64 = 0
+    var neg: bool = false
+    var i: i64 = 0
+    if n > 0 {
+        if str_char(s, 0) == "-" {
+            neg = true
+            i = 1
+        }
+    }
+    while i < n {
+        var cc = char_code(str_char(s, i))
+        if cc >= 48 {
+            if cc <= 57 {
+                v = v * 10 + (cc - 48)
+            }
+        }
+        i = i + 1
+    }
+    if neg {
+        v = 0 - v
+    }
+    return v
+}
+
+// 加载 AST 协议文本（首行 N: + 每行 id tag name val aux line col nchild c1...）
+// 重建 9 列全局表。返回 0 成功 / -1 失败。
+pub func load_ast(ast_text: string) -> i64 {
+    // 首行 N:
+    var first_end: i64 = 0
+    var n = str_len(ast_text)
+    var i: i64 = 0
+    while i < n {
+        if str_char(ast_text, i) == "\n" {
+            first_end = i
+            break
+        }
+        i = i + 1
+    }
+    if first_end == 0 {
+        return -1
+    }
+    var head = str.slice(ast_text, 0, first_end)
+    var cnt = parse_dec(str.slice(head, 0, str_len(head) - 1))
+    s_n = cnt
+    // 预分配 9 列（push -1 占位，避免后续超界）
+    s_tags = table_new_i64()
+    s_names = table_new_i64()
+    s_vals = table_new_i64()
+    s_aux = table_new_i64()
+    s_coff = table_new_i64()
+    s_nchild = table_new_i64()
+    s_children = table_new_i64()
+    s_lines = table_new_i64()
+    s_cols = table_new_i64()
+    node_types = table_new_i64()
+    var k: i64 = 0
+    while k < cnt {
+        table_push(s_tags, 0)
+        table_push(s_names, 0)
+        table_push(s_vals, 0)
+        table_push(s_aux, 0)
+        table_push(s_coff, 0)
+        table_push(s_nchild, 0)
+        table_push(s_lines, 0)
+        table_push(s_cols, 0)
+        table_push(node_types, -1)
+        k = k + 1
+    }
+    // 逐行解析节点
+    var pos: i64 = first_end + 1
+    var node_id: i64 = 0
+    while pos < n && node_id < cnt {
+        var line_end: i64 = pos
+        while line_end < n {
+            if str_char(ast_text, line_end) == "\n" {
+                break
+            }
+            line_end = line_end + 1
+        }
+        var line = str.slice(ast_text, pos, line_end)
+        // id tag name val aux line col nchild c1...
+        var tag = parse_dec(pf(line, 1))
+        var name = parse_dec(pf(line, 2))
+        var val = parse_dec(pf(line, 3))
+        var aux = parse_dec(pf(line, 4))
+        var ln = parse_dec(pf(line, 5))
+        var col = parse_dec(pf(line, 6))
+        var nc = parse_dec(pf(line, 7))
+        s_tags[node_id] = tag
+        s_names[node_id] = name
+        s_vals[node_id] = val
+        s_aux[node_id] = aux
+        s_nchild[node_id] = nc
+        s_lines[node_id] = ln
+        s_cols[node_id] = col
+        node_id = node_id + 1
+        pos = line_end + 1
+    }
+    // 计算子节点偏移并填充 s_children
+    var off: i64 = 0
+    var j: i64 = 0
+    while j < cnt {
+        s_coff[j] = off
+        off = off + s_nchild[j]
+        j = j + 1
+    }
+    // 二次扫描：填充 s_children
+    s_children = table_new_i64()
+    var z: i64 = 0
+    while z < off {
+        table_push(s_children, 0)
+        z = z + 1
+    }
+    pos = first_end + 1
+    node_id = 0
+    while pos < n && node_id < cnt {
+        var line_end: i64 = pos
+        while line_end < n {
+            if str_char(ast_text, line_end) == "\n" {
+                break
+            }
+            line_end = line_end + 1
+        }
+        var line = str.slice(ast_text, pos, line_end)
+        var nc = s_nchild[node_id]
+        var base = s_coff[node_id]
+        var c: i64 = 0
+        while c < nc {
+            s_children[base + c] = parse_dec(pf(line, 8 + c))
+            c = c + 1
+        }
+        node_id = node_id + 1
+        pos = line_end + 1
+    }
+    return 0
+}
+
+// ==================== import 展开：追加合并 AST ====================
+// 把 import 文件的 AST 协议文本节点追加到当前 s_* 表末尾。
+// 新节点 id 自动 = 原 id + base（当前节点总数）；子节点 id 同步偏移。
+// 返回新节点段起点 base（>=0 成功；-1 失败）——调用方可用
+// base + 新文件节点数 - 1 定位该文件的顶层 StmtList root。
+pub func append_ast(ast_text: string) -> i64 {
+    // 首行 N:
+    var first_end: i64 = 0
+    var n = str_len(ast_text)
+    var i: i64 = 0
+    while i < n {
+        if str_char(ast_text, i) == "\n" {
+            first_end = i
+            break
+        }
+        i = i + 1
+    }
+    if first_end == 0 {
+        return -1
+    }
+    var head = str.slice(ast_text, 0, first_end)
+    var cnt = parse_dec(str.slice(head, 0, str_len(head) - 1))
+    var base = len(s_tags)
+    // 逐行解析节点并追加（子节点先暂存，第二次扫描填偏移）
+    var pos: i64 = first_end + 1
+    var node_id: i64 = 0
+    var new_offs: table<i64> = table_new_i64()
+    while pos < n && node_id < cnt {
+        var line_end: i64 = pos
+        while line_end < n {
+            if str_char(ast_text, line_end) == "\n" {
+                break
+            }
+            line_end = line_end + 1
+        }
+        var line = str.slice(ast_text, pos, line_end)
+        var tag = parse_dec(pf(line, 1))
+        var name = parse_dec(pf(line, 2))
+        var val = parse_dec(pf(line, 3))
+        var aux = parse_dec(pf(line, 4))
+        var ln = parse_dec(pf(line, 5))
+        var col = parse_dec(pf(line, 6))
+        var nc = parse_dec(pf(line, 7))
+        table_push(s_tags, tag)
+        table_push(s_names, name)
+        table_push(s_vals, val)
+        table_push(s_aux, aux)
+        table_push(s_coff, 0)
+        table_push(s_nchild, nc)
+        table_push(s_lines, ln)
+        table_push(s_cols, col)
+        table_push(node_types, -1)
+        table_push(new_offs, 0)
+        node_id = node_id + 1
+        pos = line_end + 1
+    }
+    // 计算新节点子段偏移（相对 s_children 当前末尾）
+    var off = len(s_children)
+    var j: i64 = 0
+    while j < cnt {
+        new_offs[j] = off
+        off = off + s_nchild[base + j]
+        j = j + 1
+    }
+    // 二次扫描：填充子节点（id 偏移 +base，-1 哨兵保持）
+    pos = first_end + 1
+    node_id = 0
+    while pos < n && node_id < cnt {
+        var line_end: i64 = pos
+        while line_end < n {
+            if str_char(ast_text, line_end) == "\n" {
+                break
+            }
+            line_end = line_end + 1
+        }
+        var line = str.slice(ast_text, pos, line_end)
+        s_coff[base + node_id] = new_offs[node_id]
+        var nc = s_nchild[base + node_id]
+        var c: i64 = 0
+        while c < nc {
+            var cid = parse_dec(pf(line, 8 + c))
+            if cid >= 0 {
+                cid = cid + base
+            }
+            table_push(s_children, cid)
+            c = c + 1
+        }
+        node_id = node_id + 1
+        pos = line_end + 1
+    }
+    s_n = len(s_tags)
+    return base
+}
+
+// ==================== 节点访问辅助 ====================
+pub func nchild(id: i64) -> i64 {
+    return s_nchild[id]
+}
+pub func child(id: i64, k: i64) -> i64 {
+    return s_children[s_coff[id] + k]
+}
+pub func name_str(id: i64) -> string {
+    var nid = s_names[id]
+    if nid < 0 {
+        return ""
+    }
+    return intern.lookup(nid)
+}
+
+// ==================== 可寻址与可见性辅助 ====================
+// P8 可寻址判定（对齐 Rust is_addressable_expr）：只有变量或字段访问链可寻址。
+pub func is_addressable(id: i64) -> bool {
+    var tag = s_tags[id]
+    if tag == 6 {
+        return true
+    }
+    if tag == 15 {
+        return is_addressable(child(id, 0))
+    }
+    return false
+}
+
+// 字符串前缀判定（s 是否以 pre 开头）
+pub func has_prefix_str(s: string, pre: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(pre)
+    if n < m {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(pre, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 查找最后一个 "::" 的位置（命名空间分隔；返回 ':' 下标，-1 = 无）
+pub func rfind_ns(s: string) -> i64 {
+    var n = str_len(s)
+    var i: i64 = 0
+    var last: i64 = -1
+    while i + 1 < n {
+        if str_char(s, i) == ":" {
+            if str_char(s, i + 1) == ":" {
+                last = i
+            }
+        }
+        i = i + 1
+    }
+    return last
+}
+
+// 私有函数可见性校验（对齐 Rust check_visibility，M2.1.7）：
+// 返回 0 = 可见 / -1 = 私有拦截（sm_err_* 已置）。
+// 规则：显式 pub 放行；顶层函数（全名无 ::）恒放行；同命名空间或**子命名空间**
+// 放行（ns_stack 前缀匹配 prefix）；否则报私有调用错误。
+pub func check_visibility(full_name: string, sig: i64, call_node: i64) -> i64 {
+    if sg_pub[sig] == 1 {
+        return 0
+    }
+    var last = rfind_ns(full_name)
+    if last < 0 {
+        return 0
+    }
+    var prefix = str.slice(full_name, 0, last)
+    var cur = cur_ns_prefix()
+    if cur == prefix {
+        return 0
+    }
+    if has_prefix_str(cur, prefix + "::") {
+        return 0
+    }
+    sm_err_line = s_lines[call_node]
+    sm_err_col = s_cols[call_node]
+    sm_err_msg = "函数 '" + full_name + "' 是命名空间 '" + prefix + "' 的私有函数（默认私有，`pub func` 显式导出），不可在命名空间之外调用"
+    return -1
+}
+
+// 当前函数命名空间前缀（可见性校验用）
+pub func cur_ns_prefix() -> string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < ns_top {
+        if i > 0 {
+            out = out + "::"
+        }
+        out = out + intern.lookup(ns_stack[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ==================== 符号表（并行排序表 + 二分）====================
+// 二分查找升序 keys，返回下标或 -1
+pub func bs_find(keys: table<i64>, k: i64) -> i64 {
+    var lo: i64 = 0
+    var hi: i64 = len(keys) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        var kv = keys[mid]
+        if kv == k {
+            return mid
+        }
+        if kv < k {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -1
+}
+
+// 有序插入 keys（返回插入位置），vals 并行同步插入
+pub func sorted_insert(keys: table<i64>, vals: table<i64>, k: i64, v: i64) -> i64 {
+    var n = len(keys)
+    var lo: i64 = 0
+    var hi: i64 = n - 1
+    var pos: i64 = n
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if keys[mid] < k {
+            lo = mid + 1
+        } else {
+            pos = mid
+            hi = mid - 1
+        }
+    }
+    table_push(keys, 0)
+    table_push(vals, 0)
+    var i: i64 = n
+    while i > pos {
+        keys[i] = keys[i - 1]
+        vals[i] = vals[i - 1]
+        i = i - 1
+    }
+    keys[pos] = k
+    vals[pos] = v
+    return pos
+}
+
+// 函数签名登记（重复定义检查，返回签名 id 或 -1）
+pub func reg_fn(full_name: string, is_pub: i64, nparams: i64, required: i64, ret_ty: i64, p_tys: table<i64>, p_refs: table<i64>, p_defs: table<i64>) -> i64 {
+    var nid = intern.intern(full_name)
+    if bs_find(fn_keys, nid) >= 0 {
+        sm_err_line = 1
+        sm_err_col = 1
+        sm_err_msg = "函数 '" + full_name + "' 重复定义"
+        return -1
+    }
+    var sig = len(sg_nparams)
+    var off = len(sp_tys)
+    table_push(sg_nparams, nparams)
+    table_push(sg_required, required)
+    table_push(sg_ret, ret_ty)
+    table_push(sg_pub, is_pub)
+    table_push(sg_off, off)
+    var i: i64 = 0
+    while i < nparams {
+        table_push(sp_tys, p_tys[i])
+        table_push(sp_refs, p_refs[i])
+        table_push(sp_defs, p_defs[i])
+        i = i + 1
+    }
+    sorted_insert(fn_keys, fn_vals, nid, sig)
+    return sig
+}
+
+// 查函数签名 id（未定义返回 -1）
+pub func fn_sig(full_name: string) -> i64 {
+    var nid = intern.intern(full_name)
+    var idx = bs_find(fn_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return fn_vals[idx]
+}
+
+// struct 登记（重复/冲突检查，返回 struct 索引或 -1）
+pub func reg_struct(name: string, parent: string) -> i64 {
+    var nid = intern.intern(name)
+    if bs_find(st_keys, nid) >= 0 {
+        sm_err_msg = "struct '" + name + "' 重复定义"
+        return -1
+    }
+    var idx = len(cls_parent)
+    var p_nid: i64 = -1
+    if parent != "" {
+        p_nid = intern.intern(parent)
+    }
+    table_push(cls_parent, p_nid)
+    table_push(cls_fldoff, len(fld_names))
+    table_push(cls_nfld, 0)
+    table_push(cls_done, 0)
+    sorted_insert(st_keys, st_vals, nid, idx)
+    // struct 名登记由上层（stype）经 types.set_struct_name 完成
+    return idx
+}
+
+// ==================== 命名空间栈 ====================
+// 命名空间段压栈（游标写：复用已分配槽位，避免旧值残留误读）
+pub func ns_push(seg_id: i64) {
+    if ns_top < len(ns_stack) {
+        ns_stack[ns_top] = seg_id
+    } else {
+        table_push(ns_stack, seg_id)
+    }
+    ns_top = ns_top + 1
+}
+
+// 命名空间段弹栈（游标递减）
+pub func ns_pop() {
+    if ns_top > 0 {
+        ns_top = ns_top - 1
+    }
+}
+
+// 命名空间全名拼接（ns_stack 段 + 名字）
+pub func ns_full_name(name: string) -> string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < ns_top {
+        if i > 0 {
+            out = out + "::"
+        }
+        out = out + intern.lookup(ns_stack[i])
+        i = i + 1
+    }
+    if out != "" {
+        out = out + "::"
+    }
+    return out + name
+}
+
+// struct 索引 -> 名字（st_keys 按名字排序，须经 st_vals 反查索引位置）
+pub func struct_name_of(idx: i64) -> string {
+    var n = len(st_keys)
+    var i: i64 = 0
+    while i < n {
+        if st_vals[i] == idx {
+            return intern.lookup(st_keys[i])
+        }
+        i = i + 1
+    }
+    return "?"
+}
+
+}

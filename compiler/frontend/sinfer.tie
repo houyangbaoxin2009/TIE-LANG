@@ -1,0 +1,1034 @@
+// tie:library
+// compiler/frontend/sinfer.tie —— T2.6 表达式类型推断（模块拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.6（.omo/plans/self-hosting-v2.md）完整语义分析
+// 拆分为 8 模块之一（本文件 = 表达式类型推断 + 调用解析 + 作用域辅助）。
+// 对应 proto/semantic.tie 1980-2112（作用域辅助）+ 2115-2645（infer_expr）
+// + 2652-2704（resolve_call_name）+ 2706-2896（infer_call/infer_method_call）
+// + 2899-3003（recv_path_name/infer_struct_method）逻辑搬移。
+// 依赖：./sstate.tie（AST 全局 + 符号表 + 工具）+ ./stype.tie（类型匹配）+
+// ./sbuiltin.tie（内置函数签名）。树式无环：由 scollect.tie import。
+import "./sbuiltin.tie"
+
+namespace sinfer {
+
+// ==================== 作用域辅助 ====================
+// 查局部作用域（返回类型 id；-1 = 未声明）
+pub func lv_find(nid: i64) -> i64 {
+    var idx = sstate.bs_find(lv_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return lv_vals[idx]
+}
+pub func lv_const_of(nid: i64) -> i64 {
+    var idx = sstate.bs_find(lv_keys, nid)
+    if idx < 0 {
+        return 0
+    }
+    return lv_const[idx]
+}
+pub func lv_telem_of(nid: i64) -> i64 {
+    var idx = sstate.bs_find(lv_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return lv_telem[idx]
+}
+pub func lv_dyn_of(nid: i64) -> i64 {
+    var idx = sstate.bs_find(lv_keys, nid)
+    if idx < 0 {
+        return 0
+    }
+    return lv_dyn[idx]
+}
+
+// 局部作用域插入（五表同步；已存在覆盖，对齐 Rust scope.insert）
+pub func lv_insert(nid: i64, ty: i64, is_const: i64, telem: i64, dyn: i64) -> i64 {
+    var pos0 = sstate.bs_find(lv_keys, nid)
+    if pos0 >= 0 {
+        lv_vals[pos0] = ty
+        lv_const[pos0] = is_const
+        lv_telem[pos0] = telem
+        lv_dyn[pos0] = dyn
+        return pos0
+    }
+    var n = len(lv_keys)
+    var lo: i64 = 0
+    var hi: i64 = n - 1
+    var pos: i64 = n
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if lv_keys[mid] < nid {
+            lo = mid + 1
+        } else {
+            pos = mid
+            hi = mid - 1
+        }
+    }
+    table_push(lv_keys, 0)
+    table_push(lv_vals, 0)
+    table_push(lv_const, 0)
+    table_push(lv_telem, 0)
+    table_push(lv_dyn, 0)
+    var i: i64 = n
+    while i > pos {
+        lv_keys[i] = lv_keys[i - 1]
+        lv_vals[i] = lv_vals[i - 1]
+        lv_const[i] = lv_const[i - 1]
+        lv_telem[i] = lv_telem[i - 1]
+        lv_dyn[i] = lv_dyn[i - 1]
+        i = i - 1
+    }
+    lv_keys[pos] = nid
+    lv_vals[pos] = ty
+    lv_const[pos] = is_const
+    lv_telem[pos] = telem
+    lv_dyn[pos] = dyn
+    return pos
+}
+
+// 全局变量查询（返回类型 id；-1 = 未声明）
+pub func gb_find(nid: i64) -> i64 {
+    var idx = sstate.bs_find(gb_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return gb_vals[idx]
+}
+pub func gb_const_of(nid: i64) -> i64 {
+    var idx = sstate.bs_find(gb_keys, nid)
+    if idx < 0 {
+        return 0
+    }
+    return gb_const[idx]
+}
+pub func gb_telem_of(nid: i64) -> i64 {
+    var idx = sstate.bs_find(gb_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return gb_telem[idx]
+}
+
+// 表元素类型（变量名）：局部 → 全局 → -1
+pub func var_table_elem(nid: i64) -> i64 {
+    var i = sstate.bs_find(lv_keys, nid)
+    if i >= 0 {
+        return lv_telem[i]
+    }
+    var j = sstate.bs_find(gb_keys, nid)
+    if j >= 0 {
+        return gb_telem[j]
+    }
+    return -1
+}
+pub func var_dyn(nid: i64) -> i64 {
+    var i = sstate.bs_find(lv_keys, nid)
+    if i >= 0 {
+        return lv_dyn[i]
+    }
+    var j = sstate.bs_find(gb_keys, nid)
+    if j >= 0 {
+        return 1
+    }
+    return 0
+}
+
+// 函数返回表元素类型查询（fn 名 -> 元素类型；-1 无）
+pub func table_ret_elem(fn_name: string) -> i64 {
+    var nid = intern.intern(fn_name)
+    var idx = sstate.bs_find(tre_keys, nid)
+    if idx >= 0 {
+        return tre_vals[idx]
+    }
+    var bi = sstate.bs_find(tre_bi_keys, nid)
+    if bi >= 0 {
+        return tre_bi_vals[bi]
+    }
+    return -1
+}
+
+// ==================== 裸调用名解析（M2.1.7） ====================
+// 候选 1：顶层裸名；候选 2：当前命名空间前缀补全（逐级外层）；
+// 候选 3：using 引入的命名空间。返回实际注册键（全名）。
+pub func resolve_call_name(name: string) -> string {
+    var nid = intern.intern(name)
+    if sstate.fn_sig(name) >= 0 {
+        return name
+    }
+    // 候选 2：当前命名空间逐级外层补全
+    if ns_top > 0 {
+        var depth: i64 = ns_top
+        while depth >= 0 {
+            var full: string = ""
+            var i: i64 = 0
+            while i < depth {
+                if i > 0 {
+                    full = full + "::"
+                }
+                full = full + intern.lookup(ns_stack[i])
+                i = i + 1
+            }
+            var cand: string = ""
+            if full != "" {
+                cand = full + "::" + name
+            } else {
+                cand = name
+            }
+            if sstate.fn_sig(cand) >= 0 {
+                return cand
+            }
+            depth = depth - 1
+        }
+    }
+    // 候选 3：using 引入的命名空间
+    var off: i64 = 0
+    var u: i64 = 0
+    while u < len(using_lens) {
+        var ln = using_lens[u]
+        var full: string = ""
+        var i: i64 = 0
+        while i < ln {
+            if i > 0 {
+                full = full + "::"
+            }
+            full = full + intern.lookup(using_prefixes[off + i])
+            i = i + 1
+        }
+        var cand = full + "::" + name
+        if sstate.fn_sig(cand) >= 0 {
+            return cand
+        }
+        off = off + ln
+        u = u + 1
+    }
+    return name
+}
+
+// ==================== 表达式类型推断 ====================
+// infer_expr(id) -> 类型 id；-1 = 错误（g_err_* 已置）
+pub func infer_expr(id: i64) -> i64 {
+    var tag = s_tags[id]
+    // 字面量
+    if tag == 0 {
+        node_types[id] = types.named(TK_I64)
+        g_typed = g_typed + 1
+        return types.named(TK_I64)
+    }
+    if tag == 1 {
+        node_types[id] = types.named(TK_F64)
+        g_typed = g_typed + 1
+        return types.named(TK_F64)
+    }
+    if tag == 2 {
+        node_types[id] = types.named(TK_STR)
+        g_typed = g_typed + 1
+        return types.named(TK_STR)
+    }
+    if tag == 3 {
+        node_types[id] = types.named(TK_CHAR)
+        g_typed = g_typed + 1
+        return types.named(TK_CHAR)
+    }
+    if tag == 4 {
+        node_types[id] = types.named(TK_BOOL)
+        g_typed = g_typed + 1
+        return types.named(TK_BOOL)
+    }
+    if tag == 5 {
+        node_types[id] = types.named(TK_TRIT)
+        g_typed = g_typed + 1
+        return types.named(TK_TRIT)
+    }
+    // Var
+    if tag == S_N_VAR {
+        var nm = sstate.name_str(id)
+        var nid = intern.intern(nm)
+        var lt = lv_find(nid)
+        if lt >= 0 {
+            node_types[id] = lt
+            g_typed = g_typed + 1
+            return lt
+        }
+        var gt = gb_find(nid)
+        if gt >= 0 {
+            node_types[id] = gt
+            g_typed = g_typed + 1
+            return gt
+        }
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "未声明的变量 '" + nm + "'"
+        return -1
+    }
+    // Range
+    if tag == S_N_RANGE {
+        var st = infer_expr(sstate.child(id, 0))
+        if st < 0 {
+            return -1
+        }
+        var en = infer_expr(sstate.child(id, 1))
+        if en < 0 {
+            return -1
+        }
+        if !types.is_int(st) || !types.is_int(en) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "范围两端必须是整数"
+            return -1
+        }
+        node_types[id] = types.named(TK_I64)
+        g_typed = g_typed + 1
+        return types.named(TK_I64)
+    }
+    // Unary
+    if tag == S_N_UNARY {
+        var op = s_vals[id]
+        var operand = infer_expr(sstate.child(id, 0))
+        if operand < 0 {
+            return -1
+        }
+        if op == 0 {
+            // Neg：数字
+            if !types.is_number(operand) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "取负运算的操作数必须是数字"
+                return -1
+            }
+        } else if op == 1 {
+            // Not：bool 或 trit
+            if !types.is_bool_like(operand) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "逻辑非的操作数必须是 bool"
+                return -1
+            }
+        } else {
+            // 自增/自减：可写数字变量
+            var target = sstate.child(id, 0)
+            if s_tags[target] != S_N_VAR {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "自增/自减的操作数必须是可写数字变量"
+                return -1
+            }
+            var nm = sstate.name_str(target)
+            var nid2 = intern.intern(nm)
+            if lv_const_of(nid2) == 1 {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "不能对 const 变量 '" + nm + "' 自增/自减"
+                return -1
+            }
+            if !types.is_number(operand) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "自增/自减的操作数必须是可写数字变量"
+                return -1
+            }
+        }
+        node_types[id] = operand
+        g_typed = g_typed + 1
+        return operand
+    }
+    // Binary
+    if tag == S_N_BINARY {
+        var op = s_vals[id]
+        var lhs = infer_expr(sstate.child(id, 0))
+        if lhs < 0 {
+            return -1
+        }
+        var rhs = infer_expr(sstate.child(id, 1))
+        if rhs < 0 {
+            return -1
+        }
+        // 两侧类型一致（trit×i64 例外；int×float 混用；string+string 拼接）
+        var type_ok: bool = false
+        if lhs == rhs {
+            type_ok = true
+        } else if types.is_bool_like(lhs) && types.is_bool_like(rhs) {
+            type_ok = true
+        } else if lhs == TK_TRIT && types.is_int(rhs) {
+            type_ok = true
+        } else if rhs == TK_TRIT && types.is_int(lhs) {
+            type_ok = true
+        } else if types.is_int(lhs) && types.is_int(rhs) {
+            type_ok = true
+        } else if types.is_float(lhs) && types.is_float(rhs) {
+            type_ok = true
+        } else if types.is_int(lhs) && types.is_float(rhs) {
+            type_ok = true
+        } else if types.is_float(lhs) && types.is_int(rhs) {
+            type_ok = true
+        } else if op == 0 && lhs == TK_STR && rhs == TK_STR {
+            // 字符串拼接
+            type_ok = true
+        }
+        if !type_ok {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "二元运算两侧类型不一致：" + types.type_name(lhs) + " 与 " + types.type_name(rhs)
+            return -1
+        }
+        // 按运算符分组校验
+        if op <= 4 || op == 13 || op == 14 || op == 15 || op == 16 || op == 17 {
+            // 算术/位运算：数字（位运算需整数）
+            if !types.is_number(lhs) && lhs != TK_STR && !(lhs == TK_TRIT || rhs == TK_TRIT) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "算术运算符不能用于 " + types.type_name(lhs)
+                return -1
+            }
+            if op >= 13 && !types.is_int(lhs) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "位运算只支持整数，不能用于 " + types.type_name(lhs)
+                return -1
+            }
+            if op == 4 && !types.is_int(lhs) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "取模运算只支持整数"
+                return -1
+            }
+        } else if op <= 10 {
+            // 比较：数字/字符串/bool/trit
+            if !types.is_number(lhs) && lhs != TK_STR && !types.is_bool_like(lhs) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "比较运算符不能用于 " + types.type_name(lhs)
+                return -1
+            }
+        } else if op <= 12 {
+            // 逻辑：bool 或 trit
+            if !types.is_bool_like(lhs) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "逻辑运算符两侧必须是 bool（或两侧同为 trit）"
+                return -1
+            }
+        }
+        var rt = lhs
+        if types.is_int(lhs) && types.is_float(rhs) {
+            rt = rhs
+        }
+        if types.is_float(lhs) && types.is_int(rhs) {
+            rt = lhs
+        }
+        if op <= 10 && op >= 5 {
+            // 比较/逻辑：结果 bool
+            rt = types.named(TK_BOOL)
+        }
+        node_types[id] = rt
+        g_typed = g_typed + 1
+        return rt
+    }
+    // Ternary
+    if tag == S_N_TERNARY {
+        var cond = infer_expr(sstate.child(id, 0))
+        if cond < 0 {
+            return -1
+        }
+        if !types.is_bool_like(cond) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "三目条件必须是 bool"
+            return -1
+        }
+        var th = infer_expr(sstate.child(id, 1))
+        if th < 0 {
+            return -1
+        }
+        var el = infer_expr(sstate.child(id, 2))
+        if el < 0 {
+            return -1
+        }
+        if th != el && !(types.is_int(th) && types.is_int(el)) && !(types.is_float(th) && types.is_float(el)) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "三目两分支类型不一致：" + types.type_name(th) + " 与 " + types.type_name(el)
+            return -1
+        }
+        node_types[id] = th
+        g_typed = g_typed + 1
+        return th
+    }
+    // Path：不能作值
+    if tag == S_N_PATH {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "命名空间路径 '" + sstate.name_str(id) + "' 不能作为值使用（只能用于调用，如 'x::f()'）"
+        return -1
+    }
+    // TypeLit：仅 switch case
+    if tag == S_N_TYPE_LIT {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "类型字面量只能用作 switch 的 case 类型匹配"
+        return -1
+    }
+    // Index
+    if tag == S_N_INDEX {
+        var base = infer_expr(sstate.child(id, 0))
+        if base < 0 {
+            return -1
+        }
+        var idx = infer_expr(sstate.child(id, 1))
+        if idx < 0 {
+            return -1
+        }
+        if types.is_table(base) {
+            var elem = types.table_elem(base)
+            if elem < 0 {
+                // 表变量：查 var_table_elem
+                var base_node = sstate.child(id, 0)
+                if s_tags[base_node] == S_N_VAR {
+                    var nm = sstate.name_str(base_node)
+                    var nid = intern.intern(nm)
+                    var te = var_table_elem(nid)
+                    if te >= 0 {
+                        node_types[id] = te
+                        g_typed = g_typed + 1
+                        return te
+                    }
+                }
+                // 裸 table：元素类型未知，默认 i64
+                node_types[id] = types.named(TK_I64)
+                g_typed = g_typed + 1
+                return types.named(TK_I64)
+            }
+            node_types[id] = elem
+            g_typed = g_typed + 1
+            return elem
+        }
+        if base == TK_STR {
+            if !types.is_int(idx) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "下标必须是整数，实际是 " + types.type_name(idx)
+                return -1
+            }
+            // 对齐 Rust 版：s[i] → 取第 i 个字符（char），非 string
+            node_types[id] = types.named(TK_CHAR)
+            g_typed = g_typed + 1
+            return types.named(TK_CHAR)
+        }
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "下标访问的对象必须是表或字符串，实际是 " + types.type_name(base)
+        return -1
+    }
+    // FieldAccess
+    if tag == S_N_FIELD_ACCESS {
+        var base = infer_expr(sstate.child(id, 0))
+        if base < 0 {
+            return -1
+        }
+        var fnm = sstate.name_str(id)
+        var bk = types.kind(base)
+        if bk == K_TUPLE {
+            var ti = types.low(base)
+            var off = tup_offs[ti]
+            var cnt = tup_n[ti]
+            var i: i64 = 0
+            while i < cnt {
+                var fnid = tup_names[off + i]
+                // 访问顺序：数字下标（.0 起）→ ItemN（1 起编号）→ 字段名
+                var hit: bool = false
+                if fnm == to_string(i) {
+                    hit = true
+                } else if fnm == "Item" + to_string(i + 1) {
+                    hit = true
+                } else if fnid >= 0 {
+                    if intern.lookup(fnid) == fnm {
+                        hit = true
+                    }
+                }
+                if hit {
+                    node_types[id] = tup_tys[off + i]
+                    g_typed = g_typed + 1
+                    return tup_tys[off + i]
+                }
+                i = i + 1
+            }
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "元组没有字段 '" + fnm + "'"
+            return -1
+        }
+        if bk == K_STRUCT {
+            // P8：struct 字段访问的 base 必须可寻址
+            var base_node = sstate.child(id, 0)
+            if !sstate.is_addressable(base_node) {
+                var cls_name = sstate.struct_name_of(types.low(base))
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "struct 实例 '" + cls_name + "' 的字段访问需要可寻址对象（变量/字段链），"
+                return -1
+            }
+            var si = types.low(base)
+            var off = cls_fldoff[si]
+            var cnt = cls_nfld[si]
+            var i: i64 = 0
+            while i < cnt {
+                if intern.lookup(fld_names[off + i]) == fnm {
+                    node_types[id] = fld_tys[off + i]
+                    g_typed = g_typed + 1
+                    return fld_tys[off + i]
+                }
+                i = i + 1
+            }
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "类 '" + intern.lookup(st_keys[si]) + "' 没有字段 '" + fnm + "'"
+            return -1
+        }
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "字段访问 '.' 的对象必须是元组或类实例，实际是 " + types.type_name(base)
+        return -1
+    }
+    // TableLit
+    if tag == S_N_TABLE_LIT {
+        var nc = sstate.nchild(id)
+        if nc == 0 {
+            // 空表：i64
+            node_types[id] = types.named(TK_I64)
+            g_typed = g_typed + 1
+            return types.named(TK_I64)
+        }
+        // map 检测：TableId 子节点存在
+        var is_map: bool = false
+        var i: i64 = 0
+        while i < nc {
+            var cell = sstate.child(id, i)
+            var cid = sstate.child(cell, 0)
+            if cid >= 0 {
+                if s_tags[cid] == S_N_TABLE_ID {
+                    is_map = true
+                }
+            }
+            i = i + 1
+        }
+        if is_map {
+            // map<val_ty>：所有值类型一致
+            var val_ty: i64 = -1
+            var i2: i64 = 0
+            while i2 < nc {
+                var cell = sstate.child(id, i2)
+                var vt = infer_expr(sstate.child(cell, 1))
+                if vt < 0 {
+                    return -1
+                }
+                if val_ty < 0 {
+                    val_ty = vt
+                } else {
+                    if vt != val_ty && !(types.is_int(vt) && types.is_int(val_ty)) {
+                        sm_err_line = s_lines[id]
+                        sm_err_col = s_cols[id]
+                        sm_err_msg = "键值表值类型不匹配：map 值为 " + types.type_name(val_ty) + " 与 " + types.type_name(vt)
+                        return -1
+                    }
+                }
+                i2 = i2 + 1
+            }
+            node_types[id] = types.map_of(val_ty)
+            g_typed = g_typed + 1
+            return types.map_of(val_ty)
+        }
+        // 普通表：元素类型一致
+        var elem_ty: i64 = -1
+        var i3: i64 = 0
+        while i3 < nc {
+            var cell = sstate.child(id, i3)
+            var vt = infer_expr(sstate.child(cell, 1))
+            if vt < 0 {
+                return -1
+            }
+            if elem_ty < 0 {
+                elem_ty = vt
+            } else {
+                if vt != elem_ty && !(types.is_int(vt) && types.is_int(elem_ty)) && !(types.is_float(vt) && types.is_float(elem_ty)) {
+                    sm_err_line = s_lines[id]
+                    sm_err_col = s_cols[id]
+                    sm_err_msg = "表元素类型不一致：" + types.type_name(elem_ty) + " 与 " + types.type_name(vt)
+                    return -1
+                }
+            }
+            i3 = i3 + 1
+        }
+        node_types[id] = types.table_of(elem_ty)
+        g_typed = g_typed + 1
+        return types.table_of(elem_ty)
+    }
+    // TupleLit
+    if tag == S_N_TUPLE_LIT {
+        var nc = sstate.nchild(id)
+        if nc == 0 {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "空元组 () 不支持"
+            return -1
+        }
+        // 字段名查重
+        var i: i64 = 0
+        while i < nc {
+            var f = sstate.child(id, i)
+            var fnid = s_names[f]
+            if fnid >= 0 {
+                var j: i64 = 0
+                while j < i {
+                    var g = sstate.child(id, j)
+                    if s_names[g] == fnid {
+                        sm_err_line = s_lines[id]
+                        sm_err_col = s_cols[id]
+                        sm_err_msg = "元组字段名 '" + intern.lookup(fnid) + "' 重复"
+                        return -1
+                    }
+                    j = j + 1
+                }
+            }
+            i = i + 1
+        }
+        // 登记 tuple 类型（先占位再填值保证字段段紧凑）
+        var idx = len(tuple_tys)
+        var off = len(tup_names)
+        table_push(tup_offs, off)
+        table_push(tup_n, nc)
+        table_push(tuple_tys, types.tuple_of(idx))
+        var jj: i64 = 0
+        while jj < nc {
+            table_push(tup_names, -1)
+            table_push(tup_tys, 0)
+            jj = jj + 1
+        }
+        var i2: i64 = 0
+        while i2 < nc {
+            var f = sstate.child(id, i2)
+            var ft = infer_expr(sstate.child(f, 0))
+            if ft < 0 {
+                return -1
+            }
+            tup_names[off + i2] = s_names[f]
+            tup_tys[off + i2] = ft
+            i2 = i2 + 1
+        }
+        var rt = types.tuple_of(idx)
+        node_types[id] = rt
+        g_typed = g_typed + 1
+        return rt
+    }
+    // Call
+    if tag == S_N_CALL {
+        return infer_call(id)
+    }
+    // MethodCall
+    if tag == S_N_METHOD_CALL {
+        return infer_method_call(id)
+    }
+    sm_err_line = s_lines[id]
+    sm_err_col = s_cols[id]
+    sm_err_msg = "无法推断表达式（节点 " + to_string(tag) + "）"
+    return -1
+}
+
+// 函数调用推断
+pub func infer_call(id: i64) -> i64 {
+    var fnm = sstate.name_str(id)
+    // 实参收集
+    var args: table<i64> = table_new_i64()
+    var nc = sstate.nchild(id)
+    var i: i64 = 0
+    while i < nc {
+        table_push(args, sstate.child(id, i))
+        i = i + 1
+    }
+    // 内置函数：先校验个数（-2=参数错误已报），通过后逐个推断实参
+    var br = sbuiltin.builtin_call(fnm, args, id)
+    if br >= -1 && br != -3 {
+        // 实参类型推断（未声明变量/类型错误在此暴露；只做检查不改结果）
+        var ka: i64 = 0
+        while ka < nc {
+            var at = infer_expr(args[ka])
+            if at < 0 {
+                return -1
+            }
+            ka = ka + 1
+        }
+        if br == -1 {
+            // void
+            node_types[id] = types.named(TK_VOID)
+            g_typed = g_typed + 1
+            return types.named(TK_VOID)
+        }
+        node_types[id] = br
+        g_typed = g_typed + 1
+        return br
+    }
+    if br == -2 {
+        return -1
+    }
+    // struct 构造
+    var snid = intern.intern(fnm)
+    var sidx = sstate.bs_find(st_keys, snid)
+    if sidx >= 0 {
+        var si = st_vals[sidx]
+        var nf = cls_nfld[si]
+        if nc > nf {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "构造 '" + fnm + "' 最多 " + to_string(nf) + " 个参数（字段数），实际 " + to_string(nc) + " 个"
+            return -1
+        }
+        // 字段类型匹配
+        var off = cls_fldoff[si]
+        var j: i64 = 0
+        while j < nc {
+            var at = infer_expr(args[j])
+            if at < 0 {
+                return -1
+            }
+            if !stype.types_match(fld_tys[off + j], at, args[j]) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "构造 '" + fnm + "' 参数类型不匹配：字段 '" + intern.lookup(fld_names[off + j]) + "' 期望 " + types.type_name(fld_tys[off + j]) + "，实际 " + types.type_name(at)
+                return -1
+            }
+            j = j + 1
+        }
+        node_types[id] = types.struct_of(si)
+        g_typed = g_typed + 1
+        return types.struct_of(si)
+    }
+    // 用户函数（裸调用解析：顶层 / 当前命名空间补全 / using 前缀补全）
+    var full_name = resolve_call_name(fnm)
+    var sig = sstate.fn_sig(full_name)
+    if sig < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "未定义的函数 '" + fnm + "'"
+        return -1
+    }
+    // 可见性校验
+    var vr = sstate.check_visibility(full_name, sig, id)
+    if vr < 0 {
+        return -1
+    }
+    var req = sg_required[sig]
+    var total = sg_nparams[sig]
+    if nc < req || nc > total {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "函数 '" + fnm + "' 期望 " + to_string(req) + " 到 " + to_string(total) + " 个参数，实际 " + to_string(nc) + " 个"
+        return -1
+    }
+    var off = sg_off[sig]
+    var j2: i64 = 0
+    while j2 < nc {
+        var at = infer_expr(args[j2])
+        if at < 0 {
+            return -1
+        }
+        var want = sp_tys[off + j2]
+        if !stype.types_compatible(want, at) && !stype.types_match(want, at, args[j2]) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "调用 '" + fnm + "' 参数类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(at)
+            return -1
+        }
+        j2 = j2 + 1
+    }
+    var rt = sg_ret[sig]
+    node_types[id] = rt
+    g_typed = g_typed + 1
+    return rt
+}
+
+// 方法调用推断（命名空间函数 / struct 方法转发）
+pub func infer_method_call(id: i64) -> i64 {
+    var recv = sstate.child(id, 0)
+    var mname = sstate.name_str(id)
+    var args: table<i64> = table_new_i64()
+    var nc = sstate.nchild(id)
+    var i: i64 = 1
+    while i < nc {
+        table_push(args, sstate.child(id, i))
+        i = i + 1
+    }
+    // 接收者是命名空间路径（Var 未绑定）→ ns 调用
+    var full = ""
+    if s_tags[recv] == S_N_VAR {
+        var rname = sstate.name_str(recv)
+        var rnid = intern.intern(rname)
+        var rt2 = lv_find(rnid)
+        if rt2 < 0 {
+            rt2 = gb_find(rnid)
+        }
+        if rt2 < 0 {
+            // 未绑定：命名空间前缀
+            full = rname + "::" + mname
+        } else {
+            // struct 实例方法转发
+            return infer_struct_method(recv, rt2, mname, args, id)
+        }
+    } else {
+        // Path 接收者 → ns 调用
+        full = recv_path_name(recv) + "::" + mname
+    }
+    if full == "::" + mname {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "方法调用的对象必须是 struct 实例或 struct 名，实际是 " + types.type_name(infer_expr(recv))
+        return -1
+    }
+    var sig = sstate.fn_sig(full)
+    if sig < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "命名空间函数 '" + full + "' 未定义"
+        return -1
+    }
+    // 可见性校验
+    var vr = sstate.check_visibility(full, sig, id)
+    if vr < 0 {
+        return -1
+    }
+    var req = sg_required[sig]
+    var total = sg_nparams[sig]
+    if len(args) < req || len(args) > total {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "命名空间函数 '" + full + "' 期望 " + to_string(req) + " 到 " + to_string(total) + " 个参数，实际 " + to_string(len(args)) + " 个"
+        return -1
+    }
+    var off = sg_off[sig]
+    var j: i64 = 0
+    while j < len(args) {
+        var at = infer_expr(args[j])
+        if at < 0 {
+            return -1
+        }
+        var want = sp_tys[off + j]
+        if !stype.types_compatible(want, at) && !stype.types_match(want, at, args[j]) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "调用 '" + full + "' 参数类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(at)
+            return -1
+        }
+        j = j + 1
+    }
+    var rt = sg_ret[sig]
+    node_types[id] = rt
+    g_typed = g_typed + 1
+    return rt
+}
+
+// 接收者路径名拼接（Segment 链 / FieldAccess 链 / Var / Path 统一递归）
+pub func recv_path_name(recv: i64) -> string {
+    var tag = s_tags[recv]
+    if tag == S_N_VAR {
+        return sstate.name_str(recv)
+    }
+    if tag == S_N_FIELD_ACCESS {
+        // FieldAccess[name=字段名, children=[基址]]：字段名在 name 字段
+        var base = sstate.child(recv, 0)
+        var bp = recv_path_name(base)
+        var fnm = sstate.name_str(recv)
+        if bp == "" {
+            return fnm
+        }
+        return bp + "::" + fnm
+    }
+    if tag == S_N_PATH {
+        // Path(children=[Segment...])：逐段拼接
+        var out: string = ""
+        var nc = sstate.nchild(recv)
+        var i: i64 = 0
+        while i < nc {
+            if i > 0 {
+                out = out + "::"
+            }
+            out = out + sstate.name_str(sstate.child(recv, i))
+            i = i + 1
+        }
+        return out
+    }
+    // 兜底：逐 child 拼接名字
+    var out2: string = ""
+    var nc2 = sstate.nchild(recv)
+    var j: i64 = 0
+    while j < nc2 {
+        if j > 0 {
+            out2 = out2 + "::"
+        }
+        out2 = out2 + sstate.name_str(sstate.child(recv, j))
+        j = j + 1
+    }
+    return out2
+}
+
+// struct 实例方法转发
+pub func infer_struct_method(recv: i64, recv_ty: i64, mname: string, args: table<i64>, id: i64) -> i64 {
+    var bk = types.kind(recv_ty)
+    if bk != K_STRUCT {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "方法调用的对象必须是 struct 实例或 struct 名，实际是 " + types.type_name(recv_ty)
+        return -1
+    }
+    var si = types.low(recv_ty)
+    var sname = intern.lookup(st_keys[si])
+    var full = sname + "::" + mname
+    var sig = sstate.fn_sig(full)
+    if sig < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "struct '" + sname + "'（含继承链）没有方法 '" + mname + "'"
+        return -1
+    }
+    // 方法函数必须 pub
+    var vr = sstate.check_visibility(full, sig, id)
+    if vr < 0 {
+        return -1
+    }
+    // 方法：首参 = 接收者（按引用）
+    var total = sg_nparams[sig]
+    if len(args) + 1 > total {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "方法 '" + full + "' 期望 " + to_string(total - 1) + " 个参数（不含接收者），实际 " + to_string(len(args)) + " 个"
+        return -1
+    }
+    // 接收者类型匹配（首参）
+    var off = sg_off[sig]
+    var want = sp_tys[off]
+    if !stype.types_compatible(want, recv_ty) {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "方法 '" + full + "' 首参类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(recv_ty)
+        return -1
+    }
+    var j: i64 = 0
+    while j < len(args) {
+        var at = infer_expr(args[j])
+        if at < 0 {
+            return -1
+        }
+        var want2 = sp_tys[off + 1 + j]
+        if !stype.types_compatible(want2, at) && !stype.types_match(want2, at, args[j]) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "方法 '" + full + "' 参数类型不匹配：期望 " + types.type_name(want2) + "，实际 " + types.type_name(at)
+            return -1
+        }
+        j = j + 1
+    }
+    var rt = sg_ret[sig]
+    node_types[id] = rt
+    g_typed = g_typed + 1
+    return rt
+}
+
+}

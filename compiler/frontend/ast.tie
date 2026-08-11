@@ -156,31 +156,6 @@ const U_PRE_DEC: i64 = 3;
 const U_POST_INC: i64 = 4;
 const U_POST_DEC: i64 = 5;
 
-// ---------- 类型关键字 TyKw 索引（对齐 Rust TyKw 顺序，T2.5 补）----------
-// 0=i8 1=i16 2=i32 3=i64 4=u8 5=u16 6=u32 7=u64 8=f32 9=f64 10=bool
-// 11=trit 12=char 13=string 14=void 15=code 16=num 17=text 18=misc 19=table 20=map
-const TK_I8: i64 = 0;
-const TK_I16: i64 = 1;
-const TK_I32: i64 = 2;
-const TK_I64: i64 = 3;
-const TK_U8: i64 = 4;
-const TK_U16: i64 = 5;
-const TK_U32: i64 = 6;
-const TK_U64: i64 = 7;
-const TK_F32: i64 = 8;
-const TK_F64: i64 = 9;
-const TK_BOOL: i64 = 10;
-const TK_TRIT: i64 = 11;
-const TK_CHAR: i64 = 12;
-const TK_STR: i64 = 13;
-const TK_VOID: i64 = 14;
-const TK_CODE: i64 = 15;
-const TK_NUM: i64 = 16;
-const TK_TEXT: i64 = 17;
-const TK_MISC: i64 = 18;
-const TK_TABLE: i64 = 19;
-const TK_MAP: i64 = 20;
-
 // ---------- 全局列式节点池（T0.4 全局表：下标对齐 = 节点 id）----------
 var node_tags: table<i64>;       // 第 0 列：节点 tag
 var node_names: table<i64>;      // 第 1 列：字符串池 id（-1 = 无名字）

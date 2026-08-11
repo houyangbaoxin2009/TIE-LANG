@@ -17,7 +17,7 @@ pub func parse_type() -> i64 {
         var lex = putil.peek_lexeme()
         var tk = putil.typekw_index(lex)
         putil.advance()
-        if tk == TK_TABLE {
+        if tk == 19 {
             if putil.eat(lex_lt) {
                 var elem = parse_type()
                 if elem < 0 {
@@ -32,9 +32,9 @@ pub func parse_type() -> i64 {
                 ast.set_children(t, kids)
                 return t
             }
-            return ast.new_node(N_NAMED_TYPE, interner.intern(lex), TK_TABLE, -1, line, col)
+            return ast.new_node(N_NAMED_TYPE, interner.intern(lex), 19, -1, line, col)
         }
-        if tk == TK_MAP {
+        if tk == 20 {
             if putil.eat(lex_lt) {
                 var val = parse_type()
                 if val < 0 {
@@ -50,7 +50,7 @@ pub func parse_type() -> i64 {
                 return t
             }
             // 裸 map = map<i64>
-            var i64node = ast.new_node(N_NAMED_TYPE, interner.intern("i64"), TK_I64, -1, line, col)
+            var i64node = ast.new_node(N_NAMED_TYPE, interner.intern("i64"), 3, -1, line, col)
             var t = ast.new_node(N_MAP_TYPE, -1, -1, -1, line, col)
             var kids: table<i64> = table_new_i64()
             table_push(kids, i64node)
@@ -113,6 +113,6 @@ func parse_tuple_type(line: i64, col: i64) -> i64 {
     }
     var t = ast.new_node(N_TUPLE_TYPE, -1, -1, -1, line, col)
     ast.set_children(t, fields)
-
+    return t
 }
 }

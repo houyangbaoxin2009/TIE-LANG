@@ -1,0 +1,185 @@
+// tie:logic
+// compiler/frontend/semantic_test.tie —— 自举 v2 T2.6 完整语义分析器验收程序
+// ============================================================
+// 作用：
+//   1) 无参数运行：对 corpus.txt（101 文件）中 pass 文件做
+//      parser.parse_src + semantic.check，断言返回 "OK:" 开头；
+//   2) 负例断言（与 Rust semantic 行为对齐）：未声明变量/类型不匹配/
+//      const 赋值/函数重复定义/循环外 break；
+//   3) check_debug 输出类型表/签名摘要（人工比对 Rust）；
+//   4) 输出「semantic 验收通过」exit 0。
+// 编译运行：target\release\tie-llvm.exe compiler\frontend\semantic_test.tie
+import "./semantic.tie"
+
+// 断言辅助
+func tcheck(ok: bool, what: string) -> bool {
+    if !ok {
+        println("自检失败: " + what)
+    }
+    return ok
+}
+
+// 字符串断言：失败打印期望/实际
+func tcheck_str(got: string, want: string, what: string) -> bool {
+    if got != want {
+        println("自检失败: " + what)
+        println("  期望: [" + want + "]")
+        println("  实际: [" + got + "]")
+        return false
+    }
+    return true
+}
+
+// 是否 ERR: 协议错误
+func has_err(s: string) -> bool {
+    return str_len(s) >= 4 &&
+        str_char(s, 0) == "E" && str_char(s, 1) == "R" &&
+        str_char(s, 2) == "R" && str_char(s, 3) == ":"
+}
+
+// 是否 OK: 开头
+func is_ok(s: string) -> bool {
+    return str_len(s) >= 3 &&
+        str_char(s, 0) == "O" && str_char(s, 1) == "K" && str_char(s, 2) == ":"
+}
+
+// 路径目录：返回最后一个 '/' 之前的子串（含 '/'）；无 '/' 返回 ""
+func path_dir_of(path: string) -> string {
+    var n = str_len(path)
+    var i: i64 = n - 1
+    var last: i64 = -1
+    while i >= 0 {
+        if str_char(path, i) == "/" {
+            last = i
+            break
+        }
+        i = i - 1
+    }
+    if last < 0 {
+        return ""
+    }
+    return str.slice(path, 0, last + 1)
+}
+
+// 检查单个 pass 文件：parse + import 展开 + check 全通过
+func check_file(path: string) -> i64 {
+    var src = file_read(path)
+    var r = semantic.check_src(src, path_dir_of(path))
+    if !is_ok(r) {
+        println("  [" + path + "] 语义错误: " + str.slice(r, 0, 120))
+        return 0
+    }
+    return 1
+}
+
+// 负例：期望包含关键字的消息
+func expect_err(src: string, keyword: string, label: string) -> i64 {
+    var r = semantic.check_src(src, "")
+    if is_ok(r) {
+        println("  [" + label + "] 期望语义错误但通过")
+        return 0
+    }
+    // 检查消息含关键字
+    if str.contains(r, keyword) {
+        return 1
+    }
+    println("  [" + label + "] 消息缺关键字 '" + keyword + "': " + r)
+    return 0
+}
+
+func main() {
+    var ok: bool = true
+
+    // ============ corpus 全量检查 ============
+    var corpus = file_read("scripts/bench/corpus.txt")
+    var total_ok: i64 = 0
+    var total_err: i64 = 0
+    var total_excl: i64 = 0
+    var n = str_len(corpus)
+    var pos: i64 = 0
+    var line_start: i64 = 0
+    while pos <= n {
+        var at_end: bool = false
+        if pos == n {
+            at_end = true
+        } else {
+            if str_char(corpus, pos) == "\n" {
+                at_end = true
+            }
+        }
+        if at_end {
+            var line = str.slice(corpus, line_start, pos)
+            var line_len = str_len(line)
+            var is_comment: bool = false
+            if line_len > 0 {
+                if str_char(line, 0) == "#" {
+                    is_comment = true
+                }
+            }
+            if line_len > 0 && !is_comment {
+                // 格式：<path> <pass|fail>
+                var space_at: i64 = -1
+                var i: i64 = 0
+                while i < line_len {
+                    if str_char(line, i) == " " {
+                        space_at = i
+                        break
+                    }
+                    i = i + 1
+                }
+                var path = ""
+                var role = ""
+                if space_at >= 0 {
+                    path = str.slice(line, 0, space_at)
+                    role = str.slice(line, space_at + 1, line_len)
+                }
+                if role == "pass" {
+                    var r = check_file(path)
+                    if r == 1 {
+                        total_ok = total_ok + 1
+                    } else if r == 0 {
+                        total_err = total_err + 1
+                    } else {
+                        total_excl = total_excl + 1
+                    }
+                }
+            }
+            line_start = pos + 1
+        }
+        pos = pos + 1
+    }
+    println("corpus pass: " + to_string(total_ok) + "/" + to_string(total_ok + total_err) + "（excluded " + to_string(total_excl) + "，ERR " + to_string(total_err) + "）")
+    ok = tcheck(total_err == 0, "corpus 全部 pass") && ok
+
+    // ============ 负例断言 ============
+    var neg_ok: i64 = 0
+    var neg_total: i64 = 0
+    var n1 = expect_err("func main() {\n    var x = 1\n    println(y)\n}\n", "未声明的变量", "未声明变量")
+    neg_total = neg_total + 1
+    neg_ok = neg_ok + n1
+    var n2 = expect_err("func main() {\n    var x: i64 = \"hello\"\n}\n", "类型不匹配", "类型不匹配")
+    neg_total = neg_total + 1
+    neg_ok = neg_ok + n2
+    var n3 = expect_err("func main() {\n    const K: i64 = 1\n    K = 2\n}\n", "不能给 const", "const 赋值")
+    neg_total = neg_total + 1
+    neg_ok = neg_ok + n3
+    var n4 = expect_err("func f() {}\nfunc f() {}\nfunc main() {}\n", "重复定义", "函数重复定义")
+    neg_total = neg_total + 1
+    neg_ok = neg_ok + n4
+    var n5 = expect_err("func main() {\n    break\n}\n", "只能出现在循环体内", "循环外 break")
+    neg_total = neg_total + 1
+    neg_ok = neg_ok + n5
+    println("负例断言：" + to_string(neg_ok) + "/" + to_string(neg_total) + " 通过")
+    ok = tcheck(neg_ok == neg_total, "负例全部通过") && ok
+
+    // ============ 类型表验证（check_debug）============
+    var hello = file_read("examples/hello.tie")
+    var dbg = semantic.check_debug_src(hello, "examples/")
+    println("类型表/签名摘要：")
+    println(dbg)
+
+    if !ok {
+        exit(1)
+    }
+    println("semantic 验收通过")
+}

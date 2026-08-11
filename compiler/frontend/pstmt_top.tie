@@ -93,7 +93,18 @@ func parse_import() -> i64 {
     putil.advance()   // import
     var path = -1
     if putil.peek_tag() == lex_str {
-        path = interner.intern(putil.peek_lexeme())
+        // 路径去首尾引号（字符串 lexeme 是原始切片含引号；Rust 版 path 无引号）
+        var raw = putil.peek_lexeme()
+        var rn = str_len(raw)
+        var clean = raw
+        if rn >= 2 {
+            if str_char(raw, 0) == "\"" {
+                if str_char(raw, rn - 1) == "\"" {
+                    clean = str.slice(raw, 1, rn - 1)
+                }
+            }
+        }
+        path = interner.intern(clean)
         putil.advance()
     } else {
         putil.set_err(putil.peek_line(), putil.peek_col(), "import 后必须是字符串路径，实际是 " + putil.describe(putil.peek_tag()))
@@ -284,7 +295,7 @@ func parse_extern() -> i64 {
             return -1
         }
     } else {
-        ret_ty = ast.new_node(N_NAMED_TYPE, interner.intern("void"), TK_VOID, -1, line, col)
+        ret_ty = ast.new_node(N_NAMED_TYPE, interner.intern("void"), 14, -1, line, col)
     }
     if !putil.expect(lex_semi, "extern 声明结束的分号") {
         return -1
@@ -370,7 +381,7 @@ func parse_fn_def() -> i64 {
             return -1
         }
     } else {
-        ret_ty = ast.new_node(N_NAMED_TYPE, interner.intern("void"), TK_VOID, -1, line, col)
+        ret_ty = ast.new_node(N_NAMED_TYPE, interner.intern("void"), 14, -1, line, col)
     }
     var body = pstmt_flow.parse_block()
     if body < 0 {

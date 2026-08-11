@@ -1,0 +1,593 @@
+// tie:library
+// compiler/frontend/scollect.tie —— T2.6 顶层收集子遍（模块拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.6（.omo/plans/self-hosting-v2.md）完整语义分析
+// 拆分为 8 模块之一（本文件 = 顶层收集：函数/命名空间/struct/全局变量/
+// extern 登记 + struct 字段拍平 + 返回表预扫描 + 命名空间全名补全）。
+// 对应 proto/semantic.tie 862-872（tre_bi_init）+ 873-957（collect_top）
+// + 960-1058（find_struct_node/collect_struct_fields/collect_all_struct_fields）
+// + 1066-1207（scan_return_elem/scan_blk/collect_all_return_tables）
+// + 1208-1247（collect_fn）+ 1266-1336（collect_ns/ns_full_name）
+// + 1339-1407（collect_global_var）逻辑搬移。
+// 依赖：./sstate.tie（AST 全局 + 符号表 + 工具）+ ./sinfer.tie（表达式推断
+// + resolve_call_name + table_ret_elem）。树式无环：由 scheck.tie import。
+import "./sinfer.tie"
+
+namespace scollect {
+
+// 内置函数返回表预登记（语言底座）
+pub func tre_bi_init() {
+    tre_bi_keys = table_new_i64()
+    tre_bi_vals = table_new_i64()
+    sstate.sorted_insert(tre_bi_keys, tre_bi_vals, intern.intern("list_dir"), types.named(TK_STR))
+    sstate.sorted_insert(tre_bi_keys, tre_bi_vals, intern.intern("walk_dir"), types.named(TK_STR))
+    sstate.sorted_insert(tre_bi_keys, tre_bi_vals, intern.intern("byte_read"), types.named(TK_I64))
+    sstate.sorted_insert(tre_bi_keys, tre_bi_vals, intern.intern("byte_concat"), types.named(TK_I64))
+    sstate.sorted_insert(tre_bi_keys, tre_bi_vals, intern.intern("regex_find_all"), types.named(TK_STR))
+}
+
+// 顶层函数签名收集（含参数/返回类型解析）
+pub func collect_fn(fn_node: i64, full: string) -> i64 {
+    var nparams = s_aux[fn_node]
+    var is_pub = s_vals[fn_node]
+    var rt_node = sstate.child(fn_node, 0)
+    var ret_ty = stype.parse_type_node(rt_node)
+    if ret_ty < 0 {
+        return -1
+    }
+    var p_tys: table<i64> = table_new_i64()
+    var p_refs: table<i64> = table_new_i64()
+    var p_defs: table<i64> = table_new_i64()
+    var required: i64 = nparams
+    var k: i64 = 0
+    while k < nparams {
+        var p = sstate.child(fn_node, 1 + k)
+        var pt = stype.parse_type_node(sstate.child(p, 0))
+        if pt < 0 {
+            return -1
+        }
+        table_push(p_tys, pt)
+        table_push(p_refs, s_vals[p])
+        var has_def: i64 = 0
+        if sstate.nchild(p) > 1 {
+            if sstate.child(p, 1) >= 0 {
+                has_def = 1
+            }
+        }
+        table_push(p_defs, has_def)
+        if has_def == 0 {
+            required = k + 1
+        }
+        k = k + 1
+    }
+    if sstate.reg_fn(full, is_pub, nparams, required, ret_ty, p_tys, p_refs, p_defs) < 0 {
+        sm_err_line = s_lines[fn_node]
+        sm_err_col = s_cols[fn_node]
+        return -1
+    }
+    return 0
+}
+
+// 查找顶层 struct 定义节点（按名字）
+pub func find_struct_node(name: string) -> i64 {
+    var n = sstate.nchild(g_root)
+    var i: i64 = 0
+    while i < n {
+        var s = sstate.child(g_root, i)
+        if s_tags[s] == S_N_STRUCT {
+            if sstate.name_str(s) == name {
+                return s
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 收集单个 struct 的拍平字段（含继承）
+pub func collect_struct_fields(si: i64) -> i64 {
+    if cls_done[si] == 1 {
+        return 0
+    }
+    cls_done[si] = 1
+    var p = cls_parent[si]
+    if p >= 0 {
+        var pidx = sstate.bs_find(st_keys, p)
+        var psi = st_vals[pidx]
+        var r = collect_struct_fields(psi)
+        if r < 0 {
+            return -1
+        }
+        // 字段段起点对齐父字段段
+        cls_fldoff[si] = cls_fldoff[psi]
+        cls_nfld[si] = cls_nfld[psi]
+    } else {
+        // 无父：字段段起点 = 当前 fld_names 末尾
+        cls_fldoff[si] = len(fld_names)
+        cls_nfld[si] = 0
+    }
+    var nm = intern.lookup(st_keys[si])
+    var snode = find_struct_node(nm)
+    if snode < 0 {
+        sm_err_line = 1
+        sm_err_col = 1
+        sm_err_msg = "内部错误：struct '" + nm + "' 定义节点未找到"
+        return -1
+    }
+    // 自身字段
+    var nf = sstate.nchild(snode)
+    var k: i64 = 0
+    while k < nf {
+        var f = sstate.child(snode, k)
+        var fty = stype.parse_type_node(sstate.child(f, 0))
+        if fty < 0 {
+            sm_err_line = s_lines[f]
+            sm_err_col = s_cols[f]
+            return -1
+        }
+        var fnid = intern.intern(sstate.name_str(f))
+        // 字段名跨继承链唯一
+        var d: i64 = 0
+        var dup: bool = false
+        while d < cls_nfld[si] {
+            if fld_names[cls_fldoff[si] + d] == fnid {
+                dup = true
+                break
+            }
+            d = d + 1
+        }
+        if dup {
+            sm_err_line = s_lines[f]
+            sm_err_col = s_cols[f]
+            sm_err_msg = "字段 '" + nm + "." + sstate.name_str(f) + "' 与继承链中的字段重名（字段名必须跨继承链唯一）"
+            return -1
+        }
+        table_push(fld_names, fnid)
+        table_push(fld_tys, fty)
+        cls_nfld[si] = cls_nfld[si] + 1
+        k = k + 1
+    }
+    return 0
+}
+
+// 全部 struct 字段收集（check 前调用）
+pub func collect_all_struct_fields() -> i64 {
+    var n = len(st_keys)
+    var i: i64 = 0
+    while i < n {
+        var si = st_vals[i]
+        var r = collect_struct_fields(si)
+        if r < 0 {
+            return -1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 返回表达式元素类型（表字面量/构造调用/变量）
+pub func scan_return_elem(e: i64) -> i64 {
+    var tag = s_tags[e]
+    if tag == S_N_CALL {
+        var nm = sstate.name_str(e)
+        if nm == "table_new_i64" {
+            return types.named(TK_I64)
+        }
+        if nm == "table_new_f64" {
+            return types.named(TK_F64)
+        }
+        if nm == "table_new_string" {
+            return types.named(TK_STR)
+        }
+        if nm == "table_new_bool" {
+            return types.named(TK_BOOL)
+        }
+        // 已登记返回表的函数调用（裸名经 resolve_call_name 补全 using/命名空间前缀）
+        var fnm = sinfer.resolve_call_name(nm)
+        return sinfer.table_ret_elem(fnm)
+    }
+    if tag == S_N_TABLE_LIT {
+        var nc = sstate.nchild(e)
+        if nc == 0 {
+            return types.named(TK_I64)
+        }
+        // 表字面量：取首元素值推断
+        return scan_return_elem(sstate.child(sstate.child(e, 0), 1))
+    }
+    if tag == S_N_VAR {
+        var nm = sstate.name_str(e)
+        // 查本函数体内同名 var 声明的初始化
+        var nparams = s_aux[g_cur_scan_fn]
+        return scan_blk(sstate.child(g_cur_scan_fn, 1 + nparams), nm)
+    }
+    return -1
+}
+
+// 遍历语句块：want 为空 → 找 return 表达式推断元素类型；否则找同名 var 声明
+pub func scan_blk(blk: i64, want: string) -> i64 {
+    var n = sstate.nchild(blk)
+    var i: i64 = 0
+    while i < n {
+        var s = sstate.child(blk, i)
+        var tag = s_tags[s]
+        if want == "" {
+            if tag == S_N_RETURN {
+                var v = sstate.child(s, 0)
+                if v >= 0 {
+                    var e = scan_return_elem(v)
+                    if e >= 0 {
+                        return e
+                    }
+                }
+            }
+        } else {
+            if tag == S_N_VAR_DECL {
+                if sstate.name_str(s) == want {
+                    var init = sstate.child(s, 1)
+                    if init >= 0 {
+                        var e = scan_return_elem(init)
+                        if e >= 0 {
+                            return e
+                        }
+                    }
+                }
+            }
+        }
+        // 递归子块：if/while/for/switch
+        var r: i64 = -1
+        if tag == S_N_IF {
+            r = scan_blk(sstate.child(s, 1), want)
+            if r >= 0 {
+                return r
+            }
+            var el = sstate.child(s, 2)
+            if el >= 0 {
+                r = scan_blk(el, want)
+                if r >= 0 {
+                    return r
+                }
+            }
+        } else if tag == S_N_WHILE {
+            r = scan_blk(sstate.child(s, 1), want)
+            if r >= 0 {
+                return r
+            }
+        } else if tag == S_N_FOR {
+            r = scan_blk(sstate.child(s, 1), want)
+            if r >= 0 {
+                return r
+            }
+        } else if tag == S_N_SWITCH {
+            var ncases = s_aux[s]
+            var k: i64 = 0
+            while k < ncases {
+                var c = sstate.child(s, 1 + k)
+                r = scan_blk(sstate.child(c, 2), want)
+                if r >= 0 {
+                    return r
+                }
+                k = k + 1
+            }
+            var dflt = sstate.child(s, 1 + ncases)
+            if dflt >= 0 {
+                r = scan_blk(dflt, want)
+                if r >= 0 {
+                    return r
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 全部返回表函数预扫描（check 前调用）
+pub func collect_all_return_tables() -> i64 {
+    var n = len(fn_keys)
+    var i: i64 = 0
+    while i < n {
+        var fname = intern.lookup(fn_keys[i])
+        var sig = sstate.fn_sig(fname)
+        if sig >= 0 {
+            if sg_ret[sig] == TK_TABLE {
+                var fn_node = find_fn_node(fname)
+                if fn_node >= 0 {
+                    g_cur_scan_fn = fn_node
+                    var nparams = s_aux[fn_node]
+                    var e = scan_blk(sstate.child(fn_node, 1 + nparams), "")
+                    if e >= 0 {
+                        if sstate.bs_find(tre_keys, fn_keys[i]) < 0 {
+                            sstate.sorted_insert(tre_keys, tre_vals, fn_keys[i], e)
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 命名空间递归收集（全名路径段压栈 + 递归）
+pub func collect_ns(ns_node: i64) -> i64 {
+    var nsegs = s_aux[ns_node]
+    var body: i64 = -1
+    var i: i64 = 0
+    while i < nsegs {
+        var seg = sstate.child(ns_node, i)
+        sstate.ns_push(s_names[seg])
+        i = i + 1
+    }
+    body = sstate.child(ns_node, nsegs)
+    // 命名空间内：函数/嵌套命名空间/struct
+    var nb = sstate.nchild(body)
+    var j: i64 = 0
+    while j < nb {
+        var s = sstate.child(body, j)
+        var tag = s_tags[s]
+        if tag == S_N_FN_DEF {
+            var full = sstate.ns_full_name(sstate.name_str(s))
+            var r = collect_fn(s, full)
+            if r < 0 {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                return -1
+            }
+        } else if tag == S_N_NAMESPACE {
+            var r = collect_ns(s)
+            if r < 0 {
+                return -1
+            }
+        } else if tag == S_N_STRUCT {
+            var nm = sstate.name_str(s)
+            var parent = ""
+            var p = s_aux[s]
+            if p >= 0 {
+                parent = intern.lookup(p)
+            }
+            var idx = sstate.reg_struct(nm, parent)
+            if idx < 0 {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                return -1
+            }
+        }
+        j = j + 1
+    }
+    // 弹栈
+    i = 0
+    while i < nsegs {
+        sstate.ns_pop()
+        i = i + 1
+    }
+    return 0
+}
+
+// 顶层全局变量收集
+pub func collect_global_var(v: i64) -> i64 {
+    var nm = sstate.name_str(v)
+    var is_const = s_vals[v]
+    var ty_node = sstate.child(v, 0)
+    var init = sstate.child(v, 1)
+    // 必须显式标注类型
+    if ty_node < 0 {
+        sm_err_line = s_lines[v]
+        sm_err_col = s_cols[v]
+        sm_err_msg = "全局变量 '" + nm + "' 必须显式标注类型（如 var x: i64）"
+        return -1
+    }
+    var ty = stype.parse_type_node(ty_node)
+    if ty < 0 {
+        return -1
+    }
+    var nid = intern.intern(nm)
+    if sstate.bs_find(gb_keys, nid) >= 0 {
+        sm_err_line = s_lines[v]
+        sm_err_col = s_cols[v]
+        sm_err_msg = "全局变量 '" + nm + "' 重复定义"
+        return -1
+    }
+    if sstate.bs_find(fn_keys, nid) >= 0 {
+        sm_err_line = s_lines[v]
+        sm_err_col = s_cols[v]
+        sm_err_msg = "全局变量 '" + nm + "' 与函数名冲突"
+        return -1
+    }
+    var k = types.kind(ty)
+    if k == K_TABLE || k == K_MAP || ty == TK_TABLE || ty == TK_MAP {
+        // 表全局：const 不支持；初始化必须空表
+        if is_const == 1 {
+            sm_err_line = s_lines[v]
+            sm_err_col = s_cols[v]
+            sm_err_msg = "const 全局表暂不支持：'" + nm + "'需要 main 入口运行时创建，无法静态初始化"
+            return -1
+        }
+        var elem: i64 = -1
+        if ty == TK_TABLE {
+            elem = types.named(TK_STR)
+        } else if k == K_TABLE {
+            elem = types.low(ty)
+        } else {
+            elem = types.named(TK_STR)
+        }
+        sstate.sorted_insert(gb_keys, gb_vals, nid, ty)
+        table_push(gb_const, is_const)
+        table_push(gb_telem, elem)
+        return 0
+    }
+    // 标量全局：字面量初始化 + 类型匹配
+    if init >= 0 {
+        var it = sinfer.infer_expr(init)
+        if it < 0 {
+            return -1
+        }
+        if !stype.types_match(ty, it, init) {
+            sm_err_line = s_lines[v]
+            sm_err_col = s_cols[v]
+            sm_err_msg = "全局变量 '" + nm + "' 初始化类型不匹配：期望 " + types.type_name(ty) + "，实际 " + types.type_name(it)
+            return -1
+        }
+    }
+    sstate.sorted_insert(gb_keys, gb_vals, nid, ty)
+    table_push(gb_const, is_const)
+    table_push(gb_telem, -1)
+    return 0
+}
+
+// 收集全部顶层语句（第一子遍）：遍历 g_extra_tops（semantic 主入口
+// import 展开后填充：主文件顶层 + 全部被导入文件顶层）。
+// 返回 0 成功 / -1 错误
+pub func collect_top() -> i64 {
+    var n = len(g_extra_tops)
+    var i: i64 = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        var tag = s_tags[s]
+        if tag == S_N_FN_DEF {
+            var full = sstate.name_str(s)
+            var r = collect_fn(s, full)
+            if r < 0 {
+                return -1
+            }
+        } else if tag == S_N_NAMESPACE {
+            var r = collect_ns(s)
+            if r < 0 {
+                return -1
+            }
+        } else if tag == S_N_STRUCT {
+            var nm = sstate.name_str(s)
+            var parent = ""
+            var p = s_aux[s]
+            if p >= 0 {
+                parent = intern.lookup(p)
+            }
+            var idx = sstate.reg_struct(nm, parent)
+            if idx < 0 {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                return -1
+            }
+        } else if tag == S_N_VAR_DECL {
+            var r = collect_global_var(s)
+            if r < 0 {
+                return -1
+            }
+        } else if tag == S_N_EXTERN {
+            var full = sstate.name_str(s)
+            var nparams = s_aux[s]
+            var ret_ty = stype.parse_type_node(sstate.child(s, 0))
+            if ret_ty < 0 {
+                return -1
+            }
+            var p_tys: table<i64> = table_new_i64()
+            var p_refs: table<i64> = table_new_i64()
+            var p_defs: table<i64> = table_new_i64()
+            var k: i64 = 0
+            while k < nparams {
+                var p = sstate.child(s, 1 + k)
+                var pt = stype.parse_type_node(sstate.child(p, 0))
+                if pt < 0 {
+                    return -1
+                }
+                table_push(p_tys, pt)
+                table_push(p_refs, 0)
+                table_push(p_defs, 0)
+                k = k + 1
+            }
+            if sstate.reg_fn(full, 1, nparams, nparams, ret_ty, p_tys, p_refs, p_defs) < 0 {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                return -1
+            }
+            // extern 名集合（语义登记）
+            sstate.sorted_insert(ext_keys, ext_keys, intern.intern(full), 0)
+        } else if tag == S_N_IMPORT {
+            // import 展开在 semantic 主入口处理（读文件 + 递归）
+        } else if tag == S_N_USING {
+            // 收集 using 引入的命名空间段（裸调用补全候选）
+            var nsegs = s_aux[s]
+            var k2: i64 = 0
+            while k2 < nsegs {
+                var seg = sstate.child(s, k2)
+                table_push(using_prefixes, s_names[seg])
+                k2 = k2 + 1
+            }
+            table_push(using_lens, nsegs)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 查找函数定义节点（顶层 + 命名空间递归）
+// 顶层遍历 g_extra_tops（import 展开后的全部文件顶层）；namespace 内递归。
+pub func find_fn_node(full: string) -> i64 {
+    var n = len(g_extra_tops)
+    var i: i64 = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        var tag = s_tags[s]
+        if tag == S_N_FN_DEF {
+            if sstate.ns_full_name(sstate.name_str(s)) == full {
+                return s
+            }
+        } else if tag == S_N_NAMESPACE {
+            var nsegs = s_aux[s]
+            var j: i64 = 0
+            while j < nsegs {
+                var seg = sstate.child(s, j)
+                sstate.ns_push(s_names[seg])
+                j = j + 1
+            }
+            var body = sstate.child(s, nsegs)
+            var found = find_fn_in_ns(body, full)
+            j = 0
+            while j < nsegs {
+                ns_top = ns_top - 1
+                j = j + 1
+            }
+            if found >= 0 {
+                return found
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 命名空间体内递归查找函数节点（含嵌套 namespace）
+func find_fn_in_ns(blk: i64, full: string) -> i64 {
+    var n = sstate.nchild(blk)
+    var i: i64 = 0
+    while i < n {
+        var s = sstate.child(blk, i)
+        var tag = s_tags[s]
+        if tag == S_N_FN_DEF {
+            if sstate.ns_full_name(sstate.name_str(s)) == full {
+                return s
+            }
+        } else if tag == S_N_NAMESPACE {
+            var nsegs = s_aux[s]
+            var j: i64 = 0
+            while j < nsegs {
+                var seg = sstate.child(s, j)
+                sstate.ns_push(s_names[seg])
+                j = j + 1
+            }
+            var body = sstate.child(s, nsegs)
+            var found = find_fn_in_ns(body, full)
+            j = 0
+            while j < nsegs {
+                ns_top = ns_top - 1
+                j = j + 1
+            }
+            if found >= 0 {
+                return found
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+}

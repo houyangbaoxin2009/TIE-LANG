@@ -1,0 +1,256 @@
+// tie:library
+// compiler/frontend/stype.tie —— T2.6 语义类型辅助（模块拆分）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.6（.omo/plans/self-hosting-v2.md）完整语义分析
+// 拆分为 8 模块之一（本文件 = 类型节点解析 + 类型兼容/匹配判定）。
+// 对应 proto/semantic.tie 755-857（parse_type_node）+ 1410-1476
+// （types_compatible）+ 1478-1543（types_match）逻辑搬移。
+// 类型系统复用 middle/types.tie（types.named/table_of/kind/low/判据族/
+// type_name 与 proto 的 ty_* 完全同构）与 middle/data.tie（tag 段表）。
+// 依赖：./sstate.tie（AST 全局 + 符号表 + 工具，经其裸名访问 s_*/tup_*/
+// sm_err_*）+ ../middle/data.tie（经其传递可达 ../middle/types.tie）。
+// 树式无环：由 scollect.tie import（传递可达上层全部）。
+import "./sstate.tie"
+import "../middle/data.tie"
+
+namespace stype {
+
+// 类型节点 → 类型 id（types 自编码；含 tuple 查找/登记）
+pub func parse_type_node(tid: i64) -> i64 {
+    var tag = s_tags[tid]
+    if tag == S_N_NAMED_TYPE {
+        return types.named(s_vals[tid])
+    }
+    if tag == S_N_TABLE_TYPE {
+        var elem = parse_type_node(sstate.child(tid, 0))
+        if elem < 0 {
+            return -1
+        }
+        return types.table_of(elem)
+    }
+    if tag == S_N_MAP_TYPE {
+        var v = parse_type_node(sstate.child(tid, 0))
+        if v < 0 {
+            return -1
+        }
+        return types.map_of(v)
+    }
+    if tag == S_N_STRUCT_TYPE {
+        var nm = sstate.name_str(tid)
+        var nid = intern.intern(nm)
+        var idx = sstate.bs_find(st_keys, nid)
+        if idx < 0 {
+            sm_err_line = s_lines[tid]
+            sm_err_col = s_cols[tid]
+            sm_err_msg = "类 '" + nm + "' 未定义"
+            return -1
+        }
+        return types.struct_of(st_vals[idx])
+    }
+    if tag == S_N_TUPLE_TYPE {
+        // 查找/登记 tuple 类型
+        var nf = sstate.nchild(tid)
+        var i: i64 = 0
+        while i < len(tuple_tys) {
+            // 逐 tuple 比较字段
+            var off = tup_offs[i]
+            var cnt = tup_n[i]
+            if cnt == nf {
+                var match: bool = true
+                var j: i64 = 0
+                while j < nf {
+                    var f = sstate.child(tid, j)
+                    var fname = sstate.name_str(f)
+                    var fty = parse_type_node(sstate.child(f, 0))
+                    var fnid: i64 = -1
+                    if fname != "" {
+                        fnid = intern.intern(fname)
+                    }
+                    if tup_names[off + j] != fnid {
+                        match = false
+                        break
+                    }
+                    if tup_tys[off + j] != fty {
+                        match = false
+                        break
+                    }
+                    j = j + 1
+                }
+                if match {
+                    return types.tuple_of(i)
+                }
+            }
+            i = i + 1
+        }
+        // 新 tuple 登记（先占位再填值保证字段段紧凑 [off, off+nf)）
+        var idx = len(tuple_tys)
+        var off = len(tup_names)
+        table_push(tup_offs, off)
+        table_push(tup_n, nf)
+        table_push(tuple_tys, types.tuple_of(idx))
+        var j: i64 = 0
+        while j < nf {
+            table_push(tup_names, -1)
+            table_push(tup_tys, 0)
+            j = j + 1
+        }
+        var j2: i64 = 0
+        while j2 < nf {
+            var f = sstate.child(tid, j2)
+            var fname = sstate.name_str(f)
+            var fnid: i64 = -1
+            if fname != "" {
+                fnid = intern.intern(fname)
+            }
+            var fty = parse_type_node(sstate.child(f, 0))
+            if fty < 0 {
+                return -1
+            }
+            tup_names[off + j2] = fnid
+            tup_tys[off + j2] = fty
+            j2 = j2 + 1
+        }
+        return types.tuple_of(idx)
+    }
+    sm_err_line = s_lines[tid]
+    sm_err_col = s_cols[tid]
+    sm_err_msg = "期望类型，实际是未知节点"
+    return -1
+}
+
+// 类型兼容判定（宽类型框/裸表/嵌套逐层，对齐 Rust wide_accepts 与
+// proto types_compatible）
+pub func types_compatible(a: i64, b: i64) -> bool {
+    if a == b {
+        return true
+    }
+    var ka = types.kind(a)
+    var kb = types.kind(b)
+    // 宽类型 num/text/misc 是「类别框」
+    if a == TK_NUM && (types.is_int(b) || types.is_float(b)) {
+        return true
+    }
+    if b == TK_NUM && (types.is_int(a) || types.is_float(a)) {
+        return true
+    }
+    if a == TK_TEXT && (b == TK_STR || b == TK_CHAR) {
+        return true
+    }
+    if b == TK_TEXT && (a == TK_STR || a == TK_CHAR) {
+        return true
+    }
+    if a == TK_MISC && !types.is_wide(b) {
+        return true
+    }
+    if b == TK_MISC && !types.is_wide(a) {
+        return true
+    }
+    // 裸 table/map 与具体类型兼容
+    if a == TK_TABLE || a == TK_MAP {
+        if kb == K_TABLE || kb == K_MAP {
+            return true
+        }
+    }
+    if b == TK_TABLE || b == TK_MAP {
+        if ka == K_TABLE || ka == K_MAP {
+            return true
+        }
+    }
+    if ka == K_TABLE && kb == K_TABLE {
+        return types_compatible(types.low(a), types.low(b))
+    }
+    if ka == K_MAP && kb == K_MAP {
+        return types_compatible(types.low(a), types.low(b))
+    }
+    if ka == K_STRUCT && kb == K_STRUCT {
+        return a == b
+    }
+    if ka == K_TUPLE && kb == K_TUPLE {
+        // 逐字段比较
+        var ia = types.low(a)
+        var ib = types.low(b)
+        if tup_n[ia] != tup_n[ib] {
+            return false
+        }
+        var offa = tup_offs[ia]
+        var offb = tup_offs[ib]
+        var i: i64 = 0
+        while i < tup_n[ia] {
+            if tup_tys[offa + i] != tup_tys[offb + i] {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    return false
+}
+
+// 类型匹配（含字面量适配：整数字面量可作任意整数/浮点/trit 标注等）
+pub func types_match(want: i64, got: i64, init_node: i64) -> bool {
+    if types_compatible(want, got) {
+        return true
+    }
+    // 字面量适配
+    if init_node >= 0 {
+        var tag = s_tags[init_node]
+        // 元组字面量：逐字段适配
+        if tag == S_N_TUPLE_LIT {
+            var kw = types.kind(want)
+            var kg = types.kind(got)
+            if kw == K_TUPLE && kg == K_TUPLE {
+                var wi = types.low(want)
+                var gi = types.low(got)
+                if tup_n[wi] == tup_n[gi] {
+                    var cnt2 = tup_n[wi]
+                    var owi = tup_offs[wi]
+                    var ogi = tup_offs[gi]
+                    var i2: i64 = 0
+                    var all_ok: bool = true
+                    while i2 < cnt2 {
+                        var fe = sstate.child(init_node, i2)
+                        var fv = sstate.child(fe, 0)
+                        if !types_match(tup_tys[owi + i2], tup_tys[ogi + i2], fv) {
+                            all_ok = false
+                            break
+                        }
+                        i2 = i2 + 1
+                    }
+                    if all_ok {
+                        return true
+                    }
+                }
+            }
+        }
+        if tag == S_N_INT_LIT {
+            // IntLit：整数/浮点标注 + trit（对齐 Rust）
+            if types.is_int(want) || types.is_float(want) {
+                return true
+            }
+            if want == TK_TRIT {
+                return true
+            }
+        }
+        if tag == S_N_FLOAT_LIT {
+            // FloatLit：浮点标注
+            if types.is_float(want) {
+                return true
+            }
+        }
+        if tag == S_N_BOOL_LIT {
+            // BoolLit：bool → bool；true/false 可适配 trit
+            if want == TK_BOOL || want == TK_TRIT {
+                return true
+            }
+        }
+        if tag == S_N_TRIT_LIT {
+            // TritLit（zero）：适配 trit 标注
+            if want == TK_TRIT {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+}

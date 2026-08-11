@@ -311,7 +311,7 @@ pub func is_table_type(ty: i64) -> bool {
         return true
     }
     if tag == N_NAMED_TYPE {
-        if ast.val(ty) == TK_TABLE {
+        if ast.val(ty) == 19 {
             return true
         }
     }

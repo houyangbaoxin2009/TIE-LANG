@@ -1,0 +1,335 @@
+// tie:library
+// compiler/frontend/semantic.tie —— 自举 v2 T2.6：完整语义分析器（主入口）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.6（.omo/plans/self-hosting-v2.md）。由 T1.3 原型
+// compiler/proto/semantic.tie 升版（corpus pass + 负例断言），行为基准
+// Rust crates/tie-frontend/src/semantic.rs（错误消息逐字对齐）。
+// # 模块拆分（2026-08-11）：原 3802 行单文件按「无环 import 树」拆为 8 模块——
+//   sstate.tie（全局状态+AST 9 列+工具）/ stype.tie（类型辅助，复用 types）/
+//   sbuiltin.tie（内置函数签名）/ sinfer.tie（表达式推断+调用解析）/
+//   scollect.tie（顶层收集）/ scheck.tie（语句/函数检查）/ 本文件（主入口）。
+//   类型系统复用 middle/types.tie + middle/data.tie（T2.1 交付）。
+// # 相比原型改进：
+//   - import 展开（原型跳过，本版实现：读文件 + 递归检查 + 重复导入去重）；
+//   - 类型系统走 types.tie（ty_* 自编码与 proto 同构）。
+// # 协议：check(ast_text) -> "OK:<typed_count>" 或 "ERR:<line> <col> <msg>"。
+// # T2.6 验收：corpus 101 文件 pass + 负例 golden 逐字对齐 Rust。
+// import 树：本文件同时 import parser 树（展开 import 用）与 scheck 链
+// （语义检查）；两树文件无重叠（parser 树 = pst/ast/lexer/putil/pexpr/...，
+// semantic 树 = sstate/stype/sbuiltin/sinfer/scollect/scheck），无环无重复。
+import "./parser.tie"
+import "./scheck.tie"
+
+// ==================== import 展开状态 ====================
+// 当前文件目录（相对 import 解析基准）
+var g_cur_dir: string = "";
+
+namespace semantic {
+
+// 路径目录：返回最后一个 '/' 之前的子串（含 '/'）；无 '/' 返回 ""。
+func path_dir(path: string) -> string {
+    var n = str_len(path)
+    var i: i64 = n - 1
+    var last: i64 = -1
+    while i >= 0 {
+        if str_char(path, i) == "/" {
+            last = i
+            break
+        }
+        i = i - 1
+    }
+    if last < 0 {
+        return ""
+    }
+    return str.slice(path, 0, last + 1)
+}
+
+// 解析 import 路径：相对当前文件目录（处理 "./" 与 "../"）
+pub func resolve_import_path(path: string) -> string {
+    if sstate.has_prefix_str(path, "./") {
+        return g_cur_dir + str.slice(path, 2, str_len(path))
+    }
+    if sstate.has_prefix_str(path, "../") {
+        // g_cur_dir 形如 "examples/"：去掉最后一个非空目录段得 "…/"，
+        // 再拼去掉 ../ 的剩余路径（../ext/x → ext/x）
+        var d = g_cur_dir
+        var dn = str_len(d)
+        // 去掉尾部斜杠（若 d 非空且以 / 结尾）
+        while dn > 0 {
+            if str_char(d, dn - 1) == "/" {
+                dn = dn - 1
+            } else {
+                break
+            }
+        }
+        // 找到上一个 '/'，截断到它（含）——去掉最后一段
+        var cut: i64 = -1
+        var i: i64 = dn - 1
+        while i >= 0 {
+            if str_char(d, i) == "/" {
+                cut = i + 1
+                break
+            }
+            i = i - 1
+        }
+        var parent = ""
+        if cut >= 0 {
+            parent = str.slice(d, 0, cut)
+        }
+        return parent + str.slice(path, 3, str_len(path))
+    }
+    return path
+}
+
+// 已导入集合线性查找（文件少，线性足够）
+func imported_has(p: string) -> bool {
+    var i: i64 = 0
+    while i < len(g_imported) {
+        if g_imported[i] == p {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 递归展开单个 import 节点：读文件 → parse → append_ast 合并，
+// 其顶层语句（非 import）进 g_extra_tops，其 import 递归展开。
+func expand_one_import(imp_node: i64) -> i64 {
+    var p = sstate.name_str(imp_node)
+    var full = resolve_import_path(p)
+    if imported_has(full) {
+        return 0
+    }
+    table_push(g_imported, full)
+    var src = file_read(full)
+    if src == "" {
+        sm_err_line = s_lines[imp_node]
+        sm_err_col = s_cols[imp_node]
+        sm_err_msg = "无法读取导入文件 '" + full + "'"
+        return -1
+    }
+    var ast_text = parser.parse_src(src)
+    if sstate.has_prefix_str(ast_text, "ERR:") {
+        sm_err_line = s_lines[imp_node]
+        sm_err_col = s_cols[imp_node]
+        sm_err_msg = "导入文件 '" + full + "' 解析失败: " + ast_text
+        return -1
+    }
+    var base = sstate.append_ast(ast_text)
+    if base < 0 {
+        return -1
+    }
+    // import as 别名（M2.1.7）：alias = imp_node.aux（字符串池 id，-1 = 无别名）。
+    // 有别名时，把被导入文件顶层 namespace 的段名替换为别名（f2 作为唯一入口）。
+    var alias = s_aux[imp_node]
+    var new_root = len(s_tags) - 1
+    if alias >= 0 {
+        var an = sstate.nchild(new_root)
+        var ak: i64 = 0
+        while ak < an {
+            var as_ = sstate.child(new_root, ak)
+            if s_tags[as_] == S_N_NAMESPACE {
+                var nsegs = s_aux[as_]
+                if nsegs > 0 {
+                    // 只改第一段（namespace fmt → namespace f2）
+                    var first_seg = sstate.child(as_, 0)
+                    s_names[first_seg] = alias
+                }
+            }
+            ak = ak + 1
+        }
+    }
+    // 新文件顶层 StmtList root = 追加后最后节点
+    // 递归：新文件顶层中的 import 立即展开；其余进 g_extra_tops
+    var saved_dir = g_cur_dir
+    g_cur_dir = path_dir(full)
+    var nc = sstate.nchild(new_root)
+    var k: i64 = 0
+    while k < nc {
+        var s = sstate.child(new_root, k)
+        if s_tags[s] == S_N_IMPORT {
+            var r = expand_one_import(s)
+            if r < 0 {
+                g_cur_dir = saved_dir
+                return -1
+            }
+        } else {
+            table_push(g_extra_tops, s)
+        }
+        k = k + 1
+    }
+    g_cur_dir = saved_dir
+    return 0
+}
+
+// import 展开总入口：主文件顶层进 g_extra_tops，import 递归展开
+func expand_imports() -> i64 {
+    g_imported = table_new_string()
+    g_extra_tops = table_new_i64()
+    var n = sstate.nchild(g_root)
+    var i: i64 = 0
+    while i < n {
+        var s = sstate.child(g_root, i)
+        if s_tags[s] == S_N_IMPORT {
+            var r = expand_one_import(s)
+            if r < 0 {
+                return -1
+            }
+        } else {
+            table_push(g_extra_tops, s)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 便捷入口：源码字符串 + 基准目录 → 可读语义摘要
+pub func check_debug_src(src: string, base_dir: string) -> string {
+    var ast_text = parser.parse_src(src)
+    if sstate.has_prefix_str(ast_text, "ERR:") {
+        return ast_text
+    }
+    return check_debug(ast_text)
+}
+
+// ==================== check 主入口 ====================
+// 语义检查入口：AST 协议文本 → "OK:<typed>" / "ERR:<line> <col> <msg>"
+pub func check(ast_text: string) -> string {
+    return check_impl(ast_text, "")
+}
+
+// 便捷入口：源码字符串 + 基准目录 → 完整语义检查（parse + import 展开 + check）
+pub func check_src(src: string, base_dir: string) -> string {
+    var ast_text = parser.parse_src(src)
+    if sstate.has_prefix_str(ast_text, "ERR:") {
+        return ast_text
+    }
+    return check_impl(ast_text, base_dir)
+}
+
+// check 核心（含 import 展开）
+pub func check_impl(ast_text: string, base_dir: string) -> string {
+    g_cur_dir = base_dir
+    s_tags = table_new_i64()
+    s_names = table_new_i64()
+    s_vals = table_new_i64()
+    s_aux = table_new_i64()
+    s_coff = table_new_i64()
+    s_nchild = table_new_i64()
+    s_children = table_new_i64()
+    s_lines = table_new_i64()
+    s_cols = table_new_i64()
+    fn_keys = table_new_i64()
+    fn_vals = table_new_i64()
+    sg_nparams = table_new_i64()
+    sg_required = table_new_i64()
+    sg_ret = table_new_i64()
+    sg_pub = table_new_i64()
+    sg_off = table_new_i64()
+    sp_tys = table_new_i64()
+    sp_refs = table_new_i64()
+    sp_defs = table_new_i64()
+    st_keys = table_new_i64()
+    st_vals = table_new_i64()
+    cls_parent = table_new_i64()
+    cls_fldoff = table_new_i64()
+    cls_nfld = table_new_i64()
+    cls_done = table_new_i64()
+    fld_names = table_new_i64()
+    fld_tys = table_new_i64()
+    gb_keys = table_new_i64()
+    gb_vals = table_new_i64()
+    gb_const = table_new_i64()
+    gb_telem = table_new_i64()
+    ext_keys = table_new_i64()
+    tre_keys = table_new_i64()
+    tre_vals = table_new_i64()
+    node_types = table_new_i64()
+    lv_keys = table_new_i64()
+    lv_vals = table_new_i64()
+    lv_const = table_new_i64()
+    lv_telem = table_new_i64()
+    lv_dyn = table_new_i64()
+    lp_stack = table_new_i64()
+    lp_top = 0
+    ns_stack = table_new_i64()
+    ns_top = 0
+    using_prefixes = table_new_i64()
+    using_lens = table_new_i64()
+    tuple_tys = table_new_i64()
+    tup_names = table_new_i64()
+    tup_tys = table_new_i64()
+    tup_offs = table_new_i64()
+    tup_n = table_new_i64()
+    g_curfn = -1
+    g_typed = 0
+    sm_err_msg = ""
+    if len(tre_bi_keys) == 0 {
+        scollect.tre_bi_init()
+    }
+    if sstate.load_ast(ast_text) < 0 {
+        return "ERR:0 0 AST 协议解析失败"
+    }
+    g_root = s_n - 1
+    // import 展开（主文件顶层进 g_extra_tops，import 文件递归合并）
+    var er = expand_imports()
+    if er < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
+    var r = scollect.collect_top()
+    if r < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
+    // struct 字段拍平收集（含继承；须在逐函数检查前完成）
+    var r3 = scollect.collect_all_struct_fields()
+    if r3 < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
+    // 返回表元素预扫描（先于逐函数 check）
+    var r4 = scollect.collect_all_return_tables()
+    if r4 < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
+    var i: i64 = 0
+    while i < len(fn_keys) {
+        var fname = intern.lookup(fn_keys[i])
+        var r2 = scheck.check_fn_walk(fname)
+        if r2 < 0 {
+            return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        }
+        i = i + 1
+    }
+    return "OK:" + to_string(g_typed)
+}
+
+// ==================== check_debug：可读输出 ====================
+// 返回可读的语义摘要（函数签名/struct/全局变量/节点类型表计数）
+pub func check_debug(ast_text: string) -> string {
+    var r = check(ast_text)
+    var out: string = "语义检查: " + r + "\n"
+    out = out + "函数签名 (" + to_string(len(fn_keys)) + "):\n"
+    var i: i64 = 0
+    while i < len(fn_keys) {
+        var sig = fn_vals[i]
+        out = out + "  " + intern.lookup(fn_keys[i]) + "(" + to_string(sg_nparams[sig]) + " 参数) -> " + types.type_name(sg_ret[sig]) + "\n"
+        i = i + 1
+    }
+    out = out + "struct (" + to_string(len(st_keys)) + "):\n"
+    i = 0
+    while i < len(st_keys) {
+        var si = st_vals[i]
+        out = out + "  " + intern.lookup(st_keys[i]) + " (" + to_string(cls_nfld[si]) + " 字段)\n"
+        i = i + 1
+    }
+    out = out + "全局变量 (" + to_string(len(gb_keys)) + "):\n"
+    i = 0
+    while i < len(gb_keys) {
+        out = out + "  " + intern.lookup(gb_keys[i]) + ": " + types.type_name(gb_vals[i]) + "\n"
+        i = i + 1
+    }
+    out = out + "节点类型表 (" + to_string(g_typed) + " 条目)\n"
+    return out
+}
+
+}
