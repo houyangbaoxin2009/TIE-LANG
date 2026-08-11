@@ -1,0 +1,75 @@
+// tie:logic
+// tie:opt=2
+
+// utf + ascii 标准库验收（std/utf.tie + std/ascii.tie）：
+// - utf：Unicode 码点工具——codepoint / utf8_bytes / byte_len / hex_escape /
+//   is_ascii / is_letter / to_char（可打印 ASCII 查表）。
+// - ascii：ASCII 字符分类与转换——is_digit / is_alpha / is_alnum / is_lower /
+//   is_upper / to_lower / to_upper / is_print / is_space / to_code / to_char。
+// 关键点：tie 字符串内部是 UTF-8 编码，中文一个汉字 3 字节——"四段式"码点级
+// str_len 为 3、字节级 byte_len 为 9；hex_escape 输出 LLVM 风格 \XX 大写字节转义
+// （"四"0x56DB → "\E5\9B\9B"）。
+// 命名说明：char / code 是 tie 类型关键字保留字，故码点→字符函数为 to_char、
+// 字符→ASCII 码函数为 to_code（见 std/utf.tie、std/ascii.tie 头部注释）。
+// 预期输出：utf+ascii 验收通过（全部断言通过，无 assert 失败退出）。
+import "../../std/assert.tie"
+import "../../std/utf.tie"
+import "../../std/ascii.tie"
+using assert;
+using utf;
+using ascii;
+
+func main() {
+    // ---- utf.byte_len：UTF-8 字节数（中文 3 字节/字符）----
+    assert.assert_eq(utf.byte_len("四段式"), 9)
+    assert.assert_eq(utf.byte_len("hello"), 5)
+    assert.assert_eq(utf.byte_len("a你b"), 5)
+    assert.assert_eq(utf.byte_len(""), 0)
+    // ---- utf.utf8_bytes：码点 → UTF-8 字节数 ----
+    assert.assert_eq(utf.utf8_bytes(0x41), 1)
+    assert.assert_eq(utf.utf8_bytes(0x56DB), 3)
+    assert.assert_eq(utf.utf8_bytes(0x20AC), 3)
+    assert.assert_eq(utf.utf8_bytes(0x1F600), 4)
+    // ---- utf.hex_escape：LLVM \XX 风格大写字节转义 ----
+    // "四"(0x56DB) UTF-8 编码 E5 9B 9B → "\E5\9B\9B"；"A"(0x41) → "\41"。
+    // tie 源码中反斜杠需写成 \\（裸 \E5 属未知转义序列会报词法错误）。
+    assert.assert_eq_str(utf.hex_escape(0x56DB), "\\E5\\9B\\9B")
+    assert.assert_eq_str(utf.hex_escape(0x41), "\\41")
+    // ---- utf.codepoint：单字符 → Unicode 码点；非单字符/空串返回 -1 ----
+    assert.assert_eq(utf.codepoint("四"), 0x56DB)
+    // ---- utf.is_ascii / is_letter ----
+    assert.assert(utf.is_ascii(127))
+    assert.assert(!utf.is_ascii(128))
+    assert.assert(utf.is_letter(65))
+    assert.assert(!utf.is_letter(0x4E2D))
+    // ---- utf.to_char：可打印 ASCII 码点 → 单字符；越界返回空串 ----
+    assert.assert_eq_str(utf.to_char(65), "A")
+    assert.assert_eq_str(utf.to_char(31), "")
+    assert.assert_eq_str(utf.to_char(0x4E2D), "")
+    // ---- ascii.is_digit ----
+    assert.assert(ascii.is_digit(48))
+    assert.assert(!ascii.is_digit(58))
+    // ---- ascii.is_alpha / is_alnum ----
+    assert.assert(ascii.is_alpha(90))
+    assert.assert(!ascii.is_alpha(91))
+    assert.assert(ascii.is_alnum(57))
+    // ---- ascii.is_lower / is_upper ----
+    assert.assert(ascii.is_lower(97))
+    assert.assert(ascii.is_upper(65))
+    // ---- ascii.to_lower / to_upper：大小写转换；非字母原样 ----
+    assert.assert_eq(ascii.to_lower(65), 97)
+    assert.assert_eq(ascii.to_upper(122), 90)
+    assert.assert_eq(ascii.to_lower(48), 48)
+    // ---- ascii.is_print ----
+    assert.assert(ascii.is_print(32))
+    assert.assert(ascii.is_print(126))
+    assert.assert(!ascii.is_print(127))
+    // ---- ascii.is_space ----
+    assert.assert(ascii.is_space(32))
+    assert.assert(!ascii.is_space(65))
+    // ---- ascii.to_code / to_char：字符 ↔ ASCII 码 ----
+    assert.assert_eq(ascii.to_code("A"), 65)
+    assert.assert_eq(ascii.to_code("四"), -1)
+    assert.assert_eq_str(ascii.to_char(65), "A")
+    println("utf+ascii 验收通过")
+}

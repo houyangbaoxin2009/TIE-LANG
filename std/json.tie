@@ -1,0 +1,788 @@
+// tie:library
+// json.tie：标准库——JSON 解析与序列化（命名空间 json），兑现
+// "tie 当数据交换格式"定位（文件头 tie:data 角色的互操作核心）。
+// 实现：JSON 值 = 节点 id（AST 式平行表，模仿 compiler 前端模式），
+// 只依赖底座原语（str_len/str_char/char_code/parse_int/parse_float/
+// table_new_*/table_push/table_at/len）+ 字符串拼接。
+//
+// 节点表示（平行表，节点 id 为下标）：
+//   j_types[i]  节点类型：0=null 1=bool 2=int 3=float 4=str 5=array 6=object
+//   j_ivals[i]  int/bool 值；str 节点存字符串表 j_strs 的索引
+//   j_fvals[i]  float 值
+//   j_strs      字符串表（str 节点文本 + object 键文本，登记序去重）
+//   j_kids[i]   array/object：子元素在**扁平登记表**中的起始下标
+//   j_ovals[i]  array/object：子元素个数（数组元素=节点 id；对象=键值对数）
+//   j_elem_flat 数组元素节点 id 扁平表（追加式登记，永不修改）
+//   j_key_flat  对象键（j_strs 索引）扁平表
+//   j_val_flat  对象值节点 id 扁平表（与 j_key_flat 平行，同区间）
+//   j_err_msg   最近一次 parse 的错误消息（成功时为空串）
+// 说明：tie 的表元素只能存标量（无法存表引用），故数组/对象的子元素用
+// 扁平登记表 + [起始, 长度] 区间表示——追加式构建期间各节点区间固定，
+// 访问器按区间切片读取，无需嵌套表。
+//
+// 解析器位置推进：tie 参数按值传递（无引用参数），pos 无法经参数回传，
+// 故所有 parse_* 函数共享**模块级全局 g_pos**（parse 开头置 0），
+// 每个函数消费后推进 g_pos，递归返回后调用方续用——约定：函数返回时
+// g_pos 指向已消费内容之后的首个未消费字符（失败时 g_pos 指向错误处）。
+//
+// 失败约定：parse 返回 -1 且置 j_err_msg；访问器对非法节点 id 返回安全值
+// （0 / 空串 / -1），不崩溃。
+//
+// 局限：
+//   1. \uXXXX 转义仅支持可构造 ASCII 码点（\0 \t \n \r 与 32..126）：
+//      tie 无「码点 → 任意字符」原语（utf.to_char 仅 32..126），非 ASCII
+//      码点无法构造字符，解析报错。中文字符在 JSON 原文中直接出现即可解析。
+//   2. \b \f 转义：tie 词法不支持 \b \f 字面量（无法构造退格/换页字符），
+//      解析遇 \b \f 报错（j_err_msg 注明）。
+//   3. 浮点输出用 to_string 近似（to_string_f64 的 Rust 格式）。
+//   4. 字符串深度递归：tie 支持递归函数，深层嵌套受调用栈限制。
+//   5. 对象重复键：后者覆盖前者（obj_get 线性扫描取区间内最后命中）。
+//
+// 调用：import 后 json.parse(...) / json.to_str(...)；命名空间内互调为裸调用。
+// 命名规范：命名空间内函数不加 json_ 前缀（统一 func 写法，Harbor M2.1.6）。
+
+// ==================== 节点存储（模块级全局，命名空间外） ====================
+var j_types: table<i64>;
+var j_ivals: table<i64>;
+var j_fvals: table<f64>;
+var j_strs: table<string>;
+var j_kids: table<i64>;
+var j_ovals: table<i64>;
+var j_elem_flat: table<i64>;
+var j_key_flat: table<i64>;
+var j_val_flat: table<i64>;
+var j_err_msg: string = "";
+// 解析器位置游标（全局，见文件头"位置推进"说明）
+var g_pos: i64 = 0;
+
+namespace json {
+// ---------- 节点构造（内部） ----------
+
+// 新建一个节点，返回节点 id。类型码入 j_types，其余槽位填默认值。
+func new_node(ty: i64) -> i64 {
+    table_push(j_types, ty)
+    table_push(j_ivals, 0)
+    table_push(j_fvals, 0.0)
+    table_push(j_strs, "")
+    table_push(j_kids, -1)
+    table_push(j_ovals, 0)
+    return len(j_types) - 1
+}
+
+// 字符串节点：文本存入 j_strs，节点 j_ivals 存其索引。返回节点 id。
+func new_str_node(content: string) -> i64 {
+    var n = new_node(4)
+    table_push(j_strs, content)
+    j_ivals[n] = len(j_strs) - 1
+    return n
+}
+
+// ---------- 解析（递归下降） ----------
+
+// 解析 JSON 文本，成功返回根节点 id（>=0）；失败返回 -1 且置 j_err_msg。
+// 顶层必须恰一个值；允许前后空白（空格/制表/换行/回车）。
+pub func parse(s: string) -> i64 {
+    // 重置节点存储
+    j_types = table_new_i64()
+    j_ivals = table_new_i64()
+    j_fvals = table_new_f64()
+    j_strs = table_new_string()
+    j_kids = table_new_i64()
+    j_ovals = table_new_i64()
+    j_elem_flat = table_new_i64()
+    j_key_flat = table_new_i64()
+    j_val_flat = table_new_i64()
+    j_err_msg = ""
+    g_pos = 0
+    var root = parse_value(s)
+    if root < 0 {
+        return -1
+    }
+    // 根值后只允许空白
+    skip_ws(s)
+    if g_pos < str_len(s) {
+        j_err_msg = "JSON 根值后有额外内容（位置 " + to_string(g_pos) + "）"
+        return -1
+    }
+    return root
+}
+
+// 解析文件（file_read + parse）；失败返回 -1（j_err_msg 含文件/解析信息）。
+pub func parse_file(path: string) -> i64 {
+    var content = file_read(path)
+    if str_len(content) == 0 {
+        j_err_msg = "JSON 文件为空或读取失败: " + path
+        return -1
+    }
+    return parse(content)
+}
+
+// 跳过空白（空格 32 / 制表 9 / 换行 10 / 回车 13），推进 g_pos。
+func skip_ws(s: string) {
+    var n: i64 = str_len(s)
+    while g_pos < n {
+        var cp: i64 = char_code(str_char(s, g_pos))
+        if cp == 32 || cp == 9 || cp == 10 || cp == 13 {
+            g_pos = g_pos + 1
+        } else {
+            return
+        }
+    }
+}
+
+// 按首字符分派解析一个值；失败返回 -1（j_err_msg 已置）。
+// 注意：str_char 返回的单字符立即用于比较/char_code，不跨函数持有
+// （规避 Rust tie-llvm 后端循环内字符串缓冲 bug，见 std/http.tie 头注释）。
+func parse_value(s: string) -> i64 {
+    skip_ws(s)
+    var n: i64 = str_len(s)
+    if g_pos >= n {
+        j_err_msg = "JSON 值意外结束"
+        return -1
+    }
+    var c = str_char(s, g_pos)
+    var cp: i64 = char_code(c)
+    if cp == 123 {
+        return parse_object(s)
+    }
+    if cp == 91 {
+        return parse_array(s)
+    }
+    if cp == 34 {
+        return parse_string(s)
+    }
+    if cp == 116 {
+        return parse_literal(s, "true", 1)
+    }
+    if cp == 102 {
+        return parse_literal(s, "false", 0)
+    }
+    if cp == 110 {
+        return parse_literal(s, "null", -1)
+    }
+    if cp == 45 || (cp >= 48 && cp <= 57) {
+        return parse_number(s)
+    }
+    j_err_msg = "JSON 值意外字符（位置 " + to_string(g_pos) + "）"
+    return -1
+}
+
+// 解析关键字字面量（true/false/null）：匹配整个关键字。
+// 匹配成功：true → bool 节点 1；false → bool 节点 0；null → null 节点。
+func parse_literal(s: string, word: string, value: i64) -> i64 {
+    var m: i64 = str_len(word)
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < m {
+        if g_pos + i >= n || str_char(s, g_pos + i) != str_char(word, i) {
+            j_err_msg = "JSON 字面量不完整（位置 " + to_string(g_pos) + "）"
+            return -1
+        }
+        i = i + 1
+    }
+    g_pos = g_pos + m
+    if value == -1 {
+        return new_node(0)
+    }
+    var nd = new_node(1)
+    j_ivals[nd] = value
+    return nd
+}
+
+// 解析数字：-? 整数 (. 小数)? (e|E [+-]? 整数)?。收集数字字符后用
+// parse_int/parse_float 解析。返回 int 或 float 节点。
+func parse_number(s: string) -> i64 {
+    var n: i64 = str_len(s)
+    var digits: string = ""
+    // 可选负号
+    if g_pos < n && str_char(s, g_pos) == "-" {
+        digits = digits + "-"
+        g_pos = g_pos + 1
+    }
+    var is_float: bool = false
+    var started: bool = false
+    // 整数部分
+    while g_pos < n {
+        var c = str_char(s, g_pos)
+        var cp: i64 = char_code(c)
+        if cp >= 48 && cp <= 57 {
+            digits = digits + c
+            started = true
+            g_pos = g_pos + 1
+        } else {
+            break
+        }
+    }
+    if !started {
+        j_err_msg = "JSON 数字缺少整数部分（位置 " + to_string(g_pos) + "）"
+        return -1
+    }
+    // 小数部分
+    if g_pos < n && str_char(s, g_pos) == "." {
+        is_float = true
+        digits = digits + "."
+        g_pos = g_pos + 1
+        var fstarted: bool = false
+        while g_pos < n {
+            var c2 = str_char(s, g_pos)
+            var cp2: i64 = char_code(c2)
+            if cp2 >= 48 && cp2 <= 57 {
+                digits = digits + c2
+                fstarted = true
+                g_pos = g_pos + 1
+            } else {
+                break
+            }
+        }
+        if !fstarted {
+            j_err_msg = "JSON 数字小数部分缺少数字（位置 " + to_string(g_pos) + "）"
+            return -1
+        }
+    }
+    // 指数部分
+    if g_pos < n && (str_char(s, g_pos) == "e" || str_char(s, g_pos) == "E") {
+        is_float = true
+        digits = digits + "e"
+        g_pos = g_pos + 1
+        if g_pos < n && (str_char(s, g_pos) == "+" || str_char(s, g_pos) == "-") {
+            digits = digits + str_char(s, g_pos)
+            g_pos = g_pos + 1
+        }
+        var estarted: bool = false
+        while g_pos < n {
+            var c3 = str_char(s, g_pos)
+            var cp3: i64 = char_code(c3)
+            if cp3 >= 48 && cp3 <= 57 {
+                digits = digits + c3
+                estarted = true
+                g_pos = g_pos + 1
+            } else {
+                break
+            }
+        }
+        if !estarted {
+            j_err_msg = "JSON 数字指数部分缺少数字（位置 " + to_string(g_pos) + "）"
+            return -1
+        }
+    }
+    if is_float {
+        var nd = new_node(3)
+        j_fvals[nd] = parse_float(digits)
+        return nd
+    }
+    var nd2 = new_node(2)
+    j_ivals[nd2] = parse_int(digits)
+    return nd2
+}
+
+// 解析 JSON 字符串（含引号）：处理转义 \" \\ \/ \b \f \n \r \t \uXXXX。
+// \uXXXX 仅支持可构造 ASCII 码点；\b \f 无法构造报错（文件头局限）。
+func parse_string(s: string) -> i64 {
+    var n: i64 = str_len(s)
+    // 跳过开引号
+    g_pos = g_pos + 1
+    var out: string = ""
+    while g_pos < n {
+        var c = str_char(s, g_pos)
+        if c == "\"" {
+            // 闭引号：返回字符串节点
+            g_pos = g_pos + 1
+            return new_str_node(out)
+        }
+        if c == "\\" {
+            // 转义序列
+            if g_pos + 1 >= n {
+                j_err_msg = "JSON 字符串转义不完整（位置 " + to_string(g_pos) + "）"
+                return -1
+            }
+            var e = str_char(s, g_pos + 1)
+            if e == "\"" {
+                out = out + "\""
+                g_pos = g_pos + 2
+            } else if e == "\\" {
+                out = out + "\\"
+                g_pos = g_pos + 2
+            } else if e == "/" {
+                out = out + "/"
+                g_pos = g_pos + 2
+            } else if e == "b" {
+                // tie 词法不支持 \b 字面量（无法构造退格字符）→ 报错
+                j_err_msg = "JSON \\b（退格）转义无法构造（tie 语言限制，位置 " + to_string(g_pos) + "）"
+                return -1
+            } else if e == "f" {
+                // tie 词法不支持 \f 字面量（无法构造换页字符）→ 报错
+                j_err_msg = "JSON \\f（换页）转义无法构造（tie 语言限制，位置 " + to_string(g_pos) + "）"
+                return -1
+            } else if e == "n" {
+                out = out + "\n"
+                g_pos = g_pos + 2
+            } else if e == "r" {
+                out = out + "\r"
+                g_pos = g_pos + 2
+            } else if e == "t" {
+                out = out + "\t"
+                g_pos = g_pos + 2
+            } else if e == "u" {
+                // \uXXXX：解析 4 位十六进制
+                if g_pos + 6 >= n {
+                    j_err_msg = "JSON \\u 转义不完整（位置 " + to_string(g_pos) + "）"
+                    return -1
+                }
+                var cp: i64 = 0
+                var k: i64 = 0
+                var ok: bool = true
+                while k < 4 {
+                    var h = str_char(s, g_pos + 2 + k)
+                    var hv: i64 = hex_val(h)
+                    if hv < 0 {
+                        ok = false
+                    }
+                    cp = cp * 16 + hv
+                    k = k + 1
+                }
+                if !ok {
+                    j_err_msg = "JSON \\u 含非十六进制字符（位置 " + to_string(g_pos) + "）"
+                    return -1
+                }
+                // 码点 → 字符：仅可构造集合（\0 \t \n \r 特判，32..126 查表）
+                var ch = cp_to_char(cp)
+                if str_len(ch) == 0 {
+                    j_err_msg = "JSON \\u 仅支持可构造 ASCII 码点（\\u" + hex4(cp) + "，位置 " + to_string(g_pos) + "）"
+                    return -1
+                }
+                out = out + ch
+                g_pos = g_pos + 6
+            } else {
+                j_err_msg = "JSON 未知转义 \\" + e + "（位置 " + to_string(g_pos) + "）"
+                return -1
+            }
+        } else {
+            out = out + c
+            g_pos = g_pos + 1
+        }
+    }
+    j_err_msg = "JSON 字符串未闭合"
+    return -1
+}
+
+// 解析数组 [v1, v2, ...]：元素节点 id 追加进 j_elem_flat，
+// 节点记录 [j_kids=起始下标, j_ovals=元素个数]。
+func parse_array(s: string) -> i64 {
+    var n: i64 = str_len(s)
+    var nd = new_node(5)
+    var start: i64 = len(j_elem_flat)
+    // 跳过 [
+    g_pos = g_pos + 1
+    skip_ws(s)
+    if g_pos < n && str_char(s, g_pos) == "]" {
+        // 空数组
+        g_pos = g_pos + 1
+        j_kids[nd] = start
+        j_ovals[nd] = 0
+        return nd
+    }
+    var cnt: i64 = 0
+    while true {
+        var v = parse_value(s)
+        if v < 0 {
+            return -1
+        }
+        table_push(j_elem_flat, v)
+        cnt = cnt + 1
+        skip_ws(s)
+        if g_pos >= n {
+            j_err_msg = "JSON 数组未闭合"
+            return -1
+        }
+        var c = str_char(s, g_pos)
+        if c == "," {
+            g_pos = g_pos + 1
+        } else if c == "]" {
+            g_pos = g_pos + 1
+            break
+        } else {
+            j_err_msg = "JSON 数组期望 , 或 ]（位置 " + to_string(g_pos) + "）"
+            return -1
+        }
+    }
+    j_kids[nd] = start
+    j_ovals[nd] = cnt
+    return nd
+}
+
+// 解析对象 {"k": v, ...}：键值对交错登记进 j_key_flat（键 j_strs 索引）
+// 与 j_val_flat（值节点 id），节点记录 [j_kids=起始, j_ovals=键值对数]。
+func parse_object(s: string) -> i64 {
+    var n: i64 = str_len(s)
+    var nd = new_node(6)
+    var start: i64 = len(j_key_flat)
+    // 跳过 {
+    g_pos = g_pos + 1
+    skip_ws(s)
+    if g_pos < n && str_char(s, g_pos) == "}" {
+        // 空对象
+        g_pos = g_pos + 1
+        j_kids[nd] = start
+        j_ovals[nd] = 0
+        return nd
+    }
+    var cnt: i64 = 0
+    while true {
+        skip_ws(s)
+        if g_pos >= n {
+            j_err_msg = "JSON 对象未闭合"
+            return -1
+        }
+        // 键必须是字符串
+        if str_char(s, g_pos) != "\"" {
+            j_err_msg = "JSON 对象键必须是字符串（位置 " + to_string(g_pos) + "）"
+            return -1
+        }
+        var knode = parse_string(s)
+        if knode < 0 {
+            return -1
+        }
+        // 键文本 = j_strs[j_ivals[knode]]；登记（去重：已有同文本复用索引）
+        var ktext = j_strs[j_ivals[knode]]
+        var ks: i64 = -1
+        var si: i64 = 0
+        while si < len(j_strs) {
+            if j_strs[si] == ktext {
+                ks = si
+            }
+            si = si + 1
+        }
+        if ks < 0 {
+            table_push(j_strs, ktext)
+            ks = len(j_strs) - 1
+        }
+        table_push(j_key_flat, ks)
+        // 值槽占位：值表必须与键表平行（嵌套时内层值先于外层值完成解析，
+        // 若按完成顺序 push 会导致键值错位）——先占位，值解析后按槽回填。
+        table_push(j_val_flat, 0)
+        var val_slot: i64 = len(j_val_flat) - 1
+        skip_ws(s)
+        if g_pos >= n || str_char(s, g_pos) != ":" {
+            j_err_msg = "JSON 对象期望 :（位置 " + to_string(g_pos) + "）"
+            return -1
+        }
+        g_pos = g_pos + 1
+        var v = parse_value(s)
+        if v < 0 {
+            return -1
+        }
+        j_val_flat[val_slot] = v
+        cnt = cnt + 1
+        skip_ws(s)
+        if g_pos >= n {
+            j_err_msg = "JSON 对象未闭合"
+            return -1
+        }
+        var c = str_char(s, g_pos)
+        if c == "," {
+            g_pos = g_pos + 1
+        } else if c == "}" {
+            g_pos = g_pos + 1
+            break
+        } else {
+            j_err_msg = "JSON 对象期望 , 或 }（位置 " + to_string(g_pos) + "）"
+            return -1
+        }
+    }
+    j_kids[nd] = start
+    j_ovals[nd] = cnt
+    return nd
+}
+
+// ---------- 序列化 ----------
+
+// 节点 → JSON 文本（紧凑格式：无多余空白；字符串按 JSON 转义规则）。
+pub func to_str(n: i64) -> string {
+    if n < 0 || n >= len(j_types) {
+        return "null"
+    }
+    var ty = j_types[n]
+    if ty == 0 {
+        return "null"
+    }
+    if ty == 1 {
+        if j_ivals[n] != 0 {
+            return "true"
+        }
+        return "false"
+    }
+    if ty == 2 {
+        return to_string(j_ivals[n])
+    }
+    if ty == 3 {
+        return to_string(j_fvals[n])
+    }
+    if ty == 4 {
+        return escape_json_str(j_strs[j_ivals[n]])
+    }
+    if ty == 5 {
+        return arr_to_str(n)
+    }
+    if ty == 6 {
+        return obj_to_str(n)
+    }
+    return "null"
+}
+
+// 数组序列化：[e1,e2,...]
+func arr_to_str(n: i64) -> string {
+    var out: string = "["
+    var start: i64 = j_kids[n]
+    var cnt: i64 = j_ovals[n]
+    var i: i64 = 0
+    while i < cnt {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + to_str(j_elem_flat[start + i])
+        i = i + 1
+    }
+    return out + "]"
+}
+
+// 对象序列化：{"k":v,...}
+func obj_to_str(n: i64) -> string {
+    var out: string = "{"
+    var start: i64 = j_kids[n]
+    var cnt: i64 = j_ovals[n]
+    var i: i64 = 0
+    while i < cnt {
+        if i > 0 {
+            out = out + ","
+        }
+        // 键：JSON 字符串转义
+        out = out + escape_json_str(j_strs[j_key_flat[start + i]])
+        out = out + ":"
+        out = out + to_str(j_val_flat[start + i])
+        i = i + 1
+    }
+    return out + "}"
+}
+
+// 字符串 JSON 转义：\" \\ \n \r \t；其余（含中文）直接输出（UTF-8）。
+// 注：\b \f 在 tie 中无法构造（词法不支持 \b \f 字面量），故无此分支；
+// 反向解析遇 \b \f 报错（见 parse_string）。
+func escape_json_str(s: string) -> string {
+    var out: string = "\""
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "\"" {
+            out = out + "\\\""
+        } else if c == "\\" {
+            out = out + "\\\\"
+        } else if c == "\n" {
+            out = out + "\\n"
+        } else if c == "\r" {
+            out = out + "\\r"
+        } else if c == "\t" {
+            out = out + "\\t"
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+// ---------- 访问器 ----------
+
+// 节点类型码（0-6；非法 id 返回 -1）。
+pub func type_of(n: i64) -> i64 {
+    if n < 0 || n >= len(j_types) {
+        return -1
+    }
+    return j_types[n]
+}
+
+pub func is_null(n: i64) -> bool {
+    return type_of(n) == 0
+}
+pub func is_bool(n: i64) -> bool {
+    return type_of(n) == 1
+}
+pub func is_int(n: i64) -> bool {
+    return type_of(n) == 2
+}
+pub func is_float(n: i64) -> bool {
+    return type_of(n) == 3
+}
+pub func is_str(n: i64) -> bool {
+    return type_of(n) == 4
+}
+pub func is_array(n: i64) -> bool {
+    return type_of(n) == 5
+}
+pub func is_object(n: i64) -> bool {
+    return type_of(n) == 6
+}
+
+// int/bool 节点的值（bool: 0/1；其他类型返回 0）。
+pub func int_val(n: i64) -> i64 {
+    if n < 0 || n >= len(j_types) {
+        return 0
+    }
+    if j_types[n] == 1 || j_types[n] == 2 {
+        return j_ivals[n]
+    }
+    return 0
+}
+
+// float 节点的值（其他类型返回 0.0）。
+pub func float_val(n: i64) -> f64 {
+    if n < 0 || n >= len(j_types) {
+        return 0.0
+    }
+    if j_types[n] == 3 {
+        return j_fvals[n]
+    }
+    return 0.0
+}
+
+// str 节点的文本（其他类型返回空串）。
+pub func str_val(n: i64) -> string {
+    if n < 0 || n >= len(j_types) {
+        return ""
+    }
+    if j_types[n] == 4 {
+        return j_strs[j_ivals[n]]
+    }
+    return ""
+}
+
+// 数组元素个数（非数组返回 0）。
+pub func arr_len(n: i64) -> i64 {
+    if type_of(n) != 5 {
+        return 0
+    }
+    return j_ovals[n]
+}
+
+// 数组第 i 个元素节点（越界返回 -1）。
+pub func arr_at(n: i64, i: i64) -> i64 {
+    if type_of(n) != 5 {
+        return -1
+    }
+    if i < 0 || i >= j_ovals[n] {
+        return -1
+    }
+    return j_elem_flat[j_kids[n] + i]
+}
+
+// 对象键名表（table<string>；非对象返回空表）。
+pub func obj_keys(n: i64) -> table<string> {
+    var out = table_new_string()
+    if type_of(n) != 6 {
+        return out
+    }
+    var start: i64 = j_kids[n]
+    var cnt: i64 = j_ovals[n]
+    var i: i64 = 0
+    while i < cnt {
+        table_push(out, j_strs[j_key_flat[start + i]])
+        i = i + 1
+    }
+    return out
+}
+
+// 对象按键取值节点（键不存在返回 -1；重复键取最后登记——区间靠后者）。
+pub func obj_get(n: i64, key: string) -> i64 {
+    if type_of(n) != 6 {
+        return -1
+    }
+    var start: i64 = j_kids[n]
+    var cnt: i64 = j_ovals[n]
+    var found: i64 = -1
+    var i: i64 = 0
+    while i < cnt {
+        if j_strs[j_key_flat[start + i]] == key {
+            found = j_val_flat[start + i]
+        }
+        i = i + 1
+    }
+    return found
+}
+
+// 最近一次 parse 的错误消息（成功时为空串）。
+pub func err_msg() -> string {
+    return j_err_msg
+}
+
+// ---------- 内部工具 ----------
+
+// 单字符十六进制数字 → 数值 0..15；非十六进制返回 -1。
+func hex_val(c: string) -> i64 {
+    var cp: i64 = char_code(c)
+    if cp >= 48 && cp <= 57 {
+        return cp - 48
+    }
+    if cp >= 65 && cp <= 70 {
+        return cp - 65 + 10
+    }
+    if cp >= 97 && cp <= 102 {
+        return cp - 97 + 10
+    }
+    return -1
+}
+
+// 码点（0..127）→ 单字符。可构造集合：\0（0）、\t（9）、\n（10）、\r（13）
+// 用字面量特判；32..126 查可打印 ASCII 表；其余无法构造返回空串。
+func cp_to_char(cp: i64) -> string {
+    if cp == 0 {
+        return "\0"
+    }
+    if cp == 9 {
+        return "\t"
+    }
+    if cp == 10 {
+        return "\n"
+    }
+    if cp == 13 {
+        return "\r"
+    }
+    if cp >= 32 && cp <= 126 {
+        var chars = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+        return str_char(chars, cp - 32)
+    }
+    return ""
+}
+
+// 码点 → 4 位大写十六进制（\uXXXX 错误消息用）。
+func hex4(cp: i64) -> string {
+    return hex2b((cp >> 8) & 0xFF) + hex2b(cp & 0xFF)
+}
+
+// 字节值（0..255）→ 两位大写十六进制（无前缀）。hex4 用：高 4 位 + 低 4 位。
+func hex2b(v: i64) -> string {
+    return hex1(v >> 4) + hex1(v & 0xF)
+}
+
+// 半字节（0..15）→ 一位大写十六进制。
+func hex1(v: i64) -> string {
+    if v < 10 {
+        return to_string(v)
+    }
+    if v == 10 {
+        return "A"
+    }
+    if v == 11 {
+        return "B"
+    }
+    if v == 12 {
+        return "C"
+    }
+    if v == 13 {
+        return "D"
+    }
+    if v == 14 {
+        return "E"
+    }
+    return "F"
+}
+}

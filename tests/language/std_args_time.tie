@@ -1,0 +1,61 @@
+// tie:logic
+// tie:opt=2
+
+// args + time 标准库验收（std/args.tie + std/time.tie）：
+// - args：命令行参数——count()（用户参数个数，不含程序名）、get(i)（0 基取值，
+//   越界空串）、has(flag)（精确匹配存在性）、value(flag)（"--flag=value" 或
+//   "--flag value" 取值，未命中空串）。
+// - time：时间/计时——now()（Unix 纪元**秒**，time_now 原语单位）、now_ms()
+//   （秒→毫秒换算）、tick_start()/tick_ms()（计时起点→毫秒差）、
+//   elapsed_ms(start)（给定起点→毫秒差）、seconds(s)（秒→毫秒）。
+// 关键点：time_now 单位为秒（确认自 tie_interp tie_time_now 的 as_secs()），
+// 因此毫秒级 API 内部统一 *1000。
+// 带参验收（--flag abc）：count()>=1、has("--flag")、value("--flag")=="abc"。
+// 预期输出：std_args_time 验收通过（全部断言通过，无 assert 失败退出）。
+import "../../std/assert.tie"
+import "../../std/args.tie"
+import "../../std/time.tie"
+using assert;
+using args;
+using time;
+
+func main() {
+    // ---- args：基础契约（任何运行方式都应满足）----
+    // 参数个数 >= 0（无参运行 = 0）
+    assert.assert(args.count() >= 0)
+    // 越界取值返回空串（负数下标与超大下标）
+    assert.assert_eq_str(args.get(-1), "")
+    assert.assert_eq_str(args.get(9999), "")
+    // 带参运行（编译后 exe 带 "--flag abc"）：完整验证
+    if args.count() >= 2 {
+        // 用户参数个数 = 传入参数个数（不含程序名）
+        assert.assert(args.count() >= 1)
+        // has：精确匹配 "--flag" 存在
+        assert.assert(args.has("--flag"))
+        // value：形式一 "--flag=abc" 等价取值；形式二 "--flag abc" 取下一位
+        assert.assert_eq_str(args.value("--flag"), "abc")
+        // get：0 基取值与传入顺序一致
+        assert.assert_eq_str(args.get(0), "--flag")
+        assert.assert_eq_str(args.get(1), "abc")
+    } else {
+        // 无参运行：空参数时 has 应为 false，value 应为空串
+        assert.assert(!args.has("--flag"))
+        assert.assert_eq_str(args.value("--flag"), "")
+    }
+    // ---- time：计时契约 ----
+    // now() 为 Unix 纪元秒，远大于 0
+    assert.assert(time.now() > 0)
+    // now_ms() >= now() 的秒值换算（内部再采样，跨秒只会更大，恒成立）
+    var n1: i64 = time.now()
+    assert.assert(time.now_ms() >= n1 * 1000)
+    // seconds：秒 → 毫秒换算
+    assert.assert_eq(time.seconds(2), 2000)
+    // tick_start 后 tick_ms：0 <= 经过毫秒 <= 5000（宽容上界，运行极快）
+    time.tick_start()
+    var tick: i64 = time.tick_ms()
+    assert.assert(tick >= 0)
+    assert.assert(tick <= 5000)
+    // elapsed_ms(now()-1)：起点为 1 秒前，毫秒差应 >= 0
+    assert.assert(time.elapsed_ms(time.now() - 1) >= 0)
+    println("std_args_time 验收通过")
+}

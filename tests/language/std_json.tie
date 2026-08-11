@@ -1,0 +1,114 @@
+// tie:logic
+// tie:opt=2
+
+// std/json.tie 验收（namespace json）：
+// - parse：标量/字符串（转义 \u）/数组/对象/嵌套 + 错误路径
+// - 访问器：type_of / int_val / str_val / arr_len / arr_at / obj_keys / obj_get
+// - 序列化：to_str 紧凑格式往返
+// 局限说明（见 std/json.tie 头注释）：\uXXXX 仅支持可构造 ASCII 码点，
+// 中文在原文中直接出现；浮点输出用 to_string 近似。
+// 预期输出：std_json 验收通过（全部断言通过，无 assert 失败退出）。
+import "../../std/assert.tie"
+import "../../std/json.tie"
+using assert;
+using json;
+
+func main() {
+    // ---- 标量 ----
+    var n0 = json.parse("null")
+    assert.assert(json.is_null(n0))
+    assert.assert_eq_str(json.to_str(n0), "null")
+
+    var n1 = json.parse("true")
+    assert.assert(json.is_bool(n1))
+    assert.assert_eq(json.int_val(n1), 1)
+    assert.assert_eq_str(json.to_str(n1), "true")
+
+    var n2 = json.parse("42")
+    assert.assert(json.is_int(n2))
+    assert.assert_eq(json.int_val(n2), 42)
+    assert.assert_eq_str(json.to_str(n2), "42")
+
+    var n3 = json.parse("-7")
+    assert.assert_eq(json.int_val(n3), -7)
+
+    // ---- 浮点 ----
+    var n4 = json.parse("3.5")
+    assert.assert(json.is_float(n4))
+    assert.assert_eq_f64(json.float_val(n4), 3.5)
+
+    // ---- 字符串（中文直接出现 + 转义）----
+    var n5 = json.parse("\"你好\"")
+    assert.assert(json.is_str(n5))
+    assert.assert_eq_str(json.str_val(n5), "你好")
+    var n6 = json.parse("\"a\\nb\"")
+    assert.assert_eq_str(json.str_val(n6), "a\nb")
+    // \u 转义：ASCII 可构造（\u0041 = "A"）
+    var n7 = json.parse("\"\\u0041\"")
+    assert.assert_eq_str(json.str_val(n7), "A")
+    // 非 ASCII \u：报错
+    assert.assert_eq(json.parse("\"\\u4E2D\""), -1)
+    assert.assert(str_len(json.err_msg()) > 0)
+
+    // ---- 数组 ----
+    var n8 = json.parse("[1,2,3]")
+    assert.assert(json.is_array(n8))
+    assert.assert_eq(json.arr_len(n8), 3)
+    assert.assert_eq(json.int_val(json.arr_at(n8, 0)), 1)
+    assert.assert_eq(json.int_val(json.arr_at(n8, 2)), 3)
+    assert.assert_eq(json.arr_at(n8, 3), -1)
+    assert.assert_eq(json.arr_at(n8, -1), -1)
+    assert.assert_eq_str(json.to_str(n8), "[1,2,3]")
+
+    // ---- 对象 ----
+    var n9 = json.parse("{\"a\":1,\"b\":[true,null]}")
+    assert.assert(json.is_object(n9))
+    assert.assert_eq(json.int_val(json.obj_get(n9, "a")), 1)
+    var bnode = json.obj_get(n9, "b")
+    assert.assert(json.is_array(bnode))
+    assert.assert_eq(json.arr_len(bnode), 2)
+    assert.assert(json.is_bool(json.arr_at(bnode, 0)))
+    assert.assert_eq(json.int_val(json.arr_at(bnode, 0)), 1)
+    assert.assert(json.is_null(json.arr_at(bnode, 1)))
+    assert.assert_eq(json.obj_get(n9, "不存在"), -1)
+    var keys = json.obj_keys(n9)
+    assert.assert_eq(len(keys), 2)
+    assert.assert_eq_str(keys[0], "a")
+    assert.assert_eq_str(keys[1], "b")
+
+    // ---- 嵌套 + 序列化往返 ----
+    var n10 = json.parse("{\"k\":{\"k2\":[1,{\"deep\":null}]}}")
+    var inner = json.obj_get(n10, "k")
+    assert.assert(json.is_object(inner))
+    var k2 = json.obj_get(inner, "k2")
+    assert.assert(json.is_array(k2))
+    assert.assert_eq(json.arr_len(k2), 2)
+    var deep = json.obj_get(json.arr_at(k2, 1), "deep")
+    assert.assert(json.is_null(deep))
+    // 序列化（单键序稳定）
+    var n11 = json.parse("{\"x\":[1,2],\"y\":\"z\"}")
+    assert.assert_eq_str(json.to_str(n11), "{\"x\":[1,2],\"y\":\"z\"}")
+
+    // ---- 空容器 ----
+    var n12 = json.parse("[]")
+    assert.assert(json.is_array(n12))
+    assert.assert_eq(json.arr_len(n12), 0)
+    var n13 = json.parse("{}")
+    assert.assert(json.is_object(n13))
+    assert.assert_eq(len(json.obj_keys(n13)), 0)
+
+    // ---- 错误路径 ----
+    assert.assert_eq(json.parse(""), -1)
+    assert.assert_eq(json.parse("{"), -1)
+    assert.assert_eq(json.parse("[1,]"), -1)
+    assert.assert_eq(json.parse("abc"), -1)
+    assert.assert_eq(json.parse("{\"a\":1}extra"), -1)
+    assert.assert(str_len(json.err_msg()) > 0)
+
+    // ---- 空白容忍 ----
+    var n14 = json.parse("  [ 1 , 2 ]  ")
+    assert.assert(json.is_array(n14))
+    assert.assert_eq(json.arr_len(n14), 2)
+
+    println("std_json 验收通过")
+}

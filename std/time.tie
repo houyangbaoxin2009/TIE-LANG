@@ -1,0 +1,58 @@
+// tie:library
+// time.tie：标准库——时间/计时工具（命名空间 time），全部基于底座原语
+// time_now 实现，不依赖其他 std 模块。
+//
+// 底座原语语义（对齐 crates/tie-interp/src/lib.rs tie_time_now）：
+// - time_now() 返回 **Unix 纪元秒**（SystemTime 距 1970-01-01 的整秒数，i64）。
+//   注意单位是**秒**不是毫秒——因此本模块提供 now_ms() 秒→毫秒换算，
+//   tick_ms()/elapsed_ms() 内部都做 *1000 换算，调用方拿到的都是毫秒。
+// - time_now 是**唯一**时间原语：没有日期拆分能力（无年/月/日/时/分/秒
+//   拆分函数），需要日历时间需由调用方自行基于纪元秒换算。
+//
+// 计时用途：tick_start() 记录起点到模块级全局变量 t_tick_start（秒），
+// tick_ms() 返回起点到当前经过的毫秒数。t_tick_start 是顶层持久变量
+// （T0.4 全局变量机制，编译期映射为 IR 全局槽），跨函数共享。
+//
+// 调用：import 后 time.now() / time.tick_start() / time.tick_ms() / ...
+// 命名规范：命名空间内函数不加 time_ 前缀；pub func 显式导出（Harbor M2.1.7）。
+
+// 模块级全局变量：计时起点（Unix 纪元秒，time_now 单位）。0 = 尚未 tick_start。
+var t_tick_start: i64 = 0;
+
+namespace time {
+// 当前 Unix 纪元秒数（i64）。time_now 原语包装。
+// 单位：**秒**（确认自 tie_time_now 实现：`d.as_secs() as i64`）。
+pub func now() -> i64 {
+    return time_now()
+}
+
+// 当前 Unix 纪元毫秒数（秒 × 1000）。因 time_now 单位为秒，此为换算便捷函数。
+pub func now_ms() -> i64 {
+    return now() * 1000
+}
+
+// 记录计时起点（now() 的秒值）到模块级全局变量 t_tick_start。
+// 之后调用 tick_ms() 返回自此刻起经过的毫秒数。
+pub func tick_start() {
+    t_tick_start = now()
+}
+
+// 从 tick_start() 记录的时刻到当前的毫秒数（起点秒差 × 1000）。
+// 未调用 tick_start()（t_tick_start 仍为 0）时返回的是自纪元起的毫秒数，
+// 语义无定义——使用约定：先 tick_start() 再 tick_ms()。
+pub func tick_ms() -> i64 {
+    return (now() - t_tick_start) * 1000
+}
+
+// 从给定起点（Unix 纪元秒，通常取 now() 返回值）到当前的毫秒数。
+// 起点比当前更晚（future 起点）时返回负值——由调用方决定是否接受。
+pub func elapsed_ms(start: i64) -> i64 {
+    return (now() - start) * 1000
+}
+
+// 秒 → 毫秒换算（time_now 单位为秒，秒值 × 1000 得毫秒）。
+// 保持该函数：单位语义在此显式化，避免调用方各自散写 * 1000。
+pub func seconds(s: i64) -> i64 {
+    return s * 1000
+}
+}

@@ -1,0 +1,126 @@
+// tie:library
+// args.tie：标准库——命令行参数工具（命名空间 args），全部基于底座原语
+// arg_count / arg_string 实现，不依赖其他 std 模块。
+//
+// 底座原语语义（对齐 crates/tie-interp/src/lib.rs tie_arg_count/tie_arg_string）：
+// - arg_count() 返回**用户参数个数，不含程序名**（argv[0] 被跳过：实现为
+//   std::env::args().count().saturating_sub(1)，极端无 argv 环境也保证 >= 0）；
+// - arg_string(i) 返回第 i 个用户参数（0 基，跳过 argv[0]），越界（负数或
+//   >= arg_count()）返回空串。
+//
+// value() 的取值规则（与 has() 区分，避免误吞普通参数）：
+// 1. "--flag=value" 形式：某参数以 `flag + "="` 开头（如 "--flag=abc"），
+//    取 "=" 之后的全部内容为值（"= "后空串也算有效，如 "--flag=" → 空串）；
+// 2. "--flag value" 形式：某参数**精确等于** flag（如 "--flag"），取下一参数
+//    为值（下一参数存在时；不存在则返回空串）；
+// 3. 其余一律返回空串：普通参数（如 "abc"）既不以 `flag=` 开头也不精确等于
+//    flag，永远不会被误认为取值来源；has() 才是"精确匹配存在性"查询。
+// 注意：形式 2 不判断下一参数是否为另一 flag（"--flag --other" 会取 "--other"），
+// 这是 CLI 常见语义权衡——精确的 flag 归属判定应使用 "--flag=value" 形式。
+//
+// 调用：import 后 args.count() / args.get(...) / args.has(...) / args.value(...)
+// 命名规范：命名空间内函数不加 args_ 前缀；pub func 显式导出（Harbor M2.1.7）。
+
+namespace args {
+// 用户参数个数（不含程序名）。arg_count 原语包装。
+pub func count() -> i64 {
+    return arg_count()
+}
+
+// 第 i 个用户参数（0 基，不含程序名）；越界返回空串。arg_string 原语包装。
+pub func get(i: i64) -> string {
+    return arg_string(i)
+}
+
+// 遍历全部用户参数做**精确匹配**，判断是否存在某参数与 flag 完全相等。
+// 支持 "--flag" 或 "-x" 等任意形式；参数中带 "=" 的（如 "--flag=abc"）
+// 不会命中（它们不精确等于 flag）——存在性判断应配合 value() 取具体值。
+pub func has(flag: string) -> bool {
+    var n: i64 = count()
+    var i: i64 = 0
+    while i < n {
+        if get(i) == flag {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 取 flag 的值（规则见文件头部注释）：
+// - "--flag=value"：返回 "=" 后内容；- "--flag value"：返回下一参数；
+// - 两种形式都未命中（flag 未出现 / 形式 2 无下一参数）→ 空串。
+pub func value(flag: string) -> string {
+    var n: i64 = count()
+    var i: i64 = 0
+    while i < n {
+        var arg = get(i)
+        // 形式一：--flag=value（前缀命中 flag + "="）
+        var eq: i64 = find_char(arg, "=")
+        if has_prefix(arg, flag + "=") && eq >= 0 {
+            return slice_from(arg, eq + 1)
+        }
+        // 形式二：--flag value（参数精确等于 flag，取下一参数）
+        if arg == flag {
+            var next: i64 = i + 1
+            if next < n {
+                return get(next)
+            }
+            return ""
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 判断 s 是否以 prefix 开头（码点级比较，逐字符）；空前缀视为真。
+// 私有辅助：str_len 是码点数、str_char 按码点索引，中文参数不受字节数影响。
+func has_prefix(s: string, prefix: string) -> bool {
+    var m: i64 = str_len(prefix)
+    if m == 0 {
+        return true
+    }
+    var n: i64 = str_len(s)
+    if n < m {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(prefix, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 找 s 中字符 ch 的码点索引（ch 应为单字符串）；找不到返回 -1。
+// 私有辅助：value() 定位 "=" 分隔符用。
+func find_char(s: string, ch: string) -> i64 {
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == ch {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 取 s 从 start（含）到末尾的子串；start 越界（>= 串长或负数越界）返回空串。
+// 私有辅助：value() 形式一取 "=" 后内容用。
+func slice_from(s: string, start: i64) -> string {
+    var n: i64 = str_len(s)
+    if start < 0 || start >= n {
+        return ""
+    }
+    var out: string = ""
+    var i: i64 = start
+    while i < n {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+}

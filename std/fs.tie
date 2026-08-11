@@ -1,0 +1,130 @@
+// tie:library
+// fs.tie：标准库——文件系统工具（命名空间 fs），封装语言底座散落的
+// 文件系统原语（file_* / list_dir / walk_dir / mkdir_all 等），统一为
+// bool 成功语义 + 易用命名。全部基于底座原语，不依赖其他 std 模块。
+//
+// 底座原语返回约定（对齐 crates/tie-interp 与 Rust 语义层）：
+//   - file_read(path) -> string：失败返回空串（**无法区分"空文件"与"失败"**，
+//     需要精确判断时先用 exists() 前置检查）；
+//   - file_write / file_append / file_copy / file_move / file_delete /
+//     mkdir_all / remove_dir_all / copy_dir / untar_gz / unzip -> bool；
+//   - file_exists(path) -> bool；
+//   - list_dir / walk_dir(path) -> table<string>：失败返回空表。
+// Windows 注意：路径反斜杠在 tie 源码字符串中须写成 \\（如 "F:\\tmp\\a.txt"）。
+//
+// 调用：import 后 fs.exists(...) / fs.read_lines(...)；命名空间内互调为裸调用。
+// 命名规范：命名空间内函数不加 fs_ 前缀（统一 func 写法，Harbor M2.1.6）。
+
+namespace fs {
+// 读取文本文件全部内容；空串可能表示"空文件或失败"（见文件头约定）。
+pub func read_text(path: string) -> string {
+    return file_read(path)
+}
+
+// 写入文本文件（覆盖）；成功返回 true。
+pub func write_text(path: string, content: string) -> bool {
+    return file_write(path, content)
+}
+
+// 追加文本到文件末尾（文件不存在则创建）；成功返回 true。
+pub func append_text(path: string, content: string) -> bool {
+    return file_append(path, content)
+}
+
+// 复制文件 src → dst；成功返回 true。
+pub func copy(src: string, dst: string) -> bool {
+    return file_copy(src, dst)
+}
+
+// 移动/重命名文件 src → dst；成功返回 true。
+pub func move(src: string, dst: string) -> bool {
+    return file_move(src, dst)
+}
+
+// 删除文件；成功（或文件本不存在）返回 true。
+pub func delete(path: string) -> bool {
+    return file_delete(path)
+}
+
+// 文件是否存在。
+pub func exists(path: string) -> bool {
+    return file_exists(path)
+}
+
+// 列出目录下的直接条目（文件名，不含路径前缀）；失败返回空表。
+pub func list(path: string) -> table<string> {
+    return list_dir(path)
+}
+
+// 递归遍历目录，返回全部文件/目录路径；失败返回空表。
+pub func walk(path: string) -> table<string> {
+    return walk_dir(path)
+}
+
+// 递归创建目录（含中间层级）；成功返回 true。
+pub func mkdir_all(path: string) -> bool {
+    return mkdir_all(path)
+}
+
+// 递归删除目录及其全部内容；成功返回 true。
+pub func remove_all(path: string) -> bool {
+    return remove_dir_all(path)
+}
+
+// 递归复制目录 src → dst；成功返回 true。
+pub func copy_dir(src: string, dst: string) -> bool {
+    return copy_dir(src, dst)
+}
+
+// 解压 .tar.gz 归档到 dest 目录；成功返回 true。
+pub func untar_gz(file: string, dest: string) -> bool {
+    return untar_gz(file, dest)
+}
+
+// 解压 .zip 归档到 dest 目录；成功返回 true。
+pub func unzip(file: string, dest: string) -> bool {
+    return unzip(file, dest)
+}
+
+// 按行读取文本文件（\n 拆分，去掉 Windows 行尾 \r）；空文件返回空表。
+// 实现：read_text 拆行——逐码点扫描，遇到 \n 切一行（行尾 \r 剔除）。
+pub func read_lines(path: string) -> table<string> {
+    var rows = table_new_string()
+    var content = file_read(path)
+    var n: i64 = str_len(content)
+    var line: string = ""
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(content, i)
+        if c == "\n" {
+            // 行结束：去掉行尾 \r 后入表
+            var m: i64 = str_len(line)
+            if m > 0 && str_char(line, m - 1) == "\r" {
+                line = str_char_slice(line, 0, m - 1)
+            }
+            table_push(rows, line)
+            line = ""
+        } else {
+            line = line + c
+        }
+        i = i + 1
+    }
+    // 末尾无换行时补最后一行（非空）
+    if str_len(line) > 0 {
+        table_push(rows, line)
+    }
+    return rows
+}
+
+// 取字符串 [start, end) 子串（码点级）。read_lines 的内部辅助——不用
+// std/string.tie 的 str.slice（保持 fs 模块零依赖），str_char 逐码点拼接。
+func str_char_slice(s: string, start: i64, end: i64) -> string {
+    var out: string = ""
+    var i: i64 = start
+    while i < end {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+}

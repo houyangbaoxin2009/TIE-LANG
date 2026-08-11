@@ -1,0 +1,95 @@
+// tie:library
+// ascii.tie：标准库——ASCII 字符分类与转换（命名空间 ascii），全部按码点 i64 输入。
+// 与 utf 的分工：utf 面向完整 Unicode 码点（含非 ASCII），ascii 只认 0..127 ASCII 范围
+// （分类函数对 ASCII 范围外的码点一律返回 false / 原样返回）。码点即字符的 UTF-32 值，
+// 字符级工具（code / to_char）输入的必须是单字符字符串或可打印 ASCII 码点。
+// 替代的散落实现（本模块集中收纳，不改动它们）：examples/byte_demo.tie 的 ascii(c)
+// （字符→ASCII 码查表）；archive/compiler-v1/lexer.tie 的字符分类；ext/codec/zstd|lz4|
+// brotli.tie 的 32..126 可打印 ASCII 查表 char↔code。编译器前端后续可复用本模块。
+// 调用：import 后 ascii.is_digit(...) / ascii.to_lower(...)；命名空间内互调为裸调用。
+// 命名规范：命名空间内函数不加 ascii_ 前缀（统一 func 写法，Harbor M2.1.6）。
+// 命名说明：码点→字符函数本应为 char，但 char 是 tie 类型关键字（TyKw::Char）保留字，
+// 不能用作函数名，故以 to_char 命名（与 utf.to_char 同名方案，各自独立实现）。
+
+namespace ascii {
+// 是否为数字字符（48..57 '0'-'9'）
+pub func is_digit(cp: i64) -> bool {
+    return cp >= 48 && cp <= 57
+}
+
+// 是否为字母字符（65..90 'A'-'Z'，97..122 'a'-'z'）
+pub func is_alpha(cp: i64) -> bool {
+    return (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122)
+}
+
+// 是否为字母或数字（is_digit 或 is_alpha）
+pub func is_alnum(cp: i64) -> bool {
+    return is_digit(cp) || is_alpha(cp)
+}
+
+// 是否为小写字母（97..122）
+pub func is_lower(cp: i64) -> bool {
+    return cp >= 97 && cp <= 122
+}
+
+// 是否为大写字母（65..90）
+pub func is_upper(cp: i64) -> bool {
+    return cp >= 65 && cp <= 90
+}
+
+// 大写字母 → 小写（A-Z 码点 + 32）；其余码点原样返回
+pub func to_lower(cp: i64) -> i64 {
+    if cp >= 65 && cp <= 90 {
+        return cp + 32
+    }
+    return cp
+}
+
+// 小写字母 → 大写（a-z 码点 - 32）；其余码点原样返回
+pub func to_upper(cp: i64) -> i64 {
+    if cp >= 97 && cp <= 122 {
+        return cp - 32
+    }
+    return cp
+}
+
+// 是否为可打印 ASCII（32..126，含空格，不含 DEL 127）
+pub func is_print(cp: i64) -> bool {
+    return cp >= 32 && cp <= 126
+}
+
+// 是否为空白字符（空格 32 / 制表符 9 / 换行 10 / 回车 13）
+pub func is_space(cp: i64) -> bool {
+    return cp == 32 || cp == 9 || cp == 10 || cp == 13
+}
+
+// 单字符字符串 → ASCII 码；非 ASCII（码点 >127）、空串或非单字符返回 -1。
+// 与 utf.codepoint 的区别：codepoint 接受任意 Unicode 码点，本函数只认 ASCII（≤127）。
+// 底座原语 char_code 取「首字符」且空串返回 -1，此处先校验必须恰好一个字符，
+// 再校验码点落在 0..127（char_code 对空串返回 -1 也已落入该校验）。
+// 命名说明：本应为 code，但 code 是 tie 类型关键字（TyKw::Code）保留字，故用 to_code。
+pub func to_code(c: string) -> i64 {
+    if str_len(c) != 1 {
+        return -1
+    }
+    var cp: i64 = char_code(c)
+    if cp < 0 || cp > 127 {
+        return -1
+    }
+    return cp
+}
+
+// 可打印 ASCII 码点（32..126）→ 单字符；越界返回空串。
+// 查表方案同 utf.to_char：常量字符串含 32..126 全部 95 个可打印字符，
+// str_char(表, cp-32) 定位（tie 无码点→任意字符原语，用查表实现）。
+// 局限：非 ASCII 码点（如 0x4E2D "中"）无法还原为字符，返回空串。
+// 命名说明：本应为 char，但 char 是 tie 类型关键字保留字，故用 to_char。
+pub func to_char(cp: i64) -> string {
+    // 32..126 全部 95 个可打印 ASCII 字符表（变量名 chars，table 是类型关键字保留字）
+    var chars = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+    if cp < 32 || cp > 126 {
+        return ""
+    }
+    return str_char(chars, cp - 32)
+}
+}

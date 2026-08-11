@@ -1,0 +1,55 @@
+// tie:logic
+// tie:opt=2
+
+// ext 扩展库验收：test.tie（测试框架）+ bench.tie（基准计时）。
+// - test：手动断言收集模型——expect 系列断言累计全局计数，pass_count/fail_count/
+//   exit_code/summary/done 输出结论；失败断言立即打印 [FAIL] 定位行。
+// - bench：time_now 秒级原语换算毫秒计时——start/end 累计、elapsed 查询、
+//   lap 一步计时、summary 按登记序输出。秒级精度下单次耗时多为 0ms（>=0 恒成立）。
+// 预期输出：两轮 [FAIL]（bad/strbad 故意失败）后 reset 清零，最终
+// "3 passed, 0 failed / 测试完成: PASS / ext_test_bench 验收通过"。
+import "../../ext/test.tie"
+import "../../ext/bench.tie"
+import "../../std/string.tie"
+using test;
+using bench;
+using str;
+
+func main() {
+    // ---- test 框架验收：收集断言 + 计数 + 退出码 ----
+    test.reset()
+    test.expect(true, "ok1")                 // pass=1
+    test.expect(false, "bad")                // fail=1（立即打印 [FAIL]）
+    test.expect_eq(42, 42, "eq")             // pass=2
+    test.expect_str_eq("a", "a", "str")      // pass=3
+    test.expect_str_eq("a", "b", "strbad")   // fail=2（立即打印 [FAIL]）
+    // 用 expect 验证框架自身计数与退出码（此刻 pass=3 / fail=2 / exit_code=1）
+    test.expect(test.pass_count() == 3, "pass_count_3")
+    test.expect(test.fail_count() == 2, "fail_count_2")
+    test.expect(test.exit_code() == 1, "exit_code_1")
+    // reset 清零：计数归零后再断言清零结果
+    test.reset()
+    test.expect(test.pass_count() == 0 && test.fail_count() == 0, "reset_clears")
+
+    // ---- bench 框架验收：计时/累计/查询/汇总 ----
+    bench.reset()
+    bench.start("t1")
+    bench.end("t1")
+    // 秒级精度下 start→end 差值多为 0ms，elapsed 恒 >= 0
+    test.expect(bench.elapsed("t1") >= 0, "elapsed_t1")
+    // lap 一步完成：返回值即本次耗时（毫秒），>= 0
+    test.expect(bench.lap("t2") >= 0, "lap_t2")
+    // summary 按登记序含 t1 与 t2 两行
+    var s = bench.summary()
+    test.expect(str.contains(s, "t1"), "summary_has_t1")
+    test.expect(str.contains(s, "t2"), "summary_has_t2")
+    println("bench summary:")
+    println(bench.summary())
+
+    // ---- 结尾：分组 + 全 PASS 结论 ----
+    test.group("ext_test_bench")
+    test.expect(true, "final_ok")
+    test.expect_eq(7 * 6, 42, "final_eq")
+    test.done()   // 此时应全 PASS（3 passed, 0 failed → 测试完成: PASS）
+    println("ext_test_bench 验收通过")
+}

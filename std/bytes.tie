@@ -1,0 +1,94 @@
+// tie:library
+// bytes.tie：标准库——字节表（动态 i64 表，元素 0..255）工具（命名空间 bytes），
+// 基于底座原语 byte_read / byte_write / byte_concat / bit_read / bit_write。
+// 调用：import 后 bytes.read(path) / bytes.to_ascii(t)；命名空间内互调为裸调用。
+// 命名规范：命名空间内函数不加 bytes_ 前缀（统一 func 写法，Harbor M2.1.6）。
+// 命名说明：bit_read / bit_write 与底座原语同名——语义分析中**内置原语优先于
+// 用户函数**解析（sinfer.infer_call 先查 builtin_call），故函数体内裸调 bit_read
+// 命中的是底座原语而非自身，不构成递归；外部用限定调用 bytes.bit_read 命中本函数。
+// 底座行为说明：
+//   - byte_read 失败（文件不存在等）由编译器输出运行时错误并退出（exit 1），
+//     std 层无法捕获，"失败空表"仅作文档约定；
+//   - byte_write 返回 i8（成功 1 / 失败 0），本模块转 bool；
+//   - bit_read 越界（pos<0 或超出表位数）返回 0；bit_write 越界返回 0（失败）。
+// 局限：tie 无「码点→任意字符」原语，to_ascii 只能查可打印 ASCII 表（32..126）
+// 还原字节，非可打印字节无法构造字符（跳过）；from_ascii 只接受 ASCII 码点
+// （0..127），遇非 ASCII 码点返回空表。
+
+namespace bytes {
+// 读取文件全部字节为 i64 表（每元素 0..255）；失败返回空表（文档约定，
+// 实际失败由编译器报错退出，见文件头底座行为说明）。
+pub func read(path: string) -> table<i64> {
+    return byte_read(path)
+}
+
+// 把字节表写入文件（元素 clamp 到 0..255）；成功返回 true，失败返回 false。
+// 底座 byte_write 返回 i8：1=成功、0=失败，此处转换为 bool。
+// 注意：底座 byte_write 的参数类型要求是**裸 table**（Rust 语义层 TyKw::Table，
+// table<i64> 参数化类型会被拒绝）——故本函数形参也用裸 table（csv_write 同款先例）。
+pub func write(path: string, t: table) -> bool {
+    return byte_write(path, t)
+}
+
+// 拼接两个字节表，返回新 i64 表（a 的元素在前，b 在后）；不修改入参。
+// 形参用裸 table（底座 byte_concat 的类型约束，同上）。
+pub func concat(a: table, b: table) -> table<i64> {
+    return byte_concat(a, b)
+}
+
+// 读字节表第 pos 位（LSB 序：第 pos 位 = 第 pos/8 字节的第 pos%8 位），返回 0/1。
+// 越界（pos<0 或 pos/8 超出表长）返回 0（底座语义，与越界读 0 一致）。
+// 形参用裸 table（底座 bit_read 的类型约束，同上）。
+pub func bit_read(t: table, pos: i64) -> i64 {
+    return bit_read(t, pos)
+}
+
+// 写字节表第 pos 位为 bit（0/1，LSB 序），就地修改表；成功返回 true，越界
+// （pos<0 或超出表位数）返回 false 且不改动表。
+// 形参用裸 table（底座 bit_write 的类型约束，同上）。
+pub func bit_write(t: table, pos: i64, bit: i64) -> bool {
+    return bit_write(t, pos, bit)
+}
+
+// 字节表 → 字符串：每个字节按码点拼字符。可打印 ASCII（32..126）查表还原；
+// 非可打印字节（<32 或 >126）tie 无法构造字符，跳过（见文件头局限说明）；
+// 越界字节（<0 或 >255）忽略。ASCII 字节表可完整往返（to_ascii(from_ascii(s))==s）。
+pub func to_ascii(t: table<i64>) -> string {
+    // 32..126 全部 95 个可打印 ASCII 字符表（变量名 printable，非保留字）
+    var printable = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+    var out: string = ""
+    var n: i64 = len(t)
+    var i: i64 = 0
+    while i < n {
+        var v: i64 = t[i]
+        // 越界字节（负值或 >255）忽略
+        if v >= 0 && v <= 255 {
+            // 可打印 ASCII 查表还原；非可打印（无法构造字符）自然跳过
+            if v >= 32 && v <= 126 {
+                out = out + str_char(printable, v - 32)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 字符串 → 字节表：每个 ASCII 码点（0..127）一字节；遇非 ASCII 码点（>127）
+// 返回空表（局限：tie 字符串内部为 UTF-8，非 ASCII 字符无法按字节拆解到表）。
+pub func from_ascii(s: string) -> table<i64> {
+    var out = table_new_i64()
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        // str_char 取单字符，char_code 取其码点（ASCII 下等于字节值）
+        var cp: i64 = char_code(str_char(s, i))
+        if cp > 127 {
+            // 非 ASCII 码点：返回空表（局限）
+            return table_new_i64()
+        }
+        table_push(out, cp)
+        i = i + 1
+    }
+    return out
+}
+}

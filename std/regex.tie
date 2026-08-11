@@ -1,0 +1,45 @@
+// tie:library
+// regex.tie：标准库——正则表达式工具（命名空间 regex），全部为底座原语
+// regex_match / regex_find / regex_find_all / regex_group / regex_replace 的直接包装。
+// 正则语法：由 Rust 侧 regex crate 提供（Rust 正则语法）——支持捕获组 (x)、
+// 字符类 [...]、量词 *+?{n,m}、锚点 ^$、预查 (?=...) (?!...) 等；不支持回引用
+// （Rust regex 默认无回溯）。详见 Rust regex crate 文档。
+// 调用：import 后 regex.is_match(s, pattern) / regex.find(...)；命名空间内互调为裸调用。
+// 命名规范：命名空间内函数不加 regex_ 前缀（统一 func 写法，Harbor M2.1.6）。
+// 底座 ok 参数说明：regex_match 的 C 桥签名 (s, pattern, ok) 带隐藏 out 参数，
+// tie 侧注册为 2 参数（ok 由编译器内部自动分配，调用方不传）——模式合法时 ok=1
+// 返回 0/1（是否匹配）；模式非法时 ok=0 返回 0。tie 语言暂无法读取 ok，故
+// is_match 对非法模式也返回 false（调用方无法区分「不匹配」与「非法模式」）。
+// 其余原语（find/find_all/group/replace）C 桥无 ok 参数，模式非法时返回 NULL，
+// 由编译器输出运行时错误并退出。
+
+namespace regex {
+// 判断 s 中是否存在 pattern 的匹配（部分匹配即可，非全串匹配）。
+// 模式非法返回 false（底座 ok=0 时返回值 0），见文件头 ok 参数说明。
+pub func is_match(s: string, pattern: string) -> bool {
+    return regex_match(s, pattern)
+}
+
+// 返回 s 中第一个匹配片段；无匹配返回空串；模式非法由编译器报错退出。
+pub func find(s: string, pattern: string) -> string {
+    return regex_find(s, pattern)
+}
+
+// 返回 s 中全部匹配片段组成的字符串表（按出现顺序）；无匹配返回空表；
+// 模式非法由编译器报错退出。
+pub func find_all(s: string, pattern: string) -> table<string> {
+    return regex_find_all(s, pattern)
+}
+
+// 返回 s 中第一个匹配的第 i 个捕获组（i=0 为整个匹配）；无匹配或组号越界返回
+// 空串；模式非法由编译器报错退出。注意：i 需 ≤ 模式中捕获组数量，越界返回空串。
+pub func group(s: string, pattern: string, i: i64) -> string {
+    return regex_group(s, pattern, i)
+}
+
+// 把 s 中所有 pattern 匹配替换为 repl；repl 支持捕获引用（$1、$name），
+// 与 Rust regex replace_all 语义一致；模式非法由编译器报错退出。
+pub func replace(s: string, pattern: string, repl: string) -> string {
+    return regex_replace(s, pattern, repl)
+}
+}

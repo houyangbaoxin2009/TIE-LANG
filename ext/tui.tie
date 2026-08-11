@@ -1,0 +1,138 @@
+// tie:library
+// tui.tie：扩展库——终端文本装饰（命名空间 tui），纯可见字符实现
+// （进度条/分隔线/文本框/对齐），**无 ANSI 颜色**。
+//
+// 语言限制（重要）：tie 字符串字面量不支持 \xHH 转义（词法只支持
+// \n\t\r\\\"\'\0），且无「码点 → 任意字符」构造原语（utf.to_char 仅
+// 32..126）——因此**纯 tie 无法产生 ESC 字符（0x1B）**，ANSI 颜色序列
+// 无法实现。TODO：词法器增加 \x 转义后补 fg()/bg()/bold() 等颜色函数。
+//
+// 宽度语义：所有对齐函数按**码点**宽度（str_len）计算——中文字符按 1
+// 码点计，终端实际显示 2 列，中文内容可能不对齐（注释说明；字节宽度
+// 版本可用 std/utf.byte_len 扩展）。
+//
+// 调用：import 后 tui.hline(...) / tui.progress(...)；命名空间内互调为裸调用。
+// 命名规范：命名空间内函数不加 tui_ 前缀（统一 func 写法，Harbor M2.1.6）。
+
+namespace tui {
+// 重复 n 次字符 ch（n<=0 返回空串）。ch 约定为单字符字符串。
+pub func line(ch: string, n: i64) -> string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < n {
+        out = out + ch
+        i = i + 1
+    }
+    return out
+}
+
+// 水平分隔线：n 个 '-'。
+pub func hline(n: i64) -> string {
+    return line("-", n)
+}
+
+// 居中标题：text 两侧补 '=' 到总码点宽度 width；width 不足时左右至少
+// 各 1 个 '='。偶数余数左少右多（左侧先分配）。
+// 例：title("Hi", 10) → "====Hi===="（4+2+4）。
+pub func title(content: string, width: i64) -> string {
+    var n: i64 = str_len(content)
+    var pad: i64 = width - n - 2
+    if pad < 0 {
+        pad = 0
+    }
+    var left: i64 = pad / 2
+    var right: i64 = pad - left
+    return line("=", left + 1) + content + line("=", right + 1)
+}
+
+// 进度条："[####----] 50%"——# 个数 = percent*width/100（clamp 0..100），
+// 其余 '-' 填充；总宽含括号与百分比（实际括号内 width 个填充字符）。
+// 例：progress(50, 10) → "[#####-----] 50%"。
+pub func progress(percent: i64, width: i64) -> string {
+    var p: i64 = percent
+    if p < 0 {
+        p = 0
+    }
+    if p > 100 {
+        p = 100
+    }
+    var filled: i64 = p * width / 100
+    var rest: i64 = width - filled
+    return "[" + line("#", filled) + line("-", rest) + "] " + to_string(p) + "%"
+}
+
+// 多行文本框：每行两侧 '|'，上下 '+--...--+' 边框，宽度 = 最长行 + 2。
+// 例：box(["a", "bb"]) →
+//   +----+
+//   | a  |
+//   | bb |
+//   +----+
+// 中文行按码点宽度，终端显示可能不对齐（文件头说明）。
+pub func box(texts: table<string>) -> string {
+    var width: i64 = 0
+    var n: i64 = len(texts)
+    var i: i64 = 0
+    while i < n {
+        var w: i64 = str_len(texts[i])
+        if w > width {
+            width = w
+        }
+        i = i + 1
+    }
+    var out: string = "+" + line("-", width + 2) + "+"
+    i = 0
+    while i < n {
+        out = out + "\n| " + pad(texts[i], width) + " |"
+        i = i + 1
+    }
+    return out + "\n+" + line("-", width + 2) + "+"
+}
+
+// 右侧补空格到码点宽度 width；超长截断（保留前 width 个码点）。
+pub func pad(s: string, width: i64) -> string {
+    var n: i64 = str_len(s)
+    if n >= width {
+        return slice(s, 0, width)
+    }
+    return s + line(" ", width - n)
+}
+
+// 居中补空格到码点宽度 width；超长截断。左少右多。
+pub func pad_center(s: string, width: i64) -> string {
+    var n: i64 = str_len(s)
+    if n >= width {
+        return slice(s, 0, width)
+    }
+    var left: i64 = (width - n) / 2
+    var right: i64 = width - n - left
+    return line(" ", left) + s + line(" ", right)
+}
+
+// 每行（\n 分隔）前加 n 个空格（多行缩进）。
+pub func indent(s: string, n: i64) -> string {
+    var out: string = ""
+    var m: i64 = str_len(s)
+    var i: i64 = 0
+    var sp = line(" ", n)
+    while i < m {
+        // 行首加缩进；换行后下一行也加
+        if i == 0 || str_char(s, i - 1) == "\n" {
+            out = out + sp
+        }
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+// 取字符串 [start, end) 子串（码点级）。内部辅助，保持零依赖。
+func slice(s: string, start: i64, end: i64) -> string {
+    var out: string = ""
+    var i: i64 = start
+    while i < end {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+}

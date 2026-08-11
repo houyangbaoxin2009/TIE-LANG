@@ -1,0 +1,135 @@
+// tie:logic
+// tie:opt=2
+
+// ext/tui.tie + ext/config.tie + ext/pretty.tie 验收：
+// - tui：hline/line/title/progress/box/pad/pad_center/indent（无 ANSI 颜色，
+//   语言限制见 ext/tui.tie 头注释）
+// - cfg：parse_kv/parse_ini/get/get_int/get_bool/has（交错表约定）
+// - pretty：table/simple/kv（单元格 '|' 分隔约定）
+// 预期输出：ext_ui_cfg 验收通过（全部断言通过，无 assert 失败退出）。
+import "../../std/assert.tie"
+import "../../ext/tui.tie"
+import "../../ext/config.tie"
+import "../../ext/pretty.tie"
+using assert;
+using tui;
+using cfg;
+using pretty;
+
+func main() {
+    // ---- tui.line / hline ----
+    assert.assert_eq_str(tui.hline(5), "-----")
+    assert.assert_eq_str(tui.line("#", 3), "###")
+    assert.assert_eq_str(tui.line("x", 0), "")
+
+    // ---- tui.title ----
+    var t1 = tui.title("Hi", 10)
+    assert.assert(tui.str_contains(t1, "Hi"))
+    assert.assert_eq(str_len(t1), 10)
+
+    // ---- tui.progress ----
+    var p1 = tui.progress(50, 10)
+    assert.assert(tui.str_contains(p1, "50%"))
+    assert.assert_eq(str_len(p1), 16)
+    var p0 = tui.progress(0, 4)
+    assert.assert(tui.str_contains(p0, "[----]"))
+    var p100 = tui.progress(100, 4)
+    assert.assert(tui.str_contains(p100, "[####]"))
+    // clamp
+    assert.assert(tui.str_contains(tui.progress(150, 4), "100%"))
+
+    // ---- tui.box ----
+    var b1 = tui.box(["a", "bb"])
+    assert.assert(tui.str_contains(b1, "+----+"))
+    assert.assert(tui.str_contains(b1, "| a  |"))
+    assert.assert(tui.str_contains(b1, "| bb |"))
+
+    // ---- tui.pad / pad_center / indent ----
+    assert.assert_eq_str(tui.pad("a", 3), "a  ")
+    assert.assert_eq_str(tui.pad("abcdef", 3), "abc")
+    assert.assert_eq_str(tui.pad_center("a", 4), " a  ")
+    assert.assert_eq_str(tui.indent("a\nb", 2), "  a\n  b")
+
+    // ---- cfg.parse_kv ----
+    var kv = cfg.parse_kv("a=1\n#comment\nb= hello \n")
+    assert.assert_eq_str(cfg.get(kv, "a", "-1"), "1")
+    assert.assert_eq_str(cfg.get(kv, "b", "-1"), "hello")
+    assert.assert(cfg.has(kv, "a"))
+    assert.assert(!cfg.has(kv, "不存在"))
+    assert.assert_eq(cfg.get_int(kv, "a", 0), 1)
+    assert.assert_eq(cfg.get_int(kv, "不存在", 42), 42)
+    assert.assert_eq_str(cfg.get(kv, "不存在", "def"), "def")
+
+    // ---- cfg.parse_ini（节前缀）----
+    var ini = cfg.parse_ini("[sec]\nk=v\n")
+    assert.assert_eq_str(cfg.get(ini, "sec.k", "-1"), "v")
+
+    // ---- cfg.get_bool ----
+    var bkv = cfg.parse_kv("t=true\nf=0\nx=maybe\n")
+    assert.assert(cfg.get_bool(bkv, "t", false))
+    assert.assert(!cfg.get_bool(bkv, "f", true))
+    assert.assert(cfg.get_bool(bkv, "x", true))
+
+    // ---- pretty.render ----
+    var t = pretty.render(["Name", "Age"], ["Alice | 30", "Bob | 25"])
+    assert.assert(pretty.str_contains(t, "+------+-----+") || pretty.str_contains(t, "+-----+"))
+    assert.assert(pretty.str_contains(t, "| Name"))
+    assert.assert(pretty.str_contains(t, "Alice"))
+    assert.assert(pretty.str_contains(t, "Bob"))
+
+    // ---- pretty.simple / kv ----
+    var s = pretty.simple(["A", "B"], ["1 | 2"])
+    assert.assert(pretty.str_contains(s, "|"))
+    assert.assert_eq_str(pretty.kv("key", "value", 3), "key: value")
+
+    println("ext_ui_cfg 验收通过")
+}
+
+namespace tui {
+// 测试辅助：字符串包含判断（测试文件内私有）
+pub func str_contains(s: string, sub: string) -> bool {
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(sub)
+    var i: i64 = 0
+    while i + m <= n {
+        var j: i64 = 0
+        var ok: bool = true
+        while j < m {
+            if str_char(s, i + j) != str_char(sub, j) {
+                ok = false
+            }
+            j = j + 1
+        }
+        if ok {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+}
+
+namespace pretty {
+// 测试辅助：字符串包含判断（同上）
+pub func str_contains(s: string, sub: string) -> bool {
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(sub)
+    var i: i64 = 0
+    while i + m <= n {
+        var j: i64 = 0
+        var ok: bool = true
+        while j < m {
+            if str_char(s, i + j) != str_char(sub, j) {
+                ok = false
+            }
+            j = j + 1
+        }
+        if ok {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+}
+

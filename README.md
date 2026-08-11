@@ -172,8 +172,12 @@ tie/
 ├── prep/core.tie     预处理器核心模块（tie 语言自写：头部提取/角色判定/正文重建；Harbor M3 自举，编译期内嵌 tie-prep）
 ├── prep/indent.tie   转换器模块示例（制表符→4 空格；证明扩展性——新增转换器只需写 tie 模块，`tie-prep --module` 挂载）
 ├── prep/rename_tcmsg_to_log.tie  转换器模块实战（tcmsg → log 批量改名，tie 语言自写完成真实重构任务）
-├── std/              标准库（tie 语言自写：assert / string / math / csv / format / exmath / radix，均为命名空间形式调用，如 assert.assert / str.split / format.sprintf / csv.csv_write / exmath.huffman_encode / radix.to_str，基于语言底座原语；M4 补全大小写转换/join/repeat/trim 拆分/gcd/lcm/pow_i/sprintf 占位符/csv_write/浮点与字符串断言；M4 补齐新增 exmath 高级数学算法库——霍夫曼编码/解码、素数判定/筛法、快速幂、斐波那契、阶乘、组合数，与 radix 通用进制转换库——任意进制 2..36 双向转换）
-├── ext/              扩展库（Extension，tie 语言自写，随发行版内置：log 控制台信息库——i18n 消息系统，依赖 std 与语言底座 msg_* 原语；M4 增强带参消息/级别体系/stderr 通道/批量登记/多级回退）
+├── std/              标准库（tie 语言自写，均命名空间形式调用，基于语言底座原语；M4 补全大小写转换/join/repeat/trim 拆分/gcd/lcm/pow_i/sprintf 占位符/csv_write/浮点与字符串断言；2026-08-12 大规模扩展为 20+ 模块）：
+│                     - 文本/编码：string（trim/slice/split/join/大小写）、utf（UTF-8 码点/字节工具：codepoint/byte_len/hex_escape）、ascii（字符分类与转换）、encoding（base64/hex/url percent）、regex（正则包装）、json（JSON 解析/序列化，节点式访问器）
+│                     - 数据结构/算法：sort（排序数组/二分）、collection（最小堆/栈/KMP）、crypto（crc32/fnv1a 校验）、optsearch（排序/背包/N 皇后等）、graph（图算法）、linalg（矩阵）、exmath（高级数学：霍夫曼/素数/快速幂）、math（基础数学）、radix（进制转换）
+│                     - IO/系统：fs（文件系统：读改写删/目录/解压）、path（路径：basename/dirname/ext/stem，extern 桥）、args（命令行参数）、http（HTTP GET + URL 编码）、random（随机）、bytes（字节表）、time（计时）、process（进程）、intern（字符串池）、version（版本比较）、format（格式化）、csv、assert（断言）
+│                     典型调用：assert.assert / str.split / format.sprintf / csv.csv_write / exmath.huffman_encode / radix.to_str / fs.read_lines / json.parse / utf.byte_len / coll.heap_push
+├── ext/              扩展库（Extension，tie 语言自写，随发行版内置，依赖 std 与语言底座：log 控制台信息库——i18n 消息系统，M4 增强带参消息/级别体系/stderr 通道/批量登记/多级回退；2026-08-12 新增 test 测试框架（断言收集+统计）、bench 基准计时、tui 终端装饰（进度条/文本框，无 ANSI——语言无 \xHH 转义限制）、config 配置解析（KV/INI）、pretty 文本表格；另有 cache/compress/ml/registry/codec（brotli/jpeg/lz4/zstd））
 ├── pkg/              包管理器（tie 语言自写，M6 E1/E2 + E3/E4）：main.tie CLI 入口
 │                     （init/add/remove/install/update/build/run/publish/search/info/help
 │                     子命令分派）+ manifest.tie（tie.pkg 清单解析）+ deps.tie（path/git/

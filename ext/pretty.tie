@@ -1,0 +1,219 @@
+// tie:library
+// pretty.tie：扩展库——文本表格输出（命名空间 pretty）。
+//
+// 数据形状：行 = 预拼接的文本行（table<string>，每元素一行的单元格
+// 列表用 '|' 分隔）——tie 表元素只能存标量，无法存嵌套表（语言限制），
+// 故采用"调用方用 | 预拼好每行单元格"的约定，本模块负责对齐与边框。
+// 便捷用法见 examples（后续补）。
+//
+// 对齐：列宽 = 标题与内容最大码点宽度 + 2 边距；统一左对齐（数字列
+// 右对齐可自行在单元格文本中补空格）；中文按码点宽度，终端可能不对齐。
+//
+// 调用：import 后 本模块负责对齐(...) / pretty.simple(...)；命名空间内裸调用。
+// 命名规范：命名空间内函数不加 pretty_ 前缀（统一 func 写法，Harbor M2.1.6）。
+
+namespace pretty {
+// 本模块负责对齐。headers 为列标题；rows 每元素 = 单元格 '|' 分隔的文本行。
+// 输出格式：
+//   +--------+-----+
+//   | Name   | Age |
+//   +--------+-----+
+//   | Alice  | 30  |
+//   +--------+-----+
+pub func render(headers: table<string>, rows: table<string>) -> string {
+    // headers 本就是列数组（table<string>），直接引用，无需拆单元格
+    var cols = headers
+    var ncols: i64 = len(cols)
+    // 列宽：标题起步，扫描内容取最大
+    var widths = table_new_i64()
+    var i: i64 = 0
+    while i < ncols {
+        table_push(widths, str_len(cols[i]))
+        i = i + 1
+    }
+    var nr: i64 = len(rows)
+    i = 0
+    while i < nr {
+        var cells = split_cells(rows[i])
+        var j: i64 = 0
+        while j < ncols && j < len(cells) {
+            var w: i64 = str_len(cells[j])
+            if w > widths[j] {
+                widths[j] = w
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // 边框行
+    var sep: string = "+"
+    i = 0
+    while i < ncols {
+        sep = sep + line("-", widths[i] + 2) + "+"
+        i = i + 1
+    }
+    // 标题行
+    var out: string = sep + "\n| "
+    i = 0
+    while i < ncols {
+        if i > 0 {
+            out = out + " | "
+        }
+        out = out + pad(cols[i], widths[i])
+        i = i + 1
+    }
+    out = out + " |\n" + sep
+    // 内容行
+    i = 0
+    while i < nr {
+        var cells = split_cells(rows[i])
+        out = out + "\n| "
+        var j: i64 = 0
+        while j < ncols {
+            if j > 0 {
+                out = out + " | "
+            }
+            var cell: string = ""
+            if j < len(cells) {
+                cell = cells[j]
+            }
+            out = out + pad(cell, widths[j])
+            j = j + 1
+        }
+        out = out + " |\n" + sep
+        i = i + 1
+    }
+    return out
+}
+
+// 简化表格：无边框，列间 '|' 分隔、空格对齐。
+pub func simple(headers: table<string>, rows: table<string>) -> string {
+    // headers 本就是列数组（table<string>），直接引用，无需拆单元格
+    var cols = headers
+    var ncols: i64 = len(cols)
+    var widths = table_new_i64()
+    var i: i64 = 0
+    while i < ncols {
+        table_push(widths, str_len(cols[i]))
+        i = i + 1
+    }
+    var nr: i64 = len(rows)
+    i = 0
+    while i < nr {
+        var cells = split_cells(rows[i])
+        var j: i64 = 0
+        while j < ncols && j < len(cells) {
+            var w: i64 = str_len(cells[j])
+            if w > widths[j] {
+                widths[j] = w
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // 标题行
+    var out: string = ""
+    i = 0
+    while i < ncols {
+        if i > 0 {
+            out = out + " | "
+        }
+        out = out + pad(cols[i], widths[i])
+        i = i + 1
+    }
+    // 内容行
+    i = 0
+    while i < nr {
+        var cells = split_cells(rows[i])
+        out = out + "\n"
+        var j: i64 = 0
+        while j < ncols {
+            if j > 0 {
+                out = out + " | "
+            }
+            var cell: string = ""
+            if j < len(cells) {
+                cell = cells[j]
+            }
+            out = out + pad(cell, widths[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 单行键值输出："key: value"（key 列左对齐到 width）。
+pub func kv(key: string, value: string, width: i64) -> string {
+    return pad(key, width) + ": " + value
+}
+
+// ---------- 内部工具 ----------
+
+// 按 '|' 拆单元格（各单元格 trim 掉两侧空格）。
+func split_cells(s: string) -> table<string> {
+    var out = table_new_string()
+    var n: i64 = str_len(s)
+    var cell: string = ""
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "|" {
+            table_push(out, trim(cell))
+            cell = ""
+        } else {
+            cell = cell + c
+        }
+        i = i + 1
+    }
+    table_push(out, trim(cell))
+    return out
+}
+
+// 右侧补空格到码点宽度 width；超长截断。
+func pad(s: string, width: i64) -> string {
+    var n: i64 = str_len(s)
+    if n >= width {
+        return slice(s, 0, width)
+    }
+    return s + line(" ", width - n)
+}
+
+// 重复 n 次 ch。
+func line(ch: string, n: i64) -> string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < n {
+        out = out + ch
+        i = i + 1
+    }
+    return out
+}
+
+// 去除字符串首尾空白（空格/制表）。
+func trim(s: string) -> string {
+    var n: i64 = str_len(s)
+    var start: i64 = 0
+    var end: i64 = n
+    while start < end && (str_char(s, start) == " " || str_char(s, start) == "\t") {
+        start = start + 1
+    }
+    while end > start && (str_char(s, end - 1) == " " || str_char(s, end - 1) == "\t") {
+        end = end - 1
+    }
+    return slice(s, start, end)
+}
+
+// 取字符串 [start, end) 子串（码点级）。
+func slice(s: string, start: i64, end: i64) -> string {
+    var out: string = ""
+    var i: i64 = start
+    while i < end {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+}
+
+

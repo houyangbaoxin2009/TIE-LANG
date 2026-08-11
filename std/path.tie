@@ -1,0 +1,106 @@
+// tie:library
+// path.tie：标准库——路径处理（命名空间 path），基于底座原语 path_join/cwd
+// 与 T0.7 extern fn 声明的 C ABI 桥（tie_path_basename 等，符号在 tie-interp
+// 静态库中，clang 链接自动解析）。
+//
+// extern 声明说明（对齐 std/process.tie 的 system 先例，T0.7 语言特性）：
+//   顶层 `extern fn tie_path_basename(p: string) -> string;` 声明链接期符号
+//   tie_path_basename（C 原型 `char* tie_path_basename(const char*)`），
+//   编译路径发射 LLVM `declare` + 普通 call；解释路径不支持调用 extern。
+//   桥实现见 crates/tie-interp/src/lib.rs（basename/dirname/abs/normalize）。
+//
+// 纯 tie 函数（ext/stem）基于码点级字符串操作：str_len/str_char。
+// Windows 注意：路径字符串中的反斜杠在 tie 源码中须写成 \\。
+//
+// 调用：import 后 path.basename(...) / path.join(...)；命名空间内互调为裸调用。
+// 命名规范：命名空间内函数不加 path_ 前缀（统一 func 写法，Harbor M2.1.6）。
+
+// extern 声明：C ABI 路径桥（链接 tie-interp 静态库）。仅顶层裸名。
+extern fn tie_path_basename(p: string) -> string;
+extern fn tie_path_dirname(p: string) -> string;
+extern fn tie_path_abs(p: string) -> string;
+extern fn tie_path_normalize(p: string) -> string;
+
+namespace path {
+// 拼接两个路径段（a + 分隔符 + b；桥处理分隔符归一）。底座 path_join 包装。
+pub func join(a: string, b: string) -> string {
+    return path_join(a, b)
+}
+
+// 取路径最后一段（文件名或目录名）。C ABI 桥包装。
+pub func basename(p: string) -> string {
+    return tie_path_basename(p)
+}
+
+// 取路径所在目录（不含最后一段）。C ABI 桥包装。
+pub func dirname(p: string) -> string {
+    return tie_path_dirname(p)
+}
+
+// 取路径的绝对形式（基于当前工作目录）。C ABI 桥包装。
+pub func abs(p: string) -> string {
+    return tie_path_abs(p)
+}
+
+// 规范化路径（解析 . 与 ..，归一化分隔符）。C ABI 桥包装。
+pub func normalize(p: string) -> string {
+    return tie_path_normalize(p)
+}
+
+// 取扩展名（basename 中最后一个 . 之后的部分，不含点）：无扩展名、
+// 点在首位的隐藏文件（如 .git）或空串返回空串。
+// 纯 tie 实现：找 basename 中最后一个 '.' 的位置。
+pub func ext(p: string) -> string {
+    var base = tie_path_basename(p)
+    var n: i64 = str_len(base)
+    var dot: i64 = -1
+    var i: i64 = 0
+    while i < n {
+        if str_char(base, i) == "." {
+            dot = i
+        }
+        i = i + 1
+    }
+    // 无点，或点是首位（隐藏文件）→ 无扩展名
+    if dot <= 0 {
+        return ""
+    }
+    return slice(base, dot + 1, n)
+}
+
+// 去扩展名（basename 去掉 ext 部分）：无扩展名时返回 basename 原样。
+// 纯 tie 实现，与 ext 共用"找最后点"逻辑。
+pub func stem(p: string) -> string {
+    var base = tie_path_basename(p)
+    var n: i64 = str_len(base)
+    var dot: i64 = -1
+    var i: i64 = 0
+    while i < n {
+        if str_char(base, i) == "." {
+            dot = i
+        }
+        i = i + 1
+    }
+    if dot <= 0 {
+        return base
+    }
+    return slice(base, 0, dot)
+}
+
+// 当前工作目录。底座 cwd 包装。
+pub func cwd() -> string {
+    return cwd()
+}
+
+// 取字符串 [start, end) 子串（码点级）。ext/stem 的内部辅助——
+// 保持模块零依赖（不 import std/string.tie），str_char 逐码点拼接。
+func slice(s: string, start: i64, end: i64) -> string {
+    var out: string = ""
+    var i: i64 = start
+    while i < end {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+}

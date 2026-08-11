@@ -1,0 +1,221 @@
+// tie:library
+// config.tie：扩展库——配置解析（命名空间 cfg），KEY=VALUE 与 INI 子集。
+//
+// 设计说明：语言底座**未注册 map 原语**（tie_map_* 仅 C ABI 层，语言层
+// 不可调用），故配置表用**交错表**表示：table<string> 按 [键, 值, 键, 值...]
+// 交替存放，get/has 线性扫描（配置条目少，线性足够）。
+//
+// 语法：
+//   KEY=VALUE 行（= 两侧 trim；值保留内部空白）；
+//   INI 节：[section] 起始的行后，键存为 "section.key"（顶层键存 "key"）；
+//   空行与 # 开头的整行注释跳过（行内 # 不视为注释）；
+//   重复键：后者覆盖前者（扫描取最后命中）。
+//
+// 调用：import 后 cfg.parse_kv(...) / cfg.get(...)；命名空间内互调为裸调用。
+// 命名规范：命名空间内函数不加 cfg_ 前缀（统一 func 写法，Harbor M2.1.6）。
+
+namespace cfg {
+// 解析 KEY=VALUE 文本 → 交错表 [k1,v1,k2,v2...]。空输入返回空表。
+pub func parse_kv(content: string) -> table<string> {
+    var out = table_new_string()
+    var section: string = ""
+    var lines = split_lines(content)
+    var n: i64 = len(lines)
+    var i: i64 = 0
+    while i < n {
+        var ln = lines[i]
+        var m: i64 = str_len(ln)
+        if m == 0 {
+            i = i + 1
+            continue
+        }
+        // 整行注释或 INI 节标记
+        if str_char(ln, 0) == "#" {
+            i = i + 1
+            continue
+        }
+        if str_char(ln, 0) == "[" && str_char(ln, m - 1) == "]" {
+            section = slice(ln, 1, m - 1)
+            i = i + 1
+            continue
+        }
+        // KEY=VALUE：找第一个 '='
+        var eq: i64 = find_char(ln, "=")
+        if eq < 0 {
+            i = i + 1
+            continue
+        }
+        var key = trim(slice(ln, 0, eq))
+        var val = trim(slice(ln, eq + 1, m))
+        var full: string = key
+        if str_len(section) > 0 {
+            full = section + "." + key
+        }
+        table_push(out, full)
+        table_push(out, val)
+        i = i + 1
+    }
+    return out
+}
+
+// 解析 INI 文本 → 交错表（键含节前缀 "section.key"）。实现同 parse_kv
+// （parse_kv 已处理 [section] 标记，本函数为语义别名）。
+pub func parse_ini(content: string) -> table<string> {
+    return parse_kv(content)
+}
+
+// 取键值（线性扫描取最后命中）；键不存在返回 def。
+pub func get(t: table<string>, key: string, def: string) -> string {
+    var n: i64 = len(t)
+    var found: string = def
+    var i: i64 = 0
+    while i + 1 < n {
+        if t[i] == key {
+            found = t[i + 1]
+        }
+        i = i + 2
+    }
+    return found
+}
+
+// 取整数值：值字符串是合法整数才 parse_int，否则（非数字/缺省）返回 def。
+// 注意：语言底座 parse_int 对非法输入直接报运行时错误（无 try/catch），
+// 故先用 is_int_str 自检格式（可选 '-' + 全数字），非数字不调用 parse_int。
+pub func get_int(t: table<string>, key: string, def: i64) -> i64 {
+    var v = get(t, key, "")
+    if !is_int_str(v) {
+        return def
+    }
+    return parse_int(v)
+}
+
+// 取布尔值：true/1/yes → true；false/0/no → false；其他/缺省用 def。
+pub func get_bool(t: table<string>, key: string, def: bool) -> bool {
+    var v = get(t, key, "")
+    if v == "true" || v == "1" || v == "yes" {
+        return true
+    }
+    if v == "false" || v == "0" || v == "no" {
+        return false
+    }
+    return def
+}
+
+// 键是否存在。
+pub func has(t: table<string>, key: string) -> bool {
+    var n: i64 = len(t)
+    var i: i64 = 0
+    while i < n {
+        if t[i] == key {
+            return true
+        }
+        i = i + 2
+    }
+    return false
+}
+
+// 读取配置文件并自动判定格式（含 [ 行 → INI 节，否则 KV）；读取失败返回空表。
+// 先 file_exists 预检（file_read 对不存在文件直接报运行时错误，语言无
+// try/catch，必须前置判断），再读内容判定格式。
+pub func parse_file(path: string) -> table<string> {
+    if !file_exists(path) {
+        return table_new_string()
+    }
+    var content = file_read(path)
+    if str_len(content) == 0 {
+        return table_new_string()
+    }
+    // 自动判定：parse_kv 已统一处理 [section] 节语法（含 [ 行 → 键带
+    // "section." 前缀，等价 INI 解析；不含 → 纯 KV）——两种输入一个实现。
+    return parse_kv(content)
+}
+
+// ---------- 内部工具（零依赖实现，不 import std） ----------
+
+// 字符串是否为合法整数字面量：可选单 '-' 前缀 + 其余全是 0-9 数字。
+// 空串/"-"单独/含其他字符均判非整数（供 get_int 自检，避免 parse_int 报错）。
+func is_int_str(s: string) -> bool {
+    var n: i64 = str_len(s)
+    if n == 0 {
+        return false
+    }
+    var i: i64 = 0
+    // 可选负号：- 后必须还有数字
+    if str_char(s, 0) == "-" {
+        if n == 1 {
+            return false
+        }
+        i = 1
+    }
+    while i < n {
+        var c = str_char(s, i)
+        if c < "0" || c > "9" {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 按 \n 拆行（去掉行尾 \r）；空文本返回空表。
+func split_lines(s: string) -> table<string> {
+    var rows = table_new_string()
+    var n: i64 = str_len(s)
+    var line: string = ""
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "\n" {
+            table_push(rows, line)
+            line = ""
+        } else if c == "\r" {
+            // 忽略 \r（行尾）——保留行内 \r 无意义
+        } else {
+            line = line + c
+        }
+        i = i + 1
+    }
+    if str_len(line) > 0 {
+        table_push(rows, line)
+    }
+    return rows
+}
+
+// 找字符串中首个 ch 的位置；未找到返回 -1。
+func find_char(s: string, ch: string) -> i64 {
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == ch {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 去除字符串首尾空白（空格/制表）。
+func trim(s: string) -> string {
+    var n: i64 = str_len(s)
+    var start: i64 = 0
+    var end: i64 = n
+    while start < end && (str_char(s, start) == " " || str_char(s, start) == "\t") {
+        start = start + 1
+    }
+    while end > start && (str_char(s, end - 1) == " " || str_char(s, end - 1) == "\t") {
+        end = end - 1
+    }
+    return slice(s, start, end)
+}
+
+// 取字符串 [start, end) 子串（码点级）。
+func slice(s: string, start: i64, end: i64) -> string {
+    var out: string = ""
+    var i: i64 = start
+    while i < end {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+}

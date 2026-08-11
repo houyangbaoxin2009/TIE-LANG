@@ -3,6 +3,56 @@
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 里程碑命名：**M0–M4 = 预开发版本**（正式发行前的语言核心基础建设）；**Harbor（2026.1）架构：M0 = 正式发行版基础、M1 = VSCode 插件、M2 = 标准库、M3 = 预处理器自举、M4 = 标准库重构**。
 
+## [自举 v2 T2.8] LLVM IR 文本生成器打通 + 标准库大规模扩展 — 2026-08-12
+
+自举 v2 后端收尾与标准库扩展批：`irgen（AST→tie-IR）+ llvmgen（tie-IR→.ll）` 端到端
+跑通 hello.tie（opt -O2 + clang 链接生成可执行文件，输出对比 PASS），同时标准库从
+7 模块扩展至 20+ 模块、扩展库新增 5 模块。
+
+### T2.8 后端：irgen + llvmgen 端到端打通
+- **irgen.tie（compiler/backend/）**：AST 协议文本 → tie-IR 列式表。支持语句 VarDecl/
+  ExprStmt/Return/If/For（范围）；表达式 IntLit/StrLit/Var/Binary（算术+比较）/Range/
+  Call（println/print）。
+- **llvmgen.tie**：tie-IR → .ll 文本。字符串常量自省收集（const_str/call_vararg 池 id →
+  `@.str.N`）；UTF-8 字节级转义（中文 → `\E5\9B\9B`，对齐 Rust escape_ir_string）；
+  指令映射 alloca/load/store/const_i/const_str/算术/icmp/br/cond_br/ret/call_vararg。
+- **验收**：`_driver_test.tie` 端到端（读 hello.tie → gen_src → emit → 写 .ll → opt -O2 →
+  clang 链接 → 运行对比输出）PASS。
+- **修复的关键缺陷**：
+  - const_str/call_vararg 结果值缺失（`new_inst` 对 ty<0 不分配结果寄存器，而 llvmgen
+    期望 `%N = ...`）——ty 补 i64/i32；
+  - i32 变量初始化类型不匹配（const_i 硬编码 i64，store i32 %N 失败）——const_i 按
+    ins_ty 输出、VarDecl 整数初始化按声明类型生成常量；
+  - LLVM 新版不支持内联 `sext (i32 %N to i64)` 实参——改为独立 sext 指令；
+  - 字符串字面量带引号（自举前端 lexeme 原样存池）——irgen 去引号 + 反转义再登记。
+- **去重**：llvmgen 的 UTF-8 编码复用 std/utf（hex_escape/byte_len），删除内联重复实现。
+
+### 标准库扩展（7 → 20+ 模块，均命名空间形式）
+- 新增：**utf**（UTF-8 码点/字节：codepoint/byte_len/hex_escape）、**ascii**（字符分类/
+  转换）、**encoding**（base64/hex/url percent）、**json**（JSON 解析/序列化，节点式
+  访问器 parse/to_str/obj_get/arr_at，扁平登记表表示）、**fs**（文件系统：读改写删/
+  目录/解压）、**path**（路径：basename/dirname/ext/stem，T0.7 extern 桥）、**args**
+  （命令行参数）、**http**（HTTP GET + URL 编码）、**regex**（正则包装）、**random**、
+  **bytes**（字节表）、**time**（计时）、**collection**（最小堆/栈/KMP）、**crypto**
+  （crc32/fnv1a 校验向量验证）。
+- 测试：tests/language/ 新增 9 个验收测试（utf_ascii/std_args_time/std_encoding/
+  std_net_text/std_coll_crc/std_fs_path/std_json/ext_test_bench/ext_ui_cfg）全部通过。
+
+### 扩展库新增（ext/）
+- **test**：断言收集框架（expect 系列 + 计数 + summary/exit_code，无函数指针的语言
+  采用手动收集模型）。
+- **bench**：基准计时（start/end/lap/summary，time_now 秒→毫秒换算）。
+- **tui**：终端装饰（进度条/文本框/对齐）——无 ANSI 颜色（tie 词法不支持 \xHH 转义，
+  TODO 词法器扩展后补）。
+- **config**：KV/INI 配置解析（交错表表示，map 原语未注册语言层）。
+- **pretty**：文本表格输出（边框/对齐）。
+
+### 已知限制（记录待自举后端落地）
+- Rust tie-llvm 后端字符串常量 bug：运行期字符串被错误烘焙为 `@.str.N`（复现常量
+  `c"a%140b\00"` 声明 [6 x i8] 实际 7 字节，opt 拒绝），循环内 str_char 返回值跨
+  函数调用被破坏——http.url_encode/url_decode 测试暂缓（自举后端显式池 id 无此问题）。
+- tie 词法不支持 \b \f 与 \xHH 转义：json 的 \b/\f 转义报错、tui 无 ANSI 颜色。
+
 ## [自举准备] 表能力加强（E0 + E1 + E3）— 2026-08-10
 
 自举障碍清零批：修复表变量传参缺陷（E0）、打通嵌套表 `table<table<T>>`（E1）、

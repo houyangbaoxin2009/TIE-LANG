@@ -1,0 +1,107 @@
+// tie:library
+// bench.tie：扩展库——基准计时（namespace bench）
+//
+// 基于语言底座原语 time_now()：返回 Unix 纪元**秒**数（i64，见 crates/
+// tie-interp/src/lib.rs tie_time_now——SystemTime 秒级粒度，编译/解释两路径共用）。
+//
+// **单位换算**：本库统一以毫秒为累计单位，ms = time_now() * 1000。
+// **精度说明**：time_now 只有秒级粒度，同秒内两次调用差值恒为 0，故单次
+// start→end 的毫秒耗时多为 0ms；毫秒累计适合趋势/对比，秒级以上的长基准
+// 才有区分度。
+//
+// 表登记：b_names 按 start 首次登记顺序记录名字，summary 按登记序逐行输出；
+// 同名重复 start 会覆盖起点（若上次未 end，起点被覆盖则该段计时丢失——注释
+// 说明：勿在同名未 end 时再次 start）；end 时无起点（未登记）则静默忽略。
+// tie 表无删除操作，本库不做清理；reset() 通过重建表清空全部状态。
+
+// ---- 基准状态（顶层持久变量，跨函数共享） ----
+// b_names：登记序名字表；b_starts：各名字当前起点（毫秒）；b_totals：累计毫秒
+var b_names: table<string> = []
+var b_starts: table<i64> = []
+var b_totals: table<i64> = []
+
+namespace bench {
+    // 内部：按名字查找登记索引；未登记返回 -1
+    func index_of(name: string) -> i64 {
+        var n: i64 = len(b_names)
+        var i: i64 = 0
+        while i < n {
+            if b_names[i] == name {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    // 内部：登记或覆盖起点（毫秒），返回名字索引（未登记则追加登记）
+    func set_start(name: string, ms: i64) -> i64 {
+        var idx = index_of(name)
+        if idx >= 0 {
+            b_starts[idx] = ms
+            return idx
+        }
+        table_push(b_names, name)
+        table_push(b_starts, ms)
+        table_push(b_totals, 0)
+        return len(b_names) - 1
+    }
+
+    // 清空全部基准状态（重建三张表：名字登记/起点/累计）
+    pub func reset() {
+        b_names = table_new_string()
+        b_starts = table_new_i64()
+        b_totals = table_new_i64()
+    }
+
+    // 记录起点（毫秒）：同名重复 start 覆盖起点；未 end 再 start 会丢上次
+    // ——起点被覆盖、上次计时作废（累计未写入 b_totals），勿在同名未 end 时
+    // 再次 start。
+    pub func start(name: string) {
+        set_start(name, time_now() * 1000)
+    }
+
+    // 结束计时：本次耗时（now - 起点，毫秒）累加到 b_totals；
+    // 无起点（名字未登记）则忽略，不报错。
+    pub func end(name: string) {
+        var idx = index_of(name)
+        if idx < 0 {
+            return
+        }
+        b_totals[idx] = b_totals[idx] + (time_now() * 1000 - b_starts[idx])
+    }
+
+    // 查询某名字当前累计毫秒；未登记返回 0
+    pub func elapsed(name: string) -> i64 {
+        var idx = index_of(name)
+        if idx < 0 {
+            return 0
+        }
+        return b_totals[idx]
+    }
+
+    // 汇总：每名字一行 "name: N ms"（按登记序，行间换行分隔；无登记返回空串）
+    pub func summary() -> string {
+        var n: i64 = len(b_names)
+        var out: string = ""
+        var i: i64 = 0
+        while i < n {
+            if i > 0 {
+                out = out + "\n"
+            }
+            out = out + b_names[i] + ": " + to_string(b_totals[i]) + " ms"
+            i = i + 1
+        }
+        return out
+    }
+
+    // start+end 一步完成：返回本次耗时（毫秒）。起点覆盖语义同 start
+    // （未登记自动登记；同名重复 lap 会覆盖起点、丢掉上次未结算段）。
+    pub func lap(name: string) -> i64 {
+        var now: i64 = time_now() * 1000
+        var idx = set_start(name, now)
+        var d: i64 = time_now() * 1000 - now
+        b_totals[idx] = b_totals[idx] + d
+        return d
+    }
+}

@@ -1,0 +1,104 @@
+// tie:logic
+// tie:opt=2
+
+// std/fs.tie + std/path.tie 验收（namespace fs + namespace path）：
+// - fs：文件系统包装——exists / read_lines / write_text→read_text 往返 /
+//   append_text / delete（临时文件，验收后删除）；
+// - path：路径处理——basename / dirname / ext / stem / join / abs / cwd
+//   （extern fn C ABI 桥 + 纯 tie 实现）。
+// 预期输出：std_fs_path 验收通过（全部断言通过，无 assert 失败退出）。
+import "../../std/assert.tie"
+import "../../std/fs.tie"
+import "../../std/path.tie"
+using assert;
+using fs;
+using path;
+
+func main() {
+    // ---- fs.exists：存在与不存在 ----
+    assert.assert(fs.exists("examples/hello.tie"))
+    assert.assert(!fs.exists("不存在文件_xyz_2026"))
+
+    // ---- fs.read_lines：拆行（首行是文件头注释，第 8 行是 Hello 输出行）----
+    var lines = fs.read_lines("examples/hello.tie")
+    assert.assert(len(lines) >= 8)
+    assert.assert(fs.str_contains(lines[0], "tie:logic"))
+    assert.assert(fs.str_contains(lines[7], "Hello, tie!"))
+
+    // ---- fs 写读往返 + 追加 + 删除（临时文件）----
+    var tmp = "C:/Users/Jiro/AppData/Local/Temp/opencode/t28_fs_test.txt"
+    assert.assert(fs.write_text(tmp, "abc"))
+    assert.assert_eq_str(fs.read_text(tmp), "abc")
+    assert.assert(fs.append_text(tmp, "def"))
+    assert.assert_eq_str(fs.read_text(tmp), "abcdef")
+    assert.assert(fs.delete(tmp))
+    assert.assert(!fs.exists(tmp))
+
+    // ---- path.basename / dirname ----
+    var full = "F:\\Projects\\tie\\examples\\hello.tie"
+    assert.assert_eq_str(path.basename(full), "hello.tie")
+    assert.assert(path.str_contains(path.dirname(full), "examples"))
+
+    // ---- path.ext / stem（纯 tie）----
+    assert.assert_eq_str(path.ext("hello.tie"), "tie")
+    assert.assert_eq_str(path.stem("hello.tie"), "hello")
+    assert.assert_eq_str(path.ext("noext"), "")
+    assert.assert_eq_str(path.ext(".gitignore"), "")
+
+    // ---- path.join / abs / cwd ----
+    var j = path.join("a", "b")
+    assert.assert(path.str_contains(j, "a"))
+    assert.assert(path.str_contains(j, "b"))
+    assert.assert(str_len(path.abs("examples/hello.tie")) > 0)
+    assert.assert(str_len(path.cwd()) > 0)
+
+    println("std_fs_path 验收通过")
+}
+
+namespace fs {
+// 测试辅助：字符串包含判断（测试文件内私有，避免依赖 std/string）
+pub func str_contains(s: string, sub: string) -> bool {
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(sub)
+    var i: i64 = 0
+    while i + m <= n {
+        var j: i64 = 0
+        var ok: bool = true
+        while j < m {
+            if str_char(s, i + j) != str_char(sub, j) {
+                ok = false
+            }
+            j = j + 1
+        }
+        if ok {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+}
+
+namespace path {
+// 测试辅助：字符串包含判断（同上）
+pub func str_contains(s: string, sub: string) -> bool {
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(sub)
+    var i: i64 = 0
+    while i + m <= n {
+        var j: i64 = 0
+        var ok: bool = true
+        while j < m {
+            if str_char(s, i + j) != str_char(sub, j) {
+                ok = false
+            }
+            j = j + 1
+        }
+        if ok {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+}

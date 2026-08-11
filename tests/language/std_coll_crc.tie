@@ -1,0 +1,79 @@
+// tie:logic
+// tie:opt=2
+
+// std/collection.tie + std/crypto.tie 验收（namespace coll + namespace crc）：
+// - coll：最小堆（heap_push/pop/peek/size）、栈（stack_push/pop/peek）、
+//   KMP 码点级匹配（kmp_find/contains/count）。堆约定：0 基下标，i 子节点
+//   2i+1/2i+2，父 (i-1)/2；空堆/空栈 pop/peek 返回哨兵 0（无 Option 类型）。
+//   堆删除用 ref 形参重建表（语言无 pop 原语），调用方 t 跟随重绑定。
+// - crc：crc32 标准 CRC-32 表驱动（多项式 0xEDB88320 反射表，初始/输出异或
+//   0xFFFFFFFF）；fnv1a 32 位 FNV-1a（偏移 0x811C9DC5，素数 0x01000193）。
+//   标准校验向量：crc32("123456789")==0xCBF43926、fnv1a("")==0x811C9DC5。
+//   数值安全：crc 恒 & 0xFFFFFFFF 保持正数，>>8 算术右移即逻辑右移（正数）；
+//   fnv1a 乘法上限 ≈7.2e16 << i64::MAX，永不溢出。
+// 预期输出：std_coll_crc 验收通过（全部断言通过，无 assert 失败退出）。
+import "../../std/assert.tie"
+import "../../std/collection.tie"
+import "../../std/crypto.tie"
+using assert;
+using coll;
+using crc;
+
+func main() {
+    // ---- coll.heap：最小堆插入 [5,3,8,1,9]，pop 依次 1,3,5,8,9 ----
+    var h = table_new_i64()
+    coll.heap_push(h, 5)
+    coll.heap_push(h, 3)
+    coll.heap_push(h, 8)
+    coll.heap_push(h, 1)
+    coll.heap_push(h, 9)
+    // 堆顶为最小值 1，元素数 5
+    assert.assert_eq(coll.heap_size(h), 5)
+    assert.assert_eq(coll.heap_peek(h), 1)
+    // 依次弹出：最小堆序 1,3,5,8,9
+    assert.assert_eq(coll.heap_pop(h), 1)
+    assert.assert_eq(coll.heap_pop(h), 3)
+    assert.assert_eq(coll.heap_pop(h), 5)
+    assert.assert_eq(coll.heap_pop(h), 8)
+    assert.assert_eq(coll.heap_pop(h), 9)
+    // 空堆：pop 返回 0，size 为 0
+    assert.assert_eq(coll.heap_size(h), 0)
+    assert.assert_eq(coll.heap_pop(h), 0)
+    assert.assert_eq(coll.heap_peek(h), 0)
+
+    // ---- coll.stack：LIFO，push 1,2,3 → pop 3,2,1 ----
+    var st = table_new_i64()
+    coll.stack_push(st, 1)
+    coll.stack_push(st, 2)
+    coll.stack_push(st, 3)
+    // 表尾即栈顶
+    assert.assert_eq(coll.stack_peek(st), 3)
+    assert.assert_eq(coll.stack_pop(st), 3)
+    assert.assert_eq(coll.stack_pop(st), 2)
+    assert.assert_eq(coll.stack_pop(st), 1)
+    // 空栈：pop/peek 返回 0
+    assert.assert_eq(coll.stack_pop(st), 0)
+    assert.assert_eq(coll.stack_peek(st), 0)
+
+    // ---- coll.kmp：码点级匹配 ----
+    assert.assert_eq(coll.kmp_find("abcabcab", "cab"), 2)
+    assert.assert_eq(coll.kmp_find("hello", "x"), -1)
+    assert.assert_eq(coll.kmp_find("aaa", ""), 0)
+    assert.assert_eq(coll.kmp_count("aaaa", "aa"), 2)
+    assert.assert(coll.kmp_contains("abcabcab", "abc"))
+    assert.assert(!coll.kmp_contains("hello", "x"))
+
+    // ---- crc.crc32：标准校验向量 ----
+    assert.assert_eq(crc.crc32(""), 0)
+    assert.assert_eq(crc.crc32("123456789"), 0xCBF43926)
+    // 表驱动构建完毕：查找表 256 项（crc32_table 惰性构建后可查询）
+    assert.assert_eq(len(crc.crc32_table()), 256)
+
+    // ---- crc.fnv1a：32 位标准偏移 + 确定性 ----
+    assert.assert_eq(crc.fnv1a(""), 0x811C9DC5)
+    // 相同输入两次调用结果一致
+    var h1: i64 = crc.fnv1a("hello")
+    assert.assert_eq(h1, crc.fnv1a("hello"))
+
+    println("std_coll_crc 验收通过")
+}

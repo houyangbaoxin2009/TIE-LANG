@@ -1,0 +1,249 @@
+// tie:library
+// collection.tie：标准库——数据结构（命名空间 coll）
+// 内容：最小堆（heap_*）、栈（stack_*）、KMP 字符串匹配（kmp_*）。
+// 底座原语：table_new_i64 / table_push / t[i] 下标读写 / len / str_len /
+//   str_char（码点级）/ 位运算。表操作约束：只追加（table_push）+ 下标赋值
+//   t[i]=v（M4 支持），**无 pop/删除/缩表原语**（见 std/sort.tie 头部注释）——
+//   故 heap_pop / stack_pop 用 `ref table<i64>` 形参（自举 T0.3 by_ref）在
+//   函数内重建新表并重绑定，写回调用方实参槽，实现"删除元素"语义。
+// 堆约定（最小堆，0 基下标）：t[0] 为堆顶（最小值）；i 的子节点为 2i+1 /
+//   2i+2，父节点为 (i-1)/2。插入 = push 尾部后**上浮**（与父比较交换）；
+//   删堆顶 = 末元素放根后**下沉**（与最小子比较交换）。
+// 空堆/空栈哨兵：pop / peek 返回 0（tie 无 Option 类型，约定 0 为哨兵值；
+//   堆栈元素应避免把 0 作为业务数据，或调用方自行判空）。
+// KMP 码点级：str_len 为码点数（非字节数），str_char(s,i) 取第 i 个码点字符，
+//   字符比较用 ==（字符串比较）；next 数组用动态表 table<i64>。
+//   空子串：kmp_find 视为位置 0 命中；kmp_count 视为 0 次（避免无限循环）。
+// 移位语义确认（查 crates/tie-llvm/src/ir.rs BinaryOp::Shr）：i64 是有符号
+//   类型，`>>` 生成 **ashr（算术右移）**，仅无符号类型走 lshr——本模块堆下标
+//   运算 (i-1)/2 用除法，不依赖移位，无符号性陷阱。
+// 调用：import 后 coll.heap_push(...) / coll.kmp_find(...)；命名空间内互调为
+//   裸调用。命名规范：命名空间内函数不加 coll_ 前缀（Harbor M2.1.6）。
+
+namespace coll {
+// ---------- 最小堆 ----------
+
+// 向最小堆 t 插入值 v：追加到尾部后上浮，保持堆序（父 <= 子）。
+// 上浮：从新元素位置开始，与父节点比较，比父小则交换，逐级上移。
+pub func heap_push(t: table<i64>, v: i64) {
+    table_push(t, v)
+    var i: i64 = len(t) - 1
+    var up: bool = true
+    while up {
+        // 已到根：上浮结束
+        if i == 0 {
+            up = false
+        } else {
+            var p: i64 = (i - 1) / 2
+            // 比父小则交换（最小堆），否则堆序已满足
+            if t[i] < t[p] {
+                var tmp: i64 = t[i]
+                t[i] = t[p]
+                t[p] = tmp
+                i = p
+            } else {
+                up = false
+            }
+        }
+    }
+}
+
+// 取出堆顶并删除：空堆返回哨兵 0。删除 = 末元素放根 + 下沉调整。
+// 语言无缩表原语，故用 ref 形参重建新表（末元素放根、其余元素保持原序），
+// 对根做标准下沉（与较小子节点交换，直至满足堆序），再重绑定写回调用方。
+pub func heap_pop(t: ref table<i64>) -> i64 {
+    var n: i64 = len(t)
+    // 空堆：返回哨兵 0
+    if n == 0 {
+        return 0
+    }
+    var top: i64 = t[0]
+    // 重建表：末元素放根，原 t[1..n-2] 保持顺序跟在其后（= 原地删除的标准数组布局）
+    var nt = table_new_i64()
+    if n > 1 {
+        table_push(nt, t[n - 1])
+        var k: i64 = 1
+        while k < n - 1 {
+            table_push(nt, t[k])
+            k = k + 1
+        }
+        // 下沉根：与较小的子节点比较交换，直到不小于任一子节点或到达叶子
+        // 注意：tie 的逻辑与 && **不短路**（两侧无条件求值），表下标访问必须
+        // 用嵌套 if 防护越界，不能写成 `l < len(nt) && nt[l] < nt[i]` 形式。
+        var i: i64 = 0
+        var down: bool = true
+        while down {
+            var l: i64 = 2 * i + 1
+            var r: i64 = 2 * i + 2
+            // 选较小的子节点（左子必须存在；右子存在且更小则取右）
+            var m: i64 = l
+            var has: bool = false
+            if l < len(nt) {
+                has = true
+                if r < len(nt) {
+                    if nt[r] < nt[l] {
+                        m = r
+                    }
+                }
+            }
+            // 子节点比当前小则交换并下移，否则堆序满足
+            if has {
+                if nt[m] < nt[i] {
+                    var tmp: i64 = nt[i]
+                    nt[i] = nt[m]
+                    nt[m] = tmp
+                    i = m
+                } else {
+                    down = false
+                }
+            } else {
+                down = false
+            }
+        }
+    }
+    // 重绑定写回调用方（ref 语义，T0.3）
+    t = nt
+    return top
+}
+
+// 看堆顶不删除：空堆返回哨兵 0。
+pub func heap_peek(t: table<i64>) -> i64 {
+    if len(t) == 0 {
+        return 0
+    }
+    return t[0]
+}
+
+// 堆元素个数（len 包装）。
+pub func heap_size(t: table<i64>) -> i64 {
+    return len(t)
+}
+
+// ---------- 栈 ----------
+
+// 入栈：追加到表尾（表尾即栈顶）。
+pub func stack_push(t: table<i64>, v: i64) {
+    table_push(t, v)
+}
+
+// 出栈并删除栈顶：空栈返回哨兵 0。无缩表原语，ref 重建前 n-1 个元素重绑定。
+pub func stack_pop(t: ref table<i64>) -> i64 {
+    var n: i64 = len(t)
+    // 空栈：返回哨兵 0
+    if n == 0 {
+        return 0
+    }
+    var top: i64 = t[n - 1]
+    // 重建去掉栈顶（前 n-1 个元素保持原序）
+    var nt = table_new_i64()
+    var i: i64 = 0
+    while i < n - 1 {
+        table_push(nt, t[i])
+        i = i + 1
+    }
+    t = nt
+    return top
+}
+
+// 看栈顶不删除：空栈返回哨兵 0。
+pub func stack_peek(t: table<i64>) -> i64 {
+    var n: i64 = len(t)
+    if n == 0 {
+        return 0
+    }
+    return t[n - 1]
+}
+
+// ---------- KMP 字符串匹配（码点级） ----------
+
+// 构建子串 sub 的 next 表（失配回退表），KMP 核心。next[i] = sub[0..i] 的
+// 最长相等真前后缀长度。约定 next[0] = 0。表元素为 i64，长度 = 码点数。
+func build_next(sub: string) -> table {
+    var next = table_new_i64()
+    var m: i64 = str_len(sub)
+    table_push(next, 0)
+    var j: i64 = 0
+    var i: i64 = 1
+    while i < m {
+        // 当前字符与 next 已推进位置失配：按 next 回退（j 恒 < i，next[j-1] 合法）
+        while j > 0 && str_char(sub, i) != str_char(sub, j) {
+            j = next[j - 1]
+        }
+        // 匹配则前缀长度 +1
+        if str_char(sub, i) == str_char(sub, j) {
+            j = j + 1
+        }
+        table_push(next, j)
+        i = i + 1
+    }
+    return next
+}
+
+// sub 在 s 中首次出现位置（码点下标，0 起）：未找到返回 -1；空子串视为位置 0。
+// KMP 线性扫描：主串指针不回溯，失配时子串指针按 next 回退。
+pub func kmp_find(s: string, sub: string) -> i64 {
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(sub)
+    // 空子串：位置 0 命中
+    if m == 0 {
+        return 0
+    }
+    // 子串比主串长：不可能匹配
+    if m > n {
+        return -1
+    }
+    var next = build_next(sub)
+    var si: i64 = 0
+    var pj: i64 = 0
+    while si < n {
+        // 主串字符与子串当前位置失配：子串指针按 next 回退
+        while pj > 0 && str_char(s, si) != str_char(sub, pj) {
+            pj = next[pj - 1]
+        }
+        if str_char(s, si) == str_char(sub, pj) {
+            pj = pj + 1
+        }
+        // 完整匹配：返回起点（si 已走到匹配段尾，起点 = si - m + 1）
+        if pj == m {
+            return si - m + 1
+        }
+        si = si + 1
+    }
+    return -1
+}
+
+// s 是否包含子串 sub（kmp_find >= 0）。
+pub func kmp_contains(s: string, sub: string) -> bool {
+    return kmp_find(s, sub) >= 0
+}
+
+// sub 在 s 中**不重叠**出现次数：空子串返回 0（避免无限循环/定义歧义）。
+// 匹配成功后 pj 归零、si 前进，跳过整个匹配段（KMP 线性扫描不回溯）。
+pub func kmp_count(s: string, sub: string) -> i64 {
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(sub)
+    // 空子串：约定 0 次；子串比主串长：必然 0 次
+    if m == 0 || m > n {
+        return 0
+    }
+    var next = build_next(sub)
+    var count: i64 = 0
+    var si: i64 = 0
+    var pj: i64 = 0
+    while si < n {
+        while pj > 0 && str_char(s, si) != str_char(sub, pj) {
+            pj = next[pj - 1]
+        }
+        if str_char(s, si) == str_char(sub, pj) {
+            pj = pj + 1
+        }
+        if pj == m {
+            // 完整匹配：计数 +1，pj 归零（不重叠），si 继续前进
+            count = count + 1
+            pj = 0
+        }
+        si = si + 1
+    }
+    return count
+}
+}

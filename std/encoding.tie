@@ -1,0 +1,359 @@
+// tie:library
+// encoding.tie：标准库——编码转换工具（命名空间 enc）——base64 / 十六进制 / URL percent 编码。
+// 全部纯函数，只依赖底座原语（str_len / str_char / char_code）+ 位运算（& | << >>）
+// + 字符串拼接 + 循环/分支，无字节级原语。
+// 关键局限：tie 无「字节级字符串」原语，编码函数按**码点**处理，输入约定为 ASCII
+// 字符串（每码点恰好 1 字节）；遇到非 ASCII 码点（>127）返回空串。字节级替代方案
+// 见 std/utf.tie 的 byte_len / hex_escape（UTF-8 字节数 / 码点→\XX 大写十六进制字节
+// 转义），本模块为保持零依赖（只吃底座原语）不复用 utf，注释仅作替代方案说明。
+// 同理，解码结果的字节值只能构造可打印 ASCII 字符（32..126），越界字节无法由 i64
+// 还原为字符（tie 无码点→任意字符原语），此时返回空串。
+// 调用：import 后 enc.base64_encode(...) / enc.hex_encode(...) / enc.url_encode(...)；
+// 命名空间内互调为裸调用。
+// 命名规范：命名空间内函数不加 enc_ 前缀（统一 func 写法，Harbor M2.1.6）；table /
+// char / code 是 tie 类型关键字保留字，变量名用 chars / digits / b0 / idx 等避开。
+// 位运算安全说明：全部中间量 ≤ 24 位（值恒 < 2^24 < 2^31），右移（>>）不会带入
+// 符号位，& | << 在 i64 上直接进行。
+
+namespace enc {
+// 0..255 字节值 → 单字符字符串（仅可打印 ASCII 32..126），越界返回空串。
+// 查表实现：常量串含 32..126 全部 95 个可打印字符，str_char(表, b-32) 定位
+// （tie 无码点→任意字符原语）。与 utf.to_char 同款方案，此处内联保持模块零依赖。
+func byte_to_char(b: i64) -> string {
+    var chars = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+    if b < 32 || b > 126 {
+        return ""
+    }
+    return str_char(chars, b - 32)
+}
+
+// 单字符 → base64 索引（0..63）；不在标准字符表 "A-Za-z0-9+/" 中返回 -1。
+// 逐字符扫描字符表比对（tie 无 find 原生绑定，str.find 在 std/string.tie，避免跨
+// 模块依赖故内联线性扫描；表长 64，性能无关紧要）。
+func b64_idx(c: string) -> i64 {
+    var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    var m: i64 = str_len(chars)
+    var j: i64 = 0
+    while j < m {
+        if str_char(chars, j) == c {
+            return j
+        }
+        j = j + 1
+    }
+    return -1
+}
+
+// 单字符 → 十六进制数值（0..15）；支持小写 a-f 与大写 A-F，其余返回 -1。
+// 供 hex_decode / url_decode 共用：先查小写表再查大写表。
+func hex_val(c: string) -> i64 {
+    var lower = "0123456789abcdef"
+    var m: i64 = str_len(lower)
+    var j: i64 = 0
+    while j < m {
+        if str_char(lower, j) == c {
+            return j
+        }
+        j = j + 1
+    }
+    var upper = "ABCDEF"
+    m = str_len(upper)
+    j = 0
+    while j < m {
+        if str_char(upper, j) == c {
+            return 10 + j
+        }
+        j = j + 1
+    }
+    return -1
+}
+
+// 码点是否为 URL「非保留字符」（RFC 3986 unreserved：A-Z a-z 0-9 - _ . ~），
+// percent 编码中这些字符原样输出。
+func is_unreserved(c: i64) -> bool {
+    if c >= 48 && c <= 57 {
+        return true
+    }
+    if c >= 65 && c <= 90 {
+        return true
+    }
+    if c >= 97 && c <= 122 {
+        return true
+    }
+    if c == 45 || c == 95 || c == 46 || c == 126 {
+        return true
+    }
+    return false
+}
+
+// base64 编码：逐 3 码点（字节）一组，拼接 24 位整数（b0<<16 | b1<<8 | b2），
+// 取 4 个 6 位索引查标准字符表输出 4 字符。
+// 填充：余 1 字节 → 2 字符 + "=="；余 2 字节 → 3 字符 + "="。
+// 非 ASCII 输入（任何码点 >127）返回空串（本模块只处理码点级 ASCII 约定）。
+pub func base64_encode(s: string) -> string {
+    var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    var n: i64 = str_len(s)
+    // 先整体校验：任一码点 >127（非 ASCII）直接拒绝
+    var i: i64 = 0
+    while i < n {
+        if char_code(str_char(s, i)) > 127 {
+            return ""
+        }
+        i = i + 1
+    }
+    var out: string = ""
+    i = 0
+    // 完整 3 字节组：24 位整数 → 4 个 6 位索引
+    while i + 2 < n {
+        var b0: i64 = char_code(str_char(s, i))
+        var b1: i64 = char_code(str_char(s, i + 1))
+        var b2: i64 = char_code(str_char(s, i + 2))
+        var v: i64 = (b0 << 16) | (b1 << 8) | b2
+        out = out + str_char(chars, (v >> 18) & 0x3F)
+        out = out + str_char(chars, (v >> 12) & 0x3F)
+        out = out + str_char(chars, (v >> 6) & 0x3F)
+        out = out + str_char(chars, v & 0x3F)
+        i = i + 3
+    }
+    // 余 1 字节：b0 拆两段（高 6 位 + 低 2 位补 4 个 0），补 2 个 '='
+    if n - i == 1 {
+        var b0: i64 = char_code(str_char(s, i))
+        out = out + str_char(chars, b0 >> 2)
+        out = out + str_char(chars, (b0 & 0x03) << 4)
+        out = out + "=="
+    }
+    // 余 2 字节：b0 高 6 位、b0 低 2 位|b1 高 4 位、b1 低 4 位补 2 个 0，补 1 个 '='
+    if n - i == 2 {
+        var b0: i64 = char_code(str_char(s, i))
+        var b1: i64 = char_code(str_char(s, i + 1))
+        out = out + str_char(chars, b0 >> 2)
+        out = out + str_char(chars, ((b0 & 0x03) << 4) | (b1 >> 4))
+        out = out + str_char(chars, (b1 & 0x0F) << 2)
+        out = out + "="
+    }
+    return out
+}
+
+// base64 解码：4 字符 → 3 字节的逆过程（24 位整数 v = i0<<18|i1<<12|i2<<6|i3，
+// 按 & 0xFF 掩码取 3 字节）。
+// 校验规则（严格 RFC 4648）：
+//   - 长度必须为 4 的倍数；前两位不允许是 '='；'=' 只能出现在最后一组且必须成对尾随；
+//   - 整个输入必须含 '=' 填充（无填充形式如 "SGVs" 视为非法，返回空串）；
+//   - 非字符表字符返回空串。
+// 解码字节只支持可打印 ASCII（32..126），越界字节无法构造字符，返回空串（局限）。
+pub func base64_decode(s: string) -> string {
+    var n: i64 = str_len(s)
+    // 空串直接返回空串
+    if n == 0 {
+        return ""
+    }
+    // 长度非 4 的倍数：非法
+    if n % 4 != 0 {
+        return ""
+    }
+    var out: string = ""
+    var i: i64 = 0
+    var saw_pad: bool = false
+    while i < n {
+        var c0 = str_char(s, i)
+        var c1 = str_char(s, i + 1)
+        var c2 = str_char(s, i + 2)
+        var c3 = str_char(s, i + 3)
+        var last: bool = (i + 4 == n)
+        // '=' 填充只允许出现在第三/四位，且前两位必须是数据字符
+        if c0 == "=" || c1 == "=" {
+            return ""
+        }
+        // 第三位是 '='：第四位必须也是 '='，且只能是最后一组
+        if c2 == "=" {
+            if c3 != "=" {
+                return ""
+            }
+            if !last {
+                return ""
+            }
+            saw_pad = true
+        }
+        // 第四位是 '='：只能是最后一组
+        if c3 == "=" {
+            if !last {
+                return ""
+            }
+            saw_pad = true
+        }
+        // 前两索引必然存在（非 '=' 已排除，再查字符表）
+        var i0: i64 = b64_idx(c0)
+        var i1: i64 = b64_idx(c1)
+        if i0 < 0 || i1 < 0 {
+            return ""
+        }
+        // 分支：按填充情况恢复 1/2/3 字节
+        if c3 == "=" {
+            if c2 == "=" {
+                // 2 字符 + "==" → 1 字节：i0 高 6 位 + i1 高 4 位拼 8 位
+                var v: i64 = (i0 << 18) | (i1 << 12)
+                var b: i64 = (v >> 16) & 0xFF
+                var ch = byte_to_char(b)
+                if str_len(ch) == 0 {
+                    return ""
+                }
+                out = out + ch
+            } else {
+                // 3 字符 + "=" → 2 字节：取 i0,i1,i2 共 18 位的前 16 位
+                var i2: i64 = b64_idx(c2)
+                if i2 < 0 {
+                    return ""
+                }
+                var v: i64 = (i0 << 18) | (i1 << 12) | (i2 << 6)
+                var b0: i64 = (v >> 16) & 0xFF
+                var b1: i64 = (v >> 8) & 0xFF
+                var ch0 = byte_to_char(b0)
+                var ch1 = byte_to_char(b1)
+                if str_len(ch0) == 0 || str_len(ch1) == 0 {
+                    return ""
+                }
+                out = out + ch0 + ch1
+            }
+        } else {
+            // 无填充完整组：4 字符 → 3 字节
+            var i2: i64 = b64_idx(c2)
+            var i3: i64 = b64_idx(c3)
+            if i2 < 0 || i3 < 0 {
+                return ""
+            }
+            var v: i64 = (i0 << 18) | (i1 << 12) | (i2 << 6) | i3
+            var b0: i64 = (v >> 16) & 0xFF
+            var b1: i64 = (v >> 8) & 0xFF
+            var b2: i64 = v & 0xFF
+            var ch0 = byte_to_char(b0)
+            var ch1 = byte_to_char(b1)
+            var ch2 = byte_to_char(b2)
+            if str_len(ch0) == 0 || str_len(ch1) == 0 || str_len(ch2) == 0 {
+                return ""
+            }
+            out = out + ch0 + ch1 + ch2
+        }
+        i = i + 4
+    }
+    // 严格 RFC 4648：要求输入含 '=' 填充，无填充形式视为非法
+    if !saw_pad {
+        return ""
+    }
+    return out
+}
+
+// 十六进制编码：每码点输出两位小写十六进制（查表 "0123456789abcdef"）。
+// 非 ASCII 码点（>127）返回空串（局限同上）。
+pub func hex_encode(s: string) -> string {
+    var digits = "0123456789abcdef"
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    var out: string = ""
+    while i < n {
+        var c: i64 = char_code(str_char(s, i))
+        // 非 ASCII：拒绝
+        if c < 0 || c > 127 {
+            return ""
+        }
+        // 高 4 位 + 低 4 位各取一个十六进制字符
+        out = out + str_char(digits, c >> 4) + str_char(digits, c & 0xF)
+        i = i + 1
+    }
+    return out
+}
+
+// 十六进制解码：每两位 hex → 1 字节码点（16 位组合 (hi<<4)|lo，再查可打印表）。
+// 非法输入（奇数长度 / 非 hex 字符 / 解码字节不可打印）返回空串。
+pub func hex_decode(s: string) -> string {
+    var n: i64 = str_len(s)
+    // 奇数长度：无法两两配对，非法
+    if n % 2 != 0 {
+        return ""
+    }
+    var i: i64 = 0
+    var out: string = ""
+    while i < n {
+        var hi: i64 = hex_val(str_char(s, i))
+        var lo: i64 = hex_val(str_char(s, i + 1))
+        // 任一字符非 hex：非法
+        if hi < 0 || lo < 0 {
+            return ""
+        }
+        var b: i64 = (hi << 4) | lo
+        // 解码字节只能表示为可打印 ASCII，否则返回空串（局限）
+        var ch = byte_to_char(b)
+        if str_len(ch) == 0 {
+            return ""
+        }
+        out = out + ch
+        i = i + 2
+    }
+    return out
+}
+
+// URL percent 编码（宽松 RFC 3986）：非保留字符（字母数字 - _ . ~）原样输出，
+// 空格输出 %20，其余可打印 ASCII 输出大写 %XX。非 ASCII 返回空串（注释局限：
+// 真正的 percent 编码应对 UTF-8 字节逐个编码，字节级工作超出本模块码点级能力，
+// 字节级替代见 std/utf.tie 的 hex_escape）。
+pub func url_encode(s: string) -> string {
+    var hex_upper = "0123456789ABCDEF"
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    var out: string = ""
+    while i < n {
+        var c: i64 = char_code(str_char(s, i))
+        // 非 ASCII：拒绝
+        if c < 0 || c > 127 {
+            return ""
+        }
+        if is_unreserved(c) {
+            // 非保留字符原样
+            out = out + str_char(s, i)
+        } else {
+            // 其余大写 %XX
+            out = out + "%" + str_char(hex_upper, c >> 4) + str_char(hex_upper, c & 0xF)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// URL percent 解码：%XX → 字节码点、+ → 空格；其余字符原样。
+// 非法 % 序列（% 后不足两位 / 非 hex 字符 / 解码字节不可打印）返回空串。
+pub func url_decode(s: string) -> string {
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    var out: string = ""
+    while i < n {
+        var c = str_char(s, i)
+        if c == "+" {
+            // '+' 解码为空格（表单惯例）
+            out = out + " "
+            i = i + 1
+        } else if c == "%" {
+            // 需要紧随的两位 hex 数字；不足两位则非法
+            if i + 2 >= n {
+                return ""
+            }
+            var hi: i64 = hex_val(str_char(s, i + 1))
+            var lo: i64 = hex_val(str_char(s, i + 2))
+            // 任一位非 hex：非法
+            if hi < 0 || lo < 0 {
+                return ""
+            }
+            var b: i64 = (hi << 4) | lo
+            // 解码字节需可打印 ASCII（局限）
+            var ch = byte_to_char(b)
+            if str_len(ch) == 0 {
+                return ""
+            }
+            out = out + ch
+            i = i + 3
+        } else {
+            // 普通字符原样
+            out = out + c
+            i = i + 1
+        }
+    }
+    return out
+}
+}

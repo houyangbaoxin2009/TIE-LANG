@@ -1,0 +1,119 @@
+// tie:library
+// test.tie：扩展库——测试框架（收集式断言，namespace test）
+//
+// 定位：tests/language 批跑与自举验收用——调用方直接用 expect 系列断言收集
+// 结果，框架累计全局计数，结尾 summary()/exit_code()/done() 输出结论。
+//
+// 与 std/assert 的关系：assert 是单断言即刻失败退出风格（assert_* 失败即打印
+// 并退出进程）；test 是收集风格（失败累计计数、立即打印定位行，跑完全部用例
+// 再输出 PASS/FAIL 结论）。两种风格二选一使用，勿混用。
+//
+// 设计约束：tie 无函数指针/闭包，测试框架无法注册回调函数——故采用
+// **手动断言收集**模型：调用方直接调用 expect 系列断言，框架累计全局计数，
+// 结尾 summary/exit_code 输出结论；用例组织（分组名）用字符串参数。
+//
+// 分组说明：group() 仅设置当前分组名，参与 summary 文本与 [FAIL] 定位行前缀，
+// 不参与判定逻辑；done() 后如需复用可再 reset()。
+
+// ---- 测试状态（顶层持久变量，跨函数共享） ----
+// t_pass/t_fail：通过/失败计数；t_cur_group：当前分组名（仅影响显示）
+var t_pass: i64 = 0
+var t_fail: i64 = 0
+var t_cur_group: string = ""
+
+namespace test {
+    // 内部：失败定位行后缀——分组非空时 "分组 用例名"，否则 "用例名"
+    func fail_label(name: string) -> string {
+        if t_cur_group == "" {
+            return name
+        }
+        return t_cur_group + " " + name
+    }
+
+    // 内部：f64 绝对值（避免依赖 std/math，保持扩展库自包含）
+    func abs_f(x: f64) -> f64 {
+        if x < 0.0 {
+            return -x
+        }
+        return x
+    }
+
+    // 清空计数与当前分组名（重置测试状态）
+    pub func reset() {
+        t_pass = 0
+        t_fail = 0
+        t_cur_group = ""
+    }
+
+    // 设置当前分组名：仅影响 summary/done 显示（"组: N passed, ..."、
+    // "[FAIL] 组 名" 前缀），不参与判定逻辑
+    pub func group(name: string) {
+        t_cur_group = name
+    }
+
+    // 断言：cond 为 true 计 pass；false 计 fail 并立即打印 "[FAIL] <group> <name>"
+    // （失败即时输出便于定位，无需等结尾 summary）
+    pub func expect(cond: bool, name: string) {
+        if cond {
+            t_pass = t_pass + 1
+        } else {
+            t_fail = t_fail + 1
+            println("[FAIL] " + fail_label(name))
+        }
+    }
+
+    // 整数相等断言
+    pub func expect_eq(a: i64, b: i64, name: string) {
+        expect(a == b, name)
+    }
+
+    // 字符串相等断言
+    pub func expect_str_eq(a: string, b: string, name: string) {
+        expect(a == b, name)
+    }
+
+    // 浮点近似断言：相对误差 1e-9（|a-b| <= |b|*1e-9）；
+    // b==0 时相对误差无意义，退化为绝对误差 1e-9（+1e-9 兜底项保证健壮性）
+    pub func expect_float_eq(a: f64, b: f64, name: string) {
+        var diff: f64 = abs_f(a - b)
+        expect(diff <= abs_f(b) * 0.000000001 + 0.000000001, name)
+    }
+
+    // 查询通过计数
+    pub func pass_count() -> i64 {
+        return t_pass
+    }
+
+    // 查询失败计数
+    pub func fail_count() -> i64 {
+        return t_fail
+    }
+
+    // 汇总字符串："N passed, M failed"（分组非空时前缀 "组: "）
+    pub func summary() -> string {
+        var s = to_string(t_pass) + " passed, " + to_string(t_fail) + " failed"
+        if t_cur_group != "" {
+            return t_cur_group + ": " + s
+        }
+        return s
+    }
+
+    // 退出码：全过 0 / 有失败 1——供 main 结尾 exit(test.exit_code()) 或 return 用
+    pub func exit_code() -> i64 {
+        if t_fail > 0 {
+            return 1
+        }
+        return 0
+    }
+
+    // 结束：打印 summary 并输出 PASS/FAIL 结论（有失败时额外提示存在失败用例）
+    pub func done() {
+        println(summary())
+        if t_fail > 0 {
+            println("测试完成: FAIL")
+            println("[FAIL] 存在失败用例")
+        } else {
+            println("测试完成: PASS")
+        }
+    }
+}

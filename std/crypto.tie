@@ -1,0 +1,117 @@
+// tie:library
+// crypto.tie：标准库——哈希/校验（命名空间 crc）
+// 用途：缓存键、校验和（完整性校验），**非加密安全**（CRC-32 与 FNV 都是
+//   非加密哈希，可碰撞，勿用于密码/签名/防篡改）。
+// 内容：crc32（标准 CRC-32，IEEE 802.3）、fnv1a（32 位 FNV-1a）。
+// 底座原语：str_len / str_char / char_code / 位运算 & ^ | << >> / 表读写。
+//
+// == 移位语义确认（查 crates/tie-llvm/src/ir.rs BinaryOp::Shr 生成逻辑）==
+//   i64 是有符号类型，`>>` 生成 **ashr（算术右移）**；仅无符号类型走 lshr
+//   （ir.rs 2725-2731：`is_unsigned` 分支）。因此本模块所有 `>>` 均为算术右移，
+//   依赖"操作数恒为正"来保证算术右移 == 逻辑右移（高位补 0）。
+//
+// == crc32 数值安全论证 ==
+//   crc 值恒存 i64 且每步 `& 0xFFFFFFFF`（或操作数天然 < 2^32）→ 恒正且
+//   < 2^32，i64 符号位恒为 0 → `crc >> 8`（ashr 算术右移）对正数等价于逻辑
+//   右移，高位补 0，逐字节 CRC 位运算正确；最终 `^ 0xFFFFFFFF` 亦 < 2^32。
+//   表项（多项式 0xEDB88320 反射展开）同样 < 2^32 恒正，`>> 1` 同理安全。
+//
+// == 乘法溢出确认（查 crates/tie-llvm ir.rs 与 tie-interp lib.rs）==
+//   LLVM 侧 `mul i64` **无 nsw/nuw 标志**（ir.rs 2491）→ 溢出为静默回绕
+//   （two's complement 截断），不报错；interp 侧 `Value::Int(a * b)`（Rust
+//   原生乘法）同样截断。结论：i64 乘法溢出**安全不回绝**，只截断。
+//   但 64 位 FNV-1a（偏移 0xCBF29CE484222325 > i64::MAX）结果在 i64 中为负，
+//   断言/打印不便，故本模块**降级实现 32 位 FNV-1a**：偏移 0x811C9DC5、
+//   素数 0x01000193，每步 (2^32-1)*0x01000193 ≈ 7.2e16 << i64::MAX
+//   (9.2e18)，**乘法永不溢出**，`& 0xFFFFFFFF` 掩码保证结果恒正。
+//
+// 逐字节处理：对每个码点取 char_code；ASCII（0..255）直接用，非 ASCII 码点
+//   按 0 处理（CRC/FNV 的字节语义对非 ASCII 无定义，自行决定：取 0 使校验和
+//   只覆盖 ASCII 部分，稳定可复现）。
+// 调用：import 后 crc.crc32(...) / crc.fnv1a(...)；命名空间内互调为裸调用。
+// 命名规范：命名空间内函数不加 crc_ 前缀（Harbor M2.1.6）。
+
+// 模块级全局表（T0.4 顶层表全局变量）：CRC-32 反射查找表，惰性构建。
+// 顶层 var 只支持字面量初始化，表需运行期构建 → 用"len==0 即未构建"标记
+// + ensure_crc32_table() 懒构建（首次调用 crc32 / crc32_table 时填充 256 项）。
+var crc32_tab: table<i64>;
+
+namespace crc {
+// 惰性构建 CRC-32 反射查找表（256 项）：多项式 0xEDB88320（IEEE 802.3 反射
+// 表示）。每项 = 8 轮"右移一位，最低位为 1 则异或多项式"。c 恒正 < 2^32，
+// `c >> 1`（ashr）对正数即逻辑右移（见头部安全论证）。
+func ensure_crc32_table() {
+    // 已构建（len 256）：直接返回
+    if len(crc32_tab) > 0 {
+        return
+    }
+    var i: i64 = 0
+    while i < 256 {
+        var c: i64 = i
+        var k: i64 = 0
+        while k < 8 {
+            var lsb: i64 = c & 1
+            c = c >> 1
+            if lsb != 0 {
+                c = c ^ 0xEDB88320
+            }
+            k = k + 1
+        }
+        table_push(crc32_tab, c)
+        i = i + 1
+    }
+}
+
+// 标准 CRC-32（IEEE 802.3）：多项式 0xEDB88320 反射表驱动，初始 0xFFFFFFFF，
+// 输出再异或 0xFFFFFFFF。逐字节处理（ASCII 码点；非 ASCII 按 0，见头部注释）。
+// 标准校验向量：crc32("123456789") == 0xCBF43926；crc32("") == 0。
+// 数值安全：crc 恒 `& 0xFFFFFFFF` 保持正数 < 2^32，`>> 8` 即逻辑右移（见头部）。
+pub func crc32(s: string) -> i64 {
+    ensure_crc32_table()
+    var crc: i64 = 0xFFFFFFFF
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        // 取第 i 个码点；非 ASCII（>255 或负）按字节 0 处理
+        var cp: i64 = char_code(str_char(s, i))
+        var b: i64 = 0
+        if cp >= 0 && cp <= 255 {
+            b = cp
+        }
+        // 标准循环：index = (crc ^ 字节) 低 8 位，crc = 表[index] ^ (crc >> 8)
+        var idx: i64 = (crc ^ b) & 0xFF
+        crc = crc32_tab[idx] ^ (crc >> 8)
+        i = i + 1
+    }
+    // 输出异或：最终值仍 < 2^32 正数
+    return crc ^ 0xFFFFFFFF
+}
+
+// FNV-1a 32 位：偏移基数 0x811C9DC5，素数 0x01000193，逐字节 (h ^ 字节) * 素数。
+// 降级说明见头部"乘法溢出确认"：32 位版乘法永不溢出 i64（≈7.2e16 上限），
+// 每步 `& 0xFFFFFFFF` 掩码截断，h 恒正。
+// 标准校验向量：fnv1a("") == 0x811C9DC5（2166136261）；同输入两次调用结果一致。
+pub func fnv1a(s: string) -> i64 {
+    var h: i64 = 0x811C9DC5
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var cp: i64 = char_code(str_char(s, i))
+        var b: i64 = 0
+        if cp >= 0 && cp <= 255 {
+            b = cp
+        }
+        // 先异或字节再掩码保正，再乘素数后掩码截断回 32 位
+        h = (h ^ b) & 0xFFFFFFFF
+        h = (h * 0x01000193) & 0xFFFFFFFF
+        i = i + 1
+    }
+    return h
+}
+
+// 暴露 CRC-32 查找表（调试用，可选）：返回模块级全局表 crc32_tab（256 项）。
+pub func crc32_table() -> table {
+    ensure_crc32_table()
+    return crc32_tab
+}
+}

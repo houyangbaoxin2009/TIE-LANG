@@ -1,0 +1,184 @@
+// tie:logic
+// compiler/backend/_driver_test.tie —— 自举 v2 T2.8 端到端验收脚本
+// ============================================================
+// 作用：把 tie 源码走完整后端链路并对比输出——
+//   源码 → AST(irgen.gen_src) → tie-IR → .ll(llvmgen.emit)
+//   → opt 优化 → clang 链接 → 运行 exe → 与预期输出逐行对比。
+// 链路各部件：
+//   - irgen.gen_src(src, base_dir)：AST → tie-IR 列式表，返回 0/-1，
+//     失败时全局变量 sm_err_msg 携带错误消息（sstate.tie 顶层全局，import 树传递可达）。
+//   - llvmgen.emit()：把 tie-IR 生成完整 .ll 文本（模块头+declare+define+字符串节）。
+//   - 工具链：D:\LLVM\bin\opt.exe（-O2 -S）优化 + clang.exe 链接生成 exe。
+// 编译运行：target\release\tie-llvm.exe compiler\backend\_driver_test.tie -o compiler\backend\_driver_test.exe
+// 说明：仅读 irgen/llvmgen；llvmgen 正被并行修改，本文件不写它。
+import "./irgen.tie"
+
+// ==================== 字符串工具（语言底座原语实现，不依赖 std） ====================
+
+// 子串：按码点截取 s[from, from+cnt)（str_char/str_len 按码点索引，中文安全）
+func substr(s: string, from: i64, cnt: i64) -> string {
+    var out = ""
+    var i: i64 = from
+    while i < from + cnt {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+// 去除末尾回车 \r（Windows 重定向可能引入 \r\n）
+func trim_cr(s: string) -> string {
+    var n = str_len(s)
+    if n > 0 && str_char(s, n - 1) == "\r" {
+        return substr(s, 0, n - 1)
+    }
+    return s
+}
+
+// 按换行拆行（语言底座无 split，手写）；末尾 \r 清理
+func split_lines(s: string) -> table<string> {
+    var rows = table_new_string()
+    var n = str_len(s)
+    var start: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == "\n" {
+            table_push(rows, trim_cr(substr(s, start, i - start)))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n {
+        table_push(rows, trim_cr(substr(s, start, n - start)))
+    }
+    return rows
+}
+
+// ==================== 预期输出 ====================
+
+// hello.tie 的预期输出（见 README「快速开始」节，共 16 行）
+func expected_lines() -> table<string> {
+    var rows = table_new_string()
+    table_push(rows, "Hello, tie!")
+    table_push(rows, "四段式: 预处理 [前端 中间优化 后端]")
+    table_push(rows, "50")
+    table_push(rows, "336")
+    table_push(rows, "100")
+    table_push(rows, "x 大于 y")
+    var i: i64 = 0
+    while i < 10 {
+        table_push(rows, to_string(i))
+        i = i + 1
+    }
+    return rows
+}
+
+// ==================== 逐行对比 ====================
+
+// 逐行对比实际输出与预期；行数或内容不同即返回 false（打印差异行）
+func compare_lines(got: table<string>, want: table<string>) -> bool {
+    var g = len(got)
+    var w = len(want)
+    if g != w {
+        println("行数不同: 实际 " + to_string(g) + " 行, 预期 " + to_string(w) + " 行")
+        return false
+    }
+    var i: i64 = 0
+    while i < g {
+        if got[i] != want[i] {
+            println("第 " + to_string(i + 1) + " 行不同:")
+            println("  实际: [" + got[i] + "]")
+            println("  预期: [" + want[i] + "]")
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ==================== 主流程 ====================
+
+// main：端到端链路按序执行，每步打印状态；任一步失败打印原因并返回非 0
+func main() -> i64 {
+    println("=== t28 端到端验收开始 ===")
+
+    // 0) 工作目录（临时文件统一放 t28）
+    var dir = "C:\\Users\\Jiro\\AppData\\Local\\Temp\\opencode\\t28"
+    if !mkdir_all(dir) {
+        println("=== FAIL: 创建临时目录失败 " + dir)
+        return 1
+    }
+
+    // 1) 读源码（Windows 路径反斜杠双写）
+    var src_path = "F:\\Projects\\tie\\examples\\hello.tie"
+    var src = file_read(src_path)
+    if str_len(src) == 0 {
+        println("=== FAIL: 读取源码失败 " + src_path)
+        return 1
+    }
+    println("[1] 读源码 OK (" + to_string(str_len(src)) + " 字符)")
+
+    // 2) 前端 + 中端：AST → tie-IR
+    var rc = irgen.gen_src(src, "F:\\Projects\\tie")
+    if rc != 0 {
+        println("=== FAIL: irgen.gen_src 失败 rc=" + to_string(rc))
+        println("  sm_err_msg: " + sm_err_msg)
+        return 1
+    }
+    println("[2] irgen.gen_src OK (rc=0)")
+
+    // 3) 后端入口：tie-IR → .ll 文本
+    var ll = llvmgen.emit()
+    println("[3] llvmgen.emit OK (" + to_string(str_len(ll)) + " 字符)")
+
+    // 4) 写 .ll 到临时目录
+    var ll_path = dir + "\\t28_out.ll"
+    if !file_write(ll_path, ll) {
+        println("=== FAIL: 写 .ll 失败 " + ll_path)
+        return 1
+    }
+    println("[4] 写 .ll OK (" + ll_path + ")")
+
+    // 5) opt 优化 + clang 链接
+    var opt_path = dir + "\\t28_out.opt.ll"
+    var rc_opt = exec_code("D:\\LLVM\\bin\\opt.exe -O2 -S " + ll_path + " -o " + opt_path)
+    if rc_opt != 0 {
+        println("=== FAIL: opt 优化失败 rc=" + to_string(rc_opt))
+        println("  命令: D:\\LLVM\\bin\\opt.exe -O2 -S " + ll_path + " -o " + opt_path)
+        return 1
+    }
+    println("[5a] opt -O2 OK")
+
+    var exe_path = dir + "\\t28_out.exe"
+    var rc_clang = exec_code("D:\\LLVM\\bin\\clang.exe " + opt_path + " -o " + exe_path)
+    if rc_clang != 0 {
+        println("=== FAIL: clang 链接失败 rc=" + to_string(rc_clang))
+        println("  命令: D:\\LLVM\\bin\\clang.exe " + opt_path + " -o " + exe_path)
+        return 1
+    }
+    println("[5b] clang 链接 OK (" + exe_path + ")")
+
+    // 6) 运行 exe，捕获输出
+    var out = exec_output(exe_path)
+    println("[6] 运行 exe OK (" + to_string(str_len(out)) + " 字符)")
+
+    // 7) 与预期输出逐行对比
+    var got = split_lines(out)
+    var want = expected_lines()
+    var pass = compare_lines(got, want)
+
+    // 8) 验收结论
+    if pass {
+        println("=== PASS ===")
+        return 0
+    }
+    println("=== FAIL: 输出与预期不一致 ===")
+    // 打印实际输出前几行供人工核对
+    println("--- 实际输出前 6 行 ---")
+    var i: i64 = 0
+    while i < 6 && i < len(got) {
+        println("  " + got[i])
+        i = i + 1
+    }
+    return 1
+}

@@ -1,0 +1,428 @@
+// tie:library
+// compiler/backend/llvmgen.tie —— 自举 v2 T2.8：tie-IR → LLVM IR 文本生成
+// ============================================================
+// 里程碑：自举 v2 计划 T2.8（.omo/plans/self-hosting-v2.md）后端 LLVM IR
+// 文本生成器。本文件 = tie-IR 列式表 → .ll 文本（Rust ir.rs run() 契约）。
+// 最小可行集：模块头/declare/define/entry 块/指令映射/字符串常量。
+// **字符串自省**：遍历 tie-IR 的 const_str(62)/call_vararg(41) 指令收集
+// 字符串池 id，经 interner.lookup 还原文本生成 @.str.N（不依赖 irgen）。
+// 依赖：./../middle/ir.tie（tie-IR 表访问）。
+// types.tie 经 irgen→semantic→…→stype→data 树传递可达（K_NAMED/TK_*）；
+// str_char/char_code/str_len/to_string 为语言底座原语（全局可见，无需 import）；
+// intern 经 irgen→semantic→…→lex_tokdefs→interner 树传递可达。
+// 唯一直接 import ir.tie：避免菱形 import 导致全局变量重复定义。
+// 树式无环：irgen import 本文件（本文件不 import irgen）。
+// UTF-8 字节级能力复用 std/utf（hex_escape/utf8_bytes/byte_len），
+// 不再内联重复实现（编译器自举后亦可继续依赖 std——std 亦为 tie 自写）。
+import "./../middle/ir.tie"
+import "../../std/utf.tie"
+
+// ==================== 输出缓冲 ====================
+var out_buf: string = "";
+// 字符串常量表：池 id → @.str.N 序号（自省收集）
+var str_pool: table<i64>;   // 字符串池 id（登记序）
+var str_idx: table<i64>;    // 对应 @.str.N
+var str_count: i64 = 0;
+// printf i32 实参 sext 的新寄存器计数（LLVM 不支持内联 sext 表达式实参，
+// 每处 i32 实参生成一个独立 %ext<N> 寄存器）
+var g_sext_cnt: i64 = 0;
+
+namespace llvmgen {
+
+func line(s: string) {
+    out_buf = out_buf + s + "\n"
+}
+
+// ==================== 类型映射 ====================
+// types 自编码 → LLVM 类型名
+func llvm_ty(t: i64) -> string {
+    if t == TK_VOID {
+        return "void"
+    }
+    if t == TK_I8 || t == TK_U8 {
+        return "i8"
+    }
+    if t == TK_I16 || t == TK_U16 {
+        return "i16"
+    }
+    if t == TK_I32 || t == TK_U32 {
+        return "i32"
+    }
+    if t == TK_I64 || t == TK_U64 {
+        return "i64"
+    }
+    if t == TK_F32 {
+        return "float"
+    }
+    if t == TK_F64 {
+        return "double"
+    }
+    if t == TK_BOOL {
+        return "i1"
+    }
+    if t == TK_CHAR {
+        return "i32"
+    }
+    // string/table/map/struct 等 → ptr（引用类型）
+    return "ptr"
+}
+
+// ==================== 字符串自省 ====================
+// 查找/登记字符串池 id → @.str.N 序号
+func str_slot(name_id: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(str_pool) {
+        if str_pool[i] == name_id {
+            return str_idx[i]
+        }
+        i = i + 1
+    }
+    var n = str_count
+    table_push(str_pool, name_id)
+    table_push(str_idx, n)
+    str_count = str_count + 1
+    return n
+}
+
+// 遍历 tie-IR 全部指令，收集 const_str(62) 与 call_vararg(41) 的字符串操作数
+func collect_strings() {
+    str_pool = table_new_i64()
+    str_idx = table_new_i64()
+    str_count = 0
+    var ni = ir.inst_count()
+    var i: i64 = 0
+    while i < ni {
+        var op = ir.ins_op(i)
+        var cnt = ir.ins_ops_cnt(i)
+        var k: i64 = 0
+        if op == 62 {
+            // const_str：操作数[0] = 字符串池 id
+            if cnt >= 1 {
+                str_slot(ir.ins_opnd(i, 0))
+            }
+        } else if op == 41 {
+            // call_vararg：操作数[0] = 格式串池 id
+            if cnt >= 1 {
+                str_slot(ir.ins_opnd(i, 0))
+            }
+        }
+        i = i + 1
+    }
+}
+
+// 字符串文本 → LLVM 转义（对齐 Rust escape_ir_string：可打印 ASCII 原样，
+// 特殊字符 \XX 十六进制；含中文等非 ASCII 码点逐字节转义）
+func escape_str(s: string) -> string {
+    var out: string = ""
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var cc = char_code(str_char(s, i))
+        if cc == 92 {
+            out = out + "\\5C"
+        } else if cc == 34 {
+            out = out + "\\22"
+        } else if cc == 10 {
+            out = out + "\\0A"
+        } else if cc == 13 {
+            out = out + "\\0D"
+        } else if cc == 9 {
+            out = out + "\\09"
+        } else if cc >= 32 && cc <= 126 {
+            out = out + str_char(s, i)
+        } else {
+            // 非 ASCII 码点（含中文）或 ASCII 控制字符：按 UTF-8 字节序列 \XX 转义
+            // （std/utf.hex_escape 字节级编码；码点值 ≠ UTF-8 字节序列）
+            out = out + utf.hex_escape(cc)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 输出字符串常量节（模块末尾）
+func emit_strings() {
+    var i: i64 = 0
+    while i < len(str_pool) {
+        var txt = intern.lookup(str_pool[i])
+        var byte_len = utf.byte_len(txt)
+        var esc = escape_str(txt)
+        line("@.str." + to_string(str_idx[i]) + " = private unnamed_addr constant [" +
+            to_string(byte_len + 1) + " x i8] c\"" + esc + "\\00\"")
+        i = i + 1
+    }
+}
+
+// ==================== 指令映射 ====================
+// 操作数引用：OK_VALUE(0) → %N；OK_BLOCK(1) → label；OK_IMM(2) → 立即数
+func opnd_ref(inst_id: i64, k: i64) -> string {
+    var v = ir.ins_opnd(inst_id, k)
+    var kind = ir.ins_opnd_kind(inst_id, k)
+    if kind == 0 {
+        return "%" + to_string(v)
+    }
+    if kind == 1 {
+        // 块标签统一为 bb<N>（与 gen_func 标签定义一致）
+        return "label %bb" + to_string(v)
+    }
+    return to_string(v)
+}
+
+// 值 id → 定义指令 id（扫描；无定义返回 -1）
+func value_def(v: i64) -> i64 {
+    var ni = ir.inst_count()
+    var i: i64 = 0
+    while i < ni {
+        if ir.ins_val(i) == v {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// printf 实参引用：按值定义指令判定类型
+//   const_str(62) → "ptr @.str.N"（格式串 %s 需指针，不走寄存器）
+//   i64 结果     → "i64 %N"
+//   i32 结果     → 由 call_vararg 分支生成独立 sext（不在本函数内联——
+//                  LLVM 新版本不支持 `sext (i32 %N to i64)` 表达式实参）
+//   其他/未知    → "i64 %N"
+func arg_ref(inst_id: i64, k: i64) -> string {
+    var v = ir.ins_opnd(inst_id, k)
+    var def = value_def(v)
+    if def >= 0 {
+        if ir.ins_op(def) == 62 {
+            var slot = str_slot(ir.ins_opnd(def, 0))
+            return "ptr @.str." + to_string(slot)
+        }
+    }
+    return "i64 %" + to_string(v)
+}
+
+// 单条指令 → .ll 文本（核心子集）
+func gen_inst(inst_id: i64) {
+    var op = ir.ins_op(inst_id)
+    var val = ir.ins_val(inst_id)   // 结果值 id（-1 = 无结果）
+    var cnt = ir.ins_ops_cnt(inst_id)
+
+    var reg = ""
+    if val >= 0 {
+        reg = "%" + to_string(val)
+    }
+
+    if op == 20 {
+        // alloca
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = alloca " + ty)
+        return
+    }
+    if op == 21 {
+        // load：操作数[0] = 地址
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = load " + ty + ", ptr " + opnd_ref(inst_id, 0))
+        return
+    }
+    if op == 22 {
+        // store：操作数 [类型IMM, 值VALUE, 地址VALUE]
+        var vty = llvm_ty(ir.ins_opnd(inst_id, 0))
+        line("store " + vty + " " + opnd_ref(inst_id, 1) + ", ptr " + opnd_ref(inst_id, 2))
+        return
+    }
+    if op == 60 {
+        // const_i：立即数常量 → add 0, val（结果寄存器 = 值）。
+        // 类型按指令 ins_ty（i32 变量初始化是 i32 常量；i64 默认）——
+        // 否则 store i32 %N 会因 %N 为 i64 而类型不匹配。
+        var v = ir.ins_opnd(inst_id, 0)
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = add " + ty + " 0, " + to_string(v))
+        return
+    }
+    if op == 62 {
+        // const_str：字符串全局指针（ptr 类型结果）
+        var sid = ir.ins_opnd(inst_id, 0)
+        var slot = str_slot(sid)
+        // 返回全局字符串指针（作为 ptr 值）
+        line(reg + " = ptrtoint ptr @.str." + to_string(slot) + " to i64")
+        return
+    }
+    if op == 0 || op == 1 || op == 2 || op == 3 || op == 4 {
+        // add/sub/mul/div/mod
+        var opname = ""
+        if op == 0 {
+            opname = "add"
+        } else if op == 1 {
+            opname = "sub"
+        } else if op == 2 {
+            opname = "mul"
+        } else if op == 3 {
+            opname = "sdiv"
+        } else if op == 4 {
+            opname = "srem"
+        }
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = " + opname + " " + ty + " " + opnd_ref(inst_id, 0) + ", " + opnd_ref(inst_id, 1))
+        return
+    }
+    if op == 12 {
+        // icmp：操作数 [lhs VALUE, rhs VALUE, cmp IMM]
+        var lv = ir.ins_opnd(inst_id, 0)
+        var rv = ir.ins_opnd(inst_id, 1)
+        var cmp = ir.ins_opnd(inst_id, 2)
+        var cname = "eq"
+        if cmp == 0 {
+            cname = "eq"
+        } else if cmp == 1 {
+            cname = "ne"
+        } else if cmp == 2 {
+            cname = "slt"
+        } else if cmp == 3 {
+            cname = "sgt"
+        } else if cmp == 4 {
+            cname = "sle"
+        } else if cmp == 5 {
+            cname = "sge"
+        }
+        line(reg + " = icmp " + cname + " i64 " + opnd_ref(inst_id, 0) + ", " + opnd_ref(inst_id, 1))
+        return
+    }
+    if op == 30 {
+        // br label %block
+        line("br " + opnd_ref(inst_id, 0))
+        return
+    }
+    if op == 31 {
+        // cond_br：操作数 [cond VALUE, then BLOCK, else BLOCK]
+        var cond = ir.ins_opnd(inst_id, 0)
+        var then_b = ir.ins_opnd(inst_id, 1)
+        var else_b = ir.ins_opnd(inst_id, 2)
+        line("br i1 %" + to_string(cond) + ", label %bb" + to_string(then_b) + ", label %bb" + to_string(else_b))
+        return
+    }
+    if op == 32 {
+        // ret：无操作数 → ret void；有 → ret T %N
+        if cnt == 0 {
+            line("ret void")
+        } else {
+            var v0 = ir.ins_opnd(inst_id, 0)
+            line("ret i32 " + opnd_ref(inst_id, 0))
+        }
+        return
+    }
+    if op == 41 {
+        // call_vararg（printf）：操作数[0] = 格式串池 id；[1..] = 实参
+        var fid = ir.ins_opnd(inst_id, 0)
+        var slot = str_slot(fid)
+        // 实参类型提升：const_str → ptr 直传 @.str.N；i32 结果 → 先生成
+        // 独立 sext 指令（LLVM 不支持内联 sext 表达式实参）再传 i64；
+        // i64 → 直传。
+        var args = ""
+        var k: i64 = 1
+        while k < cnt {
+            if k > 1 {
+                args = args + ", "
+            }
+            var v = ir.ins_opnd(inst_id, k)
+            var def = value_def(v)
+            var rref = arg_ref(inst_id, k)
+            // i32 值实参：生成 sext 到独立寄存器（新寄存器号 g_sext_cnt 递增）
+            if def >= 0 && llvm_ty(ir.ins_ty(def)) == "i32" {
+                g_sext_cnt = g_sext_cnt + 1
+                var rn = "%ext" + to_string(g_sext_cnt)
+                line(rn + " = sext i32 %" + to_string(v) + " to i64")
+                rref = "i64 " + rn
+            }
+            args = args + rref
+            k = k + 1
+        }
+        // 实参列表前缀：非空时补 ", "
+        var call_args = ""
+        if args != "" {
+            call_args = ", " + args
+        }
+        line(reg + " = call i32 (ptr, ...) @printf(ptr @.str." + to_string(slot) + call_args + ")")
+        return
+    }
+    // 未支持指令：占位注释
+    line("; TODO op=" + to_string(op) + " inst=" + to_string(inst_id))
+}
+
+// ==================== 模块生成 ====================
+// 生成完整 .ll 文本
+pub func emit() -> string {
+    collect_strings()
+    out_buf = ""
+    // 模块头
+    line("; ModuleID = 'tie'")
+    line("source_filename = \"input.tie\"")
+    line("")
+    // 无条件 declare
+    line("declare i32 @printf(ptr, ...)")
+    line("")
+    line("declare i64 @strlen(ptr)")
+    line("declare i32 @strcmp(ptr, ptr)")
+    line("declare ptr @malloc(i64)")
+    line("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)")
+    line("")
+    line("declare ptr @fopen(ptr, ptr)")
+    line("declare i64 @fwrite(ptr, i64, i64, ptr)")
+    line("declare i32 @fclose(ptr)")
+    line("declare i32 @fflush(ptr)")
+    line("declare void @exit(i32)")
+    line("declare i32 @remove(ptr)")
+    line("declare double @sqrt(double)")
+    line("declare double @sin(double)")
+    line("declare double @cos(double)")
+    line("declare double @tan(double)")
+    line("declare double @exp(double)")
+    line("declare double @log(double)")
+    line("declare double @pow(double, double)")
+    line("declare double @floor(double)")
+    line("declare double @ceil(double)")
+    line("declare double @round(double)")
+    line("")
+    // 各函数
+    var nf = ir.func_count()
+    var i: i64 = 0
+    while i < nf {
+        gen_func(i)
+        i = i + 1
+    }
+    // 字符串常量节
+    line("")
+    emit_strings()
+    return out_buf
+}
+
+// 单个函数生成
+func gen_func(fid: i64) {
+    var name = intern.lookup(ir.func_name(fid))
+    var ret_llvm = llvm_ty(ir.func_ret(fid))
+    // main 特殊：void main → define i32 @main
+    if name == "main" && ret_llvm == "void" {
+        ret_llvm = "i32"
+    }
+    line("define " + ret_llvm + " @" + name + "() {")
+    // 遍历该函数的全部块（按块 id 顺序；入口块先）
+    var nb = ir.block_count()
+    var bi: i64 = 0
+    while bi < nb {
+        if ir.block_func(bi) == fid {
+            // 块标签：统一用块 id（bb<N>），避免 block_name 多 if/for 冲突
+            line("bb" + to_string(bi) + ":")
+            var start = ir.block_start(bi)
+            var end = ir.block_end(bi)
+            var ii = start
+            while ii < end {
+                gen_inst(ii)
+                ii = ii + 1
+            }
+        }
+        bi = bi + 1
+    }
+    line("}")
+    line("")
+}
+
+}
+
+

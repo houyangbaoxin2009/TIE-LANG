@@ -1,0 +1,53 @@
+// tie:logic
+// tie:opt=2
+
+// enc（std/encoding.tie）编码转换标准库验收：
+// - base64：encode 三档填充 / decode 往返 / 严格填充与非法输入拒绝；
+// - hex：encode 小写两位 / decode 往返 / 奇数长度与非 hex 字符拒绝；
+// - url：percent 编码（非保留字符原样、空格 %20）/ 解码（+ → 空格、%XX）/ 非法序列拒绝。
+// 关键设计：tie 无字节级字符串原语，enc 按码点处理，输入约定 ASCII（每码点 1 字节），
+// 非 ASCII 码点（>127）返回空串；解码字节只支持可打印 ASCII（32..126）。
+// 编译器规避：tie-llvm 的「全局重编号」pass（crates/tie-llvm/src/ir.rs 的 renumber_ir）
+// 会把字符串常量里 `%数字` 序列当寄存器引用重编号（实测 "%20" → "%3"），既损坏字面量
+// 值、又可能引发 opt 常量长度不匹配（编译失败）。因此含 `%数字` 相邻的字符串一律写成
+// 运行时拼接（"a%" + "20b"），避免 % 与数字在源码字面量中相邻；"%G" 这类 % 后非数字
+// 不受影响，可直接写字面量。
+// 预期输出：std_encoding 验收通过（全部断言通过，无 assert 失败退出）。
+import "../../std/assert.tie"
+import "../../std/encoding.tie"
+using assert;
+using enc;
+
+func main() {
+    // ---- enc.base64_encode：3 字节 → 4 字符，末尾 '=' 填充 ----
+    // "Hello"(48 65 6C 6C 6F) → "SGVs bG8="；"a" → "YQ=="；"abc" → "YWJj"；空串 → 空串
+    assert.assert_eq_str(enc.base64_encode("Hello"), "SGVsbG8=")
+    assert.assert_eq_str(enc.base64_encode("a"), "YQ==")
+    assert.assert_eq_str(enc.base64_encode("abc"), "YWJj")
+    assert.assert_eq_str(enc.base64_encode(""), "")
+    // ---- enc.base64_decode：逆过程往返 + 严格填充 + 非法输入 ----
+    assert.assert_eq_str(enc.base64_decode("SGVsbG8="), "Hello")
+    assert.assert_eq_str(enc.base64_decode("YQ=="), "a")
+    assert.assert_eq_str(enc.base64_decode(""), "")
+    assert.assert_eq_str(enc.base64_decode("!!!"), "")   // 长度非 4 的倍数
+    assert.assert_eq_str(enc.base64_decode("SGVs"), "")  // 无 '=' 填充（严格 RFC 4648 拒绝）
+    // ---- enc.hex_encode：每码点两位小写十六进制 ----
+    // "A"(0x41) → "41"；"B"(0x42) → "42"；"a"(0x61) → "61"
+    assert.assert_eq_str(enc.hex_encode("AB"), "4142")
+    assert.assert_eq_str(enc.hex_encode("a"), "61")
+    assert.assert_eq_str(enc.hex_encode(""), "")
+    // ---- enc.hex_decode：每两位 → 1 字节；非法输入返回空串 ----
+    assert.assert_eq_str(enc.hex_decode("4142"), "AB")
+    assert.assert_eq_str(enc.hex_decode(""), "")
+    assert.assert_eq_str(enc.hex_decode("4"), "")    // 奇数长度
+    assert.assert_eq_str(enc.hex_decode("4G"), "")   // 非 hex 字符
+    // ---- enc.url_encode：宽松 RFC 3986，非保留字符原样、空格 %20 ----
+    assert.assert_eq_str(enc.url_encode("a b"), "a%" + "20b")
+    assert.assert_eq_str(enc.url_encode("a.b-c_d~"), "a.b-c_d~")
+    // ---- enc.url_decode：%XX → 字节、+ → 空格；非法 % 序列返回空串 ----
+    assert.assert_eq_str(enc.url_decode("a%" + "20b"), "a b")
+    assert.assert_eq_str(enc.url_decode("a+b"), "a b")
+    assert.assert_eq_str(enc.url_decode("%G"), "")      // % 后不足两位
+    assert.assert_eq_str(enc.url_decode("a%" + "2Gb"), "")   // % 后跟非 hex 字符
+    println("std_encoding 验收通过")
+}

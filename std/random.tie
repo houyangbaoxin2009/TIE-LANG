@@ -1,0 +1,68 @@
+// tie:library
+// random.tie：标准库——伪随机工具（命名空间 rnd），基于底座原语 rand_range。
+// rand_range(min, max) 返回 [min, max) 半开区间随机整数，种子由语言底座内部管理
+// （非加密安全，勿用于密码学/安全令牌场景）。
+// 调用：import 后 rnd.int(min, max) / rnd.pick(t)；命名空间内互调为裸调用。
+// 命名规范：命名空间内函数不加 rnd_ 前缀（统一 func 写法，Harbor M2.1.6）。
+// 命名说明：任务要求的 bool() 因 bool 是 tie 类型关键字（保留字）不能用作函数名，
+// 故以 flip() 命名（掷硬币语义：等概率返回 true/false）。
+// 闭区间语义：rand_range 为半开 [min, max)，int(min, max) 包装为 rand_range(min, max+1)
+// 得到闭区间 [min, max]。注意 max = i64::MAX 时 max+1 会溢出，本函数不处理该边界。
+
+namespace rnd {
+// 闭区间 [min, max] 内随机整数。int(5,5) 恒为 5（边界）；int(a,b) 要求 b >= a。
+// 语义来源：rand_range 半开区间包装为 min..max+1。
+pub func int(min: i64, max: i64) -> i64 {
+    return rand_range(min, max + 1)
+}
+
+// 等概率返回 true / false（掷硬币）。等价于 int(0,1)==1。
+pub func flip() -> bool {
+    if int(0, 1) == 1 {
+        return true
+    }
+    return false
+}
+
+// 随机取表 t 的一个元素（等概率）；空表返回 0（约定，注释说明）。
+// 下标取 rand_range(0, len(t))（半开区间覆盖全部下标 0..len-1）。
+pub func pick(t: table<i64>) -> i64 {
+    var n: i64 = len(t)
+    if n == 0 {
+        return 0
+    }
+    return t[rand_range(0, n)]
+}
+
+// 随机取字符串表 t 的一个元素（等概率）；空表返回空串（约定）。
+pub func pick_str(t: table<string>) -> string {
+    var n: i64 = len(t)
+    if n == 0 {
+        return ""
+    }
+    return t[rand_range(0, n)]
+}
+
+// Fisher-Yates 洗牌：返回打乱后的新表，**不修改入参表 t**（先整体复制到新表，
+// 再在新表上反向洗牌）。空表/单元素表返回等长的新表（无交换发生）。
+pub func shuffle(t: table<i64>) -> table<i64> {
+    // 复制入参到新表 out（保证不修改调用方）
+    var out = table_new_i64()
+    var n: i64 = len(t)
+    var i: i64 = 0
+    while i < n {
+        table_push(out, t[i])
+        i = i + 1
+    }
+    // 反向 Fisher-Yates：i 从 n-1 到 1，随机取 [0, i] 内下标与当前位置交换
+    var i2: i64 = n - 1
+    while i2 > 0 {
+        var j: i64 = rand_range(0, i2 + 1)
+        var tmp: i64 = out[i2]
+        out[i2] = out[j]
+        out[j] = tmp
+        i2 = i2 - 1
+    }
+    return out
+}
+}
