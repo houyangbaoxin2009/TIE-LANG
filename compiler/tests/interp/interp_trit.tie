@@ -1,0 +1,94 @@
+// tie:logic
+// tie:opt=2
+
+// 自举 v2 T4.4：interp 行为测试 tie 化——trit 平衡三进制。
+// 移植自 crates/tie-interp/src/lib.rs tests：trit字面量与格式化 /
+// tritKleene三值逻辑真值表 / trit算术饱和与i64混合。
+// 注意：var a: trit = true 会把 bool 字面量适配为 trit（true→+1/false→-1）；
+// 每个用例前 reset（对齐 Rust 独立 Session）。
+
+import "../../interp/interp.tie"
+
+var g_fail: i64 = 0;
+
+func check(actual: string, expected: string) {
+    if actual == expected {
+        println("PASS  [" + expected + "]")
+    } else {
+        println("FAIL  got=[" + actual + "]")
+        println("      want=[" + expected + "]")
+        g_fail = g_fail + 1
+    }
+}
+
+func check_err(actual: string, expected: string) {
+    if actual == expected {
+        println("PASS  err[" + expected + "]")
+    } else {
+        println("FAIL  got-err=[" + actual + "]")
+        println("      want-err=[" + expected + "]")
+        g_fail = g_fail + 1
+    }
+}
+
+func main() {
+    // ---- trit字面量与格式化 ----
+    interp.reset()
+    check(interp.eval("zero"), "0")
+    interp.reset()
+    check(interp.eval("to_string(zero)"), "0")
+
+    // ---- tritKleene三值逻辑真值表（Kleene && = min，|| = max；! = 取反）----
+    interp.reset()
+    check(interp.eval("var a: trit = true; var b: trit = true; to_string(a && b)"), "1")
+    interp.reset()
+    check(interp.eval("var a: trit = true; var b: trit = zero; to_string(a && b)"), "0")
+    interp.reset()
+    check(interp.eval("var a: trit = true; var b: trit = false; to_string(a && b)"), "-1")
+    interp.reset()
+    check(interp.eval("var a: trit = zero; var b: trit = false; to_string(a && b)"), "-1")
+    interp.reset()
+    check(interp.eval("var a: trit = false; var b: trit = true; to_string(a || b)"), "1")
+    interp.reset()
+    check(interp.eval("var a: trit = false; var b: trit = zero; to_string(a || b)"), "0")
+    interp.reset()
+    check(interp.eval("var a: trit = false; var b: trit = false; to_string(a || b)"), "-1")
+    interp.reset()
+    check(interp.eval("var a: trit = true; to_string(!a)"), "-1")
+    interp.reset()
+    check(interp.eval("var a: trit = false; to_string(!a)"), "1")
+    interp.reset()
+    check(interp.eval("var a: trit = zero; to_string(!a)"), "0")
+
+    // ---- trit算术饱和与i64混合 ----
+    interp.reset()
+    check(interp.eval("var a: trit = true; var b: trit = true; to_string(a + b)"), "1")
+    interp.reset()
+    check(interp.eval("var a: trit = true; var b: trit = false; to_string(a - b)"), "1")
+    interp.reset()
+    check(interp.eval("var a: trit = true; var b: trit = true; to_string(a * b)"), "1")
+    interp.reset()
+    check(interp.eval("var a: trit = true; var b: trit = true; to_string(a - b)"), "0")
+    interp.reset()
+    check(interp.eval("var a: trit = true; to_string(a + 5)"), "6")
+    interp.reset()
+    check(interp.eval("var a: trit = false; to_string(5 + a)"), "4")
+    interp.reset()
+    check(interp.eval("var a: trit = true; var b: trit = false; (a > b) ? \"1\" : \"0\""), "1")
+    interp.reset()
+    check(interp.eval("var a: trit = true; (a == 1) ? \"1\" : \"0\""), "1")
+    interp.reset()
+    check(interp.eval("var a: trit = false; (a == 1) ? \"1\" : \"0\""), "0")
+    interp.reset()
+    check_err(interp.eval("var a: trit = true; var b: trit = true; to_string(a / b)"), "trit 不支持除/取模运算（三值无除法）")
+
+    // ---- parse_trit：依赖 T4.2（桥函数 parse_trit 未在 tie interp 内置集）----
+    println("SKIP  [parse_trit] 依赖 T4.2 桥函数（parse_trit 未在 tie interp 内置集）")
+
+    if g_fail == 0 {
+        println("interp_trit 验收通过：全部比对一致（golden 对齐 Rust interp；parse_trit SKIP）")
+    } else {
+        println("interp_trit 验收失败：" + to_string(g_fail) + " 项不一致")
+        exit(1)
+    }
+}

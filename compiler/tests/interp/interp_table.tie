@@ -1,0 +1,89 @@
+// tie:logic
+// tie:opt=2
+
+// 自举 v2 T4.4：interp 行为测试 tie 化——动态表（table_new/push/at/下标赋值/遍历）。
+// 移植自 crates/tie-interp/src/lib.rs tests：表下标赋值动态表读写 /
+// dyn_table_new_push_len / dyn_table_at_reads_element /
+// dyn_table_at_out_of_bounds_errors / dyn_table_string_build_and_for /
+// dyn_table_bool_and_f64 / ref表参数内容修改与重绑定写回调用方。
+
+import "../../interp/interp.tie"
+
+var g_fail: i64 = 0;
+
+func check(actual: string, expected: string) {
+    if actual == expected {
+        println("PASS  [" + expected + "]")
+    } else {
+        println("FAIL  got=[" + actual + "]")
+        println("      want=[" + expected + "]")
+        g_fail = g_fail + 1
+    }
+}
+
+func check_err(actual: string, expected: string) {
+    if actual == expected {
+        println("PASS  err[" + expected + "]")
+    } else {
+        println("FAIL  got-err=[" + actual + "]")
+        println("      want-err=[" + expected + "]")
+        g_fail = g_fail + 1
+    }
+}
+
+func main() {
+    // ---- 表下标赋值动态表读写：下标赋值/复合赋值/越界写 ----
+    interp.reset()
+    check(interp.eval("var t = table_new_i64(); table_push(t, 10); table_push(t, 20); t[0] = 99; t[0]"), "99")
+    interp.reset()
+    check(interp.eval("var t = table_new_i64(); table_push(t, 5); t[0] += 3; t[0]"), "8")
+    interp.reset()
+    check_err(interp.eval("var t = table_new_i64(); table_push(t, 1); t[5] = 9"), "运行时错误: table_at 下标越界：索引 5 超出长度 1")
+
+    // ---- dyn_table_new_push_len：push 1..100 → len 100 ----
+    interp.reset()
+    check(interp.eval("var t: table = table_new_i64()\nvar i: i64 = 1\nwhile i <= 100 { table_push(t, i); i = i + 1; }\nlen(t)"), "100")
+    interp.reset()
+    check(interp.eval("len(table_new_i64())"), "0")
+
+    // ---- dyn_table_at_reads_element：table_at 读取 ----
+    interp.reset()
+    check(interp.eval("var t: table = table_new_i64()\ntable_push(t, 10)\ntable_push(t, 20)\ntable_push(t, 30)\ntable_at(t, 1)"), "20")
+    interp.reset()
+    check(interp.eval("var t: table = table_new_i64()\ntable_push(t, 7)\ntable_push(t, 8)\nt[0]"), "7")
+
+    // ---- dyn_table_at_out_of_bounds_errors：越界读取报错 ----
+    interp.reset()
+    check_err(interp.eval("var t: table = table_new_i64()\ntable_push(t, 1)\ntable_at(t, 5)"), "运行时错误: table_at 下标越界：索引 5 超出长度 1")
+    interp.reset()
+    check_err(interp.eval("table_at(table_new_i64(), -1)"), "运行时错误: table_at 下标越界：索引 -1 超出长度 0")
+
+    // ---- dyn_table_string_build_and_for：字符串表遍历 ----
+    interp.reset()
+    check(interp.eval("var t: table = table_new_string()\ntable_push(t, \"a\")\ntable_push(t, \"b\")\ntable_push(t, \"c\")\nvar out = \"\"\nfor x in t { out = out + x; }\nout"), "abc")
+    interp.reset()
+    check(interp.eval("var t: table = table_new_string()\ntable_push(t, \"hello\")\ntable_push(t, \"world\")\ntable_at(t, 1)"), "world")
+
+    // ---- dyn_table_bool_and_f64：bool/f64 元素 ----
+    interp.reset()
+    check(interp.eval("var t: table = table_new_bool()\ntable_push(t, true)\ntable_push(t, false)\ntable_at(t, 0)"), "true")
+    interp.reset()
+    check(interp.eval("var t: table = table_new_f64()\ntable_push(t, 1.5)\ntable_push(t, 2.5)\nlen(t)"), "2")
+
+    // ---- ref表参数内容修改与重绑定写回调用方：ref table 形参 ----
+    interp.reset()
+    check(interp.eval("func f(x: ref table<i64>) { table_push(x, 99); x[0] = 42; x = table_new_i64(); table_push(x, 7); }"), "已定义 1 个函数")
+    // 内容修改 + 重绑定都写回调用方（真引用）
+    check(interp.eval("var t = table_new_i64(); table_push(t, 1); f(t); table_at(t, 0)"), "7")
+    // 控制组：非 ref 表参数重绑定不写回调用方——t 仍是原表
+    interp.reset()
+    check(interp.eval("func g(x: table<i64>) { table_push(x, 99); x = table_new_i64(); table_push(x, 7); }"), "已定义 1 个函数")
+    check(interp.eval("var t = table_new_i64(); table_push(t, 1); g(t); table_at(t, 0)"), "1")
+
+    if g_fail == 0 {
+        println("interp_table 验收通过：全部比对一致（golden 对齐 Rust interp）")
+    } else {
+        println("interp_table 验收失败：" + to_string(g_fail) + " 项不一致")
+        exit(1)
+    }
+}

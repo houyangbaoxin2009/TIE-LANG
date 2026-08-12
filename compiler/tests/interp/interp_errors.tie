@@ -1,0 +1,87 @@
+// tie:logic
+// tie:opt=2
+
+// 自举 v2 T4.4：interp 行为测试 tie 化——运行时错误文本。
+// 移植自 crates/tie-interp/src/lib.rs tests：eval_errors /
+// eval_break_continue_outside_loop_err / ref表参数不可寻址实参报错 /
+// eval_顶层表全局变量跨函数持久化 / eval_extern调用报错仅编译路径可用 /
+// eval_extern声明注册不影响其他函数。
+
+import "../../interp/interp.tie"
+
+var g_fail: i64 = 0;
+
+func check(actual: string, expected: string) {
+    if actual == expected {
+        println("PASS  [" + expected + "]")
+    } else {
+        println("FAIL  got=[" + actual + "]")
+        println("      want=[" + expected + "]")
+        g_fail = g_fail + 1
+    }
+}
+
+func check_err(actual: string, expected: string) {
+    if actual == expected {
+        println("PASS  err[" + expected + "]")
+    } else {
+        println("FAIL  got-err=[" + actual + "]")
+        println("      want-err=[" + expected + "]")
+        g_fail = g_fail + 1
+    }
+}
+
+func main() {
+    // ---- eval_errors：运行时错误 ----
+    interp.reset()
+    check_err(interp.eval("1 / 0"), "除零错误")
+    interp.reset()
+    check_err(interp.eval("undefined_var"), "变量 'undefined_var' 未声明")
+    interp.reset()
+    check_err(interp.eval("1 + true"), "类型不匹配: 整数 + 布尔")
+
+    // ---- eval_break_continue_outside_loop_err：循环外 break/continue ----
+    interp.reset()
+    check_err(interp.eval("break;"), "break 只能出现在循环体内")
+    interp.reset()
+    check_err(interp.eval("continue;"), "continue 只能出现在循环体内")
+    interp.reset()
+    check_err(interp.eval("while true { break nope; }"), "break nope 只能出现在循环体内")
+
+    // ---- ref表参数不可寻址实参报错 ----
+    interp.reset()
+    check(interp.eval("func g(t: ref table<i64>) {}"), "已定义 1 个函数")
+    check_err(interp.eval("g([1, 2])"), "函数 'g' 的 ref 参数需要可寻址的表变量实参（字面量/下标/调用结果不可取地址）")
+
+    // ---- eval_顶层表全局变量跨函数持久化 ----
+    interp.reset()
+    check(interp.eval("var g: table<i64>;"), "已定义 0 个函数")
+    check(interp.eval("func add(x: i64) { table_push(g, x); }"), "已定义 1 个函数")
+    check(interp.eval("func dump() -> i64 { return len(g); }"), "已定义 1 个函数")
+    check(interp.eval("add(1)"), "")
+    check(interp.eval("add(2)"), "")
+    check(interp.eval("len(g)"), "2")
+    check(interp.eval("g[0]"), "1")
+    check(interp.eval("g[1]"), "2")
+    check(interp.eval("dump()"), "2")
+    check(interp.eval("g[0] = 9"), "")
+    check(interp.eval("g[0]"), "9")
+    check(interp.eval("len(g)"), "2")
+
+    // ---- eval_extern：extern 声明注册 + 调用报错（仅编译路径可用）----
+    interp.reset()
+    check(interp.eval("extern fn foo(a: i64) -> i64;"), "已定义 0 个函数")
+    check_err(interp.eval("foo(1)"), "REPL 不支持调用 extern 函数 'foo'（仅编译路径可用，请用 tie-llvm 编译运行）")
+    // extern 声明不影响其他函数
+    interp.reset()
+    check(interp.eval("extern fn foo(a: i64) -> i64;"), "已定义 0 个函数")
+    check(interp.eval("func f() { return 42; }"), "已定义 1 个函数")
+    check(interp.eval("f()"), "42")
+
+    if g_fail == 0 {
+        println("interp_errors 验收通过：全部比对一致（golden 对齐 Rust interp）")
+    } else {
+        println("interp_errors 验收失败：" + to_string(g_fail) + " 项不一致")
+        exit(1)
+    }
+}

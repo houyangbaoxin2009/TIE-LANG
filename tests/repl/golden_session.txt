@@ -1,0 +1,18 @@
+1 + 2
+var x = 1
+x + 1
+var m = ["a": 1, "b": 2]
+m["a"]
+"a" + "b"
+1 < 2
+3 >= 4
+[1, 2]
+["a": 1]
+["b": 2, "a": 1]
+func add(a: i64, b: i64) -> i64 { return a + b; }
+add(1, 2)
+func fact(n: i64) -> i64 { if n <= 1 { return 1; } return n * fact(n - 1); }
+fact(5)
+1 / 0
+undefined_var
+:quit

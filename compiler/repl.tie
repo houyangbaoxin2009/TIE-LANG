@@ -1,0 +1,52 @@
+// tie:logic
+// compiler/repl.tie —— 自举 v2 T4.3：REPL 入口（tie 自写解释器求值）
+// ============================================================
+// 里程碑：自举 v2 计划 T4.3（.omo/plans/self-hosting-v2.md）——REPL 循环 +
+// 会话 parity 回归。与 repl/repl.tie（Rust eval 桥外壳）**外壳结构逐行对齐**，
+// 唯一差异：求值通道改用 compiler/interp/interp.tie 的 `interp.eval`（T4.1
+// tie 自写解释器），不再经 Rust tie-interp 的 eval C ABI 桥。
+//
+// # 循环协议（与 repl/repl.tie 完全一致，保证字节级 parity）
+//   print("> ") 提示符（不换行；编译路径 print 含 fflush，控制台立即显示）
+//   → read_line 读一行（EOF 时 tie_read_line 内部 exit(0)，管道输入自动收尾）
+//   → ":quit" 退出；空行跳过；其余交 interp.eval(line) 求值
+//   → eval 返回「结果文本或错误文本」（T4.1 约定：错误也以文本返回，
+//      REPL 直接打印，与 Rust 桥 tie_eval_expr 失败返回错误串的契约一致）
+//   → 非空结果 println(result)；空结果补一个 println("")（让下一个提示符
+//      另起一行——print 副作用输出后提示符不挤在同一行）。
+//
+// # 会话持久性（MUST DO 验证项）
+//   T4.1 约定：interp.eval 的 Session（globals + funcs）跨多次 eval 调用保留
+//   ——REPL 输入 `var x = 1` 后下一行 `x + 1` 应得 2。本模块不调用 interp.reset()
+//   （保持持久）；interp_eval.tie 验收已覆盖该场景（"var x = 1"→"" / "x + 1"→"2"）。
+//
+// # 编译方式（独立 repl 入口，不并入 tiec）
+//   cargo build --release -p tie-interp                      # 产出 tie_interp.lib
+//   target/release/tie-llvm.exe compiler/repl.tie -o compiler/repl.exe
+//   链接 tie_interp.lib（read_line / print / println 等底座原语来自 C ABI 桥；
+//   interp.eval 及整个前端/解释器链为编译进本程序的 tie 原生代码）。
+
+import "./interp/interp.tie"
+
+func main() -> i64 {
+    println("tie REPL（输入 :quit 退出）")
+    while true {
+        // 提示符不换行（print 内建；编译路径 print 已含 fflush，控制台立即显示）
+        print("> ")
+        var line = read_line()
+        if line == ":quit" {
+            return 0
+        }
+        // 空行直接跳过；其余交给 tie 自写解释器求值，非空结果打印
+        if line != "" {
+            var result = interp.eval(line)
+            if result != "" {
+                println(result)
+            } else {
+                // eval 无返回值（如纯声明 / print 副作用输出）：补一个换行，
+                // 让下一个提示符另起一行（否则 print 输出后提示符挤在同一行）
+                println("")
+            }
+        }
+    }
+}

@@ -1,0 +1,129 @@
+// tie:logic
+// tie:opt=2
+
+// 自举 v2 T4.4：interp 行为测试 tie 化——算术/比较/变量/位运算/三元/自增自减/复合赋值。
+// 移植自 crates/tie-interp/src/lib.rs tests：eval_arithmetic / eval_compare /
+// eval_vars / eval_bitwise / eval_ternary / eval_inc_dec / eval_compound_assign。
+// 每个用例前 interp.reset()（对齐 Rust 每用例独立 Session 的 ev() 语义）。
+
+import "../../interp/interp.tie"
+
+var g_fail: i64 = 0;
+
+func check(actual: string, expected: string) {
+    if actual == expected {
+        println("PASS  [" + expected + "]")
+    } else {
+        println("FAIL  got=[" + actual + "]")
+        println("      want=[" + expected + "]")
+        g_fail = g_fail + 1
+    }
+}
+
+// 负例：断言 eval 返回的错误文本（完整比对，对齐 Rust）
+func check_err(actual: string, expected: string) {
+    if actual == expected {
+        println("PASS  err[" + expected + "]")
+    } else {
+        println("FAIL  got-err=[" + actual + "]")
+        println("      want-err=[" + expected + "]")
+        g_fail = g_fail + 1
+    }
+}
+
+func main() {
+    // ---- eval_arithmetic：算术 ----
+    interp.reset()
+    check(interp.eval("1 + 2"), "3")
+    interp.reset()
+    check(interp.eval("10 - 3 * 2"), "4")
+    interp.reset()
+    check(interp.eval("7 / 2"), "3")
+    interp.reset()
+    check(interp.eval("7 % 3"), "1")
+
+    // ---- eval_compare：比较 ----
+    interp.reset()
+    check(interp.eval("1 < 2"), "true")
+    interp.reset()
+    check(interp.eval("\"abc\" == \"abc\""), "true")
+    interp.reset()
+    check(interp.eval("3 >= 4"), "false")
+
+    // ---- eval_vars：变量 ----
+    interp.reset()
+    check(interp.eval("var x = 10; x * 2"), "20")
+    interp.reset()
+    check(interp.eval("var x = 1; x = x + 1; x"), "2")
+
+    // ---- eval_bitwise：位运算（负数右移为算术右移）----
+    interp.reset()
+    check(interp.eval("5 & 3"), "1")
+    interp.reset()
+    check(interp.eval("5 | 8"), "13")
+    interp.reset()
+    check(interp.eval("5 ^ 1"), "4")
+    interp.reset()
+    check(interp.eval("8 >> 2"), "2")
+    interp.reset()
+    check(interp.eval("1 << 3"), "8")
+    interp.reset()
+    check(interp.eval("-8 >> 2"), "-2")
+    interp.reset()
+    check_err(interp.eval("1 << 64"), "左移量必须在 0..64 范围内")
+
+    // ---- eval_ternary：三元 ----
+    interp.reset()
+    check(interp.eval("1 > 0 ? 10 : 20"), "10")
+    interp.reset()
+    check(interp.eval("1 < 0 ? 10 : 20"), "20")
+    interp.reset()
+    check(interp.eval("var x: i64 = 5; (x > 0 ? 1 : 0) + 1"), "2")
+
+    // ---- eval_inc_dec：自增自减 ----
+    interp.reset()
+    check(interp.eval("var x = 1; x++; x"), "2")
+    interp.reset()
+    check(interp.eval("var x = 1; ++x; x"), "2")
+    interp.reset()
+    check(interp.eval("var x = 2; x--; x"), "1")
+    interp.reset()
+    check(interp.eval("var x = 2; --x; x"), "1")
+    interp.reset()
+    check(interp.eval("var x = 1; x++ + x"), "3")
+    interp.reset()
+    check(interp.eval("var x = 1; ++x + x"), "4")
+    interp.reset()
+    check(interp.eval("var x = 1.5; x++; x"), "2.5")
+
+    // ---- eval_compound_assign：复合赋值 ----
+    interp.reset()
+    check(interp.eval("var x: i64 = 1; x += 2; x"), "3")
+    interp.reset()
+    check(interp.eval("var x: i64 = 12; x -= 1; x"), "11")
+    interp.reset()
+    check(interp.eval("var x: i64 = 3; x *= 4; x"), "12")
+    interp.reset()
+    check(interp.eval("var x: i64 = 10; x /= 2; x"), "5")
+    interp.reset()
+    check(interp.eval("var x: i64 = 5; x %= 3; x"), "2")
+    interp.reset()
+    check(interp.eval("var x: i64 = 5; x &= 3; x"), "1")
+    interp.reset()
+    check(interp.eval("var x: i64 = 5; x |= 8; x"), "13")
+    interp.reset()
+    check(interp.eval("var x: i64 = 5; x ^= 1; x"), "4")
+    interp.reset()
+    check(interp.eval("var x: i64 = 1; x <<= 3; x"), "8")
+    interp.reset()
+    check(interp.eval("var x: i64 = 8; x >>= 2; x"), "2")
+    interp.reset()
+    check(interp.eval("var s = \"a\"; s += \"b\"; s"), "ab")
+
+    if g_fail == 0 {
+        println("interp_arithmetic 验收通过：全部比对一致（golden 对齐 Rust interp）")
+    } else {
+        println("interp_arithmetic 验收失败：" + to_string(g_fail) + " 项不一致")
+        exit(1)
+    }
+}

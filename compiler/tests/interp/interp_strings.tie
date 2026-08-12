@@ -1,0 +1,96 @@
+// tie:logic
+// tie:opt=2
+
+// 自举 v2 T4.4：interp 行为测试 tie 化——字符串/数字转换/len。
+// 移植自 crates/tie-interp/src/lib.rs tests：eval_string_concat /
+// builtin_str_char_index_and_utf8 / builtin_to_string_numeric /
+// builtin_parse_int_valid_invalid / builtin_parse_float_valid_invalid /
+// builtin_len_table / builtin_str_len。
+
+import "../../interp/interp.tie"
+
+var g_fail: i64 = 0;
+
+func check(actual: string, expected: string) {
+    if actual == expected {
+        println("PASS  [" + expected + "]")
+    } else {
+        println("FAIL  got=[" + actual + "]")
+        println("      want=[" + expected + "]")
+        g_fail = g_fail + 1
+    }
+}
+
+func check_err(actual: string, expected: string) {
+    if actual == expected {
+        println("PASS  err[" + expected + "]")
+    } else {
+        println("FAIL  got-err=[" + actual + "]")
+        println("      want-err=[" + expected + "]")
+        g_fail = g_fail + 1
+    }
+}
+
+func main() {
+    // ---- eval_string_concat：字符串拼接 ----
+    interp.reset()
+    check(interp.eval("\"foo\" + \"bar\""), "foobar")
+
+    // ---- builtin_str_char_index_and_utf8：str_char 码点索引 ----
+    interp.reset()
+    check(interp.eval("str_char(\"hello\", 1)"), "e")
+    check(interp.eval("str_char(\"你好\", 0)"), "你")
+    check(interp.eval("str_char(\"你好\", 1)"), "好")
+    check(interp.eval("str_char(\"a你b\", 1)"), "你")
+    check(interp.eval("str_char(\"hello\", 5)"), "")
+    check(interp.eval("str_char(\"hello\", 99)"), "")
+    check(interp.eval("str_char(\"hello\", -1)"), "")
+
+    // ---- builtin_to_string_numeric：数字 → 字符串 ----
+    interp.reset()
+    check(interp.eval("to_string(42)"), "42")
+    check(interp.eval("to_string(-7)"), "-7")
+    check(interp.eval("to_string(0)"), "0")
+    check(interp.eval("to_string(3.14)"), "3.14")
+    check(interp.eval("to_string(1.0)"), "1")
+    check(interp.eval("to_string(0.5)"), "0.5")
+
+    // ---- builtin_parse_int_valid_invalid：整数解析 ----
+    interp.reset()
+    check(interp.eval("parse_int(\"123\")"), "123")
+    check(interp.eval("parse_int(\"-42\")"), "-42")
+    check(interp.eval("parse_int(\"0\")"), "0")
+    check_err(interp.eval("parse_int(\"abc\")"), "运行时错误: parse_int 参数 'abc' 不是合法的整数")
+    check_err(interp.eval("parse_int(\"12abc\")"), "运行时错误: parse_int 参数 '12abc' 不是合法的整数")
+
+    // ---- builtin_parse_float_valid_invalid：浮点解析 ----
+    interp.reset()
+    check(interp.eval("parse_float(\"3.5\")"), "3.5")
+    check(interp.eval("parse_float(\"-0.25\")"), "-0.25")
+    check(interp.eval("parse_float(\"2\")"), "2")
+    check_err(interp.eval("parse_float(\"abc\")"), "运行时错误: parse_float 参数 'abc' 不是合法的浮点数")
+
+    // ---- builtin_len_table：len 表/字符串 ----
+    interp.reset()
+    check(interp.eval("len([1, 2, 3])"), "3")
+    check(interp.eval("len([])"), "0")
+    check(interp.eval("len([\"a\", \"b\"])"), "2")
+    check(interp.eval("len(\"hello\")"), "5")
+
+    // ---- builtin_str_len：Unicode 码点数 ----
+    interp.reset()
+    check(interp.eval("str_len(\"你好\")"), "2")
+    check(interp.eval("str_len(\"hello\")"), "5")
+    check(interp.eval("str_len(\"你好，世界\")"), "5")
+    check(interp.eval("str_len(\"\")"), "0")
+    check(interp.eval("len(\"你好\")"), "6")
+    check(interp.eval("str_char(\"你好\", str_len(\"你好\") - 1)"), "好")
+    check_err(interp.eval("str_len(42)"), "str_len 只支持字符串")
+
+    if g_fail == 0 {
+        println("interp_strings 验收通过：全部比对一致（golden 对齐 Rust interp）")
+    } else {
+        println("interp_strings 验收失败：" + to_string(g_fail) + " 项不一致")
+        exit(1)
+    }
+}

@@ -39,6 +39,12 @@ opencode.json
 /dist/
 /repl/repl.exe
 
+# 自举 v2 REPL 构建产物（T4.3）：compiler/repl.exe（tie 自写解释器 REPL，
+# 由 scripts/repl-parity.ps1 / tie-llvm 编译 compiler/repl.tie 生成）与 parity
+# 脚本使用的临时 Rust 通道 _rust_repl.exe（repl/repl.tie 编译到 compiler/ 下）
+/compiler/repl.exe
+/compiler/_rust_repl.exe
+
 # 包管理器自举产物（pkg.exe，由 tie-llvm 编译 pkg/main.tie 生成）
 /pkg/pkg.exe
 
