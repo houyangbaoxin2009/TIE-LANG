@@ -169,6 +169,15 @@ tie/
 │   └── tie/           CLI 主入口：角色分派调度器 + REPL（启动 repl.exe）+ Harbor M3 协调统筹
 │                      （config 配置文件 / cache 缓存池 / pipeline 三阶段并行分片编译）
 ├── repl/repl.tie     REPL 外壳（tie 语言自写，自举；编译链接 tie-interp 静态库）
+├── compiler/         自举 v2 编译器（tie 语言自写，T2–T5 阶段产物）：
+│                     - frontend/：词法/语法/语义分析器（T2.4–2.6，自举前端）
+│                     - middle/：tie-IR 列式表 + 类型系统（T2.2–2.3）
+│                     - backend/：irgen（AST→tie-IR）+ llvmgen（tie-IR→.ll）+
+│                       toolchain（opt/clang/llvm-ar 驱动，T2.8/T3.1）
+│                     - interp/：解释器（value/session/interp/env，T4.1–4.2）
+│                     - driver.tie → tiec.exe：完整 CLI 编译器（T3.2）
+│                     - repl.tie → repl.exe：tie 自写解释器 REPL（T4.3）
+│                     - tests/interp/：解释器行为测试套件（T4.4，11 文件 198 断言）
 ├── prep/core.tie     预处理器核心模块（tie 语言自写：头部提取/角色判定/正文重建；Harbor M3 自举，编译期内嵌 tie-prep）
 ├── prep/indent.tie   转换器模块示例（制表符→4 空格；证明扩展性——新增转换器只需写 tie 模块，`tie-prep --module` 挂载）
 ├── prep/rename_tcmsg_to_log.tie  转换器模块实战（tcmsg → log 批量改名，tie 语言自写完成真实重构任务）
@@ -282,3 +291,18 @@ tie/
 | T0.5 map 排序键二分 | map 查找由线性扫描升级为排序键二分（strcmp 字节序），10k 查找 ~2295×；输出按键排序 | `scripts/bench/map-bench.tie` | ✅ 完成 |
 | T0.6 字符串池 intern 库 | `std/intern.tie`：`intern(s)->i64` / `lookup(id)->string` / `interned_len()`，符号比较 O(1) id 化 | `tests/language/intern.tie` | ✅ 完成 |
 | T0.7 extern 函数声明 | 顶层 `extern fn` 声明外部 C 符号（IR `declare`，clang 链接 libc）；`std/process.tie` 进程原语 | `tests/language/extern_decl.tie`（rand/0/3/hello） | ✅ 完成 |
+
+**自举 v2 阶段 1–5 进度（2026-08-12）**：
+
+| 阶段 | 内容 | 状态 |
+| --- | --- | --- |
+| T1.1–T1.5 | 词法/语法原型 + G1 性能闸门 | ✅ 完成 |
+| T2.4–T2.6 | 完整词法/语法/语义分析器（正式版，tie 重写前端） | ✅ 完成（5536151/a9a8d10） |
+| T2.7 | 错误 golden corpus（63 触发 + 语义检查补齐） | ✅ 完成（12b350a） |
+| T2.8 | LLVM IR 文本生成端到端（irgen + llvmgen，opt+clang 编译运行） | ✅ 完成（eb15f93） |
+| T2.9 | tiec 组装（driver-lite）+ 行为等价回归（等价率 100%） | ✅ 完成（e780353） |
+| T3 | tiec 完整编译器：工具链驱动 + CLI + 可复现构建（Brepro） | ✅ 完成（c56c30a） |
+| T4.1–T4.4 | 解释器 tie 化：core（eval/eval_call）+ 环境原语 + REPL parity + 测试移植（198 断言） | ✅ 完成（0830ef7/d3adfc0/53fce7d） |
+| T4.5–T4.6 | tie 运行时静态库（std/runtime.a 替代 Rust interp 链接）+ G3 闸门（0-Rust） | ✅ 完成（747ef1a/db585f2） |
+| T5.1 | tiec 前端全局表修复（自编译成功）+ G4 性能基准（ratio 1.007） | ✅ 完成（dc71e11） |
+| T5 后续 | irgen 最小集扩展（前端已就绪，扩展后 G4 覆盖自动扩全） | 📋 进行中 |

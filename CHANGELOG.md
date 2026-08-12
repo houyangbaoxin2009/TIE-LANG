@@ -1,3 +1,16 @@
+## [自举 v2 T5.1] tiec 前端全局表修复 + G4 性能基准 — 2026-08-12
+
+### tiec 前端语义修复（自举闭环关键）
+- 修复全局表元素类型误判：table<i64> 顶层全局被当 table<string>（gb_telem 解析）
+- 修复全局表 const 误判：顶层 var 被当 const（gb_const 槽位）
+- driver.tie 自编译成功（种子 tiec 编译自身）、repl 编译语义错误消失
+- 回归全绿（interp 套件 11 文件 / driver_test / tiec hello）
+
+### G4 性能基准（scripts/bench.ps1 gate4）
+- --emit-ir 通道、median-of-5、per-file ratio = tiec中位/Rust中位
+- 首轮 ratio 1.007（6/74 可编译，irgen 最小集限制）——可编译子集 tiec 与
+  Rust 几乎同速（验证无 renumber/语义单遍/类型表直查净收益）
+- 67 个不可编译文件缺口清单化（docs/bench/phase5.md + phase5.json）
 # CHANGELOG
 
 tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
@@ -1096,6 +1109,8 @@ switch n {
 - 语义分析（符号表/类型检查）
 - LLVM IR 文本生成 + opt/clang/lld 后端链路
 - 跑通 `println` / 算术 / 变量
+
+
 
 
 
