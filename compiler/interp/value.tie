@@ -1,0 +1,593 @@
+// tie:library
+// compiler/interp/value.tie —— 自举 v2 T4.1：解释器 Value 编码（节点 id + 平行表）与字符串化
+// ============================================================
+// 里程碑：自举 v2 计划 T4.1（.omo/plans/self-hosting-v2.md）——把 Rust 解释器
+// crates/tie-interp/src/lib.rs 的 Value 枚举（3847 行）移植为 tie 语言。
+// tie 无 enum/Option：Value = 节点 id + 平行表（借鉴 std/json.tie 的节点方案
+// 与模块级全局游标模式；T0.4 顶层表全局变量承载跨函数状态）。
+//
+// # 类型码（对齐 Rust Value 变体顺序）
+//   0=Int 1=Float 2=Bool 3=Trit 4=Char 5=Str 6=Range 7=Table 8=Map 9=Void
+//
+// # 节点布局（节点 id 为平行表下标；只增不减——globals 可能跨 eval 持有旧 id）
+//   v_types : 类型码（判别键）
+//   v_ivals : Int 值 / Bool(0/1) / Trit(-1/0/1) / Char 码点 / Range 起点
+//   v_aux   : Range 终点
+//   v_fvals : Float 值
+//   v_svals : Str 文本
+//   v_koff  : Table/Map 子元素段起点（v_kids / v_mkeys+v_mvals 的偏移）
+//   v_kcnt  : Table/Map 子元素个数
+//   v_kids  : Table 元素值 id 扁平表（追加式登记；段区间 [koff, koff+kcnt)）
+//   v_mkeys : Map 键扁平表（**升序**——to_print_string 按键升序输出，G3 REPL
+//             parity 的确定性要求，对齐 Rust T0.2 R1 修复；map_set 维护升序）
+//   v_mvals : Map 值 id 扁平表（与 v_mkeys 平行，同区间）
+//
+// # 错误槽
+//   解释器统一错误槽 g_err 声明于本模块（三个模块共享——import 文本内联后
+//   模块级全局跨模块可见）。可失败函数：置 g_err 并返回哨兵（-1/false/0）；
+//   成功路径调用方负责先清 g_err。eval/eval_call 把 g_err 原样返回（对齐
+//   Rust Err 文本，与 C ABI 桥"返回错误串"约定一致）。
+//
+// # 字符串化（对齐 Rust to_print_string / to_repl_string）
+//   to_print_string：bool → "1"/"0"；表 → "[a, b]"；键值表 → "{k: v, k2: v2}"
+//     （键升序）；Range → "s..e"；Void → ""；其余直接格式化。
+//   to_repl_string：bool → "true"/"false"，其余同 to_print_string。
+//
+// # 字符串原语纪律（规避 Rust tie-llvm 后端字符串缓冲 bug）
+//   str_char 返回值即取即用（立即比较/拼接/char_code），不跨函数持有。
+//
+// # 调用约定
+//   import 后 ivalue.new_int(...) / ivalue.to_print_string(...)。
+//   命名规范：命名空间内函数不加 iv_ 前缀；内部工具私有（非 pub）。
+
+import "../../std/utf.tie"
+
+// ==================== 类型码常量 ====================
+const T_INT: i64 = 0;
+const T_FLOAT: i64 = 1;
+const T_BOOL: i64 = 2;
+const T_TRIT: i64 = 3;
+const T_CHAR: i64 = 4;
+const T_STR: i64 = 5;
+const T_RANGE: i64 = 6;
+const T_TABLE: i64 = 7;
+const T_MAP: i64 = 8;
+const T_VOID: i64 = 9;
+
+// ==================== 值节点池（模块级全局，跨函数共享） ====================
+var v_types: table<i64>;
+var v_ivals: table<i64>;
+var v_aux: table<i64>;
+var v_fvals: table<f64>;
+var v_svals: table<string>;
+var v_koff: table<i64>;
+var v_kcnt: table<i64>;
+var v_kids: table<i64>;
+var v_mkeys: table<i64>;   // Map 键（**字符串池 id**）扁平表——见"键值表操作"节
+var v_mvals: table<i64>;
+// map_set 的参数槽（全局槽模式：绕开混合实参错位 bug；调用方先写后调）
+var g_ms_key: i64 = 0;
+var g_ms_val: i64 = 0;
+// 解释器统一错误槽（session/interp 共享；空串 = 无错误）
+var g_err: string = "";
+
+namespace ivalue {
+
+// 清空值池与错误槽（会话重置；interp.reset 调用）。
+pub func reset() {
+    v_types = table_new_i64()
+    v_ivals = table_new_i64()
+    v_aux = table_new_i64()
+    v_fvals = table_new_f64()
+    v_svals = table_new_string()
+    v_koff = table_new_i64()
+    v_kcnt = table_new_i64()
+    v_kids = table_new_i64()
+    v_mkeys = table_new_string()
+    v_mvals = table_new_i64()
+    g_err = ""
+}
+
+// ==================== 节点构造 ====================
+
+// 建值节点骨架（类型码入 v_types，其余槽位填默认值），返回节点 id。
+func new_node(ty: i64) -> i64 {
+    table_push(v_types, ty)
+    table_push(v_ivals, 0)
+    table_push(v_aux, 0)
+    table_push(v_fvals, 0.0)
+    table_push(v_svals, "")
+    table_push(v_koff, 0)
+    table_push(v_kcnt, 0)
+    return len(v_types) - 1
+}
+
+pub func new_int(v: i64) -> i64 {
+    var n = new_node(T_INT)
+    v_ivals[n] = v
+    return n
+}
+
+pub func new_float(v: f64) -> i64 {
+    var n = new_node(T_FLOAT)
+    v_fvals[n] = v
+    return n
+}
+
+pub func new_bool(b: bool) -> i64 {
+    var n = new_node(T_BOOL)
+    if b {
+        v_ivals[n] = 1
+    } else {
+        v_ivals[n] = 0
+    }
+    return n
+}
+
+pub func new_trit(v: i64) -> i64 {
+    var n = new_node(T_TRIT)
+    v_ivals[n] = v
+    return n
+}
+
+// 字符值：存 Unicode 码点（i64）。
+pub func new_char(cp: i64) -> i64 {
+    var n = new_node(T_CHAR)
+    v_ivals[n] = cp
+    return n
+}
+
+pub func new_str(s: string) -> i64 {
+    var n = new_node(T_STR)
+    v_svals[n] = s
+    return n
+}
+
+pub func new_range(s: i64, e: i64) -> i64 {
+    var n = new_node(T_RANGE)
+    v_ivals[n] = s
+    v_aux[n] = e
+    return n
+}
+
+// 空表值（动态表 table_new_* 与表字面量共用：后续 push 产生新节点）。
+pub func new_table() -> i64 {
+    var n = new_node(T_TABLE)
+    v_koff[n] = len(v_kids)
+    v_kcnt[n] = 0
+    return n
+}
+
+// 空键值表值（["a":1] 字面量构造起点）。
+pub func new_map() -> i64 {
+    var n = new_node(T_MAP)
+    v_koff[n] = len(v_mkeys)
+    v_kcnt[n] = 0
+    return n
+}
+
+pub func new_void() -> i64 {
+    return new_node(T_VOID)
+}
+
+// ==================== 值访问 ====================
+
+// 类型码（T_* 常量）。
+pub func type_of(id: i64) -> i64 {
+    return v_types[id]
+}
+
+// 类型名（错误提示用；对齐 Rust Value::type_name）。
+pub func type_name(id: i64) -> string {
+    var t = v_types[id]
+    if t == T_INT {
+        return "整数"
+    }
+    if t == T_FLOAT {
+        return "浮点数"
+    }
+    if t == T_BOOL {
+        return "布尔"
+    }
+    if t == T_TRIT {
+        return "trit"
+    }
+    if t == T_CHAR {
+        return "字符"
+    }
+    if t == T_STR {
+        return "字符串"
+    }
+    if t == T_RANGE {
+        return "范围"
+    }
+    if t == T_TABLE {
+        return "表"
+    }
+    if t == T_MAP {
+        return "键值表"
+    }
+    return "void"
+}
+
+pub func int_val(id: i64) -> i64 {
+    return v_ivals[id]
+}
+
+pub func float_val(id: i64) -> f64 {
+    return v_fvals[id]
+}
+
+// 字符串值文本（T_STR 节点）。
+pub func str_val(id: i64) -> string {
+    return v_svals[id]
+}
+
+// 真值判断（if/while/三目条件）：只接受布尔，否则报错（对齐 Rust is_truthy）。
+// 失败置 g_err 并返回 false；调用方判 g_err。
+pub func is_truthy(id: i64) -> bool {
+    if v_types[id] != T_BOOL {
+        g_err = "条件必须是布尔，实际是 " + type_name(id)
+        return false
+    }
+    return v_ivals[id] != 0
+}
+
+// ==================== 表 / 键值表操作 ====================
+
+// 表元素个数（Value::Table / Value::Map 的元素数；len 内置用）。
+pub func elem_count(id: i64) -> i64 {
+    return v_kcnt[id]
+}
+
+// 第 i 个元素值 id（表）；越界返回 -1 哨兵。
+pub func elem_at(id: i64, i: i64) -> i64 {
+    if i < 0 {
+        return -1
+    }
+    if i >= v_kcnt[id] {
+        return -1
+    }
+    return v_kids[v_koff[id] + i]
+}
+
+// 表尾部追加元素：返回**新表节点**（原节点视为不可变，对齐 Rust
+// `cells.push(val)` 后重绑定变量——旧节点成为池中废弃值）。
+pub func table_push_val(tid: i64, elem: i64) -> i64 {
+    var n = new_node(T_TABLE)
+    var off = v_koff[tid]
+    var cnt = v_kcnt[tid]
+    v_koff[n] = len(v_kids)
+    var i: i64 = 0
+    while i < cnt {
+        table_push(v_kids, v_kids[off + i])
+        i = i + 1
+    }
+    table_push(v_kids, elem)
+    v_kcnt[n] = cnt + 1
+    return n
+}
+
+// 表第 i 个元素替换为新值：返回**新表节点**（下标赋值 t[i] = v 用；
+// 越界由调用方校验，此处假定 i 合法）。
+pub func table_set_at(tid: i64, i: i64, elem: i64) -> i64 {
+    var n = new_node(T_TABLE)
+    var off = v_koff[tid]
+    var cnt = v_kcnt[tid]
+    v_koff[n] = len(v_kids)
+    var k: i64 = 0
+    while k < cnt {
+        if k == i {
+            table_push(v_kids, elem)
+        } else {
+            table_push(v_kids, v_kids[off + k])
+        }
+        k = k + 1
+    }
+    v_kcnt[n] = cnt
+    return n
+}
+
+// Range 终点（v_aux 槽）。
+pub func range_end(id: i64) -> i64 {
+    return v_aux[id]
+}
+
+// ==================== 键值表（Map）操作 ====================
+// **键存字符串池 id（i64）**：tie 的字符串缓冲在跨函数调用后不可靠
+// （Rust tie-llvm 后端 bug：从表读取的字符串经 table_push 等调用后内容
+// 被破坏——实测 map_set 复制循环/冒泡在大型编译单元中出错），i64 键
+// 比较 O(1) 且无缓冲问题；文本还原经 interner.lookup（返回值经实测
+// 跨调用安全）即取即用。键 id 由调用方 interner.intern 提供。
+
+// Map 键表线性查找（段内）；命中返回段内下标，未命中 -1。
+func map_find(mid: i64, key_id: i64) -> i64 {
+    var off = v_koff[mid]
+    var cnt = v_kcnt[mid]
+    var i: i64 = 0
+    while i < cnt {
+        if v_mkeys[off + i] == key_id {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Map 按键读取：命中返回值 id；未命中置 g_err 并返回 -1
+//（文本对齐 Rust map_get 桥："运行时错误: map_get 键不存在：'k'"）。
+pub func map_get(mid: i64, key_id: i64) -> i64 {
+    var off = v_koff[mid]
+    var i = map_find(mid, key_id)
+    if i < 0 {
+        g_err = "运行时错误: map_get 键不存在：'" + interner.lookup(key_id) + "'"
+        return -1
+    }
+    return v_mvals[off + i]
+}
+
+// Map 按键读取（复合赋值用）：命中返回值 id；未命中返回 Int(0)（不报错，
+// 对齐 Rust `m.get(&key).cloned().unwrap_or(Value::Int(0))`）。
+pub func map_get_opt(mid: i64, key_id: i64) -> i64 {
+    var off = v_koff[mid]
+    var i = map_find(mid, key_id)
+    if i < 0 {
+        return new_int(0)
+    }
+    return v_mvals[off + i]
+}
+
+// Map 写键值：返回**新 map 节点**（键已存在 → 覆盖值；否则按**文本字典序
+// 升序插入**；对齐 Rust HashMap 覆盖语义与 to_print_string 键升序输出）。
+//
+// **tie-llvm 缓冲 bug 规避组合拳**（全部实测确认）：
+//   1. 新节点由**调用方** new_map() 创建后传入（被调方内部 new_node 的
+//      返回值会泄漏写坏调用方刚赋的全局槽/参数——别名分析 bug）；
+//   2. 键/值经**参数**传递（混合 i64+字符串实参嵌套调用会错位，故键走
+//      全局槽 g_ms_key、值走参数——纯 i64 单值参数经实测安全）；
+//   3. 复制循环用**局部表过渡**（读全局表立即 push 会写入错乱值）。
+pub func map_set(n: i64, mid: i64, val: i64) -> i64 {
+    var key_id = g_ms_key
+    var off = v_koff[mid]
+    var cnt = v_kcnt[mid]
+    // 旧段 → 局部表（i64 读取 + push 经实测安全）
+    var tk: table<i64> = table_new_i64()
+    var tv: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < cnt {
+        table_push(tk, v_mkeys[off + i])
+        table_push(tv, v_mvals[off + i])
+        i = i + 1
+    }
+    // 局部表 → 新段（读局部表作实参经实测安全）
+    v_koff[n] = len(v_mkeys)
+    v_kcnt[n] = cnt
+    i = 0
+    var replaced = false
+    while i < cnt {
+        if !replaced && tk[i] == key_id {
+            // 覆盖：值取新值（键已在表中）
+            table_push(v_mkeys, tk[i])
+            table_push(v_mvals, val)
+            replaced = true
+        } else {
+            table_push(v_mkeys, tk[i])
+            table_push(v_mvals, tv[i])
+        }
+        i = i + 1
+    }
+    if !replaced {
+        // 新键：段尾追加后向前冒泡保持升序（两表同步交换）。
+        // 冒泡下限是段起点 off（共享扁平表，多个 map 分段共存）
+        table_push(v_mkeys, key_id)
+        table_push(v_mvals, val)
+        var j = len(v_mkeys) - 1
+        var moving: bool = true
+        while moving {
+            if j <= v_koff[n] {
+                moving = false
+            } else if text_less(j) {
+                var tmpk: i64 = v_mkeys[j]
+                v_mkeys[j] = v_mkeys[j - 1]
+                v_mkeys[j - 1] = tmpk
+                var tmpv: i64 = v_mvals[j]
+                v_mvals[j] = v_mvals[j - 1]
+                v_mvals[j - 1] = tmpv
+                j = j - 1
+            } else {
+                moving = false
+            }
+        }
+        v_kcnt[n] = cnt + 1
+    }
+    return n
+}
+
+// 段内元素文本比较：lookup(keys[j]) < lookup(keys[j-1])（返回值即取即用，
+// 不跨调用持有——经实测 lookup 返回值跨调用安全）。
+func text_less(j: i64) -> bool {
+    return interner.lookup(v_mkeys[j]) < interner.lookup(v_mkeys[j - 1])
+}
+
+// ==================== 字符串化 ====================
+
+// 打印格式（println 输出，与编译路径一致：bool → 0/1；表 → [a, b]；
+// 键值表 → {k: v} 键升序；Void → ""）。对齐 Rust Value::to_print_string。
+pub func to_print_string(id: i64) -> string {
+    var t = v_types[id]
+    if t == T_INT {
+        return to_string(v_ivals[id])
+    }
+    if t == T_FLOAT {
+        return to_string(v_fvals[id])
+    }
+    if t == T_BOOL {
+        if v_ivals[id] != 0 {
+            return "1"
+        }
+        return "0"
+    }
+    if t == T_TRIT {
+        return to_string(v_ivals[id])
+    }
+    if t == T_CHAR {
+        return utf_char_of(v_ivals[id])
+    }
+    if t == T_STR {
+        return v_svals[id]
+    }
+    if t == T_RANGE {
+        return to_string(v_ivals[id]) + ".." + to_string(v_aux[id])
+    }
+    if t == T_TABLE {
+        return table_print(id)
+    }
+    if t == T_MAP {
+        return map_print(id)
+    }
+    return ""
+}
+
+// REPL 结果格式（eval 返回给外壳展示：bool → true/false）。
+// 对齐 Rust Value::to_repl_string。
+pub func to_repl_string(id: i64) -> string {
+    if v_types[id] == T_BOOL {
+        if v_ivals[id] != 0 {
+            return "true"
+        }
+        return "false"
+    }
+    return to_print_string(id)
+}
+
+// 表 → "[a, b]"（元素逐个 to_print_string，", " 连接）。
+func table_print(id: i64) -> string {
+    var off = v_koff[id]
+    var cnt = v_kcnt[id]
+    var out: string = "["
+    var i: i64 = 0
+    while i < cnt {
+        out = out + to_print_string(v_kids[off + i])
+        if i + 1 < cnt {
+            out = out + ", "
+        }
+        i = i + 1
+    }
+    return out + "]"
+}
+
+// 键值表 → "{k: v, k2: v2}"（键升序——构造期已保证）。
+// 键 id → 文本经 interner.lookup（返回值经实测跨调用安全）即取即用；
+// 递归调用（to_print_string）结果即时拼接（json.to_str 同款模式）。
+// 键值表 → "{k: v, k2: v2}"（键升序——构造期已保证）。
+// 键 id → 文本经 interner.lookup 即取即用；值经 to_print_string 递归
+// （json.to_str 同款「调用结果立即拼接」模式）。
+func map_print(id: i64) -> string {
+    var off = v_koff[id]
+    var cnt = v_kcnt[id]
+    var out: string = "{"
+    var i: i64 = 0
+    while i < cnt {
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + interner.lookup(v_mkeys[off + i])
+        out = out + ": "
+        out = out + to_print_string(v_mvals[off + i])
+        i = i + 1
+    }
+    return out + "}"
+}
+
+// ==================== 字面量反转义 ====================
+
+// 字符串字面量 lexeme（**带引号**，自举前端存原文）→ 纯文本：
+// 去首尾引号 + 反转义（\n \t \r \\ \" \' \0；未知转义原样保留反斜杠）。
+// 与 irgen.str_unescape_quoted 的转义集一致（消费方各自实现，本模块不依赖 irgen）。
+pub func unescape_str(raw: string) -> string {
+    var n = str_len(raw)
+    if n >= 2 {
+        if str_char(raw, 0) == "\"" {
+            if str_char(raw, n - 1) == "\"" {
+                raw = slice(raw, 1, n - 1)
+            }
+        }
+    }
+    var out: string = ""
+    var m = str_len(raw)
+    var i: i64 = 0
+    while i < m {
+        var c = str_char(raw, i)
+        if c == "\\" && i + 1 < m {
+            var e = str_char(raw, i + 1)
+            if e == "n" {
+                out = out + "\n"
+                i = i + 2
+            } else if e == "t" {
+                out = out + "\t"
+                i = i + 2
+            } else if e == "r" {
+                out = out + "\r"
+                i = i + 2
+            } else if e == "\\" {
+                out = out + "\\"
+                i = i + 2
+            } else if e == "\"" {
+                out = out + "\""
+                i = i + 2
+            } else if e == "'" {
+                out = out + "'"
+                i = i + 2
+            } else if e == "0" {
+                out = out + "\0"
+                i = i + 2
+            } else {
+                // 未知转义：原样保留反斜杠（对齐 irgen）
+                out = out + c
+                i = i + 1
+            }
+        } else {
+            out = out + c
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// 字符字面量 lexeme（带引号）→ Unicode 码点（i64）。
+// 反转义后取首字符码点；空串返回 -1（对齐 char_code 空串哨兵）。
+pub func unescape_char(raw: string) -> i64 {
+    var s = unescape_str(raw)
+    var n = str_len(s)
+    if n == 0 {
+        return -1
+    }
+    return char_code(str_char(s, 0))
+}
+
+// ==================== 工具 ====================
+
+// 码点 → 单字符字符串（T_CHAR 的 to_print_string 用）。
+// tie 无「码点 → 任意字符」原语：可打印 ASCII（32..126）经 std/utf.to_char
+// 查表还原；其余码点退回 "?" 占位（对齐 json.tie 头注释的 utf 局限）。
+func utf_char_of(cp: i64) -> string {
+    if cp >= 32 {
+        if cp <= 126 {
+            return utf.to_char(cp)
+        }
+    }
+    return "?"
+}
+
+// 子串 s[start, end)（码点级；unescape_str 内部辅助，不依赖 std/string）。
+func slice(s: string, start: i64, end: i64) -> string {
+    var out: string = ""
+    var i: i64 = start
+    while i < end {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+}   // namespace ivalue

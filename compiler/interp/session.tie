@@ -1,0 +1,520 @@
+// tie:library
+// compiler/interp/session.tie —— 自举 v2 T4.1：Session（globals + funcs 注册表
+// + AST 归档池 + 求值环境作用域栈）
+// ============================================================
+// 里程碑：自举 v2 计划 T4.1（.omo/plans/self-hosting-v2.md）——把 Rust 解释器
+// crates/tie-interp/src/lib.rs 的 Session（1636 行）/ Env（1845 行）移植为
+// tie 语言。Session 是 REPL 持久状态：globals（顶层 var，跨 eval 存活）+
+// funcs（顶层/命名空间函数注册表）+ externs（extern 声明名单）。
+//
+// # AST 归档池（本模块最关键的设计决策）
+//   Rust 端 Session 直接持有解析出的 AST（FnDef 克隆进 funcs），节点 id
+//   跨 eval 稳定。tie 端 sstate.load_ast 每次解析都**重建** sstate 9 列表，
+//   旧节点 id 立即失效——若直接注册 sstate 节点 id，第二次 eval 后函数体
+//   指向错误节点。解法：每次解析成功后把 sstate 全表**追加拷贝**进本模块
+//   的归档池（a_* 表，id = 归档基数 + 原 id，子节点引用同步重映射），
+//   函数注册/求值全部读归档池。归档只增不减，注册过的函数节点永不失效。
+//
+// # 环境（Env）：作用域链 + 引用槽 + 命名空间前缀 + 流程槽
+//   tie 的表无法缩容（无 pop/remove 原语），作用域栈用**扁平表 + 段**方案：
+//   env_keys/env_vals 按作用域分段追加（env_soff/scnt 记录每段区间），
+//   pop_scope 不删除条目而把段内条目标记 env_alive=0（墓碑）——查找/赋值
+//   只认存活条目（对齐 Rust 的栈式作用域语义；内存只增，REPL 规模可接受）。
+//   查找顺序：当前函数 ref 槽（by_ref 形参穿透调用方）→ 作用域栈
+//   [env_base..顶部] 逆序 → 顶层 globals（对齐 Rust Env::lookup 1885 行）。
+//
+// # 流程槽（Flow 通道）
+//   tie 无 enum/多返回值：exec_stmt/exec_block 的结果经模块级流程槽传递——
+//   g_flow（0=正常 1=return 2=break 3=continue）+ g_flow_val（return 值 id）
+//   + g_flow_label（break/continue 标签，空串=无）+ g_lastval（最后表达式值）。
+//
+// # 调用约定
+//   import 后 isess.archive_add() / isess.lookup(...) 等；模块级全局
+//   （a_* / g_* / env_* 等）跨模块直接可见（import 文本内联）。
+//   命名规范：命名空间内函数不加 is_ 前缀；内部工具私有（非 pub）。
+
+import "./value.tie"
+
+// ==================== AST 归档池（跨 eval 持久；id = 归档基数 + 原 id） ====================
+var a_tags: table<i64>;
+var a_names: table<i64>;
+var a_vals: table<i64>;
+var a_aux: table<i64>;
+var a_coff: table<i64>;
+var a_cnts: table<i64>;
+var a_kids: table<i64>;
+var a_lines: table<i64>;
+var a_cols: table<i64>;
+var a_n: i64 = 0;      // 归档节点总数（下一批拷贝的 id 基数）
+var a_root: i64 = 0;   // 最近一次归档的根 StmtList 节点 id（reset 置 -1）
+
+// ==================== globals（顶层 var，REPL 持久） ====================
+var g_keys: table<string>;
+var g_vals: table<i64>;
+
+// ==================== funcs（已注册函数：全名 → 归档 FnDef 节点 id） ====================
+var f_keys: table<string>;
+var f_nodes: table<i64>;
+
+// ==================== externs（extern 声明名单；调用报明确错误） ====================
+var e_keys: table<string>;
+
+// ==================== 环境：作用域栈（扁平表 + 段 + 墓碑） ====================
+var env_keys: table<string>;
+var env_vals: table<i64>;
+var env_alive: table<i64>;
+var env_soff: table<i64>;   // 每层作用域段起点（env_keys 偏移）
+var env_scnt: table<i64>;   // 每层作用域条目数
+var env_base: i64 = 0;      // 当前函数作用域起点（跨函数隔离；顶层为 0）
+var env_ns: table<string>;  // 当前执行函数的命名空间前缀段（裸调用补全用）
+
+// ==================== by_ref 引用槽栈（T0.3：形参名 → 调用方变量名） ====================
+var r_keys: table<string>;   // 当前函数各 ref 形参名
+var r_vals: table<string>;   // 对应调用方变量名（lookup/assign 穿透目标）
+var r_soff: table<i64>;      // 每层引用槽段起点（对齐作用域段方案）
+
+// ==================== 流程槽（exec_stmt/exec_block 结果通道） ====================
+var g_flow: i64 = 0;       // 0=正常 1=return 2=break 3=continue
+var g_flow_val: i64 = 0;   // return 携带的值 id（reset 置 -1）
+var g_flow_label: string = "";  // break/continue 标签（空串 = 无标签）
+var g_lastval: i64 = 0;    // 最后一条表达式语句的值 id（-1 = 无；reset 置 -1）
+
+// 流程码常量
+const FL_NORMAL: i64 = 0;
+const FL_RETURN: i64 = 1;
+const FL_BREAK: i64 = 2;
+const FL_CONTINUE: i64 = 3;
+
+namespace isess {
+
+// 会话重置：值池 + 归档池 + globals/funcs/externs + 环境 + 流程槽全清。
+pub func reset() {
+    ivalue.reset()
+    a_tags = table_new_i64()
+    a_names = table_new_i64()
+    a_vals = table_new_i64()
+    a_aux = table_new_i64()
+    a_coff = table_new_i64()
+    a_cnts = table_new_i64()
+    a_kids = table_new_i64()
+    a_lines = table_new_i64()
+    a_cols = table_new_i64()
+    a_n = 0
+    a_root = -1
+    g_keys = table_new_string()
+    g_vals = table_new_i64()
+    f_keys = table_new_string()
+    f_nodes = table_new_i64()
+    e_keys = table_new_string()
+    env_keys = table_new_string()
+    env_vals = table_new_i64()
+    env_alive = table_new_i64()
+    env_soff = table_new_i64()
+    env_scnt = table_new_i64()
+    env_base = 0
+    env_ns = table_new_string()
+    r_keys = table_new_string()
+    r_vals = table_new_string()
+    r_soff = table_new_i64()
+    g_flow = 0
+    g_flow_val = -1
+    g_flow_label = ""
+    g_lastval = -1
+    a_root = -1
+}
+
+// ==================== AST 归档 ====================
+
+// 把 sstate 当前 9 列全表追加拷贝进归档池（id 重映射：新 id = 原 id + 基数；
+// 子节点引用同步偏移；-1 哨兵保持）。返回本批基数（首个新节点 id）。
+// 前提：调用方已 sstate.load_ast 成功。拷贝后 a_root = 本批根 StmtList。
+pub func archive_add() -> i64 {
+    var base = a_n
+    var off = a_n
+    var i: i64 = 0
+    while i < s_n {
+        table_push(a_tags, s_tags[i])
+        table_push(a_names, s_names[i])
+        table_push(a_vals, s_vals[i])
+        table_push(a_aux, s_aux[i])
+        table_push(a_lines, s_lines[i])
+        table_push(a_cols, s_cols[i])
+        table_push(a_coff, len(a_kids))
+        table_push(a_cnts, s_nchild[i])
+        var k: i64 = 0
+        while k < s_nchild[i] {
+            var c = s_children[s_coff[i] + k]
+            if c < 0 {
+                table_push(a_kids, -1)
+            } else {
+                table_push(a_kids, c + off)
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    a_n = a_n + s_n
+    a_root = a_n - 1
+    return base
+}
+
+// 归档节点访问（跨 eval 稳定的节点句柄）。
+pub func ntag(id: i64) -> i64 {
+    return a_tags[id]
+}
+pub func nname(id: i64) -> i64 {
+    return a_names[id]
+}
+pub func nval(id: i64) -> i64 {
+    return a_vals[id]
+}
+pub func naux(id: i64) -> i64 {
+    return a_aux[id]
+}
+pub func nchild(id: i64) -> i64 {
+    return a_cnts[id]
+}
+pub func nchild_at(id: i64, k: i64) -> i64 {
+    if k < 0 {
+        return -1
+    }
+    if k >= a_cnts[id] {
+        return -1
+    }
+    return a_kids[a_coff[id] + k]
+}
+// 节点名字字段 → 文本（-1 无名字 → 空串；interner 与 parser 共享同一池）。
+pub func nname_str(id: i64) -> string {
+    var nid = a_names[id]
+    if nid < 0 {
+        return ""
+    }
+    return interner.lookup(nid)
+}
+
+// 节点辅助整数槽 → 标签文本（For 的 aux=循环标签；-1 无标签 → 空串）。
+// 标签与名字字段同约定：存字符串池 id。
+pub func naux_label(id: i64) -> string {
+    var v = a_aux[id]
+    if v < 0 {
+        return ""
+    }
+    return interner.lookup(v)
+}
+
+// ==================== globals ====================
+
+// globals 线性查找：命中返回下标，未命中 -1。
+func g_find(name: string) -> i64 {
+    var i: i64 = 0
+    while i < len(g_keys) {
+        if g_keys[i] == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 顶层全局声明（顶层 var 初始化后登记；重复声明由调用方校验）。
+pub func g_declare(name: string, vid: i64) {
+    table_push(g_keys, name)
+    table_push(g_vals, vid)
+}
+
+// 顶层全局读取：未命中置 g_err 返回 -1（文本对齐 Rust 变量未声明）。
+pub func g_lookup(name: string) -> i64 {
+    var i = g_find(name)
+    if i < 0 {
+        g_err = "变量 '" + name + "' 未声明"
+        return -1
+    }
+    return g_vals[i]
+}
+
+// 顶层全局写回：未声明置 g_err 返回 -1（对齐 Rust assign 兜底错误）。
+pub func g_assign(name: string, vid: i64) -> i64 {
+    var i = g_find(name)
+    if i < 0 {
+        g_err = "变量 '" + name + "' 未声明"
+        return -1
+    }
+    g_vals[i] = vid
+    return 0
+}
+
+// ==================== funcs / externs ====================
+
+func f_find(name: string) -> i64 {
+    var i: i64 = 0
+    while i < len(f_keys) {
+        if f_keys[i] == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+pub func f_has(name: string) -> bool {
+    return f_find(name) >= 0
+}
+
+// 函数注册（顶层裸名 / 命名空间全名）。
+pub func f_put(name: string, node: i64) {
+    var i = f_find(name)
+    if i >= 0 {
+        f_nodes[i] = node  // 同名重复注册：覆盖（Rust HashMap insert 语义）
+        return
+    }
+    table_push(f_keys, name)
+    table_push(f_nodes, node)
+}
+
+// 按全名取函数节点 id；未注册 -1。
+pub func f_get(name: string) -> i64 {
+    var i = f_find(name)
+    if i < 0 {
+        return -1
+    }
+    return f_nodes[i]
+}
+
+// extern 声明登记（解释路径不可调用，仅记录名字）。
+pub func e_add(name: string) {
+    var i: i64 = 0
+    while i < len(e_keys) {
+        if e_keys[i] == name {
+            return
+        }
+        i = i + 1
+    }
+    table_push(e_keys, name)
+}
+
+pub func e_has(name: string) -> bool {
+    var i: i64 = 0
+    while i < len(e_keys) {
+        if e_keys[i] == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ==================== 作用域栈 ====================
+
+// 压一层空作用域（段起点 = 当前扁平表长度）。
+pub func scope_push() {
+    table_push(env_soff, len(env_keys))
+    table_push(env_scnt, 0)
+}
+
+// 弹一层作用域：段内条目全部标记死亡（墓碑；不缩表）。
+pub func scope_pop() {
+    var n = len(env_soff)
+    if n == 0 {
+        return
+    }
+    var off = env_soff[n - 1]
+    var cnt = env_scnt[n - 1]
+    var i: i64 = 0
+    while i < cnt {
+        env_alive[off + i] = 0
+        i = i + 1
+    }
+    table_push(env_soff, 0)  // 不可缩表：用哨兵占位维持栈长一致性（不再弹用）
+    table_push(env_scnt, 0)
+}
+
+// 当前作用域层下标（栈顶；无作用域返回 -1）。
+pub func scope_top() -> i64 {
+    return len(env_soff) - 1
+}
+
+// 当前作用域声明变量（重复声明由调用方经 var_declared 校验）。
+pub func var_declare(name: string, vid: i64) {
+    table_push(env_keys, name)
+    table_push(env_vals, vid)
+    table_push(env_alive, 1)
+    var top = len(env_soff) - 1
+    env_scnt[top] = env_scnt[top] + 1
+}
+
+// 段内逆序查找存活条目：命中返回扁平表下标，未命中 -1。
+func seg_find_rev(seg: i64, name: string) -> i64 {
+    var off = env_soff[seg]
+    var cnt = env_scnt[seg]
+    var i = cnt - 1
+    while i >= 0 {
+        var idx = off + i
+        if env_alive[idx] != 0 {
+            if env_keys[idx] == name {
+                return idx
+            }
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+// 引用槽段内查找（当前函数 ref 形参名 → 调用方变量名）。
+func ref_find(name: string) -> string {
+    var n = len(r_soff)
+    if n == 0 {
+        return ""
+    }
+    var off = r_soff[n - 1]
+    var i = len(r_keys) - 1
+    while i >= off {
+        if r_keys[i] == name {
+            return r_vals[i]
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+// 变量查找：ref 槽穿透调用方 → 作用域栈 [env_base..顶部] 逆序 → globals。
+// 未命中返回 -1 且**不置错误**（调用方决定错误文本）。
+pub func lookup(name: string) -> i64 {
+    // T0.3 by_ref：引用槽优先——ref 形参从调用方槽取当前值
+    var refname = ref_find(name)
+    if refname != "" {
+        return lookup_caller(refname)
+    }
+    // 函数作用域栈（env_base..顶部）逆序
+    var s = len(env_soff) - 1
+    while s >= env_base {
+        var idx = seg_find_rev(s, name)
+        if idx >= 0 {
+            return env_vals[idx]
+        }
+        s = s - 1
+    }
+    // 顶层 globals
+    var i = g_find(name)
+    if i >= 0 {
+        return g_vals[i]
+    }
+    return -1
+}
+
+// ref 穿透目标查找：调用方变量槽 = 调用方作用域（env_base 之下）逆序 →
+// 顶层 globals（对齐 Rust RefTarget 解析：调用方作用域或 globals）。
+func lookup_caller(name: string) -> i64 {
+    var s = env_base - 1
+    while s >= 0 {
+        var idx = seg_find_rev(s, name)
+        if idx >= 0 {
+            return env_vals[idx]
+        }
+        s = s - 1
+    }
+    var i = g_find(name)
+    if i >= 0 {
+        return g_vals[i]
+    }
+    return -1
+}
+
+// 变量赋值：ref 槽穿透 → 作用域栈 [env_base..顶部] 逆序 → globals。
+// 未声明置 g_err 返回 -1（文本对齐 Rust assign 兜底）。
+pub func assign(name: string, vid: i64) -> i64 {
+    var refname = ref_find(name)
+    if refname != "" {
+        return assign_caller(refname, vid)
+    }
+    var s = len(env_soff) - 1
+    while s >= env_base {
+        var idx = seg_find_rev(s, name)
+        if idx >= 0 {
+            env_vals[idx] = vid
+            return 0
+        }
+        s = s - 1
+    }
+    var i = g_find(name)
+    if i >= 0 {
+        g_vals[i] = vid
+        return 0
+    }
+    g_err = "变量 '" + name + "' 未声明"
+    return -1
+}
+
+func assign_caller(name: string, vid: i64) -> i64 {
+    var s = env_base - 1
+    while s >= 0 {
+        var idx = seg_find_rev(s, name)
+        if idx >= 0 {
+            env_vals[idx] = vid
+            return 0
+        }
+        s = s - 1
+    }
+    var i = g_find(name)
+    if i >= 0 {
+        g_vals[i] = vid
+        return 0
+    }
+    g_err = "变量 '" + name + "' 未声明"
+    return -1
+}
+
+// 变量是否已声明（当前函数 ref 槽 / 作用域栈 / 顶层；VarDecl 重复声明校验用）。
+pub func var_declared(name: string) -> bool {
+    if ref_find(name) != "" {
+        return true
+    }
+    var s = len(env_soff) - 1
+    while s >= env_base {
+        if seg_find_rev(s, name) >= 0 {
+            return true
+        }
+        s = s - 1
+    }
+    return g_find(name) >= 0
+}
+
+// ==================== by_ref 引用槽层 ====================
+
+// 压一层引用槽（进入被调函数时；记录段起点）。
+pub func ref_push() {
+    table_push(r_soff, len(r_keys))
+}
+
+// 登记当前层一个 ref 形参：形参名 → 调用方变量名。
+pub func ref_add(pname: string, cname: string) {
+    table_push(r_keys, pname)
+    table_push(r_vals, cname)
+}
+
+// 弹一层引用槽（标记本层条目死亡；不缩表）。
+pub func ref_pop() {
+    var n = len(r_soff)
+    if n == 0 {
+        return
+    }
+    table_push(r_soff, len(r_keys))  // 不可缩表：哨兵占位
+}
+
+// ==================== 命名空间前缀（裸调用补全） ====================
+
+// 保存当前命名空间前缀（调用用户函数前；返回副本供恢复）。
+pub func ns_save() -> table<string> {
+    var out: table<string> = table_new_string()
+    var i: i64 = 0
+    while i < len(env_ns) {
+        table_push(out, env_ns[i])
+        i = i + 1
+    }
+    return out
+}
+
+pub func ns_restore(t: table<string>) {
+    env_ns = t
+}
+
+}   // namespace isess

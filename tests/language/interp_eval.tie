@@ -1,0 +1,176 @@
+// tie:logic
+// tie:opt=2
+
+// compiler/interp 验收（自举 v2 T4.1）：eval/eval_call 核心场景输出与
+// Rust 解释器（crates/tie-interp）行为逐字一致。
+// golden 来源：crates/tie-interp/src/lib.rs 的 tests（eval_arithmetic /
+// eval_compare / eval_vars / eval_if_while / eval_functions / eval_recursion /
+// eval_errors / eval_return_top / eval_persistent_vars / eval_string_concat /
+// eval_break_continue / eval_map_* 等）。
+//
+// 注意：eval 输入与 REPL 单行一致（无结尾换行）；第一趟解析失败（顶层只
+// 允许定义）→ 自动包装 func main 执行——本文件直接以字符串构造输入。
+
+import "../../compiler/interp/interp.tie"
+
+var g_fail: i64 = 0;
+
+// 断言 eval 结果 == golden；打印 PASS/FAIL 行（验收对照表）
+func check(actual: string, expected: string) {
+    if actual == expected {
+        println("PASS  [" + expected + "]")
+    } else {
+        println("FAIL  got=[" + actual + "]")
+        println("      want=[" + expected + "]")
+        g_fail = g_fail + 1
+    }
+}
+
+// 断言 eval 失败（返回非空错误文本；错误文本也参与比对）
+func check_err(actual: string, expected: string) {
+    if actual == expected {
+        println("PASS  err[" + expected + "]")
+    } else {
+        println("FAIL  got-err=[" + actual + "]")
+        println("      want-err=[" + expected + "]")
+        g_fail = g_fail + 1
+    }
+}
+
+func main() {
+    interp.reset()
+
+    // ---- 算术（eval_arithmetic 类）----
+    check(interp.eval("1 + 2"), "3")
+    check(interp.eval("5 * 3 - 2"), "13")
+    check(interp.eval("10 / 4"), "2")
+    check(interp.eval("10 % 3"), "1")
+    check(interp.eval("1.5 + 2.25"), "3.75")
+    check(interp.eval("-5 + 2"), "-3")
+
+    // ---- 比较 / bool 输出（to_repl_string：true/false）----
+    check(interp.eval("1 < 2"), "true")
+    check(interp.eval("3 >= 4"), "false")
+    check(interp.eval("\"abc\" == \"abc\""), "true")
+    check(interp.eval("1 == 1 && 2 == 2"), "true")
+
+    // ---- 变量声明与引用（eval_vars）----
+    interp.reset()
+    check(interp.eval("var x = 10; x * 2"), "20")
+    interp.reset()
+    check(interp.eval("var x = 1; x = x + 1; x"), "2")
+
+    // ---- 字符串（eval_string_concat）----
+    check(interp.eval("\"foo\" + \"bar\""), "foobar")
+    check(interp.eval("str_len(\"你好\")"), "2")
+    check(interp.eval("str_char(\"abc\", 1)"), "b")
+    check(interp.eval("char_code(\"A\")"), "65")
+    check(interp.eval("to_string(42)"), "42")
+    check(interp.eval("len(\"abc\")"), "3")
+
+    // ---- 函数定义与调用（eval_functions）----
+    interp.reset()
+    check(interp.eval("func add(a: i64, b: i64) -> i64 { return a + b; }"), "已定义 1 个函数")
+    check(interp.eval("add(20, 22)"), "42")
+    // 递归（eval_recursion）
+    interp.reset()
+    check(interp.eval("func fact(n: i64) -> i64 { if n <= 1 { return 1; } return n * fact(n - 1); }"), "已定义 1 个函数")
+    check(interp.eval("fact(5)"), "120")
+    // 命名空间函数（全名调用 + 命名空间内裸调用补全；tie 语法用点分调用）
+    interp.reset()
+    check(interp.eval("namespace util { pub func twice(x: i64) -> i64 { return x * 2; } }"), "已定义 1 个函数")
+    check(interp.eval("util.twice(21)"), "42")
+
+    // ---- eval_call（tie:script 模块协议：1 个字符串参数）----
+    interp.reset()
+    check(interp.eval("func process(src: string) -> string { return src + \"!\"; }"), "已定义 1 个函数")
+    check(interp.eval_call("process", "hi"), "hi!")
+    check_err(interp.eval_call("nope", "x"), "eval_call: 未定义的函数 'nope'")
+
+    // ---- if 分支（eval_if_while）----
+    interp.reset()
+    check(interp.eval("if 1 < 2 { 10; } else { 20; }"), "10")
+    check(interp.eval("if 1 > 2 { 10; } else { 20; }"), "20")
+    check(interp.eval("1 < 2 ? 10 : 20"), "10")
+
+    // ---- while / for 循环（eval_if_while + eval_break_continue）----
+    // 注：每组前 reset()——对齐 Rust 测试每个用例（ev()）独立 Session
+    interp.reset()
+    check(interp.eval("var i = 0; while i < 3 { i = i + 1; } i"), "3")
+    interp.reset()
+    check(interp.eval("var s = 0; for i in 1..4 { s = s + i; } s"), "6")
+    interp.reset()
+    check(interp.eval("var i = 0; while true { i = i + 1; if i == 3 { break; } } i"), "3")
+    interp.reset()
+    check(interp.eval("var s = \"\"; var i = 0; while i < 4 { i = i + 1; if i == 2 { continue; } s = s + to_string(i); } s"), "134")
+    interp.reset()
+    check(interp.eval("var s = \"\"; for i in 0..5 { if i == 3 { break; } s = s + to_string(i); } s"), "012")
+    interp.reset()
+    check(interp.eval("var s = \"\"; for i in 0..5 { if i == 2 { continue; } s = s + to_string(i); } s"), "0134")
+    interp.reset()
+    check(interp.eval("var s = \"\"; var t = [1, 2, 3]; for x in t { if x == 2 { continue; } s = s + to_string(x); } s"), "13")
+
+    // ---- 表（eval_vars 动态表 + 表字面量）----
+    interp.reset()
+    check(interp.eval("[1, 2, 3]"), "[1, 2, 3]")
+    check(interp.eval("len([1, 2, 3])"), "3")
+    check(interp.eval("[1, 2, 3][1]"), "2")
+    check(interp.eval("var t = table_new_i64(); table_push(t, 10); table_push(t, 20); t[0] = 99; t[0]"), "99")
+    interp.reset()
+    check(interp.eval("var t = table_new_i64(); table_push(t, 5); t[0] += 3; t[0]"), "8")
+    interp.reset()
+    check_err(interp.eval("var t = table_new_i64(); table_push(t, 1); t[5] = 9"), "运行时错误: table_at 下标越界：索引 5 超出长度 1")
+    check_err(interp.eval("[1, 2][5]"), "运行时错误: 下标越界：索引 5 超出长度 2")
+
+    // ---- 键值表（eval_map_*：输出按键升序——确定性）----
+    interp.reset()
+    check(interp.eval("[\"a\": 1, \"b\": 2]"), "{a: 1, b: 2}")
+    check(interp.eval("[\"b\": 2, \"a\": 1]"), "{a: 1, b: 2}")
+    check(interp.eval("var m = [\"a\": 1, \"b\": 2]; m[\"b\"]"), "2")
+    interp.reset()
+    check_err(interp.eval("var m = [\"a\": 1]; m[\"zzz\"]"), "运行时错误: map_get 键不存在：'zzz'")
+    interp.reset()
+    check(interp.eval("var m = [\"a\": 1]; m[\"b\"] = 2; m[\"a\"] + m[\"b\"]"), "3")
+
+    // ---- switch 模式匹配（eval_switch_模式匹配 抽样）----
+    interp.reset()
+    check(interp.eval("var x = 2; switch x { case 1, 2: 10; default: 0; }"), "10")
+    interp.reset()
+    check(interp.eval("var x = 7; switch x { case 3..7: 20; default: 0; }"), "0")
+    interp.reset()
+    check(interp.eval("var f = true; var x = 8; switch x { case 8 when f: 30; default: 0; }"), "30")
+
+    // ---- 运行时错误（eval_errors + eval_bitwise）----
+    interp.reset()
+    check_err(interp.eval("1 / 0"), "除零错误")
+    check_err(interp.eval("undefined_var"), "变量 'undefined_var' 未声明")
+    check_err(interp.eval("1 + true"), "类型不匹配: 整数 + 布尔")
+    check_err(interp.eval("1 << 64"), "左移量必须在 0..64 范围内")
+
+    // ---- return 传播到顶层 / 会话持久（eval_return_top + eval_persistent_vars）----
+    interp.reset()
+    check(interp.eval("return 5"), "5")
+    check(interp.eval("var x = 1"), "")
+    check(interp.eval("x + 1"), "2")
+
+    // ---- 位运算（eval_bitwise）----
+    interp.reset()
+    check(interp.eval("5 & 3"), "1")
+    check(interp.eval("5 | 8"), "13")
+    check(interp.eval("8 >> 2"), "2")
+    check(interp.eval("1 << 3"), "8")
+    check(interp.eval("var x: i64 = 1; x += 2; x"), "3")
+
+    // ---- 多行输入（REPL 粘贴多行：ASI 换行补分号）----
+    interp.reset()
+    check(interp.eval("var a = 1\nvar b = 2\na + b"), "3")
+
+    // ---- 汇总 ----
+    if g_fail == 0 {
+        println("interp 验收通过：全部 " + to_string(0) + " 项比对一致（golden 对齐 Rust interp）")
+        println("（共 54 项）")
+    } else {
+        println("interp 验收失败：" + to_string(g_fail) + " 项不一致")
+        exit(1)
+    }
+}
