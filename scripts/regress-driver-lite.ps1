@@ -4,7 +4,7 @@
 #   -Detail   逐文件打印状态行（默认只打印汇总与差异清单）
 #
 # 作用：把一批输入文件分别用两条编译链路编译并运行，对比 stdout：
-#   - 新链路（tie 自写编译器）：compiler\driver-lite.exe <f> -o <tie_exe>
+#   - 新链路（tie 自写编译器）：compiler\tiec.exe <f> -o <tie_exe>
 #   - 基线链路（Rust 种子）   ：target\release\tie-llvm.exe <f> -o <rust_exe>
 # 状态分类：
 #   PASS       两端都能编译+运行，stdout 逐字节一致
@@ -26,7 +26,7 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 $root = Split-Path -Parent $PSScriptRoot
-$driver = Join-Path $root 'compiler\driver-lite.exe'
+$driver = Join-Path $root 'compiler\tiec.exe'
 $rust = Join-Path $root 'target\release\tie-llvm.exe'
 $work = Join-Path $env:TEMP 't29_regress'
 $tieDir = Join-Path $work 'tie'
@@ -177,3 +177,4 @@ if ($Detail) {
 
 # 清理临时产物
 Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+

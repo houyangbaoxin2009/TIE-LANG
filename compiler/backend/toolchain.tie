@@ -1,0 +1,198 @@
+// tie:library
+// toolchain.tie：自举 T3.1 —— 工具链驱动模块（命名空间 tc）
+// ============================================================
+// 对齐 Rust crates/tie-llvm/src/backend.rs：调用 LLVM 工具链
+// （opt / clang / llvm-ar）完成中间优化、链接可执行文件、库编译。
+// 依赖语言底座原语 exec_code / exec_output（C ABI 桥，链接 tie-interp）。
+//
+// 功能：
+//   - 工具发现：PATH → D:\LLVM\bin → C:\Program Files\LLVM\bin →
+//     C:\LLVM\bin（对齐 Rust find_clang / find_llvm_ar）
+//   - 中间优化：opt -O{0|1|2|3} -S in.ll -o out.opt.ll
+//   - 链接可执行：clang in.opt.ll -o out.exe [--target=T] [interp.lib]
+//     （仅 need_interp 时追加 tie_interp.lib 与 Rust std 依赖系统库）
+//   - 库编译：clang -c in.opt.ll -o out.o [--target] + llvm-ar rcs out.a out.o
+// 错误契约：各函数返回退出码（0 成功），失败时 tc_err_msg 携带 stderr 文本；
+// 调用方（driver）按阶段前缀 [中间优化] / [后端] 包装。
+//
+// 命令拼接注意：exec_code 经 system() 调 cmd，**可执行路径不加引号**
+// （cmd 不认 `"C:\path\exe"` 作为命令名）；本环境路径无空格，安全。
+//
+// 调用：import 后 tc.opt(...) / tc.link_exe(...)；命名空间内互调为裸调用。
+// 命名规范：命名空间内函数不加 tc_ 前缀（统一 func 写法，Harbor M2.1.6）。
+
+// 最近一次工具调用的错误消息（stderr 文本；成功时空串）
+var tc_err_msg: string = "";
+
+namespace tc {
+// ---------- 工具发现 ----------
+
+// 按 PATH 拆分查找可执行文件（Windows 分号分隔）；PATH 不含时走固定目录
+// （D:\LLVM\bin → C:\Program Files\LLVM\bin → C:\LLVM\bin）。找不到返回空串。
+// 实现：get_env("PATH") 取环境变量 → 按 ';' 拆分 → 逐目录查 {name}.exe；
+// 再查固定目录（file_exists）。
+func find_tool(name: string) -> string {
+    var path_var = get_env("PATH")
+    var dirs = split_env(path_var)
+    var n: i64 = len(dirs)
+    var i: i64 = 0
+    while i < n {
+        var exe = dirs[i] + "\\" + name + ".exe"
+        if file_exists(exe) {
+            return exe
+        }
+        i = i + 1
+    }
+    // 固定安装目录
+    var fixed = table_new_string()
+    table_push(fixed, "D:\\LLVM\\bin")
+    table_push(fixed, "C:\\Program Files\\LLVM\\bin")
+    table_push(fixed, "C:\\LLVM\\bin")
+    var m: i64 = len(fixed)
+    i = 0
+    while i < m {
+        var exe2 = fixed[i] + "\\" + name + ".exe"
+        if file_exists(exe2) {
+            return exe2
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 找 clang（链接可执行 / 编译目标文件）。找不到返回空串。
+pub func find_clang() -> string {
+    return find_tool("clang")
+}
+
+// 找 llvm-ar（静态库打包）。找不到返回空串。
+pub func find_llvm_ar() -> string {
+    return find_tool("llvm-ar")
+}
+
+// 按 ';' 拆分 PATH 为目录表（忽略空段）。
+func split_env(path_var: string) -> table<string> {
+    var dirs = table_new_string()
+    var n: i64 = str_len(path_var)
+    var cur: string = ""
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(path_var, i)
+        if c == ";" {
+            if str_len(cur) > 0 {
+                table_push(dirs, cur)
+            }
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
+    }
+    if str_len(cur) > 0 {
+        table_push(dirs, cur)
+    }
+    return dirs
+}
+
+// ---------- 工具调用 ----------
+
+// 执行工具命令：先 exec_code 取退出码；失败时 exec_output 捕获 stdout+stderr
+// 到 tc_err_msg。返回退出码（0 成功）。
+func run(cmd: string) -> i64 {
+    var rc = exec_code(cmd)
+    if rc != 0 {
+        tc_err_msg = exec_output(cmd)
+    } else {
+        tc_err_msg = ""
+    }
+    return rc
+}
+
+// 中间优化：opt -O{level} -S in.ll -o out.opt.ll。level 0..3。返回退出码。
+pub func opt(input_ll: string, output_opt: string, level: i64) -> i64 {
+    var tool = find_tool("opt")
+    if str_len(tool) == 0 {
+        tc_err_msg = "未找到 opt，请确认 LLVM 已安装并在 PATH 中"
+        return -1
+    }
+    var optl = "-O2"
+    if level == 0 {
+        optl = "-O0"
+    } else if level == 1 {
+        optl = "-O1"
+    } else if level == 3 {
+        optl = "-O3"
+    }
+    return run(tool + " " + optl + " -S " + input_ll + " -o " + output_opt)
+}
+
+// 链接可执行文件：clang in.opt.ll -o out.exe [--target=T] [interp.lib + 系统库]。
+// need_interp 为 true 时追加 tie_interp.lib（TIE_INTERP_LIB 环境变量 →
+// target\release → target\debug）与 Rust std 依赖系统库。返回退出码。
+pub func link_exe(input_opt: string, output_exe: string, target: string, need_interp: bool) -> i64 {
+    var tool = find_clang()
+    if str_len(tool) == 0 {
+        tc_err_msg = "未找到 clang，请确认 LLVM 已安装并在 PATH 中"
+        return -1
+    }
+    var cmd = tool + " " + input_opt + " -o " + output_exe + " -Wl,/Brepro"
+    if str_len(target) > 0 {
+        cmd = cmd + " --target=" + target
+    }
+    if need_interp {
+        var lib = find_interp_lib()
+        if str_len(lib) == 0 {
+            tc_err_msg = "程序使用了 REPL 内置函数（read_line/eval 等），但未找到 tie-interp 静态库。" +
+                "请先构建 tie-interp（cargo build -p tie-interp --release），或设置环境变量 TIE_INTERP_LIB"
+            return -1
+        }
+        cmd = cmd + " " + lib + " -lws2_32 -luserenv -lntdll -lbcrypt -ladvapi32 -lole32 -lshell32"
+    }
+    return run(cmd)
+}
+
+// 编译 IR 为独立目标文件：clang -c in.opt.ll -o out.o [--target=T]（库编译第一步）。
+pub func compile_object(input_opt: string, output_obj: string, target: string) -> i64 {
+    var tool = find_clang()
+    if str_len(tool) == 0 {
+        tc_err_msg = "未找到 clang，请确认 LLVM 已安装并在 PATH 中"
+        return -1
+    }
+    var cmd = tool + " -c " + input_opt + " -o " + output_obj
+    if str_len(target) > 0 {
+        cmd = cmd + " --target=" + target
+    }
+    return run(cmd)
+}
+
+// 打包静态库：llvm-ar rcs lib.a obj.o（库编译第二步）。返回退出码。
+pub func archive(object: string, lib_path: string) -> i64 {
+    var tool = find_llvm_ar()
+    if str_len(tool) == 0 {
+        tc_err_msg = "未找到 llvm-ar，请确认 LLVM 已安装并在 PATH 中"
+        return -1
+    }
+    return run(tool + " rcs " + lib_path + " " + object)
+}
+
+// 定位 tie-interp 静态库：TIE_INTERP_LIB 环境变量 → target\release →
+// target\debug。找不到返回空串。
+func find_interp_lib() -> string {
+    var env = get_env("TIE_INTERP_LIB")
+    if str_len(env) > 0 && file_exists(env) {
+        return env
+    }
+    var cands = table_new_string()
+    table_push(cands, "target\\release\\tie_interp.lib")
+    table_push(cands, "target\\debug\\tie_interp.lib")
+    var n: i64 = len(cands)
+    var i: i64 = 0
+    while i < n {
+        if file_exists(cands[i]) {
+            return cands[i]
+        }
+        i = i + 1
+    }
+    return ""
+}
+}

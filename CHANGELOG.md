@@ -53,6 +53,34 @@ tie 语言项目的变更记录，按里程碑组织。格式参考 [Keep a Chan
   函数调用被破坏——http.url_encode/url_decode 测试暂缓（自举后端显式池 id 无此问题）。
 - tie 词法不支持 \b \f 与 \xHH 转义：json 的 \b/\f 转义报错、tui 无 ANSI 颜色。
 
+## [自举 v2 T3] tiec 完整编译器（工具链驱动 + CLI + 可复现构建）— 2026-08-12
+
+Phase 3 收尾：driver-lite（T2.9 临时入口）升级为 tiec 完整编译器。
+
+### T3.1 工具链驱动（compiler/backend/toolchain.tie，命名空间 tc）
+- 工具发现：PATH → D:\LLVM\bin → C:\Program Files\LLVM\bin → C:\LLVM\bin
+  （对齐 Rust backend.rs find_clang/find_llvm_ar）
+- opt -O{0..3} -S 中间优化；clang 链接可执行（--target 交叉、tie-interp 按需）；
+  clang -c + llvm-ar rcs 库编译；exec_code/exec_output 退出码 + stderr 捕获
+- 命令拼接注意：exec_code 经 system() 调 cmd，可执行路径不加引号（cmd 不认
+  "C:\path\exe" 作命令名——踩坑修复）
+
+### T3.2 完整 CLI（compiler/driver.tie → compiler/tiec.exe）
+- 参数：-o/-O0..3/--target/--emit-ir/--keep-ir/--prep-only/--config/--help；
+  参数错误退出码 2；--prep-only 只打印识别结果
+- 角色识别：头部扫描（// tie:xxx），logic/library → 编译工具链，
+  data/ui/db → 提示对应工具链未实现（对齐 Rust driver.rs 消息）
+- opt/target 优先级：CLI 显式 > 头部 // tie:opt=/// tie:target= > 默认 O2/无
+- 消息格式对齐 Rust：编译成功/库编译成功/已生成 LLVM IR/读取源码失败/语法/语义/
+  [中间优化]/[后端]
+- 验收：tiec.exe hello 全链路 PASS、--emit-ir、--prep-only、--help、
+  参数错误 exit 2、library 编译 .a、--keep-ir 保留中间文件 全部正确
+
+### T3.3 可复现构建
+- clang 链接加 -Wl,/Brepro（lld-link 去时间戳）——同一源码两次构建 .exe
+  MD5 一致（验证通过）
+- 行为等价回归（regress-driver-lite.ps1 改用 tiec）：72 文件，
+  可编译文件等价率 100%（1/1 >= 90% 达标）
 ## [自举准备] 表能力加强（E0 + E1 + E3）— 2026-08-10
 
 自举障碍清零批：修复表变量传参缺陷（E0）、打通嵌套表 `table<table<T>>`（E1）、
@@ -1026,3 +1054,4 @@ switch n {
 - 语义分析（符号表/类型检查）
 - LLVM IR 文本生成 + opt/clang/lld 后端链路
 - 跑通 `println` / 算术 / 变量
+
