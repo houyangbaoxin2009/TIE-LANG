@@ -547,9 +547,7 @@ pub func collect_global_var(v: i64) -> i64 {
         } else {
             elem = types.named(TK_STR)
         }
-        sstate.sorted_insert(gb_keys, gb_vals, nid, ty)
-        table_push(gb_const, is_const)
-        table_push(gb_telem, elem)
+        sstate.sorted_insert_gb(gb_keys, gb_vals, gb_const, gb_telem, nid, ty, is_const, elem)
         return 0
     }
     // 标量全局：字面量初始化 + 类型匹配
@@ -565,9 +563,7 @@ pub func collect_global_var(v: i64) -> i64 {
             return -1
         }
     }
-    sstate.sorted_insert(gb_keys, gb_vals, nid, ty)
-    table_push(gb_const, is_const)
-    table_push(gb_telem, -1)
+    sstate.sorted_insert_gb(gb_keys, gb_vals, gb_const, gb_telem, nid, ty, is_const, -1)
     return 0
 }
 

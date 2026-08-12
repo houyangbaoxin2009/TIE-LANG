@@ -709,11 +709,28 @@ pub func check_var_decl(s: i64) -> i64 {
             // 调用/方法调用返回的裸表：查返回表元素类型
             if s_tags[init] == S_N_CALL {
                 var fnm2 = sstate.name_str(init)
-                var te2 = sinfer.table_ret_elem(sinfer.resolve_call_name(fnm2))
-                if te2 >= 0 {
-                    telem2 = te2
+                // table_new_*：元素类型由调用名决定（对齐 Rust dynamic_table_elem_ty
+                // 3844 行 table_new_elem_ty——Rust 侧 table_new_* 表达式类型是裸 table，
+                // 元素类型在 VarDecl 处按调用名解析登记）
+                var te4: i64 = -1
+                if fnm2 == "table_new_i64" {
+                    te4 = types.named(TK_I64)
+                } else if fnm2 == "table_new_f64" {
+                    te4 = types.named(TK_F64)
+                } else if fnm2 == "table_new_string" {
+                    te4 = types.named(TK_STR)
+                } else if fnm2 == "table_new_bool" {
+                    te4 = types.named(TK_BOOL)
+                }
+                if te4 >= 0 {
+                    telem2 = te4
                 } else {
-                    telem2 = types.named(TK_I64)
+                    var te2 = sinfer.table_ret_elem(sinfer.resolve_call_name(fnm2))
+                    if te2 >= 0 {
+                        telem2 = te2
+                    } else {
+                        telem2 = types.named(TK_I64)
+                    }
                 }
             } else if s_tags[init] == S_N_METHOD_CALL {
                 // 方法调用返回表：recv::mname 查返回表元素（如 str.split → str::split）

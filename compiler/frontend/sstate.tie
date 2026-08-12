@@ -568,6 +568,44 @@ pub func sorted_insert(keys: table<i64>, vals: table<i64>, k: i64, v: i64) -> i6
     return pos
 }
 
+// 全局变量四列有序插入（返回插入位置）：keys/vals/cons/telems 并行同步移位。
+// 全局变量收集顺序与 intern id 顺序不一致（import 文件全局先收集、主文件
+// 全局后收集但 nid 更小），故 sorted_insert 可能中间插入——若 const/telem
+// 仅 table_push 末尾追加会与 keys/vals 错位（读错行的 const/元素类型）。
+// 参照 sinfer.lv_add 的五列同步移位模式，四列同位置插入。
+pub func sorted_insert_gb(keys: table<i64>, vals: table<i64>, cons: table<i64>, telems: table<i64>, k: i64, v: i64, c: i64, e: i64) -> i64 {
+    var n = len(keys)
+    var lo: i64 = 0
+    var hi: i64 = n - 1
+    var pos: i64 = n
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if keys[mid] < k {
+            lo = mid + 1
+        } else {
+            pos = mid
+            hi = mid - 1
+        }
+    }
+    table_push(keys, 0)
+    table_push(vals, 0)
+    table_push(cons, 0)
+    table_push(telems, 0)
+    var i: i64 = n
+    while i > pos {
+        keys[i] = keys[i - 1]
+        vals[i] = vals[i - 1]
+        cons[i] = cons[i - 1]
+        telems[i] = telems[i - 1]
+        i = i - 1
+    }
+    keys[pos] = k
+    vals[pos] = v
+    cons[pos] = c
+    telems[pos] = e
+    return pos
+}
+
 // 函数签名登记（重复定义检查，返回签名 id 或 -1）
 pub func reg_fn(full_name: string, is_pub: i64, nparams: i64, required: i64, ret_ty: i64, p_tys: table<i64>, p_refs: table<i64>, p_defs: table<i64>) -> i64 {
     var nid = intern.intern(full_name)

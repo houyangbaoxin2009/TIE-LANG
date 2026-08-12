@@ -77,17 +77,12 @@ pub func builtin_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 
             sm_err_msg = fn_name + "() 期望 0 个参数，实际 " + to_string(nargs) + " 个"
             return -2
         }
-        // 元素化动态表：table_new_i64 -> table<i64>（for 迭代取元素类型用）
-        if fn_name == "table_new_i64" {
-            return types.table_of(types.named(TK_I64))
-        }
-        if fn_name == "table_new_f64" {
-            return types.table_of(types.named(TK_F64))
-        }
-        if fn_name == "table_new_bool" {
-            return types.table_of(types.named(TK_BOOL))
-        }
-        return types.table_of(types.named(TK_STR))
+        // 裸 table 返回（对齐 Rust 1947 行）：table_new_* 创建的空动态表，元素类型
+        // 由调用名决定（VarDecl 分支 table_new_* 名字映射登记元素类型）。返回裸
+        // table 而非 table<T>——赋值给标注 table<T> 变量时（如 `t = table_new_string()`
+        // 且 t: table<i64>）Rust 侧 types_compatible(Table(x), Named(Table)) 放行，
+        // 元素化返回会因元素类型严格比较而误报（见 T5 语义缺口修复记录）。
+        return types.named(TK_TABLE)
     }
     if fn_name == "table_push" {
         if nargs != 2 {
