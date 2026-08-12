@@ -1,0 +1,348 @@
+// tie:logic
+// compiler/driver-lite.tie —— 自举 v2 T2.9：临时编译器入口（tiec 雏形）
+// ============================================================
+// 里程碑：自举 v2 计划 T2.9（.omo/plans/self-hosting-v2.md）——把 T2.6/T2.8
+// 既有链路组装成可用的命令行编译器（只组装消费，不改 backend/frontend）：
+//   读文件 → 前端（parser.parse_src + semantic.check_impl，含 import 展开）
+//   → 中端（irgen.gen_src，tie-IR）→ 后端（llvmgen.emit → opt -O2 → clang）
+//   → 可执行文件。
+//
+// 用法：
+//   driver-lite <input.tie> [--check] [--emit-ir] [-o <path>]
+//     --check      只做前端检查（词法+语法+语义）；成功静默退出 0，失败退出 1
+//     --emit-ir    只生成 .ll（默认 <input>.ll；-o 指定则写 <path>），不继续编译
+//     -o <path>    指定产物路径（--emit-ir 时 = .ll 路径；默认链路时 = .exe 路径）
+//   默认（无标志）：完整链路编译出可执行文件（<input>.exe，-o 指定则写 <path>）
+//
+// 退出码：0=成功 / 1=编译失败 / 2=参数错误（对齐 Rust tie-llvm 约定）
+//
+// 错误契约：
+//   读取源码失败: <path>            —— 文件读取失败（前缀与 Rust driver 一致）
+//   <语法|语义>错误 @行:列: 消息     —— 词法/语法/语义错误（Rust 对齐格式，
+//                                    复用 ERR:<line> <col> <msg> 协议 + sm_err_msg）
+//   不支持: <消息>                  —— irgen 最小集之外的语句（尚未支持）
+//   文件操作失败: ...                —— 写 .ll / 建目录失败
+//   [中间优化] / [后端] ...          —— opt / clang 调用失败
+//
+// 依赖：只 import "./backend/irgen.tie"。链式可达：irgen → semantic → parser
+//   → lexer（前端树）；irgen → llvmgen → ir（中后端树）。parser/semantic/
+//   irgen/llvmgen 全部经 import 树传递可见（与 proto/main.tie 同款用法）。
+//   base_dir = 输入文件所在目录（'/' 与 '\\' 都识别，统一正斜杠），import 展开用。
+//
+// 说明：本文件是 T2.9 临时入口，T3.x 将由正式 compiler/driver.tie 取代。
+
+import "./backend/irgen.tie"
+
+// ==================== 字符串工具（语言底座原语实现，不依赖 std） ====================
+
+// 子串：按码点截取 s[from, from+cnt)（越界自动截断）
+func d_slice(s: string, from: i64, cnt: i64) -> string {
+    var out = ""
+    var i: i64 = from
+    var n = str_len(s)
+    while i < from + cnt && i < n {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+// 是否以指定前缀开头
+func d_has_prefix(s: string, p: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(p)
+    if n < m {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(p, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 是否以 "ERR:" 开头（parse_src / check_impl 统一错误协议）
+func d_has_err(s: string) -> bool {
+    return d_has_prefix(s, "ERR:")
+}
+
+// 找第一个指定字符下标（-1 = 无）
+func d_find_char(s: string, c: string) -> i64 {
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == c {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 错误协议 → Rust 格式：<cat> @<line>:<col>: <message>
+// 输入 e = "ERR:<line> <col> <message>"；cat = "语法错误" / "语义错误"
+func d_fmt_error(e: string, cat: string) -> string {
+    var body = d_slice(e, 4, str_len(e) - 4)  // 去 "ERR:" 前缀
+    var sp1 = d_find_char(body, " ")
+    var line = ""
+    var rest = ""
+    if sp1 >= 0 {
+        line = d_slice(body, 0, sp1)
+        rest = d_slice(body, sp1 + 1, str_len(body) - sp1 - 1)
+    } else {
+        line = body
+    }
+    var sp2 = d_find_char(rest, " ")
+    var col = ""
+    var msg = ""
+    if sp2 >= 0 {
+        col = d_slice(rest, 0, sp2)
+        msg = d_slice(rest, sp2 + 1, str_len(rest) - sp2 - 1)
+    } else {
+        col = rest
+    }
+    return cat + " @" + line + ":" + col + ": " + msg
+}
+
+// 反斜杠 → 正斜杠（import 展开约定用 '/' 拼接路径；Windows 文件读取两者皆可）
+func d_norm_sep(p: string) -> string {
+    var n = str_len(p)
+    var out = ""
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(p, i)
+        if c == "\\" {
+            out = out + "/"
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 输入文件路径 → 所在目录（含尾部分隔符；'/' 与 '\\' 都识别，结果统一正斜杠）
+func d_path_dir(path: string) -> string {
+    var n = str_len(path)
+    var last: i64 = -1
+    var i: i64 = n - 1
+    while i >= 0 {
+        var c = str_char(path, i)
+        if c == "/" || c == "\\" {
+            last = i
+            break
+        }
+        i = i - 1
+    }
+    if last < 0 {
+        return ""
+    }
+    return d_norm_sep(d_slice(path, 0, last + 1))
+}
+
+// 路径扩展名替换：如 "a\\b.ll" + "exe" → "a\\b.exe"；无扩展名 → 追加
+func d_replace_ext(path: string, ext: string) -> string {
+    var n = str_len(path)
+    var last_sep: i64 = -1
+    var i: i64 = n - 1
+    while i >= 0 {
+        var c = str_char(path, i)
+        if c == "/" || c == "\\" {
+            last_sep = i
+            break
+        }
+        i = i - 1
+    }
+    var dot: i64 = -1
+    i = n - 1
+    while i > last_sep {
+        if str_char(path, i) == "." {
+            dot = i
+            break
+        }
+        i = i - 1
+    }
+    if dot < 0 {
+        return path + "." + ext
+    }
+    return d_slice(path, 0, dot) + "." + ext
+}
+
+// ==================== 命令行参数 ====================
+
+var g_input: string = ""   // 输入文件路径
+var g_out: string = ""     // -o 产物路径（.ll / .exe）
+var g_check: i64 = 0       // --check 标志
+var g_emit: i64 = 0        // --emit-ir 标志
+
+// 逐个参数扫描：第一个位置参数 = 输入文件；其余须为已知标志。
+// 返回 0 = 成功 / -1 = 参数错误（调用方打印用法并退出 2）
+func d_parse_args() -> i64 {
+    var n = arg_count()
+    var i: i64 = 0
+    while i < n {
+        var a = arg_string(i)
+        if a == "--check" {
+            g_check = 1
+        } else if a == "--emit-ir" {
+            g_emit = 1
+        } else if a == "-o" {
+            i = i + 1
+            if i >= n {
+                print_err("错误: -o 后缺少输出路径")
+                return -1
+            }
+            g_out = arg_string(i)
+        } else {
+            // 以 '-' 开头 = 未知选项（对齐 Rust「错误: 未知选项」→ 退出 2）
+            if a != "" {
+                if str_char(a, 0) == "-" {
+                    print_err("错误: 未知选项: " + a)
+                    return -1
+                }
+            }
+            // 位置参数：第一个 = 输入文件，第二个起为多余参数
+            if g_input == "" {
+                g_input = a
+            } else {
+                print_err("错误: 多余的位置参数: " + a)
+                return -1
+            }
+        }
+        i = i + 1
+    }
+    if g_input == "" {
+        print_err("错误: 缺少输入文件")
+        return -1
+    }
+    return 0
+}
+
+// 打印用法（参数错误时输出到 stderr）
+func d_print_usage() {
+    print_err("用法: driver-lite <input.tie> [--check] [--emit-ir] [-o <path>]")
+    print_err("  --check      只做前端检查（词法+语法+语义）；成功静默，失败退出 1")
+    print_err("  --emit-ir    只生成 .ll（默认 <input>.ll，-o 指定写 <path>）")
+    print_err("  -o <path>    指定产物路径（--emit-ir=.ll；默认链路=.exe）")
+    print_err("退出码: 0=成功 / 1=编译失败 / 2=参数错误")
+}
+
+// ==================== 完整链路（opt + clang） ====================
+// 写 .ll → opt -O2 → clang 链接 → 删除中间文件 → 0 成功 / -1 失败
+func d_full_chain(ll: string, exe_path: string) -> i64 {
+    var ll_path = d_replace_ext(exe_path, "ll")
+    var opt_path = d_replace_ext(exe_path, "opt.ll")
+    // 工具链 stderr 侧车文件（opt/clang 的成功告警不外泄；失败时读回打印）
+    var err_path = d_replace_ext(exe_path, "err.txt")
+    // 产物目录（可执行文件所在目录）确保存在
+    var exe_dir = d_path_dir(exe_path)
+    if exe_dir != "" && !mkdir_all(exe_dir) {
+        print_err("文件操作失败: 创建目录 " + exe_dir)
+        return -1
+    }
+    if !file_write(ll_path, ll) {
+        print_err("文件操作失败: 写 " + ll_path)
+        return -1
+    }
+    var rc_opt = exec_code("D:\\LLVM\\bin\\opt.exe -O2 -S " + ll_path + " -o " + opt_path + " 2> " + err_path)
+    if rc_opt != 0 {
+        print_err("[中间优化] opt -O2 失败 rc=" + to_string(rc_opt))
+        print_err("  命令: D:\\LLVM\\bin\\opt.exe -O2 -S " + ll_path + " -o " + opt_path)
+        print_err("  stderr: " + file_read(err_path))
+        file_delete(err_path)
+        return -1
+    }
+    var rc_clang = exec_code("D:\\LLVM\\bin\\clang.exe " + opt_path + " -o " + exe_path + " 2> " + err_path)
+    if rc_clang != 0 {
+        print_err("[后端] clang 链接失败 rc=" + to_string(rc_clang))
+        print_err("  命令: D:\\LLVM\\bin\\clang.exe " + opt_path + " -o " + exe_path)
+        print_err("  stderr: " + file_read(err_path))
+        file_delete(err_path)
+        return -1
+    }
+    // 清理中间文件（.ll / .opt.ll / err.txt），只留可执行文件
+    file_delete(ll_path)
+    file_delete(opt_path)
+    file_delete(err_path)
+    return 0
+}
+
+// ==================== 主入口 ====================
+func main() -> i64 {
+    var r = d_parse_args()
+    if r != 0 {
+        d_print_usage()
+        return 2
+    }
+    var base_dir = d_path_dir(g_input)
+
+    // 1) 读源码（对齐 Rust 前缀契约）
+    if !file_exists(g_input) {
+        print_err("读取源码失败: " + g_input)
+        return 1
+    }
+    var src = file_read(g_input)
+
+    // 2) 前端：词法 + 语法（parse_src 内部完成，出错返回 ERR 协议）
+    var ast = parser.parse_src(src)
+    if d_has_err(ast) {
+        print_err(d_fmt_error(ast, "语法错误"))
+        return 1
+    }
+
+    // 3) 前端：语义（含 import 展开）
+    var sem = semantic.check_impl(ast, base_dir)
+    if d_has_err(sem) {
+        print_err(d_fmt_error(sem, "语义错误"))
+        return 1
+    }
+    if g_check == 1 {
+        return 0  // --check：前端通过，静默退出 0
+    }
+
+    // 4) 中端：AST → tie-IR（irgen 最小集；不支持的语句返回 -1）
+    //    此处 check_src 已通过，返回 -1 即 irgen 最小集之外的语句
+    var rc = irgen.gen_src(src, base_dir)
+    if rc != 0 {
+        var why = sm_err_msg
+        if why == "" {
+            why = "irgen 最小集之外的语句（尚未支持）"
+        }
+        print_err("不支持: " + why)
+        return 1
+    }
+
+    // 5) 后端：tie-IR → .ll 文本
+    var ll = llvmgen.emit()
+
+    // 6a) --emit-ir：只写 .ll，不继续编译
+    if g_emit == 1 {
+        var ll_out = g_input
+        if g_out != "" {
+            ll_out = g_out
+        }
+        ll_out = d_replace_ext(ll_out, "ll")
+        if !file_write(ll_out, ll) {
+            print_err("文件操作失败: 写 " + ll_out)
+            return 1
+        }
+        println("已生成 LLVM IR: " + ll_out)
+        return 0
+    }
+
+    // 6b) 默认：完整链路 → 可执行文件
+    var exe_path = g_input
+    if g_out != "" {
+        exe_path = g_out
+    }
+    exe_path = d_replace_ext(exe_path, "exe")
+    var rr = d_full_chain(ll, exe_path)
+    if rr != 0 {
+        return 1
+    }
+    println("编译成功: " + exe_path)
+    return 0
+}
