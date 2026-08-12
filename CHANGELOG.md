@@ -105,6 +105,24 @@ T4 阶段：Rust tie-interp 逐步替换为 tie 自写解释器（0-Rust 关键�
 - **已知 Rust 后端缺陷（记录）**：exit 的底座调用生成 unreachable → tie-llvm
   renumber_ir 在 if 链尾编号断链（"instruction expected to be numbered %44"）——
   已通过 exit 移出 if 链绕过；自举后端单调编号无此问题
+## [自举 v2 T4.5/4.6] tie 运行时静态库 + G3 闸门（0-Rust）— 2026-08-12
+
+### T4.5 tie runtime staticlib（747ef1a）
+- std/runtime.tie → std/runtime.a：T0.7 extern fn 声明 libc（system/getenv/time）
+  实现 tie_exec_code/tie_get_env/tie_time_now 桥符号；顶层裸函数不 mangle 与
+  语言底座 declare 字节级匹配
+- irgen gen_tie_call（extern_call 指令 + g_used_runtime）、llvmgen collect_externs/
+  extern_decl、driver/toolchain need_interp 优先链接 std/runtime.a（回退 tie_interp.lib）
+- 验收：**移走 tie_interp.lib 后 tiec 仍编译运行** exec_code/time_now/get_env 程序
+- 限制：ptr 桥（file_read/str_char/rand_range/arg_*）无法 tie 化（tie 无指针类型）
+
+### T4.6 G3 闸门（0-Rust 验证）
+- scripts/zero-rust-check.ps1 + docs/bench/zero-rust.md：**G3 PASS**
+  7 项矩阵全绿（tiec 编译 hello/运行时程序、运行时栈 Rust-free、runtime.a 允许集、
+  REPL parity 空 diff、interp 套件全 PASS）
+- 种子界限：tiec 由 Rust 种子编译（唯一接触点），其后一切 0-Rust
+- 修复 tiec 缺陷：llvmgen ret 类型硬编码（显式 return 值类型）、irgen main 补 ret
+  （TK_I32 显式类型）
 ## [自举准备] 表能力加强（E0 + E1 + E3）— 2026-08-10
 
 自举障碍清零批：修复表变量传参缺陷（E0）、打通嵌套表 `table<table<T>>`（E1）、
@@ -1078,5 +1096,6 @@ switch n {
 - 语义分析（符号表/类型检查）
 - LLVM IR 文本生成 + opt/clang/lld 后端链路
 - 跑通 `println` / 算术 / 变量
+
 
 

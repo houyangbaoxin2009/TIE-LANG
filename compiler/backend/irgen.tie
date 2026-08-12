@@ -659,8 +659,10 @@ func gen_fn_def(fn_node: i64) -> i64 {
         }
         if !has_ret {
             if name == "main" {
-                var ret = ir.new_inst(g_cur_block, 32, -1)  // ret
-                ir.add_operand(ret, 0, 2)  // 立即数 0（i32）
+                // main 补 ret i32 0：ty 必须显式 i32（llvmgen 按 ins_ty 输出 ret 类型，
+                // ty=-1 会生成 ret ptr 0 / ret void 与 define i32 @main 不匹配）
+                var ret = ir.new_inst(g_cur_block, 32, types.named(TK_I32))  // ret i32
+                ir.add_operand(ret, 0, 2)  // 立即数 0
             } else {
                 var ret = ir.new_inst(g_cur_block, 32, -1)  // ret void
             }

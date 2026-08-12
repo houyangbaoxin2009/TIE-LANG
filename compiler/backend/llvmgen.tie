@@ -365,12 +365,14 @@ func gen_inst(inst_id: i64) {
         return
     }
     if op == 32 {
-        // ret：无操作数 → ret void；有 → ret T %N
+        // ret：无操作数 → ret void；有 → ret T %N（类型按指令 ins_ty——
+        // 显式 return 的表达式是 i64 常量/变量，硬编码 ret i32 会类型不匹配）
         if cnt == 0 {
             line("ret void")
         } else {
             var v0 = ir.ins_opnd(inst_id, 0)
-            line("ret i32 " + opnd_ref(inst_id, 0))
+            var rty = llvm_ty(ir.ins_ty(inst_id))
+            line("ret " + rty + " " + opnd_ref(inst_id, 0))
         }
         return
     }
