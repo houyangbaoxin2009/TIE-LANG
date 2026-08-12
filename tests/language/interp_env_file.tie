@@ -1,0 +1,71 @@
+// tie:logic
+// tie:opt=2
+
+// compiler/interp/env.tie 验收（T4.2 第一部分）：文件/字符串/数学/环境/时间桥。
+import "../../compiler/interp/env.tie"
+
+var g_fail: i64 = 0
+var g_n: i64 = 0
+
+func check(cond: bool, name: string) {
+    g_n = g_n + 1
+    if !cond {
+        g_fail = g_fail + 1
+        println("[FAIL] " + name)
+    } else {
+        println("PASS  [" + name + "]")
+    }
+}
+
+func main() -> i64 {
+    var args = table_new_i64()
+    var vid: i64 = 0
+
+    // ---- 文件 ----
+    table_push(args, ivalue.new_str("examples/hello.tie"))
+    vid = ienv.call("file_read", args)
+    check(ivalue.type_of(vid) == T_STR && str_len(ivalue.str_val(vid)) > 0, "file_read hello 非空")
+    args = table_new_i64()
+    table_push(args, ivalue.new_str("examples/hello.tie"))
+    vid = ienv.call("file_exists", args)
+    check(ivalue.type_of(vid) == T_BOOL && ivalue.int_val(vid) == 1, "file_exists true")
+    args = table_new_i64()
+    table_push(args, ivalue.new_str("no_such_xyz_2026"))
+    vid = ienv.call("file_exists", args)
+    check(ivalue.type_of(vid) == T_BOOL && ivalue.int_val(vid) == 0, "file_exists false")
+
+    // ---- 字符串 ----
+    args = table_new_i64()
+    table_push(args, ivalue.new_str("hello"))
+    vid = ienv.call("str_len", args)
+    check(ivalue.type_of(vid) == T_INT && ivalue.int_val(vid) == 5, "str_len 5")
+    args = table_new_i64()
+    table_push(args, ivalue.new_str("A"))
+    vid = ienv.call("char_code", args)
+    check(ivalue.type_of(vid) == T_INT && ivalue.int_val(vid) == 65, "char_code 65")
+    args = table_new_i64()
+    table_push(args, ivalue.new_str("123"))
+    vid = ienv.call("parse_int", args)
+    check(ivalue.type_of(vid) == T_INT && ivalue.int_val(vid) == 123, "parse_int 123")
+
+    // ---- 数学 ----
+    args = table_new_i64()
+    table_push(args, ivalue.new_int(9))
+    vid = ienv.call("sqrt", args)
+    check(ivalue.type_of(vid) == T_FLOAT && ivalue.float_val(vid) > 2.9, "sqrt 9 ≈ 3")
+
+    // ---- 环境/时间 ----
+    args = table_new_i64()
+    table_push(args, ivalue.new_str("PATH"))
+    vid = ienv.call("get_env", args)
+    check(ivalue.type_of(vid) == T_STR && str_len(ivalue.str_val(vid)) > 0, "get_env PATH 非空")
+    args = table_new_i64()
+    vid = ienv.call("time_now", args)
+    check(ivalue.type_of(vid) == T_INT && ivalue.int_val(vid) > 0, "time_now > 0")
+
+    println("env 文件/字符串/数学 验收通过：" + to_string(g_n - g_fail) + " 项一致（共 " + to_string(g_n) + " 项）")
+    if g_fail > 0 {
+        return 1
+    }
+    return 0
+}

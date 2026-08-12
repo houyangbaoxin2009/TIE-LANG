@@ -81,6 +81,30 @@ Phase 3 收尾：driver-lite（T2.9 临时入口）升级为 tiec 完整编译�
   MD5 一致（验证通过）
 - 行为等价回归（regress-driver-lite.ps1 改用 tiec）：72 文件，
   可编译文件等价率 100%（1/1 >= 90% 达标）
+## [自举 v2 T4] 解释器 tie 化（core + env + REPL + 测试移植）— 2026-08-12
+
+T4 阶段：Rust tie-interp 逐步替换为 tie 自写解释器（0-Rust 关键路径）。
+
+### T4.1 解释器核心（0830ef7）
+- compiler/interp/{value,session,interp}.tie：Value 编码（9 类型节点 id + 平行表）、
+  Session（globals/funcs/AST 归档池）、树遍历求值器 eval/eval_call（两遍解析）
+- 54 项 golden 验收 PASS（对齐 Rust interp 行为与错误文本）
+
+### T4.3 REPL parity（d3adfc0）
+- compiler/repl.tie：tie 自写解释器 REPL（read_line→interp.eval→print）
+- scripts/repl-parity.ps1：18 命令 golden 会话，tie repl 与 Rust 通道 233 字节逐字节一致
+
+### T4.4 interp 行为测试移植（d3adfc0）
+- compiler/tests/interp/ 11 文件 198 断言全 PASS + scripts/run-interp-tests.ps1 runner
+- 7 项 tie interp 已知缺陷 SKIP 注释化；42 项 env 依赖用例清单化
+
+### T4.2 环境原语（env.tie）
+- compiler/interp/env.tie：C ABI 桥函数 tie 化（文件/字符串/数学/进程/环境/时间/
+  路径/目录/字节转发底座 + 表/键值表 Value 语义 + 限制清单文档化）
+- 16 项验收 PASS（interp_env_file 9 + interp_env_value 7）
+- **已知 Rust 后端缺陷（记录）**：exit 的底座调用生成 unreachable → tie-llvm
+  renumber_ir 在 if 链尾编号断链（"instruction expected to be numbered %44"）——
+  已通过 exit 移出 if 链绕过；自举后端单调编号无此问题
 ## [自举准备] 表能力加强（E0 + E1 + E3）— 2026-08-10
 
 自举障碍清零批：修复表变量传参缺陷（E0）、打通嵌套表 `table<table<T>>`（E1）、
@@ -1054,4 +1078,5 @@ switch n {
 - 语义分析（符号表/类型检查）
 - LLVM IR 文本生成 + opt/clang/lld 后端链路
 - 跑通 `println` / 算术 / 变量
+
 

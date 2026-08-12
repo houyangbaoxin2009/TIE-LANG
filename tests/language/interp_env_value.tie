@@ -1,0 +1,72 @@
+// tie:logic
+// tie:opt=2
+
+// compiler/interp/env.tie 验收（T4.2 第二部分）：Value 语义表/键值表 + 限制清单。
+import "../../compiler/interp/env.tie"
+
+var g_fail: i64 = 0
+var g_n: i64 = 0
+
+func check(cond: bool, name: string) {
+    g_n = g_n + 1
+    if !cond {
+        g_fail = g_fail + 1
+        println("[FAIL] " + name)
+    } else {
+        println("PASS  [" + name + "]")
+    }
+}
+
+func main() -> i64 {
+    var args = table_new_i64()
+    var vid: i64 = 0
+
+    // ---- 表（Value 语义）----
+    var t0 = ivalue.new_table()
+    t0 = ivalue.table_push_val(t0, ivalue.new_int(10))
+    t0 = ivalue.table_push_val(t0, ivalue.new_int(20))
+    table_push(args, t0)
+    vid = ienv.call("table_len", args)
+    check(ivalue.type_of(vid) == T_INT && ivalue.int_val(vid) == 2, "table_len 2")
+    args = table_new_i64()
+    table_push(args, t0)
+    table_push(args, ivalue.new_int(1))
+    vid = ienv.call("table_at", args)
+    check(ivalue.type_of(vid) == T_INT && ivalue.int_val(vid) == 20, "table_at[1] = 20")
+    args = table_new_i64()
+    table_push(args, t0)
+    table_push(args, ivalue.new_int(5))
+    vid = ienv.call("table_at", args)
+    check(vid < 0 && str_len(g_err) > 0, "table_at 越界错误")
+
+    // ---- 键值表（Value 语义）----
+    var m0 = ivalue.new_map()
+    args = table_new_i64()
+    table_push(args, m0)
+    table_push(args, ivalue.new_str("a"))
+    table_push(args, ivalue.new_int(1))
+    m0 = ienv.call("map_set", args)
+    check(ivalue.type_of(m0) == T_MAP, "map_set 返回 map")
+    args = table_new_i64()
+    table_push(args, m0)
+    table_push(args, ivalue.new_str("a"))
+    vid = ienv.call("map_get", args)
+    check(ivalue.type_of(vid) == T_INT && ivalue.int_val(vid) == 1, "map_get a = 1")
+    args = table_new_i64()
+    table_push(args, m0)
+    table_push(args, ivalue.new_str("zzz"))
+    vid = ienv.call("map_get", args)
+    check(vid < 0 && str_len(g_err) > 0, "map_get 缺键错误")
+
+    // ---- 未覆盖桥：限制清单报错 ----
+    args = table_new_i64()
+    table_push(args, ivalue.new_str("x"))
+    vid = ienv.call("http_get", args)
+    check(vid < 0 && str_len(g_err) > 0, "限制清单桥报错")
+
+    println("env Value 语义验收通过：" + to_string(g_n - g_fail) + " 项一致（共 " + to_string(g_n) + " 项）")
+    if g_fail > 0 {
+        return 1
+    }
+    return 0
+}
