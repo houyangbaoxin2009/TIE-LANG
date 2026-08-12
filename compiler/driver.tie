@@ -307,14 +307,15 @@ func compile_program(src: string) -> i64 {
 }
 
 // logic：clang 链接可执行文件；清理中间文件（除非 --keep-ir）。
-// 注意：need_interp 暂恒 false（irgen 最小集不支持 read_line/eval 等 interp
-// 内置调用，用户程序用不到 tie-interp 库；后续 irgen 扩展后接入）。
+// need_interp（T4.5）：程序用了 tie 运行时桥内置（exec_code/get_env/time_now，
+// irgen 置 g_used_runtime）→ 链接 std/runtime.a（tie 自写运行时，无需 Rust
+// tie-interp 库）；其余恒 false（irgen 最小集不支持 read_line/eval 等）。
 func compile_logic(ir_path: string, opt_path: string, target: string) -> i64 {
     var exe_path = g_output
     if str_len(exe_path) == 0 {
         exe_path = replace_ext(g_input, "exe")
     }
-    var bres = tc.link_exe(opt_path, exe_path, target, false)
+    var bres = tc.link_exe(opt_path, exe_path, target, g_used_runtime)
     if bres != 0 {
         println("[后端] " + tc_err_msg)
         return 1

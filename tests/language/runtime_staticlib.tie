@@ -1,0 +1,25 @@
+// tie:logic
+// T4.5 验收：tie 运行时静态库（std/runtime.a）替代 Rust tie-interp 链接。
+//
+// 本程序调用三个语言内置 exec_code / time_now / get_env——IR 层生成对
+// @tie_exec_code / @tie_time_now / @tie_get_env 的调用（extern_call 指令），
+// 链接期由 driver 优先链接 std/runtime.a（tie 语言自写运行时，见 std/runtime.tie），
+// **无需 Rust tie-interp 库**。
+//
+// 期望输出（stdout，逐字节）：
+//   tie-runtime-ok      ← exec_code("echo tie-runtime-ok") 的子进程输出（继承 stdout）
+//   0                   ← exec_code 退出码（echo 成功）
+//   <Unix 秒时间戳>      ← time_now()
+//   <PATH 环境变量值>    ← get_env("PATH")
+func main() {
+    // exec_code：执行命令并返回退出码（桥符号 tie_exec_code，runtime.a 提供）
+    var rc = exec_code("echo tie-runtime-ok")
+    println(rc)
+    // time_now：Unix 纪元秒（桥符号 tie_time_now，runtime.a 提供）
+    var t = time_now()
+    println(t)
+    // get_env：读取环境变量（桥符号 tie_get_env，runtime.a 提供；PATH 常驻，避免
+    // getenv NULL 边界——见 std/runtime.tie 行为差异）
+    var p: string = get_env("PATH")
+    println(p)
+}

@@ -1,0 +1,73 @@
+// tie:library
+// std/runtime.tie —— 自举 v2 T4.5：tie 运行时静态库（替代 Rust tie-interp 桥）
+// ============================================================
+// 目标：0-Rust 路径的关键一步——用 tie 语言提供 tie_* C ABI 桥符号的
+// 实现，使链接用户程序时不再需要 Rust tie-interp 静态库。
+//
+// 编译方式：经 Rust 种子编译器（tie-llvm.exe，与 pkg.exe/repl.exe 同路径）
+// 编译为 std/runtime.a（clang -c + llvm-ar rcs）。tiec 当前 irgen 为最小集
+// （不支持 extern fn 声明体/普通函数调用），故本库由种子编译——本库内部的
+// 实现代码是 tie，种子只承担「编译器」角色（自举过渡期既定安排）。
+//
+// # 符号导出机制（关键设计）
+// tie 函数的 LLVM 符号名 = 命名空间路径::函数名 中的 :: 替换为 $。**顶层
+// 裸函数无命名空间** → 符号名 = 函数名原样（无 mangle）。因此：
+//   `func tie_exec_code(cmd: string) -> i64` → `define i64 @tie_exec_code(ptr)`
+// 与内置 exec_code 的 IR 调用点 `declare i64 @tie_exec_code(ptr)` 逐字节匹配
+// （tie 编译期字符串 = NUL 结尾 char*，string 形参映射 LLVM ptr），链接期按
+// 符号名解析即可——无需改 llvmgen 的符号命名。
+//
+// # 可行性边界（tie 无指针类型）
+// 可实现的桥 = 参数/返回值全为标量（i64/string）且内部只需 libc 标量调用的：
+//   - tie_exec_code：包装 libc system（extern fn system(cmd: string) -> i64）
+//   - tie_get_env   ：包装 libc getenv（string 返回——extern 返回限标量，string 合法）
+//   - tie_time_now  ：包装 libc time（`time(time_t*)` 传 NULL 即返回当前秒；
+//                     无指针类型下声明 `time(t: i64) -> i64` 传 0，x64 ABI 上
+//                     i64 0 与 NULL 在同一寄存器，实参侧等价）
+// 无法实现（依赖 ptr 的桥，详见 T4.5 限制清单）：
+//   - tie_exec_output（内部需 file_read → fopen/fread 指针语义）
+//   - tie_file_read/file_write（fopen/fwrite 需 FILE*/缓冲指针）
+//   - tie_str_char/str_len（需遍历内存/计数，char* 逐字节访问）
+//   - tie_rand_range（签名含 `ok: *mut i8` 出参指针）
+//   - tie_arg_*（需 argv/argc，C main 参数或指针间接）
+//   这些继续依赖 Rust tie-interp 库（语言底座原语，T4.5 覆盖可实现的子集）。
+//
+// # 行为差异（文档化）
+// - tie_exec_code 声明 system 为 i64：x86-64 写 EAX（i32）自动清零 RAX 高 32 位，
+//   正常退出码与 Rust 桥一致；仅在「命令启动失败」时 system 返回 -1（i32）被
+//   零扩展为 4294967295（Rust 桥返回 -1）。tie 程序通常只判断 != 0，分支一致。
+// - tie_get_env 变量不存在时 getenv 返回 NULL，tie 无法判空（无指针比较），
+//   返回 NULL 被当字符串使用有崩溃风险（Rust 桥返回空串）。验收用常驻变量。
+//
+// 调用：用户程序用内置 exec_code/get_env/time_now（IR 层生成对 @tie_exec_code/
+// @tie_get_env/@tie_time_now 的调用），链接期由 driver 优先链接本库产物
+// std/runtime.a（见 compiler/backend/toolchain.tie find_runtime_lib）。
+
+// extern 声明（T0.7）：链接期 libc 符号，clang 自动解析 msvcrt/CRT。
+// system：`int system(const char*)`，声明 i64 返回（RAX 零扩展保证，见上）。
+extern fn system(cmd: string) -> i64;
+// getenv：`char *getenv(const char*)`，string 参数 + string 返回（extern 返回限标量，
+// string 是标量 extern 类型，LLVM 映射 ptr ↔ char*，直接转发）。
+extern fn getenv(name: string) -> string;
+// time：`time_t time(time_t*)`——传 NULL 返回当前 Unix 秒；tie 无指针类型，
+// 声明 i64 参数传 0（x64 调用约定 i64 与指针同寄存器，实参侧等价 NULL）。
+extern fn time(t: i64) -> i64;
+
+// tie_exec_code：执行命令，返回退出码（0 成功；启动失败零扩展 4294967295，
+// 见文件头行为差异）。替代 Rust tie-interp 的同名 C ABI 桥。
+func tie_exec_code(cmd: string) -> i64 {
+    return system(cmd)
+}
+
+// tie_get_env：读取环境变量，返回其值。变量不存在时 getenv 返回 NULL——
+// tie 无法判空，返回 NULL 当字符串用有崩溃风险（限制清单 #3）；常驻变量安全。
+// 替代 Rust tie-interp 的同名 C ABI 桥（Rust 桥缺失变量返回空串）。
+func tie_get_env(name: string) -> string {
+    return getenv(name)
+}
+
+// tie_time_now：返回 Unix 纪元秒数（与 Rust 桥 SystemTime 同一量纲）。
+// 替代 Rust tie-interp 的同名 C ABI 桥。
+func tie_time_now() -> i64 {
+    return time(0)
+}

@@ -24,6 +24,9 @@ var g_cur_func: i64 = 0;
 var g_cur_block: i64 = 0;
 // 参数区是否已输出（entry 顶部）
 var g_params_done: bool = false;
+// T4.5：程序是否使用了 tie 运行时桥内置（exec_code/get_env/time_now）。
+// 置位后 driver 链接 std/runtime.a（无需 Rust tie-interp 库）。
+var g_used_runtime: bool = false;
 
 // 变量查作用域：命中返回 1 并置 out 参数（tie 无引用返回，用全局槽）
 var g_lookup_found: bool = false;
@@ -264,15 +267,55 @@ func gen_expr(id: i64) -> i64 {
         return gen_expr(sstate.child(id, 0))
     }
     if tag == 7 {
-        // Call：println/print 最小集
+        // Call：println/print 最小集；T4.5 起支持 tie 运行时桥内置
+        // （exec_code/time_now/get_env——经 extern_call 指令调用 std/runtime.a
+        //  导出的 @tie_* 符号，链接不依赖 Rust tie-interp 库）
         var nm = sstate.name_str(id)
         if nm == "println" || nm == "print" {
             return gen_println(id, nm == "println")
+        }
+        if nm == "exec_code" || nm == "time_now" || nm == "get_env" {
+            return gen_tie_call(nm, id)
         }
         return -1  // 其他函数调用后续扩展
     }
     // 其他表达式后续扩展
     return -1
+}
+
+// T4.5：tie 运行时桥内置 → extern_call(36) 指令。
+// 生成 `call <ret> @tie_<name>(args)`：符号 = "tie_" + 内置名（如 exec_code →
+// tie_exec_code），实参全部为字符串（LLVM ptr）。返回结果值 id。
+// 关键：**先求值全部实参（创建实参指令），再新建 extern_call**——与 gen_binary
+// 同模式，保证指令的操作数在扁平 ir_ops 段内连续（否则实参指令的操作数
+// 会内插到本指令操作数之间，llvmgen 按段偏移读取错位）。
+func gen_tie_call(nm: string, id: i64) -> i64 {
+    g_used_runtime = true
+    var nc = sstate.nchild(id)
+    var argvals = table_new_i64()
+    var k: i64 = 0
+    while k < nc {
+        var av = gen_expr(sstate.child(id, k))
+        if av < 0 {
+            return -1
+        }
+        table_push(argvals, av)
+        k = k + 1
+    }
+    var sym = interner.intern("tie_" + nm)
+    // 结果类型：exec_code/time_now → i64；get_env → string
+    var ret_ty: i64 = types.named(TK_I64)
+    if nm == "get_env" {
+        ret_ty = types.named(TK_STR)
+    }
+    var inst = ir.new_inst(g_cur_block, 36, ret_ty)  // extern_call
+    ir.add_operand(inst, sym, 0)
+    var j: i64 = 0
+    while j < len(argvals) {
+        ir.add_operand(inst, argvals[j], 0)
+        j = j + 1
+    }
+    return ir.get_value(inst)
 }
 
 // println/print 生成：printf 调用（格式串 + 参数）
@@ -298,6 +341,18 @@ func gen_println(id: i64, newline: bool) -> i64 {
     if atag == 2 {
         // 字符串参数：格式 "%s\n" + 字符串指针
         var sval = gen_str_lit(s_names[arg])
+        var fmt = interner.intern("%s" + nl)
+        var inst = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
+        ir.add_operand(inst, fmt, 0)
+        ir.add_operand(inst, sval, 0)
+        return ir.get_value(inst)
+    }
+    if atag == 6 && scope_get(s_names[arg]) >= 0 && g_lookup_ty == types.named(TK_STR) {
+        // T4.5：字符串类型变量（如 `var p: string = get_env("PATH")`）→ "%s\n" + ptr
+        var sval = gen_var_ref(s_names[arg])
+        if sval < 0 {
+            return -1
+        }
         var fmt = interner.intern("%s" + nl)
         var inst = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
         ir.add_operand(inst, fmt, 0)
@@ -524,6 +579,7 @@ pub func gen_src(src: string, base_dir: string) -> i64 {
     g_sc_tys = table_new_i64()
     g_str_keys = table_new_i64()
     g_str_count = 0
+    g_used_runtime = false
     ir.new_module()
     // 遍历顶层：g_extra_tops（主文件 + import 展开后的全部顶层语句）
     var n = len(g_extra_tops)

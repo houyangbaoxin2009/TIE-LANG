@@ -45,6 +45,12 @@ opencode.json
 /compiler/repl.exe
 /compiler/_rust_repl.exe
 
+# 自举 v2 tiec 编译器产物（T3.2，tie-llvm 编译 compiler/driver.tie 生成）
+/compiler/tiec.exe
+
+# 自举 v2 测试编译产物（tests/language/*.tie 经 tiec 编译生成）
+/tests/language/*.exe
+
 # 包管理器自举产物（pkg.exe，由 tie-llvm 编译 pkg/main.tie 生成）
 /pkg/pkg.exe
 

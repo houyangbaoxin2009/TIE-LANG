@@ -126,9 +126,14 @@ pub func opt(input_ll: string, output_opt: string, level: i64) -> i64 {
     return run(tool + " " + optl + " -S " + input_ll + " -o " + output_opt)
 }
 
-// 链接可执行文件：clang in.opt.ll -o out.exe [--target=T] [interp.lib + 系统库]。
-// need_interp 为 true 时追加 tie_interp.lib（TIE_INTERP_LIB 环境变量 →
-// target\release → target\debug）与 Rust std 依赖系统库。返回退出码。
+// 链接可执行文件：clang in.opt.ll -o out.exe [--target=T] [runtime/interp 库 + 系统库]。
+// need_interp 为 true 时优先链接 tie 运行时静态库 std/runtime.a（T4.5，
+// tie 语言自写，覆盖 exec_code/get_env/time_now 等桥符号——无需 Rust）：
+// - 找到 std\runtime.a（或 TIE_RUNTIME_LIB 环境变量）→ 直接链接，无需系统库
+//   （runtime 内部只用 msvcrt/CRT，clang 自动解析）；
+// - 未找到 → 回退 tie_interp.lib（Rust 桥，覆盖全部符号含文件/字符串原语，
+//   TIE_INTERP_LIB 环境变量 → target\release → target\debug）与 Rust std 依赖
+//   系统库。返回退出码。
 pub func link_exe(input_opt: string, output_exe: string, target: string, need_interp: bool) -> i64 {
     var tool = find_clang()
     if str_len(tool) == 0 {
@@ -140,13 +145,18 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
         cmd = cmd + " --target=" + target
     }
     if need_interp {
-        var lib = find_interp_lib()
-        if str_len(lib) == 0 {
-            tc_err_msg = "程序使用了 REPL 内置函数（read_line/eval 等），但未找到 tie-interp 静态库。" +
-                "请先构建 tie-interp（cargo build -p tie-interp --release），或设置环境变量 TIE_INTERP_LIB"
-            return -1
+        var rlib = find_runtime_lib()
+        if str_len(rlib) > 0 {
+            cmd = cmd + " " + rlib
+        } else {
+            var lib = find_interp_lib()
+            if str_len(lib) == 0 {
+                tc_err_msg = "程序使用了 REPL 内置函数（read_line/eval 等），但未找到 tie-interp 静态库。" +
+                    "请先构建 tie-interp（cargo build -p tie-interp --release），或设置环境变量 TIE_INTERP_LIB"
+                return -1
+            }
+            cmd = cmd + " " + lib + " -lws2_32 -luserenv -lntdll -lbcrypt -ladvapi32 -lole32 -lshell32"
         }
-        cmd = cmd + " " + lib + " -lws2_32 -luserenv -lntdll -lbcrypt -ladvapi32 -lole32 -lshell32"
     }
     return run(cmd)
 }
@@ -173,6 +183,20 @@ pub func archive(object: string, lib_path: string) -> i64 {
         return -1
     }
     return run(tool + " rcs " + lib_path + " " + object)
+}
+
+// 定位 tie 运行时静态库：TIE_RUNTIME_LIB 环境变量 → 工作目录 std\runtime.a。
+// 找不到返回空串。std/runtime.a 由 tie-llvm 编译 std/runtime.tie 生成
+// （`tie-llvm std/runtime.tie -o std/runtime.a`，T4.5）。
+func find_runtime_lib() -> string {
+    var env = get_env("TIE_RUNTIME_LIB")
+    if str_len(env) > 0 && file_exists(env) {
+        return env
+    }
+    if file_exists("std\\runtime.a") {
+        return "std\\runtime.a"
+    }
+    return ""
 }
 
 // 定位 tie-interp 静态库：TIE_INTERP_LIB 环境变量 → target\release →

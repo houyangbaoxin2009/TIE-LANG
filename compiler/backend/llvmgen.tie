@@ -26,6 +26,9 @@ var str_count: i64 = 0;
 // printf i32 实参 sext 的新寄存器计数（LLVM 不支持内联 sext 表达式实参，
 // 每处 i32 实参生成一个独立 %ext<N> 寄存器）
 var g_sext_cnt: i64 = 0;
+// T4.5：extern_call(36) 收集的符号名池 id（去重登记序；llvmgen 顶层变量，
+// 与 out_buf 等同级——命名空间体内不允许 var）
+var ext_syms: table<i64>;
 
 namespace llvmgen {
 
@@ -110,6 +113,65 @@ func collect_strings() {
     }
 }
 
+// T4.5：遍历全部指令，收集 extern_call(36) 的符号名池 id（去重）。
+// 符号名经 interner 还原文本；emit_extern_decls 按符号名输出 declare。
+func collect_externs() {
+    ext_syms = table_new_i64()
+    var ni = ir.inst_count()
+    var i: i64 = 0
+    while i < ni {
+        if ir.ins_op(i) == 36 && ir.ins_ops_cnt(i) >= 1 {
+            var sid = ir.ins_opnd(i, 0)
+            var dup = false
+            var k: i64 = 0
+            while k < len(ext_syms) {
+                if ext_syms[k] == sid {
+                    dup = true
+                    break
+                }
+                k = k + 1
+            }
+            if !dup {
+                table_push(ext_syms, sid)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// 符号名 → declare 声明文本（tie 运行时桥签名表；未登记符号返回空串）。
+// 与 std/runtime.tie 的导出符号一一对应：
+//   tie_exec_code(cmd: string) -> i64 → declare i64 @tie_exec_code(ptr)
+//   tie_get_env(name: string) -> string → declare ptr @tie_get_env(ptr)
+//   tie_time_now() -> i64 → declare i64 @tie_time_now()
+func extern_decl(sym: string) -> string {
+    if sym == "tie_exec_code" {
+        return "declare i64 @tie_exec_code(ptr)"
+    }
+    if sym == "tie_get_env" {
+        return "declare ptr @tie_get_env(ptr)"
+    }
+    if sym == "tie_time_now" {
+        return "declare i64 @tie_time_now()"
+    }
+    return ""
+}
+
+// 输出 extern_call 收集到的 declare（模块头，无条件 declare 之后）。
+func emit_extern_decls() {
+    var i: i64 = 0
+    while i < len(ext_syms) {
+        var d = extern_decl(intern.lookup(ext_syms[i]))
+        if d != "" {
+            line(d)
+        }
+        i = i + 1
+    }
+    if len(ext_syms) > 0 {
+        line("")
+    }
+}
+
 // 字符串文本 → LLVM 转义（对齐 Rust escape_ir_string：可打印 ASCII 原样，
 // 特殊字符 \XX 十六进制；含中文等非 ASCII 码点逐字节转义）
 func escape_str(s: string) -> string {
@@ -183,6 +245,7 @@ func value_def(v: i64) -> i64 {
 
 // printf 实参引用：按值定义指令判定类型
 //   const_str(62) → "ptr @.str.N"（格式串 %s 需指针，不走寄存器）
+//   string 类型值（TK_STR，如 get_env 返回/string 变量 load）→ "ptr %N"（T4.5）
 //   i64 结果     → "i64 %N"
 //   i32 结果     → 由 call_vararg 分支生成独立 sext（不在本函数内联——
 //                  LLVM 新版本不支持 `sext (i32 %N to i64)` 表达式实参）
@@ -194,6 +257,9 @@ func arg_ref(inst_id: i64, k: i64) -> string {
         if ir.ins_op(def) == 62 {
             var slot = str_slot(ir.ins_opnd(def, 0))
             return "ptr @.str." + to_string(slot)
+        }
+        if ir.ins_ty(def) == TK_STR {
+            return "ptr %" + to_string(v)
         }
     }
     return "i64 %" + to_string(v)
@@ -342,14 +408,46 @@ func gen_inst(inst_id: i64) {
         line(reg + " = call i32 (ptr, ...) @printf(ptr @.str." + to_string(slot) + call_args + ")")
         return
     }
+    if op == 36 {
+        // extern_call（T4.5）：tie 运行时桥调用。
+        // 操作数[0] = 符号名池 id（如 "tie_exec_code"）；[1..] = 实参（全字符串 ptr）。
+        // 结果类型 = 指令类型（i64 / ptr）；declare 由 emit_extern_decls 输出。
+        var sid = ir.ins_opnd(inst_id, 0)
+        var sym = intern.lookup(sid)
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        var args = ""
+        var k: i64 = 1
+        while k < cnt {
+            if k > 1 {
+                args = args + ", "
+            }
+            args = args + ptr_arg_ref(inst_id, k)
+            k = k + 1
+        }
+        line(reg + " = call " + ty + " @" + sym + "(" + args + ")")
+        return
+    }
     // 未支持指令：占位注释
     line("; TODO op=" + to_string(op) + " inst=" + to_string(inst_id))
+}
+
+// T4.5：extern_call 实参引用——tie 运行时桥参数全为字符串（ptr）。
+// const_str → "ptr @.str.N"；其余（string 变量 load / 上一条指令结果）→ "ptr %N"。
+func ptr_arg_ref(inst_id: i64, k: i64) -> string {
+    var v = ir.ins_opnd(inst_id, k)
+    var def = value_def(v)
+    if def >= 0 && ir.ins_op(def) == 62 {
+        var slot = str_slot(ir.ins_opnd(def, 0))
+        return "ptr @.str." + to_string(slot)
+    }
+    return "ptr %" + to_string(v)
 }
 
 // ==================== 模块生成 ====================
 // 生成完整 .ll 文本
 pub func emit() -> string {
     collect_strings()
+    collect_externs()
     out_buf = ""
     // 模块头
     line("; ModuleID = 'tie'")
@@ -380,6 +478,8 @@ pub func emit() -> string {
     line("declare double @ceil(double)")
     line("declare double @round(double)")
     line("")
+    // T4.5：tie 运行时桥 declare（extern_call 收集，按符号名输出）
+    emit_extern_decls()
     // 各函数
     var nf = ir.func_count()
     var i: i64 = 0
