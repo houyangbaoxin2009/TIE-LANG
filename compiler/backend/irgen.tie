@@ -45,6 +45,15 @@ var g_used_interp: bool = false;
 // 当前函数的**全名**（命名空间函数含 "::"，如 sstate::child）——调用名解析
 // 需要当前命名空间前缀补全（对齐 sinfer.resolve_call_name 的候选 2）。
 var g_cur_fn_name: string = "";
+// 当前函数返回类型 id（Return 的 BoolLit 适配 trit 用：`return false` 在返回
+// trit 的函数里生成 i8 而非 i1）
+var g_cur_ret_ty: i64 = 0;
+// 表变量元素类型表（函数级）：变量名池 id → 元素类型 id。语义层 lv_telem
+// 是 per-function 且在 irgen 阶段已过期（只可靠查到最后一个函数），跨函数
+// 场景（exmath::parse_series 里 table_push(result, parse_float(...))）必须由
+// irgen 自己登记 table_new_f64()/table<T> 变量的元素类型。
+var g_tv_keys: table<i64>;
+var g_tv_elems: table<i64>;
 // 顶层全局变量登记：name 池 id → 类型 id / 表元素类型 id（对齐 sstate gb_*，
 // 直接查 gb_keys/gb_vals/gb_telem；此处仅缓存 llvm 初始化需要的标记）。
 // （llvmgen 侧维护 g_global_* 登记表，irgen 仅转发登记。）
@@ -87,6 +96,35 @@ func scope_put(name_id: i64, alloca: i64, ty: i64) {
         table_push(g_sc_tys, ty)
     }
     g_sc_top = g_sc_top + 1
+}
+
+// 表变量元素类型登记/查询（irgen 自维护，函数级）：
+// 语义层 lv_telem 是 per-function 且 irgen 阶段已过期（只可靠查到最后一个
+// 函数），table_new_f64()/table<T> 变量的元素类型须由 irgen 自己记录，
+// table_push/table_at 才能选对桥（push_f64 vs push_i64）。
+func tblvar_put(nm: i64, te: i64) {
+    var i: i64 = 0
+    while i < len(g_tv_keys) {
+        if g_tv_keys[i] == nm {
+            g_tv_elems[i] = te
+            return
+        }
+        i = i + 1
+    }
+    table_push(g_tv_keys, nm)
+    table_push(g_tv_elems, te)
+}
+
+// 查表变量元素类型；未登记 -1
+func tblvar_get(nm: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_tv_keys) {
+        if g_tv_keys[i] == nm {
+            return g_tv_elems[i]
+        }
+        i = i + 1
+    }
+    return -1
 }
 
 // 变量查作用域：从栈顶向下（内层优先遮蔽外层）。命中置全局槽。
@@ -257,6 +295,107 @@ func gen_str_lit(name_id: i64) -> i64 {
     return ir.get_value(inst)
 }
 
+// 浮点字面量 → const_f 指令（操作数 = 浮点文本的字符串池 id）。
+// lexeme 来自词法 lex_float（必然合法，parse_float 编译期执行不会失败）；
+// llvmgen 端按 LLVM 语法规范化（补小数点）后输出 fadd double <lit>, 0.0。
+func gen_float_lit(name_id: i64) -> i64 {
+    var inst = ir.new_inst(g_cur_block, 51, types.named(TK_F64))  // const_f
+    ir.add_operand(inst, name_id, 0)  // OK_VALUE 浮点文本池 id（原 lexeme）
+    return ir.get_value(inst)
+}
+
+// 字符字面量 → i32 码点常量（对齐 Rust CharLit → (c as i32, "i32")）。
+// lexeme 形如 "'a'" / "'\n'"（带引号）：去引号 + 反转义 → 单字符 → 码点。
+func gen_char_lit(name_id: i64) -> i64 {
+    var raw = interner.lookup(name_id)
+    var n: i64 = str_len(raw)
+    if n >= 3 && str_char(raw, 0) == "'" && str_char(raw, n - 1) == "'" {
+        raw = str_slice(raw, 1, n - 1)
+    }
+    // 转义处理（与 str_unescape_quoted 同款字符集）
+    var ch: string = ""
+    var m: i64 = str_len(raw)
+    if m >= 2 && str_char(raw, 0) == "\\" {
+        var e = str_char(raw, 1)
+        if e == "n" {
+            ch = "\n"
+        } else if e == "t" {
+            ch = "\t"
+        } else if e == "r" {
+            ch = "\r"
+        } else if e == "\\" {
+            ch = "\\"
+        } else if e == "'" {
+            ch = "'"
+        } else if e == "0" {
+            ch = "\0"
+        } else {
+            // 未知转义：取转义字符本身（与字符串保留反斜杠不同——字符无歧义）
+            ch = e
+        }
+    } else {
+        ch = str_char(raw, 0)
+    }
+    var cp = char_code(ch)  // 语言底座原语（编译期执行，取码点）
+    var inst = ir.new_inst(g_cur_block, 60, types.named(TK_CHAR))  // const_i i32
+    ir.add_operand(inst, cp, 2)  // OK_IMM 码点
+    return ir.get_value(inst)
+}
+
+// trit 字面量 → i8 常量（值域 -1/0/1；driver 树仅 lex_zero → 0）
+func gen_trit_lit(v: i64) -> i64 {
+    var inst = ir.new_inst(g_cur_block, 60, types.named(TK_I8))  // const_i i8
+    ir.add_operand(inst, v, 2)  // OK_IMM
+    return ir.get_value(inst)
+}
+
+// 三目运算 cond ? then : else：三块短路 + phi 汇合（对齐 Rust gen_expr Ternary）。
+// AST：Ternary[children=[cond, then, else]]；then/else 为表达式（无 return），
+// 分支内必然以 br merge 结束，无需 block_terminated 检查。
+func gen_ternary(id: i64) -> i64 {
+    var cond = gen_expr(sstate.child(id, 0))
+    if cond < 0 {
+        return -1
+    }
+    var then_blk = ir.new_block(g_cur_func, interner.intern("tern.then"))
+    var else_blk = ir.new_block(g_cur_func, interner.intern("tern.else"))
+    var merge_blk = ir.new_block(g_cur_func, interner.intern("tern.merge"))
+    var cbr = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbr, cond, 0)
+    ir.add_operand(cbr, then_blk, 1)
+    ir.add_operand(cbr, else_blk, 1)
+    // then 分支
+    g_cur_block = then_blk
+    var tv = gen_expr(sstate.child(id, 1))
+    if tv < 0 {
+        return -1
+    }
+    var tv_blk = g_cur_block  // 嵌套短路时值实际产生块
+    var br1 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br1, merge_blk, 1)
+    // else 分支
+    g_cur_block = else_blk
+    var ev = gen_expr(sstate.child(id, 2))
+    if ev < 0 {
+        return -1
+    }
+    var ev_blk = g_cur_block
+    var br2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br2, merge_blk, 1)
+    // merge：phi 汇合（类型取 then 分支语义类型；兜底 i64）
+    g_cur_block = merge_blk
+    var pty = node_types[sstate.child(id, 1)]
+    if pty < 0 {
+        pty = types.named(TK_I64)
+    }
+    var phi = ir.new_inst(g_cur_block, 33, pty)
+    ir.add_operand(phi, tv, 0)
+    ir.add_operand(phi, tv_blk, 1)
+    ir.add_operand(phi, ev, 0)
+    ir.add_operand(phi, ev_blk, 1)
+    return ir.get_value(phi)
+}
+
 // 字符串字面量 lexeme（带引号）→ 纯文本池 id：去首尾引号 + 反转义
 // （\n \t \r \\ \" \' \0，与词法 scan_string 的转义集一致）。
 // 返回重新 intern 的纯文本池 id。
@@ -377,19 +516,29 @@ func fn_nparams(sig: i64) -> i64 {
 // ---------- 裸调用名解析（irgen 版，对齐 sinfer.resolve_call_name） ----------
 // 在当前函数命名空间前缀链中补全裸名（如 sstate 内 child() → sstate::child）。
 // 返回全名（裸名已存在或内置 → 原样）。
+// 注意：**逐级外层**补全（log::error::no_file 内 lookup → log::error::lookup
+// 不存在时继续试 log::lookup）——曾只试最近一层，嵌套命名空间（log.error.no_file）
+// 内裸调用私有函数（log::lookup）解析失败报"无签名"
 func resolve_call_name(fnm: string) -> string {
     if sstate.fn_sig(fnm) >= 0 {
         return fnm
     }
-    // 候选 2：当前函数命名空间前缀补全（逐级外层）
+    // 候选 2：当前函数命名空间前缀**逐级**外层补全
     var full = g_cur_fn_name
-    var last = sstate.rfind_ns(full)
-    if last >= 0 {
+    while str_len(full) > 0 {
+        var last = sstate.rfind_ns(full)
+        if last < 0 {
+            break
+        }
         var prefix = ig_slice(full, 0, last)
+        if prefix == "" {
+            break
+        }
         var cand = prefix + "::" + fnm
         if sstate.fn_sig(cand) >= 0 {
             return cand
         }
+        full = prefix  // 再往上一层
     }
     // 候选 3：using 前缀（driver 树无 using，防御）
     var off: i64 = 0
@@ -447,6 +596,25 @@ func ig_ns_sym(full: string) -> string {
 // 字符串操作（+ 拼接 / 比较）走运行时桥（str_cat / strcmp），由 node_types 判定。
 // && || 走短路（cond_br + phi 汇合，对齐 Rust ir.rs 短路模式）。
 func gen_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
+    // trit 判定先行（对齐 Rust gen_binary 分派顺序）：trit 的 &&/|| 是 Kleene
+    // min/max（非短路），混合 trit×i64 走 gen_binary_trit——短路分支只服务 bool
+    var lhs_t = node_types[lhs]
+    var rhs_t = node_types[rhs]
+    if lhs_t == types.named(TK_TRIT) || rhs_t == types.named(TK_TRIT) {
+        var lv0 = gen_expr(lhs)
+        if lv0 < 0 {
+            return -1
+        }
+        var rv0 = gen_expr(rhs)
+        if rv0 < 0 {
+            return -1
+        }
+        // 分流：两侧都 trit → Kleene/饱和/icmp i8；一侧 trit（×i64 混合）→ sext
+        if lhs_t == types.named(TK_TRIT) && rhs_t == types.named(TK_TRIT) {
+            return gen_trit_bin(op, lv0, rv0)
+        }
+        return gen_trit_mixed(op, lhs_t == types.named(TK_TRIT), lv0, rv0)
+    }
     // 逻辑短路：&&（11）/ ||（12）→ cond_br + phi（两侧类型 i1）
     if op == 11 || op == 12 {
         return gen_logic_short(op, lhs, rhs)
@@ -460,10 +628,16 @@ func gen_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
         return -1
     }
     // 字符串判定（node_types 语义类型；driver 树比较/拼接两侧为 string）
-    var lhs_str = node_types[lhs] == types.named(TK_STR)
-    var rhs_str = node_types[rhs] == types.named(TK_STR)
+    var lhs_str = lhs_t == types.named(TK_STR)
+    var rhs_str = rhs_t == types.named(TK_STR)
     if lhs_str || rhs_str {
         return gen_binary_str(op, lv, rv)
+    }
+    // 浮点判定（f64/f32 字面量与算术；对齐 Rust：类型以一侧为准，语义已统一）
+    var lhs_f = lhs_t == types.named(TK_F64) || lhs_t == types.named(TK_F32)
+    var rhs_f = rhs_t == types.named(TK_F64) || rhs_t == types.named(TK_F32)
+    if lhs_f || rhs_f {
+        return gen_binary_float(op, lv, rv)
     }
     // op 码（ast）：0=+ 1=- 2=* 3=/ 4=% 5== 6!= 7< 8> 9<= 10>= 11&& 12||
     // 13& 14| 15^ 16<< 17>>（逻辑已在短路分支处理；此处为位运算）
@@ -526,6 +700,317 @@ func gen_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
         }
         ir.add_operand(inst, cmp, 2)
     }
+    return ir.get_value(inst)
+}
+
+// 浮点二元运算（f64/f32）：算术 → fadd/fsub/fmul/fdiv/frem；比较 → fcmp（ordered）。
+// 对齐 Rust gen_binary_on_regs 的 is_float 分支；比较结果 i1，算术结果 f64。
+func gen_binary_float(op: i64, lv: i64, rv: i64) -> i64 {
+    var iop: i64 = -1
+    if op == 0 {
+        iop = 13  // fadd
+    } else if op == 1 {
+        iop = 14  // fsub
+    } else if op == 2 {
+        iop = 15  // fmul
+    } else if op == 3 {
+        iop = 16  // fdiv
+    } else if op == 4 {
+        iop = 17  // fmod（frem）
+    } else if op >= 5 && op <= 10 {
+        iop = 18  // fcmp
+    } else {
+        return -1  // 位运算/移位对浮点非法（语义层已拦截）
+    }
+    var rty = types.named(TK_F64)
+    if op >= 5 && op <= 10 {
+        rty = types.named(TK_BOOL)  // 比较结果 i1
+    }
+    var inst = ir.new_inst(g_cur_block, iop, rty)
+    ir.add_operand(inst, lv, 0)
+    ir.add_operand(inst, rv, 0)
+    if op >= 5 && op <= 10 {
+        // fcmp 比较码（对齐 ir.cmp：0=oeq 1=one 2=olt 3=ogt 4=ole 5=oge）
+        var cmp: i64 = 0
+        if op == 5 {
+            cmp = 0
+        } else if op == 6 {
+            cmp = 1
+        } else if op == 7 {
+            cmp = 2
+        } else if op == 8 {
+            cmp = 3
+        } else if op == 9 {
+            cmp = 4
+        } else {
+            cmp = 5
+        }
+        ir.add_operand(inst, cmp, 2)
+    }
+    return ir.get_value(inst)
+}
+
+// trit 二元运算（对齐 Rust gen_binary_trit）：
+//   - 混合 trit×i64：trit 侧 sext i8→i64 后常规整数运算（返回 i64/i1）；
+//   - 同为 trit：&&=min ||=max（icmp+select）；+ - * = 饱和算术（i8 运算 + clamp）；
+//     比较 → icmp i8 → i1。
+// 由 gen_binary 分流：两侧都 trit → gen_trit_bin；一侧 trit → gen_trit_mixed。
+
+// 两侧同为 trit：Kleene 逻辑（And=min / Or=max）与饱和算术（Add/Sub/Mul）
+// 用 icmp+select 实现；比较类 → icmp i8 → i1。
+// trit 值域仅 -1/0/1，i8 运算不会溢出（-2..2 均在 i8 范围），clamp 用 select。
+func gen_trit_bin(op: i64, lv: i64, rv: i64) -> i64 {
+    if op == 11 || op == 12 {
+        // Kleene &&=min ||=max：icmp slt/sgt i8 + select i8
+        var cmp = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp i1
+        ir.add_operand(cmp, lv, 0)
+        ir.add_operand(cmp, rv, 0)
+        if op == 11 {
+            ir.add_operand(cmp, 2, 2)  // slt
+        } else {
+            ir.add_operand(cmp, 3, 2)  // sgt
+        }
+        var c = ir.get_value(cmp)
+        var sel = ir.new_inst(g_cur_block, 34, types.named(TK_I8))  // select i8
+        ir.add_operand(sel, c, 0)
+        ir.add_operand(sel, lv, 0)
+        ir.add_operand(sel, rv, 0)
+        return ir.get_value(sel)
+    }
+    if op == 0 || op == 1 || op == 2 {
+        // 饱和算术：i8 运算 → clamp [-1,1]（select 链，无需 sext/trunc——
+        // 值域 -1..1 的 i8 运算结果在 -2..2，无溢出）
+        var aop: i64 = 0
+        if op == 0 {
+            aop = 0  // add
+        } else if op == 1 {
+            aop = 1  // sub
+        } else {
+            aop = 2  // mul
+        }
+        var raw = ir.new_inst(g_cur_block, aop, types.named(TK_I8))
+        ir.add_operand(raw, lv, 0)
+        ir.add_operand(raw, rv, 0)
+        var rv_id = ir.get_value(raw)
+        var lo = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp slt -1
+        ir.add_operand(lo, rv_id, 0)
+        ir.add_operand(lo, -1, 2)
+        ir.add_operand(lo, 2, 2)
+        var lo_v = ir.get_value(lo)
+        var cl = ir.new_inst(g_cur_block, 34, types.named(TK_I8))  // select -1
+        ir.add_operand(cl, lo_v, 0)
+        ir.add_operand(cl, -1, 2)
+        ir.add_operand(cl, rv_id, 0)
+        var cl_v = ir.get_value(cl)
+        var hi = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp sgt 1
+        ir.add_operand(hi, rv_id, 0)
+        ir.add_operand(hi, 1, 2)
+        ir.add_operand(hi, 3, 2)
+        var hi_v = ir.get_value(hi)
+        var ch = ir.new_inst(g_cur_block, 34, types.named(TK_I8))  // select 1
+        ir.add_operand(ch, hi_v, 0)
+        ir.add_operand(ch, 1, 2)
+        ir.add_operand(ch, cl_v, 0)
+        return ir.get_value(ch)
+    }
+    if op >= 5 && op <= 10 {
+        // 比较：icmp i8 → i1（slt/sgt 有符号）
+        var cmp: i64 = 0
+        if op == 5 {
+            cmp = 0
+        } else if op == 6 {
+            cmp = 1
+        } else if op == 7 {
+            cmp = 2
+        } else if op == 8 {
+            cmp = 3
+        } else if op == 9 {
+            cmp = 4
+        } else {
+            cmp = 5
+        }
+        var inst = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+        ir.add_operand(inst, lv, 0)
+        ir.add_operand(inst, rv, 0)
+        ir.add_operand(inst, cmp, 2)
+        return ir.get_value(inst)
+    }
+    return -1  // 位运算/除/模对 trit 非法（语义层已拦截）
+}
+
+// trit×i64 混合运算：trit 侧 sext i8→i64 后整数运算（+ - * == != < > <= >=）。
+// lhs_is_trit：trit 在左侧（true）还是右侧（false）；非交换运算按位置语义。
+// 结果：算术 → i64；比较 → i1。需要 sext opcode（ir 19，llvmgen 已实现）。
+func gen_trit_mixed(op: i64, lhs_is_trit: bool, lv: i64, rv: i64) -> i64 {
+    var trit_reg: i64 = lv
+    var int_reg: i64 = rv
+    if !lhs_is_trit {
+        trit_reg = rv
+        int_reg = lv
+    }
+    // trit 侧 sext i8 → i64
+    var sext = ir.new_inst(g_cur_block, 19, types.named(TK_I64))  // sext
+    ir.add_operand(sext, types.named(TK_I8), 2)  // 源类型 IMM
+    ir.add_operand(sext, trit_reg, 0)
+    var sv = ir.get_value(sext)
+    // 操作数顺序：非交换运算（- < > <= >=）按 trit op i64 语义
+    var a: i64 = sv
+    var b: i64 = int_reg
+    if !lhs_is_trit {
+        a = int_reg
+        b = sv
+    }
+    if op == 0 {
+        var i0 = ir.new_inst(g_cur_block, 0, types.named(TK_I64))  // add
+        ir.add_operand(i0, a, 0)
+        ir.add_operand(i0, b, 0)
+        return ir.get_value(i0)
+    }
+    if op == 1 {
+        var i1 = ir.new_inst(g_cur_block, 1, types.named(TK_I64))  // sub
+        ir.add_operand(i1, a, 0)
+        ir.add_operand(i1, b, 0)
+        return ir.get_value(i1)
+    }
+    if op == 2 {
+        var i2 = ir.new_inst(g_cur_block, 2, types.named(TK_I64))  // mul
+        ir.add_operand(i2, a, 0)
+        ir.add_operand(i2, b, 0)
+        return ir.get_value(i2)
+    }
+    if op >= 5 && op <= 10 {
+        var cmp: i64 = 0
+        if op == 5 {
+            cmp = 0
+        } else if op == 6 {
+            cmp = 1
+        } else if op == 7 {
+            cmp = 2
+        } else if op == 8 {
+            cmp = 3
+        } else if op == 9 {
+            cmp = 4
+        } else {
+            cmp = 5
+        }
+        var ic = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp i1
+        ir.add_operand(ic, a, 0)
+        ir.add_operand(ic, b, 0)
+        ir.add_operand(ic, cmp, 2)
+        return ir.get_value(ic)
+    }
+    return -1
+}
+
+// 自增/自减生成（Unary op 2-5）：load → add/sub 1（浮点 1.0）→ store 回槽。
+// 前缀（2/3）返回新值；后缀（4/5）返回旧值。操作数须为变量（语义层保证）。
+func gen_inc_dec(op: i64, operand: i64) -> i64 {
+    var nm = sstate.name_str(operand)
+    var nid = interner.intern(nm)
+    if scope_get_global(nid) < 0 {
+        sm_err_msg = "自增自减目标 '" + nm + "' 未入作用域（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var ty = g_lookup_ty
+    // load 旧值
+    var cur = ir.new_inst(g_cur_block, 21, ty)  // load
+    if g_lookup_is_global > 0 {
+        ir.add_operand(cur, g_lookup_alloca, 3)  // 全局槽
+    } else {
+        ir.add_operand(cur, g_lookup_alloca, 0)
+    }
+    var cur_v = ir.get_value(cur)
+    // add/sub 1（浮点 → fadd/fsub 1.0；dec = op 3/5）
+    var is_dec = op == 3 || op == 5
+    var new_v: i64 = -1
+    if types.is_float(ty) {
+        var one = gen_float_lit(interner.intern("1.0"))
+        var opc = 13  // fadd
+        if is_dec {
+            opc = 14  // fsub
+        }
+        var inst = ir.new_inst(g_cur_block, opc, ty)
+        ir.add_operand(inst, cur_v, 0)
+        ir.add_operand(inst, one, 0)
+        new_v = ir.get_value(inst)
+    } else {
+        var opc = 0  // add
+        if is_dec {
+            opc = 1  // sub
+        }
+        var inst = ir.new_inst(g_cur_block, opc, ty)
+        ir.add_operand(inst, cur_v, 0)
+        ir.add_operand(inst, 1, 2)  // 立即数 1
+        new_v = ir.get_value(inst)
+    }
+    // store 新值回槽
+    var st = ir.new_inst(g_cur_block, 22, -1)  // store
+    ir.add_operand(st, ty, 2)
+    ir.add_operand(st, new_v, 0)
+    if g_lookup_is_global > 0 {
+        ir.add_operand(st, g_lookup_alloca, 3)
+    } else {
+        ir.add_operand(st, g_lookup_alloca, 0)
+    }
+    // 前缀返回新值；后缀返回旧值
+    if op == 2 || op == 3 {
+        return new_v
+    }
+    return cur_v
+}
+
+// 复合赋值运算（Assign op ≥ 0）：在 load 出的旧值与右值上执行二元运算。
+// 类型分派：字符串 += → str_cat；浮点 → fadd 族；整数/位运算 → 常规 opcode。
+func gen_compound_assign(op: i64, lv: i64, rv: i64, ty: i64) -> i64 {
+    // 字符串拼接（+=）：str_cat 指令
+    if ty == types.named(TK_STR) && op == 0 {
+        var sc = ir.new_inst(g_cur_block, 56, types.named(TK_STR))  // str_cat
+        ir.add_operand(sc, lv, 0)
+        ir.add_operand(sc, rv, 0)
+        return ir.get_value(sc)
+    }
+    var is_f = types.is_float(ty)
+    var iop: i64 = -1
+    if op == 0 {
+        iop = 0  // +=
+    } else if op == 1 {
+        iop = 1  // -=
+    } else if op == 2 {
+        iop = 2  // *=
+    } else if op == 3 {
+        iop = 3  // /=
+    } else if op == 4 {
+        iop = 4  // %=
+    } else if op == 13 {
+        iop = 6  // &=
+    } else if op == 14 {
+        iop = 7  // |=
+    } else if op == 15 {
+        iop = 8  // ^=
+    } else if op == 16 {
+        iop = 10  // <<=
+    } else if op == 17 {
+        iop = 11  // >>=
+    }
+    if is_f {
+        if op == 0 {
+            iop = 13  // fadd
+        } else if op == 1 {
+            iop = 14  // fsub
+        } else if op == 2 {
+            iop = 15  // fmul
+        } else if op == 3 {
+            iop = 16  // fdiv
+        } else if op == 4 {
+            iop = 17  // fmod
+        }
+    }
+    if iop < 0 {
+        return -1
+    }
+    var inst = ir.new_inst(g_cur_block, iop, ty)
+    ir.add_operand(inst, lv, 0)
+    ir.add_operand(inst, rv, 0)
     return ir.get_value(inst)
 }
 
@@ -664,9 +1149,21 @@ func gen_expr(id: i64) -> i64 {
         // IntLit
         return gen_int_lit(s_vals[id])
     }
+    if tag == 1 {
+        // FloatLit：f64 常量（lexeme 文本存池，llvmgen 规范化输出）
+        return gen_float_lit(s_names[id])
+    }
     if tag == 2 {
         // StrLit
         return gen_str_lit(s_names[id])
+    }
+    if tag == 3 {
+        // CharLit：'a' / 转义 → i32 码点常量（对齐 Rust CharLit → i32）
+        return gen_char_lit(s_names[id])
+    }
+    if tag == 5 {
+        // TritLit：zero → i8 0（true/false 走 BoolLit + trit 上下文改写）
+        return gen_trit_lit(s_vals[id])
     }
     if tag == 6 {
         // Var
@@ -675,6 +1172,10 @@ func gen_expr(id: i64) -> i64 {
     if tag == 9 {
         // Binary
         return gen_binary(s_vals[id], sstate.child(id, 0), sstate.child(id, 1))
+    }
+    if tag == 10 {
+        // Ternary：cond ? then : else → cond_br + phi（对齐 Rust 三块短路结构）
+        return gen_ternary(id)
     }
     if tag == 11 {
         // Range：for 迭代起点/终点
@@ -688,9 +1189,24 @@ func gen_expr(id: i64) -> i64 {
         if nm == "println" || nm == "print" {
             return gen_println(id, nm == "println")
         }
-        // 内置（语言底座原语 → tie_* 桥或 libc）：非用户函数
-        if builtin_expr(nm, id) >= 0 {
-            return g_builtin_res
+        // struct 构造调用：StructName(args...) → 聚合值（优先级高于内置/用户
+        // 函数解析——构造名不可能与函数/内置重名，语义层已校验）
+        if is_struct_name(nm) {
+            return gen_struct_construct(id, nm)
+        }
+        // 内置（语言底座原语 → tie_* 桥或 libc）：非用户函数。
+        // 名字命中内置集后失败必须传播（-1 保留原 sm_err_msg），绝不降级为
+        // 用户调用——否则内置参数内的未支持表达式会连锁成"函数 X 无签名"
+        // 误导错误（历史根因：table_push(j_fvals, 0.0) 曾报 table_push 无签名）
+        if is_builtin_name(nm) {
+            var br = builtin_expr(nm, id)
+            if br >= 0 {
+                return g_builtin_res
+            }
+            if str_len(sm_err_msg) == 0 {
+                sm_err_msg = "内置调用 '" + nm + "' 生成失败（函数 " + g_cur_fn_name + "）"
+            }
+            return -1
         }
         // 用户函数：裸调用名解析（当前命名空间补全）
         var full = resolve_call_name(nm)
@@ -704,7 +1220,14 @@ func gen_expr(id: i64) -> i64 {
         return gen_user_call_from(full, id, aoff)
     }
     if tag == 4 {
-        // BoolLit → i1 常量
+        // BoolLit → i1 常量（trit 上下文 → i8：true=1 / false=-1，对齐 Rust）
+        if node_types[id] == types.named(TK_TRIT) {
+            var tv: i64 = -1
+            if s_vals[id] == 1 {
+                tv = 1
+            }
+            return gen_trit_lit(tv)
+        }
         return gen_bool_lit(s_vals[id])
     }
     if tag == 8 {
@@ -715,15 +1238,36 @@ func gen_expr(id: i64) -> i64 {
         if ov < 0 {
             return -1
         }
+        var oty = node_types[operand]
+        if op == 2 || op == 3 || op == 4 || op == 5 {
+            // 自增/自减（M4）：2=++i 3=--i 4=i++ 5=i--；操作数必须是变量
+            // （语义层保证），直接读写其槽：load → add/sub 1 → store；
+            // 前缀返回新值，后缀返回旧值（对齐 Rust gen_inc_dec）
+            return gen_inc_dec(op, operand)
+        }
         if op == 0 {
-            // Neg：sub 0, x（i64）；字符串/浮点语义已拦截
+            // Neg：整数 → sub 0, x；浮点 → fsub 0.0, x（对齐 Rust fneg 语义）。
+            // 立即数 0 在浮点上下文必须为 0.0（LLVM：fsub double 0, %x 非法）
+            if oty == types.named(TK_F64) || oty == types.named(TK_F32) {
+                var zf = gen_float_lit(interner.intern("0.0"))
+                var fneg = ir.new_inst(g_cur_block, 14, types.named(TK_F64))  // fsub
+                ir.add_operand(fneg, zf, 0)
+                ir.add_operand(fneg, ov, 0)
+                return ir.get_value(fneg)
+            }
             var inst = ir.new_inst(g_cur_block, 1, types.named(TK_I64))  // sub
             ir.add_operand(inst, 0, 2)
             ir.add_operand(inst, ov, 0)
             return ir.get_value(inst)
         }
         if op == 1 {
-            // Not：xor i1 true
+            // Not：bool → xor i1 true；trit → sub i8 0, x（取反，-1↔1，0 保持）
+            if oty == types.named(TK_TRIT) {
+                var tnot = ir.new_inst(g_cur_block, 1, types.named(TK_I8))  // sub i8
+                ir.add_operand(tnot, 0, 2)
+                ir.add_operand(tnot, ov, 0)
+                return ir.get_value(tnot)
+            }
             var inst = ir.new_inst(g_cur_block, 8, types.named(TK_BOOL))  // xor
             ir.add_operand(inst, ov, 0)
             ir.add_operand(inst, 1, 2)
@@ -739,6 +1283,14 @@ func gen_expr(id: i64) -> i64 {
         // Index：t[i] 表下标读（动态表 → tie_table_at 桥）
         return gen_index_read(id)
     }
+    if tag == 14 {
+        // TupleLit：元组字面量 (a, b) → 聚合值（alloca + 逐字段 store + load）
+        return gen_tuple_lit(id)
+    }
+    if tag == 15 {
+        // FieldAccess：.q / .Item1 / .0 字段访问（元组/struct）→ 地址 + GEP + load
+        return gen_field_access(id)
+    }
     if tag == 12 {
         // TableLit：动态表创建（仅 var 初始化/实参场景；直接求值 → 建表）
         return gen_table_lit(id)
@@ -750,7 +1302,73 @@ func gen_expr(id: i64) -> i64 {
     return -1
 }
 
-// 内置表达式调用分派：返回 0 已处理（g_builtin_res 携带结果值 id）；-1 非内置
+// 内置原语名判定（builtin_expr 支持集；与 sbuitin 语义层原语表对齐）。
+// 命中即内置——调用失败传播错误，不降级为用户函数路径。
+func is_builtin_name(nm: string) -> bool {
+    if nm == "exec_code" || nm == "time_now" || nm == "get_env" || nm == "exec_output" {
+        return true
+    }
+    if nm == "str_len" || nm == "char_code" || nm == "str_char" {
+        return true
+    }
+    if nm == "to_string" || nm == "parse_int" || nm == "parse_float" || nm == "parse_trit" {
+        return true
+    }
+    if nm == "len" {
+        return true
+    }
+    if nm == "table_new_i64" || nm == "table_new_f64" || nm == "table_new_string" || nm == "table_new_bool" {
+        return true
+    }
+    if nm == "table_push" || nm == "table_at" || nm == "exit" {
+        return true
+    }
+    if nm == "arg_count" || nm == "arg_string" {
+        return true
+    }
+    if nm == "file_read" || nm == "file_write" || nm == "file_append" || nm == "file_exists" || nm == "file_delete" {
+        return true
+    }
+    if nm == "print_err" || nm == "mkdir_all" || nm == "remove_dir_all" || nm == "regex_find_all" {
+        return true
+    }
+    if nm == "regex_match" || nm == "regex_find" || nm == "regex_replace" || nm == "regex_group" {
+        return true
+    }
+    if nm == "sqrt" || nm == "sin" || nm == "cos" || nm == "tan" ||
+        nm == "exp" || nm == "log" || nm == "floor" || nm == "ceil" || nm == "round" || nm == "pow" {
+        return true
+    }
+    if nm == "read_line" || nm == "cwd" || nm == "list_dir" || nm == "walk_dir" ||
+        nm == "byte_read" || nm == "byte_write" || nm == "byte_concat" {
+        return true
+    }
+    if nm == "bit_read" || nm == "bit_write" {
+        return true
+    }
+    if nm == "path_basename" || nm == "path_dirname" || nm == "path_abs" ||
+        nm == "path_normalize" || nm == "path_join" {
+        return true
+    }
+    if nm == "http_get" || nm == "http_get_file" || nm == "untar_gz" || nm == "unzip" ||
+        nm == "copy_dir" || nm == "file_copy" || nm == "file_move" {
+        return true
+    }
+    if nm == "eval" || nm == "eval_call" || nm == "set_env" {
+        return true
+    }
+    if nm == "msg_set_lang" || nm == "msg_get_lang" || nm == "msg_register" ||
+        nm == "msg_t" || nm == "msg_t_lang" {
+        return true
+    }
+    if nm == "rand_range" {
+        return true
+    }
+    return false
+}
+
+// 内置表达式调用分派：返回 0 已处理（g_builtin_res 携带结果值 id）；-1 失败
+// （名字已由 is_builtin_name 判定命中——本函数内 -1 一律为真失败，调用方传播）。
 func builtin_expr(nm: string, id: i64) -> i64 {
     if nm == "exec_code" || nm == "time_now" || nm == "get_env" || nm == "exec_output" {
         g_builtin_res = gen_runtime_call(nm, id)
@@ -793,12 +1411,21 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         if v < 0 {
             return -1
         }
-        // 实参类型：i64 → tie_to_string_i64；f64 → tie_to_string_f64
+        // 实参类型：f64 → tie_to_string_f64；窄整数（i8/i16/i32/trit/char）→
+        // 先 sext 到 i64 再 tie_to_string_i64（C ABI 桥只收 i64；trit 值 -1/0/1
+        // 以 i8 存储，直传会生成 `call ptr @tie_to_string_i64(i64 %i8)` 类型错）
         var vt = node_types[sstate.child(id, 0)]
-        if vt == types.named(TK_F64) {
+        if vt == types.named(TK_F64) || vt == types.named(TK_F32) {
             g_builtin_res = gen_ext_call1("tie_to_string_f64", v, types.named(TK_F64), types.named(TK_STR))
-        } else {
+        } else if vt == types.named(TK_I64) || vt == types.named(TK_U64) || vt < 0 {
             g_builtin_res = gen_ext_call1("tie_to_string_i64", v, types.named(TK_I64), types.named(TK_STR))
+        } else {
+            // 窄类型（trit/char/i8/i16/i32/u8/u16/u32 等）：sext → i64
+            var sv = gen_sext(v, vt, types.named(TK_I64))
+            if sv < 0 {
+                return -1
+            }
+            g_builtin_res = gen_ext_call1("tie_to_string_i64", sv, types.named(TK_I64), types.named(TK_STR))
         }
         return 0
     }
@@ -814,6 +1441,33 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         ir.add_operand(pio, types.named(TK_I8), 2)
         g_builtin_res = gen_ext_call2("tie_parse_int", v, types.named(TK_STR),
             ir.get_value(pio), types.named(TK_STR), types.named(TK_I64))
+        return 0
+    }
+    if nm == "parse_float" {
+        // 浮点解析：Rust 桥签名 (ptr s, ptr ok) -> double；ok 出参必须占位
+        // （ABI 错位会写垃圾指针崩溃，与 parse_int 同类）
+        g_used_interp = true
+        var v = gen_expr(sstate.child(id, 0))
+        if v < 0 {
+            return -1
+        }
+        var pfo = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
+        ir.add_operand(pfo, types.named(TK_I8), 2)
+        g_builtin_res = gen_ext_call2("tie_parse_float", v, types.named(TK_STR),
+            ir.get_value(pfo), types.named(TK_STR), types.named(TK_F64))
+        return 0
+    }
+    if nm == "parse_trit" {
+        // trit 解析：Rust 桥签名 (ptr s, ptr ok) -> i8（值域 -1/0/1）
+        g_used_interp = true
+        var v = gen_expr(sstate.child(id, 0))
+        if v < 0 {
+            return -1
+        }
+        var pto = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
+        ir.add_operand(pto, types.named(TK_I8), 2)
+        g_builtin_res = gen_ext_call2("tie_parse_trit", v, types.named(TK_STR),
+            ir.get_value(pto), types.named(TK_STR), types.named(TK_I8))
         return 0
     }
     if nm == "len" {
@@ -857,7 +1511,25 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         var tname_node = sstate.child(id, 0)
         var tname = sstate.name_str(tname_node)
         var elem: i64 = types.named(TK_I64)
-        var te = sinfer.var_table_elem(intern.intern(tname))
+        // 优先 irgen 作用域完整类型（table_new_f64() 初始化的变量 scope 里是
+        // table_of(f64) → 元素 f64）。var_table_elem 是语义层每函数重置的，
+        // irgen 阶段只可靠查到最后一次登记——跨函数场景（parse_series 里
+        // push parse_float 结果）会误判为 i64 导致 push_i64(double) 类型错
+        var te: i64 = -1
+        var tnid = interner.intern(tname)
+        var tv_own = tblvar_get(tnid)
+        if tv_own >= 0 {
+            te = tv_own  // irgen 自维护登记（最可靠）
+        } else if scope_get(tnid) >= 0 && types.is_table(g_lookup_ty) {
+            var le = types.table_elem(g_lookup_ty)
+            if le > 0 {
+                te = le
+            }
+        }
+        if te < 0 {
+            te = sinfer.var_table_elem(tnid)
+        }
+
         if te >= 0 {
             elem = te
         }
@@ -870,13 +1542,17 @@ func builtin_expr(nm: string, id: i64) -> i64 {
             return -1
         }
         // 桥选择：按**值**的实际类型判定（嵌套表/字符串值 → push_string 存 ptr；
-        // 曾按声明元素类型选桥——表 push 进 table<i64> 会 push_i64(ptr) 类型错）
+        // 浮点值 → push_f64；曾按声明元素类型选桥——parse_series 把 parse_float
+        // 结果 push 进 i64 表会 push_i64(double) 类型错，Rust 按值类型选桥）
         var suffix = bridge_suffix(elem)
         var pty = types.named(TK_I64)
         var vt = node_types[sstate.child(id, 1)]
         if vt >= 0 && (types.is_table(vt) || types.is_map(vt) || vt == types.named(TK_STR)) {
             suffix = "string"
             pty = types.named(TK_STR)
+        } else if vt >= 0 && (vt == types.named(TK_F64) || vt == types.named(TK_F32)) {
+            suffix = "f64"
+            pty = types.named(TK_F64)
         } else if suffix == "string" {
             pty = types.named(TK_STR)
         } else if suffix == "bool" {
@@ -947,7 +1623,17 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         if p < 0 {
             return -1
         }
-        g_builtin_res = gen_ext_call1("remove", p, types.named(TK_STR), types.named(TK_I32))
+        // remove 返回 i32（0 = 成功）→ bool（对齐 Rust：icmp eq i32, 0；
+        // 曾直接返回 i32 导致 `var ok = file_delete(...)` 存 i1 槽类型错）
+        var r = gen_ext_call1("remove", p, types.named(TK_STR), types.named(TK_I32))
+        if r < 0 {
+            return -1
+        }
+        var ok = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp eq
+        ir.add_operand(ok, r, 0)
+        ir.add_operand(ok, 0, 2)
+        ir.add_operand(ok, 0, 2)  // eq
+        g_builtin_res = ir.get_value(ok)
         return 0
     }
     if nm == "print_err" {
@@ -980,6 +1666,391 @@ func builtin_expr(nm: string, id: i64) -> i64 {
             return -1
         }
         g_builtin_res = gen_ext_call2("tie_regex_find_all", s, types.named(TK_STR), p, types.named(TK_STR), types.named(TK_STR))
+        return 0
+    }
+    // ---------- M4/M6 补齐：系统能力内置（对齐 Rust ir.rs 同名单分支）----------
+    // 数学库（libm，llvmgen 无条件 declare；f64 → f64）。
+    // 整数实参（sqrt(4)）→ sitofp 提升为 f64（LLVM 类型必须匹配）
+    if nm == "sqrt" || nm == "sin" || nm == "cos" || nm == "tan" ||
+        nm == "exp" || nm == "log" || nm == "floor" || nm == "ceil" || nm == "round" {
+        var mv = gen_expr(sstate.child(id, 0))
+        if mv < 0 {
+            return -1
+        }
+        var mvt = node_types[sstate.child(id, 0)]
+        var mf = gen_to_f64(mv, mvt)
+        if mf < 0 {
+            return -1
+        }
+        g_builtin_res = gen_ext_call1(nm, mf, types.named(TK_F64), types.named(TK_F64))
+        return 0
+    }
+    if nm == "pow" {
+        var pv1 = gen_expr(sstate.child(id, 0))
+        if pv1 < 0 {
+            return -1
+        }
+        var pv2 = gen_expr(sstate.child(id, 1))
+        if pv2 < 0 {
+            return -1
+        }
+        var p1t = node_types[sstate.child(id, 0)]
+        var p2t = node_types[sstate.child(id, 1)]
+        var pf1 = gen_to_f64(pv1, p1t)
+        var pf2 = gen_to_f64(pv2, p2t)
+        if pf1 < 0 || pf2 < 0 {
+            return -1
+        }
+        g_builtin_res = gen_ext_call2("pow", pf1, types.named(TK_F64), pf2, types.named(TK_F64), types.named(TK_F64))
+        return 0
+    }
+    // read_line / cwd / msg_get_lang：零参数 → ptr 返回
+    if nm == "read_line" || nm == "cwd" || nm == "msg_get_lang" {
+        g_used_interp = true
+        var zero_v = gen_int_lit_ty(0, types.named(TK_I64))
+        g_builtin_res = gen_ext_call1("tie_" + nm, zero_v, types.named(TK_I64), types.named(TK_STR))
+        return 0
+    }
+    // 单字符串参数 → ptr 返回（list_dir/walk_dir/byte_read 动态表；path_* 堆串；
+    // http_get/msg_t 堆串；path_normalize 堆串）
+    if nm == "list_dir" || nm == "walk_dir" || nm == "byte_read" ||
+        nm == "path_basename" || nm == "path_dirname" || nm == "path_abs" ||
+        nm == "path_normalize" || nm == "http_get" || nm == "msg_t" {
+        g_used_interp = true
+        var sv = gen_expr(sstate.child(id, 0))
+        if sv < 0 {
+            return -1
+        }
+        g_builtin_res = gen_ext_call1("tie_" + nm, sv, types.named(TK_STR), types.named(TK_STR))
+        return 0
+    }
+    if nm == "eval" {
+        // eval：桥名 tie_eval_expr（非 tie_eval——C ABI 桥签名 (ptr) -> ptr）
+        g_used_interp = true
+        var sv = gen_expr(sstate.child(id, 0))
+        if sv < 0 {
+            return -1
+        }
+        g_builtin_res = gen_ext_call1("tie_eval_expr", sv, types.named(TK_STR), types.named(TK_STR))
+        return 0
+    }
+    // 双字符串参数 → ptr 返回（path_join/msg_t_lang/eval_call/regex_find）
+    if nm == "path_join" || nm == "msg_t_lang" || nm == "eval_call" || nm == "regex_find" {
+        g_used_interp = true
+        var a1 = gen_expr(sstate.child(id, 0))
+        if a1 < 0 {
+            return -1
+        }
+        var a2 = gen_expr(sstate.child(id, 1))
+        if a2 < 0 {
+            return -1
+        }
+        g_builtin_res = gen_ext_call2("tie_" + nm, a1, types.named(TK_STR), a2, types.named(TK_STR), types.named(TK_STR))
+        return 0
+    }
+    // 三字符串参数 → ptr（regex_replace：s, pattern, replacement）
+    if nm == "regex_replace" {
+        g_used_interp = true
+        var r1 = gen_expr(sstate.child(id, 0))
+        if r1 < 0 {
+            return -1
+        }
+        var r2 = gen_expr(sstate.child(id, 1))
+        if r2 < 0 {
+            return -1
+        }
+        var r3 = gen_expr(sstate.child(id, 2))
+        if r3 < 0 {
+            return -1
+        }
+        var ats: table<i64> = table_new_i64()
+        var avs: table<i64> = table_new_i64()
+        table_push(ats, types.named(TK_STR))
+        table_push(avs, r1)
+        table_push(ats, types.named(TK_STR))
+        table_push(avs, r2)
+        table_push(ats, types.named(TK_STR))
+        table_push(avs, r3)
+        g_builtin_res = gen_ext_call_typed("tie_regex_replace", ats, avs, types.named(TK_STR))
+        return 0
+    }
+    // regex_group：字符串 + 字符串 + i64 → ptr
+    if nm == "regex_group" {
+        g_used_interp = true
+        var g1 = gen_expr(sstate.child(id, 0))
+        if g1 < 0 {
+            return -1
+        }
+        var g2 = gen_expr(sstate.child(id, 1))
+        if g2 < 0 {
+            return -1
+        }
+        var g3 = gen_expr(sstate.child(id, 2))
+        if g3 < 0 {
+            return -1
+        }
+        var ats: table<i64> = table_new_i64()
+        var avs: table<i64> = table_new_i64()
+        table_push(ats, types.named(TK_STR))
+        table_push(avs, g1)
+        table_push(ats, types.named(TK_STR))
+        table_push(avs, g2)
+        table_push(ats, types.named(TK_I64))
+        table_push(avs, g3)
+        g_builtin_res = gen_ext_call_typed("tie_regex_group", ats, avs, types.named(TK_STR))
+        return 0
+    }
+    // regex_match：字符串 + 字符串 + ok 出参 → i8 → bool
+    if nm == "regex_match" {
+        g_used_interp = true
+        var m1 = gen_expr(sstate.child(id, 0))
+        if m1 < 0 {
+            return -1
+        }
+        var m2 = gen_expr(sstate.child(id, 1))
+        if m2 < 0 {
+            return -1
+        }
+        var mo = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8 ok
+        ir.add_operand(mo, types.named(TK_I8), 2)
+        var mats: table<i64> = table_new_i64()
+        var mavs: table<i64> = table_new_i64()
+        table_push(mats, types.named(TK_STR))
+        table_push(mavs, m1)
+        table_push(mats, types.named(TK_STR))
+        table_push(mavs, m2)
+        table_push(mats, types.named(TK_STR))
+        table_push(mavs, ir.get_value(mo))
+        var mr = gen_ext_call_typed("tie_regex_match", mats, mavs, types.named(TK_I8))
+        if mr < 0 {
+            return -1
+        }
+        var mi = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp ne 0
+        ir.add_operand(mi, mr, 0)
+        ir.add_operand(mi, 0, 2)
+        ir.add_operand(mi, 1, 2)
+        g_builtin_res = ir.get_value(mi)
+        return 0
+    }
+    // 单字符串参数 i8 返回 → bool（file_exists 已有；remove_dir_all/mkdir_all 已有
+    // mkdir_all；此处补 remove_dir_all）
+    if nm == "remove_dir_all" {
+        g_used_interp = true
+        var rv = gen_expr(sstate.child(id, 0))
+        if rv < 0 {
+            return -1
+        }
+        g_builtin_res = gen_bool_bridge1("tie_remove_dir_all", rv, types.named(TK_STR))
+        return 0
+    }
+    // 双字符串参数 i8 返回 → bool（file_copy/file_move/untar_gz/unzip/copy_dir/http_get_file）
+    if nm == "file_copy" || nm == "file_move" || nm == "untar_gz" || nm == "unzip" ||
+        nm == "copy_dir" || nm == "http_get_file" {
+        g_used_interp = true
+        var f1 = gen_expr(sstate.child(id, 0))
+        if f1 < 0 {
+            return -1
+        }
+        var f2 = gen_expr(sstate.child(id, 1))
+        if f2 < 0 {
+            return -1
+        }
+        g_builtin_res = gen_bool_bridge2("tie_" + nm, f1, f2)
+        return 0
+    }
+    // byte_write：路径 + 字节表 → i8 → bool
+    if nm == "byte_write" {
+        g_used_interp = true
+        var w1 = gen_expr(sstate.child(id, 0))
+        if w1 < 0 {
+            return -1
+        }
+        var w2 = gen_expr(sstate.child(id, 1))
+        if w2 < 0 {
+            return -1
+        }
+        g_builtin_res = gen_bool_bridge2("tie_byte_write", w1, w2)
+        return 0
+    }
+    // bit_read：字节表 + 位置 → i64；bit_write：字节表 + 位置 + 位 → i8 → bool
+    if nm == "bit_read" {
+        g_used_interp = true
+        var b1 = gen_expr(sstate.child(id, 0))
+        if b1 < 0 {
+            return -1
+        }
+        var b2 = gen_expr(sstate.child(id, 1))
+        if b2 < 0 {
+            return -1
+        }
+        var ats: table<i64> = table_new_i64()
+        var avs: table<i64> = table_new_i64()
+        table_push(ats, types.named(TK_STR))
+        table_push(avs, b1)
+        table_push(ats, types.named(TK_I64))
+        table_push(avs, b2)
+        g_builtin_res = gen_ext_call_typed("tie_bit_read", ats, avs, types.named(TK_I64))
+        return 0
+    }
+    if nm == "bit_write" {
+        g_used_interp = true
+        var bw1 = gen_expr(sstate.child(id, 0))
+        if bw1 < 0 {
+            return -1
+        }
+        var bw2 = gen_expr(sstate.child(id, 1))
+        if bw2 < 0 {
+            return -1
+        }
+        var bw3 = gen_expr(sstate.child(id, 2))
+        if bw3 < 0 {
+            return -1
+        }
+        var ats: table<i64> = table_new_i64()
+        var avs: table<i64> = table_new_i64()
+        table_push(ats, types.named(TK_STR))
+        table_push(avs, bw1)
+        table_push(ats, types.named(TK_I64))
+        table_push(avs, bw2)
+        table_push(ats, types.named(TK_I64))
+        table_push(avs, bw3)
+        var br = gen_ext_call_typed("tie_bit_write", ats, avs, types.named(TK_I8))
+        if br < 0 {
+            return -1
+        }
+        var bi = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp ne 0
+        ir.add_operand(bi, br, 0)
+        ir.add_operand(bi, 0, 2)
+        ir.add_operand(bi, 1, 2)
+        g_builtin_res = ir.get_value(bi)
+        return 0
+    }
+    // byte_concat：字节表 + 字节表 → 字节表
+    if nm == "byte_concat" {
+        g_used_interp = true
+        var c1 = gen_expr(sstate.child(id, 0))
+        if c1 < 0 {
+            return -1
+        }
+        var c2 = gen_expr(sstate.child(id, 1))
+        if c2 < 0 {
+            return -1
+        }
+        g_builtin_res = gen_ext_call2("tie_byte_concat", c1, types.named(TK_STR), c2, types.named(TK_STR), types.named(TK_STR))
+        return 0
+    }
+    // set_env：双字符串参数 void；msg_set_lang：单字符串参数 void；msg_register：三字符串 void
+    if nm == "set_env" || nm == "msg_set_lang" {
+        g_used_interp = true
+        var e1 = gen_expr(sstate.child(id, 0))
+        if e1 < 0 {
+            return -1
+        }
+        if nm == "set_env" {
+            var e2 = gen_expr(sstate.child(id, 1))
+            if e2 < 0 {
+                return -1
+            }
+            gen_ext_call2v("tie_set_env", e1, types.named(TK_STR), e2, types.named(TK_STR))
+        } else {
+            gen_ext_call1("tie_msg_set_lang", e1, types.named(TK_STR), -1)
+        }
+        g_builtin_res = gen_int_lit(0)  // void：哑值
+        return 0
+    }
+    if nm == "msg_register" {
+        g_used_interp = true
+        var q1 = gen_expr(sstate.child(id, 0))
+        if q1 < 0 {
+            return -1
+        }
+        var q2 = gen_expr(sstate.child(id, 1))
+        if q2 < 0 {
+            return -1
+        }
+        var q3 = gen_expr(sstate.child(id, 2))
+        if q3 < 0 {
+            return -1
+        }
+        var ats: table<i64> = table_new_i64()
+        var avs: table<i64> = table_new_i64()
+        table_push(ats, types.named(TK_STR))
+        table_push(avs, q1)
+        table_push(ats, types.named(TK_STR))
+        table_push(avs, q2)
+        table_push(ats, types.named(TK_STR))
+        table_push(avs, q3)
+        gen_ext_call_typed("tie_msg_register", ats, avs, -1)
+        g_builtin_res = gen_int_lit(0)  // void：哑值
+        return 0
+    }
+    // rand_range：i64 + i64 + ok 出参 → i64（对齐 Rust 桥签名）
+    if nm == "rand_range" {
+        g_used_interp = true
+        var d1 = gen_expr(sstate.child(id, 0))
+        if d1 < 0 {
+            return -1
+        }
+        var d2 = gen_expr(sstate.child(id, 1))
+        if d2 < 0 {
+            return -1
+        }
+        var ro = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8 ok
+        ir.add_operand(ro, types.named(TK_I8), 2)
+        var ats: table<i64> = table_new_i64()
+        var avs: table<i64> = table_new_i64()
+        table_push(ats, types.named(TK_I64))
+        table_push(avs, d1)
+        table_push(ats, types.named(TK_I64))
+        table_push(avs, d2)
+        table_push(ats, types.named(TK_STR))
+        table_push(avs, ir.get_value(ro))
+        g_builtin_res = gen_ext_call_typed("tie_rand_range", ats, avs, types.named(TK_I64))
+        return 0
+    }
+    // table_at：表 + 下标 → 元素（与 t[i] 同语义；元素类型 fallback 判定）
+    if nm == "table_at" {
+        g_used_interp = true
+        var tb = gen_expr(sstate.child(id, 0))
+        if tb < 0 {
+            return -1
+        }
+        var ti = gen_expr(sstate.child(id, 1))
+        if ti < 0 {
+            return -1
+        }
+        // 元素类型：语义节点类型（表实参的 node_types 可能是 TK_TABLE——元素类型
+        // 按 var_table_elem 尽力推断，失败 fallback i64）
+        var elem: i64 = types.named(TK_I64)
+        var tn = sstate.child(id, 0)
+        if s_tags[tn] == 6 {
+            var te = sinfer.var_table_elem(intern.intern(sstate.name_str(tn)))
+            if te >= 0 {
+                elem = te
+            }
+        }
+        var suffix = bridge_suffix(elem)
+        var ret_ty = types.named(TK_I64)
+        if suffix == "string" {
+            ret_ty = types.named(TK_STR)
+        } else if suffix == "f64" {
+            // f64 表元素：返回类型 double（曾落默认 i64 → `call i64 @tie_table_at_f64`
+            // 与 declare 的 double 返回不匹配，opt 报类型错）
+            ret_ty = types.named(TK_F64)
+        } else if suffix == "bool" {
+            ret_ty = types.named(TK_BOOL)
+        }
+        var ok_slot = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
+        ir.add_operand(ok_slot, types.named(TK_I8), 2)
+        var ats: table<i64> = table_new_i64()
+        var avs: table<i64> = table_new_i64()
+        table_push(ats, types.named(TK_STR))
+        table_push(avs, tb)
+        table_push(ats, types.named(TK_I64))
+        table_push(avs, ti)
+        table_push(ats, types.named(TK_STR))
+        table_push(avs, ir.get_value(ok_slot))
+        g_builtin_res = gen_ext_call_typed("tie_table_at_" + suffix, ats, avs, ret_ty)
         return 0
     }
     return -1  // 非内置
@@ -1066,19 +2137,24 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
     // 实参全求值（by_ref 形参 + Var 实参 → 传槽地址跳过 load）
     var nc = sstate.nchild(id)
     var argvals: table<i64> = table_new_i64()
+    var argisref: table<i64> = table_new_i64()  // 并行：ref 实参标志（类型 → ptr）
     var k: i64 = arg_start
     while k < nc {
         var arg_node = sstate.child(id, k)
         var av: i64 = -1
+        var is_ref_arg: i64 = 0
         var arg_idx = k - arg_start  // 实参序号（aoff=1 时 children[0] 是路径节点）
         if arg_idx < nparams {
             // T0.3 by_ref：实参是 Var 时传实参槽地址（局部 alloca %N / 全局 @g），
-            // 函数内 load/store 透过该槽 → 内容修改 + 重绑定都写回调用方
+            // 函数内 load/store 透过该槽 → 内容修改 + 重绑定都写回调用方。
+            // M2.1.8：struct 接收者自动 ref（表 ref 原本 table→ptr 一致，
+            // struct 聚合类型必须显式 ptr——形参已声明 ptr，实参须同型）
             var ref_flag = sp_refs[sg_off[sig] + arg_idx]
             if ref_flag == 1 && s_tags[arg_node] == 6 {
                 var anm = interner.intern(sstate.name_str(arg_node))
                 if scope_get_global(anm) >= 0 {
                     av = g_lookup_alloca
+                    is_ref_arg = 1
                 }
             }
         }
@@ -1086,6 +2162,7 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
             av = gen_expr(arg_node)
         }
         table_push(argvals, av)
+        table_push(argisref, is_ref_arg)
         k = k + 1
     }
     var ty35: i64 = -1
@@ -1101,7 +2178,11 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
     while k < len(argvals) {
         var pty = types.named(TK_I64)
         if k < nparams {
-            pty = ptys[k]
+            if argisref[k] == 1 {
+                pty = types.named(TK_STR)  // ref 实参：槽地址 → ptr
+            } else {
+                pty = ptys[k]
+            }
         }
         ir.add_operand(inst, pty, 2)
         ir.add_operand(inst, argvals[k], 0)
@@ -1115,10 +2196,22 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
 
 // 方法调用（MethodCall，tag 18）：receiver + 方法名 → 命名空间函数全名。
 // receiver 是 Path/Var/FieldAccess 链（未绑定）→ ns 调用；绑定实例 → struct
-// 方法（driver 树无 struct，防御返回 -1）。
+// 方法转发（obj.method() → StructName::method(obj, ...)，语义层已校验签名）。
 func gen_method_call(id: i64) -> i64 {
     var recv = sstate.child(id, 0)
     var mname = sstate.name_str(id)
+    // 接收者是已绑定实例（局部/全局变量）且类型为 struct → 实例方法转发：
+    // 函数全名 = <struct 名>::<方法>，实参 = [receiver 值] + 显式实参
+    if s_tags[recv] == 6 {
+        var rnid = interner.intern(sstate.name_str(recv))
+        if scope_get_global(rnid) >= 0 && types.kind(g_lookup_ty) == K_STRUCT {
+            var si = g_lookup_ty - BASE_STRUCT
+            var full = sstate.struct_name_of(si) + "::" + mname
+            if sstate.fn_sig(full) >= 0 {
+                return gen_struct_method_call(full, id, recv, g_lookup_ty)
+            }
+        }
+    }
     var prefix = sinfer.recv_path_name(recv)
     if prefix == "" {
         sm_err_msg = "方法调用接收者不可解析（方法 " + mname + "，函数 " + g_cur_fn_name + "）"
@@ -1127,6 +2220,397 @@ func gen_method_call(id: i64) -> i64 {
     var full = prefix + "::" + mname
     // 实参从 children[1] 开始（children[0] 是 receiver）
     return gen_user_call_from(full, id, 1)
+}
+
+// struct 实例方法转发调用：函数 = StructName::method，首参 = receiver 聚合值，
+// 其余实参 = children[1..]。操作数布局与 gen_user_call_from 完全一致。
+func gen_struct_method_call(full: string, id: i64, recv: i64, rty: i64) -> i64 {
+    var sig = sstate.fn_sig(full)
+    if sig < 0 {
+        sm_err_msg = "函数 '" + full + "' 无签名（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var ret_ty = fn_ret_ty(sig)
+    var nparams = fn_nparams(sig)
+    var ptys = fn_param_tys(sig)
+    // 首参 ref 标志（M2.1.8 struct 接收者自动按引用）：sp_refs[sg_off[sig] + 0]
+    var first_ref = 0
+    var sgo = sg_off[sig]
+    if sgo >= 0 && sgo < len(sp_refs) {
+        first_ref = sp_refs[sgo]
+    }
+    var sym = interner.intern(full)
+    llvmgen.call_sym_reg(sym)
+    // 首参 = receiver（struct 接收者按引用：传槽地址；否则按值传聚合）
+    var argvals: table<i64> = table_new_i64()
+    var argtys: table<i64> = table_new_i64()  // 并行实参类型（ref 首参 → ptr）
+    var rv: i64 = -1
+    if first_ref == 1 {
+        rv = gen_agg_addr(recv, rty)  // 接收者槽地址（Var → alloca；表达式落内存）
+    } else {
+        rv = gen_expr(recv)
+    }
+    if rv < 0 {
+        return -1
+    }
+    table_push(argvals, rv)
+    if first_ref == 1 {
+        table_push(argtys, types.named(TK_STR))  // 引用 → ptr
+    } else {
+        table_push(argtys, rty)
+    }
+    // 其余实参（children[1..]）
+    var nc = sstate.nchild(id)
+    var k: i64 = 1
+    while k < nc {
+        var av = gen_expr(sstate.child(id, k))
+        if av < 0 {
+            return -1
+        }
+        table_push(argvals, av)
+        var apty = types.named(TK_I64)
+        if k < nparams {
+            apty = ptys[k]
+        }
+        table_push(argtys, apty)
+        k = k + 1
+    }
+    // 生成 call（同 gen_user_call_from 尾部；实参类型用 argtys 并行表）
+    var ty35: i64 = -1
+    if ret_ty != types.named(TK_VOID) {
+        ty35 = ret_ty
+    }
+    var inst = ir.new_inst(g_cur_block, 35, ty35)  // call
+    ir.add_operand(inst, sym, 0)
+    ir.add_operand(inst, ret_ty, 2)
+    k = 0
+    while k < len(argvals) {
+        ir.add_operand(inst, argtys[k], 2)
+        ir.add_operand(inst, argvals[k], 0)
+        k = k + 1
+    }
+    if ret_ty == types.named(TK_VOID) {
+        return gen_int_lit(0)  // void 结果：哑值（调用方丢弃）
+    }
+    return ir.get_value(inst)
+}
+
+// ==================== 元组 / struct 聚合（M4/P7 扩展）====================
+// 聚合值表示：LLVM 结构体 {T0, T1, ...}——寄存器中是聚合值，变量/参数在
+// alloca 聚合槽。字段读写统一走"取地址 → agg_gep → load/store"。
+// 对齐 Rust ir.rs：元组构造 insertvalue、字段访问 extractvalue/GEP+load 语义
+// 完全一致；tie-IR 用 alloca+store+load 构造聚合值、agg_gep 取字段地址。
+
+// 聚合类型 → 字段索引（元组：命名匹配 + ItemN/数字；struct：命名匹配）
+func agg_field_index(ty: i64, fname: string) -> i64 {
+    var k = types.kind(ty)
+    if k == K_TUPLE {
+        var idx = ty - BASE_TUPLE
+        var off = tup_offs[idx]
+        var n = tup_n[idx]
+        var i: i64 = 0
+        while i < n {
+            var fnid = tup_names[off + i]
+            if fnid >= 0 && intern.lookup(fnid) == fname {
+                return i
+            }
+            i = i + 1
+        }
+        // 匿名元组：ItemN（解构展开，N 从 1 起）或纯数字下标（.0/.1）
+        return num_field_index(fname)
+    }
+    if k == K_STRUCT {
+        var idx2 = ty - BASE_STRUCT
+        var off2 = cls_fldoff[idx2]
+        var n2 = cls_nfld[idx2]
+        var i2: i64 = 0
+        while i2 < n2 {
+            var fnid2 = fld_names[off2 + i2]
+            if fnid2 >= 0 && intern.lookup(fnid2) == fname {
+                return i2
+            }
+            i2 = i2 + 1
+        }
+    }
+    return -1
+}
+
+// 聚合类型 → 字段类型 id
+func agg_field_ty(ty: i64, idx: i64) -> i64 {
+    var k = types.kind(ty)
+    if k == K_TUPLE {
+        var t = ty - BASE_TUPLE
+        return tup_tys[tup_offs[t] + idx]
+    }
+    if k == K_STRUCT {
+        var s = ty - BASE_STRUCT
+        return fld_tys[cls_fldoff[s] + idx]
+    }
+    return types.named(TK_I64)
+}
+
+// 数字/ItemN 字段名解析：".0"/".1" → 字段下标；".Item1"/".Item2" → N-1。
+// 非法数字串返回 -1（parse_int 对非法输入报错，须先自行解析）。
+func num_field_index(fname: string) -> i64 {
+    var n = str_len(fname)
+    var start = 0
+    if n >= 5 && ig_slice(fname, 0, 4) == "Item" {
+        start = 4
+    }
+    var val: i64 = 0
+    var i: i64 = start
+    while i < n {
+        var cc = char_code(str_char(fname, i))
+        if cc < 48 || cc > 57 {
+            return -1  // 非数字字段名（未命中）
+        }
+        val = val * 10 + (cc - 48)
+        i = i + 1
+    }
+    if start == 4 {
+        return val - 1  // ItemN → N-1（1-based）
+    }
+    return val  // 纯数字 → 字段下标
+}
+
+// 取聚合 base 的地址（alloca 指针）：Var → 作用域槽地址；表达式 → 求聚合值
+// 后 alloca + store（寄存器聚合值落内存，供 GEP 寻址）。
+func gen_agg_addr(base: i64, agg: i64) -> i64 {
+    if s_tags[base] == 6 {
+        var nm = interner.intern(sstate.name_str(base))
+        if scope_get_global(nm) >= 0 && g_lookup_is_global == 0 {
+            return g_lookup_alloca  // 局部聚合变量槽
+        }
+    }
+    // 表达式（构造调用 / 函数返回 / 字段链）→ 落内存
+    var v = gen_expr(base)
+    if v < 0 {
+        return -1
+    }
+    var alloca = ir.new_inst(g_cur_block, 20, agg)  // alloca 聚合
+    ir.add_operand(alloca, agg, 2)
+    var ap = ir.get_value(alloca)
+    var st = ir.new_inst(g_cur_block, 22, -1)  // store 聚合值
+    ir.add_operand(st, agg, 2)
+    ir.add_operand(st, v, 0)
+    ir.add_operand(st, ap, 0)
+    return ap
+}
+
+// 元组字面量 (a, b) → 聚合值：alloca 聚合 → 逐字段 agg_gep + store → load。
+// 字段类型取自语义层 tup_tys（node_types[id] 已登记元组类型）。
+func gen_tuple_lit(id: i64) -> i64 {
+    var agg = node_types[id]
+    if agg < 0 {
+        sm_err_msg = "元组字面量缺少语义类型（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    return gen_tuple_lit_typed(id, agg)
+}
+
+// 元组字面量按**目标类型**构造（类型标注适配）：`var w: (i32, i64) = (7, 8)`
+// 时语义层把字面量推断为 (i64,i64)，必须按目标 (i32,i64) 构造——IntLit 字段
+// 按目标字段类型生成常量（i32 槽存 i32 值；f64 槽转浮点字面量）。
+func gen_tuple_lit_typed(id: i64, agg: i64) -> i64 {
+    var alloca = ir.new_inst(g_cur_block, 20, agg)  // alloca
+    ir.add_operand(alloca, agg, 2)
+    var ap = ir.get_value(alloca)
+    var nc = sstate.nchild(id)
+    var i: i64 = 0
+    while i < nc {
+        var f = sstate.child(id, i)  // N_TUPLE_FIELD
+        var vnode = sstate.child(f, 0)
+        var fty = agg_field_ty(agg, i)
+        var v: i64 = -1
+        if s_tags[vnode] == 0 {
+            // IntLit：按目标字段类型生成常量（i32 槽 i32 值 / f64 槽浮点文本）
+            if fty == types.named(TK_F64) || fty == types.named(TK_F32) {
+                v = gen_float_lit(interner.intern(to_string(s_vals[vnode]) + ".0"))
+            } else {
+                v = gen_int_lit_ty(s_vals[vnode], fty)
+            }
+        } else {
+            v = gen_expr(vnode)
+        }
+        if v < 0 {
+            return -1
+        }
+        var gp = ir.new_inst(g_cur_block, 27, agg)  // agg_gep
+        ir.add_operand(gp, ap, 0)
+        ir.add_operand(gp, i, 2)
+        var gpp = ir.get_value(gp)
+        var st = ir.new_inst(g_cur_block, 22, -1)  // store
+        ir.add_operand(st, fty, 2)
+        ir.add_operand(st, v, 0)
+        ir.add_operand(st, gpp, 0)
+        i = i + 1
+    }
+    var ld = ir.new_inst(g_cur_block, 21, agg)  // load 聚合值
+    ir.add_operand(ld, ap, 0)
+    return ir.get_value(ld)
+}
+
+// 字段访问（读）：base.field → 地址 + agg_gep + load。
+func gen_field_access(id: i64) -> i64 {
+    var base = sstate.child(id, 0)
+    var fname = sstate.name_str(id)
+    var base_ty = node_types[base]
+    var bk = types.kind(base_ty)
+    if base_ty < 0 || (bk != K_TUPLE && bk != K_STRUCT) {
+        sm_err_msg = "字段访问 '.' 的对象不是元组/struct（类型 " + types.type_name(base_ty) + "，函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var fidx = agg_field_index(base_ty, fname)
+    if fidx < 0 {
+        sm_err_msg = "字段 '" + fname + "' 解析失败（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var fty = agg_field_ty(base_ty, fidx)
+    var addr = gen_agg_addr(base, base_ty)
+    if addr < 0 {
+        return -1
+    }
+    var gp = ir.new_inst(g_cur_block, 27, base_ty)  // agg_gep
+    ir.add_operand(gp, addr, 0)
+    ir.add_operand(gp, fidx, 2)
+    var gpp = ir.get_value(gp)
+    var ld = ir.new_inst(g_cur_block, 21, fty)  // load
+    ir.add_operand(ld, gpp, 0)
+    return ir.get_value(ld)
+}
+
+// 字段赋值（FieldAssign 115）：base.field op= value → 地址 + agg_gep + store。
+// 复合赋值（op ≥ 0）先 load 旧值运算再写回（对齐 gen_compound_assign）。
+func gen_field_assign(id: i64) -> i64 {
+    var fname = sstate.name_str(id)
+    var base = sstate.child(id, 0)
+    var val = sstate.child(id, 1)
+    var op = s_vals[id]
+    var base_ty = node_types[base]
+    var bk = types.kind(base_ty)
+    if base_ty < 0 || (bk != K_TUPLE && bk != K_STRUCT) {
+        sm_err_msg = "字段赋值的目标不是元组/struct（类型 " + types.type_name(base_ty) + "，函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var fidx = agg_field_index(base_ty, fname)
+    if fidx < 0 {
+        sm_err_msg = "字段 '" + fname + "' 解析失败（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var fty = agg_field_ty(base_ty, fidx)
+    var addr = gen_agg_addr(base, base_ty)
+    if addr < 0 {
+        return -1
+    }
+    var gp = ir.new_inst(g_cur_block, 27, base_ty)  // agg_gep
+    ir.add_operand(gp, addr, 0)
+    ir.add_operand(gp, fidx, 2)
+    var gpp = ir.get_value(gp)
+    if op >= 0 {
+        // 复合字段赋值：load 旧值 → 运算 → store
+        var cur = ir.new_inst(g_cur_block, 21, fty)  // load
+        ir.add_operand(cur, gpp, 0)
+        var cur_v = ir.get_value(cur)
+        var rv = gen_expr(val)
+        if rv < 0 {
+            return -1
+        }
+        var res = gen_compound_assign(op, cur_v, rv, fty)
+        if res < 0 {
+            sm_err_msg = "复合字段赋值运算失败（字段 " + fname + "，函数 " + g_cur_fn_name + "）"
+            return -1
+        }
+        var st = ir.new_inst(g_cur_block, 22, -1)  // store
+        ir.add_operand(st, fty, 2)
+        ir.add_operand(st, res, 0)
+        ir.add_operand(st, gpp, 0)
+        return 0
+    }
+    var vv = gen_expr(val)
+    if vv < 0 {
+        return -1
+    }
+    var st2 = ir.new_inst(g_cur_block, 22, -1)  // store
+    ir.add_operand(st2, fty, 2)
+    ir.add_operand(st2, vv, 0)
+    ir.add_operand(st2, gpp, 0)
+    return 0
+}
+
+// struct 名判定（构造调用：Call 名命中 st_keys）
+func is_struct_name(nm: string) -> bool {
+    var nid = interner.intern(nm)
+    return sstate.bs_find(st_keys, nid) >= 0
+}
+
+// struct 构造调用：StructName(args...) → 聚合值。
+// 布局：alloca 聚合 → 逐字段 store（实参覆盖前 n 个；缺省字段零值——
+// 字段默认字面量未登记，与 Rust 行为差异留待后续）→ load 聚合值。
+func gen_struct_construct(id: i64, nm: string) -> i64 {
+    var nid = interner.intern(nm)
+    var sidx = sstate.bs_find(st_keys, nid)
+    if sidx < 0 {
+        sm_err_msg = "struct '" + nm + "' 未定义（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var si = st_vals[sidx]
+    var agg = types.struct_of(si)
+    var alloca = ir.new_inst(g_cur_block, 20, agg)  // alloca
+    ir.add_operand(alloca, agg, 2)
+    var ap = ir.get_value(alloca)
+    var off = cls_fldoff[si]
+    var nf = cls_nfld[si]
+    var nc = sstate.nchild(id)
+    var i: i64 = 0
+    while i < nf {
+        var fty = fld_tys[off + i]
+        var v: i64 = -1
+        if i < nc {
+            v = gen_expr(sstate.child(id, i))
+            if v < 0 {
+                return -1
+            }
+        } else if off + i < len(fld_defs) && fld_defs[off + i] >= 0 {
+            // 字段默认值（`var y: i64 = 10` → Point(5) 缺省 y 用 10）
+            v = gen_expr(fld_defs[off + i])
+            if v < 0 {
+                return -1
+            }
+        } else {
+            // 无默认值字段：零值（i64=0 / string 空串指针 / bool false）
+            v = gen_default_val(fty)
+        }
+        var gp = ir.new_inst(g_cur_block, 27, agg)  // agg_gep
+        ir.add_operand(gp, ap, 0)
+        ir.add_operand(gp, i, 2)
+        var gpp = ir.get_value(gp)
+        var st = ir.new_inst(g_cur_block, 22, -1)  // store
+        ir.add_operand(st, fty, 2)
+        ir.add_operand(st, v, 0)
+        ir.add_operand(st, gpp, 0)
+        i = i + 1
+    }
+    var ld = ir.new_inst(g_cur_block, 21, agg)  // load 聚合值
+    ir.add_operand(ld, ap, 0)
+    return ir.get_value(ld)
+}
+
+// 类型零值生成：i64/整数 → const 0；string/ptr → 空串全局常量；
+// bool → false；f64 → 0.0（const_f）；i8/i32 等 → 0 常量
+func gen_default_val(ty: i64) -> i64 {
+    if ty == types.named(TK_STR) || types.is_table(ty) || types.is_map(ty) {
+        return gen_str_lit(interner.intern("\"\""))  // 空串指针
+    }
+    if ty == types.named(TK_F64) || ty == types.named(TK_F32) {
+        return gen_float_lit(interner.intern("0.0"))
+    }
+    if ty == types.named(TK_BOOL) {
+        return gen_bool_lit(0)
+    }
+    if ty == types.named(TK_I8) || ty == types.named(TK_CHAR) || ty == types.named(TK_TRIT) {
+        return gen_int_lit_ty(0, ty)
+    }
+    return gen_int_lit_ty(0, types.named(TK_I64))
 }
 
 // 表字面量 → 动态表指针（tie_table_new + 逐元素 push）。
@@ -1162,6 +2646,9 @@ func gen_table_lit(id: i64) -> i64 {
         var pty = types.named(TK_I64)
         if suffix == "string" {
             pty = types.named(TK_STR)
+        } else if suffix == "f64" {
+            // 浮点表字面量 [1.0, 2.0]：push_f64 值参数 double
+            pty = types.named(TK_F64)
         } else if suffix == "bool" {
             pty = types.named(TK_BOOL)
         }
@@ -1206,6 +2693,12 @@ func is_libc_sym(sym: string) -> bool {
     if sym == "exit" || sym == "remove" {
         return true
     }
+    // libm 数学函数（llvmgen 无条件 declare；f64 → f64）
+    if sym == "sqrt" || sym == "sin" || sym == "cos" || sym == "tan" ||
+        sym == "exp" || sym == "log" || sym == "floor" || sym == "ceil" ||
+        sym == "round" || sym == "pow" {
+        return true
+    }
     return false
 }
 
@@ -1216,6 +2709,52 @@ func gen_ext_call1(sym: string, v: i64, vty: i64, ret_ty: i64) -> i64 {
     table_push(ats, vty)
     table_push(avs, v)
     return gen_ext_call_typed(sym, ats, avs, ret_ty)
+}
+
+// 符号扩展：src 类型值 → dst 类型（sext opcode 19）。trit/窄整数提升用。
+func gen_sext(v: i64, src_ty: i64, dst_ty: i64) -> i64 {
+    var sext = ir.new_inst(g_cur_block, 19, dst_ty)
+    ir.add_operand(sext, src_ty, 2)  // 源类型 IMM
+    ir.add_operand(sext, v, 0)
+    return ir.get_value(sext)
+}
+
+// 整数 → f64 提升（sitofp opcode 28）：数学函数整数实参（sqrt(4)）转浮点。
+// 已是 f64/f32 直传；窄整数/无符号按有符号 sitofp（tie 整数有符号语义）。
+func gen_to_f64(v: i64, vt: i64) -> i64 {
+    if types.is_int(vt) {
+        var s = ir.new_inst(g_cur_block, 28, types.named(TK_F64))  // sitofp
+        ir.add_operand(s, vt, 2)  // 源类型 IMM
+        ir.add_operand(s, v, 0)
+        return ir.get_value(s)
+    }
+    return v  // 已 f64/f32（或未知 → 直传）
+}
+
+// i8 返回桥 → bool（i1）：call i8 → icmp ne i8 %r, 0（对齐 Rust i8→i1 转换）
+func gen_bool_bridge1(sym: string, v: i64, vty: i64) -> i64 {
+    var r = gen_ext_call1(sym, v, vty, types.named(TK_I8))
+    if r < 0 {
+        return -1
+    }
+    var inst = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp ne
+    ir.add_operand(inst, r, 0)
+    ir.add_operand(inst, 0, 2)
+    ir.add_operand(inst, 1, 2)  // ne
+    return ir.get_value(inst)
+}
+
+// 双字符串参数 i8 返回桥 → bool（file_copy/file_move/untar_gz/unzip/copy_dir 等）
+func gen_bool_bridge2(sym: string, v1: i64, v2: i64) -> i64 {
+    var r = gen_ext_call2(sym, v1, types.named(TK_STR), v2, types.named(TK_STR), types.named(TK_I8))
+    if r < 0 {
+        return -1
+    }
+    var inst = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp ne
+    ir.add_operand(inst, r, 0)
+    ir.add_operand(inst, 0, 2)
+    ir.add_operand(inst, 1, 2)  // ne
+    return ir.get_value(inst)
 }
 
 // 便捷：双参数桥（返回非 void）
@@ -1355,7 +2894,14 @@ func gen_index_read(id: i64) -> i64 {
     if s_tags[base] == 6 {
         var bname = interner.intern(sstate.name_str(base))
         var matched: bool = false
-        if scope_get(bname) >= 0 && types.is_table(g_lookup_ty) {
+        // irgen 自维护表变量元素类型（table_new_f64() 变量；语义层 lv_telem
+        // 已过期）——最高优先级，f64 表读取必须选 at_f64 桥
+        var tv0 = tblvar_get(bname)
+        if tv0 >= 0 {
+            elem = tv0
+            matched = true
+        }
+        if !matched && scope_get(bname) >= 0 && types.is_table(g_lookup_ty) {
             var le = types.table_elem(g_lookup_ty)
             if le > 0 {
                 elem = le
@@ -1401,6 +2947,10 @@ func gen_index_read(id: i64) -> i64 {
     var ret_ty = types.named(TK_I64)
     if suffix == "string" {
         ret_ty = types.named(TK_STR)
+    } else if suffix == "f64" {
+        // f64 表元素：返回类型 double（曾落默认 i64 → call i64 @tie_table_at_f64
+        // 与 declare double 返回不匹配）
+        ret_ty = types.named(TK_F64)
     } else if suffix == "bool" {
         ret_ty = types.named(TK_BOOL)
     }
@@ -1425,6 +2975,7 @@ func gen_index_assign(id: i64) -> i64 {
     g_used_interp = true
     var target = sstate.child(id, 0)
     var val = sstate.child(id, 1)
+    var op = s_vals[id]  // 复合赋值码（-1 普通；0..17，对齐 B_*）
     // 目标必须是 Index：children=[base, index]
     var base = sstate.child(target, 0)
     var idx = sstate.child(target, 1)
@@ -1434,10 +2985,6 @@ func gen_index_assign(id: i64) -> i64 {
     }
     var iv = gen_expr(idx)
     if iv < 0 {
-        return -1
-    }
-    var v = gen_expr(val)
-    if v < 0 {
         return -1
     }
     // 元素类型
@@ -1460,8 +3007,44 @@ func gen_index_assign(id: i64) -> i64 {
     var pty = types.named(TK_I64)
     if suffix == "string" {
         pty = types.named(TK_STR)
+    } else if suffix == "f64" {
+        // f64 表元素：set 桥值参数 double（曾落默认 i64 →
+        // tie_table_set_f64(..., i64 %double) 类型错）
+        pty = types.named(TK_F64)
     } else if suffix == "bool" {
         pty = types.named(TK_BOOL)
+    }
+    // 复合赋值（t[i] += v）：先读旧值（tie_table_at 带 ok）→ 运算 → 写回
+    var v: i64 = -1
+    if op >= 0 {
+        var ats_r: table<i64> = table_new_i64()
+        var avs_r: table<i64> = table_new_i64()
+        table_push(ats_r, types.named(TK_STR))
+        table_push(avs_r, t)
+        table_push(ats_r, types.named(TK_I64))
+        table_push(avs_r, iv)
+        var ok_r = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
+        ir.add_operand(ok_r, types.named(TK_I8), 2)
+        table_push(ats_r, types.named(TK_STR))
+        table_push(avs_r, ir.get_value(ok_r))
+        var old = gen_ext_call_typed("tie_table_at_" + suffix, ats_r, avs_r, pty)
+        if old < 0 {
+            return -1
+        }
+        var rv = gen_expr(val)
+        if rv < 0 {
+            return -1
+        }
+        v = gen_compound_assign(op, old, rv, pty)
+        if v < 0 {
+            sm_err_msg = "下标复合赋值运算失败（函数 " + g_cur_fn_name + "）"
+            return -1
+        }
+    } else {
+        v = gen_expr(val)
+        if v < 0 {
+            return -1
+        }
     }
     var ats: table<i64> = table_new_i64()
     var avs: table<i64> = table_new_i64()
@@ -1491,35 +3074,87 @@ func gen_switch(id: i64) -> i64 {
     if sv < 0 {
         return -1
     }
+    // subject 类型分派：字符串 → strcmp 比较链；整数/char → icmp 比较链
+    var subj_is_str = node_types[subject] == types.named(TK_STR)
     var ncases = s_aux[id]
     var exit_blk = ir.new_block(g_cur_func, interner.intern("sw.exit"))
-    // 逐个 case 比较链
+    // 逐个 case：PatternList 多模式（任一命中 → body；含 Range 范围模式）
     var k: i64 = 0
     while k < ncases {
         var case_node = sstate.child(id, 1 + k)
         var pl = sstate.child(case_node, 0)
         var body = sstate.child(case_node, 2)
-        var pat = sstate.child(pl, 0)  // 单值模式（driver 树 case 均单值字符串字面量）
-        var pv = gen_expr(pat)
-        if pv < 0 {
-            return -1
-        }
-        // strcmp(sv, pv) == 0
-        var cmp = gen_ext_call2("strcmp", sv, types.named(TK_STR), pv, types.named(TK_STR), types.named(TK_I32))
-        if cmp < 0 {
-            return -1
-        }
-        var is_eq = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
-        ir.add_operand(is_eq, cmp, 0)
-        ir.add_operand(is_eq, 0, 2)
-        ir.add_operand(is_eq, 0, 2)  // eq
-        var eq_v = ir.get_value(is_eq)
         var body_blk = ir.new_block(g_cur_func, interner.intern("sw.body"))
         var next_blk = ir.new_block(g_cur_func, interner.intern("sw.next"))
-        var cb = ir.new_inst(g_cur_block, 31, -1)
-        ir.add_operand(cb, eq_v, 0)
-        ir.add_operand(cb, body_blk, 1)
-        ir.add_operand(cb, next_blk, 1)
+        var npat = sstate.nchild(pl)
+        // 逐个模式比较链：eq → body；ne → 下一模式块
+        var i: i64 = 0
+        while i < npat {
+            var pat = sstate.child(pl, i)
+            var eq_v: i64 = -1
+            if s_tags[pat] == 11 {
+                // Range 模式（case 3..7 → sv >= 3 && sv < 7）
+                var rs = gen_expr(sstate.child(pat, 0))
+                if rs < 0 {
+                    return -1
+                }
+                var re = gen_expr(sstate.child(pat, 1))
+                if re < 0 {
+                    return -1
+                }
+                var ge = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp sge
+                ir.add_operand(ge, sv, 0)
+                ir.add_operand(ge, rs, 0)
+                ir.add_operand(ge, 5, 2)  // sge
+                var ge_v = ir.get_value(ge)
+                var lt = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp slt
+                ir.add_operand(lt, sv, 0)
+                ir.add_operand(lt, re, 0)
+                ir.add_operand(lt, 2, 2)  // slt
+                var lt_v = ir.get_value(lt)
+                var and = ir.new_inst(g_cur_block, 6, types.named(TK_BOOL))  // and i1
+                ir.add_operand(and, ge_v, 0)
+                ir.add_operand(and, lt_v, 0)
+                eq_v = ir.get_value(and)
+            } else {
+                var pv = gen_expr(pat)
+                if pv < 0 {
+                    return -1
+                }
+                if subj_is_str {
+                    // 字符串比较：strcmp(sv, pv) == 0
+                    var cmp = gen_ext_call2("strcmp", sv, types.named(TK_STR), pv, types.named(TK_STR), types.named(TK_I32))
+                    if cmp < 0 {
+                        return -1
+                    }
+                    var is_eq = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+                    ir.add_operand(is_eq, cmp, 0)
+                    ir.add_operand(is_eq, 0, 2)
+                    ir.add_operand(is_eq, 0, 2)  // eq
+                    eq_v = ir.get_value(is_eq)
+                } else {
+                    // 整数/char 比较：icmp eq（值可能为 i64 整数或 i32 char——
+                    // 以 sv 定义类型为准，llvmgen icmp 按 lhs 定义类型选宽度）
+                    var is_eq = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+                    ir.add_operand(is_eq, sv, 0)
+                    ir.add_operand(is_eq, pv, 0)
+                    ir.add_operand(is_eq, 0, 2)  // eq
+                    eq_v = ir.get_value(is_eq)
+                }
+            }
+            var np_blk = ir.new_block(g_cur_func, interner.intern("sw.np"))
+            var cb = ir.new_inst(g_cur_block, 31, -1)
+            ir.add_operand(cb, eq_v, 0)
+            ir.add_operand(cb, body_blk, 1)
+            ir.add_operand(cb, np_blk, 1)
+            g_cur_block = np_blk
+            i = i + 1
+        }
+        // 所有模式未命中 → next case
+        if !block_terminated() {
+            var bnx = ir.new_inst(g_cur_block, 30, -1)  // br next
+            ir.add_operand(bnx, next_blk, 1)
+        }
         // body 块
         g_cur_block = body_blk
         var bb = gen_block_stmts(body)
@@ -1604,6 +3239,62 @@ func gen_println(id: i64, newline: bool) -> i64 {
         ir.add_operand(inst2, sval2, 0)
         return ir.get_value(inst2)
     }
+    // 浮点参数（f64/f32）：格式 "%f"（printf 变参要求 double，f32 需 fpext 提升——
+    // 语义层 f32 场景罕见，按 f64 处理；f32 值经 fpext 指令提升）
+    // num 宽类型变量（语义 node_types=TK_NUM）按槽类型补判——`var b: num = 3.14`
+    // 归约后槽是 f64，node_types 仍是 TK_NUM（曾误走 %lld 打印指针值）
+    var f_is_f = node_types[arg] == types.named(TK_F64) || node_types[arg] == types.named(TK_F32)
+    if !f_is_f && node_types[arg] == types.named(TK_NUM) && s_tags[arg] == 6 {
+        var fnid = interner.intern(sstate.name_str(arg))
+        if scope_get(fnid) >= 0 && types.is_float(g_lookup_ty) {
+            f_is_f = true
+        }
+    }
+    if f_is_f {
+        var fv = gen_expr(arg)
+        if fv < 0 {
+            return -1
+        }
+        var fref: i64 = fv
+        if node_types[arg] == types.named(TK_F32) {
+            // f32 → f64 提升（printf 变参提升规则；fpext 无专用 opcode，
+            // 用 fsub 0.0 保留值不可行——f32 值作为 f64 操作数需转换指令。
+            // 简化：tie 语义层 f32 推断均落 f64，防御性按 double 直传）
+        }
+        var fmt = interner.intern("%f" + nl)
+        var inst = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
+        ir.add_operand(inst, fmt, 0)
+        ir.add_operand(inst, fref, 0)
+        return ir.get_value(inst)
+    }
+    // 字符参数（char）：格式 "%c"（i32 值，直传）
+    if node_types[arg] == types.named(TK_CHAR) {
+        var cv = gen_expr(arg)
+        if cv < 0 {
+            return -1
+        }
+        var fmt = interner.intern("%c" + nl)
+        var inst = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
+        ir.add_operand(inst, fmt, 0)
+        ir.add_operand(inst, cv, 0)
+        return ir.get_value(inst)
+    }
+    // trit 参数：格式 "%d"（i8 → sext i32，printf 变参提升；对齐 Rust i8/i16 分支）
+    if node_types[arg] == types.named(TK_TRIT) {
+        var tv = gen_expr(arg)
+        if tv < 0 {
+            return -1
+        }
+        var sext = ir.new_inst(g_cur_block, 19, types.named(TK_I32))  // sext i8→i32
+        ir.add_operand(sext, types.named(TK_I8), 2)
+        ir.add_operand(sext, tv, 0)
+        var sv = ir.get_value(sext)
+        var fmt = interner.intern("%d" + nl)
+        var inst = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
+        ir.add_operand(inst, fmt, 0)
+        ir.add_operand(inst, sv, 0)
+        return ir.get_value(inst)
+    }
     // 整数参数（i64）：格式 "%lld\n"
     var av = gen_expr(arg)
     if av < 0 {
@@ -1630,17 +3321,40 @@ func gen_stmt(id: i64) -> i64 {
             if ty < 0 {
                 return -1
             }
+            // 宽类型归约：num/text/misc 是宽类型框（对齐 Rust 语义层展开），
+            // llvm_ty 无映射（兜底 ptr）——按 init 的实际推断类型定槽型：
+            //   num + 整数 → i64；num + 浮点 → f64；text + 字符串 → ptr；
+            //   misc + bool → i1
+            if init >= 0 && (ty == types.named(TK_NUM) || ty == types.named(TK_TEXT) ||
+                ty == types.named(TK_MISC)) {
+                var wt = node_types[init]
+                if wt >= 0 {
+                    ty = wt
+                }
+            }
         } else if init >= 0 {
             // 无类型标注：按初始化表达式的推断类型定槽型。
             // 表/映射/字符串 → TK_STR（ptr 槽：表指针 / 字符串指针统一 ptr，
             // 与 llvmgen store 的 to_ptr 转换配套）；bool → TK_BOOL（i1 槽，
             // icmp 结果是 i1——曾默认 i64 槽导致 store i64 %i1 类型错）；
+            // 元组/struct → 聚合类型 id（alloca {..} 聚合槽）；
             // 其余默认 i64。
             var it = node_types[init]
             if it >= 0 && (types.is_table(it) || types.is_map(it) || it == types.named(TK_STR)) {
                 ty = types.named(TK_STR)
+            } else if it == types.named(TK_TRIT) {
+                // trit：i8 槽（compare() 返回 trit 变量——曾落入 is_bool_like
+                // 判为 i1 槽，store i8 %i1 类型错）
+                ty = types.named(TK_TRIT)
             } else if it >= 0 && types.is_bool_like(it) {
                 ty = types.named(TK_BOOL)
+            } else if it >= 0 && types.is_float(it) {
+                // 浮点推断（f64/f32）：mean(...) 返回 f64 → alloca double 槽
+                //（曾落默认 i64 → store i64 %double 类型错）
+                ty = it
+            } else if it >= 0 && (types.kind(it) == K_TUPLE || types.kind(it) == K_STRUCT) {
+                // 聚合变量：alloca 聚合槽，init（构造调用/元组字面量/返回）求聚合值
+                ty = it
             }
         }
         // alloca + store
@@ -1654,8 +3368,21 @@ func gen_stmt(id: i64) -> i64 {
             // 其余表达式走 gen_expr（结果恒 i64，与 llvmgen store 的 vty 匹配
             // 需初始化类型为 i64——非 i64 初始化目前仅支持整数常量）。
             var iv: i64 = -1
-            if s_tags[init] == 0 {
+            if s_tags[init] == 4 && ty == types.named(TK_TRIT) {
+                // BoolLit 适配 trit（语义层 node_types 仍标 TK_BOOL，但标注类型
+                // trit 需生成 i8 值：true→1 / false→-1——否则 store i8 %i1 类型错）
+                var tv: i64 = -1
+                if s_vals[init] == 1 {
+                    tv = 1
+                }
+                iv = gen_trit_lit(tv)
+            } else if s_tags[init] == 0 {
                 iv = gen_int_lit_ty(s_vals[init], ty)
+            } else if s_tags[init] == 14 && types.kind(ty) == K_TUPLE {
+                // 元组字面量 + 元组类型标注：按目标类型构造（(i32,i64) 标注 +
+                // (7,8) 字面量——语义层推断字面量为 (i64,i64)，不按目标类型
+                // 构造会 store {i64,i64} 到 {i32,i64} 槽，LLVM 类型不匹配）
+                iv = gen_tuple_lit_typed(init, ty)
             } else {
                 iv = gen_expr(init)
             }
@@ -1668,6 +3395,34 @@ func gen_stmt(id: i64) -> i64 {
             ir.add_operand(store, av, 0)
         }
         scope_put(nm, av, ty)
+        // 表变量元素类型登记（table_push/table_at 选桥用）：
+        // init 是 table<T>（含 table_new_* 调用）→ 记录元素类型。语义层
+        // var_table_elem 已过期（per-function），table_new_f64() 返回裸 table
+        // 无法从 node_types 得知元素类型。
+        if init >= 0 {
+            var tv_te: i64 = -1
+            var it2 = node_types[init]
+            if types.is_table(it2) && types.table_elem(it2) > 0 {
+                tv_te = types.table_elem(it2)
+            } else if s_tags[init] == 7 {
+                var init_nm = sstate.name_str(init)
+                if init_nm == "table_new_f64" {
+                    tv_te = types.named(TK_F64)
+                } else if init_nm == "table_new_string" {
+                    tv_te = types.named(TK_STR)
+                } else if init_nm == "table_new_bool" {
+                    tv_te = types.named(TK_BOOL)
+                } else if init_nm == "table_new_i64" {
+                    tv_te = types.named(TK_I64)
+                }
+            }
+            if tv_te >= 0 {
+                // 键统一用 interner.intern（s_names[id] 是 parser 的 intern 池，
+                // 与 table_push 的 interner.intern(tname) 不同池，id 不可比）
+                tblvar_put(interner.intern(sstate.name_str(id)), tv_te)
+
+            }
+        }
         return 0
     }
     if tag == 102 {
@@ -1676,14 +3431,29 @@ func gen_stmt(id: i64) -> i64 {
         return gen_expr(e)
     }
     if tag == 104 {
-        // Return：children=[expr 或 -1]
+        // Return：children=[expr 或 -1]。ret 类型 = 表达式语义类型（i64/f64/
+        // 聚合/字符串 ptr——曾硬编码 i64，元组/浮点返回会类型不匹配）。
+        // BoolLit 适配 trit：返回 trit 的函数里 `return false/true` → i8
         var v = sstate.child(id, 0)
         if v >= 0 {
-            var rv = gen_expr(v)
+            var rv: i64 = -1
+            if s_tags[v] == 4 && g_cur_ret_ty == types.named(TK_TRIT) {
+                var tv: i64 = -1
+                if s_vals[v] == 1 {
+                    tv = 1
+                }
+                rv = gen_trit_lit(tv)
+            } else {
+                rv = gen_expr(v)
+            }
             if rv < 0 {
                 return -1
             }
-            var ret = ir.new_inst(g_cur_block, 32, types.named(3))  // ret
+            var rty = node_types[v]
+            if rty < 0 {
+                rty = types.named(TK_I64)
+            }
+            var ret = ir.new_inst(g_cur_block, 32, rty)  // ret
             ir.add_operand(ret, rv, 0)
         } else {
             var ret = ir.new_inst(g_cur_block, 32, -1)  // ret void
@@ -1734,12 +3504,17 @@ func gen_stmt(id: i64) -> i64 {
     }
     if tag == 107 {
         // For：name=迭代变量, children=[iter, body]
-        // 范围 0..N 最小集
+        // 范围 0..N 最小集；表遍历 `for item in arr`（iter 为 Var 表变量）
         var iter = sstate.child(id, 0)
         var body = sstate.child(id, 1)
         var iter_tag = s_tags[iter]
         if iter_tag != 11 {
-            return -1  // 仅范围 for 支持
+            // for-in 表迭代（动态表）：计数器 0..len(t) + tie_table_at 读取
+            var fr = gen_for_table(id, iter, body)
+            if fr < 0 {
+                return -1
+            }
+            return 0
         }
         var start = gen_expr(sstate.child(iter, 0))
         if start < 0 {
@@ -1865,24 +3640,63 @@ func gen_stmt(id: i64) -> i64 {
         return 0
     }
     if tag == 103 {
-        // Assign：name=目标名, children=[值]。val 恒 -1（driver 树无复合赋值）
+        // Assign：name=目标名, val=op（-1 普通；0..17 复合赋值码，对齐 B_*），
+        // children=[值]。复合赋值：load 旧值 → 运算 → store（对齐 Rust 同路径）。
+        // 注意：目标槽（g_lookup_alloca）必须**先保存**——gen_expr(val) 求值会
+        // 覆盖全局槽（x = y 时 y 的 scope_get 覆盖 g_lookup_alloca），曾导致
+        // store 存错目标（a &= b 把结果存进 b）。
         var nm = sstate.name_str(id)
         var val = sstate.child(id, 0)
-        var vv = gen_expr(val)
-        if vv < 0 {
-            return -1
-        }
+        var op = s_vals[id]
         var nid = interner.intern(nm)
         if scope_get_global(nid) < 0 {
+            sm_err_msg = "赋值目标 '" + nm + "' 未入作用域（函数 " + g_cur_fn_name + "）"
             return -1
         }
-        var st = ir.new_inst(g_cur_block, 22, -1)  // store
-        ir.add_operand(st, g_lookup_ty, 2)
-        ir.add_operand(st, vv, 0)
-        if g_lookup_is_global > 0 {
-            ir.add_operand(st, g_lookup_alloca, 3)  // OK_GLOBAL 全局地址（池 id）
+        var tgt_alloca = g_lookup_alloca
+        var tgt_global = g_lookup_is_global
+        var tgt_ty = g_lookup_ty
+        var vv: i64 = -1
+        if op >= 0 {
+            // 复合赋值：先 load 旧值
+            var cur = ir.new_inst(g_cur_block, 21, tgt_ty)  // load
+            if tgt_global > 0 {
+                ir.add_operand(cur, tgt_alloca, 3)
+            } else {
+                ir.add_operand(cur, tgt_alloca, 0)
+            }
+            var cur_v = ir.get_value(cur)
+            var rv = gen_expr(val)
+            if rv < 0 {
+                return -1
+            }
+            vv = gen_compound_assign(op, cur_v, rv, tgt_ty)
+            if vv < 0 {
+                sm_err_msg = "复合赋值运算失败（变量 " + nm + "，函数 " + g_cur_fn_name + "）"
+                return -1
+            }
         } else {
-            ir.add_operand(st, g_lookup_alloca, 0)  // 本地 alloca
+            if s_tags[val] == 4 && tgt_ty == types.named(TK_TRIT) {
+                // BoolLit 适配 trit（t = true 且 t 是 trit 变量 → i8 1）
+                var tv: i64 = -1
+                if s_vals[val] == 1 {
+                    tv = 1
+                }
+                vv = gen_trit_lit(tv)
+            } else {
+                vv = gen_expr(val)
+            }
+            if vv < 0 {
+                return -1
+            }
+        }
+        var st = ir.new_inst(g_cur_block, 22, -1)  // store
+        ir.add_operand(st, tgt_ty, 2)
+        ir.add_operand(st, vv, 0)
+        if tgt_global > 0 {
+            ir.add_operand(st, tgt_alloca, 3)  // OK_GLOBAL 全局地址（池 id）
+        } else {
+            ir.add_operand(st, tgt_alloca, 0)  // 本地 alloca
         }
         return 0
     }
@@ -1894,10 +3708,216 @@ func gen_stmt(id: i64) -> i64 {
         // IndexAssign：t[i] = v → tie_table_set 桥
         return gen_index_assign(id)
     }
+    if tag == 115 {
+        // FieldAssign：obj.field = v（元组/struct 字段赋值；复合赋值 op ≥ 0）
+        return gen_field_assign(id)
+    }
     sm_err_line = s_lines[id]
     sm_err_col = s_cols[id]
     sm_err_msg = "irgen 未支持的语句（tag=" + to_string(tag) + "，函数 " + g_cur_fn_name + "）"
     return -1  // 其他语句后续扩展
+}
+
+// for-in 表迭代：`for item in t`（t 为动态表变量/表达式）。
+// 布局（对齐 Rust gen_for_dyn_table）：计数器 alloca（0..len(t)，cond 块每次
+// 调 tie_table_len）+ 循环变量 alloca（元素类型 T）；body 每次迭代
+// tie_table_at 读取元素 → store 到循环变量；continue → step，break → exit。
+func gen_for_table(id: i64, iter: i64, body: i64) -> i64 {
+    g_used_interp = true
+    // 表指针（load ptr 槽 / 全局表 load ptr, ptr @g）
+    var t = gen_expr(iter)
+    if t < 0 {
+        return -1
+    }
+    // 元素类型判定优先级：
+    //   1. iter 变量的作用域完整类型（table<T> → table_elem）
+    //   2. node_types[iter] 的表元素类型（语义推导）
+    //   3. sinfer.var_table_elem（语义层动态表登记）
+    //   4. body 中循环变量引用节点的语义类型（for f in entries 里 println(f) 推断）
+    //   5. 兜底 i64
+    var elem: i64 = types.named(TK_I64)
+    var matched: bool = false
+    if s_tags[iter] == 6 {
+        var bname = interner.intern(sstate.name_str(iter))
+        if scope_get(bname) >= 0 && types.is_table(g_lookup_ty) {
+            var le = types.table_elem(g_lookup_ty)
+            if le > 0 {
+                elem = le
+                matched = true
+            }
+        }
+        if !matched {
+            var bt2 = node_types[iter]
+            if types.is_table(bt2) {
+                var le2 = types.table_elem(bt2)
+                if le2 > 0 {
+                    elem = le2
+                    matched = true
+                }
+            }
+        }
+        if !matched {
+            var te = sinfer.var_table_elem(bname)
+            if te >= 0 {
+                elem = te
+                matched = true
+            }
+        }
+    } else {
+        var bt = node_types[iter]
+        if types.is_table(bt) {
+            var le2 = types.table_elem(bt)
+            if le2 > 0 {
+                elem = le2
+                matched = true
+            }
+        }
+    }
+    if !matched {
+        // body 中循环变量引用类型（`for f in entries { println(f) }` →
+        // f 的引用节点被语义层推断为 TK_STR）
+        var var_nm = interner.intern(sstate.name_str(id))
+        var bn = sstate.nchild(body)
+        var bi: i64 = 0
+        while bi < bn {
+            var st0 = sstate.child(body, bi)
+            var refs = find_var_refs(st0, var_nm)
+            var ri: i64 = 0
+            while ri < len(refs) {
+                var rt = node_types[refs[ri]]
+                if rt >= 0 && (rt == types.named(TK_STR) || types.is_int(rt) ||
+                    types.is_float(rt) || types.is_bool_like(rt)) {
+                    elem = rt
+                    matched = true
+                    break
+                }
+                ri = ri + 1
+            }
+            if matched {
+                break
+            }
+            bi = bi + 1
+        }
+    }
+    var suffix = bridge_suffix(elem)
+    var elem_llvm_ty = types.named(TK_I64)
+    if suffix == "string" {
+        elem_llvm_ty = types.named(TK_STR)
+    } else if suffix == "bool" {
+        elem_llvm_ty = types.named(TK_BOOL)
+    } else if suffix == "f64" {
+        elem_llvm_ty = types.named(TK_F64)
+    }
+    // 计数器 alloca（i64）+ store 0
+    var idx_a = ir.new_inst(g_cur_block, 20, types.named(TK_I64))  // alloca
+    ir.add_operand(idx_a, types.named(TK_I64), 2)
+    var idx_ptr = ir.get_value(idx_a)
+    var i0 = gen_int_lit_ty(0, types.named(TK_I64))
+    var st0 = ir.new_inst(g_cur_block, 22, -1)  // store 0
+    ir.add_operand(st0, types.named(TK_I64), 2)
+    ir.add_operand(st0, i0, 0)
+    ir.add_operand(st0, idx_ptr, 0)
+    // 循环变量 alloca（元素类型）
+    var item_a = ir.new_inst(g_cur_block, 20, elem_llvm_ty)  // alloca
+    ir.add_operand(item_a, elem_llvm_ty, 2)
+    var item_ptr = ir.get_value(item_a)
+    // 四块：cond / body / step / exit
+    var cond_blk = ir.new_block(g_cur_func, interner.intern("for.cond"))
+    var body_blk = ir.new_block(g_cur_func, interner.intern("for.body"))
+    var step_blk = ir.new_block(g_cur_func, interner.intern("for.step"))
+    var exit_blk = ir.new_block(g_cur_func, interner.intern("for.exit"))
+    loop_push(s_aux[id], exit_blk, step_blk)
+    var b0 = ir.new_inst(g_cur_block, 30, -1)  // br cond
+    ir.add_operand(b0, cond_blk, 1)
+    // cond 块：cur >= len(t) → exit
+    g_cur_block = cond_blk
+    var cur = ir.new_inst(g_cur_block, 21, types.named(TK_I64))  // load
+    ir.add_operand(cur, idx_ptr, 0)
+    var cur_v = ir.get_value(cur)
+    var tlen = gen_ext_call1("tie_table_len", t, types.named(TK_STR), types.named(TK_I64))
+    if tlen < 0 {
+        return -1
+    }
+    var done = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp sge
+    ir.add_operand(done, cur_v, 0)
+    ir.add_operand(done, tlen, 0)
+    ir.add_operand(done, 5, 2)  // sge
+    var done_v = ir.get_value(done)
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, done_v, 0)
+    ir.add_operand(cb, exit_blk, 1)
+    ir.add_operand(cb, body_blk, 1)
+    // body 块：item = table_at(t, cur) → store → 循环体
+    g_cur_block = body_blk
+    var ok_slot = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
+    ir.add_operand(ok_slot, types.named(TK_I8), 2)
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, types.named(TK_STR))
+    table_push(avs, t)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, cur_v)
+    table_push(ats, types.named(TK_STR))
+    table_push(avs, ir.get_value(ok_slot))
+    var iv = gen_ext_call_typed("tie_table_at_" + suffix, ats, avs, elem_llvm_ty)
+    if iv < 0 {
+        return -1
+    }
+    var ist = ir.new_inst(g_cur_block, 22, -1)  // store
+    ir.add_operand(ist, elem_llvm_ty, 2)
+    ir.add_operand(ist, iv, 0)
+    ir.add_operand(ist, item_ptr, 0)
+    scope_put(s_names[id], item_ptr, elem_llvm_ty)
+    var bb = gen_block_stmts(body)
+    if bb < 0 {
+        return -1
+    }
+    scope_pop()
+    if !block_terminated() {
+        var bb2 = ir.new_inst(g_cur_block, 30, -1)  // br step
+        ir.add_operand(bb2, step_blk, 1)
+    }
+    // step 块：cur + 1 → store → br cond
+    g_cur_block = step_blk
+    var add1 = ir.new_inst(g_cur_block, 0, types.named(TK_I64))  // add
+    ir.add_operand(add1, cur_v, 0)
+    ir.add_operand(add1, 1, 2)
+    var add_v = ir.get_value(add1)
+    var st2 = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(st2, types.named(TK_I64), 2)
+    ir.add_operand(st2, add_v, 0)
+    ir.add_operand(st2, idx_ptr, 0)
+    var sb = ir.new_inst(g_cur_block, 30, -1)  // br cond
+    ir.add_operand(sb, cond_blk, 1)
+    // exit 块
+    g_cur_block = exit_blk
+    loop_pop()
+    return 0
+}
+
+// 语句树中查找变量引用节点（tag 6，名池 id == target）：返回节点 id 表。
+// gen_for_table 用它推断循环变量元素类型（body 里 println(f) → node_types[f]）
+func find_var_refs(st: i64, target: i64) -> table<i64> {
+    var out = table_new_i64()
+    collect_var_refs(st, target, out)
+    return out
+}
+
+// find_var_refs 的递归实现（深度优先遍历子节点）
+func collect_var_refs(st: i64, target: i64, out: table<i64>) {
+    if st < 0 {
+        return
+    }
+    if s_tags[st] == 6 && s_names[st] == target {
+        table_push(out, st)
+        return  // 变量节点是叶子
+    }
+    var n = sstate.nchild(st)
+    var i: i64 = 0
+    while i < n {
+        collect_var_refs(sstate.child(st, i), target, out)
+        i = i + 1
+    }
 }
 
 // 语句块遍历（StmtList children）。每个块独立作用域（push/pop）。
@@ -2069,6 +4089,10 @@ func gen_global_var(s: i64) {
         var init = sstate.child(s, 1)
         if sinfer.gb_const_of(intern.intern(nm)) == 1 && init >= 0 && s_tags[init] == 0 {
             llvmgen.global_scalar_init(nm, s_vals[init])
+        } else if init >= 0 && s_tags[init] == 2 && ty == types.named(TK_STR) {
+            // 顶层字符串全局初始字面量（var/const 均含：如 registry 默认 URL）：
+            // @g = global ptr @.str.N（曾忽略字面量 → @g 恒为空串）
+            llvmgen.global_str_init(nm, s_names[init])
         }
     }
 }
@@ -2137,6 +4161,8 @@ func gen_fn_def(fn_node: i64, prefix: string) -> i64 {
     g_lp_breaks = table_new_i64()
     g_lp_cont = table_new_i64()
     g_lp_top = 0
+    g_tv_keys = table_new_i64()
+    g_tv_elems = table_new_i64()
     var nparams = s_aux[fn_node]
     // 返回类型：children[0]
     var ret_ty = stype.parse_type_node(sstate.child(fn_node, 0))
@@ -2146,8 +4172,16 @@ func gen_fn_def(fn_node: i64, prefix: string) -> i64 {
         }
         return -1
     }
-    // 参数类型收集
+    g_cur_ret_ty = ret_ty  // Return 生成期 trit 适配用
+    // 参数类型收集（T0.3 by_ref + M2.1.8 struct 首参自动 ref：ref 参数 LLVM
+    // 形参声明为 ptr——按值声明聚合类型（%struct.Counter）会与调用方传的
+    // 槽地址不匹配。表 ref 原本 table id → llvm ptr 恰好一致；struct 需显式 ptr）
     var params: table<i64> = table_new_i64()
+    var sig0_pre = sstate.fn_sig(full_name)
+    var sig_off_pre: i64 = -1
+    if sig0_pre >= 0 {
+        sig_off_pre = sg_off[sig0_pre]
+    }
     var i: i64 = 0
     while i < nparams {
         var p = sstate.child(fn_node, 1 + i)
@@ -2158,7 +4192,15 @@ func gen_fn_def(fn_node: i64, prefix: string) -> i64 {
             }
             return -1
         }
-        table_push(params, pt)
+        var is_ref_pre = 0
+        if sig0_pre >= 0 && sig_off_pre + i < len(sp_refs) {
+            is_ref_pre = sp_refs[sig_off_pre + i]
+        }
+        if is_ref_pre == 1 {
+            table_push(params, types.named(TK_STR))  // 引用 → ptr 形参
+        } else {
+            table_push(params, pt)
+        }
         i = i + 1
     }
     var fid = ir.new_func(intern.intern(full_name), ret_ty, params)
@@ -2238,7 +4280,10 @@ func gen_fn_def(fn_node: i64, prefix: string) -> i64 {
                 has_ret = true
             }
         }
-        if !has_ret {
+        // 当前块已终止（switch 各 case return 后 exit 块已由 default ret 结束；
+        // if 两分支都 return 后 merge 块不可达）→ 不补 ret（曾补死代码
+        // `ret ptr %0` 到已终止块，LLVM 报类型错）
+        if !has_ret && !block_terminated() {
             if full_name == "main" {
                 // main 补 ret i32 0：ty 必须显式 i32（llvmgen 按 ins_ty 输出 ret 类型，
                 // ty=-1 会生成 ret ptr 0 / ret void 与 define i32 @main 不匹配）
@@ -2248,9 +4293,13 @@ func gen_fn_def(fn_node: i64, prefix: string) -> i64 {
                 var ret = ir.new_inst(g_cur_block, 32, -1)  // ret void
             } else {
                 // 非 void 缺 return：按返回类型补零值（曾一律补 ret void——
-                // i64 函数 define i64 以 ret void 结束类型不匹配）
+                // i64 函数 define i64 以 ret void 结束类型不匹配）。
+                // string/ptr 用空串常量（曾用 IMM 0——llvmgen ret 的 to_ptr
+                // 把字面量 0 误当值 id 0 → ret ptr %0 类型错）。
+                // **先建常量再建 ret**：ret 指令会终止块，其后不能追加指令
+                var dv = gen_default_val(ret_ty)
                 var ret = ir.new_inst(g_cur_block, 32, ret_ty)
-                ir.add_operand(ret, 0, 2)  // 立即数 0
+                ir.add_operand(ret, dv, 0)
             }
         }
     }

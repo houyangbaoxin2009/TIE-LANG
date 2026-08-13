@@ -142,12 +142,41 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
         }
         k = k + 1
     }
+    // M2.1.8：namespace <struct 名> 内的函数，首参 == 该 struct 类型 → 首参
+    // **自动按引用传递**（对齐 Rust ir.rs：param_by_ref[0]，字段修改反映到调用方）。
+    // `pub func inc(c: Counter)` 在 namespace Counter 内：c 首参标 ref，
+    // c.inc() 转发时传 c 的槽地址，inc 内 c.count 修改写回调用方。
+    if nparams > 0 {
+        var last2 = sstate.rfind_ns(full)
+        if last2 >= 0 {
+            var ns_name = ig_slice2(full, 0, last2)
+            var snid = intern.intern(ns_name)
+            var sidx2 = sstate.bs_find(st_keys, snid)
+            if sidx2 >= 0 {
+                var si2 = st_vals[sidx2]
+                if p_tys[0] == types.struct_of(si2) {
+                    p_refs[0] = 1  // 首参按引用（接收者）
+                }
+            }
+        }
+    }
     if sstate.reg_fn(full, is_pub, nparams, required, ret_ty, p_tys, p_refs, p_defs) < 0 {
         sm_err_line = s_lines[fn_node]
         sm_err_col = s_cols[fn_node]
         return -1
     }
     return 0
+}
+
+// 字符串切片（scollect 本地辅助；对齐 irgen.ig_slice）
+func ig_slice2(s: string, start: i64, end: i64) -> string {
+    var out: string = ""
+    var i: i64 = start
+    while i < end {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
 }
 
 // 查找顶层 struct 定义节点（按名字）
@@ -256,6 +285,12 @@ pub func collect_struct_fields(si: i64) -> i64 {
         }
         table_push(fld_names, fnid)
         table_push(fld_tys, fty)
+        // 字段默认值（`var y: i64 = 10` → child(f, 1)；无默认值 -1）
+        var fdef: i64 = -1
+        if sstate.nchild(f) > 1 {
+            fdef = sstate.child(f, 1)
+        }
+        table_push(fld_defs, fdef)
         cls_nfld[si] = cls_nfld[si] + 1
         k = k + 1
     }
@@ -543,7 +578,7 @@ pub func collect_global_var(v: i64) -> i64 {
         if ty == TK_TABLE {
             elem = types.named(TK_STR)
         } else if k == K_TABLE {
-            elem = types.low(ty)
+            elem = types.table_elem(ty)
         } else {
             elem = types.named(TK_STR)
         }

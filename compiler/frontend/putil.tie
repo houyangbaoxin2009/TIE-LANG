@@ -172,11 +172,16 @@ pub func expect_ident() -> i64 {
 
 // 分裂当前 token（Shr/Ge/ShrEq）为两个：当前位置按 Gt 消费，remainder 成为下一 token。
 // 分裂映射：Shr→余 Gt、Ge→余 Eq、ShrEq→余 Ge（Ge 再经一轮分裂为 Gt + Eq）。
+// 语义约定：调用方（expect_type_gt）对分裂类 token 返回 true = 已消费第 1 个
+// 字符（'>'），分裂出的 remainder（第 2 个字符）顶替当前位置供下一次消费。
 func split_current_gt(remainder: i64) {
     if g_pending_idx < len(g_pending) {
-        // 当前在 pending 队列中：原位覆盖为 remainder（当前位置按 Gt 消费）
+        // 当前在 pending 队列中：原位覆盖为 remainder（第 2 个字符），
+        // **不推进游标**——第 1 个 '>' 已由 expect_type_gt 的 return true 隐含
+        // 消费，下一次 peek 读到 remainder。
+        // 曾误推进 g_pending_idx：`table<table<i64>>` 的 >> 分裂后第 2 个 '>'
+        // 被跳过直接读到 RParen（语法错误 @9:34 期望 '>' 实得 RParen）。
         g_pending[g_pending_idx] = remainder
-        g_pending_idx = g_pending_idx + 1
     } else {
         // 当前在真实 token 流：记录 span，push remainder 到队尾，消费原位
         table_push(g_pending, remainder)

@@ -53,6 +53,7 @@ var g_global_names: table<i64>;   // 全局名池 id（登记序）
 var g_global_is_table: table<i64>;  // 1 = 表全局（ptr null），0 = 标量
 var g_global_tys: table<i64>;     // 标量类型 id（表全局 -1）
 var g_global_inits: table<i64>;   // const 标量初始值（-1 = 无；i64 字面量）
+var g_global_strs: table<i64>;    // 顶层字符串 const 初始值（字符串池 id；-1 = 无）
 // 阶段 A：用户函数调用（call 35）的符号名池 id（去重，与 ext_syms 平行收集；
 // 命名空间函数全名经 ns_symbol 转 $，无需 declare）
 var call_syms: table<i64>;
@@ -70,6 +71,7 @@ pub func global_table_reg(nm: string) {
     table_push(g_global_is_table, 1)
     table_push(g_global_tys, -1)
     table_push(g_global_inits, -1)
+    table_push(g_global_strs, -1)
 }
 
 pub func global_scalar_reg(nm: string, ty: i64) {
@@ -78,6 +80,7 @@ pub func global_scalar_reg(nm: string, ty: i64) {
     table_push(g_global_is_table, 0)
     table_push(g_global_tys, ty)
     table_push(g_global_inits, -1)
+    table_push(g_global_strs, -1)
 }
 
 // const 标量初始值（i64 字面量）：emit_globals 输出 @g = global i64 <v>
@@ -87,6 +90,32 @@ pub func global_scalar_init(nm: string, v: i64) {
     while i < len(g_global_names) {
         if g_global_names[i] == nid {
             g_global_inits[i] = v
+            return
+        }
+        i = i + 1
+    }
+}
+
+// 顶层字符串 const 初始值：emit_globals 输出 @g = global ptr @.str.N（字面量）
+pub func global_str_init(nm: string, lexeme_id: i64) {
+    var nid = interner.intern(nm)
+    var i: i64 = 0
+    while i < len(g_global_names) {
+        if g_global_names[i] == nid {
+            // 去引号 lexeme → 纯文本池 id（与 gen_str_lit 同款）
+            var clean = lexeme_id
+            var txt = intern.lookup(lexeme_id)
+            var n: i64 = str_len(txt)
+            if n >= 2 && str_char(txt, 0) == "\"" && str_char(txt, n - 1) == "\"" {
+                var sub: string = ""
+                var k: i64 = 1
+                while k < n - 1 {
+                    sub = sub + str_char(txt, k)
+                    k = k + 1
+                }
+                clean = interner.intern(sub)
+            }
+            g_global_strs[i] = clean
             return
         }
         i = i + 1
@@ -106,6 +135,34 @@ func global_is_table(nm: string) -> i64 {
     return 0
 }
 
+// 输出聚合类型段（模块头 declare 之后、全局变量之前）：
+// 遍历语义层已登记的 struct（st_keys/st_vals + cls_* + fld_*），
+// 输出 `%struct.<名> = type { 字段类型... }`（元组内联在 llvm_ty，无需定义）。
+func emit_agg_types() {
+    var n = len(st_vals)
+    var i: i64 = 0
+    while i < n {
+        var si = st_vals[i]
+        var off = cls_fldoff[si]
+        var cnt = cls_nfld[si]
+        var out: string = "%struct." + intern.lookup(st_keys[i]) + " = type {"
+        var j: i64 = 0
+        while j < cnt {
+            if j > 0 {
+                out = out + ","
+            }
+            out = out + " " + llvm_ty(fld_tys[off + j])
+            j = j + 1
+        }
+        out = out + " }"
+        line(out)
+        i = i + 1
+    }
+    if len(st_vals) > 0 {
+        line("")
+    }
+}
+
 // 输出全局变量段（模块头 declare 之后、函数 define 之前）：
 //   @g = global ptr null            （表全局，main 入口运行时创建）
 //   @g = global T <零值>             （标量；i64→0 / bool→false / string→null / f64→0.0）
@@ -123,10 +180,16 @@ func emit_globals() {
                 init = to_string(g_global_inits[i])
             }
             if ty == "ptr" {
-                // string 全局默认空串常量（null 会被 strcmp 段错误）
+                // string 全局默认空串常量（null 会被 strcmp 段错误）；
+                // const 字符串全局有初始字面量 → 指向该字面量常量
                 if g_global_tys[i] == TK_STR {
-                    var empty_id = interner.intern("")
-                    var eslot = str_slot(empty_id)
+                    var eslot = 0
+                    if i < len(g_global_strs) && g_global_strs[i] >= 0 {
+                        eslot = str_slot(g_global_strs[i])
+                    } else {
+                        var empty_id = interner.intern("")
+                        eslot = str_slot(empty_id)
+                    }
                     line("@" + nm + " = global ptr @.str." + to_string(eslot))
                     i = i + 1
                     continue
@@ -267,7 +330,35 @@ func llvm_ty(t: i64) -> string {
     if t == TK_CHAR {
         return "i32"
     }
-    // string/table/map/struct 等 → ptr（引用类型）
+    if t == TK_TRIT {
+        // 平衡三进制：i8 存储（值域 -1/0/1），对齐 Rust ir.rs（TritLit → i8）
+        return "i8"
+    }
+    // 元组/struct 聚合类型（M4/M6 扩展）：
+    //   元组 → 内联结构体文本 {f0, f1, ...}（字段类型递归展开）；
+    //   struct → 命名结构体 %struct.<名字>（emit_agg_types 输出 type 定义）。
+    // 对齐 Rust llvm_ty 的 Tuple/Struct 映射（元组内联、类命名）。
+    var agg_k = types.kind(t)
+    if agg_k == K_TUPLE {
+        var tidx = t - BASE_TUPLE
+        var toff = tup_offs[tidx]
+        var tn = tup_n[tidx]
+        var tout: string = "{"
+        var ti: i64 = 0
+        while ti < tn {
+            if ti > 0 {
+                tout = tout + ", "
+            }
+            tout = tout + llvm_ty(tup_tys[toff + ti])
+            ti = ti + 1
+        }
+        return tout + "}"
+    }
+    if agg_k == K_STRUCT {
+        var sidx2 = t - BASE_STRUCT
+        return "%struct." + sstate.struct_name_of(sidx2)
+    }
+    // string/table/map 等 → ptr（引用类型）
     return "ptr"
 }
 
@@ -395,6 +486,27 @@ func extern_decl(sym: string) -> string {
     if sym == "tie_parse_float" {
         return "declare double @tie_parse_float(ptr, ptr)"
     }
+    if sym == "tie_parse_trit" {
+        return "declare i8 @tie_parse_trit(ptr, ptr)"
+    }
+    if sym == "tie_list_dir" {
+        return "declare ptr @tie_list_dir(ptr)"
+    }
+    if sym == "tie_http_get" {
+        return "declare ptr @tie_http_get(ptr)"
+    }
+    if sym == "tie_msg_t_lang" {
+        return "declare ptr @tie_msg_t_lang(ptr, ptr)"
+    }
+    if sym == "tie_set_env" {
+        return "declare void @tie_set_env(ptr, ptr)"
+    }
+    if sym == "tie_msg_register" {
+        return "declare void @tie_msg_register(ptr, ptr, ptr)"
+    }
+    if sym == "tie_byte_write" {
+        return "declare i8 @tie_byte_write(ptr, ptr)"
+    }
     if sym == "tie_exec_output" {
         return "declare ptr @tie_exec_output(ptr)"
     }
@@ -437,6 +549,12 @@ func extern_decl(sym: string) -> string {
     if sym == "tie_table_at_i64" {
         return "declare i64 @tie_table_at_i64(ptr, i64, ptr)"
     }
+    if sym == "tie_table_at_f64" {
+        return "declare double @tie_table_at_f64(ptr, i64, ptr)"
+    }
+    if sym == "tie_table_at_ptr" {
+        return "declare ptr @tie_table_at_ptr(ptr, i64, ptr)"
+    }
     if sym == "tie_table_at_string" {
         return "declare ptr @tie_table_at_string(ptr, i64, ptr)"
     }
@@ -448,6 +566,12 @@ func extern_decl(sym: string) -> string {
     }
     if sym == "tie_table_set_i64" {
         return "declare void @tie_table_set_i64(ptr, i64, i64, ptr)"
+    }
+    if sym == "tie_table_set_f64" {
+        return "declare void @tie_table_set_f64(ptr, i64, double, ptr)"
+    }
+    if sym == "tie_table_set_ptr" {
+        return "declare void @tie_table_set_ptr(ptr, i64, ptr, ptr)"
     }
     if sym == "tie_table_set_string" {
         return "declare void @tie_table_set_string(ptr, i64, ptr, ptr)"
@@ -475,6 +599,66 @@ func extern_decl(sym: string) -> string {
     }
     if sym == "tie_regex_find_all" {
         return "declare ptr @tie_regex_find_all(ptr, ptr)"
+    }
+    if sym == "tie_regex_match" {
+        return "declare i8 @tie_regex_match(ptr, ptr, ptr)"
+    }
+    if sym == "tie_regex_find" {
+        return "declare ptr @tie_regex_find(ptr, ptr)"
+    }
+    if sym == "tie_regex_group" {
+        return "declare ptr @tie_regex_group(ptr, ptr, i64)"
+    }
+    if sym == "tie_regex_replace" {
+        return "declare ptr @tie_regex_replace(ptr, ptr, ptr)"
+    }
+    if sym == "tie_msg_t" {
+        return "declare ptr @tie_msg_t(ptr)"
+    }
+    if sym == "tie_msg_get_lang" {
+        return "declare ptr @tie_msg_get_lang()"
+    }
+    if sym == "tie_msg_set_lang" {
+        return "declare void @tie_msg_set_lang(ptr)"
+    }
+    if sym == "tie_eval_call" {
+        return "declare ptr @tie_eval_call(ptr, ptr)"
+    }
+    if sym == "tie_byte_read" {
+        return "declare ptr @tie_byte_read(ptr)"
+    }
+    if sym == "tie_byte_concat" {
+        return "declare ptr @tie_byte_concat(ptr, ptr)"
+    }
+    if sym == "tie_bit_read" {
+        return "declare i64 @tie_bit_read(ptr, i64)"
+    }
+    if sym == "tie_bit_write" {
+        return "declare i8 @tie_bit_write(ptr, i64, i64)"
+    }
+    if sym == "tie_remove_dir_all" {
+        return "declare i8 @tie_remove_dir_all(ptr)"
+    }
+    if sym == "tie_walk_dir" {
+        return "declare ptr @tie_walk_dir(ptr)"
+    }
+    if sym == "tie_path_basename" {
+        return "declare ptr @tie_path_basename(ptr)"
+    }
+    if sym == "tie_path_dirname" {
+        return "declare ptr @tie_path_dirname(ptr)"
+    }
+    if sym == "tie_path_abs" {
+        return "declare ptr @tie_path_abs(ptr)"
+    }
+    if sym == "tie_path_normalize" {
+        return "declare ptr @tie_path_normalize(ptr)"
+    }
+    if sym == "tie_path_join" {
+        return "declare ptr @tie_path_join(ptr, ptr)"
+    }
+    if sym == "tie_rand_range" {
+        return "declare i64 @tie_rand_range(i64, i64, ptr)"
     }
     return ""
 }
@@ -569,6 +753,12 @@ func opnd_ref(inst_id: i64, k: i64) -> string {
     if kind == 2 {
         return to_string(v)
     }
+    // 块引用（kind 1）必须优先于参数检查：块 id 与参数值 id 独立编号，
+    // 数字可能相同——jpeg encode_pixels 的 br 块 id 1 == 参数 %1，
+    // 曾误输出 `br %1`（LLVM 语法错误，opt 报 expected value token）
+    if kind == 1 {
+        return "label %bb" + to_string(v)
+    }
     // 形参引用优先（参数值 id 无定义指令，且 %N 全局编号在 LLVM 中不存在）
     var pr = param_ref(v)
     if pr != "" {
@@ -576,10 +766,6 @@ func opnd_ref(inst_id: i64, k: i64) -> string {
     }
     if kind == 0 {
         return "%" + to_string(v)
-    }
-    if kind == 1 {
-        // 块标签统一为 bb<N>（与 gen_func 标签定义一致）
-        return "label %bb" + to_string(v)
     }
     if kind == 3 {
         // 全局地址（irgen 伪绑定 "@name" 池 id）→ @name 直接引用
@@ -655,11 +841,15 @@ func value_def(v: i64) -> i64 {
 //   其他/未知    → "i64 %N"
 func arg_ref(inst_id: i64, k: i64) -> string {
     var v = ir.ins_opnd(inst_id, k)
-    // 形参优先：字符串参数 → ptr %N；其余 → i64 %N
+    // 形参优先：字符串参数 → ptr %N；浮点 → double %N；其余 → i64 %N
     var pp = param_pos(v)
     if pp >= 0 {
-        if ir.func_param_ty(g_pfid, pp) == TK_STR {
+        var ppt = ir.func_param_ty(g_pfid, pp)
+        if ppt == TK_STR {
             return "ptr %" + to_string(pp)
+        }
+        if ppt == TK_F64 || ppt == TK_F32 {
+            return llvm_ty(ppt) + " %" + to_string(pp)
         }
         return "i64 %" + to_string(pp)
     }
@@ -669,8 +859,13 @@ func arg_ref(inst_id: i64, k: i64) -> string {
             var slot = str_slot(ir.ins_opnd(def, 0))
             return "ptr @.str." + to_string(slot)
         }
-        if ir.ins_ty(def) == TK_STR {
+        var vt = ir.ins_ty(def)
+        if vt == TK_STR {
             return "ptr " + to_ptr(v)
+        }
+        // 浮点实参：double/float 直传（printf %f 匹配；曾默认 i64 %N 类型错）
+        if vt == TK_F64 || vt == TK_F32 {
+            return llvm_ty(vt) + " %" + to_string(v)
         }
     }
     return "i64 %" + to_string(v)
@@ -786,6 +981,97 @@ func gen_inst(inst_id: i64) {
         line(reg + " = icmp " + cname + " " + cmp_ty + " " + op0 + ", " + op1)
         return
     }
+    if op == 19 {
+        // sext：符号扩展（trit/窄整数提升）。操作数 [0]=源类型 IMM, [1]=值 VALUE；
+        // 目标类型 = ins_ty（如 i64 / i32）。
+        var sty = llvm_ty(ir.ins_opnd(inst_id, 0))
+        var tty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = sext " + sty + " " + opnd_ref(inst_id, 1) + " to " + tty)
+        return
+    }
+    if op == 28 {
+        // sitofp：整数转浮点（数学函数整数实参提升）。操作数 [0]=源类型 IMM,
+        // [1]=值 VALUE；目标类型 = ins_ty（double）。
+        var sty = llvm_ty(ir.ins_opnd(inst_id, 0))
+        var tty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = sitofp " + sty + " " + opnd_ref(inst_id, 1) + " to " + tty)
+        return
+    }
+    if op == 27 {
+        // agg_gep：聚合元素指针（元组/struct 字段）。操作数 [0]=地址 VALUE,
+        // [1]=字段下标 IMM；ins_ty = 聚合类型 id → 生成
+        // `getelementptr T, ptr, i32 0, i32 <idx>`（双下标：第 0 行 + 字段列）。
+        // 注：索引必须 i32（LLVM 18 对结构体 GEP 的 i64 索引报 invalid
+        // getelementptr indices；表元素 GEP 是单索引 i8/i64 不受影响）
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = getelementptr " + ty + ", ptr " + opnd_ref(inst_id, 0) + ", i32 0, i32 " + to_string(ir.ins_opnd(inst_id, 1)))
+        return
+    }
+    if op == 13 || op == 14 || op == 15 || op == 16 || op == 17 {
+        // fadd(13)/fsub(14)/fmul(15)/fdiv(16)/frem(17)——浮点算术（M4 扩展）
+        var opname = ""
+        if op == 13 {
+            opname = "fadd"
+        } else if op == 14 {
+            opname = "fsub"
+        } else if op == 15 {
+            opname = "fmul"
+        } else if op == 16 {
+            opname = "fdiv"
+        } else {
+            opname = "frem"
+        }
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = " + opname + " " + ty + " " + opnd_ref(inst_id, 0) + ", " + opnd_ref(inst_id, 1))
+        return
+    }
+    if op == 18 {
+        // fcmp：操作数 [lhs VALUE, rhs VALUE, cmp IMM]（0=oeq 1=one 2=olt 3=ogt 4=ole 5=oge，
+        // 对齐 ir.cmp 常量；ordered 语义防 NaN 误判）
+        var cmp = ir.ins_opnd(inst_id, 2)
+        var cname = "oeq"
+        if cmp == 0 {
+            cname = "oeq"
+        } else if cmp == 1 {
+            cname = "one"
+        } else if cmp == 2 {
+            cname = "olt"
+        } else if cmp == 3 {
+            cname = "ogt"
+        } else if cmp == 4 {
+            cname = "ole"
+        } else if cmp == 5 {
+            cname = "oge"
+        }
+        // 操作数类型：取 lhs 定义指令类型（对齐 icmp 分支；fadd 结果 → double）
+        var fty = "double"
+        var lv0 = ir.ins_opnd(inst_id, 0)
+        var def0 = value_def(lv0)
+        if def0 >= 0 {
+            fty = llvm_ty(ir.ins_ty(def0))
+        }
+        line(reg + " = fcmp " + cname + " " + fty + " " + opnd_ref(inst_id, 0) + ", " + opnd_ref(inst_id, 1))
+        return
+    }
+    if op == 51 {
+        // const_f：浮点常量 → fadd double <lit>, 0.0（结果寄存器；lit 规范化补小数点）。
+        // 操作数[0] = 浮点文本的字符串池 id（irgen 存 lexeme 原文本，规避 tie 无
+        // f64→文本转换；LLVM 要求字面量含小数点/指数）
+        var lit = intern.lookup(ir.ins_opnd(inst_id, 0))
+        var lit_txt = lit
+        if find_char(lit, ".") < 0 && find_char(lit, "e") < 0 && find_char(lit, "E") < 0 {
+            lit_txt = lit + ".0"
+        }
+        var fty2 = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = fadd " + fty2 + " " + lit_txt + ", 0.0")
+        return
+    }
+    if op == 34 {
+        // select：三目（操作数 [cond VALUE, then VALUE, else VALUE]；ins_ty = 值类型）
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = select i1 " + opnd_ref(inst_id, 0) + ", " + ty + " " + opnd_ref(inst_id, 1) + ", " + ty + " " + opnd_ref(inst_id, 2))
+        return
+    }
     if op == 6 || op == 7 || op == 8 || op == 10 || op == 11 {
         // and/or/xor/shl/shr（逻辑 i1 / 位运算 i64 按 ins_ty）
         var opname = ""
@@ -805,18 +1091,26 @@ func gen_inst(inst_id: i64) {
         return
     }
     if op == 33 {
-        // phi：操作数 [值1, 块1, 值2, 块2, ...]（值可为 IMM 立即数）
+        // phi：操作数 [值1, 块1, 值2, 块2, ...]（值可为 IMM 立即数）。
+        // 字符串 phi（ins_ty == TK_STR）：incoming 值须为 ptr——const_str 是
+        // i64 指针整数（ptrtoint）直引 @.str.N、str_cat 结果 inttoptr 转 ptr
+        //（曾生成 `phi ptr [%11, ...]` 而 %11 是 i64 → 类型不匹配）
+        var pty = llvm_ty(ir.ins_ty(inst_id))
+        var is_str_phi = ir.ins_ty(inst_id) == TK_STR
         var args = ""
         var k: i64 = 0
         while k + 1 < cnt {
             if k > 0 {
                 args = args + ", "
             }
-            args = args + "[" + opnd_ref(inst_id, k) + ", %bb" + to_string(ir.ins_opnd(inst_id, k + 1)) + "]"
+            var vref = opnd_ref(inst_id, k)
+            if is_str_phi {
+                vref = to_ptr(ir.ins_opnd(inst_id, k))
+            }
+            args = args + "[" + vref + ", %bb" + to_string(ir.ins_opnd(inst_id, k + 1)) + "]"
             k = k + 2
         }
-        var ty = llvm_ty(ir.ins_ty(inst_id))
-        line(reg + " = phi " + ty + " " + args)
+        line(reg + " = phi " + pty + " " + args)
         return
     }
     if op == 35 {
@@ -1144,6 +1438,8 @@ pub func emit() -> string {
     line("")
     // T4.5：tie 运行时桥 declare（extern_call 收集，按符号名输出）
     emit_extern_decls()
+    // 聚合类型段（struct type 定义；元组内联）
+    emit_agg_types()
     // 阶段 A：全局变量段（表 → ptr null；标量 → 零值）
     emit_globals()
     // 各函数

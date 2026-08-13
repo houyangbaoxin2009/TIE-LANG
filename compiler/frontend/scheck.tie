@@ -596,11 +596,15 @@ pub func check_stmt(s: i64) -> i64 {
             sm_err_msg = "下标赋值的对象必须是表，实际是 " + types.type_name(base)
             return -1
         }
-        if !types.is_int(idx) {
-            sm_err_line = s_lines[s]
-            sm_err_col = s_cols[s]
-            sm_err_msg = "下标必须是整数，实际是 " + types.type_name(idx)
-            return -1
+        // 下标类型：map 键值表允许字符串键（E3：m["key"] = v → tie_map_set_string）
+        // 与整数键；普通表下标必须是整数
+        if !types.is_map(base) {
+            if !types.is_int(idx) {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "下标必须是整数，实际是 " + types.type_name(idx)
+                return -1
+            }
         }
         return 0
     }

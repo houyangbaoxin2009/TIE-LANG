@@ -468,6 +468,14 @@ pub func infer_expr(id: i64) -> i64 {
         if types.is_float(lhs) && types.is_int(rhs) {
             rt = lhs
         }
+        // trit × i64 混合（t + 5 / 5 - t）：结果 i64（irgen 生成 i64 运算并
+        // sext trit 侧——曾按 lhs 标 TK_TRIT，IR 结果 i64 却被当 i8 转换/打印）
+        if lhs == TK_TRIT && types.is_int(rhs) {
+            rt = rhs
+        }
+        if rhs == TK_TRIT && types.is_int(lhs) {
+            rt = lhs
+        }
         if op <= 10 && op >= 5 {
             // 比较/逻辑：结果 bool
             rt = types.named(TK_BOOL)
@@ -691,12 +699,18 @@ pub func infer_expr(id: i64) -> i64 {
             g_typed = g_typed + 1
             return types.map_of(val_ty)
         }
-        // 普通表：元素类型一致
+        // 普通表：元素类型一致（空表字面量 [] 跳过——类型由兄弟元素决定，
+        // 否则 [[1,2],[]] 会因空表 fallback i64 报"表元素类型不一致"）
         var elem_ty: i64 = -1
         var i3: i64 = 0
         while i3 < nc {
             var cell = sstate.child(id, i3)
-            var vt = infer_expr(sstate.child(cell, 1))
+            var val_node = sstate.child(cell, 1)
+            if s_tags[val_node] == S_N_TABLE_LIT && sstate.nchild(val_node) == 0 {
+                i3 = i3 + 1
+                continue  // 空表：不取类型、不校验（由兄弟元素定型）
+            }
+            var vt = infer_expr(val_node)
             if vt < 0 {
                 return -1
             }
@@ -711,6 +725,9 @@ pub func infer_expr(id: i64) -> i64 {
                 }
             }
             i3 = i3 + 1
+        }
+        if elem_ty < 0 {
+            elem_ty = types.named(TK_I64)  // 全空表：兜底 i64
         }
         node_types[id] = types.table_of(elem_ty)
         g_typed = g_typed + 1
@@ -967,7 +984,7 @@ pub func infer_call(id: i64) -> i64 {
         // A1：形参 table<T> 的元素类型校验——实参表字面量/动态表变量/返回表的调用，
         // 其元素类型须与 T 一致（裸 table 形参不校验，对齐 Rust）
         if want_is_tbl && !(want == TK_TABLE) {
-            var want_elem = types.low(want)
+            var want_elem = types.table_elem(want)
             var got_elem = arg_table_elem_ty(args[j2])
             if got_elem >= 0 {
                 if !stype.types_compatible(want_elem, got_elem) {

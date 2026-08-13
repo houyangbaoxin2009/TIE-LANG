@@ -42,6 +42,7 @@ var cls_nfld: table<i64>;     // 字段数（含继承拍平）
 var cls_done: table<i64>;     // struct 字段收集完成标志（0/1，拍平递归防重）
 var fld_names: table<i64>;    // 拍平字段名 id
 var fld_tys: table<i64>;      // 拍平字段类型 id
+var fld_defs: table<i64>;     // 拍平字段默认值表达式节点 id（-1 = 无；Point.y = 10）
 
 var gb_keys: table<i64>;      // 全局变量名 id（升序）
 var gb_vals: table<i64>;      // 类型 id

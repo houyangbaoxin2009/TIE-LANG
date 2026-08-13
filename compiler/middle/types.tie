@@ -73,6 +73,14 @@ const BASE_TUPLE: i64 = 4398046511104;
 // ---------- 全局状态（懒构建）----------
 var tykw_names: table<string>;   // TyKw 索引 -> 类型名（错误消息用）
 var st_names: table<string>;     // struct 名表（索引 -> 名字；type_name 还原用）
+// 嵌套聚合登记表（序号 → 元素/值类型 id）：table<table<T>> / map<聚合> 的编码载体。
+// 背景：table_of(聚合) 若直接 BASE_TABLE + 聚合，会因聚合 id ≥ 2^40 进位撞入
+// map 段（table<table<i64>> = 2^41+3 == map<i64>）——嵌套类型必须查表编码。
+var nest_tbl_elems: table<i64>;  // 嵌套表元素段（序号 → 元素类型 id）
+var nest_map_vals: table<i64>;   // 嵌套 map 值段（序号 → 值类型 id）
+
+// 嵌套负载序号偏移（避开 named 负载段 0..99；named 仅 0..20 安全余量）
+const NEST_SLOT_OFF: i64 = 100;
 
 namespace types {
 
@@ -84,13 +92,39 @@ pub func named(kw: i64) -> i64 {
 }
 
 // table<T>：id = 1<<40 | T（T 为任意 type id，含嵌套）。
+// 嵌套聚合元素（T ≥ 100）查/登记序号表，负载 = 100 + 序号——防止
+// BASE_TABLE + 聚合进位碰撞 map 段（历史 bug：table<table<i64>> == map<i64>）。
 pub func table_of(elem: i64) -> i64 {
-    return BASE_TABLE + elem
+    if elem < NEST_SLOT_OFF {
+        return BASE_TABLE + elem  // 快路径：named 元素（0..99）
+    }
+    var n = len(nest_tbl_elems)
+    var i: i64 = 0
+    while i < n {
+        if nest_tbl_elems[i] == elem {
+            return BASE_TABLE + NEST_SLOT_OFF + i
+        }
+        i = i + 1
+    }
+    table_push(nest_tbl_elems, elem)
+    return BASE_TABLE + NEST_SLOT_OFF + n
 }
 
-// map<V>：id = 2<<40 | V。
+// map<V>：id = 2<<40 | V（嵌套聚合值同 table_of 的序号表方案）。
 pub func map_of(v: i64) -> i64 {
-    return BASE_MAP + v
+    if v < NEST_SLOT_OFF {
+        return BASE_MAP + v
+    }
+    var n = len(nest_map_vals)
+    var i: i64 = 0
+    while i < n {
+        if nest_map_vals[i] == v {
+            return BASE_MAP + NEST_SLOT_OFF + i
+        }
+        i = i + 1
+    }
+    table_push(nest_map_vals, v)
+    return BASE_MAP + NEST_SLOT_OFF + n
 }
 
 // struct S：id = 3<<40 | struct_索引（struct 表行号）。
@@ -218,13 +252,30 @@ pub func is_map(t: i64) -> bool {
 
 // 表元素类型：参数化 table<T>/map<V> 返回负载 T；
 // 裸 table/map 关键字返回 -1（元素类型未知）。
+// 嵌套聚合负载（≥ NEST_SLOT_OFF）查序号表还原真实元素类型。
 pub func table_elem(t: i64) -> i64 {
     var k = kind(t)
     if k == K_TABLE {
-        return low(t)
+        var ld = low(t)
+        if ld < NEST_SLOT_OFF {
+            return ld  // named 元素（0..99）
+        }
+        var si = ld - NEST_SLOT_OFF
+        if si >= 0 && si < len(nest_tbl_elems) {
+            return nest_tbl_elems[si]
+        }
+        return -1
     }
     if k == K_MAP {
-        return low(t)
+        var ld2 = low(t)
+        if ld2 < NEST_SLOT_OFF {
+            return ld2
+        }
+        var si2 = ld2 - NEST_SLOT_OFF
+        if si2 >= 0 && si2 < len(nest_map_vals) {
+            return nest_map_vals[si2]
+        }
+        return -1
     }
     return -1
 }
@@ -284,10 +335,10 @@ pub func type_name(t: i64) -> string {
         return "?"
     }
     if k == K_TABLE {
-        return "table<" + type_name(low(t)) + ">"
+        return "table<" + type_name(table_elem(t)) + ">"
     }
     if k == K_MAP {
-        return "map<" + type_name(low(t)) + ">"
+        return "map<" + type_name(table_elem(t)) + ">"
     }
     if k == K_STRUCT {
         var idx = low(t)

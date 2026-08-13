@@ -68,6 +68,11 @@ pub func builtin_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 
         if fn_name == "parse_float" {
             return types.named(TK_F64)
         }
+        if fn_name == "parse_trit" {
+            // trit 解析：桥返回 i8（值域 -1/0/1）——语义类型标 TK_TRIT，
+            // 否则 to_string(parse_trit(x)) 会把 i8 值当 i64 直传类型错
+            return types.named(TK_TRIT)
+        }
         return types.named(TK_I64)
     }
     if fn_name == "table_new_i64" || fn_name == "table_new_f64" || fn_name == "table_new_string" || fn_name == "table_new_bool" {

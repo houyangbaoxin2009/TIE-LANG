@@ -157,10 +157,10 @@ pub func types_compatible(a: i64, b: i64) -> bool {
         }
     }
     if ka == K_TABLE && kb == K_TABLE {
-        return types_compatible(types.low(a), types.low(b))
+        return types_compatible(types.table_elem(a), types.table_elem(b))
     }
     if ka == K_MAP && kb == K_MAP {
-        return types_compatible(types.low(a), types.low(b))
+        return types_compatible(types.table_elem(a), types.table_elem(b))
     }
     if ka == K_STRUCT && kb == K_STRUCT {
         return a == b
