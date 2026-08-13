@@ -1,0 +1,72 @@
+// tie:library
+// ascii.tie：嵌入式基础层（rdu）——ASCII 字符分类与转换模块（命名空间 rdu_ascii）
+// 层级定位：rdu = Reusable Device Utils，嵌入式基础层——面向裸机/无操作系统的
+// 底层场景提供纯计算工具，编译出的 .a 零运行时依赖（freestanding 可直接链接）。
+// 本模块由 std/ascii.tie 移植其中「码点纯函数」部分（is_digit/is_alpha/is_alnum/
+// is_lower/is_upper/is_print/is_space/to_lower/to_upper），删除依赖字符串原语的
+// to_code / to_char（str_len/char_code/str_char 属于语言底座原语，违反无栈纪律）。
+// 全部函数输入为 ASCII 码点（i64），纯标量运算，对 ASCII 范围外的码点分类函数
+// 一律返回 false、转换函数原样返回。
+//
+// 无栈纪律（本模块全部满足）：
+//   1. 零原语调用：只用比较与算术运算，不调用任何语言底座内建函数；
+//   2. 零动态内存：不创建表、不拼接字符串，参数只有 i64 码点；
+//   3. 无递归；
+//   4. 无顶层全局变量（纯函数，同输入同输出）；
+//   5. 编译出的 .a 无任何外部函数声明（IR 中无 declare），裸机可直接链接。
+//
+// 调用：import 后 rdu_ascii.is_digit(...) / rdu_ascii.to_lower(...)。
+// 命名规范：命名空间内函数不加 rdu_ascii_ 前缀（与 std/ascii.tie 风格一致）。
+
+namespace rdu_ascii {
+// 是否为数字字符（48..57 '0'-'9'）
+pub func is_digit(cp: i64) -> bool {
+    return cp >= 48 && cp <= 57
+}
+
+// 是否为字母字符（65..90 'A'-'Z'，97..122 'a'-'z'）
+pub func is_alpha(cp: i64) -> bool {
+    return (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122)
+}
+
+// 是否为字母或数字（is_digit 或 is_alpha）
+pub func is_alnum(cp: i64) -> bool {
+    return is_digit(cp) || is_alpha(cp)
+}
+
+// 是否为小写字母（97..122）
+pub func is_lower(cp: i64) -> bool {
+    return cp >= 97 && cp <= 122
+}
+
+// 是否为大写字母（65..90）
+pub func is_upper(cp: i64) -> bool {
+    return cp >= 65 && cp <= 90
+}
+
+// 大写字母 → 小写（A-Z 码点 + 32）；其余码点原样返回
+pub func to_lower(cp: i64) -> i64 {
+    if cp >= 65 && cp <= 90 {
+        return cp + 32
+    }
+    return cp
+}
+
+// 小写字母 → 大写（a-z 码点 - 32）；其余码点原样返回
+pub func to_upper(cp: i64) -> i64 {
+    if cp >= 97 && cp <= 122 {
+        return cp - 32
+    }
+    return cp
+}
+
+// 是否为可打印 ASCII（32..126，含空格，不含 DEL 127）
+pub func is_print(cp: i64) -> bool {
+    return cp >= 32 && cp <= 126
+}
+
+// 是否为空白字符（空格 32 / 制表符 9 / 换行 10 / 回车 13）
+pub func is_space(cp: i64) -> bool {
+    return cp == 32 || cp == 9 || cp == 10 || cp == 13
+}
+}

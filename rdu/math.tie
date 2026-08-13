@@ -1,0 +1,174 @@
+// tie:library
+// math.tie：嵌入式基础层（rdu）——数学函数模块（命名空间 rdu_math）
+// 层级定位：rdu = Reusable Device Utils，嵌入式基础层——面向裸机/无操作系统的
+// 底层场景提供纯计算工具，编译出的 .a 零运行时依赖（freestanding 可直接链接）。
+// 本模块由 std/math.tie 全量移植而来（abs/abs_f/max_i/min_i/max_f/min_f/clamp/
+// clamp_i/is_odd/is_even/avg_f/sign_i/deg_to_rad/rad_to_deg/gcd/lcm/pow_i），
+// 仅更改命名空间名与文件头注释，函数体与 std 版逐字一致。
+//
+// 无栈纪律（本模块全部满足）：
+//   1. 零原语调用：全部基于 + - * / % 与比较运算实现，不调用任何语言底座内建函数
+//      （std/math.tie 本就是纯运算实现，天然合规；未移植任何依赖原语的函数）；
+//   2. 零动态内存：不创建表、不拼接字符串，参数全部为 i64/f64/bool 标量；
+//   3. 无递归（gcd 用 while 辗转相除）；
+//   4. 无顶层全局变量（纯函数，同输入同输出）；
+//   5. 编译出的 .a 无任何外部函数声明（IR 中无 declare），裸机可直接链接。
+//
+// 注意：二元运算两侧类型必须一致，浮点运算一律使用浮点字面量（如 2.0 / 180.0）。
+// 调用：import 后 rdu_math.abs(...) / rdu_math.gcd(...)；命名空间内互调为裸调用。
+
+namespace rdu_math {
+// 整数绝对值：负数取反，非负数原样返回
+pub func abs(x: i64) -> i64 {
+    if x < 0 {
+        return -x
+    }
+    return x
+}
+
+// 浮点绝对值：负数取反，非负数原样返回（比较须用浮点字面量 0.0，两侧类型须一致）
+pub func abs_f(x: f64) -> f64 {
+    if x < 0.0 {
+        return -x
+    }
+    return x
+}
+
+// 两个整数取较大者
+pub func max_i(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// 两个整数取较小者
+pub func min_i(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+// 两个浮点取较大者
+pub func max_f(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// 两个浮点取较小者
+pub func min_f(a: f64, b: f64) -> f64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+// 浮点夹取：把 x 限制在 [lo, hi] 区间内（小于 lo 取 lo，大于 hi 取 hi）
+pub func clamp(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo {
+        return lo
+    }
+    if x > hi {
+        return hi
+    }
+    return x
+}
+
+// 整数夹取：把 x 限制在 [lo, hi] 区间内（小于 lo 取 lo，大于 hi 取 hi）
+pub func clamp_i(x: i64, lo: i64, hi: i64) -> i64 {
+    if x < lo {
+        return lo
+    }
+    if x > hi {
+        return hi
+    }
+    return x
+}
+
+// 判断整数是否为奇数（取模 2 余非零；负数取模余数非零同样判为奇数）
+pub func is_odd(x: i64) -> bool {
+    return x % 2 != 0
+}
+
+// 判断整数是否为偶数（取模 2 余零）
+pub func is_even(x: i64) -> bool {
+    return x % 2 == 0
+}
+
+// 两个浮点取平均值
+pub func avg_f(a: f64, b: f64) -> f64 {
+    return (a + b) / 2.0
+}
+
+// 整数符号：负数返回 -1，正数返回 1，零返回 0
+pub func sign_i(x: i64) -> i64 {
+    if x < 0 {
+        return -1
+    }
+    if x > 0 {
+        return 1
+    }
+    return 0
+}
+
+// 角度转弧度：deg * π / 180（π 取双精度近似值）
+pub func deg_to_rad(deg: f64) -> f64 {
+    return deg * 3.141592653589793 / 180.0
+}
+
+// 弧度转角度：rad * 180 / π（π 取双精度近似值）
+pub func rad_to_deg(rad: f64) -> f64 {
+    return rad * 180.0 / 3.141592653589793
+}
+
+// 两个整数的最大公约数（欧几里得辗转相除；负数取绝对值，0 与 x 的 gcd 为 |x|）
+pub func gcd(a: i64, b: i64) -> i64 {
+    var x: i64 = a
+    var y: i64 = b
+    // 负数取绝对值（i64::MIN 取反回绕为自身，数学上 gcd 符号无意义）
+    if x < 0 {
+        x = -x
+    }
+    if y < 0 {
+        y = -y
+    }
+    while y != 0 {
+        var r: i64 = x % y
+        x = y
+        y = r
+    }
+    return x
+}
+
+// 两个整数的最小公倍数：|a*b| / gcd(a, b)；任一为 0 → 0
+pub func lcm(a: i64, b: i64) -> i64 {
+    if a == 0 || b == 0 {
+        return 0
+    }
+    var g = gcd(a, b)
+    // |a / g * b|：先除后乘避免中间溢出（a/g 与 b 的乘积仍可能溢出，本期接受）
+    var q: i64 = a / g
+    var r: i64 = q * b
+    if r < 0 {
+        r = -r
+    }
+    return r
+}
+
+// 整数幂 x^n（n >= 0 循环乘）；n < 0 返回 0（整数负指数无意义，与多数语言一致）
+pub func pow_i(x: i64, n: i64) -> i64 {
+    if n < 0 {
+        return 0
+    }
+    var result: i64 = 1
+    var i: i64 = 0
+    while i < n {
+        result = result * x
+        i = i + 1
+    }
+    return result
+}
+}

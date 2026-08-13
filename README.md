@@ -23,7 +23,7 @@ tie 是一门**通用编程语言**：用一门语言写逻辑、写界面、写
 | [docs/tie-script.md](docs/tie-script.md) | tie:script 模块协议：tie 脚本的注册/调用机制、模块约定、协议文本格式、三层调用入口（Rust/CLI/tie 程序内） |
 | [docs/ai-guide.md](docs/ai-guide.md) | AI 教学指南：语言用法 + 负例 + 编译器架构（教 AI 用/开发 tie） |
 | [docs/prompt-pack.md](docs/prompt-pack.md) | 可粘贴 Prompt 包：自包含简介，直接发给任何 AI |
-| [docs/plans/](docs/plans/) | 后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法 / 动态库编译 / 包管理器 / 算法库分类） |
+| [docs/plans/](docs/plans/) | 后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法 / 动态库编译 / 包管理器 / 算法库分类 / 嵌入式基础层 rdu） |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更记录（按里程碑） |
 
 ## 快速开始
@@ -197,6 +197,14 @@ tie/
 │                     - IO/系统：fs（文件系统，Rust std::fs 风格完整 API：read_to_string/write/append/exists/size/is_file/is_dir/remove_file/create_dir_all/read_dir/rename/write_lines 等，**UTF-8 路径安全**——中文路径原生支持）、path（路径：basename/dirname/ext/stem，extern 桥）、args（命令行参数）、http（HTTP GET + URL 编码）、random（随机）、bytes（字节表）、time（计时）、process（进程）、intern（字符串池）、version（版本比较）、format（格式化）、csv、assert（断言）
 │                     典型调用：assert.assert / str.split / format.sprintf / csv.csv_write / exmath.huffman_encode / radix.to_str / fs.read_lines / json.parse / utf.byte_len / coll.heap_push
 ├── ext/              扩展库（Extension，tie 语言自写，随发行版内置，依赖 std 与语言底座：log 控制台信息库——i18n 消息系统，M4 增强带参消息/级别体系/stderr 通道/批量登记/多级回退；2026-08-12 新增 test 测试框架（断言收集+统计）、bench 基准计时、tui 终端装饰（进度条/文本框，无 ANSI——语言无 \xHH 转义限制）、config 配置解析（KV/INI）、pretty 文本表格；另有 cache/compress/ml/registry/codec（brotli/jpeg/lz4/zstd））
+├── rdu/              嵌入式基础层（Rudimentary，tie 语言自写，随发行版内置，独立于 std/ext 的第三层——专为嵌入式 MCU/裸机 freestanding 定制：无栈纪律即零原语调用/零动态内存/零数组（禁止一切数组与表功能：动态表、定长表、字面量表、下标读写、table_* 原语）/无递归/无全局可变状态/零运行时依赖，只用 i64/f64/bool 标量，不依赖 std/ext、不 import 任何东西，编译出的 .a 可被裸机直接链接）：
+│                     - bits（位操作：set/clear/toggle/test/rol/ror/bswap16/bswap32/bswap64/popcount/clz/ctz）
+│                     - math（基础数学纯标量：abs/abs_f/max_i/min_i/max_f/min_f/clamp/clamp_i/is_odd/is_even/avg_f/sign_i/deg_to_rad/rad_to_deg/gcd/lcm/pow_i）
+│                     - ascii（ASCII 码点分类/转换：is_digit/is_alpha/is_alnum/is_lower/is_upper/is_print/is_space/to_lower/to_upper）
+│                     - crc（增量式校验：crc8/16/32 的 init/update + crc32_final，CRC-32/IEEE 802.3 逐位无查表；fnv1a 的 init/update）
+│                     - fixed（Q16.16 定点数：fixed_mul/fixed_div/fixed_floor/fixed_frac）
+│                     - rnd（确定性伪随机：xorshift64，调用方持状态）
+│                     典型调用：rdu_crc.crc32_init() / rdu_bits.popcount() / rdu_fixed.fixed_mul() / rdu_rnd.xorshift64()
 ├── pkg/              包管理器（tie 语言自写，M6 E1/E2 + E3/E4）：main.tie CLI 入口
 │                     （init/add/remove/install/update/build/run/publish/search/info/help
 │                     子命令分派）+ manifest.tie（tie.pkg 清单解析）+ deps.tie（path/git/
@@ -207,7 +215,7 @@ tie/
 │                     Rust 侧只做子命令识别转发
 ├── docs/language.md   语法规范
 ├── docs/tie-script.md tie:script 模块协议（eval/eval_call 机制、模块约定、协议文本、三层调用入口）
-├── docs/plans/        后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法 / 动态库编译）
+├── docs/plans/        后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法 / 动态库编译 / 算法库分类 / 嵌入式基础层 rdu）
 ├── examples/          示例程序（hello / wide / table / tuple / oop / 负例 oop_neg_* 等）
 └── Cargo.toml         workspace（统一 edition/lints/release 配置）
 ```

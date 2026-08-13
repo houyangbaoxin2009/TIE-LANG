@@ -1,0 +1,128 @@
+// tie:logic
+// rdu_demo.tie：嵌入式基础层（rdu）演示——导入全部 6 个无栈模块并逐项核对输出
+// rdu = Reusable Device Utils（嵌入式基础层）：bits/math/ascii/crc/fixed/rnd 六个
+// 模块全部满足无栈纪律（零原语调用、零动态内存、无递归、无全局变量、.a 零运行时依赖）。
+// 本文件为验证程序（logic 角色），可自由使用 println/to_string 等底座原语；
+// rdu 库模块本身（rdu/*.tie）则严格禁止任何原语。
+// 期望值均为已知标准值（见每行注释），编译运行后逐项核对，全部一致即验证通过。
+// 运行：tie-llvm examples/rdu_demo.tie（或 tie examples/rdu_demo.tie）
+
+import "../rdu/bits.tie" as bits
+import "../rdu/math.tie" as m
+import "../rdu/ascii.tie" as ac
+import "../rdu/crc.tie" as crc
+import "../rdu/fixed.tie" as fx
+import "../rdu/rnd.tie" as rnd
+
+// 布尔值转可读文本（to_string 只支持数字，bool 需手动转换）
+func bool_str(b: bool) -> string {
+    if b {
+        return "true"
+    }
+    return "false"
+}
+
+func main() {
+    // ==================== bits（rdu_bits）====================
+    // bswap32 字节序反转：0x11223344 → 0x44332211 = 1144201745
+    var b1: i64 = bits.bswap32(0x11223344)
+    println("bits.bswap32(0x11223344) = " + to_string(b1) + "  // 期望 1144201745")
+    // popcount(11)：11 = 0b1011，有 3 个 1
+    var b2: i64 = bits.popcount(11)
+    println("bits.popcount(11) = " + to_string(b2) + "  // 期望 3")
+    // set(0, 3)：把 0 的第 3 位置 1 → 8（0b1000）
+    var b3: i64 = bits.set(0, 3)
+    println("bits.set(0, 3) = " + to_string(b3) + "  // 期望 8")
+    // test(8, 3)：8（0b1000）的第 3 位是否为 1 → true
+    var b4: bool = bits.test(8, 3)
+    println("bits.test(8, 3) = " + bool_str(b4) + "  // 期望 true")
+    // rol(1, 1)：1 循环左移 1 位 → 2（0b10）
+    var b5: i64 = bits.rol(1, 1)
+    println("bits.rol(1, 1) = " + to_string(b5) + "  // 期望 2")
+
+    // ==================== math（rdu_math）====================
+    // gcd(48, 36)：最大公约数 = 12
+    var g1: i64 = m.gcd(48, 36)
+    println("math.gcd(48, 36) = " + to_string(g1) + "  // 期望 12")
+    // lcm(4, 6)：最小公倍数 = 12
+    var g2: i64 = m.lcm(4, 6)
+    println("math.lcm(4, 6) = " + to_string(g2) + "  // 期望 12")
+    // clamp_i(99, 0, 10)：夹取到 [0,10] → 10
+    var g3: i64 = m.clamp_i(99, 0, 10)
+    println("math.clamp_i(99, 0, 10) = " + to_string(g3) + "  // 期望 10")
+    // pow_i(2, 10)：2^10 = 1024
+    var g4: i64 = m.pow_i(2, 10)
+    println("math.pow_i(2, 10) = " + to_string(g4) + "  // 期望 1024")
+
+    // ==================== ascii（rdu_ascii）====================
+    // is_digit(57)：57 = '9' 是数字 → true
+    var a1: bool = ac.is_digit(57)
+    println("ascii.is_digit(57) = " + bool_str(a1) + "  // 期望 true")
+    // to_upper(97)：97 = 'a' 转大写 → 65 = 'A'
+    var a2: i64 = ac.to_upper(97)
+    println("ascii.to_upper(97) = " + to_string(a2) + "  // 期望 65")
+    // is_space(32)：32 = 空格 → true
+    var a3: bool = ac.is_space(32)
+    println("ascii.is_space(32) = " + bool_str(a3) + "  // 期望 true")
+    // to_lower(72)：72 = 'H' 转小写 → 104 = 'h'
+    var a4: i64 = ac.to_lower(72)
+    println("ascii.to_lower(72) = " + to_string(a4) + "  // 期望 104")
+
+    // ==================== crc（rdu_crc）====================
+    // crc32：把 "123456789" 的 ASCII 码（49..57）逐字节喂入，final 收尾
+    // 期望 3421780262 = 0xCBF43926（CRC-32/IEEE 802.3 标准校验向量）
+    var c32: i64 = crc.crc32_init()
+    var ci: i64 = 49
+    while ci <= 57 {
+        c32 = crc.crc32_update(c32, ci)
+        ci = ci + 1
+    }
+    var c32f: i64 = crc.crc32_final(c32)
+    println("crc32(\"123456789\") = " + to_string(c32f) + "  // 期望 3421780262")
+    // crc8：同样喂 "123456789"，期望 244 = 0xF4（CRC-8/ATM 标准校验向量）
+    var c8: i64 = crc.crc8_init()
+    ci = 49
+    while ci <= 57 {
+        c8 = crc.crc8_update(c8, ci)
+        ci = ci + 1
+    }
+    println("crc8(\"123456789\") = " + to_string(c8) + "  // 期望 244")
+    // fnv1a：喂 'a'（97），期望 3826002220 = 0xE40C292C（FNV-1a 32 位标准值）
+    var fv: i64 = crc.fnv1a_init()
+    fv = crc.fnv1a_update(fv, 97)
+    println("fnv1a('a') = " + to_string(fv) + "  // 期望 3826002220")
+    // crc16：顺带验证 "123456789"，期望 47933 = 0xBB3D（CRC-16/IBM 标准校验向量）
+    var c16: i64 = crc.crc16_init()
+    ci = 49
+    while ci <= 57 {
+        c16 = crc.crc16_update(c16, ci)
+        ci = ci + 1
+    }
+    println("crc16(\"123456789\") = " + to_string(c16) + "  // 期望 47933")
+
+    // ==================== fixed（rdu_fixed）====================
+    // fixed_mul(3<<16, 2<<16)：3.0 × 2.0 = 6.0 → 6<<16 = 393216
+    var f1: i64 = fx.fixed_mul(3 << 16, 2 << 16)
+    println("fixed.fixed_mul(3<<16, 2<<16) = " + to_string(f1) + "  // 期望 393216")
+    // fixed_div(6<<16, 2<<16)：6.0 ÷ 2.0 = 3.0 → 3<<16 = 196608
+    var f2: i64 = fx.fixed_div(6 << 16, 2 << 16)
+    println("fixed.fixed_div(6<<16, 2<<16) = " + to_string(f2) + "  // 期望 196608")
+    // fixed_floor(393216)：393216 = 6<<16 取整 → 6
+    var f3: i64 = fx.fixed_floor(393216)
+    println("fixed.fixed_floor(393216) = " + to_string(f3) + "  // 期望 6")
+
+    // ==================== rnd（rdu_rnd）====================
+    // xorshift64：从状态 1 迭代三次，输出序列（确定性：每次运行输出相同）
+    var st: i64 = 1
+    st = rnd.xorshift64(st)
+    println("xorshift64(1) 第 1 次 = " + to_string(st))
+    st = rnd.xorshift64(st)
+    println("xorshift64 第 2 次 = " + to_string(st))
+    st = rnd.xorshift64(st)
+    println("xorshift64 第 3 次 = " + to_string(st))
+    // lcg 确定性抽查：lcg(1, 6364136223846793005, 1442695040888963407) 每次运行相同
+    var lv: i64 = rnd.lcg(1, 6364136223846793005, 1442695040888963407)
+    println("lcg(1, mul, inc) = " + to_string(lv))
+
+    println("rdu 演示全部输出，期望值核对见逐行注释")
+}

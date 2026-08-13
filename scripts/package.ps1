@@ -268,9 +268,11 @@ if (Test-Path $ExamplesSrc) {
     Write-Host "  examples/ ✔" -ForegroundColor DarkGray
 }
 
-# std/ 与 ext/：标准库与扩展库（tie 语言自写，随发行版内置；
-# 用户程序 import "../std/..." 或 "../ext/..." 依赖本地库目录）
-foreach ($lib in @("std", "ext")) {
+# std/、ext/ 与 rdu/：标准库、扩展库与嵌入式基础层（tie 语言自写，随发行版内置；
+# 用户程序 import "../std/..." 或 "../ext/..." 或 "../rdu/..." 依赖本地库目录。
+# rdu 为嵌入式基础层（Rudimentary），独立于 std/ext（不 import 任何东西），
+# 无栈纪律（零原语/零动态内存/无递归/无全局状态），随发行版内置）
+foreach ($lib in @("std", "ext", "rdu")) {
     $LibSrc = Join-Path $Root $lib
     if (Test-Path $LibSrc) {
         $LibTarget = Join-Path $DistDir $lib
@@ -278,7 +280,8 @@ foreach ($lib in @("std", "ext")) {
         Get-ChildItem $LibSrc -Filter "*.tie" | ForEach-Object {
             Copy-Item $_.FullName $LibTarget
         }
-        # std/runtime.a：tie 自写运行时静态库（tiec 链接用户程序必需，tie 语言产物）
+        # std/runtime.a（仅 std 特有）：tie 自写运行时静态库（tiec 链接用户程序必需，
+        # tie 语言产物；rdu/ext 不产生 runtime.a——rdu 为 freestanding 零运行时依赖）
         $RuntimeLib = Join-Path $LibSrc "runtime.a"
         if (Test-Path $RuntimeLib) {
             Copy-Item $RuntimeLib $LibTarget

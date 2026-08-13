@@ -1,0 +1,133 @@
+// tie:library
+// bits.tie：嵌入式基础层（rdu）——位运算模块（命名空间 rdu_bits）
+// 层级定位：rdu = Reusable Device Utils，嵌入式基础层——面向裸机/无操作系统的
+// 底层场景提供纯计算工具，编译出的 .a 零运行时依赖（freestanding 可直接链接）。
+//
+// 无栈纪律（本模块全部满足）：
+//   1. 零原语调用：只用语言运算（& | ^ << >> 比较 算术）与本命名空间内函数，
+//      不调用任何语言底座内建函数（table_*/str_*/char_code/to_string/println 等）；
+//   2. 零动态内存：不创建表、不拼接字符串，参数全部为 i64/bool 标量；
+//   3. 无递归；
+//   4. 无顶层全局变量（纯函数，同输入同输出）；
+//   5. 编译出的 .a 无任何外部函数声明（IR 中无 declare），裸机可直接链接。
+//
+// 移位语义说明：tie 中 i64 的 `>>` 生成 ashr（算术右移），对正数等价逻辑右移；
+// 涉及符号位的函数（rol/ror/clz/popcount）已用掩码消除算术右移的符号扩展，
+// 对任意符号的输入均给出与无符号语义一致的结果。
+// 调用：import 后 rdu_bits.set(...) / rdu_bits.popcount(...)。
+
+namespace rdu_bits {
+// 置位：把 v 的第 pos 位设为 1，其余位不变（1 << pos 仅 pos 位为 1）
+pub func set(v: i64, pos: i64) -> i64 {
+    return v | (1 << pos)
+}
+
+// 清位：把 v 的第 pos 位清为 0，其余位不变
+//（-1 的二进制全 1，异或掩码 (1 << pos) 后仅第 pos 位为 0，再与 v 相与即清除该位）
+pub func clear(v: i64, pos: i64) -> i64 {
+    return v & (-1 ^ (1 << pos))
+}
+
+// 翻转：把 v 的第 pos 位取反（0↔1），其余位不变
+pub func toggle(v: i64, pos: i64) -> i64 {
+    return v ^ (1 << pos)
+}
+
+// 测试：第 pos 位是否为 1（返回 bool）
+pub func test(v: i64, pos: i64) -> bool {
+    return (v & (1 << pos)) != 0
+}
+
+// 循环左移：v 整体左移 n 位，移出的高位循环回填到低位；n 先对 64 取模
+// 实现要点：`v >> (64-n)` 是算术右移会带符号扩展，用掩码 (1<<(64-n))-1 只保留
+// 高 (64-n) 位原值，再与 `v << n`（左移溢出的高位自动丢弃）相或得到完整循环结果。
+// n==0 时直接返回 v，避免 64-n==64 触发移位等于位宽的未定义行为。
+pub func rol(v: i64, n: i64) -> i64 {
+    var s: i64 = n % 64
+    if s == 0 {
+        return v
+    }
+    var high: i64 = (v >> (64 - s)) & ((1 << (64 - s)) - 1)
+    return (v << s) | high
+}
+
+// 循环右移：v 整体右移 n 位，移出的低位循环回填到高位；n 先对 64 取模
+//（循环右移 n 位等价于循环左移 (64-n) 位，n==0 时 rol(v,64) 内部取模后返回 v）
+pub func ror(v: i64, n: i64) -> i64 {
+    return rol(v, 64 - (n % 64))
+}
+
+// 16 位字节序反转：低字节与高字节互换（0x1234 → 0x3412）
+pub func bswap16(v: i64) -> i64 {
+    return ((v & 0xFF) << 8) | ((v >> 8) & 0xFF)
+}
+
+// 32 位字节序反转：四个字节高低互换（0x11223344 → 0x44332211）
+// 每字节先用 & 0xFF 提取，再位移到目标位置相或；算术右移的符号扩展被 & 0xFF 清除
+pub func bswap32(v: i64) -> i64 {
+    var b0: i64 = (v & 0xFF) << 24
+    var b1: i64 = (v & 0xFF00) << 8
+    var b2: i64 = (v >> 8) & 0xFF00
+    var b3: i64 = (v >> 24) & 0xFF
+    return b0 | b1 | b2 | b3
+}
+
+// 64 位字节序反转：八个字节高低互换（逐字节提取 + 位移到镜像位置）
+pub func bswap64(v: i64) -> i64 {
+    var r: i64 = 0
+    var i: i64 = 0
+    while i < 8 {
+        var b: i64 = (v >> (i * 8)) & 0xFF
+        r = r | (b << ((7 - i) * 8))
+        i = i + 1
+    }
+    return r
+}
+
+// 置位计数（popcount）：统计 v 二进制中 1 的个数，逐位循环 64 次
+// 实现要点：算术右移对负数会复制符号位，但每个原始位恰好以「当前最低位」身份
+// 出现一次（含符号位 1），固定 64 次循环后计数即等于所有 1 位数——正负数均正确
+pub func popcount(v: i64) -> i64 {
+    var x: i64 = v
+    var count: i64 = 0
+    var i: i64 = 0
+    while i < 64 {
+        count = count + (x & 1)
+        x = x >> 1
+        i = i + 1
+    }
+    return count
+}
+
+// 前导零计数（clz）：统计最高位起连续 0 的个数；v==0 返回 64
+// 实现要点：bit 从最高位 1<<63 逐位下移，用掩码 & 0x7FFFFFFF_FFFFFFFF 把算术
+// 右移的符号扩展清掉实现「逻辑下移」；v!=0 保证在 bit 变为 0 之前必然命中
+// v 的最高置位位，循环必然终止
+pub func clz(v: i64) -> i64 {
+    if v == 0 {
+        return 64
+    }
+    var n: i64 = 0
+    var bit: i64 = 1 << 63
+    while (v & bit) == 0 {
+        n = n + 1
+        bit = (bit >> 1) & 0x7FFFFFFFFFFFFFFF
+    }
+    return n
+}
+
+// 尾随零计数（ctz）：统计最低位起连续 0 的个数；v==0 返回 64
+// v!=0 保证最低置位位存在，循环必然在 v 变为 -1（全部位为 1）前终止
+pub func ctz(v: i64) -> i64 {
+    if v == 0 {
+        return 64
+    }
+    var x: i64 = v
+    var n: i64 = 0
+    while (x & 1) == 0 {
+        n = n + 1
+        x = x >> 1
+    }
+    return n
+}
+}

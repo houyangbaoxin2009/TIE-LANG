@@ -1,3 +1,38 @@
+## [rdu] 内置库新增 rdu 层级：嵌入式基础层（无栈）——独立于 std/ext 的第三层 — 2026-08-14
+
+新增第三层内置库 `rdu/`（Rudimentary，嵌入式基础层），专为嵌入式（MCU/裸机
+freestanding）定制：无堆/无 OS/无 libc 环境可用的最小基础库。
+
+- **定位**：`rdu/` 独立于 std/ext——不依赖 std、不依赖 ext、不 import 任何东西；
+  随发行版内置，`scripts/package.ps1` 库目录列表收录为 `@("std", "ext", "rdu")`；
+- **无栈纪律（rdu 模块硬性约束）**：
+  1. **零原语调用**——不调用语言底座内建函数（table_*/str_*/to_string/println/
+     rand_range 等），只用标量运算；
+  2. **零动态内存**——无表、无字符串拼接、无字符串参数，纯 i64/f64/bool 标量；
+  3. **无递归**（调用深度恒定）；
+  4. **无全局可变状态**（纯函数，同输入同输出）；
+  5. **零运行时依赖**——编译出的 .a 不链接 runtime.a/tie-interp 桥，裸机
+     freestanding 可直接链接。
+  原因：嵌入式目标没有堆/OS/libc，tie 字符串与表原语底层走堆分配（如
+  `str_char` 返回 `CString::into_raw`），故 rdu 完全绕开；
+- **六个模块**（文件头 `// tie:library`，命名空间统一 `rdu_` 前缀避免与 std/ext 冲突）：
+  - `rdu/bits.tie`（rdu_bits）：set/clear/toggle/test/rol/ror/bswap16/bswap32/
+    bswap64/popcount/clz/ctz；
+  - `rdu/math.tie`（rdu_math）：移植自 std/math 的纯标量函数
+    abs/abs_f/max_i/min_i/max_f/min_f/clamp/clamp_i/is_odd/is_even/avg_f/sign_i/
+    deg_to_rad/rad_to_deg/gcd/lcm/pow_i；
+  - `rdu/ascii.tie`（rdu_ascii）：移植自 std/ascii 的码点纯函数
+    is_digit/is_alpha/is_alnum/is_lower/is_upper/is_print/is_space/to_lower/to_upper
+    （去掉字符串版 to_code/to_char）；
+  - `rdu/crc.tie`（rdu_crc）：增量式校验 crc8/16/32 的 init/update + crc32_final
+    （CRC-32/IEEE 802.3，逐位无查表）、fnv1a 的 init/update（32 位 FNV-1a）；
+  - `rdu/fixed.tie`（rdu_fixed）：Q16.16 定点数 fixed_mul/fixed_div/fixed_floor/
+    fixed_frac；
+  - `rdu/rnd.tie`（rdu_rnd）：确定性伪随机 xorshift64(state)（无状态纯函数，
+    调用方持状态）；
+- **文档**：新增 docs/plans/embedded-rdu.md（定位/分层对比/无栈纪律/模块函数表/
+  验收标准/不做的事），README 工程结构新增 rdu/ 段（典型调用 rdu_crc.crc32_init()）。
+
 ## [std:fs] 完整文件系统标准库 + 中文路径修复——file_* 内置全面迁移 UTF-8 桥 — 2026-08-14
 
 制造完整 `std/fs` 文件系统库（对齐 Rust std::fs API 风格），根治中文/Unicode 路径问题。
