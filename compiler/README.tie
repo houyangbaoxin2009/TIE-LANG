@@ -5,16 +5,162 @@
 // 旧的 v1 尝试（文本协议 AST + 惰性字符串解析）已归档至 archive/compiler-v1/，
 // 全部废弃，不再引用。
 //
-// 目标架构（LLVM 三层模块化，Pass 基础设施直接借鉴 LLVM）：
-//   compiler/
-//   ├── driver.tie         CLI 薄壳（阶段 3）
-//   ├── lib/               基础库：interner（字符串池）/ columnar（列式表）/ dispatch（分派表）
-//   ├── frontend/          lexer → parser → semantic（ast 为列式 tag 表 arena）
-//   ├── middle/            tie IR（列式函数/块/指令表）+ pass 管线（AnalysisManager 惰性+失效追踪）
-//   ├── backend/           LLVM IR 文本生成（单调 %N 直生）+ opt/clang/lld 工具链驱动
-//   ├── interp/            tie 写的树遍历解释器（阶段 4，0 Rust 目标）
-//   ├── repl.tie           REPL 主循环（阶段 4）
-//   └── tests/             错误 golden 语料 / pass 测试 / interp 测试 / 运行器
+// 现状：自举 v2 T2.1–T5.3 全部完成——tie 自写编译器 tiec 已跑通
+// 「种子编译 → 二阶自举 → 运行时 0-Rust → 性能反超 Rust 老编译器」全链路，
+// G4 性能闸门达标（ratio 1.09），hello 单文件已反超 Rust（ratio 0.87）。
+
+// ============================================================
+// 1. 目录 / 模块结构
+// ============================================================
+// 编译器按四段流水线拆分：frontend（词法→语法→语义）、middle（tie-IR + pass）、
+// backend（IR 生成 + LLVM 工具链驱动），另设 interp（解释器）、lib（基础库）、
+// proto（原型）、tests（测试）；根级三个入口 + 两个构建产物：
 //
-// 当前状态：阶段 0（语言能力补强，Rust 种子侧）+ 阶段 1（性能原型）进行中，
-// 本目录各模块自阶段 2 起逐个创建（先 proto/ 原型，后模块化正式版）。
+//   compiler/
+//   ├── driver.tie         tiec 主入口（T3.2 完整 CLI 编译器驱动；499 行）
+//   ├── driver-lite.tie    T2.9 临时入口（tiec 雏形；--check/--emit-ir/-o；326 行，
+//   │                       T3 后被 driver.tie 取代，仍供行为等价回归/_driver_test）
+//   ├── repl.tie           REPL 入口（T4.3；tie 自写解释器求值，52 行）
+//   ├── frontend/          前端（T2.4–T2.6 正式版，行为基准 Rust tie-frontend）
+//   │   ├─ lexer 词法族：lexer.tie（主循环 run_lex）+ lex_scan/lex_state/
+//   │   │     lex_symtab/lex_tokdefs（845 行拆 5 模块；46 条升序符号表+二分
+//   │   │     最长匹配；doc 注释保留；tag 0-79 对齐 Rust TokenKind）
+//   │   ├─ parser 语法族：parser.tie（parse 主入口）+ pst/putil/pexpr/pexpr_type/
+//   │   │     pstmt/pstmt_flow/pstmt_top/pnames（2877 行拆 4 模块）
+//   │   ├─ semantic 语义族：semantic.tie（check 主入口）+ sstate/stype/sbuiltin/
+//   │   │     sinfer/scollect/scheck（3802 行拆 8 模块；import 展开+去重）
+//   │   ├─ ast.tie          节点池（T2.1，列式 tag 表 arena，parser/semantic 共享）
+//   │   ├─ errors.tie + error_driver.tie   错误码数据表 + 对外错误接口
+//   │   └─ *test.tie         各阶段回归测试（lex_test/parse_test/semantic_test）
+//   ├── middle/            tie-IR 中端（T2.2–T2.3）
+//   │   ├─ ir.tie          列式 tie-IR（T2.2：函数/块/指令列式表 + 操作数段，
+//   │   │                   值编号单调递增 = 性能净胜点）
+//   │   ├─ types.tie + data.tie   类型系统 + 数据表（irgen/semantic 共享）
+//   │   ├─ ir_meta.tie      IR 元信息
+//   │   └─ pass/           pass 管线（T2.3）：passmanager（惰性分析 + 失效追踪）
+//   │                       + passes + pass_registry + pass_test
+//   ├── backend/           后端（T2.8 / T3.1）
+//   │   ├─ irgen.tie       AST → tie-IR（T2.8；作用域栈 + 循环上下文栈
+//   │   │                   + 字符串常量收集；未支持语句返回 -1）
+//   │   ├─ llvmgen.tie     tie-IR → .ll 文本（T2.8；字符串自省收集 @.str.N；
+//   │   │                   行收集 + 分治拼接防 O(N²) 挂起）
+//   │   ├─ toolchain.tie   LLVM 工具链驱动（T3.1，命名空间 tc：opt/clang/llvm-ar
+//   │   │                   + 工具发现 + 错误契约 tc_err_msg）
+//   │   └─ _driver_test.tie   组装回归测试
+//   ├── interp/            解释器（T4.1–T4.2，tie 自写，0 Rust 目标）
+//   │   ├─ interp.tie      eval/eval_call 两趟解析 + 树遍历求值器（2548 行）
+//   │   ├─ env.tie         Env 执行环境（T4.2）
+//   │   ├─ session.tie     Session（globals + funcs 跨调用持久，REPL 会话）
+//   │   └─ value.tie       值模型
+//   ├── lib/               基础库（T2.1 模块化地基）
+//   │   ├─ interner.tie    字符串池统一接口（包装 std/intern，符号比较 O(1)）
+//   │   ├─ columnar.tie    列式并列表辅助（排序键表+并行值表：二分/有序插入）
+//   │   └─ dispatch.tie    C1 字符串分派表（无函数指针时的按名分派）
+//   ├── proto/             T1.x 原型（lexer/parser/semantic + main.tie + 对照测试）
+//   │                       （print_err 调试跟踪保留于此，正式版已清理）
+//   ├── tests/interp/      解释器行为测试套件（11 文件 198 断言，T4.4）
+//   ├── tiec.exe           构建产物：Rust 种子编译 driver.tie（bootstrap 界限）
+//   └── tiec2.exe          构建产物：tiec.exe 二阶自举编译 driver.tie（自举闭环）
+
+// ============================================================
+// 2. tiec 是什么
+// ============================================================
+// tiec 是 tie 语言 **100% 自写** 的完整 CLI 编译器（本目录 driver.tie 经种子编译
+// 得到 tiec.exe）：前端（词法/语法/语义）→ 中端（AST → tie-IR）→ 后端（tie-IR
+// → LLVM IR 文本 → opt/clang/lld 工具链驱动）→ 运行时链接决策，全部在 tie 侧
+// 实现。行为对齐 Rust crates/tie-llvm/src/main.rs + driver.rs（参数解析、角色
+// 分派、消息格式、退出码），编译出的可执行文件不依赖任何 Rust 运行时。
+// 中端走 gen_ast() 内存 AST 版（T5.3：前端已 parse_ast/check_ast 就绪，不再
+// 二次执行；gen_src 保留给 driver-lite/_driver_test 使用）。
+
+// ============================================================
+// 3. 构建与自举链
+// ============================================================
+// 种子编译（bootstrap 界限）：
+//   target/release/tie-llvm.exe compiler/driver.tie -o compiler/tiec.exe
+//   —— Rust 种子编译器（tie-llvm.exe）编译 tie 自写 driver.tie 得到 tiec.exe。
+//   这是**唯一的 Rust 接触点**。G3 0-Rust 承诺：种子之后的一切（编译用户程序、
+//   链接运行时、REPL 运行、解释器求值）不触碰 cargo/target 的 Rust 产物
+//   （scripts/zero-rust-check.ps1 验证 7 项全 PASS，报告见 docs/bench/zero-rust.md）。
+// 二阶自举（自举闭环证明）：
+//   compiler/tiec.exe compiler/driver.tie -o compiler/tiec2.exe
+//   —— tiec 编译自身源码得到 tiec2.exe（T5.2 irgen 最小集扩展修复 13 bug 后
+//   打通），证明编译器可自我繁殖，tiec2 与 tiec 行为一致。
+// 运行时静态库 std/runtime.a 亦由种子编译器编译（irgen 最小集暂不支持 extern fn
+// 声明，属 0-Rust 允许的 bootstrap 步骤）。
+
+// ============================================================
+// 4. CLI 用法
+// ============================================================
+// 用法：tiec <input.tie> [-o <out>] [-O0|-O1|-O2|-O3] [--target <三元组>]
+//                    [--emit-ir] [--keep-ir] [--prep-only] [--config <f>] [--help]
+// 退出码：0 成功 / 1 编译失败 / 2 参数错误。
+//
+//   -o <file>        输出路径（logic 默认：输入同名 .exe；library 默认：.a）
+//   -O0|-O1|-O2|-O3  优化级别（默认 -O2），映射到 opt -O{N}
+//   --target <三元组>  交叉编译目标（如 x86_64-pc-windows-msvc；平台别名自动归一化：
+//                    win-x64/win-x86/win-arm64/linux-x64/linux-arm64/macos-x64/
+//                    macos-arm64，未知名称原样透传）
+//   --emit-ir        只生成 LLVM IR（.ll），不继续编译
+//   --keep-ir        保留中间 IR 文件（.ll / .opt.ll）
+//   --prep-only      只做头部识别并打印结果
+//   --config <f>     协调统筹配置文件（单文件编译暂忽略）
+//   --help           显示帮助
+//
+// 角色识别：**头部扫描**（读源文件头部注释行找 `// tie:xxx`，前 20 行；无角色
+// 默认 logic），不依赖 prep/core.tie 的 import。识别 logic/library/ui/db/data：
+// logic → 编译可执行文件（clang 链接）；library → 编译静态库（clang -c + llvm-ar
+// rcs）；data/ui/db → 提示对应工具链未实现（v0.1 尚未实现）。
+// opt/target 优先级：CLI 显式 > 头部 `// tie:opt=N` / `// tie:target=` > 默认 O2/无。
+// 链接决策（need_interp）：程序用运行时桥内置（exec_code/get_env/time_now，
+// irgen 置 g_used_runtime）→ 链接 std/runtime.a（tie 自写，无需 Rust）；
+// 用 tie-interp 库桥（str_len/table_*/file_*/arg_* 等，置 g_used_interp）→ 链接
+// tie_interp.lib（Rust 桥）；两者都置时以 interp.lib 为准（覆盖 runtime.a 的三个
+// 符号，避免重复定义）。
+
+// ============================================================
+// 5. 运行时依赖
+// ============================================================
+// std/runtime.a（tie 自写运行时静态库，T4.5）：顶层裸函数 `func tie_exec_code(cmd)
+// -> i64` 编译为 `define i64 @tie_exec_code(ptr)`——无命名空间不 mangle，与语言
+// 底座 IR 的 declare **字节级匹配**，clang 链接解析。内部用 T0.7 extern fn 声明
+// libc：system（exec_code）/ getenv（get_env，string 返回）/ time(0)（time_now）。
+// tiec 的 irgen 对这三个符号生成 extern_call(36) 指令，llvmgen 收集 declare，
+// driver 按 g_used_runtime 链接 runtime.a。
+// G3 验证：运行时程序二进制**无 tie_interp.lib 独有符号**、REPL parity 空 diff、
+// interp 套件 11 文件 198 断言全绿。
+// 已知限制：runtime.a 与 repl.exe 需种子通道编译（read_line 为 C ABI 桥，ptr
+// 语义）；ptr 桥符号（tie_file_read/tie_str_char/tie_rand_range/tie_arg_* 等）尚未
+// tie 化；R3 fallback：TIE_INTERP_LIB 环境变量可回退 Rust tie-interp，直到 tiec
+// 能力闭合（extern fn 支持、irgen 全语句集）后彻底退役。
+
+// ============================================================
+// 6. 当前进度（自举 v2 里程碑）
+// ============================================================
+//   T2.1–T2.3  基础库 lib/（interner/columnar/dispatch）+ middle/ir 列式 tie-IR
+//              + pass 管线（passmanager 惰性分析 + 失效追踪）
+//   T2.4        完整词法器（frontend/lexer，f15c358）
+//   T2.5        完整语法分析器（frontend/parser，5536151）
+//   T2.6        完整语义分析器（frontend/semantic，a9a8d10）
+//   T2.7        错误 golden corpus（63 触发 + 语义检查补齐，12b350a）
+//   T2.8        LLVM IR 端到端（irgen + llvmgen，opt+clang 编译运行，eb15f93）
+//   T2.9        tiec 组装（driver-lite）+ 行为等价回归（等价率 100%，e780353）
+//   T3          tiec 完整编译器：工具链驱动（toolchain.tie）+ CLI + 可复现构建
+//               （Brepro，c56c30a）
+//   T4.1–T4.4   解释器 tie 化：core（eval/eval_call）+ env 原语 + REPL parity
+//               + 测试移植（198 断言，0830ef7/d3adfc0/53fce7d）
+//   T4.5–T4.6   tie 运行时静态库（std/runtime.a 替代 Rust interp 链接）
+//               + G3 闸门（0-Rust，747ef1a/db585f2）
+//   T5.1        tiec 前端全局表修复（driver.tie 自编译成功）+ G4 性能基准
+//               （ratio 1.007，dc71e11）
+//   T5.2        irgen 最小集扩展修复 13 bug——二阶自举打通（tiec2.exe，4471fa4）
+//   T5.3        tiec 性能优化：消除重复前端 / AST 内存传递（gen_ast 内存版）/
+//               intern 二分定位+位移 / build_protocol 分治 / print_err 清理——
+//               G4 ratio 6.9 → 1.09（tiec 2538ms vs Rust 2337ms，6.3× 提速），
+//               hello/import_main 反超 Rust（ratio 0.87/0.97，dffad89）
+//   T5 后续     irgen 最小集扩展**进行中**（前端已就绪，扩展后 G4 覆盖自动扩全）
+//
+// 性能轨迹：T5.1 首轮 G4 ratio 1.007（6/74 可编译，irgen 最小集限制）→ T5.2
+// 扩展修复后可编译增至 30/74 → T5.3 优化后全量基准 ratio 1.086（硬线 ≤3.0、
+// 目标 ≤2.0 均达标），单文件 graph_demo/optsearch/std_encoding/std_demo 由
+// 15× 级降到 1.4× 级。

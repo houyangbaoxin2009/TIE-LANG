@@ -18,6 +18,7 @@ tie 是一门**通用编程语言**：用一门语言写逻辑、写界面、写
 | --- | --- |
 | [README.md](README.md) | 本文件：工程入口（快速开始、CLI、结构、流水线、路线图） |
 | [docs/language.md](docs/language.md) | 语法规范：文件结构、类型系统、语句/控制流、函数、面向对象、语法速查表 |
+| [docs/tiec.md](docs/tiec.md) | tiec 自举编译器文档：tiec 是什么、自举链、快速开始、CLI 用法、运行时依赖、架构与进度 |
 | [docs/tie-script.md](docs/tie-script.md) | tie:script 模块协议：tie 脚本的注册/调用机制、模块约定、协议文本格式、三层调用入口（Rust/CLI/tie 程序内） |
 | [docs/ai-guide.md](docs/ai-guide.md) | AI 教学指南：语言用法 + 负例 + 编译器架构（教 AI 用/开发 tie） |
 | [docs/prompt-pack.md](docs/prompt-pack.md) | 可粘贴 Prompt 包：自包含简介，直接发给任何 AI |
