@@ -739,6 +739,35 @@ func main() {
 
 **参考验收**：`tests/language/extern_decl.tie`（输出 rand 随机值/0/3/hello）。
 
+#### 7.2.3 文件系统原语（file_* 内置，UTF-8 路径安全）
+
+文件系统内置原语 `file_read` / `file_write` / `file_append` / `file_exists` /
+`file_delete` / `file_size` / `file_is_dir` / `file_is_file`（M2 起；**2026-08-14 起
+全部迁移 UTF-8 安全桥**——Rust `std::fs` 实现、Windows 宽字符 API，中文/Unicode 路径
+原生支持。曾用 libc `fopen` / `remove`，按 ANSI 代码页（GBK）误读 UTF-8 字节，
+中文路径的存在性检查/写入/删除必失败）。
+
+**接口**（语言底座原语）：
+
+| 原语 | 签名 | 语义 |
+| --- | --- | --- |
+| `file_read` | `file_read(path: string) -> string` | 读取文本全文；失败返回空串 |
+| `file_write` | `file_write(path: string, content: string) -> bool` | 覆盖写入 |
+| `file_append` | `file_append(path: string, content: string) -> bool` | 追加写入（文件不存在则创建） |
+| `file_exists` | `file_exists(path: string) -> bool` | 存在性检查（可读探测，目录/不可读 → false） |
+| `file_delete` | `file_delete(path: string) -> bool` | 删除文件（不存在 → false） |
+| `file_size` | `file_size(path: string) -> i64` | 字节大小；失败（不存在等）返回 -1 |
+| `file_is_dir` | `file_is_dir(path: string) -> bool` | 路径是否为目录 |
+| `file_is_file` | `file_is_file(path: string) -> bool` | 路径是否为普通文件 |
+
+**完整封装**：`std/fs`（命名空间 `fs`，Rust std::fs 风格 API）：读取
+`read_to_string` / `read_text` / `read_bytes` / `read_lines`，写入 `write` /
+`write_text` / `append` / `append_text` / `write_lines`，元数据 `exists` /
+`is_file` / `is_dir` / `size`，删除 `remove_file` / `delete` / `remove_dir_all` /
+`remove_all`，目录 `create_dir_all` / `mkdir_all` / `read_dir` / `list` / `walk` /
+`copy_dir`，复制移动 `copy` / `rename` / `move`，归档 `untar_gz` / `unzip`。
+全部基于上述 UTF-8 桥，中文路径安全。
+
 ## 8. 数据结构与逻辑分离（struct / 命名空间函数 / 继承）
 
 **M2.1.8**：`class` 改名为 `struct` 并成为**纯数据**（只含字段）；逻辑（方法）移出为

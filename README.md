@@ -18,6 +18,7 @@ tie 是一门**通用编程语言**：用一门语言写逻辑、写界面、写
 | --- | --- |
 | [README.md](README.md) | 本文件：工程入口（快速开始、CLI、结构、流水线、路线图） |
 | [docs/language.md](docs/language.md) | 语法规范：文件结构、类型系统、语句/控制流、函数、面向对象、语法速查表 |
+| [docs/language-comparison.md](docs/language-comparison.md) | 语言对比报告：tie vs 42 种语言的特性/标准库全景对比（工业级全栈定位、丰俭由人伸缩谱） |
 | [docs/tiec.md](docs/tiec.md) | tiec 自举编译器文档：tiec 是什么、自举链、快速开始、CLI 用法、运行时依赖、架构与进度 |
 | [docs/tie-script.md](docs/tie-script.md) | tie:script 模块协议：tie 脚本的注册/调用机制、模块约定、协议文本格式、三层调用入口（Rust/CLI/tie 程序内） |
 | [docs/ai-guide.md](docs/ai-guide.md) | AI 教学指南：语言用法 + 负例 + 编译器架构（教 AI 用/开发 tie） |
@@ -193,7 +194,7 @@ tie/
 ├── std/              标准库（tie 语言自写，均命名空间形式调用，基于语言底座原语；M4 补全大小写转换/join/repeat/trim 拆分/gcd/lcm/pow_i/sprintf 占位符/csv_write/浮点与字符串断言；2026-08-12 大规模扩展为 20+ 模块）：
 │                     - 文本/编码：string（trim/slice/split/join/大小写）、utf（UTF-8 码点/字节工具：codepoint/byte_len/hex_escape）、ascii（字符分类与转换）、encoding（base64/hex/url percent）、regex（正则包装）、json（JSON 解析/序列化，节点式访问器）
 │                     - 数据结构/算法：sort（排序数组/二分）、collection（最小堆/栈/KMP）、crypto（crc32/fnv1a 校验）、optsearch（排序/背包/N 皇后等）、graph（图算法）、linalg（矩阵）、exmath（高级数学：霍夫曼/素数/快速幂）、math（基础数学）、radix（进制转换）
-│                     - IO/系统：fs（文件系统：读改写删/目录/解压）、path（路径：basename/dirname/ext/stem，extern 桥）、args（命令行参数）、http（HTTP GET + URL 编码）、random（随机）、bytes（字节表）、time（计时）、process（进程）、intern（字符串池）、version（版本比较）、format（格式化）、csv、assert（断言）
+│                     - IO/系统：fs（文件系统，Rust std::fs 风格完整 API：read_to_string/write/append/exists/size/is_file/is_dir/remove_file/create_dir_all/read_dir/rename/write_lines 等，**UTF-8 路径安全**——中文路径原生支持）、path（路径：basename/dirname/ext/stem，extern 桥）、args（命令行参数）、http（HTTP GET + URL 编码）、random（随机）、bytes（字节表）、time（计时）、process（进程）、intern（字符串池）、version（版本比较）、format（格式化）、csv、assert（断言）
 │                     典型调用：assert.assert / str.split / format.sprintf / csv.csv_write / exmath.huffman_encode / radix.to_str / fs.read_lines / json.parse / utf.byte_len / coll.heap_push
 ├── ext/              扩展库（Extension，tie 语言自写，随发行版内置，依赖 std 与语言底座：log 控制台信息库——i18n 消息系统，M4 增强带参消息/级别体系/stderr 通道/批量登记/多级回退；2026-08-12 新增 test 测试框架（断言收集+统计）、bench 基准计时、tui 终端装饰（进度条/文本框，无 ANSI——语言无 \xHH 转义限制）、config 配置解析（KV/INI）、pretty 文本表格；另有 cache/compress/ml/registry/codec（brotli/jpeg/lz4/zstd））
 ├── pkg/              包管理器（tie 语言自写，M6 E1/E2 + E3/E4）：main.tie CLI 入口
