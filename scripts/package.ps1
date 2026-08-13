@@ -122,6 +122,32 @@ else {
     Write-Host "  警告: 缺失 repl.exe（跳过）" -ForegroundColor DarkYellow
 }
 
+# pkg.exe（包管理器自举产物，tie.exe 子命令转发依赖；非必需，缺失仅警告）
+$PkgExe = Join-Path $Root "target\release\pkg.exe"
+if (-not (Test-Path $PkgExe)) {
+    # 回退：根目录 pkg/pkg.exe（构建产物习惯存放处）
+    $PkgExe = Join-Path $Root "pkg\pkg.exe"
+}
+if (Test-Path $PkgExe) {
+    Copy-Item $PkgExe $BinTarget
+    Write-Host "  bin/pkg.exe ✔" -ForegroundColor DarkGray
+}
+else {
+    Write-Host "  警告: 缺失 pkg.exe（跳过）" -ForegroundColor DarkYellow
+}
+
+# 自举 v2 新编译器 tiec.exe / tiec2.exe（compiler/ 编译产物，不随 compiler/ 源码进发行版，单列 bin/）
+foreach ($tiec in @("tiec.exe", "tiec2.exe")) {
+    $src = Join-Path $Root "compiler\$tiec"
+    if (Test-Path $src) {
+        Copy-Item $src $BinTarget
+        Write-Host "  bin/$tiec ✔" -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host "  警告: 缺失 $tiec（跳过）" -ForegroundColor DarkYellow
+    }
+}
+
 # doc/：文档与许可
 $DocTarget = Join-Path $DistDir "doc"
 New-Item -ItemType Directory -Path $DocTarget -Force | Out-Null
@@ -163,6 +189,12 @@ foreach ($lib in @("std", "ext")) {
         Get-ChildItem $LibSrc -Filter "*.tie" | ForEach-Object {
             Copy-Item $_.FullName $LibTarget
         }
+        # std/runtime.a：tie 自写运行时静态库（tiec 链接用户程序必需，tie 语言产物）
+        $RuntimeLib = Join-Path $LibSrc "runtime.a"
+        if (Test-Path $RuntimeLib) {
+            Copy-Item $RuntimeLib $LibTarget
+            Write-Host "  $lib/runtime.a ✔" -ForegroundColor DarkGray
+        }
         Write-Host "  $lib/ ✔" -ForegroundColor DarkGray
     }
 }
@@ -179,6 +211,25 @@ if (Test-Path $EditorSrc) {
         Copy-Item $_.FullName $EditorTarget -Recurse
     }
     Write-Host "  editor/vscode-tie/ ✔（已排除 node_modules/、out/）" -ForegroundColor DarkGray
+}
+
+# compiler/：自举 v2 编译器源码（tie 语言自写，T2–T5 阶段产物）。
+# 递归复制全部 .tie 源码（含子目录）与 README.tie；排除编译产物 tiec.exe/tiec2.exe
+# （已在 bin/ 段处理，不进 compiler/ 目录），随发行版内置便于检视与二次开发
+$CompilerSrc = Join-Path $Root "compiler"
+$CompilerTarget = Join-Path $DistDir "compiler"
+if (Test-Path $CompilerSrc) {
+    New-Item -ItemType Directory -Path $CompilerTarget -Force | Out-Null
+    # 递归复制全部 .tie 源码（含子目录）+ README.tie，剔除 .exe 编译产物
+    Get-ChildItem $CompilerSrc -Recurse -File | Where-Object {
+        $_.Extension -eq ".tie" -or $_.Name -eq "README.tie"
+    } | ForEach-Object {
+        $rel = $_.FullName.Substring($CompilerSrc.Length).TrimStart("\")
+        $dest = Join-Path $CompilerTarget $rel
+        New-Item -ItemType Directory -Path (Split-Path $dest) -Force | Out-Null
+        Copy-Item $_.FullName $dest
+    }
+    Write-Host "  compiler/ ✔（tiec 源码）" -ForegroundColor DarkGray
 }
 
 Write-Host "[3/4] 发行目录组装完成" -ForegroundColor Green
