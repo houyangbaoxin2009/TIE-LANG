@@ -1,5 +1,9 @@
 # tie
 
+<p align="center">
+  <img src="assets/tie-logo-full.svg" alt="tie 语言 Logo" width="600">
+</p>
+
 > ⚠️ **早期开发阶段**：语言设计与实现仍在快速演进，语法、语义与工具链随时可能变更，暂不建议用于生产。
 
 tie 是一门**通用编程语言**：用一门语言写逻辑、写界面、写数据库、当数据交换格式。

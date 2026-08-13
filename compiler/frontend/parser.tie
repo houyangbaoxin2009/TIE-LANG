@@ -41,17 +41,24 @@ pub func parse(proto_text: string) -> string {
     if root < 0 {
         return putil.err_protocol()
     }
-    return build_protocol()
+    print_err("LX ast-built")
+    var bp = build_protocol()
+    print_err("LX protocol-built")
+    return bp
 }
 
 // 便捷入口：源码字符串 → 词法 + 语法 → AST 协议文本（T2.6/验收程序用）
 pub func parse_src(src: string) -> string {
+    print_err("LX lex-begin")
     var ok = lexer.run_lex(src)
+    print_err("LX lex-done")
     if !ok {
         // 词法错误：直接读 lexer 的全局错误槽（词法失败时 token 表不可靠）
         return "ERR:" + to_string(g_err_line) + " " + to_string(g_err_col) + " " + g_err_msg
     }
-    return parse("")
+    var pr = parse("")
+    print_err("LX parse-done")
+    return pr
 }
 
 // 可读 AST 树形输出（缩进展示 tag 名 + lexeme + span + 顶层语句序列），供人工对比

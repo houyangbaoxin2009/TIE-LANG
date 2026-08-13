@@ -59,6 +59,8 @@ var ir_funcs_names: table<i64>;        // 函数名（字符串池 id）
 var ir_funcs_rets: table<i64>;         // 返回类型（types 自编码 id）
 var ir_funcs_params_off: table<i64>;   // 参数段偏移（ir_ops 内）
 var ir_funcs_params_cnt: table<i64>;   // 参数个数（0 = 无参）
+var ir_funcs_params_tys_off: table<i64>;  // 参数类型段偏移（ir_funcs_param_tys 内）
+var ir_funcs_param_tys: table<i64>;    // 参数类型段（扁平；函数顺序）
 var ir_funcs_entry: table<i64>;        // 入口块 id（-1 = 未建块）
 var ir_funcs_inst_total: table<i64>;   // 函数内指令总数（llvmgen 统计）
 var ir_funcs_exported: table<i64>;     // 导出标记（0 私有 / 1 导出）
@@ -228,6 +230,8 @@ pub func new_module() -> i64 {
     ir_insts_ops_cnt = table_new_i64()
     ir_ops = table_new_i64()
     ir_ops_kind = table_new_i64()
+    ir_funcs_params_tys_off = table_new_i64()
+    ir_funcs_param_tys = table_new_i64()
     ir_val_cnt = 0
     return 0
 }
@@ -241,12 +245,15 @@ pub func new_value() -> i64 {
 
 // ---------- builder：函数 ----------
 // 新建函数：name_id 函数名（池 id）、ret_ty 返回类型（types 自编码；
+// params 参数类型 id 表——同时分配参数值 id（ir_ops 参数段，供 llvmgen
+// 生成 define 形参列表与形参引用）。
 pub func new_func(name_id: i64, ret_ty: i64, params: table<i64>) -> i64 {
     var fid = len(ir_funcs_names)
     table_push(ir_funcs_names, name_id)
     table_push(ir_funcs_rets, ret_ty)
     table_push(ir_funcs_params_off, len(ir_ops))
     table_push(ir_funcs_params_cnt, len(params))
+    table_push(ir_funcs_params_tys_off, len(ir_funcs_param_tys))
     table_push(ir_funcs_entry, -1)
     table_push(ir_funcs_inst_total, 0)
     table_push(ir_funcs_exported, 0)
@@ -255,6 +262,7 @@ pub func new_func(name_id: i64, ret_ty: i64, params: table<i64>) -> i64 {
         var pv = new_value()
         table_push(ir_ops, pv)
         table_push(ir_ops_kind, OK_VALUE)
+        table_push(ir_funcs_param_tys, params[i])
         i = i + 1
     }
     return fid
@@ -331,6 +339,24 @@ pub func func_params_off(func_id: i64) -> i64 {
 pub func func_params_cnt(func_id: i64) -> i64 {
     return ir_funcs_params_cnt[func_id]
 }
+// 参数值 id（llvmgen 形参引用：值 id → 形参位置映射用）
+pub func param_val(func_id: i64, k: i64) -> i64 {
+    var off = ir_funcs_params_off[func_id]
+    var n = ir_funcs_params_cnt[func_id]
+    if k < 0 || k >= n {
+        return -1
+    }
+    return ir_ops[off + k]
+}
+// 参数类型 id（llvmgen define 形参列表用）
+pub func func_param_ty(func_id: i64, k: i64) -> i64 {
+    var off = ir_funcs_params_tys_off[func_id]
+    var n = ir_funcs_params_cnt[func_id]
+    if k < 0 || k >= n {
+        return -1
+    }
+    return ir_funcs_param_tys[off + k]
+}
 pub func func_entry(func_id: i64) -> i64 {
     return ir_funcs_entry[func_id]
 }
@@ -394,6 +420,17 @@ pub func ins_opnd_kind(inst_id: i64, k: i64) -> i64 {
 }
 pub func get_value(inst_id: i64) -> i64 {
     return ir_insts_val[inst_id]
+}
+
+// ---------- 诊断（自举调试用） ----------
+pub func diag_len_ops() -> i64 {
+    return len(ir_ops)
+}
+pub func diag_len_ops_kind() -> i64 {
+    return len(ir_ops_kind)
+}
+pub func diag_off(inst_id: i64) -> i64 {
+    return ir_insts_ops_off[inst_id]
 }
 
 }   // namespace ir

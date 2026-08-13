@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!--
+    方案 1/4：具象领带（Necktie）—— 石墨黑单色
+    · tie = 领带：结 + 领身 + 底部尖角，一眼可读的具象图标
+    · 配色：石墨黑单色（Vercel 式极简，深浅两档灰）
+  -->
+  <defs>
+    <linearGradient id="g1" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0F172A"/>
+      <stop offset="100%" stop-color="#475569"/>
+    </linearGradient>
+  </defs>
+  <!-- 结（圆角梯形） -->
+  <rect x="196" y="96" width="120" height="96" rx="30" fill="#0F172A"/>
+  <!-- 领身（上窄下宽的梯形 + 底部尖角） -->
+  <path d="M 222 192 L 290 192 L 372 432 Q 256 492 140 432 Z" fill="url(#g1)"/>
+  <!-- 领身中缝（细线） -->
+  <path d="M 256 192 L 256 440" stroke="#0F172A" stroke-opacity="0.25" stroke-width="8" stroke-linecap="round"/>
+</svg>

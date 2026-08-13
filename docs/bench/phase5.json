@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-12T17:09:14.3598532+08:00",
+  "generated_at": "2026-08-13T14:22:16.6623789+08:00",
   "cpu": "12th Gen Intel(R) Core(TM) i5-12490F",
   "machine": "JIRO-MAIN",
   "tiec_exe": "F:\\Projects\\tie\\compiler\\tiec.exe",
@@ -10,54 +10,217 @@
   "corpus_rule": "examples/*.tie（剔除 oop_neg_*）+ tests/language/*.tie（剔除 *_neg.tie）",
   "files": [
     {
+      "path": "examples/args_demo.tie",
+      "tiec_ms": 183.6,
+      "rust_ms": 68.6,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "examples/csv_demo.tie",
+      "tiec_ms": 1108.3,
+      "rust_ms": 100.1,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "examples/format_demo.tie",
+      "tiec_ms": 379.1,
+      "rust_ms": 84.5,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "examples/graph_demo.tie",
+      "tiec_ms": 1553.5,
+      "rust_ms": 77.4,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
       "path": "examples/hello.tie",
-      "tiec_ms": 85.2,
-      "rust_ms": 105.9,
+      "tiec_ms": 192.4,
+      "rust_ms": 73.7,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "examples/import_main.tie",
+      "tiec_ms": 224.7,
+      "rust_ms": 68.3,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "examples/import_nested.tie",
+      "tiec_ms": 214.8,
+      "rust_ms": 71.0,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "examples/index_assign_demo.tie",
+      "tiec_ms": 269.5,
+      "rust_ms": 76.8,
       "tiec_exit": 0,
       "rust_exit": 0
     },
     {
       "path": "examples/lib_math.tie",
-      "tiec_ms": 98.1,
-      "rust_ms": 77.7,
+      "tiec_ms": 209.2,
+      "rust_ms": 69.6,
       "tiec_exit": 0,
       "rust_exit": 0
     },
     {
       "path": "examples/lib_math2.tie",
-      "tiec_ms": 81.2,
-      "rust_ms": 69.3,
+      "tiec_ms": 204.7,
+      "rust_ms": 71.4,
       "tiec_exit": 0,
       "rust_exit": 0
     },
     {
       "path": "examples/lib_ns_tools.tie",
-      "tiec_ms": 70.2,
-      "rust_ms": 74.6,
+      "tiec_ms": 206.2,
+      "rust_ms": 73.6,
       "tiec_exit": 0,
       "rust_exit": 0
     },
     {
       "path": "examples/lib_util.tie",
-      "tiec_ms": 69.0,
-      "rust_ms": 68.5,
+      "tiec_ms": 201.8,
+      "rust_ms": 75.9,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "examples/loop_control_demo.tie",
+      "tiec_ms": 260.0,
+      "rust_ms": 95.8,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "examples/namespace_demo.tie",
+      "tiec_ms": 261.8,
+      "rust_ms": 99.4,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "examples/ns_import_demo.tie",
+      "tiec_ms": 207.4,
+      "rust_ms": 76.7,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "examples/optsearch_demo.tie",
+      "tiec_ms": 1679.6,
+      "rust_ms": 95.2,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "examples/radix_demo.tie",
+      "tiec_ms": 419.3,
+      "rust_ms": 96.7,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "examples/sort_demo.tie",
+      "tiec_ms": 1300.4,
+      "rust_ms": 113.2,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "examples/std_demo.tie",
+      "tiec_ms": 1222.9,
+      "rust_ms": 87.2,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "examples/strings.tie",
+      "tiec_ms": 220.5,
+      "rust_ms": 80.2,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "examples/switch_table_demo.tie",
+      "tiec_ms": 217.1,
+      "rust_ms": 74.2,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "tests/language/byref_table.tie",
+      "tiec_ms": 223.9,
+      "rust_ms": 77.8,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "tests/language/ext_ui_cfg.tie",
+      "tiec_ms": 1853.7,
+      "rust_ms": 110.3,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "tests/language/global_table.tie",
+      "tiec_ms": 214.9,
+      "rust_ms": 78.1,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "tests/language/intern.tie",
+      "tiec_ms": 420.7,
+      "rust_ms": 92.7,
       "tiec_exit": 0,
       "rust_exit": 0
     },
     {
       "path": "tests/language/runtime_staticlib.tie",
-      "tiec_ms": 75.5,
-      "rust_ms": 80.0,
+      "tiec_ms": 175.3,
+      "rust_ms": 79.0,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "tests/language/std_args_time.tie",
+      "tiec_ms": 446.1,
+      "rust_ms": 87.7,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "tests/language/std_coll_crc.tie",
+      "tiec_ms": 951.7,
+      "rust_ms": 103.2,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "tests/language/std_encoding.tie",
+      "tiec_ms": 1505.0,
+      "rust_ms": 85.7,
+      "tiec_exit": 0,
+      "rust_exit": 0
+    },
+    {
+      "path": "tests/language/utf_ascii.tie",
+      "tiec_ms": 660.1,
+      "rust_ms": 87.8,
       "tiec_exit": 0,
       "rust_exit": 0
     }
   ],
   "uncompilable": [
-    {
-      "path": "examples/args_demo.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
     {
       "path": "examples/assign.tie",
       "exit": 1,
@@ -84,42 +247,12 @@
       "reason": "irgen 最小集外（尚未支持的语句）"
     },
     {
-      "path": "examples/csv_demo.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
       "path": "examples/exmath_demo.tie",
       "exit": 1,
       "reason": "irgen 最小集外（尚未支持的语句）"
     },
     {
       "path": "examples/exmath_num_demo.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
-      "path": "examples/format_demo.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
-      "path": "examples/graph_demo.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
-      "path": "examples/import_main.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
-      "path": "examples/import_nested.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
-      "path": "examples/index_assign_demo.tie",
       "exit": 1,
       "reason": "irgen 最小集外（尚未支持的语句）"
     },
@@ -149,11 +282,6 @@
       "reason": "irgen 最小集外（尚未支持的语句）"
     },
     {
-      "path": "examples/loop_control_demo.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
       "path": "examples/lz4_demo.tie",
       "exit": 1,
       "reason": "irgen 最小集外（尚未支持的语句）"
@@ -169,27 +297,7 @@
       "reason": "irgen 最小集外（尚未支持的语句）"
     },
     {
-      "path": "examples/namespace_demo.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
-      "path": "examples/ns_import_demo.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
       "path": "examples/oop.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
-      "path": "examples/optsearch_demo.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
-      "path": "examples/radix_demo.tie",
       "exit": 1,
       "reason": "irgen 最小集外（尚未支持的语句）"
     },
@@ -205,16 +313,6 @@
     },
     {
       "path": "examples/script_demo.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
-      "path": "examples/sort_demo.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
-      "path": "examples/std_demo.tie",
       "exit": 1,
       "reason": "irgen 最小集外（尚未支持的语句）"
     },
@@ -239,17 +337,7 @@
       "reason": "irgen 最小集外（尚未支持的语句）"
     },
     {
-      "path": "examples/strings.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
       "path": "examples/switch_pattern.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
-      "path": "examples/switch_table_demo.tie",
       "exit": 1,
       "reason": "irgen 最小集外（尚未支持的语句）"
     },
@@ -309,17 +397,7 @@
       "reason": "irgen 最小集外（尚未支持的语句）"
     },
     {
-      "path": "tests/language/byref_table.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
       "path": "tests/language/ext_test_bench.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
-      "path": "tests/language/ext_ui_cfg.tie",
       "exit": 1,
       "reason": "irgen 最小集外（尚未支持的语句）"
     },
@@ -329,44 +407,19 @@
       "reason": "irgen 最小集外（尚未支持的语句）"
     },
     {
-      "path": "tests/language/global_table.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
-      "path": "tests/language/intern.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
       "path": "tests/language/interp_env_file.tie",
       "exit": 1,
-      "reason": "前端语义缺口"
+      "reason": "irgen 最小集外（尚未支持的语句）"
     },
     {
       "path": "tests/language/interp_env_value.tie",
       "exit": 1,
-      "reason": "前端语义缺口"
+      "reason": "irgen 最小集外（尚未支持的语句）"
     },
     {
       "path": "tests/language/interp_eval.tie",
-      "exit": 1,
-      "reason": "前端语义缺口"
-    },
-    {
-      "path": "tests/language/std_args_time.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
-      "path": "tests/language/std_coll_crc.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
-      "path": "tests/language/std_encoding.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
+      "exit": 124,
+      "reason": "其他（exit 124）"
     },
     {
       "path": "tests/language/std_fs_path.tie",
@@ -382,11 +435,6 @@
       "path": "tests/language/std_net_text.tie",
       "exit": 1,
       "reason": "irgen 最小集外（尚未支持的语句）"
-    },
-    {
-      "path": "tests/language/utf_ascii.tie",
-      "exit": 1,
-      "reason": "irgen 最小集外（尚未支持的语句）"
     }
   ],
   "both_fail": [
@@ -398,18 +446,18 @@
   ],
   "totals": {
     "corpus_total": 74,
-    "compilable_count": 6,
-    "uncompilable_count": 67,
+    "compilable_count": 30,
+    "uncompilable_count": 43,
     "both_fail_count": 1,
-    "coverage_pct": 8.1,
-    "tiec_total_ms": 479.2,
-    "rust_total_ms": 476.0,
-    "ratio": 1.007,
+    "coverage_pct": 40.5,
+    "tiec_total_ms": 17188.2,
+    "rust_total_ms": 2531.8,
+    "ratio": 6.789,
     "hard_line": "ratio <= 3.0",
     "target": "ratio <= 2.0",
-    "hard_pass": true,
-    "target_pass": true,
+    "hard_pass": false,
+    "target_pass": false,
     "partial_coverage": true,
-    "verdict": "PASS（部分基准 + 缺口清单）"
+    "verdict": "FAIL"
   }
 }

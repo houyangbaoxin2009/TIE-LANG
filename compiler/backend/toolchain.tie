@@ -127,35 +127,48 @@ pub func opt(input_ll: string, output_opt: string, level: i64) -> i64 {
 }
 
 // 链接可执行文件：clang in.opt.ll -o out.exe [--target=T] [runtime/interp 库 + 系统库]。
-// need_interp 为 true 时优先链接 tie 运行时静态库 std/runtime.a（T4.5，
-// tie 语言自写，覆盖 exec_code/get_env/time_now 等桥符号——无需 Rust）：
-// - 找到 std\runtime.a（或 TIE_RUNTIME_LIB 环境变量）→ 直接链接，无需系统库
-//   （runtime 内部只用 msvcrt/CRT，clang 自动解析）；
-// - 未找到 → 回退 tie_interp.lib（Rust 桥，覆盖全部符号含文件/字符串原语，
-//   TIE_INTERP_LIB 环境变量 → target\release → target\debug）与 Rust std 依赖
-//   系统库。返回退出码。
-pub func link_exe(input_opt: string, output_exe: string, target: string, need_interp: bool) -> i64 {
+// need_interp 为 true 时按 prefer_interp 选择链接目标（阶段 A 扩展）：
+// - prefer_interp=true（程序用了 tie-interp 库桥：str_len/table_*/arg_* 等）：
+//   链接 tie_interp.lib（Rust 桥，覆盖全部 tie_* 符号含 exec_code/get_env/time_now）
+//   + Rust std 依赖系统库——与 T4.5 runtime.a 二选一，避免重复定义；
+// - prefer_interp=false（仅 exec_code/get_env/time_now 三个运行时桥，T4.5 旧路径）：
+//   优先 std/runtime.a（tie 语言自写，覆盖三个符号，无需 Rust）；
+//   未找到 → 回退 tie_interp.lib（Rust 桥）+ 系统库。
+// 返回退出码。
+pub func link_exe(input_opt: string, output_exe: string, target: string, need_interp: bool, prefer_interp: bool) -> i64 {
     var tool = find_clang()
     if str_len(tool) == 0 {
         tc_err_msg = "未找到 clang，请确认 LLVM 已安装并在 PATH 中"
         return -1
     }
-    var cmd = tool + " " + input_opt + " -o " + output_exe + " -Wl,/Brepro"
+    // /STACK:16777216（16MB）：自举链编译器（tiec 编译的 driver）处理大文件
+    // （编译 driver 自身）时递归/嵌套调用栈深，默认 1MB 栈会 0xC00000FD 溢出
+    var cmd = tool + " " + input_opt + " -o " + output_exe + " -Wl,/Brepro -Wl,/STACK:16777216"
     if str_len(target) > 0 {
         cmd = cmd + " --target=" + target
     }
     if need_interp {
-        var rlib = find_runtime_lib()
-        if str_len(rlib) > 0 {
-            cmd = cmd + " " + rlib
-        } else {
+        if prefer_interp {
             var lib = find_interp_lib()
             if str_len(lib) == 0 {
-                tc_err_msg = "程序使用了 REPL 内置函数（read_line/eval 等），但未找到 tie-interp 静态库。" +
+                tc_err_msg = "程序使用了 tie-interp 桥内置，但未找到 tie-interp 静态库。" +
                     "请先构建 tie-interp（cargo build -p tie-interp --release），或设置环境变量 TIE_INTERP_LIB"
                 return -1
             }
             cmd = cmd + " " + lib + " -lws2_32 -luserenv -lntdll -lbcrypt -ladvapi32 -lole32 -lshell32"
+        } else {
+            var rlib = find_runtime_lib()
+            if str_len(rlib) > 0 {
+                cmd = cmd + " " + rlib
+            } else {
+                var lib = find_interp_lib()
+                if str_len(lib) == 0 {
+                    tc_err_msg = "程序使用了 REPL 内置函数（read_line/eval 等），但未找到 tie-interp 静态库。" +
+                        "请先构建 tie-interp（cargo build -p tie-interp --release），或设置环境变量 TIE_INTERP_LIB"
+                    return -1
+                }
+                cmd = cmd + " " + lib + " -lws2_32 -luserenv -lntdll -lbcrypt -ladvapi32 -lole32 -lshell32"
+            }
         }
     }
     return run(cmd)

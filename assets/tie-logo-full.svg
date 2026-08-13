@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 240" width="640" height="240">
+  <!--
+    tie 语言品牌组合 logo —— 缺口环主图标 + 小写 "tie" 文字（横向）
+    ─────────────────────────────────────────────────────────
+    · 左侧：缺口环主图标（512 → 215，中心 (145,120)）
+    · 右侧：小写 "tie"，手绘几何字形——三字母严格整齐：
+      统一总高 140px（y 50→190，垂直中心 = 图标中心 120）、
+      统一笔画宽 30px、字母间视觉空隙严格相等（36px）、基线对齐
+    · 配色：字母石墨黑 #0F172A，i 的点青 #0EA5E9 呼应缺口环悬浮点
+    · 深色适配：prefers-color-scheme 媒体查询，深色模式下
+      环与文字切换为浅色 #F8FAFC，i 点切换为亮青 #38BDF8
+  -->
+  <style>
+    .ring { stroke: #0F172A; }
+    .letter { stroke: #0F172A; }
+    .dot  { fill: #0EA5E9; }
+    @media (prefers-color-scheme: dark) {
+      .ring { stroke: #F8FAFC; }
+      .letter { stroke: #F8FAFC; }
+      .dot  { fill: #38BDF8; }
+    }
+  </style>
+
+  <!-- ── 左侧：主图标（scale 0.42：512 → 215，中心 (145,120)）── -->
+  <g transform="translate(37.5,12.5) scale(0.42)">
+    <!-- 左大半弧 -->
+    <path class="ring" d="M 190.3 353.4 A 117.5 117.5 0 0 1 190.3 158.6"
+          fill="none" stroke-width="47.5" stroke-linecap="butt"/>
+    <!-- 右大半弧 -->
+    <path class="ring" d="M 321.7 158.6 A 117.5 117.5 0 0 1 321.7 353.4"
+          fill="none" stroke-width="47.5" stroke-linecap="butt"/>
+    <!-- 悬浮青点 -->
+    <circle class="dot" cx="256" cy="152.25" r="17.5"/>
+  </g>
+
+  <!-- ── 右侧：小写 "tie" 文字（手绘几何字形，严格整齐）──
+       统一规范：
+       · 总高 140px：y 50 → 190（垂直中心 120 = 图标中心）
+       · 笔画宽 30px，圆头
+       · 字母间视觉空隙严格相等 36px：
+         t 半宽 50（横笔 100）→ i 半宽 15 → e 半径 70
+         t(320) → i(421) → e(542)，中心距 101 / 121
+       · 基线 y=190 三字母齐平；t 横笔与 i 点同高区间
+       · 光学微调（overshoot）：圆形/点的顶部弧线视觉偏矮，
+         故 i 点与 e 圆上伸 2px、e 圆下伸 2px，与平直笔画视觉齐平 -->
+  <!-- t：横笔（y 50-80）+ 竖笔（y 50-190） -->
+  <g class="letter" stroke-width="30" stroke-linecap="round">
+    <path d="M 270 65 L 370 65"/>
+    <path d="M 320 50 L 320 190"/>
+  </g>
+  <!-- i：点（cy 63，上伸抵消弧线视觉差）+ 竖笔（y 102-190） -->
+  <circle class="dot" cx="421" cy="63" r="15"/>
+  <path class="letter" d="M 421 102 L 421 190" stroke-width="30" stroke-linecap="round"/>
+  <!-- e：圆环（r 70，上下各 overshoot 2px，视觉与总高齐平）+ 中横 -->
+  <g class="letter" stroke-width="30" stroke-linecap="round">
+    <circle cx="542" cy="120" r="70" fill="none"/>
+    <path d="M 472 120 L 620 120"/>
+  </g>
+</svg>

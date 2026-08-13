@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!--
+    方案 2/4：三态分子（Trit）
+    · trit 三值（-1/0/+1）：三个节点排成等边三角形，弧线相连，中心核心
+    · 配色：深蓝 + 亮蓝 + 青 同色系（无琥珀）
+  -->
+  <defs>
+    <linearGradient id="g2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1E40AF"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+  </defs>
+  <!-- 三条连接弧（细线，同色浅） -->
+  <path d="M 256 120 A 220 220 0 0 1 452 356" fill="none" stroke="#93C5FD" stroke-width="10" stroke-linecap="round"/>
+  <path d="M 452 356 A 220 220 0 0 1 60 356" fill="none" stroke="#93C5FD" stroke-width="10" stroke-linecap="round"/>
+  <path d="M 60 356 A 220 220 0 0 1 256 120" fill="none" stroke="#93C5FD" stroke-width="10" stroke-linecap="round"/>
+  <!-- 三个节点（外环 + 内核） -->
+  <circle cx="256" cy="120" r="52" fill="url(#g2)"/>
+  <circle cx="256" cy="120" r="20" fill="#06B6D4"/>
+  <circle cx="452" cy="356" r="52" fill="url(#g2)"/>
+  <circle cx="452" cy="356" r="20" fill="#06B6D4"/>
+  <circle cx="60" cy="356" r="52" fill="url(#g2)"/>
+  <circle cx="60" cy="356" r="20" fill="#06B6D4"/>
+  <!-- 中心核心 -->
+  <circle cx="256" cy="256" r="34" fill="#0EA5E9"/>
+</svg>

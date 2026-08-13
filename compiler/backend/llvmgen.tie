@@ -18,7 +18,25 @@ import "./../middle/ir.tie"
 import "../../std/utf.tie"
 
 // ==================== 输出缓冲 ====================
-var out_buf: string = "";
+// 行收集表：line() 只追加（O(1)），emit() 末尾分治拼接成完整文本。
+// 避免 `out_buf = out_buf + s` 的 O(N²) 全量拷贝——tie 字符串不可变，
+// str_cat 每次 malloc 新串且旧串无 GC 回收，自编译（10 万级行）会挂起
+// 并耗尽内存（曾实测 30s+ / 2.3GB）。
+var out_lines: table<string>;
+// 值 id → 定义指令 id 索引（value_def 缓存）：值 id 从 0 连续分配
+// （ir.new_value 单调递增），直接作表下标 → O(1) 查询，替代全指令
+// 线性扫描的 O(N²)（每条指令的每个实参引用都全扫一遍）。
+var vdef_cache: table<i64>;
+var vdef_cache_ready: i64 = 0;
+// 调试：当前生成函数 id（gen_inst 的细粒度诊断用；0 = 未生成，真实 fid 从 0 起）
+var g_pfid: i64 = 0;
+// 当前函数参数个数（opnd_ref 形参映射用）
+var g_pcnt: i64 = 0;
+// 指令 id → 块 id 映射（emit 开头构建一次；gen_func 按指令序遍历用）。
+// 块 id 创建序 ≠ 值 id 分配序（if/while 嵌套：then/else/merge 块先创建、
+// 循环头块后创建）——按块 id 遍历会值编号回退，LLVM 解析拒绝。
+var g_inst_blk: table<i64>;
+var g_inst_blk_ready: i64 = 0;
 // 字符串常量表：池 id → @.str.N 序号（自省收集）
 var str_pool: table<i64>;   // 字符串池 id（登记序）
 var str_idx: table<i64>;    // 对应 @.str.N
@@ -29,11 +47,194 @@ var g_sext_cnt: i64 = 0;
 // T4.5：extern_call(36) 收集的符号名池 id（去重登记序；llvmgen 顶层变量，
 // 与 out_buf 等同级——命名空间体内不允许 var）
 var ext_syms: table<i64>;
+// 阶段 A：全局变量登记（名池 id → 表/标量 + 类型）。表全局 → ptr null 占位
+// + main 入口初始化；标量 → 零值 global。
+var g_global_names: table<i64>;   // 全局名池 id（登记序）
+var g_global_is_table: table<i64>;  // 1 = 表全局（ptr null），0 = 标量
+var g_global_tys: table<i64>;     // 标量类型 id（表全局 -1）
+var g_global_inits: table<i64>;   // const 标量初始值（-1 = 无；i64 字面量）
+// 阶段 A：用户函数调用（call 35）的符号名池 id（去重，与 ext_syms 平行收集；
+// 命名空间函数全名经 ns_symbol 转 $，无需 declare）
+var call_syms: table<i64>;
+// 阶段 A：str_cat 内联序列的临时寄存器计数（与 printf sext 同款独立命名空间，
+// 避免与 %N 值编号冲突）
+var g_str_reg_cnt: i64 = 0;
 
 namespace llvmgen {
 
+// 全局变量登记：表全局（global ptr null + main 初始化）/ 标量（零值 global）。
+// 供 irgen.gen_global_var 调用（driver 树顶层 VarDecl 439 个）。
+pub func global_table_reg(nm: string) {
+    var nid = interner.intern(nm)
+    table_push(g_global_names, nid)
+    table_push(g_global_is_table, 1)
+    table_push(g_global_tys, -1)
+    table_push(g_global_inits, -1)
+}
+
+pub func global_scalar_reg(nm: string, ty: i64) {
+    var nid = interner.intern(nm)
+    table_push(g_global_names, nid)
+    table_push(g_global_is_table, 0)
+    table_push(g_global_tys, ty)
+    table_push(g_global_inits, -1)
+}
+
+// const 标量初始值（i64 字面量）：emit_globals 输出 @g = global i64 <v>
+pub func global_scalar_init(nm: string, v: i64) {
+    var nid = interner.intern(nm)
+    var i: i64 = 0
+    while i < len(g_global_names) {
+        if g_global_names[i] == nid {
+            g_global_inits[i] = v
+            return
+        }
+        i = i + 1
+    }
+}
+
+// 全局表是否已登记（irgen 查表变量语义类型用）
+func global_is_table(nm: string) -> i64 {
+    var nid = interner.intern(nm)
+    var i: i64 = 0
+    while i < len(g_global_names) {
+        if g_global_names[i] == nid {
+            return g_global_is_table[i]
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 输出全局变量段（模块头 declare 之后、函数 define 之前）：
+//   @g = global ptr null            （表全局，main 入口运行时创建）
+//   @g = global T <零值>             （标量；i64→0 / bool→false / string→null / f64→0.0）
+func emit_globals() {
+    var i: i64 = 0
+    while i < len(g_global_names) {
+        var nm = intern.lookup(g_global_names[i])
+        if g_global_is_table[i] == 1 {
+            line("@" + nm + " = global ptr null")
+        } else {
+            var ty = llvm_ty(g_global_tys[i])
+            var init = "0"
+            // const 整数字面量初始值（i64 字面量直接输出；其余保持零值）
+            if i < len(g_global_inits) && g_global_inits[i] >= 0 && ty == "i64" {
+                init = to_string(g_global_inits[i])
+            }
+            if ty == "ptr" {
+                // string 全局默认空串常量（null 会被 strcmp 段错误）
+                if g_global_tys[i] == TK_STR {
+                    var empty_id = interner.intern("")
+                    var eslot = str_slot(empty_id)
+                    line("@" + nm + " = global ptr @.str." + to_string(eslot))
+                    i = i + 1
+                    continue
+                }
+                init = "null"
+            } else if ty == "i1" {
+                init = "false"
+            } else if ty == "double" {
+                init = "0.0"
+            } else if ty == "float" {
+                init = "0.0"
+            }
+            line("@" + nm + " = global " + ty + " " + init)
+        }
+        i = i + 1
+    }
+    if len(g_global_names) > 0 {
+        line("")
+    }
+}
+
+// 用户函数调用（call 35）符号登记（去重；命名空间函数全名 → $）
+pub func call_sym_reg(sid: i64) {
+    var dup = false
+    var k: i64 = 0
+    while k < len(call_syms) {
+        if call_syms[k] == sid {
+            dup = true
+            break
+        }
+        k = k + 1
+    }
+    if !dup {
+        table_push(call_syms, sid)
+    }
+}
+
+// 查找子串位置（-1 = 无）
+func find_sub(s: string, sub: string) -> i64 {
+    var n = str_len(s)
+    var m = str_len(sub)
+    if m == 0 || n < m {
+        return -1
+    }
+    var i: i64 = 0
+    while i + m <= n {
+        var j: i64 = 0
+        var ok = true
+        while j < m {
+            if str_char(s, i + j) != str_char(sub, j) {
+                ok = false
+                break
+            }
+            j = j + 1
+        }
+        if ok {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 命名空间全名 → LLVM 符号：全部 `::` 转 `$`（sstate::child → sstate$child）
+func ns_replace(s: string) -> string {
+    var out: string = ""
+    var i: i64 = 0
+    var n = str_len(s)
+    while i < n {
+        if i + 1 < n && str_char(s, i) == ":" && str_char(s, i + 1) == ":" {
+            out = out + "$"
+            i = i + 2
+        } else {
+            out = out + str_char(s, i)
+            i = i + 1
+        }
+    }
+    return out
+}
+
 func line(s: string) {
-    out_buf = out_buf + s + "\n"
+    table_push(out_lines, s)
+}
+
+// 行表 → 完整 .ll 文本：分治两两合并。
+// 每层合并拷贝总量 ≈ 最终大小，共 log₂N 层（总拷贝 O(total·log N)），
+// 且每行只参与 log N 次拼接——相比逐行追加的 O(N²) 全量拷贝是数量级差异。
+// 行语义与旧 line() 一致：每行自带尾随 "\n"（N 行 = N 个换行）。
+func join_lines() -> string {
+    var cur = out_lines
+    var n = len(cur)
+    if n == 0 {
+        return ""
+    }
+    while n > 1 {
+        var nxt = table_new_string()
+        var i: i64 = 0
+        while i + 1 < n {
+            table_push(nxt, cur[i] + "\n" + cur[i + 1])
+            i = i + 2
+        }
+        if i < n {
+            table_push(nxt, cur[i])
+        }
+        cur = nxt
+        n = len(cur)
+    }
+    return cur[0] + "\n"
 }
 
 // ==================== 类型映射 ====================
@@ -115,12 +316,15 @@ func collect_strings() {
 
 // T4.5：遍历全部指令，收集 extern_call(36) 的符号名池 id（去重）。
 // 符号名经 interner 还原文本；emit_extern_decls 按符号名输出 declare。
+// 阶段 A：同时收集 call(35) 用户函数符号（call_syms；无需 declare，本模块定义）。
 func collect_externs() {
     ext_syms = table_new_i64()
+    call_syms = table_new_i64()
     var ni = ir.inst_count()
     var i: i64 = 0
     while i < ni {
-        if ir.ins_op(i) == 36 && ir.ins_ops_cnt(i) >= 1 {
+        var op = ir.ins_op(i)
+        if op == 36 && ir.ins_ops_cnt(i) >= 1 {
             var sid = ir.ins_opnd(i, 0)
             var dup = false
             var k: i64 = 0
@@ -134,16 +338,32 @@ func collect_externs() {
             if !dup {
                 table_push(ext_syms, sid)
             }
+        } else if op == 35 && ir.ins_ops_cnt(i) >= 1 {
+            var sid2 = ir.ins_opnd(i, 0)
+            call_sym_reg(sid2)
         }
         i = i + 1
     }
 }
 
 // 符号名 → declare 声明文本（tie 运行时桥签名表；未登记符号返回空串）。
-// 与 std/runtime.tie 的导出符号一一对应：
-//   tie_exec_code(cmd: string) -> i64 → declare i64 @tie_exec_code(ptr)
-//   tie_get_env(name: string) -> string → declare ptr @tie_get_env(ptr)
-//   tie_time_now() -> i64 → declare i64 @tie_time_now()
+// 与 std/runtime.tie / tie_interp.lib 的导出符号一一对应（阶段 A 扩展）：
+//   返回 i64：tie_exec_code(ptr) / tie_time_now() / tie_str_len(ptr) /
+//            tie_char_code(ptr) / tie_arg_count() / tie_table_len(ptr) /
+//            tie_parse_int(ptr, ptr)
+//   返回 ptr：tie_get_env(ptr) / tie_exec_output(ptr) / tie_str_char(ptr, i64) /
+//            tie_to_string_i64(i64) / tie_to_string_f64(double) / tie_file_read(ptr) /
+//            tie_arg_string(i64) / tie_table_new(i64) / tie_table_at_i64(ptr, i64, ptr) /
+//            tie_table_at_string(ptr, i64, ptr) / tie_print_err(ptr) / tie_mkdir_all(ptr) /
+//            tie_regex_find_all(ptr, ptr) / tie_read_line() / tie_cwd() / tie_eval_expr(ptr)
+//   返回 void：tie_table_push_i64(ptr, i64) / tie_table_push_string(ptr, ptr) /
+//            tie_table_push_bool(ptr, i8) / tie_table_set_i64(ptr, i64, i64, ptr) /
+//            tie_table_set_string(ptr, i64, ptr, ptr) / tie_byte_write(ptr, ptr) /
+//            tie_set_env(ptr, ptr) / tie_msg_register(ptr, ptr, ptr)
+//   返回 i8：tie_mkdir_all(ptr) / tie_file_copy(ptr, ptr) / tie_file_move(ptr, ptr) /
+//            tie_http_get_file(ptr, ptr) / tie_untar_gz(ptr, ptr) / tie_unzip(ptr, ptr) /
+//            tie_copy_dir(ptr, ptr) / tie_byte_write(ptr, ptr)
+// 注意：返回 void 的桥在 irgen 用 ty=-1 建指令（无结果寄存器）。
 func extern_decl(sym: string) -> string {
     if sym == "tie_exec_code" {
         return "declare i64 @tie_exec_code(ptr)"
@@ -153,6 +373,108 @@ func extern_decl(sym: string) -> string {
     }
     if sym == "tie_time_now" {
         return "declare i64 @tie_time_now()"
+    }
+    if sym == "tie_str_len" {
+        return "declare i64 @tie_str_len(ptr)"
+    }
+    if sym == "tie_char_code" {
+        return "declare i64 @tie_char_code(ptr)"
+    }
+    if sym == "tie_str_char" {
+        return "declare ptr @tie_str_char(ptr, i64)"
+    }
+    if sym == "tie_to_string_i64" {
+        return "declare ptr @tie_to_string_i64(i64)"
+    }
+    if sym == "tie_to_string_f64" {
+        return "declare ptr @tie_to_string_f64(double)"
+    }
+    if sym == "tie_parse_int" {
+        return "declare i64 @tie_parse_int(ptr, ptr)"
+    }
+    if sym == "tie_parse_float" {
+        return "declare double @tie_parse_float(ptr, ptr)"
+    }
+    if sym == "tie_exec_output" {
+        return "declare ptr @tie_exec_output(ptr)"
+    }
+    if sym == "tie_arg_count" {
+        return "declare i64 @tie_arg_count()"
+    }
+    if sym == "tie_arg_string" {
+        return "declare ptr @tie_arg_string(i64)"
+    }
+    if sym == "tie_file_read" {
+        return "declare ptr @tie_file_read(ptr)"
+    }
+    if sym == "tie_read_line" {
+        return "declare ptr @tie_read_line()"
+    }
+    if sym == "tie_eval_expr" {
+        return "declare ptr @tie_eval_expr(ptr)"
+    }
+    if sym == "tie_cwd" {
+        return "declare ptr @tie_cwd()"
+    }
+    if sym == "tie_print_err" {
+        return "declare void @tie_print_err(ptr)"
+    }
+    if sym == "tie_table_new" {
+        return "declare ptr @tie_table_new(i64)"
+    }
+    if sym == "tie_table_push_i64" {
+        return "declare void @tie_table_push_i64(ptr, i64)"
+    }
+    if sym == "tie_table_push_string" {
+        return "declare void @tie_table_push_string(ptr, ptr)"
+    }
+    if sym == "tie_table_push_bool" {
+        return "declare void @tie_table_push_bool(ptr, i8)"
+    }
+    if sym == "tie_table_push_f64" {
+        return "declare void @tie_table_push_f64(ptr, double)"
+    }
+    if sym == "tie_table_at_i64" {
+        return "declare i64 @tie_table_at_i64(ptr, i64, ptr)"
+    }
+    if sym == "tie_table_at_string" {
+        return "declare ptr @tie_table_at_string(ptr, i64, ptr)"
+    }
+    if sym == "tie_table_at_bool" {
+        return "declare i8 @tie_table_at_bool(ptr, i64, ptr)"
+    }
+    if sym == "tie_table_len" {
+        return "declare i64 @tie_table_len(ptr)"
+    }
+    if sym == "tie_table_set_i64" {
+        return "declare void @tie_table_set_i64(ptr, i64, i64, ptr)"
+    }
+    if sym == "tie_table_set_string" {
+        return "declare void @tie_table_set_string(ptr, i64, ptr, ptr)"
+    }
+    if sym == "tie_mkdir_all" {
+        return "declare i8 @tie_mkdir_all(ptr)"
+    }
+    if sym == "tie_file_copy" {
+        return "declare i8 @tie_file_copy(ptr, ptr)"
+    }
+    if sym == "tie_file_move" {
+        return "declare i8 @tie_file_move(ptr, ptr)"
+    }
+    if sym == "tie_http_get_file" {
+        return "declare i8 @tie_http_get_file(ptr, ptr)"
+    }
+    if sym == "tie_untar_gz" {
+        return "declare i8 @tie_untar_gz(ptr, ptr)"
+    }
+    if sym == "tie_unzip" {
+        return "declare i8 @tie_unzip(ptr, ptr)"
+    }
+    if sym == "tie_copy_dir" {
+        return "declare i8 @tie_copy_dir(ptr, ptr)"
+    }
+    if sym == "tie_regex_find_all" {
+        return "declare ptr @tie_regex_find_all(ptr, ptr)"
     }
     return ""
 }
@@ -217,9 +539,41 @@ func emit_strings() {
 
 // ==================== 指令映射 ====================
 // 操作数引用：OK_VALUE(0) → %N；OK_BLOCK(1) → label；OK_IMM(2) → 立即数
+// 参数值 id → 形参位置（-1 = 非参数）。
+// 参数值 id 是全局编号，LLVM 形参按位置 %0..%n-1 命名，须映射。
+func param_pos(v: i64) -> i64 {
+    var i: i64 = 0
+    while i < g_pcnt {
+        if ir.param_val(g_pfid, i) == v {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 参数值 id → 形参位置引用（"%0"..；非参数返回空串）
+func param_ref(v: i64) -> string {
+    var p = param_pos(v)
+    if p < 0 {
+        return ""
+    }
+    return "%" + to_string(p)
+}
+
 func opnd_ref(inst_id: i64, k: i64) -> string {
     var v = ir.ins_opnd(inst_id, k)
     var kind = ir.ins_opnd_kind(inst_id, k)
+    // IMM 字面量（kind 2）优先直接输出：值 id 0 可能与参数值 id 撞号
+    // （strcmp 结果 == 0 曾误输出 %0 参数引用）
+    if kind == 2 {
+        return to_string(v)
+    }
+    // 形参引用优先（参数值 id 无定义指令，且 %N 全局编号在 LLVM 中不存在）
+    var pr = param_ref(v)
+    if pr != "" {
+        return pr
+    }
     if kind == 0 {
         return "%" + to_string(v)
     }
@@ -227,20 +581,69 @@ func opnd_ref(inst_id: i64, k: i64) -> string {
         // 块标签统一为 bb<N>（与 gen_func 标签定义一致）
         return "label %bb" + to_string(v)
     }
+    if kind == 3 {
+        // 全局地址（irgen 伪绑定 "@name" 池 id）→ @name 直接引用
+        var gref = global_ref(v)
+        if str_len(gref) > 0 {
+            return gref
+        }
+        return "%" + to_string(v)  // 防御（理论上不达）
+    }
     return to_string(v)
 }
 
-// 值 id → 定义指令 id（扫描；无定义返回 -1）
-func value_def(v: i64) -> i64 {
-    var ni = ir.inst_count()
+// 全局变量地址解析：v 是"@"+名字 的池 id（irgen scope_get_global 伪绑定）→
+// "@name"（LLVM 全局符号）；非全局 → 空串。
+// 注意：登记侧存裸名池 id（global_table_reg），引用侧存 "@name" 池 id——
+// 两池 id 不同，须按名字（去 @）比较。
+func global_ref(v: i64) -> string {
+    var nm = intern.lookup(v)
+    if str_len(nm) > 0 && str_char(nm, 0) == "@" {
+        nm = slice(nm, 1, str_len(nm))
+    }
+    var nid = interner.intern(nm)
     var i: i64 = 0
-    while i < ni {
-        if ir.ins_val(i) == v {
-            return i
+    while i < len(g_global_names) {
+        if g_global_names[i] == nid {
+            return "@" + nm
         }
         i = i + 1
     }
-    return -1
+    return ""
+}
+
+// 值 id → 定义指令 id 索引表构建（懒执行：首次 value_def 调用时一次性构建）。
+// 值 id 从 0 连续分配（ir.value_count 返回总数），直接作表下标。
+// 语义：每个值恰好被一条指令定义（SSA），后写的覆盖先写（同值不会重复定义）。
+func build_vdef_cache() {
+    vdef_cache = table_new_i64()
+    var nv = ir.value_count()
+    var i: i64 = 0
+    while i < nv {
+        table_push(vdef_cache, -1)
+        i = i + 1
+    }
+    var ni = ir.inst_count()
+    var j: i64 = 0
+    while j < ni {
+        var v = ir.ins_val(j)
+        if v >= 0 {
+            vdef_cache[v] = j
+        }
+        j = j + 1
+    }
+    vdef_cache_ready = 1
+}
+
+// 值 id → 定义指令 id（O(1) 索引；无定义/越界返回 -1）
+func value_def(v: i64) -> i64 {
+    if vdef_cache_ready == 0 {
+        build_vdef_cache()
+    }
+    if v < 0 || v >= len(vdef_cache) {
+        return -1
+    }
+    return vdef_cache[v]
 }
 
 // printf 实参引用：按值定义指令判定类型
@@ -252,6 +655,14 @@ func value_def(v: i64) -> i64 {
 //   其他/未知    → "i64 %N"
 func arg_ref(inst_id: i64, k: i64) -> string {
     var v = ir.ins_opnd(inst_id, k)
+    // 形参优先：字符串参数 → ptr %N；其余 → i64 %N
+    var pp = param_pos(v)
+    if pp >= 0 {
+        if ir.func_param_ty(g_pfid, pp) == TK_STR {
+            return "ptr %" + to_string(pp)
+        }
+        return "i64 %" + to_string(pp)
+    }
     var def = value_def(v)
     if def >= 0 {
         if ir.ins_op(def) == 62 {
@@ -259,7 +670,7 @@ func arg_ref(inst_id: i64, k: i64) -> string {
             return "ptr @.str." + to_string(slot)
         }
         if ir.ins_ty(def) == TK_STR {
-            return "ptr %" + to_string(v)
+            return "ptr " + to_ptr(v)
         }
     }
     return "i64 %" + to_string(v)
@@ -283,15 +694,21 @@ func gen_inst(inst_id: i64) {
         return
     }
     if op == 21 {
-        // load：操作数[0] = 地址
+        // load：操作数[0] = 地址（全局 kind=3 → opnd_ref 输出 @name）
         var ty = llvm_ty(ir.ins_ty(inst_id))
         line(reg + " = load " + ty + ", ptr " + opnd_ref(inst_id, 0))
         return
     }
     if op == 22 {
-        // store：操作数 [类型IMM, 值VALUE, 地址VALUE]
+        // store：操作数 [类型IMM, 值VALUE, 地址VALUE]（全局 kind=3 → opnd_ref 输出 @name）
         var vty = llvm_ty(ir.ins_opnd(inst_id, 0))
-        line("store " + vty + " " + opnd_ref(inst_id, 1) + ", ptr " + opnd_ref(inst_id, 2))
+        var vr = opnd_ref(inst_id, 1)
+        if vty == "ptr" {
+            // 值统一转真 ptr：const_str（i64 指针整数）/str_cat（i64）
+            // 不能直接 store ptr %N（%N 类型是 i64）——to_ptr 负责转换
+            vr = to_ptr(ir.ins_opnd(inst_id, 1))
+        }
+        line("store " + vty + " " + vr + ", ptr " + opnd_ref(inst_id, 2))
         return
     }
     if op == 60 {
@@ -330,9 +747,9 @@ func gen_inst(inst_id: i64) {
         return
     }
     if op == 12 {
-        // icmp：操作数 [lhs VALUE, rhs VALUE, cmp IMM]
-        var lv = ir.ins_opnd(inst_id, 0)
-        var rv = ir.ins_opnd(inst_id, 1)
+        // icmp：操作数 [lhs VALUE, rhs VALUE, cmp IMM]。
+        // 比较类型：按操作数定义指令类型（i64 整数比较；i32 为 strcmp 结果
+        // 与 0 比较——字符串比较链）。通用取 llvm_ty(lhs 定义指令类型)。
         var cmp = ir.ins_opnd(inst_id, 2)
         var cname = "eq"
         if cmp == 0 {
@@ -348,7 +765,108 @@ func gen_inst(inst_id: i64) {
         } else if cmp == 5 {
             cname = "sge"
         }
-        line(reg + " = icmp " + cname + " i64 " + opnd_ref(inst_id, 0) + ", " + opnd_ref(inst_id, 1))
+        // 类型：默认 i64；lhs 定义指令为 i32（strcmp 结果）→ i32
+        var cmp_ty = "i64"
+        var lv = ir.ins_opnd(inst_id, 0)
+        var def = value_def(lv)
+        if def >= 0 {
+            cmp_ty = llvm_ty(ir.ins_ty(def))
+        }
+        // ptr 比较时字面量 0 必须写作 null（LLVM 语法：icmp eq ptr %x, null）
+        var op0 = opnd_ref(inst_id, 0)
+        var op1 = opnd_ref(inst_id, 1)
+        if cmp_ty == "ptr" {
+            if op0 == "0" {
+                op0 = "null"
+            }
+            if op1 == "0" {
+                op1 = "null"
+            }
+        }
+        line(reg + " = icmp " + cname + " " + cmp_ty + " " + op0 + ", " + op1)
+        return
+    }
+    if op == 6 || op == 7 || op == 8 || op == 10 || op == 11 {
+        // and/or/xor/shl/shr（逻辑 i1 / 位运算 i64 按 ins_ty）
+        var opname = ""
+        if op == 6 {
+            opname = "and"
+        } else if op == 7 {
+            opname = "or"
+        } else if op == 8 {
+            opname = "xor"
+        } else if op == 10 {
+            opname = "shl"
+        } else if op == 11 {
+            opname = "ashr"
+        }
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = " + opname + " " + ty + " " + opnd_ref(inst_id, 0) + ", " + opnd_ref(inst_id, 1))
+        return
+    }
+    if op == 33 {
+        // phi：操作数 [值1, 块1, 值2, 块2, ...]（值可为 IMM 立即数）
+        var args = ""
+        var k: i64 = 0
+        while k + 1 < cnt {
+            if k > 0 {
+                args = args + ", "
+            }
+            args = args + "[" + opnd_ref(inst_id, k) + ", %bb" + to_string(ir.ins_opnd(inst_id, k + 1)) + "]"
+            k = k + 2
+        }
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = phi " + ty + " " + args)
+        return
+    }
+    if op == 35 {
+        // call（阶段 A 用户函数）：操作数 [0]=符号池id, [1]=返回类型IMM,
+        // 然后每参数 [类型IMM, 值]。返回类型 = ins_ty（void 用 -1 → call void）。
+        var sid = ir.ins_opnd(inst_id, 0)
+        var sym = ns_replace(intern.lookup(sid))
+        if sym == "" {
+            print_err("EMPTY-CALL-SYM inst=" + to_string(inst_id) + " sid=" + to_string(sid) +
+                " cnt=" + to_string(cnt) + " o1=" + to_string(ir.ins_opnd(inst_id, 1)))
+        }
+        var args = ""
+        var k: i64 = 2
+        while k + 1 < cnt {
+            if k > 2 {
+                args = args + ", "
+            }
+            var pty = llvm_ty(ir.ins_opnd(inst_id, k))
+            args = args + pty + " " + typed_ref(inst_id, k + 1)
+            k = k + 2
+        }
+        if ir.ins_ty(inst_id) < 0 || ir.ins_ty(inst_id) == TK_VOID {
+            line("call void @" + sym + "(" + args + ")")
+        } else {
+            line(reg + " = call " + llvm_ty(ir.ins_ty(inst_id)) + " @" + sym + "(" + args + ")")
+        }
+        return
+    }
+    if op == 56 {
+        // str_cat（字符串拼接）：操作数 [lhs, rhs] → malloc+memcpy 序列。
+        // 对齐 Rust gen_binary_str 的 Add：strlen+strlen → malloc(len1+len2+1)
+        // → memcpy 两段 → 末尾 \0。
+        var lv = ir.ins_opnd(inst_id, 0)
+        var rv = ir.ins_opnd(inst_id, 1)
+        // 注意：arg 传裸引用（gen_call_i64 内部会加 argty 前缀），
+        // 曾误传 "ptr " + ref 导致 `strlen(ptr ptr @.str.N)` 重复前缀
+        var n1 = gen_call_i64("strlen", "ptr", str_ptr_ref(lv))
+        var n2 = gen_call_i64("strlen", "ptr", str_ptr_ref(rv))
+        // total = n1 + n2；size = total + 1
+        var total = reg_add(n1, n2)
+        var size = reg_add(total, "1")
+        var buf = gen_call_ptr("malloc", "i64", size)
+        // memcpy(buf, lv, n1) + memcpy(buf+n1, rv, n2)
+        line("call void @llvm.memcpy.p0.p0.i64(ptr " + buf + ", ptr " + str_ptr_ref(lv) + ", i64 " + n1 + ", i1 false)")
+        var off = reg_gep(buf, n1)
+        line("call void @llvm.memcpy.p0.p0.i64(ptr " + off + ", ptr " + str_ptr_ref(rv) + ", i64 " + n2 + ", i1 false)")
+        // buf[total] = 0
+        var endp = reg_gep(buf, total)
+        line("store i8 0, ptr " + endp)
+        line(reg + " = ptrtoint ptr " + buf + " to i64")
         return
     }
     if op == 30 {
@@ -371,8 +889,48 @@ func gen_inst(inst_id: i64) {
             line("ret void")
         } else {
             var v0 = ir.ins_opnd(inst_id, 0)
-            var rty = llvm_ty(ir.ins_ty(inst_id))
-            line("ret " + rty + " " + opnd_ref(inst_id, 0))
+            var fret = llvm_ty(ir.func_ret(g_pfid))
+            if fret == "ptr" {
+                // 字符串返回：const_str/str_cat 值是 i64 指针整数，须转真 ptr
+                line("ret ptr " + to_ptr(v0))
+            } else if fret == "void" {
+                // main 特例（define i32 @main，irgen 补 ret i32 0）：
+                // 按值类型输出；其他 void 函数 → ret void
+                var fnm = intern.lookup(ir.func_name(g_pfid))
+                if fnm == "main" {
+                    // 补 ret（irgen 尾部生成 ret i32 0）：operand 是 IMM(2) 字面量 0，
+                    // 不能查 value_def——值 id 0 恰好是第一条指令，会误判为 i64
+                    var def = -1
+                    if ir.ins_opnd_kind(inst_id, 0) == 0 {
+                        def = value_def(v0)
+                    }
+                    var rty2 = "i32"
+                    if def >= 0 {
+                        rty2 = llvm_ty(ir.ins_ty(def))
+                    }
+                    line("ret " + rty2 + " " + opnd_ref(inst_id, 0))
+                } else {
+                    line("ret void")
+                }
+            } else {
+                // 非 ptr：按值实际类型（bool 函数返回 icmp i1；i32 常量等）
+                var rty = fret
+                var pp = param_pos(v0)
+                if pp >= 0 {
+                    rty = llvm_ty(ir.func_param_ty(g_pfid, pp))
+                } else {
+                    var def = value_def(v0)
+                    if def >= 0 {
+                        if ir.ins_op(def) == 12 {
+                            // icmp 结果恒 i1（irgen 类型标记为 i64 简化）
+                            rty = "i1"
+                        } else {
+                            rty = llvm_ty(ir.ins_ty(def))
+                        }
+                    }
+                }
+                line("ret " + rty + " " + opnd_ref(inst_id, 0))
+            }
         }
         return
     }
@@ -393,11 +951,19 @@ func gen_inst(inst_id: i64) {
             var def = value_def(v)
             var rref = arg_ref(inst_id, k)
             // i32 值实参：生成 sext 到独立寄存器（新寄存器号 g_sext_cnt 递增）
-            if def >= 0 && llvm_ty(ir.ins_ty(def)) == "i32" {
-                g_sext_cnt = g_sext_cnt + 1
-                var rn = "%ext" + to_string(g_sext_cnt)
-                line(rn + " = sext i32 %" + to_string(v) + " to i64")
-                rref = "i64 " + rn
+            if def >= 0 {
+                if llvm_ty(ir.ins_ty(def)) == "i32" {
+                    g_sext_cnt = g_sext_cnt + 1
+                    var rn = "%ext" + to_string(g_sext_cnt)
+                    line(rn + " = sext i32 %" + to_string(v) + " to i64")
+                    rref = "i64 " + rn
+                } else if llvm_ty(ir.ins_ty(def)) == "i1" {
+                    // bool 值实参：zext i1 → i64（%lld 打印 0/1；sext 会得 -1）
+                    g_sext_cnt = g_sext_cnt + 1
+                    var rn2 = "%ext" + to_string(g_sext_cnt)
+                    line(rn2 + " = zext i1 %" + to_string(v) + " to i64")
+                    rref = "i64 " + rn2
+                }
             }
             args = args + rref
             k = k + 1
@@ -411,26 +977,120 @@ func gen_inst(inst_id: i64) {
         return
     }
     if op == 36 {
-        // extern_call（T4.5）：tie 运行时桥调用。
-        // 操作数[0] = 符号名池 id（如 "tie_exec_code"）；[1..] = 实参（全字符串 ptr）。
-        // 结果类型 = 指令类型（i64 / ptr）；declare 由 emit_extern_decls 输出。
+        // extern_call（阶段 A 新布局）：操作数 [0]=符号名池 id, [1]=返回类型IMM,
+        // 然后每参数 [类型IMM, 值]。返回类型 = ins_ty（void → call void）。
         var sid = ir.ins_opnd(inst_id, 0)
         var sym = intern.lookup(sid)
-        var ty = llvm_ty(ir.ins_ty(inst_id))
         var args = ""
-        var k: i64 = 1
-        while k < cnt {
-            if k > 1 {
+        var k: i64 = 2
+        while k + 1 < cnt {
+            if k > 2 {
                 args = args + ", "
             }
-            args = args + ptr_arg_ref(inst_id, k)
-            k = k + 1
+            var pty = llvm_ty(ir.ins_opnd(inst_id, k))
+            args = args + pty + " " + typed_ref(inst_id, k + 1)
+            k = k + 2
         }
-        line(reg + " = call " + ty + " @" + sym + "(" + args + ")")
+        if ir.ins_ty(inst_id) < 0 || ir.ins_ty(inst_id) == TK_VOID {
+            line("call void @" + sym + "(" + args + ")")
+        } else {
+            line(reg + " = call " + llvm_ty(ir.ins_ty(inst_id)) + " @" + sym + "(" + args + ")")
+        }
         return
     }
     // 未支持指令：占位注释
     line("; TODO op=" + to_string(op) + " inst=" + to_string(inst_id))
+}
+
+// 类型化实参引用（call/extern_call 通用）：const_str → "@.str.N"（指针直引，
+// 不经过寄存器）；否则 "%N"。
+func typed_ref(inst_id: i64, k: i64) -> string {
+    var v = ir.ins_opnd(inst_id, k)
+    // 形参优先（按形参位置 %N；类型由调用方 pty 决定）
+    var pr = param_ref(v)
+    if pr != "" {
+        return pr
+    }
+    var def = value_def(v)
+    if def >= 0 {
+        if ir.ins_op(def) == 62 {
+            var slot = str_slot(ir.ins_opnd(def, 0))
+            return "@.str." + to_string(slot)
+        }
+        if ir.ins_op(def) == 56 {
+            // str_cat 结果（i64 指针整数）→ inttoptr 转 ptr（extern_call 字符串参数）
+            g_str_reg_cnt = g_str_reg_cnt + 1
+            var r = "%sc" + to_string(g_str_reg_cnt)
+            line(r + " = inttoptr i64 %" + to_string(v) + " to ptr")
+            return r
+        }
+    }
+    return "%" + to_string(v)
+}
+
+// 字符串指针引用（str_cat 用）：const_str → "@.str.N"；其余 → "%N"
+func str_ptr_ref(v: i64) -> string {
+    return to_ptr(v)
+}
+
+// 任意值 → 真 ptr 寄存器名（字符串指针实参统一入口）：
+//   const_str(62)  → "@.str.N"（直接引用常量）
+//   str_cat(56)    → inttoptr 新寄存器（str_cat 结果是 i64 指针整数，
+//                    LLVM 不支持内联 inttoptr 表达式实参，须独立指令）
+//   其余（string 变量 load / extern 返回）→ "%N"（本身已是 ptr）
+func to_ptr(v: i64) -> string {
+    // 形参优先（参数值 id 无定义指令，value_def 返回 -1 会误判）
+    var pr = param_ref(v)
+    if pr != "" {
+        return pr
+    }
+    var def = value_def(v)
+    if def >= 0 {
+        if ir.ins_op(def) == 62 {
+            var slot = str_slot(ir.ins_opnd(def, 0))
+            return "@.str." + to_string(slot)
+        }
+        if ir.ins_op(def) == 56 {
+            // str_cat 结果（i64 指针整数）→ inttoptr 转 ptr
+            g_str_reg_cnt = g_str_reg_cnt + 1
+            var r = "%sc" + to_string(g_str_reg_cnt)
+            line(r + " = inttoptr i64 %" + to_string(v) + " to ptr")
+            return r
+        }
+    }
+    return "%" + to_string(v)
+}
+
+// 生成 `%N = call i64 @f(ptr arg)`，返回寄存器名（str_cat 辅助；独立寄存器号）
+func gen_call_i64(fn: string, argty: string, arg: string) -> string {
+    g_str_reg_cnt = g_str_reg_cnt + 1
+    var r = "%sc" + to_string(g_str_reg_cnt)
+    line(r + " = call i64 @" + fn + "(" + argty + " " + arg + ")")
+    return r
+}
+
+// 生成 `%N = call ptr @f(i64 arg)`，返回寄存器名（str_cat 辅助；独立寄存器号）
+func gen_call_ptr(fn: string, argty: string, arg: string) -> string {
+    g_str_reg_cnt = g_str_reg_cnt + 1
+    var r = "%sc" + to_string(g_str_reg_cnt)
+    line(r + " = call ptr @" + fn + "(" + argty + " " + arg + ")")
+    return r
+}
+
+// 生成 `%N = add i64 a, b`（str_cat 辅助；a/b 为寄存器或立即数；独立寄存器号）
+func reg_add(a: string, b: string) -> string {
+    g_str_reg_cnt = g_str_reg_cnt + 1
+    var r = "%sc" + to_string(g_str_reg_cnt)
+    line(r + " = add i64 " + a + ", " + b)
+    return r
+}
+
+// 生成 `%N = getelementptr i8, ptr base, i64 off`（str_cat 辅助；独立寄存器号）
+func reg_gep(base: string, off: string) -> string {
+    g_str_reg_cnt = g_str_reg_cnt + 1
+    var r = "%sc" + to_string(g_str_reg_cnt)
+    line(r + " = getelementptr i8, ptr " + base + ", i64 " + off)
+    return r
 }
 
 // T4.5：extern_call 实参引用——tie 运行时桥参数全为字符串（ptr）。
@@ -438,11 +1098,13 @@ func gen_inst(inst_id: i64) {
 func ptr_arg_ref(inst_id: i64, k: i64) -> string {
     var v = ir.ins_opnd(inst_id, k)
     var def = value_def(v)
-    if def >= 0 && ir.ins_op(def) == 62 {
-        var slot = str_slot(ir.ins_opnd(def, 0))
-        return "ptr @.str." + to_string(slot)
+    if def >= 0 {
+        if ir.ins_op(def) == 62 {
+            var slot = str_slot(ir.ins_opnd(def, 0))
+            return "ptr @.str." + to_string(slot)
+        }
     }
-    return "ptr %" + to_string(v)
+    return "ptr " + to_ptr(v)
 }
 
 // ==================== 模块生成 ====================
@@ -450,7 +1112,11 @@ func ptr_arg_ref(inst_id: i64, k: i64) -> string {
 pub func emit() -> string {
     collect_strings()
     collect_externs()
-    out_buf = ""
+    print_err("E1")
+    out_lines = table_new_string()
+    g_sext_cnt = 0
+    g_str_reg_cnt = 0
+    print_err("E2")
     // 模块头
     line("; ModuleID = 'tie'")
     line("source_filename = \"input.tie\"")
@@ -458,6 +1124,7 @@ pub func emit() -> string {
     // 无条件 declare
     line("declare i32 @printf(ptr, ...)")
     line("")
+    print_err("E3")
     line("declare i64 @strlen(ptr)")
     line("declare i32 @strcmp(ptr, ptr)")
     line("declare ptr @malloc(i64)")
@@ -482,44 +1149,94 @@ pub func emit() -> string {
     line("")
     // T4.5：tie 运行时桥 declare（extern_call 收集，按符号名输出）
     emit_extern_decls()
+    print_err("E4 extern-decls-done")
+    // 阶段 A：全局变量段（表 → ptr null；标量 → 零值）
+    emit_globals()
+    print_err("E5 globals-done")
     // 各函数
     var nf = ir.func_count()
     var i: i64 = 0
+    print_err("E6 funcs-begin nf=" + to_string(nf))
     while i < nf {
         gen_func(i)
         i = i + 1
     }
+    print_err("E7 funcs-done")
     // 字符串常量节
     line("")
     emit_strings()
-    return out_buf
+    print_err("E8 strings-done")
+    return join_lines()
+}
+
+func build_inst_blk() {
+    g_inst_blk = table_new_i64()
+    var nb = ir.block_count()
+    var bi: i64 = 0
+    while bi < nb {
+        var st = ir.block_start(bi)
+        var en = ir.block_end(bi)
+        var k: i64 = st
+        while k < en {
+            while len(g_inst_blk) <= k {
+                table_push(g_inst_blk, -1)
+            }
+            g_inst_blk[k] = bi
+            k = k + 1
+        }
+        bi = bi + 1
+    }
+    g_inst_blk_ready = 1
 }
 
 // 单个函数生成
 func gen_func(fid: i64) {
+    g_pfid = fid
+    g_pcnt = ir.func_params_cnt(fid)
     var name = intern.lookup(ir.func_name(fid))
+    // 命名空间函数全名 → LLVM 符号：`::` 转 `$`（对齐 Rust ns_symbol；
+    // 调用点 call(35) 同约定，保证定义与调用两侧符号一致）
+    var sym = name
+    var ns_pos = find_sub(name, "::")
+    if ns_pos >= 0 {
+        sym = ns_replace(name)
+    }
     var ret_llvm = llvm_ty(ir.func_ret(fid))
     // main 特殊：void main → define i32 @main
-    if name == "main" && ret_llvm == "void" {
+    if sym == "main" && ret_llvm == "void" {
         ret_llvm = "i32"
     }
-    line("define " + ret_llvm + " @" + name + "() {")
-    // 遍历该函数的全部块（按块 id 顺序；入口块先）
-    var nb = ir.block_count()
-    var bi: i64 = 0
-    while bi < nb {
-        if ir.block_func(bi) == fid {
-            // 块标签：统一用块 id（bb<N>），避免 block_name 多 if/for 冲突
-            line("bb" + to_string(bi) + ":")
-            var start = ir.block_start(bi)
-            var end = ir.block_end(bi)
-            var ii = start
-            while ii < end {
-                gen_inst(ii)
-                ii = ii + 1
-            }
+    // 形参列表：`i64 %0, ptr %1, ...`（参数值 id 是全局编号，形参按位置
+    // %0..%n-1 命名；opnd_ref 经 param_ref 把参数值 id 映射到位置号）
+    var params_llvm = ""
+    var pk: i64 = 0
+    while pk < g_pcnt {
+        if pk > 0 {
+            params_llvm = params_llvm + ", "
         }
-        bi = bi + 1
+        params_llvm = params_llvm + llvm_ty(ir.func_param_ty(fid, pk)) + " %" + to_string(pk)
+        pk = pk + 1
+    }
+    line("define " + ret_llvm + " @" + sym + "(" + params_llvm + ") {")
+    // 按指令 id 序遍历本函数全部块（块首输出标签）——保证值编号单调递增
+    if g_inst_blk_ready == 0 {
+        build_inst_blk()
+    }
+    var ni2 = ir.inst_count()
+    var ii: i64 = 0
+    while ii < ni2 {
+        var blk: i64 = -1
+        if ii < len(g_inst_blk) {
+            blk = g_inst_blk[ii]
+        }
+        if blk >= 0 && ir.block_func(blk) == fid {
+            if ii == ir.block_start(blk) {
+                // 块标签：统一用块 id（bb<N>），避免 block_name 多 if/for 冲突
+                line("bb" + to_string(blk) + ":")
+            }
+            gen_inst(ii)
+        }
+        ii = ii + 1
     }
     line("}")
     line("")

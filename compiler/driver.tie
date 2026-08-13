@@ -261,11 +261,14 @@ func compile_program(src: string) -> i64 {
     // base_dir：输入路径的目录（import 展开需要）；\\ 归一化为 /
     var base_dir = dir_of(g_input)
     // 前端
+    print_err("P0 frontend-begin")
     if frontend(src, base_dir) < 0 {
         return 1
     }
+    print_err("P1 frontend-done")
     // 中端：AST → tie-IR → .ll 文本
     var rc = irgen.gen_src(src, base_dir)
+    print_err("P2 irgen-done")
     if rc < 0 {
         var msg = sm_err_msg
         if str_len(msg) == 0 {
@@ -275,6 +278,7 @@ func compile_program(src: string) -> i64 {
         return 1
     }
     var ll_text = llvmgen.emit()
+    print_err("P3 emit-done")
     // IR 文件路径：--emit-ir → -o 或 输入.ll；否则中间文件（输出基准）
     var ir_path = replace_ext(g_input, "ll")
     if str_len(g_output) > 0 {
@@ -309,13 +313,18 @@ func compile_program(src: string) -> i64 {
 // logic：clang 链接可执行文件；清理中间文件（除非 --keep-ir）。
 // need_interp（T4.5）：程序用了 tie 运行时桥内置（exec_code/get_env/time_now，
 // irgen 置 g_used_runtime）→ 链接 std/runtime.a（tie 自写运行时，无需 Rust
-// tie-interp 库）；其余恒 false（irgen 最小集不支持 read_line/eval 等）。
+// tie-interp 库）。
+// 阶段 A：程序用了 tie-interp 库桥（str_len/table_*/file_*/arg_* 等，irgen 置
+// g_used_interp）→ 必须链接 tie_interp.lib（Rust 桥，覆盖全部 tie_* 符号）。
+// 两者都置时以 interp.lib 为准（其覆盖 runtime.a 的三个符号），避免重复定义。
 func compile_logic(ir_path: string, opt_path: string, target: string) -> i64 {
     var exe_path = g_output
     if str_len(exe_path) == 0 {
         exe_path = replace_ext(g_input, "exe")
     }
-    var bres = tc.link_exe(opt_path, exe_path, target, g_used_runtime)
+    // need_interp：优先 tie_interp.lib（stage A 新桥）；否则 runtime.a（T4.5 旧路径）
+    // 第三参 prefer_interp = g_used_interp：用 interp 桥时强制 tie_interp.lib
+    var bres = tc.link_exe(opt_path, exe_path, target, g_used_interp || g_used_runtime, g_used_interp)
     if bres != 0 {
         println("[后端] " + tc_err_msg)
         return 1

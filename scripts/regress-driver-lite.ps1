@@ -1,4 +1,4 @@
-# scripts/regress-driver-lite.ps1 —— 自举 v2 T2.9 行为等价回归脚本
+﻿# scripts/regress-driver-lite.ps1 —— 自举 v2 T2.9 行为等价回归脚本
 # ============================================================
 # 用法：pwsh ./scripts/regress-driver-lite.ps1 [-Detail]
 #   -Detail   逐文件打印状态行（默认只打印汇总与差异清单）
@@ -139,9 +139,9 @@ foreach ($rel in $files) {
             $b = if ($k -lt $tl.Count) { $tl[$k] } else { '' }
             if ($a -cne $b) { $first = $k; break }
         }
-        $detail = "第 $($first + 1) 行不同: Rust=[$($rl[$first])] vs tie=[$($tl[$first])] (行数 $($rl.Count)/$($tl.Count))"
-        $results.Add("DIFF  $rel  ($detail)")
-        $diffDetails.Add("[$rel] $detail")
+        $diffMsg = "第 $($first + 1) 行不同: Rust=[$($rl[$first])] vs tie=[$($tl[$first])] (行数 $($rl.Count)/$($tl.Count))"
+        $results.Add("DIFF  $rel  ($diffMsg)")
+        $diffDetails.Add("[$rel] $diffMsg")
     }
 }
 

@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!--
+    tie 语言品牌主图标 —— 缺口环（Slit Ring）
+    ─────────────────────────────────────────
+    设计概念：
+      · 粗石墨环          = 语言的统一整体（一门语言多用）
+      · 对角双缺口        = 开放与输入输出（代码进出编译器的通道）
+      · 缺口悬浮青点      = 核心（trit / 语言内核），点亮整个符号
+      · 两段对称弧        = 圆润无接缝，负空间运用
+    配色：
+      · 环  石墨黑 #0F172A（深色模式自动切换为浅色 #F8FAFC）
+      · 点  青 #0EA5E9（深色模式切换为亮青 #38BDF8）
+    深色适配：CSS prefers-color-scheme 媒体查询，无需两套文件
+  -->
+  <style>
+    .ring { stroke: #0F172A; }
+    .dot  { fill: #0EA5E9; }
+    @media (prefers-color-scheme: dark) {
+      .ring { stroke: #F8FAFC; }
+      .dot  { fill: #38BDF8; }
+    }
+  </style>
+
+  <!-- ── 左大半弧：缺口右缘 (124°) → 缺口左缘 (236°) ── -->
+  <path class="ring" d="M 190.3 353.4 A 117.5 117.5 0 0 1 190.3 158.6"
+        fill="none" stroke-width="47.5" stroke-linecap="butt"/>
+
+  <!-- ── 右大半弧：上缺口左缘 (304°) → 下缺口右缘 (416°) ── -->
+  <path class="ring" d="M 321.7 158.6 A 117.5 117.5 0 0 1 321.7 353.4"
+        fill="none" stroke-width="47.5" stroke-linecap="butt"/>
+
+  <!-- ── 悬浮青点（上缺口内，环外缘内侧）── -->
+  <circle class="dot" cx="256" cy="152.25" r="17.5"/>
+</svg>

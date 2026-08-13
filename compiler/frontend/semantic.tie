@@ -98,6 +98,7 @@ func imported_has(p: string) -> bool {
 func expand_one_import(imp_node: i64) -> i64 {
     var p = sstate.name_str(imp_node)
     var full = resolve_import_path(p)
+    print_err("EXI begin " + full)
     if imported_has(full) {
         return 0
     }
@@ -110,6 +111,7 @@ func expand_one_import(imp_node: i64) -> i64 {
         return -1
     }
     var ast_text = parser.parse_src(src)
+    print_err("EXI parsed " + full + " len=" + to_string(str_len(ast_text)))
     if sstate.has_prefix_str(ast_text, "ERR:") {
         sm_err_line = s_lines[imp_node]
         sm_err_col = s_cols[imp_node]
@@ -117,6 +119,7 @@ func expand_one_import(imp_node: i64) -> i64 {
         return -1
     }
     var base = sstate.append_ast(ast_text)
+    print_err("EXI appended " + full + " base=" + to_string(base))
     if base < 0 {
         return -1
     }
@@ -268,29 +271,40 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     if len(tre_bi_keys) == 0 {
         scollect.tre_bi_init()
     }
+    print_err("SC0 load_ast-begin")
     if sstate.load_ast(ast_text) < 0 {
         return "ERR:0 0 AST 协议解析失败"
     }
+    print_err("SC1 load_ast-done")
     g_root = s_n - 1
     // import 展开（主文件顶层进 g_extra_tops，import 文件递归合并）
+    print_err("SC2 expand-begin")
     var er = expand_imports()
+    print_err("SC3 expand-done")
     if er < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
+    print_err("SC4 collect_top-begin")
     var r = scollect.collect_top()
+    print_err("SC5 collect_top-done")
     if r < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
     // struct 字段拍平收集（含继承；须在逐函数检查前完成）
+    print_err("SC6 struct-fields-begin")
     var r3 = scollect.collect_all_struct_fields()
+    print_err("SC7 struct-fields-done")
     if r3 < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
     // 返回表元素预扫描（先于逐函数 check）
+    print_err("SC8 ret-tables-begin")
     var r4 = scollect.collect_all_return_tables()
+    print_err("SC9 ret-tables-done")
     if r4 < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
+    print_err("SA fn-walk-begin n=" + to_string(len(fn_keys)))
     var i: i64 = 0
     while i < len(fn_keys) {
         var fname = intern.lookup(fn_keys[i])
@@ -300,6 +314,7 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
         }
         i = i + 1
     }
+    print_err("SB fn-walk-done")
     return "OK:" + to_string(g_typed)
 }
 

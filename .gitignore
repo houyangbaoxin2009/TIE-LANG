@@ -57,3 +57,19 @@ opencode.json
 # 包管理器演示项目产物（tie init 生成：main.exe 编译产物 + .tie/ 安装目录）
 /examples/demo_pkg/*.exe
 /examples/demo_pkg/.tie/
+
+# 自举 v2 调试/构建残留（bench/diag/日志/中间 IR）
+/compiler/*.ll
+/compiler/*.exe
+/compiler/*.bc
+/compiler/bench_*
+/compiler/cd*.ll
+/compiler/diag*
+/compiler/selfhost_log*.txt
+/compiler/min*.ll
+/compiler/test_out.ll
+
+# Logo 渲染临时目录（浏览器 profile 残留）
+/assets/.render/
+/assets/concepts/.render/
+/assets/preview/.render/
