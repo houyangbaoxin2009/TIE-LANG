@@ -1329,6 +1329,10 @@ func is_builtin_name(nm: string) -> bool {
     if nm == "file_read" || nm == "file_write" || nm == "file_append" || nm == "file_exists" || nm == "file_delete" {
         return true
     }
+    // 完整 fs 元数据（UTF-8 桥）：大小 / 类型判定
+    if nm == "file_size" || nm == "file_is_dir" || nm == "file_is_file" {
+        return true
+    }
     if nm == "print_err" || nm == "mkdir_all" || nm == "remove_dir_all" || nm == "regex_find_all" {
         return true
     }
@@ -1598,7 +1602,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         return 0
     }
     if nm == "file_write" || nm == "file_append" {
-        // libc fopen/fwrite/fclose（对齐 Rust；返回 bool i1）
+        // UTF-8 安全桥（tie_file_write / tie_file_append，std::fs；返回 bool i1）
         var p = gen_expr(sstate.child(id, 0))
         if p < 0 {
             return -1
@@ -1608,6 +1612,28 @@ func builtin_expr(nm: string, id: i64) -> i64 {
             return -1
         }
         g_builtin_res = gen_file_write(p, c, nm == "file_append")
+        return 0
+    }
+    if nm == "file_size" {
+        // UTF-8 桥：文件字节大小（tie_file_size，失败返回 -1）
+        var p = gen_expr(sstate.child(id, 0))
+        if p < 0 {
+            return -1
+        }
+        g_builtin_res = gen_ext_call1("tie_file_size", p, types.named(TK_STR), types.named(TK_I64))
+        return 0
+    }
+    if nm == "file_is_dir" || nm == "file_is_file" {
+        // UTF-8 桥：路径类型判定（tie_file_is_dir / tie_file_is_file，i8 → bool）
+        var p = gen_expr(sstate.child(id, 0))
+        if p < 0 {
+            return -1
+        }
+        if nm == "file_is_dir" {
+            g_builtin_res = gen_bool_bridge1("tie_file_is_dir", p, types.named(TK_STR))
+        } else {
+            g_builtin_res = gen_bool_bridge1("tie_file_is_file", p, types.named(TK_STR))
+        }
         return 0
     }
     if nm == "file_exists" {
@@ -1623,17 +1649,9 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         if p < 0 {
             return -1
         }
-        // remove 返回 i32（0 = 成功）→ bool（对齐 Rust：icmp eq i32, 0；
-        // 曾直接返回 i32 导致 `var ok = file_delete(...)` 存 i1 槽类型错）
-        var r = gen_ext_call1("remove", p, types.named(TK_STR), types.named(TK_I32))
-        if r < 0 {
-            return -1
-        }
-        var ok = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp eq
-        ir.add_operand(ok, r, 0)
-        ir.add_operand(ok, 0, 2)
-        ir.add_operand(ok, 0, 2)  // eq
-        g_builtin_res = ir.get_value(ok)
+        // UTF-8 安全桥（tie_file_delete，Rust std::fs::remove_file）；
+        // 曾用 libc remove——ANSI 代码页误读中文路径。桥返回 i8 → bool。
+        g_builtin_res = gen_bool_bridge1("tie_file_delete", p, types.named(TK_STR))
         return 0
     }
     if nm == "print_err" {
@@ -2779,64 +2797,14 @@ func gen_ext_call2v(sym: string, v1: i64, ty1: i64, v2: i64, ty2: i64) {
     gen_ext_call_typed(sym, ats, avs, -1)
 }
 
-// file_write/file_append：libc fopen("wb"/"ab") → fwrite → fclose，返回 bool。
-// 结构（对齐 Rust）：fopen 失败 → false；成功 → fwrite 字节数==strlen → phi 汇合。
+// file_write/file_append：UTF-8 安全桥（tie_file_write / tie_file_append，
+// Rust std::fs 覆盖写 / OpenOptions 追加写）。曾用 libc fopen("wb"/"ab") +
+// fwrite——中文路径按 ANSI 代码页误读必失败。返回 bool（成功与否）。
 func gen_file_write(p: i64, c: i64, append: bool) -> i64 {
-    var mode = "wb"
     if append {
-        mode = "ab"
+        return gen_bool_bridge2("tie_file_append", p, c)
     }
-    var mode_g = gen_str_lit(interner.intern("\"" + mode + "\""))
-    var f = gen_ext_call2("fopen", p, types.named(TK_STR), mode_g, types.named(TK_STR), types.named(TK_STR))
-    if f < 0 {
-        return -1
-    }
-    // f == null → false；否则写入
-    var is_null = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
-    ir.add_operand(is_null, f, 0)
-    ir.add_operand(is_null, 0, 2)
-    ir.add_operand(is_null, 0, 2)  // eq null
-    var null_v = ir.get_value(is_null)
-    var fail_blk = ir.new_block(g_cur_func, interner.intern("fw.fail"))
-    var ok_blk = ir.new_block(g_cur_func, interner.intern("fw.ok"))
-    var merge_blk = ir.new_block(g_cur_func, interner.intern("fw.merge"))
-    var cbr = ir.new_inst(g_cur_block, 31, -1)
-    ir.add_operand(cbr, null_v, 0)
-    ir.add_operand(cbr, fail_blk, 1)
-    ir.add_operand(cbr, ok_blk, 1)
-    // fail：br merge（false 由 phi）
-    g_cur_block = fail_blk
-    var br1 = ir.new_inst(g_cur_block, 30, -1)
-    ir.add_operand(br1, merge_blk, 1)
-    // ok：strlen + fwrite(c, 1, len, f) + fclose
-    g_cur_block = ok_blk
-    var len_r = gen_ext_call1("strlen", c, types.named(TK_STR), types.named(TK_I64))
-    if len_r < 0 {
-        return -1
-    }
-    var one_v = gen_int_lit_ty(1, types.named(TK_I64))
-    var wr = gen_ext_call4("fwrite", c, types.named(TK_STR), one_v, types.named(TK_I64),
-        len_r, types.named(TK_I64), f, types.named(TK_STR))
-    if wr < 0 {
-        return -1
-    }
-    gen_ext_call1("fclose", f, types.named(TK_STR), types.named(TK_I32))
-    // wr == len → true
-    var ok_eq = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
-    ir.add_operand(ok_eq, wr, 0)
-    ir.add_operand(ok_eq, len_r, 0)
-    ir.add_operand(ok_eq, 0, 2)  // eq
-    var ok_v = ir.get_value(ok_eq)
-    var br2 = ir.new_inst(g_cur_block, 30, -1)
-    ir.add_operand(br2, merge_blk, 1)
-    // merge：phi [false, fail], [ok_v, ok]
-    g_cur_block = merge_blk
-    var phi = ir.new_inst(g_cur_block, 33, types.named(TK_BOOL))
-    ir.add_operand(phi, 0, 2)
-    ir.add_operand(phi, fail_blk, 1)
-    ir.add_operand(phi, ok_v, 0)
-    ir.add_operand(phi, ok_blk, 1)
-    return ir.get_value(phi)
+    return gen_bool_bridge2("tie_file_write", p, c)
 }
 
 // 便捷：四参数桥（返回非 void）
@@ -2854,23 +2822,12 @@ func gen_ext_call4(sym: string, v1: i64, ty1: i64, v2: i64, ty2: i64, v3: i64, t
     return gen_ext_call_typed(sym, ats, avs, types.named(TK_I64))
 }
 
-// file_exists：fopen(path, "rb") 探测 → 非 null。返回 bool。
+// file_exists：UTF-8 安全桥（tie_file_exists，Rust std::fs File::open 探测）。
+// 曾用 libc fopen(path, "rb")——Windows ANSI 代码页误读 UTF-8 中文路径，
+// 中文目录/文件名的存在性检查必失败（tiec 编译中文路径源文件报"读取源码失败"）。
+// 桥返回 i8 → icmp ne 0 → bool（对齐 Rust i8→i1 转换）。
 func gen_file_exists(p: i64) -> i64 {
-    var mode_g = gen_str_lit(interner.intern("\"rb\""))
-    var f = gen_ext_call2("fopen", p, types.named(TK_STR), mode_g, types.named(TK_STR), types.named(TK_STR))
-    if f < 0 {
-        return -1
-    }
-    var is_null = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
-    ir.add_operand(is_null, f, 0)
-    ir.add_operand(is_null, 0, 2)
-    ir.add_operand(is_null, 0, 2)  // eq null
-    var null_v = ir.get_value(is_null)
-    // !is_null → true
-    var not = ir.new_inst(g_cur_block, 8, types.named(TK_BOOL))  // xor true
-    ir.add_operand(not, null_v, 0)
-    ir.add_operand(not, 1, 2)
-    return ir.get_value(not)
+    return gen_bool_bridge1("tie_file_exists", p, types.named(TK_STR))
 }
 
 // 表下标读取 t[i]：动态表 → tie_table_at_<suffix>(表指针, i64, ok)。

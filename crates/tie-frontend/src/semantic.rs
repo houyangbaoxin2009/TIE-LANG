@@ -2153,6 +2153,30 @@ impl Analyzer {
                     }
                     return Ok(TypeSpec::Named(TyKw::Bool));
                 }
+                // 内置函数 file_size / file_is_dir / file_is_file：单字符串参数，
+                // 完整 fs 元数据（UTF-8 桥）。file_size → i64（失败 -1）；
+                // file_is_dir / file_is_file → bool（路径类型判定）。
+                if name == "file_size" || name == "file_is_dir" || name == "file_is_file" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("{name}() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let at = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), at.clone());
+                    if !matches!(&at, TypeSpec::Named(TyKw::Str)) {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("{name}() 参数必须是字符串，实际是 {}", type_name(&at)),
+                        });
+                    }
+                    return if name == "file_size" {
+                        Ok(TypeSpec::Named(TyKw::I64))
+                    } else {
+                        Ok(TypeSpec::Named(TyKw::Bool))
+                    };
+                }
                 // 内置函数 file_delete：单字符串参数，返回 bool（文件删除成功与否；
                 // 不存在/不可删 → false）。
                 if name == "file_delete" {

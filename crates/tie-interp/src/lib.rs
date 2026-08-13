@@ -109,6 +109,73 @@ pub extern "C" fn tie_file_read(path: *const c_char) -> *mut c_char {
     }
 }
 
+/// C ABI 桥：文件是否存在（`File::open` 可读探测）。
+///
+/// 语义对齐 libc `fopen(path, "rb")` 探测（目录/不可读文件返回 false，
+/// 常规文件两者一致）；Windows 走宽字符 API，**中文/Unicode 路径安全**
+/// （libc fopen 按 ANSI 代码页解释 UTF-8 字节，中文路径必失败——本桥修复）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_file_exists(path: *const c_char) -> i8 {
+    let path = unsafe { c_char_to_string(path).unwrap_or_default() };
+    std::fs::File::open(&path).is_ok() as i8
+}
+
+/// C ABI 桥：覆盖写入文本文件（`std::fs::write`）。成功返回 1，失败返回 0。
+/// UTF-8 路径安全（原 libc fopen("wb") 对中文路径失败）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_file_write(path: *const c_char, content: *const c_char) -> i8 {
+    let path = unsafe { c_char_to_string(path).unwrap_or_default() };
+    let content = unsafe { c_char_to_string(content).unwrap_or_default() };
+    std::fs::write(&path, content.as_bytes()).is_ok() as i8
+}
+
+/// C ABI 桥：追加写入文本文件（`OpenOptions::append`，不存在则创建）。
+/// 成功返回 1，失败返回 0。UTF-8 路径安全（原 libc fopen("ab") 中文路径失败）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_file_append(path: *const c_char, content: *const c_char) -> i8 {
+    let path = unsafe { c_char_to_string(path).unwrap_or_default() };
+    let content = unsafe { c_char_to_string(content).unwrap_or_default() };
+    let mut f = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    std::io::Write::write_all(&mut f, content.as_bytes()).is_ok() as i8
+}
+
+/// C ABI 桥：删除文件（`std::fs::remove_file`）。成功返回 1，失败（含不存在）
+/// 返回 0——与 libc remove 语义一致。UTF-8 路径安全。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_file_delete(path: *const c_char) -> i8 {
+    let path = unsafe { c_char_to_string(path).unwrap_or_default() };
+    std::fs::remove_file(&path).is_ok() as i8
+}
+
+/// C ABI 桥：文件字节大小（`std::fs::metadata().len()`）。失败（不存在等）返回 -1。
+/// UTF-8 路径安全；Windows 宽字符 API。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_file_size(path: *const c_char) -> i64 {
+    let path = unsafe { c_char_to_string(path).unwrap_or_default() };
+    std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(-1)
+}
+
+/// C ABI 桥：路径是否为目录（`metadata().is_dir()`）。失败返回 0。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_file_is_dir(path: *const c_char) -> i8 {
+    let path = unsafe { c_char_to_string(path).unwrap_or_default() };
+    std::fs::metadata(&path).map(|m| m.is_dir() as i8).unwrap_or(0)
+}
+
+/// C ABI 桥：路径是否为普通文件（`metadata().is_file()`）。失败返回 0。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_file_is_file(path: *const c_char) -> i8 {
+    let path = unsafe { c_char_to_string(path).unwrap_or_default() };
+    std::fs::metadata(&path).map(|m| m.is_file() as i8).unwrap_or(0)
+}
+
 /// C ABI 桥：取字符串第 i 个 Unicode 码点（按字符计数，非字节），返回新分配的字符串；
 /// 越界（含负数下标）返回空串。
 // 用 Rust `chars().nth(i)` 解码 UTF-8 码点，天然支持多字节字符（如中文）。

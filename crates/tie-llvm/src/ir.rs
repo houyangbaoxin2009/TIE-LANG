@@ -3040,87 +3040,64 @@ impl<'p> IrGenerator<'p> {
             return Ok((tmp, "ptr"));
         }
         // 内置 file_write / file_append：两个字符串参数，返回 bool（成功与否）。
-        // file_write 覆盖写（"wb"），file_append 追加写（"ab"）。
+        // UTF-8 安全桥（tie_file_write / tie_file_append，std::fs 实现）——
+        // 曾用 libc fopen("wb"/"ab") + fwrite，Windows ANSI 代码页误读中文路径。
         if name == "file_write" || name == "file_append" {
             let (p, _t) = self.gen_expr(&args[0])?;
             let (c, _t) = self.gen_expr(&args[1])?;
-            let mode = if name == "file_write" { "wb" } else { "ab" };
-            let mode_g = self.string_global(mode);
-            let f = self.new_reg();
-            self.line(&format!("{f} = call ptr @fopen(ptr {p}, ptr @{mode_g})"));
-            // 打开失败 → false；成功 → fwrite + fclose，返回 (写入字节数 == 内容长度)
-            let is_null = self.new_reg();
-            self.line(&format!("{is_null} = icmp eq ptr {f}, null"));
-            let ok_label = self.new_label("file.open.ok");
-            let fail_label = self.new_label("file.open.fail");
-            let merge_label = self.new_label("file.open.merge");
-            self.line(&format!("br i1 {is_null}, label %{fail_label}, label %{ok_label}"));
-            // 打开失败：返回 false
-            self.block_start(&fail_label);
-            self.line(&format!("br label %{merge_label}"));
-            self.block_end();
-            // 打开成功：写入内容并关闭，返回写入是否完整
-            self.block_start(&ok_label);
-            let len = self.new_reg();
-            self.line(&format!("{len} = call i64 @strlen(ptr {c})"));
-            let written = self.new_reg();
-            self.line(&format!("{written} = call i64 @fwrite(ptr {c}, i64 1, i64 {len}, ptr {f})"));
-            self.line(&format!("call i32 @fclose(ptr {f})"));
-            // 非 void 的未编号调用（fclose 返回 i32）会被解析器分配隐式寄存器号，
-            // 必须用 new_reg 消费掉，否则后续寄存器编号错位（与 gen_printf 的哑返回同理）
-            let _ = self.new_reg();
+            let bridge = if name == "file_write" { "tie_file_write" } else { "tie_file_append" };
+            self.mark_used(bridge);
+            let r = self.new_reg();
+            self.line(&format!("{r} = call i8 @{bridge}(ptr {p}, ptr {c})"));
             let ok = self.new_reg();
-            self.line(&format!("{ok} = icmp eq i64 {written}, {len}"));
-            self.line(&format!("br label %{merge_label}"));
-            self.block_end();
-            // 合并块：phi 汇合两分支结果
-            self.block_start(&merge_label);
-            let res = self.new_reg();
-            self.line(&format!("{res} = phi i1 [ false, %{fail_label} ], [ {ok}, %{ok_label} ]"));
-            return Ok((res, "i1"));
+            self.line(&format!("{ok} = icmp ne i8 {r}, 0"));
+            return Ok((ok, "i1"));
         }
         // 内置 file_exists：单字符串参数，返回 bool（文件是否存在）。
-        // 用 fopen(path, "rb") 探测：能打开即存在。
-        // 注：与解释路径 std::fs::exists 的差异——目录/不可读文件会返回 false
-        //（fopen 需可读），常规文件测试两者一致。
+        // UTF-8 安全桥（tie_file_exists，Rust File::open 可读探测；语义与
+        // fopen("rb") 一致：目录/不可读文件返回 false）。曾用 libc fopen——
+        // Windows ANSI 代码页误读 UTF-8 中文路径，中文文件存在性检查必失败。
         if name == "file_exists" {
             let (p, _t) = self.gen_expr(&args[0])?;
-            let mode_g = self.string_global("rb");
-            let f = self.new_reg();
-            self.line(&format!("{f} = call ptr @fopen(ptr {p}, ptr @{mode_g})"));
-            let is_null = self.new_reg();
-            self.line(&format!("{is_null} = icmp eq ptr {f}, null"));
-            let ok_label = self.new_label("file.exists.ok");
-            let fail_label = self.new_label("file.exists.fail");
-            let merge_label = self.new_label("file.exists.merge");
-            self.line(&format!("br i1 {is_null}, label %{fail_label}, label %{ok_label}"));
-            // 打开失败：不存在 → false
-            self.block_start(&fail_label);
-            self.line(&format!("br label %{merge_label}"));
-            self.block_end();
-            // 打开成功：关闭并返回 true
-            self.block_start(&ok_label);
-            self.line(&format!("call i32 @fclose(ptr {f})"));
-            // 非 void 的未编号调用（fclose 返回 i32）会被解析器分配隐式寄存器号，必须消费掉
-            let _ = self.new_reg();
-            self.line(&format!("br label %{merge_label}"));
-            self.block_end();
-            // 合并块：phi 汇合两分支结果
-            self.block_start(&merge_label);
-            let res = self.new_reg();
-            self.line(&format!("{res} = phi i1 [ false, %{fail_label} ], [ true, %{ok_label} ]"));
-            return Ok((res, "i1"));
+            self.mark_used("tie_file_exists");
+            let r = self.new_reg();
+            self.line(&format!("{r} = call i8 @tie_file_exists(ptr {p})"));
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = icmp ne i8 {r}, 0"));
+            return Ok((ok, "i1"));
         }
         // 内置 file_delete：单字符串参数，返回 bool（文件是否删除成功）。
-        // 用 libc remove(path)：成功返回 0 → true；失败（不存在/不可删）返回非 0 → false。
-        // 与解释路径 std::fs::remove_file 行为一致（均返回 bool、无错误消息）。
+        // UTF-8 安全桥（tie_file_delete，std::fs::remove_file；语义与 libc
+        // remove 一致：成功 → true，不存在/不可删 → false）。曾用 libc remove——
+        // Windows ANSI 代码页误读中文路径。
         if name == "file_delete" {
             let (p, _t) = self.gen_expr(&args[0])?;
+            self.mark_used("tie_file_delete");
             let r = self.new_reg();
-            self.line(&format!("{r} = call i32 @remove(ptr {p})"));
-            // remove 返回 0 = 成功
+            self.line(&format!("{r} = call i8 @tie_file_delete(ptr {p})"));
             let ok = self.new_reg();
-            self.line(&format!("{ok} = icmp eq i32 {r}, 0"));
+            self.line(&format!("{ok} = icmp ne i8 {r}, 0"));
+            return Ok((ok, "i1"));
+        }
+        // 内置 file_size：单字符串参数，返回 i64（文件字节大小；失败 -1）。
+        // UTF-8 桥（tie_file_size，std::fs::metadata）。
+        if name == "file_size" {
+            let (p, _t) = self.gen_expr(&args[0])?;
+            self.mark_used("tie_file_size");
+            let r = self.new_reg();
+            self.line(&format!("{r} = call i64 @tie_file_size(ptr {p})"));
+            return Ok((r, "i64"));
+        }
+        // 内置 file_is_dir / file_is_file：单字符串参数，返回 bool（路径类型判定）。
+        // UTF-8 桥（tie_file_is_dir / tie_file_is_file，std::fs::metadata）。
+        if name == "file_is_dir" || name == "file_is_file" {
+            let (p, _t) = self.gen_expr(&args[0])?;
+            let bridge = if name == "file_is_dir" { "tie_file_is_dir" } else { "tie_file_is_file" };
+            self.mark_used(bridge);
+            let r = self.new_reg();
+            self.line(&format!("{r} = call i8 @{bridge}(ptr {p})"));
+            let ok = self.new_reg();
+            self.line(&format!("{ok} = icmp ne i8 {r}, 0"));
             return Ok((ok, "i1"));
         }
         // 内置 str_char：字符串 + 整数下标，返回 string（第 i 个 Unicode 码点）。

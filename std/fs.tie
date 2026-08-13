@@ -1,93 +1,46 @@
 // tie:library
-// fs.tie：标准库——文件系统工具（命名空间 fs），封装语言底座散落的
-// 文件系统原语（file_* / list_dir / walk_dir / mkdir_all 等），统一为
-// bool 成功语义 + 易用命名。全部基于底座原语，不依赖其他 std 模块。
+// fs.tie：标准库——完整文件系统模块（命名空间 fs）。
+// ============================================================
+// 对齐 Rust std::fs 的常用 API 形态，统一 bool 成功语义；全部文件操作
+// 底层为 **UTF-8 安全桥**（crates/tie-interp 的 Rust std::fs 实现，
+// Windows 走宽字符 API）——中文/Unicode 路径天然支持（曾用 libc
+// fopen/remove，按 ANSI 代码页误读 UTF-8 字节，中文路径必失败）。
 //
-// 底座原语返回约定（对齐 crates/tie-interp 与 Rust 语义层）：
+// 底座原语返回约定：
 //   - file_read(path) -> string：失败返回空串（**无法区分"空文件"与"失败"**，
 //     需要精确判断时先用 exists() 前置检查）；
-//   - file_write / file_append / file_copy / file_move / file_delete /
+//   - file_write / file_append / file_delete / file_copy / file_move /
 //     mkdir_all / remove_dir_all / copy_dir / untar_gz / unzip -> bool；
-//   - file_exists(path) -> bool；
+//   - file_exists(path) -> bool；file_size(path) -> i64（失败 -1）；
+//   - file_is_dir / file_is_file(path) -> bool；
 //   - list_dir / walk_dir(path) -> table<string>：失败返回空表。
 // Windows 注意：路径反斜杠在 tie 源码字符串中须写成 \\（如 "F:\\tmp\\a.txt"）。
 //
-// 调用：import 后 fs.exists(...) / fs.read_lines(...)；命名空间内互调为裸调用。
+// 调用：import 后 fs.read_to_string(...) / fs.exists(...) / fs.read_lines(...)；
+// 命名空间内互调为裸调用。
 // 命名规范：命名空间内函数不加 fs_ 前缀（统一 func 写法，Harbor M2.1.6）。
 
 namespace fs {
-// 读取文本文件全部内容；空串可能表示"空文件或失败"（见文件头约定）。
+// ---------- 读取 ----------
+
+// 读取文本文件全部内容（Rust std::fs::read_to_string 风格）。
+// 空串可能表示"空文件或失败"（见文件头约定）。
+pub func read_to_string(path: string) -> string {
+    return file_read(path)
+}
+
+// 读取文本文件（别名，保留早期命名）。
 pub func read_text(path: string) -> string {
     return file_read(path)
 }
 
-// 写入文本文件（覆盖）；成功返回 true。
-pub func write_text(path: string, content: string) -> bool {
-    return file_write(path, content)
-}
-
-// 追加文本到文件末尾（文件不存在则创建）；成功返回 true。
-pub func append_text(path: string, content: string) -> bool {
-    return file_append(path, content)
-}
-
-// 复制文件 src → dst；成功返回 true。
-pub func copy(src: string, dst: string) -> bool {
-    return file_copy(src, dst)
-}
-
-// 移动/重命名文件 src → dst；成功返回 true。
-pub func move(src: string, dst: string) -> bool {
-    return file_move(src, dst)
-}
-
-// 删除文件；成功（或文件本不存在）返回 true。
-pub func delete(path: string) -> bool {
-    return file_delete(path)
-}
-
-// 文件是否存在。
-pub func exists(path: string) -> bool {
-    return file_exists(path)
-}
-
-// 列出目录下的直接条目（文件名，不含路径前缀）；失败返回空表。
-pub func list(path: string) -> table<string> {
-    return list_dir(path)
-}
-
-// 递归遍历目录，返回全部文件/目录路径；失败返回空表。
-pub func walk(path: string) -> table<string> {
-    return walk_dir(path)
-}
-
-// 递归创建目录（含中间层级）；成功返回 true。
-pub func mkdir_all(path: string) -> bool {
-    return mkdir_all(path)
-}
-
-// 递归删除目录及其全部内容；成功返回 true。
-pub func remove_all(path: string) -> bool {
-    return remove_dir_all(path)
-}
-
-// 递归复制目录 src → dst；成功返回 true。
-pub func copy_dir(src: string, dst: string) -> bool {
-    return copy_dir(src, dst)
-}
-
-// 解压 .tar.gz 归档到 dest 目录；成功返回 true。
-pub func untar_gz(file: string, dest: string) -> bool {
-    return untar_gz(file, dest)
-}
-
-// 解压 .zip 归档到 dest 目录；成功返回 true。
-pub func unzip(file: string, dest: string) -> bool {
-    return unzip(file, dest)
+// 读取文件原始字节（byte_read 底座），返回字节表（元素 i64，值域 0..255，
+// D7 编解码器约定）；失败返回空表。
+pub func read_bytes(path: string) -> table<i64> {
+    return byte_read(path)
 }
 
 // 按行读取文本文件（\n 拆分，去掉 Windows 行尾 \r）；空文件返回空表。
-// 实现：read_text 拆行——逐码点扫描，遇到 \n 切一行（行尾 \r 剔除）。
 pub func read_lines(path: string) -> table<string> {
     var rows = table_new_string()
     var content = file_read(path)
@@ -115,6 +68,150 @@ pub func read_lines(path: string) -> table<string> {
     }
     return rows
 }
+
+// ---------- 写入 ----------
+
+// 覆盖写入文本文件（Rust std::fs::write 风格）；成功返回 true。
+pub func write(path: string, content: string) -> bool {
+    return file_write(path, content)
+}
+
+// 覆盖写入（别名，保留早期命名）。
+pub func write_text(path: string, content: string) -> bool {
+    return file_write(path, content)
+}
+
+// 追加文本到文件末尾（不存在则创建）；成功返回 true。
+pub func append(path: string, content: string) -> bool {
+    return file_append(path, content)
+}
+
+// 追加写入（别名，保留早期命名）。
+pub func append_text(path: string, content: string) -> bool {
+    return file_append(path, content)
+}
+
+// 多行写入：lines 逐行以 \n 连接后覆盖写入（末行不带换行符）。
+pub func write_lines(path: string, lines: table<string>) -> bool {
+    var content: string = ""
+    var n: i64 = len(lines)
+    var i: i64 = 0
+    while i < n {
+        content = content + lines[i]
+        if i + 1 < n {
+            content = content + "\n"
+        }
+        i = i + 1
+    }
+    return file_write(path, content)
+}
+
+// ---------- 元数据 ----------
+
+// 文件（或目录）是否存在。
+pub func exists(path: string) -> bool {
+    return file_exists(path)
+}
+
+// 路径是否为普通文件。
+pub func is_file(path: string) -> bool {
+    return file_is_file(path)
+}
+
+// 路径是否为目录。
+pub func is_dir(path: string) -> bool {
+    return file_is_dir(path)
+}
+
+// 文件字节大小；失败（不存在/目录）返回 -1。
+pub func size(path: string) -> i64 {
+    return file_size(path)
+}
+
+// ---------- 删除 ----------
+
+// 删除文件；成功返回 true（文件不存在返回 false，与 libc remove 语义一致）。
+pub func remove_file(path: string) -> bool {
+    return file_delete(path)
+}
+
+// 删除文件（别名，保留早期命名）。
+pub func delete(path: string) -> bool {
+    return file_delete(path)
+}
+
+// 递归删除目录及其全部内容；成功返回 true。
+pub func remove_dir_all(path: string) -> bool {
+    return remove_dir_all(path)
+}
+
+// 递归删除目录（别名，保留早期命名）。
+pub func remove_all(path: string) -> bool {
+    return remove_dir_all(path)
+}
+
+// ---------- 目录 ----------
+
+// 递归创建目录（含中间层级）；成功返回 true（已存在亦成功）。
+pub func create_dir_all(path: string) -> bool {
+    return mkdir_all(path)
+}
+
+// 递归创建目录（别名，保留早期命名）。
+pub func mkdir_all(path: string) -> bool {
+    return mkdir_all(path)
+}
+
+// 列出目录下的直接条目（文件名，不含路径前缀）；失败返回空表。
+pub func read_dir(path: string) -> table<string> {
+    return list_dir(path)
+}
+
+// 列出目录条目（别名，保留早期命名）。
+pub func list(path: string) -> table<string> {
+    return list_dir(path)
+}
+
+// 递归遍历目录，返回全部文件/目录路径；失败返回空表。
+pub func walk(path: string) -> table<string> {
+    return walk_dir(path)
+}
+
+// 递归复制目录 src → dst；成功返回 true。
+pub func copy_dir(src: string, dst: string) -> bool {
+    return copy_dir(src, dst)
+}
+
+// ---------- 复制 / 移动 ----------
+
+// 复制文件 src → dst（Rust std::fs::copy 风格）；成功返回 true。
+pub func copy(src: string, dst: string) -> bool {
+    return file_copy(src, dst)
+}
+
+// 移动/重命名文件 src → dst（Rust std::fs::rename 风格）；成功返回 true。
+pub func rename(src: string, dst: string) -> bool {
+    return file_move(src, dst)
+}
+
+// 移动文件（别名，保留早期命名）。
+pub func move(src: string, dst: string) -> bool {
+    return file_move(src, dst)
+}
+
+// ---------- 归档 ----------
+
+// 解压 .tar.gz 归档到 dest 目录；成功返回 true。
+pub func untar_gz(file: string, dest: string) -> bool {
+    return untar_gz(file, dest)
+}
+
+// 解压 .zip 归档到 dest 目录；成功返回 true。
+pub func unzip(file: string, dest: string) -> bool {
+    return unzip(file, dest)
+}
+
+// ---------- 内部辅助 ----------
 
 // 取字符串 [start, end) 子串（码点级）。read_lines 的内部辅助——不用
 // std/string.tie 的 str.slice（保持 fs 模块零依赖），str_char 逐码点拼接。

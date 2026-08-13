@@ -140,6 +140,20 @@ pub func builtin_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 
         }
         return types.named(TK_STR)
     }
+    // 完整 fs 元数据内置（UTF-8 桥）：file_size → i64（失败 -1）；
+    // file_is_dir / file_is_file → bool（路径类型判定）
+    if fn_name == "file_size" || fn_name == "file_is_dir" || fn_name == "file_is_file" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        if fn_name == "file_size" {
+            return types.named(TK_I64)
+        }
+        return types.named(TK_BOOL)
+    }
     if fn_name == "file_write" || fn_name == "file_append" {
         if nargs != 2 {
             sm_err_line = s_lines[call_node]

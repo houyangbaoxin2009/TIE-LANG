@@ -519,6 +519,29 @@ func extern_decl(sym: string) -> string {
     if sym == "tie_file_read" {
         return "declare ptr @tie_file_read(ptr)"
     }
+    // 完整 fs 桥（UTF-8 路径安全，Windows 宽字符 API；irgen 的 file_* 内置
+    // 从 libc fopen/remove 迁至此处——中文路径不再被 ANSI 代码页误读）
+    if sym == "tie_file_exists" {
+        return "declare i8 @tie_file_exists(ptr)"
+    }
+    if sym == "tie_file_write" {
+        return "declare i8 @tie_file_write(ptr, ptr)"
+    }
+    if sym == "tie_file_append" {
+        return "declare i8 @tie_file_append(ptr, ptr)"
+    }
+    if sym == "tie_file_delete" {
+        return "declare i8 @tie_file_delete(ptr)"
+    }
+    if sym == "tie_file_size" {
+        return "declare i64 @tie_file_size(ptr)"
+    }
+    if sym == "tie_file_is_dir" {
+        return "declare i8 @tie_file_is_dir(ptr)"
+    }
+    if sym == "tie_file_is_file" {
+        return "declare i8 @tie_file_is_file(ptr)"
+    }
     if sym == "tie_read_line" {
         return "declare ptr @tie_read_line()"
     }

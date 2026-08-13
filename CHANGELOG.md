@@ -1,3 +1,27 @@
+## [std:fs] 完整文件系统标准库 + 中文路径修复——file_* 内置全面迁移 UTF-8 桥 — 2026-08-14
+
+制造完整 `std/fs` 文件系统库（对齐 Rust std::fs API 风格），根治中文/Unicode 路径问题。
+
+- **根因**：`file_exists` / `file_write` / `file_append` / `file_delete` 内置原走 libc
+  `fopen` / `remove`——Windows ANSI 代码页将 UTF-8 中文路径按 GBK 误读，中文路径的
+  存在性检查/写入/删除必失败（tiec 编译中文路径源文件报"读取源码失败"）；
+- **7 个 UTF-8 安全桥**（interp.lib，Rust std::fs 实现，Windows 宽字符 API）：
+  `tie_file_exists` / `tie_file_write` / `tie_file_append` / `tie_file_delete` /
+  `tie_file_size` / `tie_file_is_dir` / `tie_file_is_file`；
+- **内置迁移**：irgen 与 Rust 基线 ir.rs 的 `file_exists` / `file_write` / `file_append` /
+  `file_delete` 由 libc 改为桥调用（llvmgen 补 7 声明，语义层 sbuitin/semantic 补签名）；
+  新增 `file_size` / `file_is_dir` / `file_is_file` 三个内置；
+- **std/fs.tie 完整重写**（Rust std::fs 风格 API）：读取（read_to_string / read_text /
+  read_bytes / read_lines）、写入（write / append / write_lines）、元数据（exists /
+  is_file / is_dir / size）、删除（remove_file / remove_dir_all）、目录（create_dir_all /
+  read_dir / walk / copy_dir）、复制移动（copy / rename）、归档（untar_gz / unzip），
+  全部保留早期命名别名（write_text / delete / list / mkdir_all 等）；
+- **自举链更新**：tiec.exe 二阶自洽版入库（新 tiec 编译自身后 driver 主体行为与新 irgen
+  一致——一阶产物 driver 的内置调用仍固化旧逻辑，须二阶自举）；
+- **验证**：中文路径下 tiec 编译源文件成功、std/fs 全功能测试通过（创建/写入/追加/
+  读取/行读取/大小/类型判定/删除）；行为等价回归 96.2%（≥90% 达标）；repl/pkg/driver
+  编译通过。
+
 ## [阶段 A] tiec 升格一级编译器——repl/pkg 自举改用 tiec，tiec.exe 入库版本化 — 2026-08-13
 
 tiec（自举 v2 编译器）升格为主编译器：编译链路上不再依赖 Rust 种子产出 repl/pkg。
