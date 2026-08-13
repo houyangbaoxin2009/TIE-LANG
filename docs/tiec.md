@@ -52,9 +52,18 @@ tie 语言目前有两代编译器并存：
 ③ tiec2.exe 编译 compiler/driver.tie             ──► tiec3.exe   （再自举验证）
 ```
 
-- **第 ① 步是 bootstrap 界限**：tiec 由 Rust 种子编译产生，这是整个工具链唯一的 Rust 接触点；
-- **第 ② 步**：tiec 编译自身成功，证明它可以自举；
+- **tiec.exe 已入库（阶段 A 升格）**：作为 stage0 引导二进制版本化随仓库分发
+  （`.gitignore` 已豁免 `/compiler/tiec.exe`），clone 即用、无需先构建；此后 tiec
+  始终由自身编译 driver.tie 产生（自举闭环），源码变更后重新自举并提交同步更新；
+- **第 ① 步是 bootstrap 界限**：首次产生 tiec.exe 需要 Rust 种子（历史性接触点）；
+  入库后普通构建与使用不再经过 Rust；
+- **第 ② 步**：tiec 编译自身成功，证明自举闭环；
 - **第 ③ 步**（T5.2 实测打通）：tiec2 再次编译自身并正确编译 `hello.tie`，二阶闭环验证通过；
+- **阶段 A 升格（2026-08-13）**：`repl.exe` / `pkg.exe` 自举已由 tiec 承担
+  （`scripts/package.ps1` 第 2 步用 tiec 编译 `repl/repl.tie`；`pkg/main.tie` 用 tiec
+  编译），Rust 种子在编译链路上仅剩历史 bootstrap 角色。irgen 补全 map 下标
+  赋值/读取桥（`tie_map_set*` / `tie_map_get*`，E3 键值表）并修正 table 元素类型
+  完整推断链后，tiec 可完整编译 pkg 包管理器（行为与 Rust 种子产物字节等价）；
 - **G3 闸门（0-Rust）验证 PASS**：种子界限之后，编译、运行、REPL 全链路不再依赖 Rust。
 
 ## 3. 快速开始

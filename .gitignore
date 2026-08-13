@@ -45,8 +45,10 @@ opencode.json
 /compiler/repl.exe
 /compiler/_rust_repl.exe
 
-# 自举 v2 tiec 编译器产物（T3.2，tie-llvm 编译 compiler/driver.tie 生成）
-/compiler/tiec.exe
+# 自举 v2 tiec 编译器产物——tiec.exe 作为 stage0 引导二进制**入库版本化**
+# （自举语言惯例：删除 Rust 种子后，clone 即可用 tiec 自举；tiec 自身编译
+#  compiler/driver.tie 生成，源码变更后重新自举并提交同步更新）
+# /compiler/tiec.exe   ← 不再忽略（入库）
 
 # 自举 v2 测试编译产物（tests/language/*.tie 经 tiec 编译生成）
 /tests/language/*.exe
@@ -61,6 +63,9 @@ opencode.json
 # 自举 v2 调试/构建残留（bench/diag/日志/中间 IR）
 /compiler/*.ll
 /compiler/*.exe
+# tiec.exe 豁免：stage0 引导二进制入库版本化（见上方 48-51 行说明），
+# 否定规则须位于 *.exe 通配之后才能生效
+!/compiler/tiec.exe
 /compiler/*.bc
 /compiler/bench_*
 /compiler/cd*.ll

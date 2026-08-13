@@ -1,10 +1,12 @@
 # scripts/repl-parity.ps1 —— tie REPL 会话 parity 回归脚本（自举 v2 T4.3）
 # ============================================================
 # 职责：用同一份 golden 会话（命令列表）分别跑
-#   - Rust 解释器通道：repl/repl.tie 编译为 compiler/_rust_repl.exe
-#     （eval() 走 Rust tie-interp 的 C ABI 桥 tie_eval_expr → Session::eval）
-#   - tie 解释器通道：compiler/repl.tie 编译为 compiler/repl.exe
-#     （eval 走 compiler/interp/interp.tie 的 interp.eval —— T4.1 tie 自写解释器）
+#   - tie 解释器通道：compiler/repl.tie 由 tiec 编译为 compiler/repl.exe
+#     （自举升格：tiec 是 tie 语言自写的自举 v2 编译器；
+#     eval 走 compiler/interp/interp.tie 的 interp.eval —— T4.1 tie 自写解释器）
+#   - Rust 解释器通道：repl/repl.tie 由 Rust 种子 tie-llvm.exe 编译为
+#     compiler/_rust_repl.exe（参照基线，eval() 走 Rust tie-interp 的
+#     C ABI 桥 tie_eval_expr → Session::eval）
 # 逐字节 diff 两者 stdout，验证 REPL 行为 parity（G3 闸门的一部分）。
 #
 # golden 机制：
@@ -58,6 +60,9 @@ $GoldenFile  = Join-Path $Root "tests\repl\golden_stdout.txt"
 $MaskFile    = Join-Path $Root "tests\repl\masks.txt"
 
 $SeedExe     = Join-Path $Root "target\release\tie-llvm.exe"
+# tiec：自举 v2 新编译器（tie 语言自写，compiler/driver.tie → tiec.exe）。
+# 自举升格后 tie 解释器通道 repl 由它编译（Rust 种子仅作参照基线）
+$TiecExe     = Join-Path $Root "compiler\tiec.exe"
 $InterpLib   = Join-Path $Root "target\release\tie_interp.lib"
 $TieReplSrc  = Join-Path $Root "compiler\repl.tie"
 $TieReplExe  = Join-Path $Root "compiler\repl.exe"
@@ -125,8 +130,8 @@ if (-not (Test-Path $SeedExe) -or -not (Test-Path $InterpLib)) {
 
 # 2. 构建双通道 repl（-SkipBuild 时复用现有 exe）
 if (-not $SkipBuild) {
-    Write-Host "[repl-parity] 构建 tie repl: $TieReplSrc" -ForegroundColor Cyan
-    & $SeedExe $TieReplSrc -o $TieReplExe | Out-Host
+    Write-Host "[repl-parity] 构建 tie repl（tiec）: $TieReplSrc" -ForegroundColor Cyan
+    & $TiecExe $TieReplSrc -o $TieReplExe | Out-Host
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[repl-parity] tie repl 编译失败" -ForegroundColor Red
         exit 1

@@ -576,6 +576,20 @@ func extern_decl(sym: string) -> string {
     if sym == "tie_table_set_string" {
         return "declare void @tie_table_set_string(ptr, i64, ptr, ptr)"
     }
+    // E3 键值表（map）桥：键为字符串 ptr；值按类型分 i64 / string 两个桥。
+    // 签名 (ptr map, ptr key, val, ptr ok)——与 tie_interp.lib 导出一一对应。
+    if sym == "tie_map_get" {
+        return "declare i64 @tie_map_get(ptr, ptr, ptr)"
+    }
+    if sym == "tie_map_get_string" {
+        return "declare ptr @tie_map_get_string(ptr, ptr, ptr)"
+    }
+    if sym == "tie_map_set" {
+        return "declare void @tie_map_set(ptr, ptr, i64, ptr)"
+    }
+    if sym == "tie_map_set_string" {
+        return "declare void @tie_map_set_string(ptr, ptr, ptr, ptr)"
+    }
     if sym == "tie_mkdir_all" {
         return "declare i8 @tie_mkdir_all(ptr)"
     }

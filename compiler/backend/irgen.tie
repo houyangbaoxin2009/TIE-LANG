@@ -2887,6 +2887,48 @@ func gen_index_read(id: i64) -> i64 {
     if iv < 0 {
         return -1
     }
+    // E3 键值表读取：m[key] → tie_map_get / tie_map_get_string（键为字符串 ptr）。
+    // base 类型是 map（作用域变量类型优先，其次 node_types）→ 走 map 桥，
+    // 与 Rust 基线 ir.rs gen_index_assign 的 map 分支同构（tie_map_* 专用桥）。
+    var base_is_map: bool = false
+    var map_val_ty: i64 = types.named(TK_I64)
+    if s_tags[base] == 6 {
+        var bn_rd = interner.intern(sstate.name_str(base))
+        if scope_get(bn_rd) >= 0 && types.is_map(g_lookup_ty) {
+            base_is_map = true
+            map_val_ty = types.low(g_lookup_ty)
+        }
+    }
+    if !base_is_map {
+        var bt_m = node_types[base]
+        if types.is_map(bt_m) {
+            base_is_map = true
+            map_val_ty = types.low(bt_m)
+        }
+    }
+    if base_is_map {
+        // 裸 map（id == BASE_MAP，low 解码为 0）默认 i64 值；map<string> → string 桥
+        if map_val_ty <= 0 {
+            map_val_ty = types.named(TK_I64)
+        }
+        var bridge_get = "tie_map_get"
+        var mret = types.named(TK_I64)
+        if map_val_ty == types.named(TK_STR) {
+            bridge_get = "tie_map_get_string"
+            mret = types.named(TK_STR)
+        }
+        var mok = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
+        ir.add_operand(mok, types.named(TK_I8), 2)
+        var mats: table<i64> = table_new_i64()
+        var mavs: table<i64> = table_new_i64()
+        table_push(mats, types.named(TK_STR))
+        table_push(mavs, t)
+        table_push(mats, types.named(TK_STR))
+        table_push(mavs, iv)
+        table_push(mats, types.named(TK_STR))
+        table_push(mavs, ir.get_value(mok))
+        return gen_ext_call_typed(bridge_get, mats, mavs, mret)
+    }
     // 元素类型：base 是表变量 → 优先 irgen 作用域完整类型（参数/局部表变量），
     // 其次 node_types（semantic 持久节点类型），最后 var_table_elem
     //（sinfer.lv_telem 每函数重置，irgen 阶段只能查到最后一个函数——不可靠）
@@ -2987,12 +3029,131 @@ func gen_index_assign(id: i64) -> i64 {
     if iv < 0 {
         return -1
     }
-    // 元素类型
+    // E3 键值表赋值：m[key] = v → tie_map_set / tie_map_set_string（键为字符串 ptr）。
+    // base 类型是 map（作用域变量类型优先，其次 node_types）→ 走 map 桥，
+    // 与 Rust 基线 ir.rs gen_index_assign 的 map 分支同构（含复合赋值读写回写）。
+    var base_is_map: bool = false
+    var map_val_ty: i64 = types.named(TK_I64)
+    if s_tags[base] == 6 {
+        var bn_as = interner.intern(sstate.name_str(base))
+        if scope_get(bn_as) >= 0 && types.is_map(g_lookup_ty) {
+            base_is_map = true
+            map_val_ty = types.low(g_lookup_ty)
+        }
+    }
+    if !base_is_map {
+        var bt_m2 = node_types[base]
+        if types.is_map(bt_m2) {
+            base_is_map = true
+            map_val_ty = types.low(bt_m2)
+        }
+    }
+    if base_is_map {
+        // 裸 map（low 解码为 0）默认 i64 值；map<string> → string 桥
+        if map_val_ty <= 0 {
+            map_val_ty = types.named(TK_I64)
+        }
+        var is_str_m = map_val_ty == types.named(TK_STR)
+        var bridge_set = "tie_map_set"
+        var bridge_get = "tie_map_get"
+        var pty_m = types.named(TK_I64)
+        if is_str_m {
+            bridge_set = "tie_map_set_string"
+            bridge_get = "tie_map_get_string"
+            pty_m = types.named(TK_STR)
+        }
+        // 复合赋值（m[k] += v）：先读旧值（tie_map_get 带 ok）→ 运算 → 写回
+        var v_m: i64 = -1
+        if op >= 0 {
+            var r_ok = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
+            ir.add_operand(r_ok, types.named(TK_I8), 2)
+            var rats: table<i64> = table_new_i64()
+            var ravs: table<i64> = table_new_i64()
+            table_push(rats, types.named(TK_STR))
+            table_push(ravs, t)
+            table_push(rats, types.named(TK_STR))
+            table_push(ravs, iv)
+            table_push(rats, types.named(TK_STR))
+            table_push(ravs, ir.get_value(r_ok))
+            var old_m = gen_ext_call_typed(bridge_get, rats, ravs, pty_m)
+            if old_m < 0 {
+                return -1
+            }
+            var rv_m = gen_expr(val)
+            if rv_m < 0 {
+                return -1
+            }
+            v_m = gen_compound_assign(op, old_m, rv_m, pty_m)
+            if v_m < 0 {
+                sm_err_msg = "下标复合赋值运算失败（函数 " + g_cur_fn_name + "）"
+                return -1
+            }
+        } else {
+            v_m = gen_expr(val)
+            if v_m < 0 {
+                return -1
+            }
+        }
+        var w_ok = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
+        ir.add_operand(w_ok, types.named(TK_I8), 2)
+        var ats_m: table<i64> = table_new_i64()
+        var avs_m: table<i64> = table_new_i64()
+        table_push(ats_m, types.named(TK_STR))
+        table_push(avs_m, t)
+        table_push(ats_m, types.named(TK_STR))
+        table_push(avs_m, iv)
+        table_push(ats_m, pty_m)
+        table_push(avs_m, v_m)
+        table_push(ats_m, types.named(TK_STR))
+        table_push(avs_m, ir.get_value(w_ok))
+        gen_ext_call_typed(bridge_set, ats_m, avs_m, -1)
+        return 0
+    }
+    // 元素类型：对齐 gen_index_read 的完整推断链（tblvar_get → 作用域类型 →
+    // node_types → sinfer → 索引表达式类型 fallback）。曾为简化版只查 sinfer 与
+    // node_types，导致 table<string> 等变量（存 string）元素类型推断为 i64，
+    // 生成 tie_table_set_i64 传 string 值 → opt 类型错（pkg 编译失败根因）。
     var elem: i64 = types.named(TK_I64)
     if s_tags[base] == 6 {
-        var te = sinfer.var_table_elem(intern.intern(sstate.name_str(base)))
-        if te >= 0 {
-            elem = te
+        var bname = interner.intern(sstate.name_str(base))
+        var matched: bool = false
+        // irgen 自维护表变量元素类型（table_new_f64() 变量；语义层 lv_telem 已过期）
+        var tv0 = tblvar_get(bname)
+        if tv0 >= 0 {
+            elem = tv0
+            matched = true
+        }
+        if !matched && scope_get(bname) >= 0 && types.is_table(g_lookup_ty) {
+            var le = types.table_elem(g_lookup_ty)
+            if le > 0 {
+                elem = le
+                matched = true
+            }
+        }
+        if !matched {
+            var bt2 = node_types[base]
+            if types.is_table(bt2) {
+                var le2 = types.table_elem(bt2)
+                if le2 > 0 {
+                    elem = le2
+                    matched = true
+                }
+            }
+        }
+        if !matched {
+            var te = sinfer.var_table_elem(bname)
+            if te >= 0 {
+                elem = te
+                matched = true
+            }
+        }
+        if !matched {
+            // 最后 fallback：索引表达式节点的语义推断类型（裸 table 元素未知时）
+            var nt = node_types[id]
+            if nt >= 0 && (nt == types.named(TK_STR) || types.is_int(nt) ||
+                types.is_float(nt) || types.is_bool_like(nt)) {
+                elem = nt
+            }
         }
     } else {
         var bt = node_types[base]

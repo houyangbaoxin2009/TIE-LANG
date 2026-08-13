@@ -107,7 +107,7 @@ tie-llvm 编译链接 interp 库生成），完整 CLI 逻辑全部在 tie 侧�
 | `tie help` | 显示包管理器帮助 |
 
 端到端演示见 [examples/pkg_demo.md](examples/pkg_demo.md) 与 `examples/demo_pkg/`。
-构建 `pkg.exe`：`cargo build --release -p tie-interp && target/release/tie-llvm.exe pkg/main.tie -o pkg/pkg.exe`。
+构建 `pkg.exe`：`cargo build --release -p tie-interp && compiler/tiec.exe pkg/main.tie -o pkg/pkg.exe`（自举升格：tiec 编译，不再经 Rust 种子）。
 
 流程：`tie-prep` 预处理（清理代码 + 识别文件类型）→ 按角色自动转交工具链
 （`logic` → 编译为可执行文件；`library` → 编译为静态库 `.a`；`data`/`ui`/`db` → 对应工具链，后续版本）。
@@ -154,11 +154,11 @@ tie examples/lib_math.tie -o lib_math.lib   # → MSVC 兼容静态库 .lib（CO
 - `tie-interp <file.tie>` —— 直接解释执行
 
 REPL 自举：REPL 外壳 `repl/repl.tie` 用 tie 语言自身编写（`print` + `read_line` + `eval`），
-经 tie-llvm 编译并链接 tie-interp 静态库（C ABI 桥）生成 `repl.exe`。构建：
+经 tiec（自举 v2 编译器，自举升格）编译并链接 tie-interp 静态库（C ABI 桥）生成 `repl.exe`。构建：
 
 ```bash
 cargo build --release -p tie-interp          # 产出 target/release/tie_interp.lib
-target/release/tie-llvm.exe repl/repl.tie    # 链接 interp 库生成 repl/repl.exe
+compiler/tiec.exe repl/repl.tie             # 链接 interp 库生成 repl/repl.exe
 ```
 
 `tie` 无参数时按 `TIE_REPL_EXE` → tie.exe 同目录 → 当前目录查找 repl.exe。

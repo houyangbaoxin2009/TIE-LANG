@@ -1,3 +1,20 @@
+## [阶段 A] tiec 升格一级编译器——repl/pkg 自举改用 tiec，tiec.exe 入库版本化 — 2026-08-13
+
+tiec（自举 v2 编译器）升格为主编译器：编译链路上不再依赖 Rust 种子产出 repl/pkg。
+
+- **repl / pkg 自举升格**：`scripts/package.ps1` 第 2 步由 `tie-llvm.exe repl/repl.tie` 改为
+  `compiler/tiec.exe repl/repl.tie`；`pkg/main.tie` 改由 tiec 编译（README / main.rs 构建指引同步）；
+- **irgen 修复：map 下标赋值/读取桥**（E3 键值表）——`gen_index_assign` / `gen_index_read`
+  新增 map 分支（`tie_map_set` / `tie_map_set_string` / `tie_map_get` / `tie_map_get_string`，
+  llvmgen 补齐 4 个桥声明），此前 map 赋值误走 `tie_table_set_i64` 导致 pkg 无法编译；
+- **irgen 修复：table 元素类型完整推断链**——`gen_index_assign` 对齐 `gen_index_read`
+  （tblvar_get → 作用域类型 → node_types → sinfer → 索引表达式类型 fallback），修复
+  `table<string>` 变量赋值推断为 i64 的错误；
+- **tiec.exe 入库版本化**：`.gitignore` 豁免 `/compiler/tiec.exe`（stage0 引导二进制，
+  自举语言惯例），clone 即用；源码变更后重新自举并提交同步更新；
+- **验证**：tiec 编译 pkg 行为与 Rust 种子产物字节等价（help 输出一致、init 功能正常）；
+  行为等价回归 93.7%（≥90% 达标，可编译文件 57→59）；repl-parity PASS（tie 通道 = Rust 通道）。
+
 ## [LLVM 随包分发] vendored LLVM——发行版 zip 内置精简 LLVM 工具链，解压即用免安装 — 2026-08-13
 
 LLVM 随包分发（vendored）：发行版 zip 内置精简 LLVM 工具链，解压即用免安装，

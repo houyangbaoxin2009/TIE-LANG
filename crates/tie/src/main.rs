@@ -129,7 +129,7 @@ fn repl() -> ExitCode {
         eprintln!(
             "未找到 REPL 外壳 repl.exe。请先构建（自举）:\n\
              1. cargo build --release -p tie-interp\n\
-             2. target\\release\\tie-llvm.exe repl\\repl.tie\n\
+             2. compiler\\tiec.exe repl\\repl.tie\n\
              3. 将 repl\\repl.exe 放到当前目录或 tie.exe 同目录\n\
              （或用环境变量 TIE_REPL_EXE 指定路径）"
         );
@@ -262,7 +262,7 @@ fn run_pkg() -> ExitCode {
         eprintln!(
             "未找到包管理器 pkg.exe。请先构建（自举）:\n\
              1. cargo build --release -p tie-interp\n\
-             2. target\\release\\tie-llvm.exe pkg\\main.tie -o pkg\\pkg.exe\n\
+             2. compiler\\tiec.exe pkg\\main.tie -o pkg\\pkg.exe\n\
              （或用环境变量 TIE_PKG_EXE 指定路径）"
         );
         // Windows 下直接运行（如双击）时窗口会一闪而过，暂停以让用户看到提示

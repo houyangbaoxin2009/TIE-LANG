@@ -12,7 +12,7 @@
 #
 # 流程：
 #   1. cargo build --release（全 workspace，验证 0 错误）
-#   2. repl.exe 自举（tie-interp staticlib + tie-llvm 编译 repl/repl.tie）
+#   2. repl.exe 自举（tie-interp staticlib + tiec 编译 repl/repl.tie，自举升格）
 #   3. 组装 dist/tie-{版本}/（bin/doc/examples/editor + bin/llvm/ 精简工具链）
 #   4. Compress-Archive 打包为 zip
 
@@ -57,6 +57,9 @@ Write-Host "[1/4] release 构建完成" -ForegroundColor Green
 # ---- 第 2 步：repl.exe 自举（可选）----
 Write-Host "`n[2/4] repl.exe 自举..." -ForegroundColor Yellow
 $ReplExe = Join-Path $Root "repl\repl.exe"
+# tiec：自举 v2 新编译器（tie 语言自写，compiler/driver.tie → tiec.exe）。
+# 自举升格后由它编译 repl/repl.tie（替代 Rust 种子 tie-llvm.exe）
+$TiecExe = Join-Path $Root "compiler\tiec.exe"
 if ($SkipReplBuild) {
     Write-Host "[2/4] 已跳过 repl 自举（-SkipReplBuild）" -ForegroundColor DarkYellow
 }
@@ -67,12 +70,13 @@ else {
     Push-Location $Root
     try {
         # 自举：先构建 tie-interp staticlib（tie_interp.lib），
-        # 再经 tie-llvm 编译 repl/repl.tie 并链接生成 repl.exe
+        # 再经 tiec 编译 repl/repl.tie 并链接生成 repl.exe（自举升格；
+        # tiec 默认输出 = 输入同目录同名 .exe，即 repl\repl.exe）
         cargo build --release -p tie-interp
         if ($LASTEXITCODE -ne 0) {
             throw "tie-interp staticlib 构建失败（退出码 $LASTEXITCODE）"
         }
-        & (Join-Path $Root "target\release\tie-llvm.exe") "repl\repl.tie"
+        & $TiecExe "repl\repl.tie"
         if ($LASTEXITCODE -ne 0) {
             throw "repl.exe 编译失败（退出码 $LASTEXITCODE）"
         }
