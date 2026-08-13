@@ -309,4 +309,5 @@ tie/
 | T4.1–T4.4 | 解释器 tie 化：core（eval/eval_call）+ 环境原语 + REPL parity + 测试移植（198 断言） | ✅ 完成（0830ef7/d3adfc0/53fce7d） |
 | T4.5–T4.6 | tie 运行时静态库（std/runtime.a 替代 Rust interp 链接）+ G3 闸门（0-Rust） | ✅ 完成（747ef1a/db585f2） |
 | T5.1 | tiec 前端全局表修复（自编译成功）+ G4 性能基准（ratio 1.007） | ✅ 完成（dc71e11） |
+| T5.3 | tiec 性能优化（消除重复前端/AST 内存传递/intern 二分/build_protocol 分治/print_err 清理）——G4 ratio 6.9 → 1.09，hello 反超 Rust | ✅ 完成（本批） |
 | T5 后续 | irgen 最小集扩展（前端已就绪，扩展后 G4 覆盖自动扩全） | 📋 进行中 |

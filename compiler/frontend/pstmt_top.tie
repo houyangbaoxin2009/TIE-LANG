@@ -318,7 +318,6 @@ func parse_extern() -> i64 {
 func parse_fn_def() -> i64 {
     var line = putil.peek_line()
     var col = putil.peek_col()
-    print_err("PFD0 enter")
     var is_pub: i64 = 0
     if putil.eat(lex_pub) {
         is_pub = 1
@@ -326,7 +325,6 @@ func parse_fn_def() -> i64 {
     if !putil.expect(lex_func, "'func'") {
         return -1
     }
-    print_err("PFD1 name-ok")
     var name = putil.expect_ident()
     if name < 0 {
         return -1
@@ -385,12 +383,10 @@ func parse_fn_def() -> i64 {
     } else {
         ret_ty = ast.new_node(N_NAMED_TYPE, interner.intern("void"), 14, -1, line, col)
     }
-    print_err("PFD3 before-block")
     var body = pstmt_flow.parse_block()
     if body < 0 {
         return -1
     }
-    print_err("PFD4 block-ok")
     var f = ast.new_node(N_FN_DEF, name, is_pub, len(params), line, col)
     var kids: table<i64> = table_new_i64()
     table_push(kids, ret_ty)
@@ -400,9 +396,7 @@ func parse_fn_def() -> i64 {
         i = i + 1
     }
     table_push(kids, body)
-    print_err("PFD5 before-setch")
     ast.set_children(f, kids)
-    print_err("PFD6 done")
     return f
 }
 

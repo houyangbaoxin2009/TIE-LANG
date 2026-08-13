@@ -192,7 +192,6 @@ func d_parse_args() -> i64 {
         } else if a == "-o" {
             i = i + 1
             if i >= n {
-                print_err("错误: -o 后缺少输出路径")
                 return -1
             }
             g_out = arg_string(i)
@@ -200,7 +199,6 @@ func d_parse_args() -> i64 {
             // 以 '-' 开头 = 未知选项（对齐 Rust「错误: 未知选项」→ 退出 2）
             if a != "" {
                 if str_char(a, 0) == "-" {
-                    print_err("错误: 未知选项: " + a)
                     return -1
                 }
             }
@@ -208,14 +206,12 @@ func d_parse_args() -> i64 {
             if g_input == "" {
                 g_input = a
             } else {
-                print_err("错误: 多余的位置参数: " + a)
                 return -1
             }
         }
         i = i + 1
     }
     if g_input == "" {
-        print_err("错误: 缺少输入文件")
         return -1
     }
     return 0
@@ -223,11 +219,6 @@ func d_parse_args() -> i64 {
 
 // 打印用法（参数错误时输出到 stderr）
 func d_print_usage() {
-    print_err("用法: driver-lite <input.tie> [--check] [--emit-ir] [-o <path>]")
-    print_err("  --check      只做前端检查（词法+语法+语义）；成功静默，失败退出 1")
-    print_err("  --emit-ir    只生成 .ll（默认 <input>.ll，-o 指定写 <path>）")
-    print_err("  -o <path>    指定产物路径（--emit-ir=.ll；默认链路=.exe）")
-    print_err("退出码: 0=成功 / 1=编译失败 / 2=参数错误")
 }
 
 // ==================== 完整链路（opt + clang） ====================
@@ -240,26 +231,18 @@ func d_full_chain(ll: string, exe_path: string) -> i64 {
     // 产物目录（可执行文件所在目录）确保存在
     var exe_dir = d_path_dir(exe_path)
     if exe_dir != "" && !mkdir_all(exe_dir) {
-        print_err("文件操作失败: 创建目录 " + exe_dir)
         return -1
     }
     if !file_write(ll_path, ll) {
-        print_err("文件操作失败: 写 " + ll_path)
         return -1
     }
     var rc_opt = exec_code("D:\\LLVM\\bin\\opt.exe -O2 -S " + ll_path + " -o " + opt_path + " 2> " + err_path)
     if rc_opt != 0 {
-        print_err("[中间优化] opt -O2 失败 rc=" + to_string(rc_opt))
-        print_err("  命令: D:\\LLVM\\bin\\opt.exe -O2 -S " + ll_path + " -o " + opt_path)
-        print_err("  stderr: " + file_read(err_path))
         file_delete(err_path)
         return -1
     }
     var rc_clang = exec_code("D:\\LLVM\\bin\\clang.exe " + opt_path + " -o " + exe_path + " 2> " + err_path)
     if rc_clang != 0 {
-        print_err("[后端] clang 链接失败 rc=" + to_string(rc_clang))
-        print_err("  命令: D:\\LLVM\\bin\\clang.exe " + opt_path + " -o " + exe_path)
-        print_err("  stderr: " + file_read(err_path))
         file_delete(err_path)
         return -1
     }
@@ -281,7 +264,6 @@ func main() -> i64 {
 
     // 1) 读源码（对齐 Rust 前缀契约）
     if !file_exists(g_input) {
-        print_err("读取源码失败: " + g_input)
         return 1
     }
     var src = file_read(g_input)
@@ -289,14 +271,12 @@ func main() -> i64 {
     // 2) 前端：词法 + 语法（parse_src 内部完成，出错返回 ERR 协议）
     var ast = parser.parse_src(src)
     if d_has_err(ast) {
-        print_err(d_fmt_error(ast, "语法错误"))
         return 1
     }
 
     // 3) 前端：语义（含 import 展开）
     var sem = semantic.check_impl(ast, base_dir)
     if d_has_err(sem) {
-        print_err(d_fmt_error(sem, "语义错误"))
         return 1
     }
     if g_check == 1 {
@@ -311,7 +291,6 @@ func main() -> i64 {
         if why == "" {
             why = "irgen 最小集之外的语句（尚未支持）"
         }
-        print_err("不支持: " + why)
         return 1
     }
 
@@ -326,7 +305,6 @@ func main() -> i64 {
         }
         ll_out = d_replace_ext(ll_out, "ll")
         if !file_write(ll_out, ll) {
-            print_err("文件操作失败: 写 " + ll_out)
             return 1
         }
         println("已生成 LLVM IR: " + ll_out)

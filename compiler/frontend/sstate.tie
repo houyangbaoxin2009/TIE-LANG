@@ -212,6 +212,72 @@ pub func parse_dec(s: string) -> i64 {
     return v
 }
 
+// ==================== 工具：协议行单次扫描解析 ====================
+// 整行字段一次字符扫描直接累积为 i64，返回字段值表。字段下标对应协议行：
+//   0=id 1=tag 2=name 3=val 4=aux 5=line 6=col 7=nchild 8..=子节点 id
+// 逐字节等价于原 pf(line,k) + parse_dec 组合：字段以单个空格分隔、全部为
+// 十进制整数（允许负号）。语义对齐 parse_dec——负号仅在字段首字符判定、
+// 字段内非数字字符跳过、空字段累积为 0。
+// 性能动机：原 load_ast/append_ast 每行调用 pf 8+ 次（每次 pf 内部
+// str.slice 生成一个字段子串）再各自 parse_dec 独立扫描，大文件（3000+
+// 节点）反序列化是性能热点；本函数整行单遍扫描、零中间字段子串分配
+// （每行仅一次 str.slice 生成行串本身），把每行的 8+ 次字符串分配降为 0。
+func parse_row(line: string) -> table<i64> {
+    var out: table<i64> = table_new_i64() // 字段值累积表（按出现顺序 push）
+    var n = str_len(line)                 // 行长度（协议行行尾仅 \n，无 \r）
+    var v: i64 = 0                        // 当前字段的十进制累积值
+    var neg: bool = false                 // 当前字段为负数（仅字段首字符判定）
+    var in_field: bool = false            // 已进入字段（防御行内连续空格）
+    var i: i64 = 0
+    while i < n {
+        var ch = str_char(line, i)
+        if ch == " " {
+            // 空格 = 字段分隔符：把已累积的当前字段落盘，并重置字段状态
+            if in_field {
+                if neg {
+                    v = 0 - v
+                }
+                table_push(out, v)
+                v = 0
+                neg = false
+                in_field = false
+            }
+        } else {
+            if !in_field {
+                // 字段首字符：仅此位置判定负号（对齐 parse_dec 的开头负号语义）
+                in_field = true
+                if ch == "-" {
+                    neg = true
+                } else {
+                    var cc = char_code(ch)
+                    if cc >= 48 {
+                        if cc <= 57 {
+                            v = v * 10 + (cc - 48)
+                        }
+                    }
+                }
+            } else {
+                // 字段中间字符：跳过非数字，只累积十进制位（对齐 parse_dec）
+                var cc = char_code(ch)
+                if cc >= 48 {
+                    if cc <= 57 {
+                        v = v * 10 + (cc - 48)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    // 行尾没有空格：把最后一个字段落盘（整行为空时 out 保持空表）
+    if in_field {
+        if neg {
+            v = 0 - v
+        }
+        table_push(out, v)
+    }
+    return out
+}
+
 // 加载 AST 协议文本（首行 N: + 每行 id tag name val aux line col nchild c1...）
 // 重建 9 列全局表。返回 0 成功 / -1 失败。
 pub func load_ast(ast_text: string) -> i64 {
@@ -256,7 +322,7 @@ pub func load_ast(ast_text: string) -> i64 {
         table_push(node_types, -1)
         k = k + 1
     }
-    // 逐行解析节点
+    // 逐行解析节点（parse_row 整行单次扫描直接累积 i64，零字段子串分配）
     var pos: i64 = first_end + 1
     var node_id: i64 = 0
     while pos < n && node_id < cnt {
@@ -267,22 +333,16 @@ pub func load_ast(ast_text: string) -> i64 {
             }
             line_end = line_end + 1
         }
-        var line = str.slice(ast_text, pos, line_end)
-        // id tag name val aux line col nchild c1...
-        var tag = parse_dec(pf(line, 1))
-        var name = parse_dec(pf(line, 2))
-        var val = parse_dec(pf(line, 3))
-        var aux = parse_dec(pf(line, 4))
-        var ln = parse_dec(pf(line, 5))
-        var col = parse_dec(pf(line, 6))
-        var nc = parse_dec(pf(line, 7))
-        s_tags[node_id] = tag
-        s_names[node_id] = name
-        s_vals[node_id] = val
-        s_aux[node_id] = aux
-        s_nchild[node_id] = nc
-        s_lines[node_id] = ln
-        s_cols[node_id] = col
+        // 整行字段一次扫描：f[0]=id f[1]=tag f[2]=name f[3]=val
+        // f[4]=aux f[5]=line f[6]=col f[7]=nchild f[8..]=子节点 id
+        var f: table<i64> = parse_row(str.slice(ast_text, pos, line_end))
+        s_tags[node_id] = f[1]
+        s_names[node_id] = f[2]
+        s_vals[node_id] = f[3]
+        s_aux[node_id] = f[4]
+        s_nchild[node_id] = f[7]
+        s_lines[node_id] = f[5]
+        s_cols[node_id] = f[6]
         node_id = node_id + 1
         pos = line_end + 1
     }
@@ -311,12 +371,13 @@ pub func load_ast(ast_text: string) -> i64 {
             }
             line_end = line_end + 1
         }
-        var line = str.slice(ast_text, pos, line_end)
+        // 子节点字段从下标 8 起连续排列，直接按 f[8 + c] 取用
+        var f: table<i64> = parse_row(str.slice(ast_text, pos, line_end))
         var nc = s_nchild[node_id]
         var base = s_coff[node_id]
         var c: i64 = 0
         while c < nc {
-            s_children[base + c] = parse_dec(pf(line, 8 + c))
+            s_children[base + c] = f[8 + c]
             c = c + 1
         }
         node_id = node_id + 1
@@ -360,22 +421,17 @@ pub func append_ast(ast_text: string) -> i64 {
             }
             line_end = line_end + 1
         }
-        var line = str.slice(ast_text, pos, line_end)
-        var tag = parse_dec(pf(line, 1))
-        var name = parse_dec(pf(line, 2))
-        var val = parse_dec(pf(line, 3))
-        var aux = parse_dec(pf(line, 4))
-        var ln = parse_dec(pf(line, 5))
-        var col = parse_dec(pf(line, 6))
-        var nc = parse_dec(pf(line, 7))
-        table_push(s_tags, tag)
-        table_push(s_names, name)
-        table_push(s_vals, val)
-        table_push(s_aux, aux)
+        // 整行字段一次扫描：f[0]=id f[1]=tag f[2]=name f[3]=val
+        // f[4]=aux f[5]=line f[6]=col f[7]=nchild f[8..]=子节点 id
+        var f: table<i64> = parse_row(str.slice(ast_text, pos, line_end))
+        table_push(s_tags, f[1])
+        table_push(s_names, f[2])
+        table_push(s_vals, f[3])
+        table_push(s_aux, f[4])
         table_push(s_coff, 0)
-        table_push(s_nchild, nc)
-        table_push(s_lines, ln)
-        table_push(s_cols, col)
+        table_push(s_nchild, f[7])
+        table_push(s_lines, f[5])
+        table_push(s_cols, f[6])
         table_push(node_types, -1)
         table_push(new_offs, 0)
         node_id = node_id + 1
@@ -400,12 +456,13 @@ pub func append_ast(ast_text: string) -> i64 {
             }
             line_end = line_end + 1
         }
-        var line = str.slice(ast_text, pos, line_end)
+        // 子节点字段从下标 8 起连续排列，直接按 f[8 + c] 取用
+        var f: table<i64> = parse_row(str.slice(ast_text, pos, line_end))
         s_coff[base + node_id] = new_offs[node_id]
         var nc = s_nchild[base + node_id]
         var c: i64 = 0
         while c < nc {
-            var cid = parse_dec(pf(line, 8 + c))
+            var cid = f[8 + c]
             if cid >= 0 {
                 cid = cid + base
             }

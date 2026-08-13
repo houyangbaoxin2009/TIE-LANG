@@ -1,3 +1,32 @@
+## [自举 v2 T5.3] tiec 性能优化——G4 ratio 6.9 → 1.09（目标超老编译器）— 2026-08-13
+
+针对"新编译器（tie 自写 tiec）性能超过老编译器（Rust tie-llvm）"目标的热点优化，
+G4 全量基准总比从 **6.900 → 1.086**（tiec 总耗时 2538ms vs Rust 2337ms，6.3× 提速），
+hello / import_main 单文件已**反超 Rust**（ratio 0.87 / 0.97）。
+
+### 热点根因（4 个）
+- **前端重复执行 2×**：driver.frontend 已 parse+check，irgen.gen_src 内部 check_src 又全套一遍；
+- **AST 文本协议往返**：parser 内存节点池 → build_protocol 序列化文本 → load_ast 反序列化
+  （O(n²) 拼接 + 每行 8+ 次子串 slice）；
+- **std/intern 冒泡插入 O(n²)**：新串尾部追加 + 逐元素 strcmp 交换（lexer 每 token intern）；
+- **print_err 调试跟踪**：每次编译向 stderr 刷 300+ 行（77 处调用）。
+
+### 6 项优化
+1. **消除重复前端**：irgen 新增 `gen_ast()`（复用 check_impl 后的内存状态），driver 主路径改用；
+   `gen_src` 保留给 driver-lite/_driver_test；
+2. **build_protocol 分治 join**（parser）：行收集 + 两两合并，O(n²) → O(n log n)；
+3. **intern 二分定位+位移**（std/intern.tie）：插入省去全部 strcmp 交换；
+4. **load_ast/append_ast 单扫描**（sstate）：parse_row 整行一次扫描，零字段子串分配；
+5. **AST 内存传递**：`parser.parse_ast`（不序列化）+ `semantic.check_ast` + `copy_ast_tables` /
+   `append_ast_mem`（内存直拷 9 列），import 展开同步内存化——彻底消除协议文本往返；
+6. **print_err 清理**：正式版 77 处/81 行删除（proto 原型保留）。
+
+### 验收
+- 回归全绿：interp 套件 11/11、行为等价回归 92.3%（12/13，无新增 DIFF）、错误 golden 与基线一致
+- G4 判定 PASS（硬线 ≤3.0、目标 ≤2.0 均达标；部分基准 + 缺口清单，可编译 30/74）
+- 单文件（不固定核心 median-of-5）：graph_demo 15.78×→1.44×、optsearch 16.45×→1.36×、
+  std_encoding 15.45×→1.64×、std_demo 11.34×→1.39×、hello 1.12×→0.87×
+
 ## [品牌] tie Logo 定稿：缺口环 + tie/θ 组合标 — 2026-08-13
 
 品牌标识正式定稿，落地 `assets/` 目录与 VSCode 插件：

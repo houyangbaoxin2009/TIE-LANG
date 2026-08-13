@@ -98,7 +98,6 @@ func imported_has(p: string) -> bool {
 func expand_one_import(imp_node: i64) -> i64 {
     var p = sstate.name_str(imp_node)
     var full = resolve_import_path(p)
-    print_err("EXI begin " + full)
     if imported_has(full) {
         return 0
     }
@@ -110,16 +109,19 @@ func expand_one_import(imp_node: i64) -> i64 {
         sm_err_msg = "无法读取导入文件 '" + full + "'"
         return -1
     }
-    var ast_text = parser.parse_src(src)
-    print_err("EXI parsed " + full + " len=" + to_string(str_len(ast_text)))
-    if sstate.has_prefix_str(ast_text, "ERR:") {
+    // T5.3 内存版：parse_ast 直接把库文件 AST 留在内存（不产协议文本），
+    // append_ast_mem 再从 ast 表直拷到 sstate——与原「parse_src → 文本 →
+    // append_ast」语义等价但省去协议往返的字符串开销
+    var prc = parser.parse_ast(src)
+    if prc < 0 {
         sm_err_line = s_lines[imp_node]
         sm_err_col = s_cols[imp_node]
-        sm_err_msg = "导入文件 '" + full + "' 解析失败: " + ast_text
+        // 错误消息与原协议完全一致：原 ast_text 为 "ERR:<line> <col> <msg>"
+        //（parse_src 返回），现由 parser.ast_err_protocol() 组装同格式文本
+        sm_err_msg = "导入文件 '" + full + "' 解析失败: " + parser.ast_err_protocol()
         return -1
     }
-    var base = sstate.append_ast(ast_text)
-    print_err("EXI appended " + full + " base=" + to_string(base))
+    var base = append_ast_mem()
     if base < 0 {
         return -1
     }
@@ -271,40 +273,29 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     if len(tre_bi_keys) == 0 {
         scollect.tre_bi_init()
     }
-    print_err("SC0 load_ast-begin")
     if sstate.load_ast(ast_text) < 0 {
         return "ERR:0 0 AST 协议解析失败"
     }
-    print_err("SC1 load_ast-done")
     g_root = s_n - 1
     // import 展开（主文件顶层进 g_extra_tops，import 文件递归合并）
-    print_err("SC2 expand-begin")
     var er = expand_imports()
-    print_err("SC3 expand-done")
     if er < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
-    print_err("SC4 collect_top-begin")
     var r = scollect.collect_top()
-    print_err("SC5 collect_top-done")
     if r < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
     // struct 字段拍平收集（含继承；须在逐函数检查前完成）
-    print_err("SC6 struct-fields-begin")
     var r3 = scollect.collect_all_struct_fields()
-    print_err("SC7 struct-fields-done")
     if r3 < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
     // 返回表元素预扫描（先于逐函数 check）
-    print_err("SC8 ret-tables-begin")
     var r4 = scollect.collect_all_return_tables()
-    print_err("SC9 ret-tables-done")
     if r4 < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
-    print_err("SA fn-walk-begin n=" + to_string(len(fn_keys)))
     var i: i64 = 0
     while i < len(fn_keys) {
         var fname = intern.lookup(fn_keys[i])
@@ -314,8 +305,226 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
         }
         i = i + 1
     }
-    print_err("SB fn-walk-done")
     return "OK:" + to_string(g_typed)
+}
+
+// 内存版 check 核心（T5.3 消除 AST 文本协议往返；前置条件：
+// parser.parse_ast 已成功执行、ast 节点池在内存）。
+// 与 check_impl(ast_text, base_dir) 语义完全等价：仅把 sstate.load_ast(协议文本)
+// 替换为 copy_ast_tables()（内存直拷 ast 表 → sstate 表），import 展开走内存版
+// expand_one_import（parse_ast + append_ast_mem）。状态重置、collect 系列、
+// 逐函数 check 循环与错误返回格式全部保留。
+// 返回 "OK:<typed>" 或 "ERR:<line> <col> <msg>"。
+pub func check_ast(base_dir: string) -> string {
+    g_cur_dir = base_dir
+    s_tags = table_new_i64()
+    s_names = table_new_i64()
+    s_vals = table_new_i64()
+    s_aux = table_new_i64()
+    s_coff = table_new_i64()
+    s_nchild = table_new_i64()
+    s_children = table_new_i64()
+    s_lines = table_new_i64()
+    s_cols = table_new_i64()
+    fn_keys = table_new_i64()
+    fn_vals = table_new_i64()
+    sg_nparams = table_new_i64()
+    sg_required = table_new_i64()
+    sg_ret = table_new_i64()
+    sg_pub = table_new_i64()
+    sg_off = table_new_i64()
+    sp_tys = table_new_i64()
+    sp_refs = table_new_i64()
+    sp_defs = table_new_i64()
+    st_keys = table_new_i64()
+    st_vals = table_new_i64()
+    cls_parent = table_new_i64()
+    cls_fldoff = table_new_i64()
+    cls_nfld = table_new_i64()
+    cls_done = table_new_i64()
+    fld_names = table_new_i64()
+    fld_tys = table_new_i64()
+    gb_keys = table_new_i64()
+    gb_vals = table_new_i64()
+    gb_const = table_new_i64()
+    gb_telem = table_new_i64()
+    ext_keys = table_new_i64()
+    tre_keys = table_new_i64()
+    tre_vals = table_new_i64()
+    node_types = table_new_i64()
+    lv_keys = table_new_i64()
+    lv_vals = table_new_i64()
+    lv_const = table_new_i64()
+    lv_telem = table_new_i64()
+    lv_dyn = table_new_i64()
+    lp_stack = table_new_i64()
+    lp_top = 0
+    ns_stack = table_new_i64()
+    ns_top = 0
+    using_prefixes = table_new_i64()
+    using_lens = table_new_i64()
+    tuple_tys = table_new_i64()
+    tup_names = table_new_i64()
+    tup_tys = table_new_i64()
+    tup_offs = table_new_i64()
+    tup_n = table_new_i64()
+    g_curfn = -1
+    g_typed = 0
+    sm_err_msg = ""
+    if len(tre_bi_keys) == 0 {
+        scollect.tre_bi_init()
+    }
+    // 内存直拷：ast 节点池 → sstate 9 列（替代 sstate.load_ast 的文本反序列化）
+    if copy_ast_tables() < 0 {
+        return "ERR:0 0 AST 协议解析失败"
+    }
+    g_root = s_n - 1
+    // import 展开（主文件顶层进 g_extra_tops，import 文件递归合并）
+    var er = expand_imports()
+    if er < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
+    var r = scollect.collect_top()
+    if r < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
+    // struct 字段拍平收集（含继承；须在逐函数检查前完成）
+    var r3 = scollect.collect_all_struct_fields()
+    if r3 < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
+    // 返回表元素预扫描（先于逐函数 check）
+    var r4 = scollect.collect_all_return_tables()
+    if r4 < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
+    var i: i64 = 0
+    while i < len(fn_keys) {
+        var fname = intern.lookup(fn_keys[i])
+        var r2 = scheck.check_fn_walk(fname)
+        if r2 < 0 {
+            return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+        }
+        i = i + 1
+    }
+    return "OK:" + to_string(g_typed)
+}
+
+// ==================== 内存版 AST 表复制（T5.3 消除协议往返）====================
+// 把 parser.parse_ast 留在内存的 ast 节点池（ast 命名空间 9 列全局表）复制到
+// sstate 的 s_* 9 列表。语义与 sstate.load_ast(协议文本) 完全等价——协议文本
+// 就是 build_protocol 对 ast 表的逐字节序列化，此处改为直接内存复制，
+// 省去大文件数千次 to_string / parse_row / str.slice 子串分配。
+// 返回 0（成功；正常不会失败）。
+func copy_ast_tables() -> i64 {
+    var cnt = ast.count()
+    s_n = cnt
+    // 重建 9 列 + node_types（对应 sstate.load_ast 的预分配占位 + 逐行覆写；
+    // 此处直接 push 真实值，表内容完全一致）
+    s_tags = table_new_i64()
+    s_names = table_new_i64()
+    s_vals = table_new_i64()
+    s_aux = table_new_i64()
+    s_coff = table_new_i64()
+    s_nchild = table_new_i64()
+    s_children = table_new_i64()
+    s_lines = table_new_i64()
+    s_cols = table_new_i64()
+    node_types = table_new_i64()
+    var k: i64 = 0
+    while k < cnt {
+        table_push(s_tags, ast.tag(k))
+        table_push(s_names, ast.name(k))
+        table_push(s_vals, ast.val(k))
+        table_push(s_aux, ast.aux(k))
+        table_push(s_coff, 0)
+        table_push(s_nchild, ast.child_count(k))
+        table_push(s_lines, ast.line(k))
+        table_push(s_cols, ast.col(k))
+        table_push(node_types, -1)
+        k = k + 1
+    }
+    // 第二遍：前缀和计算子段偏移（与 sstate.load_ast 相同的 s_coff 布局）
+    var off: i64 = 0
+    var j: i64 = 0
+    while j < cnt {
+        s_coff[j] = off
+        off = off + s_nchild[j]
+        j = j + 1
+    }
+    // 第三遍：预分配扁平子段后逐节点填充（ast.child_at 越界返回 -1 哨兵，
+    // 与协议字段 f[8+c] 的值域一致）
+    s_children = table_new_i64()
+    var z: i64 = 0
+    while z < off {
+        table_push(s_children, 0)
+        z = z + 1
+    }
+    var i: i64 = 0
+    while i < cnt {
+        var nc = s_nchild[i]
+        var base = s_coff[i]
+        var c: i64 = 0
+        while c < nc {
+            s_children[base + c] = ast.child_at(i, c)
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 把当前内存 ast 节点池（最近一次 parser.parse_ast 的结果）追加到 sstate 表
+// 末尾（import 展开用）。语义与 sstate.append_ast(协议文本) 完全等价：
+// 新节点 id = 原 id + base（调用前 s_tags 长度）；子节点 id >= 0 时 +base
+// 偏移，-1 哨兵保持。返回新节点段起点 base（调用方用 base + 新文件节点数 - 1
+// 定位该文件的顶层 StmtList root）。
+func append_ast_mem() -> i64 {
+    var cnt = ast.count()
+    var base = len(s_tags)
+    // 第一遍：逐节点 push 属性列 + node_types=-1（与 sstate.append_ast 的
+    // 逐行追加完全对应；new_offs 暂存各新节点的子段偏移占位）
+    var new_offs: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < cnt {
+        table_push(s_tags, ast.tag(i))
+        table_push(s_names, ast.name(i))
+        table_push(s_vals, ast.val(i))
+        table_push(s_aux, ast.aux(i))
+        table_push(s_coff, 0)
+        table_push(s_nchild, ast.child_count(i))
+        table_push(s_lines, ast.line(i))
+        table_push(s_cols, ast.col(i))
+        table_push(node_types, -1)
+        table_push(new_offs, 0)
+        i = i + 1
+    }
+    // 第二遍：计算新节点子段偏移（相对 s_children 当前末尾的前缀和）
+    var off = len(s_children)
+    var j: i64 = 0
+    while j < cnt {
+        new_offs[j] = off
+        off = off + s_nchild[base + j]
+        j = j + 1
+    }
+    // 第三遍：填充子节点（id 偏移 +base，-1 哨兵保持）并落盘 s_coff
+    var k: i64 = 0
+    while k < cnt {
+        s_coff[base + k] = new_offs[k]
+        var nc = s_nchild[base + k]
+        var c: i64 = 0
+        while c < nc {
+            var cid = ast.child_at(k, c)
+            if cid >= 0 {
+                cid = cid + base
+            }
+            table_push(s_children, cid)
+            c = c + 1
+        }
+        k = k + 1
+    }
+    s_n = len(s_tags)
+    return base
 }
 
 // ==================== check_debug：可读输出 ====================

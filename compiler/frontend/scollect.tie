@@ -137,10 +137,6 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
         table_push(p_tys, pt)
         table_push(p_refs, is_ref)
         table_push(p_defs, has_def)
-        if full == "ast::collect_stmt" {
-            print_err("CFN full=" + full + " k=" + to_string(k) + " is_ref=" + to_string(is_ref) +
-                " svals=" + to_string(s_vals[p]))
-        }
         if has_def == 0 {
             required = k + 1
         }

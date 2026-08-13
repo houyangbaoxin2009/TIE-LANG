@@ -2,8 +2,10 @@
 // compiler/driver.tie —— 自举 T3.2：完整 CLI 编译器驱动（tiec 入口）
 // ============================================================
 // 对齐 Rust crates/tie-llvm/src/main.rs + driver.rs：参数解析、角色分派、
-// 消息格式、退出码。组装前端（parse_src/check_impl）+ 中端（irgen.gen_src/
-// llvmgen.emit）+ 后端（backend/toolchain.tie）。
+// 消息格式、退出码。组装前端（parse_ast/check_ast，T5.3 内存 AST 版）+ 中端
+//（irgen.gen_ast/llvmgen.emit）+ 后端（backend/toolchain.tie）。中端用
+// gen_ast()（AST 已由 frontend 就绪，不再二次执行前端；gen_src 由
+// driver-lite/_driver_test 使用）。
 //
 // 用法：tiec <input.tie> [-o <out>] [-O0|-O1|-O2|-O3] [--target <三元组>]
 //                    [--emit-ir] [--keep-ir] [--prep-only] [--config <f>] [--help]
@@ -173,15 +175,17 @@ func scan_header(src: string) {
 
 // ==================== 前端 ====================
 
-// 前端：词法/语法（parser.parse_src）→ 语义+import（semantic.check_impl）。
+// 前端：词法/语法（parser.parse_ast，AST 留内存）→ 语义+import（semantic.check_ast）。
 // 返回 0 成功；失败打印错误并返回 -1。
 func frontend(src: string, base_dir: string) -> i64 {
-    var ast = parser.parse_src(src)
-    if has_prefix(ast, "ERR:") {
-        println("语法错误 " + err_span(ast))
+    // T5.3 内存版：parse_ast 返回 0/-1（成功时 AST 在 ast 节点池内存），
+    // 失败时由 parser.ast_err_protocol() 组装与 parse_src 相同的 "ERR:line col msg"
+    var prc = parser.parse_ast(src)
+    if prc < 0 {
+        println("语法错误 " + err_span(parser.ast_err_protocol()))
         return -1
     }
-    var sem = semantic.check_impl(ast, base_dir)
+    var sem = semantic.check_ast(base_dir)
     if has_prefix(sem, "ERR:") {
         println("语义错误 " + err_span(sem))
         return -1
@@ -261,14 +265,14 @@ func compile_program(src: string) -> i64 {
     // base_dir：输入路径的目录（import 展开需要）；\\ 归一化为 /
     var base_dir = dir_of(g_input)
     // 前端
-    print_err("P0 frontend-begin")
     if frontend(src, base_dir) < 0 {
         return 1
     }
-    print_err("P1 frontend-done")
     // 中端：AST → tie-IR → .ll 文本
-    var rc = irgen.gen_src(src, base_dir)
-    print_err("P2 irgen-done")
+    // frontend() 已执行完整前端（parse_ast + check_ast），sstate 全局表/
+    // g_extra_tops/node_types 均已就绪——直接 gen_ast() 复用，避免前端重复
+    // 执行（gen_src 内部会再 parse + check_impl 一遍，行为等价但浪费一倍）
+    var rc = irgen.gen_ast()
     if rc < 0 {
         var msg = sm_err_msg
         if str_len(msg) == 0 {
@@ -278,7 +282,6 @@ func compile_program(src: string) -> i64 {
         return 1
     }
     var ll_text = llvmgen.emit()
-    print_err("P3 emit-done")
     // IR 文件路径：--emit-ir → -o 或 输入.ll；否则中间文件（输出基准）
     var ir_path = replace_ext(g_input, "ll")
     if str_len(g_output) > 0 {

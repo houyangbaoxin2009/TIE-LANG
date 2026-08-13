@@ -10,8 +10,13 @@
 // - intern_vals : table<i64>     正查值：与 intern_keys 并行，keys[i] 对应 vals[i]（该串的 id）
 // 正查 = 对 intern_keys 二分（O(log n)）；反向 = intern_pool 下标 O(1)。
 // 说明：全局 map 未放开（顶层 `var m: map` 语法层即报错），故正查用并行排序表
-// 方案（同 D3 排序数组二分模式）；插入用「追加尾部 + 向前冒泡」保持升序（同
-// std/sort.tie 的 insert_sorted 算法），keys/vals 同步交换维持并行对应。
+// 方案（同 D3 排序数组二分模式）；插入用「二分定位 + 尾部追加占位 + 从尾向前
+// 位移」保持升序：先二分定位插入位置（O(log n) 次字符串比较），尾部追加占位后
+// 从尾向前同步搬移 keys/vals（搬移阶段零比较；表元素为共享字符串句柄，赋值即
+// 搬移引用、无深拷贝）——单次插入成本 O(log n) 次 strcmp + O(n) 次表搬移，较
+// 原「追加尾部 + 向前冒泡」实现（O(n) 次 strcmp + O(n) 次两两交换）大幅削减
+// 字符串比较热点：编译器 lexer 逐 token intern（大文件数千 token），冒泡版构成
+// O(n²) strcmp 热点，位移版降为 O(n²) 表搬移 + O(n log n) strcmp。
 //
 // 约定（接口稳定，消费者依赖）：
 // - id 从 0 递增分配（首次登记得 0，之后逐个 +1）；重复登记返回原 id，不新增条目；
@@ -51,7 +56,8 @@ func binsearch(s: string) -> i64 {
 
 // 把字符串 s 登记进池，返回稳定 id：相同串返回相同 id（id 从 0 递增）。
 // 新串流程：id = 当前池长（追加前长度）→ pool 追加 → keys/vals 有序插入
-// （追加尾部后向前冒泡，两表同步交换保持并行对应）→ 返回 id。
+// （二分定位插入位置 pos → 尾部追加占位 → 从尾向前位移 keys/vals，搬移
+// 阶段不再做字符串比较）→ 返回 id。
 pub func intern(s: string) -> i64 {
     var idx = binsearch(s)
     if idx >= 0 {
@@ -60,29 +66,45 @@ pub func intern(s: string) -> i64 {
     // 新串：id 为追加前池长（0 起始递增）
     var id: i64 = len(intern_pool)
     table_push(intern_pool, s)
-    // 有序插入 keys/vals：先追加尾部，再向前冒泡（同 insert_sorted 一步）
-    table_push(intern_keys, s)
-    table_push(intern_vals, id)
-    var i: i64 = len(intern_keys) - 1
-    var moving: bool = true
-    while moving {
-        // 已到表头：无需再前移
-        if i == 0 {
-            moving = false
-        } else if intern_keys[i] < intern_keys[i - 1] {
-            // 逆序：两表同步交换，继续向前搬移
-            var tmpk = intern_keys[i]
-            intern_keys[i] = intern_keys[i - 1]
-            intern_keys[i - 1] = tmpk
-            var tmpv: i64 = intern_vals[i]
-            intern_vals[i] = intern_vals[i - 1]
-            intern_vals[i - 1] = tmpv
-            i = i - 1
+    // 有序插入 keys/vals（二分定位 + 尾部追加占位 + 从尾向前位移）：
+    //
+    // ① 二分定位插入位置 pos：keys 升序，找"第一个 >= s"的下标（新串保证无
+    //    相等元素，等价于"第一个 > s"的下标）。pos 初始为当前表长——当全部
+    //    已登记串都小于 s（s 排到表尾）时 pos 保持表长即正确位置。比较方向：
+    //    keys[mid] < s → 目标在右半，lo = mid + 1（pos 不动）；否则 → 目标在
+    //    [lo, mid]，pos = mid 记下候选并向左收窄 hi = mid - 1。整段仅 O(log n)
+    //    次字符串比较（对应旧冒泡实现每步一次 strcmp 的 O(n) 次比较）。
+    var pos: i64 = len(intern_keys)
+    var lo: i64 = 0
+    var hi: i64 = len(intern_keys) - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if intern_keys[mid] < s {
+            lo = mid + 1
         } else {
-            // 前一元素更小（或相等）：升序已满足
-            moving = false
+            pos = mid
+            hi = mid - 1
         }
     }
+    // ② 尾部追加占位：先把新串/新 id 追加到表尾（i 指向表尾下标），随后统一
+    //    向前搬移，避免中部逐位插入；追加后表长为 n+1，表尾下标即原表长 n。
+    table_push(intern_keys, s)
+    table_push(intern_vals, id)
+    // ③ 从尾向前位移：把原 [pos, n-1] 区间的元素整体后移一格，腾出 pos 位置。
+    //    i 从表尾 n 递减到 pos 上方（i > pos 时执行），keys/vals 同步搬移维持
+    //    并行对应；搬移只是句柄赋值（table<string> 元素为共享引用，无深拷贝），
+    //    且全程不再做任何字符串比较——这是与旧冒泡实现的关键差异（冒泡每步
+    //    一次 strcmp + 一次两两交换）。
+    var i: i64 = len(intern_keys) - 1
+    while i > pos {
+        intern_keys[i] = intern_keys[i - 1]
+        intern_vals[i] = intern_vals[i - 1]
+        i = i - 1
+    }
+    // ④ 占位归位：把新串与新 id 写入腾出的 pos 处（vals 与 keys 保持并行对应，
+    //    升序不变量与"id 即登记序"语义均与旧实现一致）。
+    intern_keys[pos] = s
+    intern_vals[pos] = id
     return id
 }
 

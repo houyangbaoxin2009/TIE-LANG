@@ -825,8 +825,6 @@ func gen_inst(inst_id: i64) {
         var sid = ir.ins_opnd(inst_id, 0)
         var sym = ns_replace(intern.lookup(sid))
         if sym == "" {
-            print_err("EMPTY-CALL-SYM inst=" + to_string(inst_id) + " sid=" + to_string(sid) +
-                " cnt=" + to_string(cnt) + " o1=" + to_string(ir.ins_opnd(inst_id, 1)))
         }
         var args = ""
         var k: i64 = 2
@@ -1112,11 +1110,9 @@ func ptr_arg_ref(inst_id: i64, k: i64) -> string {
 pub func emit() -> string {
     collect_strings()
     collect_externs()
-    print_err("E1")
     out_lines = table_new_string()
     g_sext_cnt = 0
     g_str_reg_cnt = 0
-    print_err("E2")
     // 模块头
     line("; ModuleID = 'tie'")
     line("source_filename = \"input.tie\"")
@@ -1124,7 +1120,6 @@ pub func emit() -> string {
     // 无条件 declare
     line("declare i32 @printf(ptr, ...)")
     line("")
-    print_err("E3")
     line("declare i64 @strlen(ptr)")
     line("declare i32 @strcmp(ptr, ptr)")
     line("declare ptr @malloc(i64)")
@@ -1149,23 +1144,18 @@ pub func emit() -> string {
     line("")
     // T4.5：tie 运行时桥 declare（extern_call 收集，按符号名输出）
     emit_extern_decls()
-    print_err("E4 extern-decls-done")
     // 阶段 A：全局变量段（表 → ptr null；标量 → 零值）
     emit_globals()
-    print_err("E5 globals-done")
     // 各函数
     var nf = ir.func_count()
     var i: i64 = 0
-    print_err("E6 funcs-begin nf=" + to_string(nf))
     while i < nf {
         gen_func(i)
         i = i + 1
     }
-    print_err("E7 funcs-done")
     // 字符串常量节
     line("")
     emit_strings()
-    print_err("E8 strings-done")
     return join_lines()
 }
 

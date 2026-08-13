@@ -684,8 +684,6 @@ func gen_expr(id: i64) -> i64 {
         // Call：println/print / tie 运行时桥内置 / 字符串表数学内置 / 用户函数
         var nm = sstate.name_str(id)
         if nm == "" {
-            print_err("EMPTY-CALL fn=" + g_cur_fn_name + " line=" + to_string(s_lines[id]) +
-                " col=" + to_string(s_cols[id]) + " nchild=" + to_string(sstate.nchild(id)))
         }
         if nm == "println" || nm == "print" {
             return gen_println(id, nm == "println")
@@ -1051,12 +1049,9 @@ func gen_user_call(full: string, id: i64) -> i64 {
 
 func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
     var sig = sstate.fn_sig(full)
-    print_err("GCALL full=" + full + " sig=" + to_string(sig) + " nchild=" + to_string(sstate.nchild(id)))
     var probe_i: i64 = 0
     while probe_i < sstate.nchild(id) {
         var pc = sstate.child(id, probe_i)
-        print_err("GCALL-child" + to_string(probe_i) + " tag=" + to_string(s_tags[pc]) + " name=[" +
-            sstate.name_str(pc) + "]")
         probe_i = probe_i + 1
     }
     if sig < 0 {
@@ -1064,22 +1059,16 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
         return -1
     }
     var ret_ty = fn_ret_ty(sig)
-    print_err("GCALL2 ret_ty=" + to_string(ret_ty))
     var nparams = fn_nparams(sig)
-    print_err("GCALL3 nparams=" + to_string(nparams))
     var ptys = fn_param_tys(sig)
-    print_err("GCALL4 ptyslen=" + to_string(len(ptys)))
     var sym = interner.intern(full)
-    print_err("GCALL5 sym=" + to_string(sym))
     llvmgen.call_sym_reg(sym)
-    print_err("GCALL6 sym-reg-ok")
     // 实参全求值（by_ref 形参 + Var 实参 → 传槽地址跳过 load）
     var nc = sstate.nchild(id)
     var argvals: table<i64> = table_new_i64()
     var k: i64 = arg_start
     while k < nc {
         var arg_node = sstate.child(id, k)
-        print_err("GCALL-arg k=" + to_string(k) + " node=" + to_string(arg_node) + " tag=" + to_string(s_tags[arg_node]))
         var av: i64 = -1
         var arg_idx = k - arg_start  // 实参序号（aoff=1 时 children[0] 是路径节点）
         if arg_idx < nparams {
@@ -1094,12 +1083,9 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
             }
         }
         if av < 0 {
-            print_err("GCALL-genx k=" + to_string(k))
             av = gen_expr(arg_node)
-            print_err("GCALL-genx-done av=" + to_string(av))
         }
         table_push(argvals, av)
-        print_err("GCALL-push k=" + to_string(k))
         k = k + 1
     }
     var ty35: i64 = -1
@@ -1108,7 +1094,6 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
     }
     // 只创建一条（曾先建 ret_ty 再覆盖建 -1——void 时遗留无操作数垃圾指令
     // → llvmgen 生成 `call void @()` 空符号）
-    print_err("GCALL8 argvals=" + to_string(len(argvals)) + " ty35=" + to_string(ty35))
     var inst = ir.new_inst(g_cur_block, 35, ty35)  // call（void 用 -1）
     ir.add_operand(inst, sym, 0)
     ir.add_operand(inst, ret_ty, 2)  // 返回类型（IMM）
@@ -1933,12 +1918,77 @@ func gen_block_stmts(blk: i64) -> i64 {
 }
 
 // ==================== 顶层入口 ====================
-// 生成 tie-IR：内部调 semantic.check_src 填充 AST + 类型表，然后遍历顶层 FnDef。
+// 生成 tie-IR（AST 已就绪版，driver.tie 主路径专用）：**前置条件**——调用方
+// 必须先执行过 semantic.check_impl（含 parse 的 check_src 等价物），使以下
+// 全局状态完整可用：sstate 全局表（s_tags/s_children/s_lines/...）、
+// g_extra_tops（顶层声明序列，import 已递归展开填充）、node_types/fn_keys
+// （类型/函数签名登记）。driver.frontend() 即满足该条件（parser.parse_src +
+// semantic.check_impl，与 semantic.check_src 内部流程完全等价，AST 与类型表
+// 状态一致）。
+// 本函数**不含**语法/语义检查——只做 生成器状态重置 → 全局变量登记 →
+// 顶层函数/命名空间遍历 生成 tie-IR，省去第二次完整前端执行
+// （parse + import 展开 + 符号表重建）的性能浪费。调用方在 frontend 失败时
+// 已提前返回，故本函数无需再判语义错误。
+// 返回 0 成功 / -1 错误（sm_err_* 已置）。
+pub func gen_ast() -> i64 {
+    // 重置生成器状态
+    g_sc_keys = table_new_i64()
+    g_sc_allocas = table_new_i64()
+    g_sc_tys = table_new_i64()
+    g_sc_top = 0
+    g_lp_labels = table_new_i64()
+    g_lp_breaks = table_new_i64()
+    g_lp_cont = table_new_i64()
+    g_lp_top = 0
+    g_str_keys = table_new_i64()
+    g_str_count = 0
+    g_used_runtime = false
+    g_used_interp = false
+    ir.new_module()
+    // 全局变量登记（表全局 → llvmgen 输出 @g = global ptr null，main 入口初始化）
+    var n = len(g_extra_tops)
+    var i: i64 = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        if s_tags[s] == 100 {
+            gen_global_var(s)
+        }
+        i = i + 1
+    }
+    // 顶层遍历：FnDef（顶层函数）/ Namespace（递归函数体）/ 全局 VarDecl 已登记
+    i = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        if s_tags[s] == 101 {
+            // 顶层函数：全名 = 裸名
+            var r = gen_fn_def(s, "")
+            if r < 0 {
+                if str_len(sm_err_msg) == 0 {
+                    sm_err_msg = "顶层函数 " + sstate.name_str(s) + " 生成失败"
+                }
+                return -1
+            }
+        } else if s_tags[s] == 112 {
+            // 命名空间：递归生成体内函数（全名 = ns 段::函数名）
+            var nr = gen_ns(s, "")
+            if nr < 0 {
+                if str_len(sm_err_msg) == 0 {
+                    sm_err_msg = "顶层命名空间生成失败"
+                }
+                return -1
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 生成 tie-IR（完整版）：内部调 semantic.check_src（parse + 语义 + import）
+// 填充 AST + 类型表，然后遍历顶层 FnDef。driver-lite.tie 与 backend/
+// _driver_test.tie 仍在使用；driver.tie 主路径改用 gen_ast() 避免重复前端。
 // 返回 0 成功 / -1 错误（sm_err_* 已置）
 pub func gen_src(src: string, base_dir: string) -> i64 {
-    print_err("IR0 check_src-begin")
     var sem = semantic.check_src(src, base_dir)
-    print_err("IR1 check_src-done")
     if str_len(sem) < 3 {
         return -1
     }
