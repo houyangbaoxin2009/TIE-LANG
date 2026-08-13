@@ -18,31 +18,33 @@ LIGHT = dict(ring="#0F172A", dot="#0EA5E9", letter="#0F172A")
 DARK  = dict(ring="#F8FAFC", dot="#38BDF8", letter="#F8FAFC")
 
 def draw_icon(d, cx, cy, scale, pal):
-    """缺口环主图标：两段弧 + 悬浮青点（坐标基于 512 画布）"""
-    r = 117.5 * scale
+    """缺口环主图标：两段弧 + 悬浮青点（坐标基于 512 画布）
+    注意：PIL arc 的 bbox 是外缘、线宽向内扩展；SVG stroke 居中。
+    故 PIL 外缘半径 = 117.5 + 23.75 = 141.25，描边 47.5 → 中线半径 117.5 与 SVG 一致"""
+    r = 141.25 * scale   # 外缘半径
     w = 47.5 * scale
     box = [cx - r, cy - r, cx + r, cy + r]
     # 左大半弧：缺口右缘 (124°) → 缺口左缘 (236°)（PIL 角度 0°=3点钟，顺时针）
     d.arc(box, start=124, end=236, fill=pal["ring"], width=int(w))
     # 右大半弧：上缺口左缘 (304°) → 下缺口右缘 (416°)
     d.arc(box, start=304, end=416, fill=pal["ring"], width=int(w))
-    # 悬浮青点
+    # 悬浮青点（正上方缺口内：中线半径 117.5 → 中心 y = 256-117.5 = 138.5）
     dot_r = 17.5 * scale
-    px = cx + (152.25 - 256) * scale
-    d.ellipse([px - dot_r, cy - dot_r, px + dot_r, cy + dot_r], fill=pal["dot"])
+    py = cy + (138.5 - 256) * scale
+    d.ellipse([cx - dot_r, py - dot_r, cx + dot_r, py + dot_r], fill=pal["dot"])
 
 def draw_wordmark(d, pal):
     """组合版 tie 文字：三字母总高 140px、笔画 30px、视觉空隙 36px"""
     w = 30
-    # t：横笔（y 50-80）+ 竖笔（y 50-190）
+    # t：横笔（y 50-80，中心 65）+ 竖笔（y 65-190，圆头视觉顶不超横笔顶）
     d.line([(270, 65), (370, 65)], fill=pal["letter"], width=w)
-    d.line([(320, 50), (320, 190)], fill=pal["letter"], width=w)
+    d.line([(320, 65), (320, 190)], fill=pal["letter"], width=w)
     # i：点（青）+ 竖笔（y 102-190）
     d.ellipse([421-15, 63-15, 421+15, 63+15], fill=pal["dot"])
     d.line([(421, 102), (421, 190)], fill=pal["letter"], width=w)
-    # e：圆环 + 中横
+    # e：圆环 + 中横（不超圆：472 → 612）
     d.ellipse([542-70, 120-70, 542+70, 120+70], outline=pal["letter"], width=w)
-    d.line([(472, 120), (620, 120)], fill=pal["letter"], width=w)
+    d.line([(472, 120), (612, 120)], fill=pal["letter"], width=w)
 
 def render_icon(pal, out):
     """主图标 512×512，4x 超采样"""

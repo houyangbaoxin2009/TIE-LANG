@@ -14,5 +14,5 @@
   <path d="M 160.85 79.3 A 58.75 58.75 0 0 1 160.85 176.7"
         fill="none" stroke="#FFFFFF" stroke-width="23.75" stroke-linecap="butt"/>
   <!-- 悬浮青点 -->
-  <circle cx="128" cy="76.1" r="8.75" fill="#38BDF8"/>
+  <circle cx="128" cy="69.25" r="8.75" fill="#38BDF8"/>
 </svg>

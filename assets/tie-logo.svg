@@ -29,6 +29,6 @@
   <path class="ring" d="M 321.7 158.6 A 117.5 117.5 0 0 1 321.7 353.4"
         fill="none" stroke-width="47.5" stroke-linecap="butt"/>
 
-  <!-- ── 悬浮青点（上缺口内，环外缘内侧）── -->
-  <circle class="dot" cx="256" cy="152.25" r="17.5"/>
+  <!-- ── 悬浮青点（上缺口内，环带中线半径 117.5：cy = 256-117.5 = 138.5）── -->
+  <circle class="dot" cx="256" cy="138.5" r="17.5"/>
 </svg>
