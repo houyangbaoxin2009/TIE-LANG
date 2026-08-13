@@ -1,3 +1,22 @@
+## [品牌] tie Logo 定稿：缺口环 + tie/θ 组合标 — 2026-08-13
+
+品牌标识正式定稿，落地 `assets/` 目录与 VSCode 插件：
+
+- **主图标（Trit Ring 缺口环）**：石墨黑粗环 + 对角双缺口（代码进出编译器的通道）
+  + 顶部悬浮青点（语言内核/trit），负空间设计，两段对称弧无接缝；
+- **组合版（tie/θ）**：缺口环 + 手绘几何字形 "tie"——第三字母采用希腊 theta（θ，
+  数学角度符号）样式：瘦椭圆环 + 平头中横，与 t/i 严格等高（140px）、笔画统一
+  （30px）、字母间视觉空隙相等（36px）、基线齐平；t 竖笔不超横笔、θ 中横不超椭圆；
+- **深色模式适配**：`prefers-color-scheme` 媒体查询，深色背景下环/文字自动切换为
+  浅色（#F8FAFC）、青点切换为亮青（#38BDF8），单文件两用；
+- **透明背景 PNG 预览**：`assets/preview/`（Pillow 渲染脚本 `render_png.py`，PIL
+  ellipse/arc 外缘语义与 SVG 居中描边对齐）；
+- **GitHub 社交预览**：`assets/social-preview.png`（1280×640，深靛渐变底 + 组合
+  logo + 中英双语标语，生成脚本 `make_social_preview.py`）；
+- **VSCode 插件图标**：`editor/vscode-tie/icon.svg/png` 同步替换（深色圆角底 +
+  白环 + 亮青点）；
+- **README**：顶部横幅引用 `assets/tie-logo-full.svg`。
+
 ## [自举 v2 T5.1] tiec 前端全局表修复 + G4 性能基准 — 2026-08-12
 
 ### tiec 前端语义修复（自举闭环关键）

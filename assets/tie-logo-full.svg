@@ -51,9 +51,11 @@
   <!-- i：点（cy 63，上伸抵消弧线视觉差）+ 竖笔（y 102-190） -->
   <circle class="dot" cx="421" cy="63" r="15"/>
   <path class="letter" d="M 421 102 L 421 190" stroke-width="30" stroke-linecap="round"/>
-  <!-- e：圆环（r 70，上下各 overshoot 2px，视觉与总高齐平）+ 中横（不超圆：圆左缘 472 → 右缘 612） -->
+  <!-- e → θ（希腊 theta，数学角度符号）：瘦椭圆环 + 中横（平头不超椭圆）
+       椭圆路径 rx=45 ry=62 cy=128（外缘 rx=60 ry=77：底 205 与 t/i 基线对齐，
+       顶 51≈50 齐平），中横 497-569 在椭圆带内 -->
   <g class="letter" stroke-width="30" stroke-linecap="round">
-    <circle cx="542" cy="120" r="70" fill="none"/>
-    <path d="M 472 120 L 612 120"/>
+    <ellipse cx="532" cy="128" rx="45" ry="62" fill="none"/>
+    <path d="M 497 128 L 569 128" stroke-linecap="butt"/>
   </g>
 </svg>

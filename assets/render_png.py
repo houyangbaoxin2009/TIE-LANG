@@ -33,18 +33,30 @@ def draw_icon(d, cx, cy, scale, pal):
     py = cy + (138.5 - 256) * scale
     d.ellipse([cx - dot_r, py - dot_r, cx + dot_r, py + dot_r], fill=pal["dot"])
 
-def draw_wordmark(d, pal):
-    """组合版 tie 文字：三字母总高 140px、笔画 30px、视觉空隙 36px"""
-    w = 30
-    # t：横笔（y 50-80，中心 65）+ 竖笔（y 65-190，圆头视觉顶不超横笔顶）
-    d.line([(270, 65), (370, 65)], fill=pal["letter"], width=w)
-    d.line([(320, 65), (320, 190)], fill=pal["letter"], width=w)
-    # i：点（青）+ 竖笔（y 102-190）
-    d.ellipse([421-15, 63-15, 421+15, 63+15], fill=pal["dot"])
-    d.line([(421, 102), (421, 190)], fill=pal["letter"], width=w)
-    # e：圆环 + 中横（不超圆：472 → 612）
-    d.ellipse([542-70, 120-70, 542+70, 120+70], outline=pal["letter"], width=w)
-    d.line([(472, 120), (612, 120)], fill=pal["letter"], width=w)
+def rline(d, p1, p2, w, color, cap=True):
+    """圆头线（模拟 SVG stroke-linecap=round）：画线 + 两端画圆"""
+    d.line([p1, p2], fill=color, width=w)
+    if cap:
+        r = w // 2
+        for (x, y) in (p1, p2):
+            d.ellipse([x - r, y - r, x + r, y + r], fill=color)
+
+def draw_wordmark(d, pal, k=1.0):
+    """组合版 tie 文字：三字母总高 140px、笔画 30px、视觉空隙 36px
+    （几何与 tie-logo-full.svg 完全一致；e 中横为平头 butt）
+    k：缩放系数（组合版 4x 超采样传 4.0）"""
+    w = int(30 * k)
+    # t：横笔（y 50-80，中心 65）+ 竖笔（y 65-190，圆头视觉顶 = 横笔顶 50 不超）
+    rline(d, (270*k, 65*k), (370*k, 65*k), w, pal["letter"])
+    rline(d, (320*k, 65*k), (320*k, 190*k), w, pal["letter"])
+    # i：点（青）+ 竖笔（y 102-190，圆头）
+    d.ellipse([(421-15)*k, (63-15)*k, (421+15)*k, (63+15)*k], fill=pal["dot"])
+    rline(d, (421*k, 102*k), (421*k, 190*k), w, pal["letter"])
+    # θ（希腊 theta，数学角度符号）：瘦椭圆环 + 中横（平头不超椭圆）
+    # PIL ellipse outline 的 bbox 是外缘：外缘 rx=45+15=60、ry=62+15=77，
+    # cy=128 → 底部 205 与 t/i 基线对齐，顶部 51≈50 齐平
+    d.ellipse([(532-60)*k, (128-77)*k, (532+60)*k, (128+77)*k], outline=pal["letter"], width=w)
+    rline(d, (497*k, 128*k), (569*k, 128*k), w, pal["letter"], cap=False)
 
 def render_icon(pal, out):
     """主图标 512×512，4x 超采样"""
@@ -63,14 +75,8 @@ def render_full(pal, out):
     k = 4.0
     # 图标组：translate(37.5,12.5) scale(0.42) → 中心 (145,120)，缩放 0.42
     draw_icon(d, 145 * k, 120 * k, 0.42 * k, pal)
-    # 文字：整体 ×4
-    dd = lambda p1, p2: d.line([(p1[0]*k, p1[1]*k), (p2[0]*k, p2[1]*k)],
-                               fill=pal["letter"], width=int(30*k))
-    dd((270, 65), (370, 65)); dd((320, 50), (320, 190))
-    d.ellipse([(421-15)*k, (63-15)*k, (421+15)*k, (63+15)*k], fill=pal["dot"])
-    dd((421, 102), (421, 190))
-    d.ellipse([(542-70)*k, (120-70)*k, (542+70)*k, (120+70)*k], outline=pal["letter"], width=int(30*k))
-    dd((472, 120), (620, 120))
+    # 文字：与 SVG 完全一致（统一走 draw_wordmark，含外缘修正）
+    draw_wordmark(d, pal, k)
     img.resize((640, 240), Image.Resampling.LANCZOS).save(out)
     print("saved:", out)
 
