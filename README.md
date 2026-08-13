@@ -27,7 +27,10 @@ tie 是一门**通用编程语言**：用一门语言写逻辑、写界面、写
 
 ## 快速开始
 
-前置依赖：Rust（edition 2024）、LLVM 工具链（`opt`、`clang`、`lld`，编译链路的后端部分调用它们）。
+前置依赖：源码构建需要 Rust（edition 2024）与 LLVM 工具链（`opt`、`clang`、`lld`，编译链路的后端部分调用它们）；
+**发行版 zip 已内置精简 LLVM 工具链（`bin/llvm/`），解压即用，无需单独安装 LLVM**。
+LLVM 工具发现顺序：`TIE_LLVM_HOME\bin` → tie.exe/tiec.exe 同目录 `llvm\bin`（Rust 侧）→ `PATH`
+→ 常见安装目录（`D:\LLVM\bin`、`C:\Program Files\LLVM\bin`、`C:\LLVM\bin`）。
 
 ```bash
 # 构建
@@ -159,6 +162,7 @@ target/release/tie-llvm.exe repl/repl.tie    # 链接 interp 库生成 repl/repl
 ```
 
 `tie` 无参数时按 `TIE_REPL_EXE` → tie.exe 同目录 → 当前目录查找 repl.exe。
+LLVM 工具定位同「快速开始」的发现顺序；发行版自带 `bin/llvm/`，用 `TIE_LLVM_HOME` 指向它即可开箱即用。
 
 ## 工程结构
 

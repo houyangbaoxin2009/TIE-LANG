@@ -7,18 +7,24 @@
 #   .\scripts\package.ps1                     # 默认发行版号 2026.1
 #   .\scripts\package.ps1 -ReleaseVersion 2026.2
 #   .\scripts\package.ps1 -SkipReplBuild      # 跳过 repl.exe 自举（用现有产物）
+#   .\scripts\package.ps1 -LlvmDir D:\LLVM    # 指定 LLVM 安装目录（默认 D:\LLVM）
+#   .\scripts\package.ps1 -SkipLlvm           # 跳过 LLVM 精简工具链捆绑
 #
 # 流程：
 #   1. cargo build --release（全 workspace，验证 0 错误）
 #   2. repl.exe 自举（tie-interp staticlib + tie-llvm 编译 repl/repl.tie）
-#   3. 组装 dist/tie-{版本}/（bin/doc/examples/editor）
+#   3. 组装 dist/tie-{版本}/（bin/doc/examples/editor + bin/llvm/ 精简工具链）
 #   4. Compress-Archive 打包为 zip
 
 param(
     # 正式发行版号（年份.修订号），默认 2026.1
     [string]$ReleaseVersion = "2026.1",
     # 跳过 repl.exe 自举构建（复用现有 repl/repl.exe）
-    [switch]$SkipReplBuild
+    [switch]$SkipReplBuild,
+    # LLVM 安装目录（捆绑 clang/opt/llvm-ar/lld-link 与头文件的来源），默认 D:\LLVM
+    [string]$LlvmDir = "D:\LLVM",
+    # 跳过 LLVM 精简工具链捆绑（不打包 bin/llvm/）
+    [switch]$SkipLlvm
 )
 
 # 错误即停
@@ -145,6 +151,85 @@ foreach ($tiec in @("tiec.exe", "tiec2.exe")) {
     }
     else {
         Write-Host "  警告: 缺失 $tiec（跳过）" -ForegroundColor DarkYellow
+    }
+}
+
+# ---- LLVM 精简工具链（bin/llvm/，[3/4] 步骤的子步骤）----
+# tiec/tie 编译链路后端调用 clang/opt/llvm-ar/lld-link，将本机 LLVM 安装的
+# 工具与 clang 头文件捆绑进发行版 bin/llvm/，实现开箱即用（用户无需另装 LLVM）。
+# 布局匹配 clang 默认资源目录查找（../lib/clang/<ver>/include 相对 clang.exe），
+# 同时符合 TIE_LLVM_HOME 约定（<home>\bin\<tool>.exe；捆绑时 TIE_LLVM_HOME=bin/llvm）。
+Write-Host "`n[3.5] LLVM 精简工具链..." -ForegroundColor Yellow
+
+if ($SkipLlvm) {
+    Write-Host "[3.5] 已跳过 LLVM 工具链打包（-SkipLlvm）" -ForegroundColor DarkYellow
+}
+else {
+    # 主工具 clang.exe 缺失 → 整个 LLVM 块跳过（zip 仍正常打包）
+    if (-not (Test-Path (Join-Path $LlvmDir "bin\clang.exe"))) {
+        Write-Host "  LLVM 工具链打包跳过（未找到 $LlvmDir\bin\clang.exe）" -ForegroundColor DarkYellow
+    }
+    else {
+        # bin/llvm/bin/ 与 bin/llvm/lib/：目标目录
+        $LlvmBin = Join-Path $DistDir "bin\llvm\bin"
+        $LlvmLib = Join-Path $DistDir "bin\llvm\lib"
+        New-Item -ItemType Directory -Path $LlvmBin -Force | Out-Null
+        New-Item -ItemType Directory -Path $LlvmLib -Force | Out-Null
+
+        # 工具逐个复制（clang.exe 必需——缺失视为本块致命错误；其余可选——缺失仅警告）
+        $LlvmTools = @(
+            @{ Name = "clang.exe";    Required = $true },
+            @{ Name = "opt.exe";      Required = $false },
+            @{ Name = "llvm-ar.exe";  Required = $false },
+            @{ Name = "lld-link.exe"; Required = $false }
+        )
+        foreach ($lt in $LlvmTools) {
+            $src = Join-Path $LlvmDir "bin\$($lt.Name)"
+            if (Test-Path $src) {
+                Copy-Item $src $LlvmBin
+                Write-Host "  bin/llvm/bin/$($lt.Name) ✔" -ForegroundColor DarkGray
+            }
+            elseif ($lt.Required) {
+                throw "clang.exe 缺失（$LlvmDir\bin\clang.exe），LLVM 工具链打包失败"
+            }
+            else {
+                Write-Host "  警告: 缺失 $($lt.Name)（跳过）" -ForegroundColor DarkYellow
+            }
+        }
+
+        # 头文件资源目录：lib/clang/<ver>/include 整体复制（保留版本目录名，
+        # 匹配 clang 默认资源目录查找 ../lib/clang/<ver>/include 相对 clang.exe）
+        $verDir = Get-ChildItem (Join-Path $LlvmDir "lib\clang") -Directory | Select-Object -First 1
+        if ($verDir) {
+            $IncludeDest = Join-Path $LlvmLib ("clang\" + $verDir.Name + "\include")
+            Copy-Item (Join-Path $verDir.FullName "include") $IncludeDest -Recurse
+            Write-Host "  bin/llvm/lib/clang/$($verDir.Name)/include ✔" -ForegroundColor DarkGray
+        }
+        else {
+            Write-Host "  警告: 未找到 $LlvmDir\lib\clang\<ver>\include（跳过头文件）" -ForegroundColor DarkYellow
+        }
+
+        # 许可文件：优先 LLVM 安装目录自带（官方安装包），缺失时回退仓库内置
+        # third_party/llvm/LICENSE.TXT（LLVM 官方 Apache-2.0 with LLVM Exceptions，
+        # 随发行版捆绑二进制必须附许可证）
+        $LlvmLicense = Join-Path $LlvmDir "LICENSE.txt"
+        $BundledLicense = Join-Path $Root "third_party\llvm\LICENSE.TXT"
+        if (-not (Test-Path $LlvmLicense)) {
+            $LlvmLicense = $BundledLicense
+        }
+        if (Test-Path $LlvmLicense) {
+            Copy-Item $LlvmLicense (Join-Path $DistDir "bin\llvm\LICENSE.txt")
+            Write-Host "  bin/llvm/LICENSE.txt ✔" -ForegroundColor DarkGray
+        }
+        else {
+            Write-Host "  警告: 缺失 LLVM 许可文件（$BundledLicense 也不存在，跳过）" -ForegroundColor DarkYellow
+        }
+
+        # 大小汇总（MB，统计 bin/llvm/ 下全部复制文件）
+        $LlvmTotal = (Get-ChildItem (Join-Path $DistDir "bin\llvm") -Recurse -File |
+            Measure-Object -Property Length -Sum).Sum
+        Write-Host "  LLVM 工具链合计: $([math]::Round($LlvmTotal / 1MB, 2)) MB" -ForegroundColor DarkGray
+        Write-Host "[3.5] LLVM 精简工具链完成（TIE_LLVM_HOME=$DistDir\bin\llvm）" -ForegroundColor Green
     }
 }
 

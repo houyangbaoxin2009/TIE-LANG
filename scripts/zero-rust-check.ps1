@@ -10,6 +10,7 @@
 #
 # 用法：pwsh ./scripts/zero-rust-check.ps1
 # 退出码：0 = G3 PASS；1 = 部分 PASS / R3 fallback。
+# LLVM 工具发现顺序：$env:TIE_LLVM_HOME → 固定安装目录（D:\LLVM 等）→ PATH。
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -24,12 +25,28 @@ $tiec = Join-Path $root 'compiler\tiec.exe'
 $runtimeA = Join-Path $root 'std\runtime.a'
 $runtimeTie = Join-Path $root 'std\runtime.tie'
 $seed = Join-Path $root 'target\release\tie-llvm.exe'
-$clang = 'D:\LLVM\bin\clang.exe'
+
+# 按 TIE_LLVM_HOME → 固定安装目录 → PATH 顺序查找 LLVM 工具。
+function Find-LlvmTool([string]$name) {
+    $home = $env:TIE_LLVM_HOME
+    if ($home) {
+        $cand = Join-Path $home "bin\$name.exe"
+        if (Test-Path $cand) { return $cand }
+    }
+    foreach ($dir in @('D:\LLVM\bin', 'C:\Program Files\LLVM\bin', 'C:\LLVM\bin')) {
+        $cand = Join-Path $dir "$name.exe"
+        if (Test-Path $cand) { return $cand }
+    }
+    $fromPath = Get-Command "$name.exe" -ErrorAction SilentlyContinue
+    if ($fromPath) { return $fromPath.Source }
+    return $null
+}
+$clang = Find-LlvmTool 'clang'
 $opt = 'D:\LLVM\bin\opt.exe'
 
 $failures = @()
 foreach ($p in @($tiec, $runtimeTie, $clang, $opt, $seed)) {
-    if (-not (Test-Path $p)) {
+    if ($null -eq $p -or -not (Test-Path $p)) {
         $failures += "缺失: $p"
     }
 }
@@ -120,16 +137,21 @@ if (Test-Path $rtExe) {
 }
 
 # ---------- 4. runtime.a 符号清单（允许集核验） ----------
-$arSyms = & 'D:\LLVM\bin\llvm-nm.exe' $runtimeA 2>&1 | Out-String
-$arOk = $true
-foreach ($a in $allowed) {
-    if (-not $arSyms.Contains($a)) {
-        $arOk = $false
-        $failures += "runtime.a 缺少导出符号: $a"
+$nm = Find-LlvmTool 'llvm-nm'
+if ($null -eq $nm) {
+    Write-Output "[warn] 未找到 llvm-nm——跳过 runtime.a 符号清单核验（可设置 TIE_LLVM_HOME 指向 LLVM 安装目录）"
+} else {
+    $arSyms = & $nm $runtimeA 2>&1 | Out-String
+    $arOk = $true
+    foreach ($a in $allowed) {
+        if (-not $arSyms.Contains($a)) {
+            $arOk = $false
+            $failures += "runtime.a 缺少导出符号: $a"
+        }
     }
-}
-if ($arOk) {
-    Write-Output "[PASS] std/runtime.a 导出允许集符号（tie_exec_code/tie_get_env/tie_time_now）"
+    if ($arOk) {
+        Write-Output "[PASS] std/runtime.a 导出允许集符号（tie_exec_code/tie_get_env/tie_time_now）"
+    }
 }
 
 # ---------- 5. REPL parity + interp suite（种子编译通道，parity 基准） ----------

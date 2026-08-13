@@ -2,7 +2,11 @@
 //!
 //! 对应《编译原理》的中间代码优化阶段，具体优化交给 LLVM 完成，
 //! 本模块只负责定位 `opt` 并按其 CLI 约定组织参数。
+//!
+//! `opt` 查找顺序：捆绑/指定的 LLVM（`backend::bundled_llvm_bin`，vendored
+//! 模型优先）→ 系统 PATH → 固定安装目录兜底（D:\LLVM\bin 等）。
 
+use crate::backend::bundled_llvm_bin;
 use std::path::Path;
 use std::process::Command;
 
@@ -51,17 +55,25 @@ impl OptLevel {
 /// 输入输出均为 LLVM IR 文本文件。优化失败的场景（如 IR 非法）
 /// 会在驱动层转换为用户可见的错误。
 pub fn optimize(input: &Path, output: &Path, level: OptLevel) -> Result<(), OptError> {
-    // 依次查找 PATH 与常见安装位置
+    // 依次查找捆绑 LLVM → PATH 与常见安装位置
     let opt = find_opt().ok_or(OptError::NotFound)?;
     run_opt(&opt, input, output, level)
 }
 
-/// 查找 opt 可执行文件（PATH → D:\LLVM\bin 等常见位置）。
+/// 查找 opt 可执行文件（捆绑 LLVM → PATH → 常见安装位置）。
 fn find_opt() -> Option<std::path::PathBuf> {
+    // 1. 捆绑/指定的 LLVM（TIE_LLVM_HOME 或当前目录 llvm\bin）
+    if let Some(bin) = bundled_llvm_bin() {
+        let p = bin.join("opt.exe");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // 2. PATH
     if let Some(path) = which("opt") {
         return Some(path);
     }
-    // 常见 LLVM 安装目录兜底
+    // 3. 常见 LLVM 安装目录兜底
     for dir in ["D:\\LLVM\\bin", "C:\\Program Files\\LLVM\\bin", "C:\\LLVM\\bin"] {
         let p = Path::new(dir).join("opt.exe");
         if p.exists() {

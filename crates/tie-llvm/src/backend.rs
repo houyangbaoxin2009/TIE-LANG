@@ -4,6 +4,17 @@
 //! - `clang optimized.ll -o output.exe`（内部自动完成汇编与链接，生成可执行文件）
 //! - `clang -c optimized.ll -o output.o` + `llvm-ar rcs libxxx.a output.o`（生成静态库）
 //! - 交叉编译：给 clang 传 `--target=<三元组>`（如 `--target=x86_64-pc-windows-msvc`）
+//!
+//! LLVM 工具查找顺序（`bundled_llvm_bin`，随发行版 vendored LLVM 优先）：
+//! 1. 环境变量 `TIE_LLVM_HOME` 指定安装根目录的 `bin\` 子目录；
+//! 2. 当前可执行文件同目录的 `llvm\bin`（release bin/llvm/bin/*.exe）；
+//! 3. 系统 PATH；
+//! 4. 固定安装目录兜底（D:\LLVM\bin 等）。
+//! 前两者只做「目录存在」判定，具体工具缺失时自动回退到后两者，不会硬失败。
+//!
+//! `-fuse-ld=lld` 仅在 vendored LLVM 场景生效（clang 位于上述前两者目录内且
+//! 同目录有 lld-link.exe）；本机开发（clang 来自 PATH/固定目录，VS link.exe
+//! 可用）保持默认 link.exe 链接——lld 解析 Rust staticlib CRT 符号有缺陷。
 
 use std::path::Path;
 use std::process::Command;
@@ -51,6 +62,16 @@ pub fn link(
     let clang = find_clang().ok_or(BackendError::NotFound)?;
     let mut cmd = Command::new(&clang);
     cmd.arg(input).arg("-o").arg(output);
+    // -fuse-ld=lld 仅对「vendored LLVM」生效：clang 来自 TIE_LLVM_HOME 或
+    // 可执行文件同目录 llvm\bin（发布包场景，用户无 MSVC → 用随包 lld-link）。
+    // 本机开发（clang 来自 PATH/固定目录，VS link.exe 可用）不加——lld 解析
+    // Rust staticlib（tie_interp.lib）的 CRT 符号有缺陷（printf undefined），
+    // 必须保留默认 link.exe 行为（repl 自举等依赖）。
+    if let Some(bin) = bundled_llvm_bin() {
+        if bin.join("lld-link.exe").exists() && clang.starts_with(&bin) {
+            cmd.arg("-fuse-ld=lld");
+        }
+    }
     // 交叉编译：clang 按目标三元组选择后端与系统库
     if let Some(t) = target {
         cmd.arg(format!("--target={t}"));
@@ -114,11 +135,43 @@ pub fn archive(object: &Path, archive: &Path) -> Result<(), BackendError> {
     }
 }
 
-/// 查找 clang 可执行文件（PATH → 常见安装位置）。
+/// 查找随发行版捆绑/指定的 LLVM 工具所在 bin 子目录。
+///
+/// vendored LLVM 分发模型下，优先使用随包工具而非系统 PATH：
+/// 1. 环境变量 `TIE_LLVM_HOME` = LLVM 安装根目录（如 `D:\LLVM`，其 `bin\` 子目录含工具）；
+/// 2. 当前可执行文件同目录的 `llvm\bin`（release 的 bin/llvm/bin/*.exe）。
+///
+/// 返回的目录仅代表「存在」，具体工具（clang.exe 等）由调用方进一步判定；
+/// 两者都不可用时返回 `None`，调用方回退到 PATH / 固定安装目录。
+pub(crate) fn bundled_llvm_bin() -> Option<std::path::PathBuf> {
+    // 1. 环境变量 TIE_LLVM_HOME：其 bin\ 子目录存在即采用
+    if let Some(home) = std::env::var_os("TIE_LLVM_HOME") {
+        let bin = Path::new(&home).join("bin");
+        if bin.is_dir() {
+            return Some(bin);
+        }
+    }
+    // 2. 当前可执行文件同目录的 llvm\bin（release bin/llvm/bin/）
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("llvm").join("bin")))
+        .filter(|bin| bin.is_dir())
+}
+
+/// 查找 clang 可执行文件（捆绑 LLVM → PATH → 常见安装位置）。
 fn find_clang() -> Option<std::path::PathBuf> {
+    // 1. 捆绑/指定的 LLVM（TIE_LLVM_HOME 或当前目录 llvm\bin）
+    if let Some(bin) = bundled_llvm_bin() {
+        let p = bin.join("clang.exe");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // 2. PATH
     if let Some(path) = which("clang") {
         return Some(path);
     }
+    // 3. 常见安装位置兜底
     for dir in ["D:\\LLVM\\bin", "C:\\Program Files\\LLVM\\bin", "C:\\LLVM\\bin"] {
         let p = Path::new(dir).join("clang.exe");
         if p.exists() {
@@ -128,11 +181,20 @@ fn find_clang() -> Option<std::path::PathBuf> {
     None
 }
 
-/// 查找 llvm-ar 可执行文件（PATH → 常见安装位置）。
+/// 查找 llvm-ar 可执行文件（捆绑 LLVM → PATH → 常见安装位置）。
 fn find_llvm_ar() -> Option<std::path::PathBuf> {
+    // 1. 捆绑/指定的 LLVM（TIE_LLVM_HOME 或当前目录 llvm\bin）
+    if let Some(bin) = bundled_llvm_bin() {
+        let p = bin.join("llvm-ar.exe");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // 2. PATH
     if let Some(path) = which("llvm-ar") {
         return Some(path);
     }
+    // 3. 常见安装位置兜底
     for dir in ["D:\\LLVM\\bin", "C:\\Program Files\\LLVM\\bin", "C:\\LLVM\\bin"] {
         let p = Path::new(dir).join("llvm-ar.exe");
         if p.exists() {

@@ -69,6 +69,9 @@ bin\tiec.exe examples\hello.tie     # 生成 examples\hello.exe
 examples\hello.exe                  # 运行
 ```
 
+发行 zip 同时内置精简 LLVM 工具链（`bin/llvm/`：clang / opt / llvm-ar / lld-link、
+头文件与许可文本），解压即用，无需单独安装 LLVM。
+
 ### 从源码构建 tiec
 
 前置依赖：Rust（构建种子用）、LLVM 工具链（`opt`、`clang`、`llvm-ar`、`lld`）。
@@ -84,7 +87,9 @@ target\release\tie-llvm.exe compiler\driver.tie -o compiler\tiec.exe
 compiler\tiec.exe compiler\driver.tie -o compiler\tiec2.exe
 ```
 
-LLVM 工具发现顺序：`PATH` → `D:\LLVM\bin` → `C:\Program Files\LLVM\bin` → `C:\LLVM\bin`。
+LLVM 工具发现顺序：`TIE_LLVM_HOME\bin` → tie.exe/tiec.exe 同目录 `llvm\bin`（Rust 侧）→ `PATH`
+→ 固定目录（`D:\LLVM\bin`、`C:\Program Files\LLVM\bin`、`C:\LLVM\bin`）。
+发行版 zip 内置精简 LLVM（`bin/llvm/`），`TIE_LLVM_HOME` 指向它即开箱即用。
 链接时若缺少运行时静态库，需要先构建 `std/runtime.a`（见第 5 节）。
 
 ## 4. CLI 用法
@@ -162,6 +167,24 @@ tiec 链接用户程序时需要一个运行时静态库：
 **G3 闸门验证**：移走 Rust `tie_interp.lib` 后，tiec 仍能编译并运行
 `exec_code` / `time_now` / `get_env` 程序，运行时栈 Rust-free 检查通过。
 `std/runtime.a` 是 0-Rust 链路的关键一环，链接用户程序时必需。
+
+### LLVM 工具链依赖
+
+- **工具发现顺序**：`TIE_LLVM_HOME\bin` → tie.exe/tiec.exe 同目录 `llvm\bin`（Rust 侧）→
+  `PATH` → 固定目录（`D:\LLVM\bin`、`C:\Program Files\LLVM\bin`、`C:\LLVM\bin`）；
+- **vendored 发行说明**：发行版 zip 内置精简 LLVM 工具链（`bin/llvm/`，含 clang / opt /
+  llvm-ar / lld-link 与头文件），`TIE_LLVM_HOME` 指向 `bin/llvm` 即开箱即用，无需单独安装 LLVM；
+- **`-fuse-ld=lld` 仅 vendored 场景生效**：clang 来自随包 LLVM（`TIE_LLVM_HOME` 已设置 / 命中
+  同目录 `llvm\bin`）时，链接命令加 `-fuse-ld=lld`，让随包的 lld-link.exe 在无 MSVC/VS 的机器上
+  完成链接；普通开发机（clang 来自 PATH / 固定目录，VS link.exe 可用）保持默认链接器。原因：
+  lld 解析 Rust 静态库 tie_interp.lib 存在 CRT 缺陷（`undefined symbol: printf`），开发机必须保留 link.exe；
+- **已知限制**：vendored 且无 MSVC/VS 的环境下，链接使用 tie-interp C ABI 桥的程序（REPL 内建
+  read_line / eval，或由 Rust 静态库 tie_interp.lib 支撑的 std 函数）会因 lld 的 CRT 解析缺陷报
+  `undefined symbol: printf`；普通程序（不经过 interp 桥）用随包 lld 链接正常。随包的
+  repl.exe / pkg.exe 在打包机（装有 VS）上预构建，终端用户不受影响——该限制只影响在无 VS 环境下
+  重编 interp 桥程序；
+- **LLVM 许可**：`third_party/llvm/LICENSE.TXT` 保存 LLVM 官方许可（Apache-2.0 with LLVM
+  Exceptions），随包分发为 `bin/llvm/LICENSE.txt`。
 
 ## 6. 架构与模块
 

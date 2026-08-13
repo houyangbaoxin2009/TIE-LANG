@@ -6,11 +6,13 @@
 // 依赖语言底座原语 exec_code / exec_output（C ABI 桥，链接 tie-interp）。
 //
 // 功能：
-//   - 工具发现：PATH → D:\LLVM\bin → C:\Program Files\LLVM\bin →
-//     C:\LLVM\bin（对齐 Rust find_clang / find_llvm_ar）
+//   - 工具发现：TIE_LLVM_HOME\bin → PATH → D:\LLVM\bin → C:\Program Files\LLVM\bin →
+//     C:\LLVM\bin（对齐 Rust find_clang / find_llvm_ar；TIE_LLVM_HOME 由 Rust 侧
+//     tie 启动器对随发行版 vendored LLVM（bin\llvm\bin）设置，优先级最高）
 //   - 中间优化：opt -O{0|1|2|3} -S in.ll -o out.opt.ll
 //   - 链接可执行：clang in.opt.ll -o out.exe [--target=T] [interp.lib]
-//     （仅 need_interp 时追加 tie_interp.lib 与 Rust std 依赖系统库）
+//     （仅 need_interp 时追加 tie_interp.lib 与 Rust std 依赖系统库；
+//     若 clang 旁有 lld-link.exe 则加 -fuse-ld=lld 强制走 lld 链接，免 MSVC）
 //   - 库编译：clang -c in.opt.ll -o out.o [--target] + llvm-ar rcs out.a out.o
 // 错误契约：各函数返回退出码（0 成功），失败时 tc_err_msg 携带 stderr 文本；
 // 调用方（driver）按阶段前缀 [中间优化] / [后端] 包装。
@@ -20,6 +22,11 @@
 //
 // 调用：import 后 tc.opt(...) / tc.link_exe(...)；命名空间内互调为裸调用。
 // 命名规范：命名空间内函数不加 tc_ 前缀（统一 func 写法，Harbor M2.1.6）。
+//
+// 注意：本模块**不 import 任何库**（含 std/string.tie）——tie 编译器 import
+// 不去重，std/string.tie 已由 driver → irgen → semantic → parser → lexer →
+// lex_tokdefs 链式引入，重复 import 会让 str 命名空间函数重复定义导致编译失败；
+// 故所有字符串处理只用语言底座原语（str_len / str_char / + 拼接）。
 
 // 最近一次工具调用的错误消息（stderr 文本；成功时空串）
 var tc_err_msg: string = "";
@@ -27,11 +34,21 @@ var tc_err_msg: string = "";
 namespace tc {
 // ---------- 工具发现 ----------
 
-// 按 PATH 拆分查找可执行文件（Windows 分号分隔）；PATH 不含时走固定目录
+// 工具发现顺序：TIE_LLVM_HOME\bin → PATH 拆分目录 → 固定目录
 // （D:\LLVM\bin → C:\Program Files\LLVM\bin → C:\LLVM\bin）。找不到返回空串。
-// 实现：get_env("PATH") 取环境变量 → 按 ';' 拆分 → 逐目录查 {name}.exe；
-// 再查固定目录（file_exists）。
+// 实现：get_env("TIE_LLVM_HOME") 非空则先查 {home}\bin\{name}.exe（vendored LLVM
+// 发行目录，Rust 侧 tie 启动器设置；home 假定无空格，命令不加引号）；再按 ';' 拆分
+// PATH 逐目录查 {name}.exe；最后查固定目录（file_exists）。
 func find_tool(name: string) -> string {
+    // 1) TIE_LLVM_HOME：优先于 PATH 与固定目录
+    var home = get_env("TIE_LLVM_HOME")
+    if str_len(home) > 0 {
+        var exe_home = home + "\\bin\\" + name + ".exe"
+        if file_exists(exe_home) {
+            return exe_home
+        }
+    }
+    // 2) PATH 拆分查找
     var path_var = get_env("PATH")
     var dirs = split_env(path_var)
     var n: i64 = len(dirs)
@@ -43,7 +60,7 @@ func find_tool(name: string) -> string {
         }
         i = i + 1
     }
-    // 固定安装目录
+    // 3) 固定安装目录
     var fixed = table_new_string()
     table_push(fixed, "D:\\LLVM\\bin")
     table_push(fixed, "C:\\Program Files\\LLVM\\bin")
@@ -143,7 +160,21 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
     }
     // /STACK:16777216（16MB）：自举链编译器（tiec 编译的 driver）处理大文件
     // （编译 driver 自身）时递归/嵌套调用栈深，默认 1MB 栈会 0xC00000FD 溢出
-    var cmd = tool + " " + input_opt + " -o " + output_exe + " -Wl,/Brepro -Wl,/STACK:16777216"
+    // -fuse-ld=lld 仅对「vendored LLVM」生效：clang 必须来自 TIE_LLVM_HOME
+    // 指定的目录（发布包场景，用户无 MSVC → 用随包 lld-link）。
+    // 本机开发（clang 来自 PATH/固定目录，VS link.exe 可用）不加——lld 解析
+    // Rust staticlib（tie_interp.lib）的 CRT 符号有缺陷（printf undefined），
+    // 必须保留默认 link.exe 行为（repl 自举等依赖）。
+    var lld_flag = ""
+    var home = get_env("TIE_LLVM_HOME")
+    if str_len(home) > 0 {
+        if tool == home + "\\bin\\clang.exe" {
+            if file_exists(home + "\\bin\\lld-link.exe") {
+                lld_flag = " -fuse-ld=lld"
+            }
+        }
+    }
+    var cmd = tool + lld_flag + " " + input_opt + " -o " + output_exe + " -Wl,/Brepro -Wl,/STACK:16777216"
     if str_len(target) > 0 {
         cmd = cmd + " --target=" + target
     }

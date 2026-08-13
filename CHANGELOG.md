@@ -1,3 +1,22 @@
+## [LLVM 随包分发] vendored LLVM——发行版 zip 内置精简 LLVM 工具链，解压即用免安装 — 2026-08-13
+
+LLVM 随包分发（vendored）：发行版 zip 内置精简 LLVM 工具链，解压即用免安装，
+编译链路不再要求用户单独安装 LLVM。
+
+- **工具发现统一**：新增 `TIE_LLVM_HOME` 环境变量（`TIE_LLVM_HOME\bin` 最先探测），Rust 侧
+  tie.exe / tie-llvm 另支持同目录 `llvm\bin` 探测，随后回落到 PATH 与固定目录
+  （`D:\LLVM\bin`、`C:\Program Files\LLVM\bin`、`C:\LLVM\bin`）；
+- **`-fuse-ld=lld` 仅 vendored 场景生效**：clang 来自随包 LLVM 时链接命令加 `-fuse-ld=lld`，
+  让随包 lld-link.exe 在无 MSVC/VS 的机器上完成链接；普通开发机保持默认链接器（lld 解析 Rust
+  staticlib tie_interp.lib 存在 CRT 符号缺陷 `undefined symbol: printf`，会破坏 repl 自举）；
+- **打包增强**：`scripts/package.ps1` 新增 LLVM 精简打包（新参数 `-LlvmDir` / `-SkipLlvm`），
+  zip 内置 `bin/llvm/bin/{clang,opt,llvm-ar,lld-link}.exe`、clang 头文件（`bin/llvm/lib/clang/...`）
+  与许可文本，zip 约 113 MB、自包含；
+- **许可随包**：`third_party/llvm/LICENSE.TXT` 保存 LLVM 官方许可（Apache-2.0 with LLVM
+  Exceptions），随包分发为 `bin/llvm/LICENSE.txt`；
+- **脚本去硬编码**：`scripts/zero-rust-check.ps1` 改用 `Find-LlvmTool` 辅助函数发现 LLVM 工具
+  （TIE_LLVM_HOME → 固定目录 → PATH），不再写死 `D:\LLVM`。
+
 ## [Harbor-2026.1-preview.1] 自举 v2 T5.3 tiec 性能优化——G4 ratio 6.9 → 1.09（目标超老编译器）— 2026-08-13
 
 针对"新编译器（tie 自写 tiec）性能超过老编译器（Rust tie-llvm）"目标的热点优化，
