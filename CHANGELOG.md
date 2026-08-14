@@ -1,4 +1,17 @@
-## [修复] tiec 嵌套表 for 遍历桥选错（for row in t，t 为 table<table<i64>>） — 2026-08-14
+
+## [新增] P0 库级四件套（std/net + HTTP 服务端 + 集合 + 向量 db）—— 2026-08-15
+
+对比报告（docs/language-comparison.md）路线图 P0 全部落地，tie 实现优先：
+
+- **std/net**：TCP/UDP 网络库——Rust 底座原语（net_tcp_listen/accept/connect/send/recv、net_udp_bind/send/recv、net_close，句柄模型 i64）+ std/net.tie 封装；echo 验证（Rust + tiec 双路径）
+- **std/http_server**：HTTP/1.1 服务端框架（纯 tie，请求解析/响应构造/if 链路由，短连接）；demo 经 curl 验证（200/JSON/echo/404）
+- **std/set + std/deque**：集合补全——HashSet 语义（有序表+二分，i64/string 双 API）+ VecDeque（双端队列）
+- **ext/vecsearch**：向量检索 Flat 精确索引（L2/余弦距离 + 展平存储 add/remove/get/search top-k）+ 双路径验证
+- **std/db**：tie:data 数据载体（表 ↔ tie:data 文本序列化/解析）
+- **tieDB**：统一数据库 API（tiedb.connect/collection/insert/search/remove/size/save/load），zd 压缩持久化 roundtrip 验证；rdu/rdb 嵌入式纯标量子集
+- **tie:zd 角色**：	ype tie<zd> + xxx.zd.tie 文件名声明（压缩的 tie:data），角色识别三处同步（prep/tiec/crates），二进制预判在文本读前短接
+- **tie:zd 序列化格式**（2026-08-15 批次）：MessagePack 思路 + Protobuf 参考，纯 tie 实现（varint/fixint/定宽/字符串/表/map/record 字段编码），40/40 断言；str_from_code 原语（码点→字符）
+- **配套编译器修复**：tiec struct import 展开（find_struct_node 扫 g_extra_tops）、void main 内 return（ret i32 0）、import 读取失败崩溃、map 段错误（字面量当普通表生成 + 循环内 alloca 未提升）、嵌套表 for 遍历桥选择## [修复] tiec 嵌套表 for 遍历桥选错（for row in t，t 为 table<table<i64>>） — 2026-08-14
 
 tie 自写编译器 compiler/（tiec）在 `for row in t`（t 为二维表 desugar 出的
 嵌套表 `table<table<i64>>`）时生成错误桥 `tie_table_at_i64`，返回 i64 存入

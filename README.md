@@ -82,9 +82,10 @@ type tie<logic>     # 逻辑代码（默认角色，可省略）
 type tie<port>      # 端口/对外接口文件
 type tie<db>        # 数据库文件
 type tie<ir>        # IR 文件（直接生成 LLVM IR .ll）
+type tie<zd>        # 压缩数据文件（tie:data 二进制变体，主要用文件名 xxx.zd.tie 声明）
 ```
 
-- **子类型**：`script` / `data` / `ui` / `class` / `logic` / `port` / `db` / `ir`；
+- **子类型**：`script` / `data` / `ui` / `class` / `logic` / `port` / `db` / `ir` / `zd`；
   `type` 角色本身由**裸 `type tie`**（无尖括号）表达，`type tie<type>` 是格式错误；
 - **默认角色**：无声明时默认 `logic`（可执行文件，需 `func main()`）；
 - **文件名约定**：`xxx.<角色>.tie`（如 `app.script.tie`、`schema.db.tie`）可作为默认角色
@@ -243,7 +244,8 @@ tie/
 │                     - 数据结构/算法：sort（排序数组/二分）、collection（最小堆/栈/KMP）、crypto（crc32/fnv1a 校验）、optsearch（排序/背包/N 皇后等）、graph（图算法）、linalg（矩阵）、exmath（高级数学：霍夫曼/素数/快速幂）、math（基础数学）、radix（进制转换）
 │                     - IO/系统：fs（文件系统，Rust std::fs 风格完整 API：read_to_string/write/append/exists/size/is_file/is_dir/remove_file/create_dir_all/read_dir/rename/write_lines 等，**UTF-8 路径安全**——中文路径原生支持）、path（路径：basename/dirname/ext/stem，extern 桥）、args（命令行参数）、http（HTTP GET + URL 编码）、random（随机）、bytes（字节表）、time（计时）、process（进程）、intern（字符串池）、version（版本比较）、format（格式化）、csv、assert（断言）
 │                     典型调用：assert.assert / str.split / format.sprintf / csv.csv_write / exmath.huffman_encode / radix.to_str / fs.read_lines / json.parse / utf.byte_len / coll.heap_push
-├── ext/              扩展库（Extension，tie 语言自写，随发行版内置，依赖 std 与语言底座：log 控制台信息库——i18n 消息系统，M4 增强带参消息/级别体系/stderr 通道/批量登记/多级回退；2026-08-12 新增 test 测试框架（断言收集+统计）、bench 基准计时、tui 终端装饰（进度条/文本框，无 ANSI——语言无 \xHH 转义限制）、config 配置解析（KV/INI）、pretty 文本表格；另有 cache/compress/ml/registry/codec（brotli/jpeg/lz4/zstd））
+│                     2026-08-15 P0 补全：net（TCP/UDP 网络库：listen/accept/connect/send/recv、udp_bind/send/recv、close）、http_server（HTTP/1.1 服务端框架：请求解析/响应构造/if 链路由）、set（HashSet 语义：有序表+二分，i64/string 双 API）、deque（VecDeque 双端队列）、db（tie:data 数据载体：表 ↔ tie:data 文本）
+├── ext/              扩展库（Extension，tie 语言自写，随发行版内置，依赖 std 与语言底座：log 控制台信息库——i18n 消息系统，M4 增强带参消息/级别体系/stderr 通道/批量登记/多级回退；2026-08-12 新增 test 测试框架（断言收集+统计）、bench 基准计时、tui 终端装饰（进度条/文本框，无 ANSI——语言无 \xHH 转义限制）、config 配置解析（KV/INI）、pretty 文本表格；另有 cache/compress/ml/registry/codec（brotli/jpeg/lz4/zstd）；2026-08-15 新增 vecsearch（向量检索：Flat 精确索引——L2/余弦距离 + 展平存储 add/remove/get/search top-k））
 ├── rdu/              嵌入式基础层（Rudimentary，tie 语言自写，随发行版内置，独立于 std/ext 的第三层——专为嵌入式 MCU/裸机 freestanding 定制：无栈纪律即零原语调用/零动态内存/零数组（禁止一切数组与表功能：动态表、定长表、字面量表、下标读写、table_* 原语）/无递归/无全局可变状态/零运行时依赖，只用 i64/f64/bool 标量，不依赖 std/ext、不 import 任何东西，编译出的 .a 可被裸机直接链接）：
 │                     - bits（位操作：set/clear/toggle/test/rol/ror/bswap16/bswap32/bswap64/popcount/clz/ctz）
 │                     - math（基础数学纯标量：abs/abs_f/max_i/min_i/max_f/min_f/clamp/clamp_i/is_odd/is_even/avg_f/sign_i/deg_to_rad/rad_to_deg/gcd/lcm/pow_i）
@@ -252,6 +254,8 @@ tie/
 │                     - fixed（Q16.16 定点数：fixed_mul/fixed_div/fixed_floor/fixed_frac）
 │                     - rnd（确定性伪随机：xorshift64，调用方持状态）
 │                     典型调用：rdu_crc.crc32_init() / rdu_bits.popcount() / rdu_fixed.fixed_mul() / rdu_rnd.xorshift64()
+│                     - rdb（嵌入式 db 子集，2026-08-15：纯标量查询条件——cond_eq/cond_range/cond_gt/cond_lt/cmp_i64，tieDB API 的嵌入式孪生子集）
+├── tieDB/            tieDB 统一数据库 API（tie 语言自写，2026-08-15）：tiedb.connect/collection/insert/search/remove/size/save/load（本地向量集合 + zd 压缩持久化；ext/vecsearch Flat 索引；规划见 docs/plans/tiedb.md）；persist/zd.tie（tie:zd 序列化：MessagePack 思路 + Protobuf 参考，纯 tie 实现——varint/fixint/定宽/字符串/表/map/record 字段编码 + save/load）
 ├── pkg/              包管理器（tie 语言自写，M6 E1/E2 + E3/E4）：main.tie CLI 入口
 │                     （init/add/remove/install/update/build/run/publish/search/info/help
 │                     子命令分派）+ manifest.tie（tie.pkg 清单解析）+ deps.tie（path/git/
