@@ -54,8 +54,8 @@ namespace db {
         return out + "]"
     }
 
-    // 解析数字表文本（"var name = [1, 2.5, 3]"）→ table<f64>。
-    // 简单实现：定位 '[' 与 ']'，按 ',' 切分，逐项 parse_float；失败项跳过。
+    // 解析数字表文本（形如 var name = [1, 2.5, 3]）→ table<f64>。
+    // 简单实现：定位方括号，按逗号切分，逐项 parse_float；失败项跳过。
     pub func parse_data_f64(text: string) -> table<f64> {
         var out: table<f64> = table_new_f64()
         var lb = str.find(text, "[")
