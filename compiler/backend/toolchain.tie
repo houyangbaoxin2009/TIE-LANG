@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // toolchain.tie：自举 T3.1 —— 工具链驱动模块（命名空间 tc）
 // ============================================================
 // 对齐 Rust crates/tie-llvm/src/backend.rs：调用 LLVM 工具链

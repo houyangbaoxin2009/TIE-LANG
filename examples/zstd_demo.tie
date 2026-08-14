@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // zstd_demo.tie：D7d Zstd 简化实现（LZ77 + 规范霍夫曼熵编码）roundtrip 演示。
 // 运行：cargo run -p tie -- examples/zstd_demo.tie
 

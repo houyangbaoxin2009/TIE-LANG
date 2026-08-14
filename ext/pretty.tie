@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // pretty.tie：扩展库——文本表格输出（命名空间 pretty）。
 //
 // 数据形状：行 = 预拼接的文本行（table<string>，每元素一行的单元格

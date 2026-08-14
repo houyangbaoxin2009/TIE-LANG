@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // path.tie：标准库——路径处理（命名空间 path），基于底座原语 path_join/cwd
 // 与 T0.7 extern fn 声明的 C ABI 桥（tie_path_basename 等，符号在 tie-interp
 // 静态库中，clang 链接自动解析）。

@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // version.tie：标准库——semver 版本解析/比较/区间匹配（命名空间 version）
 // 内容：版本号 "x.y.z" 的解析、比较、约束匹配（M6 包管理器依赖解析的底座）。
 // 全部基于基础原语（len/str_char/to_string/parse_int/字符串拼接/循环/分支），

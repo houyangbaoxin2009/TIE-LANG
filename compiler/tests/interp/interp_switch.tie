@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // 自举 v2 T4.4：interp 行为测试 tie 化——switch 模式匹配。
 // 移植自 crates/tie-interp/src/lib.rs tests：eval_switch_模式匹配。

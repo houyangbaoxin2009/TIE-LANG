@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // 正则表达式原语端到端验证（P1）：编译路径 + 解释路径双验证
 // 用法：tie regex_demo.tie（编译运行）；tie-interp.exe regex_demo.tie（解释运行）
 

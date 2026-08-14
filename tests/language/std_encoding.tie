@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // enc（std/encoding.tie）编码转换标准库验收：
 // - base64：encode 三档填充 / decode 往返 / 严格填充与非法输入拒绝；

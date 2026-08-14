@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // format_demo.tie：格式化标准库演示——导入 format 库，验证全部函数输出
 // 运行：format_demo.exe → 打印各格式化结果，并用断言核对期望值
 // M2.1 起 std 库使用命名空间形式：format.format_int / assert.assert 等。

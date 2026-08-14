@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // lib_colors.tie：演示库——颜色常量与命名空间函数
 namespace colors {
     // 取 24 位 RGB 值（0xRRGGBB）

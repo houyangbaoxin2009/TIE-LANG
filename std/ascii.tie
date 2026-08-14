@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // ascii.tie：标准库——ASCII 字符分类与转换（命名空间 ascii），全部按码点 i64 输入。
 // 与 utf 的分工：utf 面向完整 Unicode 码点（含非 ASCII），ascii 只认 0..127 ASCII 范围
 // （分类函数对 ASCII 范围外的码点一律返回 false / 原样返回）。码点即字符的 UTF-32 值，

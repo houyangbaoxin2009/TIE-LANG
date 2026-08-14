@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // compiler/interp/env.tie 验收（T4.2 第二部分）：Value 语义表/键值表 + 限制清单。
 import "../../compiler/interp/env.tie"

@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // compiler/frontend/semantic_test.tie —— 自举 v2 T2.6 完整语义分析器验收程序
 // ============================================================
 // 作用：

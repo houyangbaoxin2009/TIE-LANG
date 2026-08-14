@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // compiler/interp 验收（自举 v2 T4.1）：eval/eval_call 核心场景输出与
 // Rust 解释器（crates/tie-interp）行为逐字一致。

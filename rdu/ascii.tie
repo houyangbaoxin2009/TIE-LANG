@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // ascii.tie：嵌入式基础层（rdu）——ASCII 字符分类与转换模块（命名空间 rdu_ascii）
 // 层级定位：rdu = Reusable Device Utils，嵌入式基础层——面向裸机/无操作系统的
 // 底层场景提供纯计算工具，编译出的 .a 零运行时依赖（freestanding 可直接链接）。

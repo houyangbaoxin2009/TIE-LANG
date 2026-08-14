@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 
 // 赋值语句验证：var 可重赋值，const 不可
 func main() {

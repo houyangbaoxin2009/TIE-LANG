@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // csv_demo.tie：CSV 标准库演示——str.split（string.tie）+ csv.csv_read / csv.csv_cells（csv.tie）
 // 自动生成临时 CSV 文件（file_write），读取后用 csv.csv_cells 切分单元格并断言核对。
 // 注意：csv.tie 内部已展开 string.tie，本文件不要再重复导入 string.tie

@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // ext/tui.tie + ext/config.tie + ext/pretty.tie 验收：
 // - tui：hline/line/title/progress/box/pad/pad_center/indent（无 ANSI 颜色，

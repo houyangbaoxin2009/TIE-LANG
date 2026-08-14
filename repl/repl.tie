@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // tie 语言自写的 REPL 外壳（自举）：
 // - 与编译路径（tie-llvm）共享前端，经 clang 链接 tie-interp 静态库（C ABI 桥）；

@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // T0.4 验收：顶层表全局变量（global table）——table<i64> 动态表，main 入口运行时创建。
 //

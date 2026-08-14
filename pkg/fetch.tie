@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // fetch.tie —— 包源拉取模块（Harbor M6 包管理器 E3/E4）
 //
 // 职责：识别并拉取 **git 源** 与 **registry（HTTP 注册表）源**：

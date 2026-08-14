@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // compiler/frontend/semantic.tie —— 自举 v2 T2.6：完整语义分析器（主入口）
 // ============================================================
 // 里程碑：自举 v2 计划 T2.6（.omo/plans/self-hosting-v2.md）。由 T1.3 原型
@@ -93,6 +93,48 @@ func imported_has(p: string) -> bool {
     return false
 }
 
+// 剥离文件类型声明行（`type tie` / `type tie<X>`）：头部区 = 最前连续行
+// （允许空行），声明行空行占位（行号不变）；其余行原样。
+// 与 Rust 链清理脚本 prep/clean.tie 同规则——被导入文件（std/库等）现在带
+// 类型声明头部（新文件类型声明体系），import 展开须先剥离再解析。
+func strip_type_decl(src: string) -> string {
+    var rows = str.split(src, "\n")
+    var n: i64 = len(rows)
+    var out = table_new_string()
+    var in_header = true
+    var i: i64 = 0
+    while i < n {
+        var ln = rows[i]
+        if in_header {
+            var t = str.trim(ln)
+            if str_len(t) == 0 {
+                // 头部区空行：保留（占位，行号不变）
+                table_push(out, ln)
+            } else if sstate.has_prefix_str(t, "type tie") {
+                var rest = str.trim(str.slice(t, 8, str_len(t)))
+                // 合法声明：`type tie` 或 `type tie<X>`（无尾随内容）→ 空行占位
+                if str_len(rest) == 0 {
+                    table_push(out, "")
+                } else if str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">" {
+                    table_push(out, "")
+                } else {
+                    // 非法形态（如 `type tie<data> extra`）：非声明，头部区结束
+                    in_header = false
+                    table_push(out, ln)
+                }
+            } else {
+                // 第一个非声明内容行：头部区结束，原样保留
+                in_header = false
+                table_push(out, ln)
+            }
+        } else {
+            table_push(out, ln)
+        }
+        i = i + 1
+    }
+    return str.join(out, "\n")
+}
+
 // 递归展开单个 import 节点：读文件 → parse → append_ast 合并，
 // 其顶层语句（非 import）进 g_extra_tops，其 import 递归展开。
 func expand_one_import(imp_node: i64) -> i64 {
@@ -109,10 +151,13 @@ func expand_one_import(imp_node: i64) -> i64 {
         sm_err_msg = "无法读取导入文件 '" + full + "'"
         return -1
     }
+    // 剥离文件类型声明行（新体系：被导入文件头部带 `type tie<X>` 声明，
+    // 须先清理再解析——与 Rust 链清理脚本 prep/clean.tie 同规则）
+    var src2 = strip_type_decl(src)
     // T5.3 内存版：parse_ast 直接把库文件 AST 留在内存（不产协议文本），
     // append_ast_mem 再从 ast 表直拷到 sstate——与原「parse_src → 文本 →
     // append_ast」语义等价但省去协议往返的字符串开销
-    var prc = parser.parse_ast(src)
+    var prc = parser.parse_ast(src2)
     if prc < 0 {
         sm_err_line = s_lines[imp_node]
         sm_err_col = s_cols[imp_node]

@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // lib_math.tie：P6 import 验证用的库文件（被主文件导入）；角色 library → 可独立编译为静态库
 // 只定义函数，不定义 main。M2.1 起示例库使用命名空间形式：mathlib.add / mathlib.mul 等。
 

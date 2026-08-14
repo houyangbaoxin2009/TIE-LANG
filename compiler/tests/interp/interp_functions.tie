@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // 自举 v2 T4.4：interp 行为测试 tie 化——函数/递归/命名空间/默认参数/table 形参。
 // 移植自 crates/tie-interp/src/lib.rs tests：eval_functions / eval_recursion /

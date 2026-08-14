@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // T4.5 验收：tie 运行时静态库（std/runtime.a）替代 Rust tie-interp 链接。
 //
 // 本程序调用三个语言内置 exec_code / time_now / get_env——IR 层生成对

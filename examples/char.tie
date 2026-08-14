@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 
 // 字符字面量验证：单引号、转义、char 变量、拼接赋值
 func main() {

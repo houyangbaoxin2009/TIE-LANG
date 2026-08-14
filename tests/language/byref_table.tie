@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // T0.3 验收：ref 表参数按引用传递（by_ref）——内容修改与重绑定都写回调用方。
 //

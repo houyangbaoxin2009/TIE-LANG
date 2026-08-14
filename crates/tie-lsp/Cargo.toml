@@ -15,6 +15,7 @@ description = "tie 语言服务器（LSP）：基于 JSON-RPC 2.0 over stdio，�
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tie-frontend = { path = "../tie-frontend" }
+tie-prep = { path = "../tie-prep" }
 
 [lints]
 workspace = true

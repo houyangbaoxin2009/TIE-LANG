@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // 自举 v2 T4.4：interp 行为测试 tie 化——标签 break/continue（E5）。
 // 移植自 crates/tie-interp/src/lib.rs tests：eval_break_continue_label。

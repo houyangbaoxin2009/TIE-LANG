@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // compiler/interp/session.tie —— 自举 v2 T4.1：Session（globals + funcs 注册表
 // + AST 归档池 + 求值环境作用域栈）
 // ============================================================

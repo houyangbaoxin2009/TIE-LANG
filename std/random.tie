@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // random.tie：标准库——伪随机工具（命名空间 rnd），基于底座原语 rand_range。
 // rand_range(min, max) 返回 [min, max) 半开区间随机整数，种子由语言底座内部管理
 // （非加密安全，勿用于密码学/安全令牌场景）。

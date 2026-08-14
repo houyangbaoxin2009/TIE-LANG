@@ -6075,7 +6075,10 @@ mod tests {
         }
         let tokens = tokenize(main).expect("词法分析失败");
         let program = parse_program(&tokens).expect("语法分析失败");
-        let expanded = crate::imports::expand_imports(program, &dir).map_err(|e| e.message)?;
+        // 测试辅助：临时文件内容由测试构造（无文件类型声明行），注入恒等清理
+        let expanded =
+            crate::imports::expand_imports(program, &dir, &|s| s.to_string())
+                .map_err(|e| e.message)?;
         let result = analyze(&expanded).map_err(|e| e.message)?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(result)

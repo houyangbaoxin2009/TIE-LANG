@@ -1,3 +1,4 @@
+type tie<script>
 // prep/core.tie：Harbor M3 预处理器核心模块（tie 语言自写，自举阶段一）
 //
 // 本模块完全用 tie 语言实现预处理逻辑：文件类型声明（type tie / type tie<X>）

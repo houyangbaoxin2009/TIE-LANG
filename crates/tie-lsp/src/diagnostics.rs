@@ -30,6 +30,14 @@ const SEVERITY_ERROR: u32 = 1;
 /// 诊断来源：`tie`。
 const SOURCE_NAME: &str = "tie";
 
+/// 源码行级清理：剥离头部区文件类型声明行（`type tie` / `type tie<X>`，
+/// 空行占位保持行号）。委托 tie 语言自写的预处理脚本 prep/clean.tie
+/// （tie_prep::clean_source）——LSP 不做 Rust 实现，未来 LSP 整体 tie 化时
+/// 本调用点由脚本直连替代。
+fn clean_source(source: &str) -> String {
+    tie_prep::clean_source(source)
+}
+
 /// 对源码执行三阶段分析（fail-fast），生成 LSP 诊断列表。
 ///
 /// 流程（任一阶段失败即停止收集）：
@@ -46,7 +54,7 @@ const SOURCE_NAME: &str = "tie";
 /// 否则会误报「未声明变量 'str'」。
 pub fn diagnostics_for_source(source: &str, base_dir: Option<&Path>) -> Vec<Diagnostic> {
     // 阶段一：词法分析
-    let tokens = match tokenize(source) {
+    let tokens = match tokenize(&clean_source(source)) {
         Ok(tokens) => tokens,
         Err(err) => return vec![one_diagnostic(err.span, err.message)],
     };
@@ -74,7 +82,7 @@ fn expand_with_base(
     base_dir: Option<&Path>,
 ) -> Result<Program, tie_frontend::imports::ImportError> {
     match base_dir {
-        Some(dir) => expand_imports(program, dir),
+        Some(dir) => expand_imports(program, dir, &clean_source),
         None => Ok(program),
     }
 }
@@ -214,7 +222,7 @@ pub fn hover_markdown(
     base_dir: Option<&Path>,
 ) -> Option<String> {
     // 命中标识符：0-based 位置还原为 1-based 再与 token.span 比较
-    let tokens = tokenize(source).ok()?;
+    let tokens = tokenize(&clean_source(source)).ok()?;
     let target_line = line.saturating_add(1);
     let target_col = character.saturating_add(1);
     let (idx, ident) = tokens.iter().enumerate().find(|(_, t)| {
@@ -311,7 +319,7 @@ pub fn definition(
     base_dir: Option<&Path>,
 ) -> Option<Range> {
     // 词法定位：命中光标处的 Ident token（并保留其在 token 流中的下标做场景判断）
-    let tokens = tokenize(source).ok()?;
+    let tokens = tokenize(&clean_source(source)).ok()?;
     let (ident, idx) = ident_token_at(&tokens, line, character)?;
     let TokenKind::Ident(word) = &ident.kind else { unreachable!() };
     let word = word.clone();
@@ -563,7 +571,7 @@ pub fn completion(
 ) -> Vec<CompletionItem> {
     // 点场景：`类名.` / `命名空间名.` → 只补对应成员；receiver 非类/命名空间时回退全集
     if let Some(receiver) = member_receiver(source, line, character) {
-        let tokens = tokenize(source).ok();
+        let tokens = tokenize(&clean_source(source)).ok();
         let program = tokens.as_deref().and_then(|t| parse_program(t).ok());
         let program = program.and_then(|p| expand_with_base(p, base_dir).ok());
         let sem = program.as_ref().and_then(|p| analyze(p).ok());
@@ -712,7 +720,7 @@ fn all_completions(source: &str, base_dir: Option<&Path>) -> Vec<CompletionItem>
         });
     }
     // 顶层函数与类名：需要语义结果（含 import 展开）
-    let tokens = tokenize(source).ok();
+    let tokens = tokenize(&clean_source(source)).ok();
     let program = tokens.as_deref().and_then(|t| parse_program(t).ok());
     let program = program.and_then(|p| expand_with_base(p, base_dir).ok());
     let sem = program.as_ref().and_then(|p| analyze(p).ok());
@@ -810,7 +818,7 @@ pub fn semantic_token_types() -> Vec<String> {
 /// （`tcmsg::error::no_file`）参与链段识别。
 pub fn semantic_tokens(source: &str, base_dir: Option<&Path>) -> Vec<u32> {
     // 词法失败（编辑中途）→ 空结果（客户端保留上一帧）
-    let Ok(tokens) = tokenize(source) else { return Vec::new() };
+    let Ok(tokens) = tokenize(&clean_source(source)) else { return Vec::new() };
 
     // 语义结果（尽力而为：语法/语义失败也能用词法规则分类）
     let program = parse_program(&tokens).ok();

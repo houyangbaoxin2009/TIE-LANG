@@ -41,6 +41,26 @@ const PREP_MODULE: &str = include_str!("../../../prep/core.tie");
 /// 模块入口函数全名（命名空间 prep 下的 process）。
 const PREP_ENTRY: &str = "prep::process";
 
+/// prep/clean.tie 清理脚本源码（编译期内嵌，发布无需额外文件）。
+const CLEAN_MODULE: &str = include_str!("../../../prep/clean.tie");
+
+/// 清理脚本入口函数全名（命名空间 prep_clean 下的 process）。
+const CLEAN_ENTRY: &str = "prep_clean::process";
+
+/// 行级源码清理：去 BOM、CRLF 归一（壳层职责——tie 字符串字面量无法表达
+/// BOM 字符），再解释执行 tie 语言自写的清理脚本 prep/clean.tie 剥离头部区
+/// 文件类型声明行（`type tie` / `type tie<X>`，声明行空行占位，行号不变）。
+///
+/// 供 import 展开 / 解释器 / LSP 等需要**行号对齐**的路径复用（编译路径的
+/// 正文重建走 [preprocess]）。脚本剥离失败 → panic 并给出可读信息
+/// （脚本内嵌于二进制，失败属于自举链破损，应尽早暴露）。
+pub fn clean_source(source: &str) -> String {
+    let source = source.trim_start_matches('\u{FEFF}');
+    let source = source.replace("\r\n", "\n");
+    run_module(CLEAN_MODULE, CLEAN_ENTRY, &source)
+        .unwrap_or_else(|e| panic!("清理脚本执行失败: {e}"))
+}
+
 /// 文件角色：由 `type tie` / `type tie<X>` 声明（或文件名 `<名>.<角色>.tie`）
 /// 决定，表示文件在四段式工具链中的类型，决定转交哪个工具链。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

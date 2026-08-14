@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // math_demo.tie：数学标准库演示——导入 assert / math / string 库，
 // 验证 math.tie 全部函数，并直接调用 Rust 层数学原语演示完整数学栈
 // M2.1 起 std 库使用命名空间形式：math.abs / assert.assert_eq 等。

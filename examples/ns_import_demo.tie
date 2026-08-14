@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // ns_import_demo.tie——M2.1.7 单文件命名空间演示
 // - import as 别名（f2）：原前缀 fmt 被屏蔽（唯一入口），必须用别名访问

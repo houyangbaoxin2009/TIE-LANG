@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // compiler/interp/value.tie —— 自举 v2 T4.1：解释器 Value 编码（节点 id + 平行表）与字符串化
 // ============================================================
 // 里程碑：自举 v2 计划 T4.1（.omo/plans/self-hosting-v2.md）——把 Rust 解释器

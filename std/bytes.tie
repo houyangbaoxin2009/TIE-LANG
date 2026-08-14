@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // bytes.tie：标准库——字节表（动态 i64 表，元素 0..255）工具（命名空间 bytes），
 // 基于底座原语 byte_read / byte_write / byte_concat / bit_read / bit_write。
 // 调用：import 后 bytes.read(path) / bytes.to_ascii(t)；命名空间内互调为裸调用。

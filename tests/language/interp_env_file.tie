@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // compiler/interp/env.tie 验收（T4.2 第一部分）：文件/字符串/数学/环境/时间桥。
 import "../../compiler/interp/env.tie"

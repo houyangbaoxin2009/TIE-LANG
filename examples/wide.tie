@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // 宽类型（num/text/misc 类别框）与表字面量语法验证
 // M2 表运行时支持单行纯位置表（数字 id），字符串 id 表、二维表留待 M3

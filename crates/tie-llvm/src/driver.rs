@@ -194,7 +194,9 @@ fn compile_program(
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    let program = imports::expand_imports(program, &base_dir).map_err(CompileError::Import)?;
+    let program =
+        imports::expand_imports(program, &base_dir, &tie_prep::clean_source)
+            .map_err(CompileError::Import)?;
     // 语义分析（符号表 + 类型检查）
     let sem = analyze(&program).map_err(CompileError::Semantic)?;
 

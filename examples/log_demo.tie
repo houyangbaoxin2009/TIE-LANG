@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // log_new_demo.tie：新版 std/log.tie（命名空间 + 默认值参数综合方案）验证
 // 双路径：tie-llvm 编译运行 / tie-interp 解释，输出与断言应一致。
 

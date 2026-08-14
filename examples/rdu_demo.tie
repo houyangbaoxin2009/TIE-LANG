@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // rdu_demo.tie：嵌入式基础层（rdu）演示——导入全部 6 个无栈模块并逐项核对输出
 // rdu = Reusable Device Utils（嵌入式基础层）：bits/math/ascii/crc/fixed/rnd 六个
 // 模块全部满足无栈纪律（零原语调用、零动态内存、无递归、无全局变量、.a 零运行时依赖）。

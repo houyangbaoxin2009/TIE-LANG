@@ -195,8 +195,12 @@ impl<'a> Pipeline<'a> {
                 .parent()
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| PathBuf::from("."));
-            let program = tie_frontend::imports::expand_imports(program, &base_dir)
-                .map_err(|e| format!("{}: {e}", slice.input.display()))?;
+            let program = tie_frontend::imports::expand_imports(
+                program,
+                &base_dir,
+                &tie_prep::clean_source,
+            )
+            .map_err(|e| format!("{}: {e}", slice.input.display()))?;
             // 语义分析
             let sem = tie_frontend::semantic::analyze(&program)
                 .map_err(|e| format!("{}: {e}", slice.input.display()))?;

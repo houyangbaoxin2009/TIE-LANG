@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // utf.tie：标准库——UTF-8/Unicode 码点工具（命名空间 utf），全部纯函数，
 // 只依赖底座原语（char_code / str_char / str_len）+ 位运算 + 字符串拼接 + 循环/分支。
 // 码点级 vs 字节级：tie 字符串内部是 UTF-8 编码，中文一个汉字 3 字节。str_len / str_char

@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // assert.tie：标准库——基础断言函数（命名空间 assert），失败时打印错误信息并退出进程
 // 调用：import 后 assert.assert(...) / assert.assert_eq(...) / assert.assert_neq(...)
 

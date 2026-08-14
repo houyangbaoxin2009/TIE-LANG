@@ -252,6 +252,22 @@ impl<'p> IrGenerator<'p> {
         if self.used_externs.iter().any(|s| s == "tie_file_read") {
             self.out.push_str("declare ptr @tie_file_read(ptr)\n");
         }
+        // 文件系统 UTF-8 安全桥（a33bf90 迁移 std/fs 后补齐；返回 i8 = 0/1）：
+        // tie_file_write / tie_file_append（bool 成功）、tie_file_exists（bool 可读）、
+        // tie_file_delete（bool 删除成功）、tie_file_size（i64 字节，失败 -1）。
+        if self.used_externs.iter().any(|s| s == "tie_file_write" || s == "tie_file_append") {
+            self.out.push_str("declare i8 @tie_file_write(ptr, ptr)\n");
+            self.out.push_str("declare i8 @tie_file_append(ptr, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_file_exists") {
+            self.out.push_str("declare i8 @tie_file_exists(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_file_delete") {
+            self.out.push_str("declare i8 @tie_file_delete(ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_file_size") {
+            self.out.push_str("declare i64 @tie_file_size(ptr)\n");
+        }
         if self.used_externs.iter().any(|s| s == "tie_str_char") {
             self.out.push_str("declare ptr @tie_str_char(ptr, i64)\n");
         }

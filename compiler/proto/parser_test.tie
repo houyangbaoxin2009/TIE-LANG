@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // compiler/proto/parser_test.tie —— 自举 v2 T1.2 验收程序
 // ============================================================
 // 用法：编译运行（tie-llvm 编译 + 直接运行），或 cargo run -p tie -- parser_test.tie

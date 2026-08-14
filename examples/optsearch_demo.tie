@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // optsearch_demo.tie：std/optsearch 搜索与规划算法演示（D4）
 // 编译运行：cargo run -p tie -- examples/optsearch_demo.tie
 // 注：tie 编译期对超长表达式链（如 10 段 to_string 拼接）有栈深度限制，

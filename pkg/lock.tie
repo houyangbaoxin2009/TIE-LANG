@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // lock.tie —— tie.lock 锁文件模块（Harbor M6 包管理器 E3）
 //
 // 职责：生成/解析/校验 tie.lock 锁文件。锁文件用 tie:data 文本记录**解析后的**

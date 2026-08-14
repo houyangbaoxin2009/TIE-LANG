@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // compiler/proto/parser.tie —— 自举 v2 T1.2：用 tie 语言重写的语法分析原型
 // ============================================================
 // 里程碑：自举 v2 计划 T1.2（见 .omo/plans/self-hosting-v2.md），消费 T1.1

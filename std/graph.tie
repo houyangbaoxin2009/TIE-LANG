@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // graph.tie：标准库——图算法（命名空间 graph，D3）
 // 内容：Dijkstra（单源最短路）、Floyd（全源最短路）、Prim（最小生成树）、
 // Bellman-Ford（负权最短路 + 负环检测）、最大流（Ford-Fulkerson）、二分匹配（匈牙利）。

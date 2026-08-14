@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // T0.7 验收：extern 函数声明（链接 libc）+ std/process 进程原语。
 //

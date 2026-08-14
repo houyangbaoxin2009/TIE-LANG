@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // time.tie：标准库——时间/计时工具（命名空间 time），全部基于底座原语
 // time_now 实现，不依赖其他 std 模块。
 //

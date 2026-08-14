@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // test.tie：扩展库——测试框架（收集式断言，namespace test）
 //
 // 定位：tests/language 批跑与自举验收用——调用方直接用 expect 系列断言收集

@@ -646,6 +646,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tie-frontend",
+ "tie-prep",
 ]
 
 [[package]]

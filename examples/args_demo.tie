@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // args_demo.tie：命令行参数演示——arg_count / arg_string 原语
 // 运行：args_demo.exe a b c → 输出 3 与每个参数；无参数运行 → 0
 

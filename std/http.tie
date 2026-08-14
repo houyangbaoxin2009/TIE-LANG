@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // http.tie：标准库——HTTP 客户端与 URL 编码工具（命名空间 http），纯函数 + 底座
 // 原语 http_get / http_get_file 的直接包装，不引入任何网络依赖。
 // 调用：import 后 http.get(url) / http.url_encode(s)；命名空间内互调为裸调用。

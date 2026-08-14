@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // exmath_demo.tie：std/exmath 高级数学算法库演示（霍夫曼编码/解码 + 数论/组合）
 // 编译运行：cargo run -p tie -- examples/exmath_demo.tie
 

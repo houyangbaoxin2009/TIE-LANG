@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // args.tie：标准库——命令行参数工具（命名空间 args），全部基于底座原语
 // arg_count / arg_string 实现，不依赖其他 std 模块。
 //

@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // 动态表（table_new_*/table_push/table_at）示例：
 // 运行时可增长的表，支持 push、下标读取、len、for 遍历。
 // 编译路径（tie-llvm）与解释路径（tie-interp）行为逐字节一致。

@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // compiler/frontend/putil.tie —— T2.5 parser 工具层（模块拆分）
 // ============================================================
 // 里程碑：自举 v2 计划 T2.5（.omo/plans/self-hosting-v2.md）完整 parser

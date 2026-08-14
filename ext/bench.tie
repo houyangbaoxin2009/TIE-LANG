@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // bench.tie：扩展库——基准计时（namespace bench）
 //
 // 基于语言底座原语 time_now()：返回 Unix 纪元**秒**数（i64，见 crates/

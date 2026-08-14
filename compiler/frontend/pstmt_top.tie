@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // compiler/frontend/pstmt_top.tie — T2.5 parser 顶层声明（再拆分）
 // ============================================================
 // 里程碑：自举 v2 计划 T2.5 完整 parser 再拆分（2026-08-11）：
@@ -158,7 +158,11 @@ func parse_using() -> i64 {
     return n
 }
 
-// 命名空间声明：`namespace tcmsg { ... }` / `namespace tcmsg.error { ... }`
+// 命名空间声明：
+//   `namespace tcmsg { ... }` / `namespace tcmsg.error { ... }`（块式）
+//   `namespace tcmsg` / `namespace tcmsg;`（单文件模式，2026-08-14）：无 '{'，
+//     文件其余全部顶层语句（直到 EOF）归入该命名空间；其中再遇 namespace
+//     声明（块式或单文件式）递归嵌套。
 func parse_namespace() -> i64 {
     var line = putil.peek_line()
     var col = putil.peek_col()
@@ -176,48 +180,110 @@ func parse_namespace() -> i64 {
         }
         table_push(segs, s)
     }
-    if !putil.expect(lex_lbrace, "命名空间声明必须跟 '{'") {
-        return -1
-    }
     var body_stmts: table<i64> = table_new_i64()
     var done = false
-    while !done {
-        var tag = putil.peek_tag()
-        if tag == lex_rbrace {
-            putil.advance()
-            done = true
-        } else if tag == lex_eof {
-            if !putil.expect(lex_rbrace, "命名空间声明必须跟 '}'") {
+    if putil.peek_tag() == lex_lbrace {
+        // ---- 块式：{ ... } ----
+        putil.advance()
+        while !done {
+            var tag = putil.peek_tag()
+            if tag == lex_rbrace {
+                putil.advance()
+                done = true
+            } else if tag == lex_eof {
+                if !putil.expect(lex_rbrace, "命名空间声明必须跟 '}'") {
+                    return -1
+                }
+                done = true
+            } else if tag == lex_func {
+                var st = parse_fn_def()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_pub {
+                var st = parse_fn_def()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_struct {
+                var st = parse_struct()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_namespace {
+                var st = parse_namespace()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "命名空间体内只允许函数定义、类定义或嵌套命名空间，实际是 " + putil.describe(tag))
                 return -1
             }
-            done = true
-        } else if tag == lex_func {
-            var st = parse_fn_def()
-            if st < 0 {
+        }
+    } else {
+        // ---- 单文件模式：无 '{'，剩余全部顶层语句归入（直到 EOF） ----
+        // 行尾分号（ASI 补全或显式 `namespace foo;`）与本模式等价，直接吞掉
+        putil.eat(lex_semi)
+        while !done {
+            var tag = putil.peek_tag()
+            if tag == lex_eof {
+                done = true
+            } else if tag == lex_func || tag == lex_pub {
+                var st = parse_fn_def()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_import {
+                var st = parse_import()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_using {
+                var st = parse_using()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_struct {
+                var st = parse_struct()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_namespace {
+                var st = parse_namespace()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_extern {
+                var st = parse_extern()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_var {
+                var st = pstmt.parse_var_decl(0)
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_const {
+                var st = pstmt.parse_var_decl(1)
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "顶层只允许函数定义、import、using、struct、命名空间声明、extern 声明或全局变量，实际是 " + putil.describe(tag))
                 return -1
             }
-            table_push(body_stmts, st)
-        } else if tag == lex_pub {
-            var st = parse_fn_def()
-            if st < 0 {
-                return -1
-            }
-            table_push(body_stmts, st)
-        } else if tag == lex_struct {
-            var st = parse_struct()
-            if st < 0 {
-                return -1
-            }
-            table_push(body_stmts, st)
-        } else if tag == lex_namespace {
-            var st = parse_namespace()
-            if st < 0 {
-                return -1
-            }
-            table_push(body_stmts, st)
-        } else {
-            putil.set_err(putil.peek_line(), putil.peek_col(), "命名空间体内只允许函数定义、类定义或嵌套命名空间，实际是 " + putil.describe(tag))
-            return -1
         }
     }
     var n = ast.new_node(N_NAMESPACE, -1, -1, len(segs), line, col)

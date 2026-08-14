@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // 表能力加强（E0/E1/E3）综合演示：嵌套表 table<table<T>> + 键值表 map。
 //
 // 编译运行：tie examples/table_enhance_demo.tie

@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // std/collection.tie + std/crypto.tie 验收（namespace coll + namespace crc）：
 // - coll：最小堆（heap_push/pop/peek/size）、栈（stack_push/pop/peek）、

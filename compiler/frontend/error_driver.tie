@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // compiler/frontend/error_driver.tie —— T2.7 错误 golden 对比驱动
 // ============================================================
 // 遍历 tests/errors/golden/*.tie，对每个文件跑 semantic.check_src，

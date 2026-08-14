@@ -1,4 +1,4 @@
-// tie:library
+type tie<script>
 // prep/indent.tie：转换器模块示例（Harbor M3 可扩展性验证）
 //
 // 协议：顶层 `func process(src: string) -> string`——输入源码文本，输出转换后文本。

@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // config.tie：扩展库——配置解析（命名空间 cfg），KEY=VALUE 与 INI 子集。
 //
 // 设计说明：语言底座**未注册 map 原语**（tie_map_* 仅 C ABI 层，语言层

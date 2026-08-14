@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // registry.tie：扩展库——注册表客户端（命名空间 registry，M6 包管理器前置）
 // 内容：注册表基址管理 + 包文件/索引 URL 拼接。有状态（M4 顶层持久变量）：
 // 基址可 set/查询，跨函数共享。

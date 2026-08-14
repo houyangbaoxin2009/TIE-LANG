@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // 自举 v2 T4.4：interp 行为测试 tie 化——if/while/for/break/continue/return/持久变量。
 // 移植自 crates/tie-interp/src/lib.rs tests：eval_if_while / eval_break_continue /

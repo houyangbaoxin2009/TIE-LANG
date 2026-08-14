@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // exmath_num_demo.tie：exmath 数值分析方法演示（D1：均值/方差/插值/微分/积分/MC/拟合/ODE）
 // 编译运行：cargo run -p tie -- examples/exmath_num_demo.tie
 // 注：tie 表参数元素类型静态未知，数值函数用逗号分隔字符串序列传采样数据。

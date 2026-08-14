@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // std/fs.tie + std/path.tie 验收（namespace fs + namespace path）：
 // - fs：文件系统包装——exists / read_lines / write_text→read_text 往返 /

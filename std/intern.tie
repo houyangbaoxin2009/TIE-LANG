@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // intern.tie：标准库——字符串池（intern，命名空间 intern，自举 T0.6）
 // 作用：把字符串登记为稳定整数 id（相同串返回相同 id），供编译器符号表把
 // O(len) 字符串比较降为 O(1) 整数比较（阶段 2 compiler/lib/interner.tie 消费，

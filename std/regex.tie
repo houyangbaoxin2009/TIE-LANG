@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // regex.tie：标准库——正则表达式工具（命名空间 regex），全部为底座原语
 // regex_match / regex_find / regex_find_all / regex_group / regex_replace 的直接包装。
 // 正则语法：由 Rust 侧 regex crate 提供（Rust 正则语法）——支持捕获组 (x)、

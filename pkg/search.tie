@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // search.tie —— 注册表搜索/信息模块（Harbor M6 包管理器 E4）
 //
 // 职责：`tie search <query>` / `tie info <pkg>` 查询注册表索引 index.tie。

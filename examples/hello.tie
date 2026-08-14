@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // tie 语言入门示例：头与内容分离 + ASI 自动分号
 // 本文件角色为 logic（可执行），通过 tie 总入口编译

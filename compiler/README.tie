@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // compiler/README.tie —— 自举 v2 编译器源码目录（tie 语言 100% 重写）
 //
 // 本目录是自举 v2 计划的编译器源码根（规划见 .omo/plans/self-hosting-v2.md）。
@@ -107,11 +107,14 @@
 //   --config <f>     协调统筹配置文件（单文件编译暂忽略）
 //   --help           显示帮助
 //
-// 角色识别：**头部扫描**（读源文件头部注释行找 `// tie:xxx`，前 20 行；无角色
-// 默认 logic），不依赖 prep/core.tie 的 import。识别 logic/library/ui/db/data：
-// logic → 编译可执行文件（clang 链接）；library → 编译静态库（clang -c + llvm-ar
-// rcs）；data/ui/db → 提示对应工具链未实现（v0.1 尚未实现）。
-// opt/target 优先级：CLI 显式 > 头部 `// tie:opt=N` / `// tie:target=` > 默认 O2/无。
+// 角色识别：**头部扫描**（读源文件头部声明行，前 20 行；无声明默认 logic），
+// 不依赖 prep/core.tie 的 import。新文件类型声明体系（2026-08-14）：
+// `type tie` → type 角色；`type tie<X>` → X（X ∈ script/data/ui/class/logic/port/db）；
+// 旧 `// tie:xxx` 注释指令已彻底移除（普通注释，不再识别角色与 opt/target 选项）。
+// logic/script → 编译可执行文件（clang 链接）；class/type → 编译静态库（clang -c +
+// llvm-ar rcs）；data/ui/db/port → 提示对应工具链未实现（v0.1 尚未实现）。
+// 文件命名约定：`xxx.<角色>.tie` 提供默认角色，与头部声明不一致时警告并采用头部声明。
+// opt/target 优先级：仅 CLI（默认 O2 / 本机）。
 // 链接决策（need_interp）：程序用运行时桥内置（exec_code/get_env/time_now，
 // irgen 置 g_used_runtime）→ 链接 std/runtime.a（tie 自写，无需 Rust）；
 // 用 tie-interp 库桥（str_len/table_*/file_*/arg_* 等，置 g_used_interp）→ 链接

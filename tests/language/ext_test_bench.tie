@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // ext 扩展库验收：test.tie（测试框架）+ bench.tie（基准计时）。
 // - test：手动断言收集模型——expect 系列断言累计全局计数，pass_count/fail_count/

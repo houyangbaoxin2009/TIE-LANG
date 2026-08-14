@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 //
 // main.tie —— tie 语言自写的包管理器 CLI 入口（Harbor M6 骨架 E1/E2 + E3/E4）
 //

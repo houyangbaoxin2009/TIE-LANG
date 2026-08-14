@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // 自举 v2 T4.4：interp 行为测试 tie 化——eval_call（tie:script 模块协议执行基础）。
 // 移植自 crates/tie-interp/src/lib.rs tests：eval_call_调用已注册函数与命名空间 /

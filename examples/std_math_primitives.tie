@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // std_math_primitives.tie：M2 标准库 floor 的数学/时间/随机原语演示。
 // 覆盖：time_now / rand_range / sqrt / sin / cos / tan / exp / log / pow /
 //       floor / ceil / round + len(表)。

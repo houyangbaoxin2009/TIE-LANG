@@ -17,37 +17,6 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// 清理被导入文件源码：去 BOM、CRLF 归一、剥离头部行。
-///
-/// 语义与 tie-prep 的 `preprocess` 一致（正文 = 第一个非头部内容行起）。
-/// 注意：tie-frontend 处于依赖图底层（被 tie-interp 依赖），而 Harbor M3 自举后
-/// tie-prep 将依赖 tie-interp（解释执行 tie 语言编写的预处理模块）——
-/// 若此处复用 tie-prep 会形成 `frontend → prep → interp → frontend` 循环依赖，
-/// 故 import 展开自带轻量清理，不依赖 tie-prep crate。
-fn clean_source(source: &str) -> String {
-    let source = source.trim_start_matches('\u{FEFF}');
-    let source = source.replace("\r\n", "\n");
-    // 剥离头部：文件最前面的连续 `// tie:` 行（允许其间空行）
-    let mut body_start = 0;
-    let mut in_header_zone = true;
-    for (idx, line) in source.lines().enumerate() {
-        let trimmed = line.trim();
-        if in_header_zone {
-            if trimmed.is_empty() {
-                // 头部区域内的空行：跳过（仍算头部区域）
-                continue;
-            }
-            if trimmed.strip_prefix("// tie:").is_some() {
-                continue;
-            }
-            // 第一个非头部内容行：正文从这里开始
-            body_start = idx;
-            in_header_zone = false;
-        }
-    }
-    source.lines().skip(body_start).collect::<Vec<_>>().join("\n")
-}
-
 /// import 展开错误：携带位置与信息（span 指向 import 语句处）。
 #[derive(Debug, Clone)]
 pub struct ImportError {
@@ -67,10 +36,19 @@ impl fmt::Display for ImportError {
 ///
 /// - 路径解析：`import "./x.tie"` 的路径相对**当前文件所在目录**；
 /// - 被导入文件自身也可含 import（递归展开，支持多级导入）；
-/// - 循环检测：用规范化绝对路径集合记录「展开链」，重复访问即报循环导入。
-pub fn expand_imports(program: Program, base_dir: &Path) -> Result<Program, ImportError> {
+/// - 循环检测：用规范化绝对路径集合记录「展开链」，重复访问即报循环导入；
+/// - `clean`：被导入文件源码的清理回调（去 BOM/CRLF/剥离文件类型声明行）。
+///   本模块（tie-frontend，依赖图底层）**不实现清理**——由调用方注入
+///   （编译器/LSP 注入 [tie_prep::clean_source]，即 tie 语言自写的清理脚本
+///   prep/clean.tie；测试可注入恒等函数）。清理逻辑统一交给预处理脚本，
+///   Rust 侧不做重复实现。
+pub fn expand_imports(
+    program: Program,
+    base_dir: &Path,
+    clean: &dyn Fn(&str) -> String,
+) -> Result<Program, ImportError> {
     let mut chain: HashSet<PathBuf> = HashSet::new();
-    expand_imports_inner(program, base_dir, &mut chain)
+    expand_imports_inner(program, base_dir, &mut chain, clean)
 }
 
 /// 递归展开的实际实现。
@@ -81,6 +59,7 @@ fn expand_imports_inner(
     program: Program,
     base_dir: &Path,
     chain: &mut HashSet<PathBuf>,
+    clean: &dyn Fn(&str) -> String,
 ) -> Result<Program, ImportError> {
     let mut out = Vec::new();
     for stmt in program.stmts {
@@ -95,12 +74,12 @@ fn expand_imports_inner(
                         message: format!("循环导入：文件 '{}' 已在导入链中", imp.path),
                     });
                 }
-                // 读取 + 清理（去 BOM/CRLF/剥离头部）+ 词法 + 语法解析被导入文件
+                // 读取 + 清理（调用方注入的预处理脚本）+ 词法 + 语法解析被导入文件
                 let source = fs::read_to_string(&import_path).map_err(|e| ImportError {
                     span: imp.span,
                     message: format!("导入文件 {} 读取失败: {e}", import_path.display()),
                 })?;
-                let cleaned = clean_source(&source);
+                let cleaned = clean(&source);
                 let tokens = crate::lexer::tokenize(&cleaned).map_err(|e| ImportError {
                     span: imp.span,
                     message: format!("导入文件 {} 词法错误: {e}", imp.path),
@@ -114,7 +93,8 @@ fn expand_imports_inner(
                     .parent()
                     .map(|p| p.to_path_buf())
                     .unwrap_or_else(|| PathBuf::from("."));
-                let expanded = expand_imports_inner(sub_program, &sub_dir, chain)?;
+                let expanded =
+                    expand_imports_inner(sub_program, &sub_dir, chain, clean)?;
                 // M2.1.7：收集被导入文件声明的全部命名空间路径（顶层 + 嵌套），
                 // 填回 import 语句的 ns_paths——语义层据此把别名/前缀映射到全名。
                 // 被导入文件自身的 import 语句已被吞掉（不构成导入方视图）。

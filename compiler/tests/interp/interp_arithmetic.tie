@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // 自举 v2 T4.4：interp 行为测试 tie 化——算术/比较/变量/位运算/三元/自增自减/复合赋值。
 // 移植自 crates/tie-interp/src/lib.rs tests：eval_arithmetic / eval_compare /

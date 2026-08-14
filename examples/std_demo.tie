@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // std_demo.tie：标准库演示——导入 assert 与 string 库，演示全部函数与文件操作
 // M2.1 起 std 库使用命名空间形式：assert.assert / str.trim 等（M2.1.6 起函数名去 str_ 前缀）。
 

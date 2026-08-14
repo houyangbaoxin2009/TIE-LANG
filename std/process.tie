@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // process.tie：标准库——进程原语（命名空间 process，自举 T0.7）
 // 作用：用 extern 声明（链接期 libc 符号）重新实现进程原语，替代/补充
 // 内置 exec_code/exec_output 的 C ABI 桥——0-Rust 路径（阶段 4）的关键证明：

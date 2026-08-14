@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // std_primitives.tie：M2 标准库 floor 的 9 个 Rust 层内置原语演示。
 // 覆盖：file_read / file_write / file_append / file_exists / str_char /
 //       to_string / parse_int / parse_float / exit。

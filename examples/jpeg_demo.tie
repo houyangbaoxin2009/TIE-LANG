@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // jpeg_demo.tie：D7c JPEG 简化编码器演示（roundtrip 验证）
 // 编译运行：cargo run -p tie -- examples/jpeg_demo.tie
 // 验证：渐变 / 棋盘 / 8×8 三种灰度图 encode → decode 像素近似还原（有损量化容差内），

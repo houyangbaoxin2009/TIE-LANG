@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // 命名空间语法演示：块式声明 + :: 路径访问 + . 成员调用
 // 编译：tie examples/namespace_demo.tie

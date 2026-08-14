@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // compiler/driver.tie —— 自举 T3.2：完整 CLI 编译器驱动（tiec 入口）
 // ============================================================
 // 对齐 Rust crates/tie-llvm/src/main.rs + driver.rs：参数解析、角色分派、
@@ -138,39 +138,82 @@ func normalize_target(t: string) -> string {
     return t
 }
 
-// ==================== 头部扫描（角色 / opt / target） ====================
+// ==================== 头部扫描（文件类型声明） ====================
 
-// 从源码头部注释行识别角色与选项：
-//   `// tie:logic` → 角色 logic；`// tie:opt=2` → 优化级别；`// tie:target=` → 三元组。
-// 逐行扫描前 20 行；无角色标记默认 logic（可执行）。
-func scan_header(src: string) {
+// 从源码头部识别文件类型声明（新体系）：
+//   `type tie` → 类型 type；`type tie<X>` → X（X ∈ script/data/ui/class/logic/port/db）。
+// 头部区 = 文件最前连续行（允许空行），遇第一个非空非声明行即结束；
+// 只扫前 20 行。无声明默认 logic（可执行）。
+// 旧 `// tie:xxx` 注释指令体系已彻底移除：该类行只是普通注释，不再识别
+// 角色与 opt/target 选项（opt 仅 CLI 默认 O2；target 仅 CLI）。
+// 返回 0 成功；声明语法非法返回 -1（由 main 报错退出）。
+func scan_header(src: string) -> i64 {
     var lines = split_lines(src)
     var n: i64 = len(lines)
     var i: i64 = 0
     g_role = "logic"
     while i < n && i < 20 {
+        var ln = trim(lines[i])
+        if str_len(ln) == 0 {
+            i = i + 1
+            continue
+        }
+        if has_prefix(ln, "type tie") {
+            var rest = trim(slice(ln, 8, str_len(ln)))
+            if str_len(rest) == 0 {
+                g_role = "type"
+                return 0
+            }
+            // 期望 `<X>` 形式，且无尾随内容
+            if str_len(rest) >= 3 && str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">" {
+                var sub = trim(slice(rest, 1, str_len(rest) - 1))
+                if sub == "script" || sub == "data" || sub == "ui" || sub == "class" || sub == "logic" || sub == "port" || sub == "db" {
+                    g_role = sub
+                    return 0
+                }
+                println("文件类型声明错误: 未知类型 '" + sub + "'（第 " + to_string(i + 1) + " 行），合法类型: script/data/ui/class/logic/port/db")
+                return -1
+            }
+            println("文件类型声明错误: 非法声明 '" + ln + "'（第 " + to_string(i + 1) + " 行），应为 `type tie` 或 `type tie<类型>`")
+            return -1
+        }
+        // 第一个非空非声明行：头部区结束
+        break
+    }
+    return 0
+}
+
+// 剥离头部区的文件类型声明行（`type tie` / `type tie<X>`），返回清理后源码。
+// 新声明是真语法行，必须从正文中移除（旧 `// tie:` 是注释由 lexer 跳过，无需剥离）。
+// 头部区 = 文件最前连续行（允许空行），遇第一个非空非声明行即停止；
+// 声明行之外的行（含空行/注释/缩进）原样保留，\n 重连。
+func strip_type_header(src: string) -> string {
+    var lines = split_lines(src)
+    var n: i64 = len(lines)
+    var out: string = ""
+    var in_header = true
+    var i: i64 = 0
+    while i < n {
         var ln = lines[i]
-        if has_prefix(ln, "// tie:") {
-            var rest = slice(ln, 7, str_len(ln))
-            var eq = find_char(rest, "=")
-            if eq < 0 {
-                // 纯角色标记：// tie:logic 等
-                var role = trim(rest)
-                if role == "logic" || role == "library" || role == "ui" || role == "db" || role == "data" {
-                    g_role = role
-                }
+        var t = trim(ln)
+        if in_header {
+            if str_len(t) == 0 {
+                // 头部区空行：保留
+            } else if has_prefix(t, "type tie") {
+                // 声明行：剥离
+                i = i + 1
+                continue
             } else {
-                var key = trim(slice(rest, 0, eq))
-                var val = trim(slice(rest, eq + 1, str_len(rest)))
-                if key == "opt" && !g_opt_set {
-                    g_opt_level = parse_int(val)
-                } else if key == "target" && str_len(g_target) == 0 {
-                    g_target = val
-                }
+                in_header = false
             }
         }
+        if str_len(out) > 0 {
+            out = out + "\n"
+        }
+        out = out + ln
         i = i + 1
     }
+    return out
 }
 
 // ==================== 前端 ====================
@@ -238,13 +281,26 @@ func main() -> i64 {
         println("读取源码失败: " + g_input)
         return 1
     }
-    // 头部扫描（角色 / opt / target）
-    scan_header(src)
+    // 头部扫描（文件类型声明 / 角色）
+    if scan_header(src) < 0 {
+        return 1
+    }
+    // 剥离头部声明行（`type tie` / `type tie<X>` 是真语法行，须从正文移除；
+    // 旧 `// tie:` 是注释由 lexer 跳过，无需处理）
+    var clean = strip_type_header(src)
+    // 文件名角色检查：`xxx.<角色>.tie` 提供默认角色，与头部声明不一致时警告
+    // （头部声明优先，文件名仅作为提示）
+    var fname = file_name_of(g_input)
+    var name_role = role_from_filename(fname)
+    if str_len(name_role) > 0 && name_role != g_role {
+        println("警告: 文件 " + g_input + " 名称声明为 " + name_role + "，与头部声明 " + g_role + " 不一致，已采用头部声明")
+    }
     if g_prep_only {
         println("[预处理] 识别为 " + g_role + " 文件（头: " + g_input + "）")
         return 0
     }
-    // 角色分派：data/ui/db → 未实现提示；logic/library → 编译工具链
+    // 角色分派：data/ui/db/port → 未实现提示；logic/script → 编译可执行；
+    // class/type → 编译静态库
     if g_role == "data" {
         println("[预处理] 识别为 data 数据交换文件（头: " + g_input + "），已转交数据解析工具链 —— v0.1 数据交换工具链尚未实现")
         return 0
@@ -257,7 +313,11 @@ func main() -> i64 {
         println("[预处理] 识别为 db 数据库文件（头: " + g_input + "），已转交数据库工具链 —— v0.1 数据库工具链尚未实现")
         return 0
     }
-    return compile_program(src)
+    if g_role == "port" {
+        println("[预处理] 识别为 port 端口文件（头: " + g_input + "），已转交端口工具链 —— v0.1 端口工具链尚未实现")
+        return 0
+    }
+    return compile_program(clean)
 }
 
 // 编译工具链（logic / library）：前端 → 中端 → 后端。
@@ -307,7 +367,7 @@ func compile_program(src: string) -> i64 {
         return 1
     }
     var target = normalize_target(g_target)
-    if g_role == "library" {
+    if g_role == "class" || g_role == "type" {
         return compile_library(ir_path, opt_path, target)
     }
     return compile_logic(ir_path, opt_path, target)
@@ -496,4 +556,53 @@ func replace_ext(path: string, new_ext: string) -> string {
         base = slice(path, 0, last_dot)
     }
     return base + "." + new_ext
+}
+
+// 取路径的文件名部分（最后一个 / 或 \ 之后；无分隔符返回原串）。
+func file_name_of(path: string) -> string {
+    var n: i64 = str_len(path)
+    var last: i64 = -1
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(path, i)
+        if c == "/" || c == "\\" {
+            last = i
+        }
+        i = i + 1
+    }
+    if last < 0 {
+        return path
+    }
+    return slice(path, last + 1, n)
+}
+
+// 从文件名推断角色：`xxx.<角色>.tie` → 角色名；否则空串。
+// （新体系文件命名约定：xxx.type.tie → type、xxx.logic.tie → logic 等；
+// 头部声明优先，文件名仅作默认，不一致时警告采用头部声明）
+func role_from_filename(name: string) -> string {
+    var n: i64 = str_len(name)
+    var first_dot: i64 = -1
+    var last_dot: i64 = -1
+    var i: i64 = 0
+    while i < n {
+        if str_char(name, i) == "." {
+            if first_dot < 0 {
+                first_dot = i
+            }
+            last_dot = i
+        }
+        i = i + 1
+    }
+    // 需要至少两段（首点存在且与末点不同）：xxx.<角色>.tie
+    if first_dot < 0 || last_dot <= first_dot {
+        return ""
+    }
+    if slice(name, last_dot + 1, n) != "tie" {
+        return ""
+    }
+    var role = slice(name, first_dot + 1, last_dot)
+    if role == "type" || role == "script" || role == "data" || role == "ui" || role == "class" || role == "logic" || role == "port" || role == "db" {
+        return role
+    }
+    return ""
 }

@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // publish.tie —— 发布模块（Harbor M6 包管理器 E4）
 //
 // 职责：`tie publish` 把当前项目打包为 tar.gz 并打 git tag / push：

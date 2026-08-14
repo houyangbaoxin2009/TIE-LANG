@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // compiler/frontend/parse_test.tie —— 自举 v2 T2.5 完整 parser 验收程序
 // ============================================================
 // 作用：

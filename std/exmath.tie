@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // exmath.tie：标准库——高级数学算法（命名空间 exmath）
 // 内容：霍夫曼编码/解码（无损压缩）、素数筛、快速幂、斐波那契、阶乘、组合数等
 // 全部基于基础原语（len/str_char/表/算术）+ 字符串表（table_new_string/table_push/下标读取）

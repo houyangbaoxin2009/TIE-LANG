@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // compiler/interp/interp.tie —— 自举 v2 T4.1：解释器核心（eval/eval_call 两趟
 // 解析 + 树遍历求值器）
 // ============================================================

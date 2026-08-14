@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 import "../std/linalg.tie"
 func main() {
     var c = linalg.mat_mul("1.0,2.0,3.0,4.0", "5.0,6.0,7.0,8.0", 2)

@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // T0.6 验收：字符串池（std/intern.tie）——字符串 → 稳定整数 id 的 intern 机制。
 //

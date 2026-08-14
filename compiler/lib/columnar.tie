@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // compiler/lib/columnar.tie —— 自举 v2 T2.1：列式并列表辅助库
 // ============================================================
 // 里程碑：自举 v2 计划 T2.1（见 .omo/plans/self-hosting-v2.md）模块化地基，

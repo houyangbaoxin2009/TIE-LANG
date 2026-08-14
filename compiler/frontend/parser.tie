@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // compiler/frontend/parser.tie —— 自举 v2 T2.5：完整语法分析器（模块拆分后主入口）
 // ============================================================
 // 里程碑：自举 v2 计划 T2.5（.omo/plans/self-hosting-v2.md）。由 T1.2 原型

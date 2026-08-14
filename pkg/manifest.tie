@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // manifest.tie —— tie.pkg 清单解析模块（M6 包管理器骨架 E1/E2）
 //
 // 职责：解析 tie:data 格式的 tie.pkg 清单文件文本，提供字段提取与依赖

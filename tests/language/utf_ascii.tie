@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // utf + ascii 标准库验收（std/utf.tie + std/ascii.tie）：
 // - utf：Unicode 码点工具——codepoint / utf8_bytes / byte_len / hex_escape /

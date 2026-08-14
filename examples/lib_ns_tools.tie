@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // lib_ns_tools.tie——M2.1.7 单文件命名空间示例工具库
 // 演示：pub 导出 / 私有函数（helper 仅 fmt 内可见）/ 嵌套命名空间
 // 配合 examples/ns_import_demo.tie 使用

@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // std_refactor_demo.tie——Harbor M4 标准库重构演示
 // 覆盖新增函数：str 大小写/join/repeat/trim_start/trim_end、

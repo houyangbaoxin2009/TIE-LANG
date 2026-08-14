@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 
 // T0.7 负例：extern 声明带表参数 → 语义错误（extern 参数限标量类型，
 // 表/结构体等容器无法映射 C ABI 标量参数）。

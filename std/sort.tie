@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // sort.tie：标准库——排序数组 + 二分查找（命名空间 sort，D3）
 // 内容：有序插入（保持升序）、二分查找（contains/index_of）、无序表排序（冒泡）。
 // 定位：替代「字符串 id 表」作符号表过渡的底层方案——符号表用「排序 id 数组 +

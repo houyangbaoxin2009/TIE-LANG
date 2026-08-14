@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // format.tie：标准库——格式化函数（命名空间 format）
 // 全部基于 to_string + str_char + len + 字符串拼接 + 循环/分支实现，不使用下标索引
 // 与字符转换；负数十六进制用「负号前缀 + 绝对值」表示（与常见语言一致）。

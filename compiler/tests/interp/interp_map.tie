@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // 自举 v2 T4.4：interp 行为测试 tie 化——键值表 map。
 // 移植自 crates/tie-interp/src/lib.rs tests：eval_map_literal_and_index /

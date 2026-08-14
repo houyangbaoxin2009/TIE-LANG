@@ -1,0 +1,180 @@
+type tie<script>
+// prep/clean.tie：源码清理转换器脚本（tie 语言自写，自举精神——能 tie 实现不用 Rust）
+//
+// 协议：顶层 `func process(src: string) -> string`——输入已去 BOM / CRLF 归一的
+// 源码文本，输出剥离文件类型声明行后的源码。
+//
+// 与 prep/core.tie（编译预处理：角色判定 + 正文重建）的区别：
+// core.tie 输出协议文本（ROLE/HEADERS/BODY），正文从第一个内容行起重建；
+// 本脚本做**行级清理**：只剥离头部区的文件类型声明行（`type tie` / `type tie<X>`），
+// 其余行（含空行、注释）原样保留，声明行位置用空行占位——**行号保持不变**，
+// 供 import 展开 / 解释器 / LSP 等需要行号对齐的路径复用。
+//
+// 挂载方式：tie-prep --module prep/clean.tie；Rust 壳（tie_prep::clean_source）
+// 内嵌 eval 执行本模块。自包含：eval 环境不支持 import，仅用语言底座原语。
+//
+// 行为约束：
+// - 头部区 = 文件最前连续行（允许空行），遇第一个非空非声明行即停止；
+// - 声明行判定（trim 后）：`type tie` 或 `type tie<X>`（无尾随内容）；
+// - 声明行 → 空行占位（行号不变）；其余行原样输出。
+
+namespace prep_clean {
+
+// 截取字符串 [start, end) 区间（码点级；越界按边界收敛；空串或 start>=end 返回空串）
+func slice(s: string, start: i64, end: i64) -> string {
+    var n: i64 = str_len(s)
+    var lo: i64 = start
+    if lo < 0 {
+        lo = 0
+    }
+    if lo > n {
+        lo = n
+    }
+    var hi: i64 = end
+    if hi < 0 {
+        hi = 0
+    }
+    if hi > n {
+        hi = n
+    }
+    if lo >= hi {
+        return ""
+    }
+    var result: string = ""
+    var i: i64 = lo
+    while i < hi {
+        result = result + str_char(s, i)
+        i = i + 1
+    }
+    return result
+}
+
+// 判断单字符字符串是否为空白字符（空格、制表、换行、回车）
+func is_whitespace(c: string) -> bool {
+    if c == " " {
+        return true
+    }
+    if c == "\t" {
+        return true
+    }
+    if c == "\n" {
+        return true
+    }
+    if c == "\r" {
+        return true
+    }
+    return false
+}
+
+// 去除字符串首尾空白（码点级，边界用 str_len）
+func trim(s: string) -> string {
+    var n: i64 = str_len(s)
+    var start: i64 = 0
+    while start < n && is_whitespace(str_char(s, start)) {
+        start = start + 1
+    }
+    var end: i64 = n
+    while end > start && is_whitespace(str_char(s, end - 1)) {
+        end = end - 1
+    }
+    return slice(s, start, end)
+}
+
+// 判断 s 是否以 prefix 开头（逐码点比较）
+func starts_with(s: string, prefix: string) -> bool {
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(prefix)
+    if n < m {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(prefix, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 按 "\n" 切分行表（保留全部行，含空行与末尾空段——行号保持的基础）
+func split_lines(s: string) -> table {
+    var lines = table_new_string()
+    var n: i64 = str_len(s)
+    var cur: string = ""
+    var i: i64 = 0
+    while i < n {
+        var c: string = str_char(s, i)
+        if c == "\n" {
+            table_push(lines, cur)
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
+    }
+    table_push(lines, cur)
+    return lines
+}
+
+// 用 "\n" 连接表元素（无尾部换行）
+func join_lines(lines: table) -> string {
+    var n: i64 = len(lines)
+    var result: string = ""
+    var i: i64 = 0
+    while i < n {
+        if i > 0 {
+            result = result + "\n"
+        }
+        result = result + lines[i]
+        i = i + 1
+    }
+    return result
+}
+
+// 判定一行是否为文件类型声明（trim 后）：`type tie` 或 `type tie<X>`，无尾随内容
+func is_decl_line(t: string) -> bool {
+    if !starts_with(t, "type tie") {
+        return false
+    }
+    var rest = trim(slice(t, 8, str_len(t)))
+    if str_len(rest) == 0 {
+        return true
+    }
+    if str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">" {
+        return true
+    }
+    return false
+}
+
+// 模块入口（协议约定）：剥离头部区声明行，其余行原样（声明行空行占位，行号不变）
+func process(src: string) -> string {
+    var lines = split_lines(src)
+    var n: i64 = len(lines)
+    var out = table_new_string()
+    var in_header = true
+    var i: i64 = 0
+    while i < n {
+        var ln = lines[i]
+        if in_header {
+            var t = trim(ln)
+            if str_len(t) == 0 {
+                // 头部区空行：保留（占位，行号不变）
+                table_push(out, ln)
+            } else if is_decl_line(t) {
+                // 声明行：空行占位（行号不变）
+                table_push(out, "")
+            } else {
+                // 第一个非声明内容行：头部区结束，原样保留
+                in_header = false
+                table_push(out, ln)
+            }
+        } else {
+            table_push(out, ln)
+        }
+        i = i + 1
+    }
+    return join_lines(out)
+}
+
+}

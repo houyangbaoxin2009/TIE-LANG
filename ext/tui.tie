@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // tui.tie：扩展库——终端文本装饰（命名空间 tui），纯可见字符实现
 // （进度条/分隔线/文本框/对齐），**无 ANSI 颜色**。
 //

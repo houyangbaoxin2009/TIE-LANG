@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // compiler/proto/main.tie —— 自举 v2 T1.4：原型编译器 CLI（tiec-proto）
 // ============================================================
 // 用法：tiec-proto <input.tie> [--check] [--emit-ir] [--debug]

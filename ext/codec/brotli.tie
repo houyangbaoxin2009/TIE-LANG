@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // brotli.tie：扩展库——Brotli 压缩算法简化教学实现（命名空间 brotli，D7d）
 //
 // 内容：Brotli 核心机制的两阶段组合——

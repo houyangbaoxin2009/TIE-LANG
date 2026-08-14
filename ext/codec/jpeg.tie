@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // jpeg.tie：扩展库——灰度 JPEG 简化编码器（命名空间 jpeg，D7c）
 // 内容：8×8 分块 → 电平移位（-128）→ 二维 DCT → 常数步长量化 →
 //       ZigZag 重排 → 有符号 16 位小端字节流（自描述格式）。

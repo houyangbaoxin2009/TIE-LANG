@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // std/runtime.tie —— 自举 v2 T4.5：tie 运行时静态库（替代 Rust tie-interp 桥）
 // ============================================================
 // 目标：0-Rust 路径的关键一步——用 tie 语言提供 tie_* C ABI 桥符号的

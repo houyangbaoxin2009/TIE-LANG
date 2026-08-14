@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // args + time 标准库验收（std/args.tie + std/time.tie）：
 // - args：命令行参数——count()（用户参数个数，不含程序名）、get(i)（0 基取值，

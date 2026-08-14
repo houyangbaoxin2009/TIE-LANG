@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // string.tie：标准库——字符串工具函数（命名空间 str，string 是类型关键字不可用）
 // 全部基于 str_char + str_len + 字符串拼接 + 循环/分支实现，不使用下标索引与字符转换
 // 注意：字符串**码点级**遍历必须用 str_len（码点数）而非 len（字节数）——str_char

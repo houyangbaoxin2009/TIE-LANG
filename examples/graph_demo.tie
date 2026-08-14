@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // graph_demo.tie：std/graph 图算法库演示（D3）
 // 编译运行：cargo run -p tie -- examples/graph_demo.tie
 // 图用逗号分隔序列传参（邻接矩阵/边表）；距离等返回表，main 内联下标读取。

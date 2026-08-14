@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // compiler/driver-lite.tie —— 自举 v2 T2.9：临时编译器入口（tiec 雏形）
 // ============================================================
 // 里程碑：自举 v2 计划 T2.9（.omo/plans/self-hosting-v2.md）——把 T2.6/T2.8

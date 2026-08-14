@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // log.tie：标准库——控制台信息库（消息系统，i18n，命名空间形式）
 //
 // 基于语言底座原语 msg_set_lang / msg_register / msg_t / msg_t_lang / msg_get_lang：

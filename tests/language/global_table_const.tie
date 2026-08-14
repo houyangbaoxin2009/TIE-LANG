@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 
 // T0.4 负例：const 全局表暂不支持——表在 main 入口运行时创建，无法静态初始化。
 // 期望：语义错误（"const 全局表暂不支持"），编译失败 exit 1。

@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // radix.tie：标准库——通用进制转换（命名空间 radix）
 // 内容：任意进制（2..36）的双向转换——整数 → 进制字符串 / 进制字符串 → 整数。
 // 与 format.format_int_hex（仅十进制→十六进制单向）互补；本库通用化。

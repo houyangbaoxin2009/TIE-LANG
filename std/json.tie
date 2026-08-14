@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // json.tie：标准库——JSON 解析与序列化（命名空间 json），兑现
 // "tie 当数据交换格式"定位（文件头 tie:data 角色的互操作核心）。
 // 实现：JSON 值 = 节点 id（AST 式平行表，模仿 compiler 前端模式），

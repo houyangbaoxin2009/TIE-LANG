@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 
 // M4 运算符扩展示例：复合赋值、位运算、三目、自增自减
 func main() {

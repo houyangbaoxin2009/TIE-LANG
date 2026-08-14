@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // compiler/middle/pass/pass_test.tie —— 自举 v2 T2.3：Pass 基础设施验收
 // ============================================================
 // 里程碑：自举 v2 计划 T2.3 验收（LLVM AnalysisManager 行为等价测试）。

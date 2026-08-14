@@ -1698,6 +1698,36 @@ where
     SESSION.with(|s| f(&mut s.borrow_mut()))
 }
 
+/// 剥离文件类型声明行（`type tie` / `type tie<X>`，新文件类型声明体系）。
+///
+/// 头部区 = 文件最前连续行（允许空行），遇第一个非空非声明行停止。
+/// 合法声明行（`type tie` 或 `type tie<X>`，X 为任意标识符）整行删除；
+/// 头部区外或非法形态（如 `type tie<data> extra`）原样保留（交由 parser 报错）。
+/// eval 直接解释的模块/库/REPL 源码均经此对齐编译链的预处理剥离行为。
+fn strip_type_declaration(code: &str) -> String {
+    let mut out = String::new();
+    let mut in_header = true;
+    for line in code.split_inclusive('\n') {
+        if in_header {
+            let t = line.trim_end_matches(['\n', '\r']).trim();
+            if t.is_empty() {
+                out.push_str(line);
+                continue;
+            }
+            if let Some(rest) = t.strip_prefix("type tie") {
+                let rest = rest.trim();
+                // 合法声明：`type tie` 或 `type tie<X>`（无尾随内容）→ 剥离
+                if rest.is_empty() || (rest.starts_with('<') && rest.ends_with('>')) {
+                    continue;
+                }
+            }
+            in_header = false;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 /// 解释器会话：跨多次 eval 持久保存的顶层作用域。
 #[derive(Default)]
 pub struct Session {
@@ -1718,8 +1748,12 @@ impl Session {
 
     /// 求值一段代码：顶层定义注册，否则包装为 main 体执行，返回格式化结果或错误。
     pub fn eval(&mut self, code: &str) -> Result<String, String> {
+        // 文件类型声明剥离：`type tie` / `type tie<X>` 是真语法行（文件级概念），
+        // eval 直接解释模块/库/REPL 源码时须先移除（编译路径由 tie-prep 剥离，
+        // 解释路径在此对齐）。头部区 = 最前连续行（允许空行），声明行删除。
+        let code = strip_type_declaration(code);
         // 第一趟：原样解析（顶层定义）
-        let tokens = tokenize(code).map_err(|e| e.to_string())?;
+        let tokens = tokenize(&code).map_err(|e| e.to_string())?;
         if let Ok(program) = parse_program(&tokens) {
             if !program.stmts.is_empty() {
                 return self.register_top_level(program);

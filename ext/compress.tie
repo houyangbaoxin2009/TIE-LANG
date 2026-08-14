@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // compress.tie：扩展库——数据压缩（命名空间 compress，D5）
 // 内容：LZ77（滑窗匹配 + 字面量）、LZSS（LZ77 变体，长度≥2 才用引用）、
 // LZW（动态字典）。压缩输出为**逗号分隔数字序列字符串**（ext 有状态应用层：

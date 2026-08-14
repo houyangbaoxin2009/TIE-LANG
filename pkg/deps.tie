@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // deps.tie —— 依赖安装与解析模块（Harbor M6 包管理器 E1/E2/E3/E4）
 //
 // 职责：

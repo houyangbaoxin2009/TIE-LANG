@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 // compiler/proto/lexer_test.tie —— T1.1 词法原型验收程序
 // ============================================================
 // 作用：

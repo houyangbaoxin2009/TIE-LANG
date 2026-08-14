@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // log_enhance_demo.tie——Harbor M4 log 增强演示
 // 覆盖：register_all 批量登记 / error_f 带参消息 / debug 级别与 set_level /

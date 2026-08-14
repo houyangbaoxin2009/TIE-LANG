@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // std_net_text 验收：std 网络/文本四模块——http（URL 编码）、regex（正则）、
 // rnd（伪随机）、bytes（字节表）。全部断言通过后打印验收信息。

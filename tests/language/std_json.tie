@@ -1,5 +1,4 @@
-// tie:logic
-// tie:opt=2
+type tie<logic>
 
 // std/json.tie 验收（namespace json）：
 // - parse：标量/字符串（转义 \u）/数组/对象/嵌套 + 错误路径

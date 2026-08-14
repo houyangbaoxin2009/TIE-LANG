@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // compiler/repl.tie —— 自举 v2 T4.3：REPL 入口（tie 自写解释器求值）
 // ============================================================
 // 里程碑：自举 v2 计划 T4.3（.omo/plans/self-hosting-v2.md）——REPL 循环 +

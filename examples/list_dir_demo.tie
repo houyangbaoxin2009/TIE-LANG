@@ -1,4 +1,4 @@
-// tie:logic
+type tie<logic>
 // list_dir_demo.tie：目录枚举演示——list_dir 返回字符串动态表（文件名集合）。
 // 演示：正常目录列出全部条目、空目录返回空表。
 // 注意：目录不存在时 list_dir 触发运行时错误（编译/解释两路径文本一致）。

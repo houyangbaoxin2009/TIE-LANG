@@ -1,4 +1,4 @@
-// tie:library
+type tie<class>
 // encoding.tie：标准库——编码转换工具（命名空间 enc）——base64 / 十六进制 / URL percent 编码。
 // 全部纯函数，只依赖底座原语（str_len / str_char / char_code）+ 位运算（& | << >>）
 // + 字符串拼接 + 循环/分支，无字节级原语。
