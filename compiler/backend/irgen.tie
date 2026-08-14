@@ -1477,6 +1477,12 @@ func is_builtin_name(nm: string) -> bool {
     if nm == "str_len" || nm == "char_code" || nm == "str_char" || nm == "str_from_code" {
         return true
     }
+    // ---------- 网络原语（P0：std/net）----------
+    if nm == "net_close" || nm == "net_tcp_accept" || nm == "net_tcp_connect" ||
+        nm == "net_tcp_listen" || nm == "net_tcp_recv" || nm == "net_tcp_send" ||
+        nm == "net_udp_bind" || nm == "net_udp_recv" || nm == "net_udp_send" {
+        return true
+    }
     if nm == "to_string" || nm == "parse_int" || nm == "parse_float" || nm == "parse_trit" {
         return true
     }
@@ -1595,6 +1601,84 @@ func builtin_expr(nm: string, id: i64) -> i64 {
             }
             g_builtin_res = gen_ext_call1("tie_str_from_code", sv, types.named(TK_I64), types.named(TK_STR))
         }
+        return 0
+    }
+    // ---------- 网络原语（P0：std/net）----------
+    // 参数签名：i=整数（窄整数 sext 到 i64）、s=字符串（ptr 直传）；桥符号 tie_<name>；
+    // net_close 返回 i8→bool（icmp ne），两个 recv 返回堆串（gen_stmt 统一 free），其余 i64。
+    if nm == "net_close" || nm == "net_tcp_accept" || nm == "net_tcp_connect" ||
+        nm == "net_tcp_listen" || nm == "net_tcp_recv" || nm == "net_tcp_send" ||
+        nm == "net_udp_bind" || nm == "net_udp_recv" || nm == "net_udp_send" {
+        g_used_interp = true
+        if nm == "net_close" {
+            // 单参句柄 → i8 桥 → icmp ne → bool（与 file_delete 同模式）
+            var h = gen_expr(call_arg(id, 0))
+            if h < 0 {
+                return -1
+            }
+            var ht = node_types[call_arg(id, 0)]
+            if ht != types.named(TK_I64) && ht != types.named(TK_U64) && ht >= 0 {
+                var sh = gen_sext(h, ht, types.named(TK_I64))
+                if sh < 0 {
+                    return -1
+                }
+                h = sh
+            }
+            g_builtin_res = gen_bool_bridge1("tie_net_close", h, types.named(TK_I64))
+            return 0
+        }
+        // 参数模式（i/s）按函数签名构造
+        var pat: table<string> = table_new_string()
+        if nm == "net_udp_send" {
+            table_push(pat, "i")
+            table_push(pat, "s")
+            table_push(pat, "i")
+            table_push(pat, "s")
+        } else if nm == "net_tcp_connect" {
+            table_push(pat, "s")
+            table_push(pat, "i")
+        } else if nm == "net_tcp_send" {
+            table_push(pat, "i")
+            table_push(pat, "s")
+        } else if nm == "net_tcp_recv" || nm == "net_udp_recv" {
+            table_push(pat, "i")
+            table_push(pat, "i")
+        } else {
+            table_push(pat, "i")
+        }
+        var atys: table<i64> = table_new_i64()
+        var avs: table<i64> = table_new_i64()
+        var k: i64 = 0
+        while k < len(pat) {
+            var a = call_arg(id, k)
+            var v = gen_expr(a)
+            if v < 0 {
+                return -1
+            }
+            if pat[k] == "i" {
+                var vt = node_types[a]
+                if vt == types.named(TK_I64) || vt == types.named(TK_U64) || vt < 0 {
+                    table_push(atys, types.named(TK_I64))
+                    table_push(avs, v)
+                } else {
+                    var sv = gen_sext(v, vt, types.named(TK_I64))
+                    if sv < 0 {
+                        return -1
+                    }
+                    table_push(atys, types.named(TK_I64))
+                    table_push(avs, sv)
+                }
+            } else {
+                table_push(atys, types.named(TK_STR))
+                table_push(avs, v)
+            }
+            k = k + 1
+        }
+        var rty = types.named(TK_I64)
+        if nm == "net_tcp_recv" || nm == "net_udp_recv" {
+            rty = types.named(TK_STR)
+        }
+        g_builtin_res = gen_ext_call_typed("tie_" + nm, atys, avs, rty)
         return 0
     }
     if nm == "to_string" {
@@ -2918,9 +3002,80 @@ func gen_default_val(ty: i64) -> i64 {
 // 元素类型：语义 node_types 首元素推断；空表 → i64 兜底。
 func gen_table_lit(id: i64) -> i64 {
     g_used_interp = true
-    // 元素类型推断
-    var elem: i64 = types.named(TK_I64)
+    // E3 键值表（map）字面量：任一个 cell 带字符串键（TableCell → TableId，
+    // TableId name = 字符串键池 id >= 0；数字键 name=-1 不算 map）→ 走 map 桥：
+    // tie_table_new(16) + 逐对 tie_map_set / tie_map_set_string（键为字符串 ptr）。
+    // 对齐 Rust 基线 gen_table_lit_arg / gen_dyn_table_var 的 map 展开（元素 16 字节）。
+    // 背景（普适段错误根因）：map 字面量曾落入普通表路径——tie_table_new(8) +
+    // tie_table_push_i64，键全部丢弃、元素宽度 8 与运行时 map 的 16 字节元素不符，
+    // 后续 tie_map_set 按 16 字节越界写堆 → 0xC0000374 / 0xC0000005 崩溃，
+    // m["a"] 读回 0（键从未写入）。
     var nc = sstate.nchild(id)
+    var has_str_key: bool = false
+    var ci: i64 = 0
+    while ci < nc {
+        var ccell = sstate.child(id, ci)
+        var cid = sstate.child(ccell, 0)
+        if cid >= 0 && s_names[cid] >= 0 {
+            has_str_key = true
+        }
+        ci = ci + 1
+    }
+    if has_str_key {
+        // map 值类型：node_types[id] = map<V> → low 解码 V；裸 map 兜底 i64；
+        // 值为 string → tie_map_set_string（对齐 gen_index_read/assign 的 map 分支）。
+        var mval_ty: i64 = types.named(TK_I64)
+        var lit_ty = node_types[id]
+        if types.is_map(lit_ty) {
+            var lv = types.low(lit_ty)
+            if lv > 0 {
+                mval_ty = lv
+            }
+        }
+        var bridge_set = "tie_map_set"
+        var pty_v = types.named(TK_I64)
+        if mval_ty == types.named(TK_STR) {
+            bridge_set = "tie_map_set_string"
+            pty_v = types.named(TK_STR)
+        }
+        var size16 = gen_int_lit_ty(16, types.named(TK_I64))
+        var t = gen_ext_call1("tie_table_new", size16, types.named(TK_I64), types.named(TK_STR))
+        var i: i64 = 0
+        while i < nc {
+            var cell = sstate.child(id, i)
+            var cid2 = sstate.child(cell, 0)
+            if cid2 < 0 || s_names[cid2] < 0 {
+                sm_err_msg = "键值表字面量元素缺少字符串键（函数 " + g_cur_fn_name + "）"
+                return -1
+            }
+            // 键字符串 → @.str.N 全局（gen_str_lit 去引号 + 登记常量；键借用约定：
+            // 字符串字面量是全局常量，比表存活更久——对齐 Rust string_global）
+            var k = gen_str_lit(s_names[cid2])
+            var val = sstate.child(cell, 1)
+            var v = gen_expr(val)
+            if v < 0 {
+                return -1
+            }
+            // ok 出参槽（越界标志；阶段 A 简化不检查，传哑槽——与下标读写 map 分支同款）
+            var mok = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
+            ir.add_operand(mok, types.named(TK_I8), 2)
+            var mats: table<i64> = table_new_i64()
+            var mavs: table<i64> = table_new_i64()
+            table_push(mats, types.named(TK_STR))
+            table_push(mavs, t)
+            table_push(mats, types.named(TK_STR))
+            table_push(mavs, k)
+            table_push(mats, pty_v)
+            table_push(mavs, v)
+            table_push(mats, types.named(TK_STR))
+            table_push(mavs, ir.get_value(mok))
+            gen_ext_call_typed(bridge_set, mats, mavs, -1)
+            i = i + 1
+        }
+        return t
+    }
+    // 普通表字面量（元素类型推断）
+    var elem: i64 = types.named(TK_I64)
     if nc > 0 {
         var cell = sstate.child(id, 0)
         var val = sstate.child(cell, 1)
@@ -3882,7 +4037,15 @@ func gen_stmt(id: i64) -> i64 {
             var ret = ir.new_inst(g_cur_block, 32, rty)  // ret
             ir.add_operand(ret, rv, 0)
         } else {
-            var ret = ir.new_inst(g_cur_block, 32, -1)  // ret void
+            // void 无值 return：main 特判 ret i32 0（CRT 退出码正确性，对齐 Rust 侧
+            // gen_stmt 的 void main return 处理——define i32 @main 与 ret void 不匹配）；
+            // 其余 void 函数 ret void。
+            if g_cur_fn_name == "main" {
+                var ret = ir.new_inst(g_cur_block, 32, types.named(TK_I32))  // ret i32 0
+                ir.add_operand(ret, 0, 2)
+            } else {
+                var ret = ir.new_inst(g_cur_block, 32, -1)  // ret void
+            }
         }
         return 0
     }

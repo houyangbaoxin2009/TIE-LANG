@@ -275,6 +275,35 @@ impl<'p> IrGenerator<'p> {
         if self.used_externs.iter().any(|s| s == "tie_str_from_code") {
             self.out.push_str("declare ptr @tie_str_from_code(i64)\n");
         }
+        // ---------- 网络原语（P0：std/net）----------
+        // 句柄模型：i64 自增 id；recv 返回堆串（调用方释放）；net_close 返回 i8（bool）。
+        if self.used_externs.iter().any(|s| s == "tie_net_tcp_listen") {
+            self.out.push_str("declare i64 @tie_net_tcp_listen(i64)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_net_tcp_accept") {
+            self.out.push_str("declare i64 @tie_net_tcp_accept(i64)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_net_tcp_connect") {
+            self.out.push_str("declare i64 @tie_net_tcp_connect(ptr, i64)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_net_tcp_send") {
+            self.out.push_str("declare i64 @tie_net_tcp_send(i64, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_net_tcp_recv") {
+            self.out.push_str("declare ptr @tie_net_tcp_recv(i64, i64)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_net_udp_bind") {
+            self.out.push_str("declare i64 @tie_net_udp_bind(i64)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_net_udp_send") {
+            self.out.push_str("declare i64 @tie_net_udp_send(i64, ptr, i64, ptr)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_net_udp_recv") {
+            self.out.push_str("declare ptr @tie_net_udp_recv(i64, i64)\n");
+        }
+        if self.used_externs.iter().any(|s| s == "tie_net_close") {
+            self.out.push_str("declare i8 @tie_net_close(i64)\n");
+        }
         // char_code（自举阶段 2 新增）：首字符 → Unicode 标量（i64，UTF-32 码点）。
         if self.used_externs.iter().any(|s| s == "tie_char_code") {
             self.out.push_str("declare i64 @tie_char_code(ptr)\n");
@@ -3241,6 +3270,67 @@ impl<'p> IrGenerator<'p> {
             let tmp = self.new_reg();
             self.line(&format!("{tmp} = call ptr @tie_str_from_code(i64 {v64})"));
             return Ok((tmp, "ptr"));
+        }
+        // ---------- 网络原语（P0：std/net）----------
+        // 句柄/端口/字节数为 i64（窄整数扩展），主机/数据为 string（ptr 直传）；
+        // recv 返回堆串（mark_used tie_free_result，独立语句统一释放）；
+        // net_close 返回 i8 → icmp ne 转 i1（bool）；其余返回 i64。
+        if name.starts_with("net_") {
+            let sym = format!("tie_{name}");
+            let sig: &[&str] = match name {
+                "net_tcp_listen" => &["i"],
+                "net_tcp_accept" => &["i"],
+                "net_tcp_connect" => &["s", "i"],
+                "net_tcp_send" => &["i", "s"],
+                "net_tcp_recv" => &["i", "i"],
+                "net_udp_bind" => &["i"],
+                "net_udp_send" => &["i", "s", "i", "s"],
+                "net_udp_recv" => &["i", "i"],
+                "net_close" => &["i"],
+                _ => {
+                    return Err(IrError {
+                        message: format!("内部错误：未知网络原语 {name}（函数 {}）", self.cur_fn),
+                    });
+                }
+            };
+            let ret_str = matches!(name, "net_tcp_recv" | "net_udp_recv");
+            let ret_bool = name == "net_close";
+            // 逐参数生成（整数扩展 i64 / 字符串 ptr）
+            let mut regs: Vec<(String, &'static str)> = Vec::with_capacity(args.len());
+            for (a, want) in args.iter().zip(sig) {
+                let (v, t) = self.gen_expr(a)?;
+                if *want == "i" {
+                    let v64 = self.extend_int_to_i64(&v, t, a)?;
+                    regs.push((v64, "i64"));
+                } else {
+                    regs.push((v, "ptr"));
+                }
+            }
+            self.mark_used(&sym);
+            if ret_str {
+                self.mark_used("tie_free_result");
+            }
+            let arg_str = regs
+                .iter()
+                .map(|(r, ty)| format!("{ty} {r}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let ret_ty = if ret_str {
+                "ptr"
+            } else if ret_bool {
+                "i8"
+            } else {
+                "i64"
+            };
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call {ret_ty} @{sym}({arg_str})"));
+            if ret_bool {
+                // i8 → i1（bool 语义：与 file_write 的桥返回转换一致）
+                let b = self.new_reg();
+                self.line(&format!("{b} = icmp ne i8 {tmp}, 0"));
+                return Ok((b, "i1"));
+            }
+            return Ok((tmp, ret_ty));
         }
         // 内置 to_string：单数字参数（i64/f64），返回 string（数字格式化）。
         // 按实参类型分派 i64/f64 桥（与解释路径一致）。

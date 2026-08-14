@@ -285,6 +285,22 @@ func ensure_builtins() {
         table_push(bi_ret, ret_of(kinds[i], kws[i]))
         i = i + 1
     }
+    // ---------- 网络原语（P0：std/net，独立子表保持主表二分安全）----------
+    // net 条目按字母序追加在主表之后（net_close < net_tcp_* < net_udp_*），
+    // 下标 = 主表长度 + 子表下标（builtin_lookup 未命中主表时二分查此段）。
+    // 返回类型（TyKw 索引）：close=Bool(10)，两个 recv=Str(13)，其余=I64(3)。
+    var net_names: table<string> = ["net_close", "net_tcp_accept",
+        "net_tcp_connect", "net_tcp_listen", "net_tcp_recv",
+        "net_tcp_send", "net_udp_bind", "net_udp_recv", "net_udp_send"]
+    var net_nargs: table<i64> = [1, 1, 2, 1, 2, 2, 1, 2, 4]
+    var net_kws: table<i64> = [10, 3, 3, 3, 13, 3, 3, 13, 3]
+    var i2: i64 = 0
+    while i2 < len(net_names) {
+        table_push(bi_keys, net_names[i2])
+        table_push(bi_nargs, net_nargs[i2])
+        table_push(bi_ret, types.named(net_kws[i2]))
+        i2 = i2 + 1
+    }
 }
 
 // 内置函数条目总数（权威 73）。
@@ -297,8 +313,24 @@ pub func builtin_count() -> i64 {
 // （调用方按"用户函数"处理，对齐 builtin_call 返回 -3 语义）。
 pub func builtin_lookup(name: string) -> i64 {
     ensure_builtins()
+    // 主表（73 项，有序）二分范围 [0, base)
+    var base = len(bi_keys) - 9
     var lo: i64 = 0
-    var hi: i64 = len(bi_keys) - 1
+    var hi = base - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if bi_keys[mid] == name {
+            return mid
+        }
+        if bi_keys[mid] < name {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    // net 子表（追加在主表后，9 项有序）二分范围 [base, len)
+    lo = base
+    hi = len(bi_keys) - 1
     while lo <= hi {
         var mid = (lo + hi) / 2
         if bi_keys[mid] == name {

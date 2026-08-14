@@ -20,6 +20,11 @@
 
 use std::ffi::{c_char, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use tie_frontend::ast::{BinaryOp, Expr, FnDefStmt, Stmt, TableId, TypeSpec};
 use tie_frontend::lexer::{tokenize, TyKw};
@@ -1131,6 +1136,190 @@ pub extern "C" fn tie_list_dir(path: *const c_char) -> *mut DynTable {
         tie_table_push_string(t, c.into_raw());
     }
     t
+}
+
+// ---------- 网络原语（P0：std/net 底座，2026-08-15）----------
+//
+// 设计说明：TCP/UDP socket 是「语言层无法自举的系统能力」（句柄/套接字/内核对象），
+// 按「表达不了才 Rust 底座」原则由本层提供桥函数，tie 侧 std/net.tie 做命名空间封装。
+// 句柄模型：i64 自增 id → 套接字对象（全局表，进程内跨函数有效；id 从 1 起）。
+// 返回值约定：句柄失败 -1；send 返回字节数（失败 -1）；bool 桥返回 i8（1/0）；
+// recv 返回堆串（连接关闭/无数据返回空串哨兵），调用方用完必须 tie_free_result。
+// 阻塞语义：accept/recv 阻塞等待（tie 单线程模型，与解释/编译两路径一致）。
+
+/// 网络句柄的底层对象（监听器 / 流 / UDP 套接字）。
+enum NetHandle {
+    TcpListener(TcpListener),
+    TcpStream(TcpStream),
+    Udp(UdpSocket),
+}
+
+/// 全局句柄表：i64 id → 套接字对象（进程内共享，跨函数有效）。
+static NET_HANDLES: OnceLock<Mutex<HashMap<i64, NetHandle>>> = OnceLock::new();
+/// 句柄 id 自增分配器（从 1 起，0 保留为哨兵）。
+static NET_NEXT_ID: AtomicI64 = AtomicI64::new(1);
+
+/// 获取全局句柄表（惰性初始化）。
+fn net_handles() -> &'static Mutex<HashMap<i64, NetHandle>> {
+    NET_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 分配新句柄 id 并登记对象，返回 id（供 tie 侧持有）。
+fn net_register(h: NetHandle) -> i64 {
+    let id = NET_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    net_handles().lock().unwrap().insert(id, h);
+    id
+}
+
+/// 按 id 取出对象并移除登记（close 语义：drop 即关闭套接字）。
+fn net_take(id: i64) -> Option<NetHandle> {
+    net_handles().lock().unwrap().remove(&id)
+}
+
+/// C ABI 桥：TCP 监听（0.0.0.0:port），成功返回句柄 id，失败返回 -1。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_net_tcp_listen(port: i64) -> i64 {
+    match TcpListener::bind(("0.0.0.0", port as u16)) {
+        Ok(l) => net_register(NetHandle::TcpListener(l)),
+        Err(_) => -1,
+    }
+}
+
+/// C ABI 桥：接受一个 TCP 连接（阻塞），成功返回新连接句柄 id，失败返回 -1。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_net_tcp_accept(handle: i64) -> i64 {
+    let listener = {
+        let mut guard = net_handles().lock().unwrap();
+        match guard.get(&handle) {
+            Some(NetHandle::TcpListener(l)) => l.try_clone().ok(),
+            _ => None,
+        }
+    };
+    match listener {
+        Some(l) => match l.accept() {
+            Ok((stream, _)) => net_register(NetHandle::TcpStream(stream)),
+            Err(_) => -1,
+        },
+        None => -1,
+    }
+}
+
+/// C ABI 桥：TCP 连接远端（host:port），成功返回连接句柄 id，失败返回 -1。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_net_tcp_connect(host: *const c_char, port: i64) -> i64 {
+    let host = match unsafe { c_char_to_string(host) } {
+        Ok(h) => h,
+        Err(_) => return -1,
+    };
+    match TcpStream::connect((host.as_str(), port as u16)) {
+        Ok(s) => net_register(NetHandle::TcpStream(s)),
+        Err(_) => -1,
+    }
+}
+
+/// C ABI 桥：TCP 发送数据（阻塞写完），返回发送字节数，失败返回 -1。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_net_tcp_send(handle: i64, data: *const c_char) -> i64 {
+    let data = match unsafe { c_char_to_string(data) } {
+        Ok(d) => d,
+        Err(_) => return -1,
+    };
+    let mut guard = net_handles().lock().unwrap();
+    match guard.get_mut(&handle) {
+        Some(NetHandle::TcpStream(s)) => match s.write(data.as_bytes()) {
+            Ok(n) => n as i64,
+            Err(_) => -1,
+        },
+        _ => -1,
+    }
+}
+
+/// C ABI 桥：TCP 接收数据（最多 max 字节，阻塞），返回堆串；连接关闭返回空串哨兵。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_net_tcp_recv(handle: i64, max: i64) -> *mut c_char {
+    let mut buf = vec![0u8; max.max(1) as usize];
+    let n = {
+        let mut guard = net_handles().lock().unwrap();
+        match guard.get_mut(&handle) {
+            Some(NetHandle::TcpStream(s)) => match s.read(&mut buf) {
+                Ok(n) => n as i64,
+                Err(_) => -1,
+            },
+            _ => -1,
+        }
+    };
+    if n < 0 {
+        return std::ptr::null_mut();
+    }
+    // 连接关闭（EOF）：空串哨兵（与「收到 0 字节」同义，调用方用 len==0 判断）
+    let s = String::from_utf8_lossy(&buf[..n as usize]).into_owned();
+    string_to_c_char(s)
+}
+
+/// C ABI 桥：UDP 绑定本地端口，成功返回句柄 id，失败返回 -1。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_net_udp_bind(port: i64) -> i64 {
+    match UdpSocket::bind(("0.0.0.0", port as u16)) {
+        Ok(u) => net_register(NetHandle::Udp(u)),
+        Err(_) => -1,
+    }
+}
+
+/// C ABI 桥：UDP 发送数据报（host:port），返回发送字节数，失败返回 -1。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_net_udp_send(
+    handle: i64,
+    host: *const c_char,
+    port: i64,
+    data: *const c_char,
+) -> i64 {
+    let host = match unsafe { c_char_to_string(host) } {
+        Ok(h) => h,
+        Err(_) => return -1,
+    };
+    let data = match unsafe { c_char_to_string(data) } {
+        Ok(d) => d,
+        Err(_) => return -1,
+    };
+    let mut guard = net_handles().lock().unwrap();
+    match guard.get_mut(&handle) {
+        Some(NetHandle::Udp(u)) => match u.send_to(data.as_bytes(), (host.as_str(), port as u16)) {
+            Ok(n) => n as i64,
+            Err(_) => -1,
+        },
+        _ => -1,
+    }
+}
+
+/// C ABI 桥：UDP 接收数据报（最多 max 字节，阻塞），返回堆串；失败返回 NULL。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_net_udp_recv(handle: i64, max: i64) -> *mut c_char {
+    let mut buf = vec![0u8; max.max(1) as usize];
+    let n = {
+        let mut guard = net_handles().lock().unwrap();
+        match guard.get_mut(&handle) {
+            Some(NetHandle::Udp(u)) => match u.recv(&mut buf) {
+                Ok(n) => n as i64,
+                Err(_) => -1,
+            },
+            _ => -1,
+        }
+    };
+    if n < 0 {
+        return std::ptr::null_mut();
+    }
+    let s = String::from_utf8_lossy(&buf[..n as usize]).into_owned();
+    string_to_c_char(s)
+}
+
+/// C ABI 桥：关闭句柄（移除并 drop 底层套接字），成功返回 1（bool true）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_net_close(handle: i64) -> i8 {
+    if net_take(handle).is_some() {
+        1
+    } else {
+        0
+    }
 }
 
 // ---------- M4 补齐：系统能力 floor 内置函数 C ABI 桥 ----------
@@ -3042,6 +3231,107 @@ impl<'a> Env<'a> {
                 let s = unsafe { c_char_to_string(p).unwrap_or_default() };
                 tie_free_result(p);
                 Ok(Value::Str(s))
+            }
+            // ---------- 网络原语（P0：std/net）----------
+            // 与编译路径共用同一 C ABI 桥实现，行为逐字节一致。
+            "net_tcp_listen" => {
+                if args.len() != 1 {
+                    return Err("net_tcp_listen 需要一个端口参数".into());
+                }
+                let Value::Int(port) = args[0] else {
+                    return Err("net_tcp_listen 需要一个端口参数".into());
+                };
+                Ok(Value::Int(tie_net_tcp_listen(port)))
+            }
+            "net_tcp_accept" => {
+                if args.len() != 1 {
+                    return Err("net_tcp_accept 需要一个句柄参数".into());
+                }
+                let Value::Int(h) = args[0] else {
+                    return Err("net_tcp_accept 需要一个句柄参数".into());
+                };
+                Ok(Value::Int(tie_net_tcp_accept(h)))
+            }
+            "net_tcp_connect" => {
+                if args.len() != 2 {
+                    return Err("net_tcp_connect 需要 主机+端口 两个参数".into());
+                }
+                let (Value::Str(host), Value::Int(port)) = (&args[0], &args[1]) else {
+                    return Err("net_tcp_connect 需要 主机+端口 两个参数".into());
+                };
+                let h = CString::new(host.as_str()).unwrap_or_default();
+                Ok(Value::Int(tie_net_tcp_connect(h.as_ptr(), *port)))
+            }
+            "net_tcp_send" => {
+                if args.len() != 2 {
+                    return Err("net_tcp_send 需要 句柄+数据 两个参数".into());
+                }
+                let (Value::Int(h), Value::Str(data)) = (&args[0], &args[1]) else {
+                    return Err("net_tcp_send 需要 句柄+数据 两个参数".into());
+                };
+                let d = CString::new(data.as_str()).unwrap_or_default();
+                Ok(Value::Int(tie_net_tcp_send(*h, d.as_ptr())))
+            }
+            "net_tcp_recv" => {
+                if args.len() != 2 {
+                    return Err("net_tcp_recv 需要 句柄+最大字节数 两个参数".into());
+                }
+                let (Value::Int(h), Value::Int(max)) = (&args[0], &args[1]) else {
+                    return Err("net_tcp_recv 需要 句柄+最大字节数 两个参数".into());
+                };
+                let r = tie_net_tcp_recv(*h, *max);
+                if r.is_null() {
+                    return Err("net_tcp_recv 失败（句柄无效或读错误）".into());
+                }
+                let s = unsafe { c_char_to_string(r).unwrap_or_default() };
+                tie_free_result(r);
+                Ok(Value::Str(s))
+            }
+            "net_udp_bind" => {
+                if args.len() != 1 {
+                    return Err("net_udp_bind 需要一个端口参数".into());
+                }
+                let Value::Int(port) = args[0] else {
+                    return Err("net_udp_bind 需要一个端口参数".into());
+                };
+                Ok(Value::Int(tie_net_udp_bind(port)))
+            }
+            "net_udp_send" => {
+                if args.len() != 4 {
+                    return Err("net_udp_send 需要 句柄+主机+端口+数据 四个参数".into());
+                }
+                let (Value::Int(h), Value::Str(host), Value::Int(port), Value::Str(data)) =
+                    (&args[0], &args[1], &args[2], &args[3])
+                else {
+                    return Err("net_udp_send 需要 句柄+主机+端口+数据 四个参数".into());
+                };
+                let ho = CString::new(host.as_str()).unwrap_or_default();
+                let d = CString::new(data.as_str()).unwrap_or_default();
+                Ok(Value::Int(tie_net_udp_send(*h, ho.as_ptr(), *port, d.as_ptr())))
+            }
+            "net_udp_recv" => {
+                if args.len() != 2 {
+                    return Err("net_udp_recv 需要 句柄+最大字节数 两个参数".into());
+                }
+                let (Value::Int(h), Value::Int(max)) = (&args[0], &args[1]) else {
+                    return Err("net_udp_recv 需要 句柄+最大字节数 两个参数".into());
+                };
+                let r = tie_net_udp_recv(*h, *max);
+                if r.is_null() {
+                    return Err("net_udp_recv 失败（句柄无效或读错误）".into());
+                }
+                let s = unsafe { c_char_to_string(r).unwrap_or_default() };
+                tie_free_result(r);
+                Ok(Value::Str(s))
+            }
+            "net_close" => {
+                if args.len() != 1 {
+                    return Err("net_close 需要一个句柄参数".into());
+                }
+                let Value::Int(h) = args[0] else {
+                    return Err("net_close 需要一个句柄参数".into());
+                };
+                Ok(Value::Bool(tie_net_close(h) != 0))
             }
             "file_write" | "file_append" => {
                 if args.len() != 2 {

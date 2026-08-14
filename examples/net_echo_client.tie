@@ -1,0 +1,20 @@
+type tie<logic>
+// examples/net_echo_client.tie —— TCP echo 客户端（P0：std/net 验证）
+// ============================================================
+// 连接 127.0.0.1:9000，发送 "hello tie"，打印回显。
+// 期望输出：hello tie
+
+import "../std/net.tie"
+using net;
+
+func main() {
+    var conn = net.tcp_connect("127.0.0.1", 9000)
+    if conn < 0 {
+        println("connect failed")
+        return
+    }
+    net.tcp_send(conn, "hello tie")
+    var reply = net.tcp_recv(conn, 4096)
+    println(reply)
+    net.close(conn)
+}

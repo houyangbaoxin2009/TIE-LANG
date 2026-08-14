@@ -1,0 +1,67 @@
+type tie<class>
+// std/net.tie —— 网络库（P0：std/net，命名空间 net）
+// ============================================================
+// 提供 TCP/UDP socket 的 tie 封装（底层为语言底座原语 net_*，C ABI 桥实现）。
+// 句柄模型：i64 自增 id（进程内跨函数有效；0 为哨兵，-1 表示失败）。
+// 约定：
+//   - 句柄失败返回 -1（tcp_listen/tcp_accept/tcp_connect/udp_bind/udp_send）；
+//   - tcp_send/udp_send 返回发送字节数（失败 -1）；
+//   - tcp_recv/udp_recv 返回接收到的字符串（阻塞；连接关闭/无数据返回空串哨兵，
+//     调用方用 len == 0 判断对端关闭），max 为单次接收上限字节数；
+//   - close 关闭句柄并释放底层套接字。
+// 阻塞语义：accept/recv 阻塞等待（tie 单线程模型）。
+// 参考验收：examples/net_echo_server.tie / examples/net_echo_client.tie。
+
+namespace net {
+
+    // ---------- TCP ----------
+
+    // 监听 0.0.0.0:port，返回监听句柄（失败 -1）。
+    pub func tcp_listen(port: i64) -> i64 {
+        return net_tcp_listen(port)
+    }
+
+    // 接受一个连接（阻塞），返回连接句柄（失败 -1）。
+    pub func tcp_accept(handle: i64) -> i64 {
+        return net_tcp_accept(handle)
+    }
+
+    // 连接远端 host:port，返回连接句柄（失败 -1）。
+    pub func tcp_connect(host: string, port: i64) -> i64 {
+        return net_tcp_connect(host, port)
+    }
+
+    // 发送数据（阻塞写完），返回发送字节数（失败 -1）。
+    pub func tcp_send(handle: i64, data: string) -> i64 {
+        return net_tcp_send(handle, data)
+    }
+
+    // 接收数据（最多 max 字节，阻塞），返回字符串；连接关闭返回空串。
+    pub func tcp_recv(handle: i64, max: i64) -> string {
+        return net_tcp_recv(handle, max)
+    }
+
+    // ---------- UDP ----------
+
+    // 绑定本地端口，返回套接字句柄（失败 -1）。
+    pub func udp_bind(port: i64) -> i64 {
+        return net_udp_bind(port)
+    }
+
+    // 发送数据报（host:port），返回发送字节数（失败 -1）。
+    pub func udp_send(handle: i64, host: string, port: i64, data: string) -> i64 {
+        return net_udp_send(handle, host, port, data)
+    }
+
+    // 接收数据报（最多 max 字节，阻塞），返回字符串。
+    pub func udp_recv(handle: i64, max: i64) -> string {
+        return net_udp_recv(handle, max)
+    }
+
+    // ---------- 通用 ----------
+
+    // 关闭句柄（释放底层套接字），成功返回 true。
+    pub func close(handle: i64) -> bool {
+        return net_close(handle)
+    }
+}

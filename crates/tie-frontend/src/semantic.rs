@@ -2608,6 +2608,59 @@ impl Analyzer {
                     }
                     return Ok(TypeSpec::Named(TyKw::Str));
                 }
+                // ---------- 网络原语（P0：std/net，2026-08-15）----------
+                // 签名约定：句柄/端口/字节数为 i64，主机/数据为 string；
+                // net_tcp_recv/net_udp_recv 返回 string，net_close 返回 bool，其余返回 i64。
+                // 参数模式：i=整数 s=字符串（长度即参数个数，顺序即类型）。
+                if name.starts_with("net_") {
+                    let sig: &[&str] = match name.as_str() {
+                        "net_tcp_listen" => &["i"],
+                        "net_tcp_accept" => &["i"],
+                        "net_tcp_connect" => &["s", "i"],
+                        "net_tcp_send" => &["i", "s"],
+                        "net_tcp_recv" => &["i", "i"],
+                        "net_udp_bind" => &["i"],
+                        "net_udp_send" => &["i", "s", "i", "s"],
+                        "net_udp_recv" => &["i", "i"],
+                        "net_close" => &["i"],
+                        _ => {
+                            return Err(SemanticError {
+                                span: *span,
+                                message: format!("未定义的内置函数 '{name}'"),
+                            });
+                        }
+                    };
+                    if args.len() != sig.len() {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("{name}() 期望 {} 个参数，实际 {} 个", sig.len(), args.len()),
+                        });
+                    }
+                    for (a, want) in args.iter().zip(sig) {
+                        let at = self.infer_expr(a, scope)?;
+                        self.result.expr_types.insert(addr_of(a), at.clone());
+                        let ok = match *want {
+                            "i" => at.is_int(),
+                            "s" => matches!(&at, TypeSpec::Named(TyKw::Str)),
+                            _ => false,
+                        };
+                        if !ok {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!(
+                                    "{name}() 参数必须是{}，实际是 {}",
+                                    if *want == "i" { "整数" } else { "字符串" },
+                                    type_name(&at)
+                                ),
+                            });
+                        }
+                    }
+                    return Ok(match name.as_str() {
+                        "net_close" => TypeSpec::Named(TyKw::Bool),
+                        "net_tcp_recv" | "net_udp_recv" => TypeSpec::Named(TyKw::Str),
+                        _ => TypeSpec::Named(TyKw::I64),
+                    });
+                }
                 // ---------- P1 正则表达式内置函数 ----------
                 //
                 // 语义：regex_match 部分匹配即真（RE2 无回溯）；regex_find 返回首个匹配片段；

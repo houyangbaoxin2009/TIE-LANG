@@ -66,6 +66,44 @@ pub func builtin_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 
         }
         return types.named(TK_STR)
     }
+    // ---------- 网络原语（P0：std/net）----------
+    // 签名：close/accept/listen/bind=1 参，connect/send/recv=2 参，udp_send=4 参；
+    // 返回：close=Bool、两个 recv=Str、其余 I64。参数类型由调用点语义检查。
+    if fn_name == "net_close" || fn_name == "net_tcp_accept" ||
+        fn_name == "net_tcp_listen" || fn_name == "net_udp_bind" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        if fn_name == "net_close" {
+            return types.named(TK_BOOL)
+        }
+        return types.named(TK_I64)
+    }
+    if fn_name == "net_tcp_connect" || fn_name == "net_tcp_send" ||
+        fn_name == "net_tcp_recv" || fn_name == "net_udp_recv" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        if fn_name == "net_tcp_recv" || fn_name == "net_udp_recv" {
+            return types.named(TK_STR)
+        }
+        return types.named(TK_I64)
+    }
+    if fn_name == "net_udp_send" {
+        if nargs != 4 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "net_udp_send() 期望 4 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+    }
     if fn_name == "to_string" || fn_name == "parse_int" || fn_name == "parse_float" || fn_name == "parse_trit" {
         if nargs != 1 {
             sm_err_line = s_lines[call_node]

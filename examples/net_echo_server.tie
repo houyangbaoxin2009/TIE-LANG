@@ -1,0 +1,33 @@
+type tie<logic>
+// examples/net_echo_server.tie —— TCP echo 服务器（P0：std/net 验证）
+// ============================================================
+// 监听 9000 端口，接受连接后逐行回显收到的数据，直到对端关闭。
+// 配合 net_echo_client.tie 验证：client 发 "hello tie" → 回显 "hello tie"。
+// 用法：编译运行本文件（后台），再运行 net_echo_client.tie。
+
+import "../std/net.tie"
+using net;
+
+func main() {
+    var srv = net.tcp_listen(9000)
+    if srv < 0 {
+        println("listen failed")
+        return
+    }
+    println("listening on 9000")
+    while true {
+        var conn = net.tcp_accept(srv)
+        if conn < 0 {
+            break
+        }
+        // echo 循环：收到数据原样回发；对端关闭（空串）退出
+        while true {
+            var data = net.tcp_recv(conn, 4096)
+            if len(data) == 0 {
+                break
+            }
+            net.tcp_send(conn, data)
+        }
+        net.close(conn)
+    }
+}

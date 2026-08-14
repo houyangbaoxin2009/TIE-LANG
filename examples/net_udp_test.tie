@@ -1,0 +1,19 @@
+type tie<logic>
+// examples/net_udp_test.tie —— UDP 收发验证（P0：std/net）
+// ============================================================
+// 同进程双套接字：A 绑 9001 发数据报 → B 绑 9002 收。
+// 期望输出：9 / udp hello
+
+import "../std/net.tie"
+using net;
+
+func main() {
+    var a = net.udp_bind(9001)
+    var b = net.udp_bind(9002)
+    var n = net.udp_send(a, "127.0.0.1", 9002, "udp hello")
+    var got = net.udp_recv(b, 4096)
+    println(n)
+    println(got)
+    net.close(a)
+    net.close(b)
+}

@@ -60,6 +60,21 @@ var call_syms: table<i64>;
 // 阶段 A：str_cat 内联序列的临时寄存器计数（与 printf sext 同款独立命名空间，
 // 避免与 %N 值编号冲突）
 var g_str_reg_cnt: i64 = 0;
+// 临时 alloca 提升（F1 增强）+ 行级重编号（对齐 Rust renumber_ir）：
+// irgen 的 ok 槽等临时 alloca 生成在当前块（循环体内），LLVM 对循环内 alloca
+// 生成动态栈分配（sub rsp 无恢复）——百万级循环栈溢出（map-bench 150 轮 →
+// 0xC00000FD，普适 map 段错误根因之一）。修复：gen_func 把函数全部 alloca
+// 前置到 entry block 输出（收集序），再对函数体行级重编号（%N → 1..N 连续）
+// 解决编号倒挂（alloca 值 id 大于后序指令值 id，LLVM 要求块内严格递增）。
+// 函数级缓冲：gen_func 期间 line() 写入 g_fn_lines，结束重编号后追加全局。
+var g_fn_lines: table<string>;
+var g_fn_mode: i64 = 0;
+var g_hoisted_allocas: table<i64>;
+var g_hoisted_cnt: i64 = 0;
+// 重编号映射表：旧值 id → 新值 id（线性，行数规模小）
+var g_ren_old: table<i64>;
+var g_ren_new: table<i64>;
+var g_ren_next: i64 = 1;
 
 namespace llvmgen {
 
@@ -271,7 +286,206 @@ func ns_replace(s: string) -> string {
 }
 
 func line(s: string) {
+    // 函数级缓冲（gen_func 期间）：alloca 提升 + 重编号在函数级完成后再并入
+    if g_fn_mode == 1 {
+        table_push(g_fn_lines, s)
+        return
+    }
     table_push(out_lines, s)
+}
+
+// 行首去空白（重编号判定用；llvmgen 不 import std/string 避免菱形 import，
+// 这里只剥空格/制表符）
+func str_trim_left(s: string) -> string {
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == " " || c == "\t" {
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    var sub: string = ""
+    while i < n {
+        sub = sub + str_char(s, i)
+        i = i + 1
+    }
+    return sub
+}
+
+// 前缀判定：s 是否以 pre 开头（str_char 逐字符比较，不依赖 std/string）
+func str_prefix(s: string, pre: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(pre)
+    if n < m {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(pre, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 行级重编号：把函数体的 %N 值编号重映射为 1..N 连续（对齐 Rust renumber_ir）。
+// 背景：alloca 提升到 entry 后，其值 id 可能大于后续块指令的值 id（alloca 在
+// 循环体中创建，值 id 分配晚于 entry 早期指令），LLVM 解析要求块内指令编号
+// 严格递增——倒挂行报 "instruction expected to be numbered '%N' or greater"。
+// 按行扫描：无编号行（标签/注释/空行/define 等）原样保留；有编号行
+// `%N = ...` 首现分配新号，行内其余 %N 引用复用映射。str_cat 的 %scN / printf
+// 的 %extN 为独立命名空间（非纯数字），不受影响。
+func renumber_lines() {
+    var out = table_new_string()
+    // 每函数独立重编号：映射表清空，新编号从形参个数 g_pcnt 起（形参值 id 占
+    // 0..N-1，定义行保留原样 %0..%N-1，指令新编号从 %N 起避免撞号）。
+    g_ren_old = table_new_i64()
+    g_ren_new = table_new_i64()
+    g_ren_next = g_pcnt
+    var n = len(g_fn_lines)
+    var i: i64 = 0
+    while i < n {
+        var ln = g_fn_lines[i]
+        var t = str_trim_left(ln)
+        // 元行（无 %N 操作数，整行跳过）：define 首行、块标签 bbN:、注释、空行。
+        // br/store/ret/call void 等指令行仍有 %N 操作数 → 走 renumber_line
+        // （引用复用映射；行首无 %N 定义则不产生新编号——对齐 Rust 实现）。
+        var no_num: bool = false
+        if str_len(t) == 0 {
+            no_num = true
+        } else {
+            var c0 = str_char(t, 0)
+            if c0 == ";" || c0 == "(" || c0 == ")" {
+                no_num = true
+            } else if str_prefix(t, "define") {
+                no_num = true
+            } else if str_prefix(t, "bb") {
+                no_num = true
+            } else if str_prefix(t, "unreacha") {
+                no_num = true
+            }
+        }
+        // 有编号行：`%N = ...` —— 首 %N 是定义（分配新号），其余 %N 引用复用。
+        // 但需注意：定义行开头 `%N =` 的 %N 也要重映射（它不是立即数/非数字）。
+        if no_num {
+            table_push(out, ln)
+        } else {
+            var rebuilt = renumber_line(ln)
+            table_push(out, rebuilt)
+        }
+        i = i + 1
+    }
+    g_fn_lines = out
+}
+
+// 单行重编号：行内每个 `%N`（N 为纯数字）重映射；`%scN`/`%extN` 非纯数字不动。
+// 定义/引用区分（关键）：行首 `%N = ...` 的 %N 是**指令定义**（总是分配新号，
+// 即使 N < g_pcnt——函数体值 id 每函数从 0 起，alloca %0 可能与形参位置 %0
+// 撞号）；行内其余 %N 引用按 ren_ref：N < g_pcnt 是形参位置引用（原样保留，
+// define 形参列表 %0..%N-1 不变），否则复用指令映射。
+func renumber_line(ln: string) -> string {
+    var n = str_len(ln)
+    var t = str_trim_left(ln)
+    // 检测定义：trim 后以 % 开头且首 %N 后跟 " ="
+    var lead_def: bool = false
+    var lead_old: i64 = -1
+    var lead_end: i64 = -1  // 定义 %N 在原始 ln 中的结束下标（相对 ln）
+    if str_len(t) > 0 && str_char(t, 0) == "%" {
+        var dj: i64 = 1
+        var ddig: string = ""
+        while dj < str_len(t) {
+            var dc = str_char(t, dj)
+            if dc == "0" || dc == "1" || dc == "2" || dc == "3" || dc == "4" ||
+                dc == "5" || dc == "6" || dc == "7" || dc == "8" || dc == "9" {
+                ddig = ddig + dc
+                dj = dj + 1
+            } else {
+                break
+            }
+        }
+        if str_len(ddig) > 0 && dj < str_len(t) && str_char(t, dj) == " " {
+            // 确认后跟 "= "（否则是引用行，如 `call @f(%0)`）
+            var ek = dj + 1
+            while ek < str_len(t) && str_char(t, ek) == " " {
+                ek = ek + 1
+            }
+            if ek < str_len(t) && str_char(t, ek) == "=" {
+                lead_def = true
+                lead_old = parse_int(ddig)
+                // trim 前导空白数 = str_len(ln) - str_len(t)，定义 %N 结束下标
+                lead_end = (str_len(ln) - str_len(t)) + dj
+            }
+        }
+    }
+    var out: string = ""
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(ln, i)
+        if c == "%" && i + 1 < n {
+            // 尝试读纯数字后缀
+            var j = i + 1
+            var digs: string = ""
+            var is_num: bool = true
+            while j < n {
+                var d = str_char(ln, j)
+                if d == "0" || d == "1" || d == "2" || d == "3" || d == "4" ||
+                    d == "5" || d == "6" || d == "7" || d == "8" || d == "9" {
+                    digs = digs + d
+                    j = j + 1
+                } else {
+                    break
+                }
+            }
+            if str_len(digs) == 0 {
+                is_num = false
+            }
+            if is_num {
+                var old = parse_int(digs)
+                var new_v: i64 = -1
+                // 定义位置：%N 后紧跟空格+等号才可能是定义；lead_end == j 时
+                // 恰是行首定义 %N（首字符 %，无前导空白）
+                if lead_def && i == 0 && j == lead_end {
+                    new_v = ren_def(old)
+                } else {
+                    new_v = ren_ref(old)
+                }
+                out = out + "%" + to_string(new_v)
+                i = j
+                continue
+            }
+        }
+        out = out + c
+        i = i + 1
+    }
+    return out
+}
+
+// 指令定义重映射：总是分配新号（查表复用）。
+func ren_def(old: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_ren_old) {
+        if g_ren_old[i] == old {
+            return g_ren_new[i]
+        }
+        i = i + 1
+    }
+    table_push(g_ren_old, old)
+    table_push(g_ren_new, g_ren_next)
+    var v = g_ren_next
+    g_ren_next = g_ren_next + 1
+    return v
+}
+
+// 引用重映射：形参位置（old < g_pcnt）原样保留；否则复用/分配指令映射。
+func ren_ref(old: i64) -> i64 {
+    if old < g_pcnt {
+        return old
+    }
+    return ren_def(old)
 }
 
 // 行表 → 完整 .ll 文本：分治两两合并。
@@ -475,8 +689,37 @@ func extern_decl(sym: string) -> string {
         return "declare ptr @tie_str_char(ptr, i64)"
     }
     if sym == "tie_str_from_code" {
-        // 码点 → 单字符 UTF-8 字符串（返回堆串，调用方 tie_free_result）
+        // 码点 → 单字符 UTF-8 字符串（返回堆串，调用方负责 tie_free_result）。
         return "declare ptr @tie_str_from_code(i64)"
+    }
+    // ---------- 网络原语（P0：std/net）----------
+    // 句柄 i64；recv 返回 ptr（堆串）；close 返回 i8（bool 桥）。
+    if sym == "tie_net_tcp_listen" {
+        return "declare i64 @tie_net_tcp_listen(i64)"
+    }
+    if sym == "tie_net_tcp_accept" {
+        return "declare i64 @tie_net_tcp_accept(i64)"
+    }
+    if sym == "tie_net_tcp_connect" {
+        return "declare i64 @tie_net_tcp_connect(ptr, i64)"
+    }
+    if sym == "tie_net_tcp_send" {
+        return "declare i64 @tie_net_tcp_send(i64, ptr)"
+    }
+    if sym == "tie_net_tcp_recv" {
+        return "declare ptr @tie_net_tcp_recv(i64, i64)"
+    }
+    if sym == "tie_net_udp_bind" {
+        return "declare i64 @tie_net_udp_bind(i64)"
+    }
+    if sym == "tie_net_udp_send" {
+        return "declare i64 @tie_net_udp_send(i64, ptr, i64, ptr)"
+    }
+    if sym == "tie_net_udp_recv" {
+        return "declare ptr @tie_net_udp_recv(i64, i64)"
+    }
+    if sym == "tie_net_close" {
+        return "declare i8 @tie_net_close(i64)"
     }
     if sym == "tie_to_string_i64" {
         return "declare ptr @tie_to_string_i64(i64)"
@@ -924,7 +1167,15 @@ func gen_inst(inst_id: i64) {
     }
 
     if op == 20 {
-        // alloca
+        // alloca：已提升到 entry（g_hoisted_allocas 含本指令）→ 跳过不输出
+        // （entry 顶部已统一输出，重复输出会与 %N 值编号冲突）。
+        var hi: i64 = 0
+        while hi < g_hoisted_cnt {
+            if g_hoisted_allocas[hi] == inst_id {
+                return
+            }
+            hi = hi + 1
+        }
         var ty = llvm_ty(ir.ins_ty(inst_id))
         line(reg + " = alloca " + ty)
         return
@@ -1545,10 +1796,38 @@ func gen_func(fid: i64) {
         pk = pk + 1
     }
     line("define " + ret_llvm + " @" + sym + "(" + params_llvm + ") {")
-    // 按指令 id 序遍历本函数全部块（块首输出标签）——保证值编号单调递增
+    // F1 增强：临时 alloca 提升到 entry block——本函数全部 alloca（含循环体内
+    // 的 ok 槽）前置输出，再对函数体行级重编号解决编号倒挂。流程：
+    // 1) 切函数级缓冲 g_fn_lines（line() 重定向）；
+    // 2) 收集本函数 alloca 指令 id；
+    // 3) 遍历输出：entry block 标签后统一输出全部 alloca（收集序），
+    //    gen_inst 对已登记 alloca 跳过（op==20 分支）；
+    // 4) renumber_lines() 行级重编号 %N → 1..N 连续；
+    // 5) 并入全局 out_lines，恢复全局缓冲。
+    g_fn_lines = table_new_string()
+    g_fn_mode = 1
+    g_hoisted_cnt = 0
     if g_inst_blk_ready == 0 {
         build_inst_blk()
     }
+    var nia = ir.inst_count()
+    var ia: i64 = 0
+    while ia < nia {
+        var blk_a: i64 = -1
+        if ia < len(g_inst_blk) {
+            blk_a = g_inst_blk[ia]
+        }
+        if blk_a >= 0 && ir.block_func(blk_a) == fid && ir.ins_op(ia) == 20 {
+            table_push(g_hoisted_allocas, ia)
+            g_hoisted_cnt = g_hoisted_cnt + 1
+        }
+        ia = ia + 1
+    }
+    // 按指令 id 序遍历本函数全部块（块首输出标签）——保证值编号单调递增。
+    // entry block（首块）标签后统一输出收集的 alloca——LLVM 要求 alloca 在
+    // entry block 内静态分配（循环内 alloca → 动态栈分配，栈溢出）。
+    var eblk = ir.func_entry(fid)
+    var entry_alloca_done: i64 = 0
     var ni2 = ir.inst_count()
     var ii: i64 = 0
     while ii < ni2 {
@@ -1560,6 +1839,22 @@ func gen_func(fid: i64) {
             if ii == ir.block_start(blk) {
                 // 块标签：统一用块 id（bb<N>），避免 block_name 多 if/for 冲突
                 line("bb" + to_string(blk) + ":")
+                // F1 增强：entry block 标签后统一输出全部收集的 alloca——
+                // 编号按收集序（值 id 全局递增）严格递增，无回退；后续
+                // gen_inst 对已登记 alloca 跳过（op==20 分支）。
+                if blk == eblk && entry_alloca_done == 0 {
+                    var eh: i64 = 0
+                    while eh < g_hoisted_cnt {
+                        var ainst = g_hoisted_allocas[eh]
+                        var ty_a = llvm_ty(ir.ins_ty(ainst))
+                        var v_a = ir.ins_val(ainst)
+                        if v_a >= 0 {
+                            line("%" + to_string(v_a) + " = alloca " + ty_a)
+                        }
+                        eh = eh + 1
+                    }
+                    entry_alloca_done = 1
+                }
             }
             gen_inst(ii)
         }
@@ -1567,6 +1862,15 @@ func gen_func(fid: i64) {
     }
     line("}")
     line("")
+    // 函数级缓冲收尾：行级重编号（%N → 连续新编号，解决 alloca 提升后的
+    // 编号倒挂）后并入全局 out_lines，恢复全局 line() 目标。
+    renumber_lines()
+    var rn: i64 = 0
+    while rn < len(g_fn_lines) {
+        table_push(out_lines, g_fn_lines[rn])
+        rn = rn + 1
+    }
+    g_fn_mode = 0
 }
 
 }
