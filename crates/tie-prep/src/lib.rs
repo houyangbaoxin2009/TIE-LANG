@@ -4,13 +4,16 @@
 //!
 //! 预处理独立于三段式，在源码文本层面工作，职责：
 //! 1. **清理代码**：去除 BOM、规范化换行，产出干净的正文源码；
-//! 2. **识别文件类型**：解析文件最前面的 `// tie:` 头指令，
-//!    判定本文件的角色（logic / ui / db / data / library）；
+//! 2. **识别文件类型**：解析文件头部的 `type tie` / `type tie<X>` 声明行
+//!    （新文件类型声明系统），判定本文件的角色
+//!    （type / script / data / ui / class / logic / port / db）；
+//!    无声明时默认 role = logic；也可按文件名 `<名>.<角色>.tie` 预判
+//!    （[role_from_filename]，头部声明优先于文件名声明）；
 //! 3. **角色判定结果**：由驱动/调用方按角色自动转交对应的工具链
 //!    （编译器 / 界面工具 / 数据库工具 / 数据解析）。
 //!
-//! 头与内容分离原则：头部只允许出现在文件最前面的连续行；
-//! 内容区出现的 `// tie:` 是普通注释，不受预处理影响。
+//! 声明区与内容分离原则：声明行只允许出现在文件最前面的连续行（允许其间空行）；
+//! 内容区出现的 `type tie` 与旧式 `// tie:` 注释都是普通内容，不受预处理影响。
 //!
 //! 本 crate 同时提供：
 //! - 库接口 [preprocess]，供 tie-llvm 等编译器集成；
@@ -18,7 +21,7 @@
 
 pub mod preprocess;
 
-pub use preprocess::{preprocess, run_module, FileRole, Header, PreprocessResult};
+pub use preprocess::{preprocess, role_from_filename, run_module, FileRole, PreprocessResult};
 
 /// 在 Windows 上把控制台输入/输出代码页切换为 UTF-8（65001）。
 ///

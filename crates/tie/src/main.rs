@@ -7,8 +7,10 @@
 //! 2. **传入文件** → 执行 .tie 脚本：
 //!    - 调用 **tie-prep** 完成预处理（清理代码 + 识别文件类型 + 角色判定）；
 //!    - 按文件角色**自动转交对应的工具链**：
-//!      - `logic` / `library` → 转交 **tie-llvm**（前端 + 中间优化 + 后端）
-//!      - `data` / `ui` / `db` → 识别后提示（对应工具链后续版本实现）
+//!      - `logic` / `script` / `class` / `type` → 转交 **tie-llvm**
+//!        （前端 + 中间优化 + 后端；logic/script 产出可执行文件，
+//!         class/type 产出静态库 .a）
+//!      - `data` / `ui` / `db` / `port` → 识别后提示（对应工具链后续版本实现）
 //!
 //! 用户也可绕过本入口单独使用 tie-prep（纯预处理）、tie-llvm（直接编译）
 //! 或 tie-interp（解释执行）。
@@ -84,22 +86,22 @@ tie 语言总入口（四段式调度器 + REPL）
                  包管理器（M6，tie 语言自写；更多见 tie help）
 
 流程:
-  1. tie-prep 预处理（清理代码 + 识别文件类型）
-  2. 按角色自动转交工具链（logic/library → tie-llvm 编译；
-     data/ui/db → 对应工具链，后续版本）
+  1. tie-prep 预处理（清理代码 + 识别文件类型，`type tie` / `type tie<X>` 声明）
+  2. 按角色自动转交工具链（logic/script/class/type → tie-llvm 编译；
+     data/ui/db/port → 对应工具链，后续版本）
 
 选项:
-  -o <file>      指定输出文件路径（默认: 输入同名 .exe；library 角色默认 .a；
+  -o <file>      指定输出文件路径（默认: 输入同名 .exe；class/type 角色默认 .a；
                  仅单文件模式生效）
   -O0|-O1|-O2|-O3
                  优化级别（默认: -O2）
   --target <三元组>
                  交叉编译目标（如 win-x64 / x86_64-pc-windows-msvc，默认: 本机）
   --config <file>
-                 协调统筹配置文件（tie:data 格式；缺省查找当前目录 tie.config，
-                 无则默认全关闭）。开启 advanced.enabled 后，多文件/目录输入
-                 按文件切片、多线程并行编译（每步产物入缓存池，全部切片完成
-                 才进入下一步）；可配置线程数、缓存池大小/位置/存储技术
+                 协调统筹配置文件（tie 数据文件，`type tie<data>` 声明；缺省查找
+                 当前目录 tie.config，无则默认全关闭）。开启 advanced.enabled 后，
+                 多文件/目录输入按文件切片、多线程并行编译（每步产物入缓存池，
+                 全部切片完成才进入下一步）；可配置线程数、缓存池大小/位置/存储技术
   --emit-ir      只生成 LLVM IR（.ll），不继续编译
   --keep-ir      保留中间 IR 文件
   --prep-only    只执行预处理并打印识别结果，不编译（仅单文件模式）
@@ -381,7 +383,8 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // ---- 加载协调统筹配置（tie:data；缺省查 tie.config，无则默认全关闭）----
+    // ---- 加载协调统筹配置（tie 数据文件 `type tie<data>` 声明；缺省查 tie.config，
+    //      无则默认全关闭）----
     let config = match config::load(args.config.as_deref()) {
         Ok(c) => c,
         Err(msg) => {
@@ -444,7 +447,25 @@ fn main() -> ExitCode {
     let pre = tie_prep::preprocess(&source);
 
     // 打印预处理识别结果
-    println!("[tie] 文件: {} | 角色: {} | 头部: {}", input.display(), pre.role, pre.headers.len());
+    println!("[tie] 文件: {} | 角色: {}", input.display(), pre.role);
+
+    // 文件名默认角色与头部声明一致性检查：头部声明优先，不一致时警告。
+    // `xxx.<角色>.tie` 形式的文件名声明只是默认值，头部 `type tie<X>`
+    // 声明是权威——不一致仅提示、不报错，采用头部声明。
+    let name_role = input
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(FileRole::from_filename);
+    if let Some(r) = name_role
+        && r != pre.role
+    {
+        eprintln!(
+            "警告: 文件 {} 名称声明为 {}，与头部声明 {} 不一致，已采用头部声明",
+            input.display(),
+            r,
+            pre.role
+        );
+    }
 
     // --prep-only：只输出识别结果，不转交工具链
     if args.prep_only {
@@ -467,8 +488,9 @@ fn main() -> ExitCode {
 /// 按角色转交对应工具链。
 fn dispatch_role(role: FileRole, args: &Args, input: PathBuf) -> Result<CompileOutcome, String> {
     match role {
-        // logic / library → tie-llvm 编译工具链
-        FileRole::Logic | FileRole::Library => {
+        // logic / script / class / type → tie-llvm 编译工具链
+        // （driver 内部按角色区分产物：logic/script 链接可执行，class/type 归档 .a）
+        FileRole::Logic | FileRole::Script | FileRole::Class | FileRole::Type => {
             let opts = CompileOptions {
                 input,
                 output: args.output.clone(),
@@ -479,7 +501,7 @@ fn dispatch_role(role: FileRole, args: &Args, input: PathBuf) -> Result<CompileO
             };
             tie_llvm::driver::compile(&opts).map_err(|e| e.to_string())
         }
-        // data / ui / db → 对应工具链（v0.1 挂接点）
+        // data / ui / db / port → 对应工具链（v0.1 挂接点）
         FileRole::Data => Ok(CompileOutcome {
             message: "[tie] 角色为 data（数据交换文件），已转交数据解析工具链 —— v0.1 尚未实现".to_string(),
             artifact: None,
@@ -490,6 +512,10 @@ fn dispatch_role(role: FileRole, args: &Args, input: PathBuf) -> Result<CompileO
         }),
         FileRole::Db => Ok(CompileOutcome {
             message: "[tie] 角色为 db（数据库文件），已转交数据库工具链 —— v0.1 尚未实现".to_string(),
+            artifact: None,
+        }),
+        FileRole::Port => Ok(CompileOutcome {
+            message: "[tie] 角色为 port（接口文件），已转交端口工具链 —— v0.1 尚未实现".to_string(),
             artifact: None,
         }),
     }

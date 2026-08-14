@@ -123,37 +123,69 @@ impl Parser {
         // 顶层只允许函数定义、import、using、struct、命名空间声明、extern 声明
         // 与全局持久变量（var/const，M4：跨函数共享的可变状态；import 由
         // driver 递归展开为函数）。extern 仅顶层（函数体内由 parse_stmt 拦截）。
-        while !matches!(self.peek_kind(), TokenKind::Eof) {
-            match self.peek_kind() {
-                TokenKind::Func | TokenKind::Pub => stmts.push(Stmt::FnDef(self.parse_fn_def()?)),
-                TokenKind::Import => stmts.push(Stmt::Import(self.parse_import()?)),
-                TokenKind::Using => stmts.push(Stmt::Using(self.parse_using()?)),
-                TokenKind::Struct => stmts.push(Stmt::Struct(self.parse_struct()?)),
-                TokenKind::Namespace => stmts.push(Stmt::Namespace(self.parse_namespace()?)),
-                // T0.7 extern 函数声明：`extern fn name(...) -> ret;`（仅顶层）
-                TokenKind::Extern => stmts.push(Stmt::Extern(self.parse_extern()?)),
-                // 顶层全局持久变量（跨函数共享；限标量类型 + 字面量初始化，语义层校验）
-                TokenKind::Var | TokenKind::Const => {
-                    let is_const = matches!(self.peek_kind(), TokenKind::Const);
-                    for v in self.parse_var_decl(is_const)? {
-                        stmts.push(Stmt::VarDecl(v));
-                    }
-                }
-                other => {
-                    return Err(self.err(format!(
-                        "顶层只允许函数定义、import、using、struct、命名空间声明、extern 声明或全局变量，实际是 {}",
-                        self.describe(other)
-                    )))
-                }
-            }
+        // 允许的语句集合由共享的 parse_top_level_stmt 统一维护，保证与
+        // 单文件命名空间体完全一致。
+        while let Some(decls) = self.parse_top_level_stmt()? {
+            stmts.extend(decls);
         }
         Ok(Program { stmts })
     }
 
-    /// 命名空间声明（C# 风格块式）：`namespace tcmsg { ... }` 或点分 `namespace tcmsg.error { ... }`。
+    /// 解析一条顶层语句，返回其产生的语句列表（var/const 元组解构会展开为多条）。
     ///
-    /// 路径段用 `.` 连接（点分声明）；体内允许函数定义、类定义与嵌套命名空间。
-    /// 前缀命名（`namespace tcmsg;`）由 tie-prep 预处理转化为块式后进入本函数。
+    /// 返回 None 表示已到达文件末尾（EOF）。parse_program 与单文件命名空间体
+    /// 共用此函数，保证两处允许的顶层语句集合完全一致。
+    ///
+    /// 顶层允许：函数定义（func/pub）、import、using、struct、命名空间声明、
+    /// extern 声明与全局持久变量（var/const）。**单文件命名空间体复用同一集合**
+    /// ——因为单文件模式下文件的全部内容都被包裹进命名空间，其中出现的
+    /// import/using/extern/var/const 应保持合法（import/using 由 imports.rs
+    /// 在 AST 层面展开，与所在命名空间层级无关；这比块式体内仅允许
+    /// 函数/struct/嵌套命名空间更宽松，是刻意为之）。
+    fn parse_top_level_stmt(&mut self) -> Result<Option<Vec<Stmt>>, ParseError> {
+        if matches!(self.peek_kind(), TokenKind::Eof) {
+            return Ok(None);
+        }
+        match self.peek_kind() {
+            TokenKind::Func | TokenKind::Pub => Ok(Some(vec![Stmt::FnDef(self.parse_fn_def()?)])),
+            TokenKind::Import => Ok(Some(vec![Stmt::Import(self.parse_import()?)])),
+            TokenKind::Using => Ok(Some(vec![Stmt::Using(self.parse_using()?)])),
+            TokenKind::Struct => Ok(Some(vec![Stmt::Struct(self.parse_struct()?)])),
+            TokenKind::Namespace => Ok(Some(vec![Stmt::Namespace(self.parse_namespace()?)])),
+            // T0.7 extern 函数声明：`extern fn name(...) -> ret;`（仅顶层）
+            TokenKind::Extern => Ok(Some(vec![Stmt::Extern(self.parse_extern()?)])),
+            // 顶层全局持久变量（跨函数共享；限标量类型 + 字面量初始化，语义层校验）
+            TokenKind::Var | TokenKind::Const => {
+                let is_const = matches!(self.peek_kind(), TokenKind::Const);
+                Ok(Some(
+                    self.parse_var_decl(is_const)?.into_iter().map(Stmt::VarDecl).collect(),
+                ))
+            }
+            other => Err(self.err(format!(
+                "顶层只允许函数定义、import、using、struct、命名空间声明、extern 声明或全局变量，实际是 {}",
+                self.describe(other)
+            ))),
+        }
+    }
+
+    /// 命名空间声明，三种形态：
+    ///
+    /// 1. **块式** `namespace tcmsg { ... }` 或点分 `namespace tcmsg.error { ... }`：
+    ///    体内语句限定为函数定义 / struct / 嵌套命名空间，以 `}` 收尾；
+    /// 2. **单文件（ASI 分号）** `namespace tcmsg` 独占一行后接文件剩余内容：
+    ///    ASI 词法器在行尾补 `Semi`，本函数把**文件剩余的全部顶层语句**归入该
+    ///    命名空间，直到文件结束（无需闭合花括号）；
+    /// 3. **单文件（显式分号）** `namespace tcmsg;`：与形态 2 完全等价。
+    ///
+    /// 形态 2/3 的 `;` 只是可选的标记——`namespace foo` 换行（ASI 补分号）与
+    /// 手写 `namespace foo;` 产生完全一致的 AST。二者都表示「从声明处起，整份
+    /// 文件被包裹进该命名空间」，体内允许与 parse_program 顶层一致的语句集合
+    /// （函数/import/using/struct/namespace/extern/var/const，见
+    /// parse_top_level_stmt 的说明）。
+    ///
+    /// 单文件模式下的嵌套 `namespace` 经本函数递归处理：块式嵌套以 `{ }` 界定
+    /// 边界；单文件嵌套继续把声明之后的剩余内容归入内层命名空间。EOF 自然结束
+    /// 最外层单文件命名空间体。
     fn parse_namespace(&mut self) -> Result<NamespaceStmt, ParseError> {
         let span = self.advance().span; // 消费 `namespace`
         // 路径：至少一段标识符，可点分（`tcmsg.error`）
@@ -161,24 +193,36 @@ impl Parser {
         while self.eat(&TokenKind::Dot) {
             path.push(self.expect_ident()?);
         }
-        self.expect(TokenKind::LBrace, "命名空间声明必须跟 '{'")?;
-        // 体内语句：函数 / 类 / 嵌套命名空间
-        let mut body = Vec::new();
-        while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
-            match self.peek_kind() {
-                TokenKind::Func | TokenKind::Pub => body.push(Stmt::FnDef(self.parse_fn_def()?)),
-                TokenKind::Struct => body.push(Stmt::Struct(self.parse_struct()?)),
-                TokenKind::Namespace => body.push(Stmt::Namespace(self.parse_namespace()?)),
-                other => {
-                    return Err(self.err(format!(
-                        "命名空间体内只允许函数定义、类定义或嵌套命名空间，实际是 {}",
-                        self.describe(other)
-                    )))
+        // 分支：`{` → 块式；其余（含 `;` 与 EOF）→ 单文件模式
+        if self.eat(&TokenKind::LBrace) {
+            // 块式：体内语句限定为函数 / struct / 嵌套命名空间
+            let mut body = Vec::new();
+            while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
+                match self.peek_kind() {
+                    TokenKind::Func | TokenKind::Pub => body.push(Stmt::FnDef(self.parse_fn_def()?)),
+                    TokenKind::Struct => body.push(Stmt::Struct(self.parse_struct()?)),
+                    TokenKind::Namespace => body.push(Stmt::Namespace(self.parse_namespace()?)),
+                    other => {
+                        return Err(self.err(format!(
+                            "命名空间体内只允许函数定义、类定义或嵌套命名空间，实际是 {}",
+                            self.describe(other)
+                        )))
+                    }
                 }
             }
+            self.expect(TokenKind::RBrace, "命名空间声明必须跟 '}'")?;
+            Ok(NamespaceStmt { path, body, span })
+        } else {
+            // 单文件模式：先吃掉可选的 `;`（ASI 在 `namespace foo` 行尾补出的
+            // 分号，或手写 `namespace foo;` 的显式分号，二者等价），随后解析
+            // 文件剩余的全部顶层语句直至 EOF 作为命名空间体。
+            self.eat(&TokenKind::Semi);
+            let mut body = Vec::new();
+            while let Some(decls) = self.parse_top_level_stmt()? {
+                body.extend(decls);
+            }
+            Ok(NamespaceStmt { path, body, span })
         }
-        self.expect(TokenKind::RBrace, "命名空间声明必须跟 '}'")?;
-        Ok(NamespaceStmt { path, body, span })
     }
 
     /// import 语句：`import "./x.tie"` 或 `import "./x.tie" as 别名`。
@@ -1540,6 +1584,87 @@ mod tests {
         let Stmt::Namespace(ns) = &prog.stmts[0] else { panic!("期望命名空间声明") };
         assert_eq!(ns.path, vec!["tcmsg", "error"]);
         assert!(ns.body.is_empty());
+    }
+
+    // ---------- 单文件命名空间（无花括号包裹）----------
+
+    /// `namespace foo` 独占一行（ASI 在行尾补 `Semi`）后接文件剩余内容：
+    /// 剩余全部顶层语句应归入命名空间 foo，直到文件结束。
+    #[test]
+    fn 单文件命名空间ASI分号把后续顶层语句纳入() {
+        let prog = parse("namespace foo\nfunc main() {}\n");
+        assert_eq!(prog.stmts.len(), 1, "顶层应只剩一个命名空间声明");
+        let Stmt::Namespace(ns) = &prog.stmts[0] else { panic!("期望命名空间声明") };
+        assert_eq!(ns.path, vec!["foo"]);
+        assert_eq!(ns.body.len(), 1, "foo 应包含 main 函数");
+        let Stmt::FnDef(f) = &ns.body[0] else { panic!("期望 foo 内的函数定义") };
+        assert_eq!(f.name, "main");
+    }
+
+    /// 显式分号 `namespace foo;` 与 ASI 分号完全等价：后续顶层语句全部入 foo。
+    #[test]
+    fn 单文件命名空间显式分号等价于ASI分号() {
+        let prog = parse("namespace foo;\nfunc a() {}\n");
+        let Stmt::Namespace(ns) = &prog.stmts[0] else { panic!("期望命名空间声明") };
+        assert_eq!(ns.path, vec!["foo"]);
+        let Stmt::FnDef(f) = &ns.body[0] else { panic!("期望 foo 内的函数定义") };
+        assert_eq!(f.name, "a");
+    }
+
+    /// 单文件模式下的嵌套：`namespace a`（单文件）后出现块式 `namespace b { }`
+    /// 与函数 `func c() {}`——两者都嵌套在 a 体内；b 是块式嵌套（体为空），
+    /// c 是 a 的直接子语句。
+    #[test]
+    fn 单文件命名空间内嵌套块式命名空间与函数() {
+        let prog = parse("namespace a\nnamespace b {\n}\nfunc c() {}\n");
+        let Stmt::Namespace(ns_a) = &prog.stmts[0] else { panic!("期望命名空间声明") };
+        assert_eq!(ns_a.path, vec!["a"]);
+        assert_eq!(ns_a.body.len(), 2, "a 应含嵌套的 b 与函数 c");
+        // body[0]：块式嵌套命名空间 b
+        let Stmt::Namespace(ns_b) = &ns_a.body[0] else { panic!("期望 a 内的嵌套命名空间 b") };
+        assert_eq!(ns_b.path, vec!["b"]);
+        assert!(ns_b.body.is_empty(), "b 为块式空体");
+        // body[1]：函数 c（a 的直接子语句）
+        let Stmt::FnDef(f) = &ns_a.body[1] else { panic!("期望 a 内的函数定义") };
+        assert_eq!(f.name, "c");
+    }
+
+    /// 单文件模式内的嵌套单文件命名空间：`namespace a\nnamespace b\nfunc c() {}`
+    /// ——b 继续把剩余内容（c）归入自己，a 体内只剩嵌套的 b。
+    #[test]
+    fn 单文件命名空间内嵌套单文件命名空间() {
+        let prog = parse("namespace a\nnamespace b\nfunc c() {}\n");
+        let Stmt::Namespace(ns_a) = &prog.stmts[0] else { panic!("期望命名空间声明") };
+        assert_eq!(ns_a.path, vec!["a"]);
+        assert_eq!(ns_a.body.len(), 1, "a 内应只有嵌套的 b");
+        let Stmt::Namespace(ns_b) = &ns_a.body[0] else { panic!("期望 a 内的嵌套命名空间 b") };
+        assert_eq!(ns_b.path, vec!["b"]);
+        let Stmt::FnDef(f) = &ns_b.body[0] else { panic!("期望 b 内的函数定义") };
+        assert_eq!(f.name, "c");
+    }
+
+    /// 块式命名空间仍按原语义解析（体内函数进 body）。
+    #[test]
+    fn 块式命名空间保持不变() {
+        let prog = parse("namespace tcmsg { func f() {} }\n");
+        let Stmt::Namespace(ns) = &prog.stmts[0] else { panic!("期望命名空间声明") };
+        assert_eq!(ns.path, vec!["tcmsg"]);
+        assert_eq!(ns.body.len(), 1);
+        let Stmt::FnDef(f) = &ns.body[0] else { panic!("期望 tcmsg 内的函数定义") };
+        assert_eq!(f.name, "f");
+    }
+
+    /// 空单文件命名空间：文件在 `namespace foo` 后立即结束 → 空体。
+    #[test]
+    fn 空单文件命名空间文件末尾() {
+        let prog = parse("namespace foo\n");
+        let Stmt::Namespace(ns) = &prog.stmts[0] else { panic!("期望命名空间声明") };
+        assert_eq!(ns.path, vec!["foo"]);
+        assert!(ns.body.is_empty(), "文件结束时空体");
+        // 显式分号 + 文件结束同样得到空体
+        let prog2 = parse("namespace foo;\n");
+        let Stmt::Namespace(ns2) = &prog2.stmts[0] else { panic!("期望命名空间声明") };
+        assert!(ns2.body.is_empty(), "显式分号 + 文件结束应为空体");
     }
 
     #[test]

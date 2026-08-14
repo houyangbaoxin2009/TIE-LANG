@@ -5,16 +5,20 @@
 //! 源码 .tie
 //!   → 预处理（清理代码 + 识别文件类型 + 角色判定）   [preprocess]
 //!   → 分派（按角色转交对应工具链）                   [driver::dispatch]
-//!   └── 编译工具链（logic / library）：
+//!   └── 编译工具链（logic/script → 可执行文件；class/type → 静态库 .a）：
 //!         → 词法分析（含 ASI）    [tie_frontend::lexer]
 //!         → 语法分析              [tie_frontend::parser]
 //!         → 语义分析（类型检查）  [tie_frontend::semantic]
 //!         → IR 生成              [ir]
 //!         → opt 中间优化         [optimizer]
 //!         → clang 链接生成可执行 [backend]
-//!   └── 其他工具链（data / ui / db）：由预处理识别角色后转交，
+//!   └── 其他工具链（data / ui / db / port）：由预处理识别角色后转交，
 //!         v0.1 阶段挂接点已就绪（后续版本实现）
 //! ```
+//!
+//! 文件角色由 `type tie` / `type tie<X>` 声明（新文件类型声明系统）或
+//! 文件名 `<名>.<角色>.tie` 决定；优化级别与交叉编译目标仅来自 CLI
+//! （旧 `// tie:xxx` 头部指令系统已完全移除）。
 
 use crate::backend;
 use crate::ir;
@@ -32,9 +36,9 @@ use tie_prep::preprocess::{self, FileRole, PreprocessResult};
 pub struct CompileOptions {
     /// 输入源码路径
     pub input: PathBuf,
-    /// 输出可执行文件路径（默认：输入同名 .exe；library 角色默认 .a）
+    /// 输出产物路径（默认：logic/script 输入同名 .exe；class/type 输入同名 .a）
     pub output: Option<PathBuf>,
-    /// 优化级别（None = 未显式指定，可由头部 `opt=` 覆盖）
+    /// 优化级别（None = 默认 O2；仅来自 CLI，头部指令已移除）
     pub opt_level: Option<OptLevel>,
     /// 只生成 IR（.ll），不继续编译
     pub emit_ir_only: bool,
@@ -49,7 +53,7 @@ pub struct CompileOptions {
 pub struct CompileOutcome {
     /// 面向用户的描述（"编译成功: x.exe" / "识别为 data 文件…"）
     pub message: String,
-    /// 产物路径（编译类角色的可执行文件 / .ll；其他角色为 None）
+    /// 产物路径（编译类角色的可执行文件 / 静态库 .a / .ll；其他角色为 None）
     pub artifact: Option<PathBuf>,
 }
 
@@ -94,23 +98,29 @@ impl std::fmt::Display for CompileError {
 
 /// 工具链分派结果：按文件角色决定处理路径。
 enum Dispatch {
-    /// 编译工具链（logic / library）
+    /// 编译工具链（logic / script → 链接可执行文件）
     Compile,
+    /// 库编译工具链（class / type → 打包静态库 .a）
+    CompileLib,
     /// 数据解析工具链（data）
     Data,
     /// UI 工具链（ui）
     Ui,
     /// 数据库工具链（db）
     Db,
+    /// 端口/对外接口工具链（port）
+    Port,
 }
 
 /// 按角色分派工具链（预处理识别 → 自动转交对应工具）。
 fn dispatch(role: FileRole) -> Dispatch {
     match role {
-        FileRole::Logic | FileRole::Library => Dispatch::Compile,
+        FileRole::Logic | FileRole::Script => Dispatch::Compile,
+        FileRole::Class | FileRole::Type => Dispatch::CompileLib,
         FileRole::Data => Dispatch::Data,
         FileRole::Ui => Dispatch::Ui,
         FileRole::Db => Dispatch::Db,
+        FileRole::Port => Dispatch::Port,
     }
 }
 
@@ -124,34 +134,50 @@ pub fn compile(opts: &CompileOptions) -> Result<CompileOutcome, CompileError> {
     // 清理代码 + 识别文件类型 + 角色判定
     let pre = preprocess::preprocess(&source);
 
+    // 文件名默认角色与头部声明一致性检查：头部声明优先，不一致时警告。
+    // `xxx.<角色>.tie` 形式的文件名声明只是默认值，头部 `type tie<X>`
+    // 声明是权威——不一致仅提示、不报错，采用头部声明。
+    let name_role = opts
+        .input
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(FileRole::from_filename);
+    if let Some(r) = name_role
+        && r != pre.role
+    {
+        eprintln!(
+            "警告: 文件 {} 名称声明为 {}，与头部声明 {} 不一致，已采用头部声明",
+            opts.input.display(),
+            r,
+            pre.role
+        );
+    }
+
     // ---- 第 2 段：按角色自动分派对应工具 ----
     match dispatch(pre.role) {
-        Dispatch::Compile => compile_program(opts, &pre),
+        // 编译类角色（logic/script → 可执行；class/type → 静态库 .a）
+        Dispatch::Compile | Dispatch::CompileLib => compile_program(opts, &pre),
         Dispatch::Data => Ok(CompileOutcome {
-            message: format!(
-                "[预处理] 识别为 data 数据交换文件（头: {:?}），已转交数据解析工具链 —— v0.1 数据交换工具链尚未实现",
-                header_texts(&pre)
-            ),
+            message: "[预处理] 识别为 data 数据交换文件，已转交数据解析工具链 —— v0.1 数据交换工具链尚未实现"
+                .to_string(),
             artifact: None,
         }),
         Dispatch::Ui => Ok(CompileOutcome {
-            message: format!(
-                "[预处理] 识别为 ui 界面文件（头: {:?}），已转交 UI 工具链 —— v0.1 UI 工具链尚未实现",
-                header_texts(&pre)
-            ),
+            message: "[预处理] 识别为 ui 界面文件，已转交 UI 工具链 —— v0.1 UI 工具链尚未实现".to_string(),
             artifact: None,
         }),
         Dispatch::Db => Ok(CompileOutcome {
-            message: format!(
-                "[预处理] 识别为 db 数据库文件（头: {:?}），已转交数据库工具链 —— v0.1 数据库工具链尚未实现",
-                header_texts(&pre)
-            ),
+            message: "[预处理] 识别为 db 数据库文件，已转交数据库工具链 —— v0.1 数据库工具链尚未实现".to_string(),
+            artifact: None,
+        }),
+        Dispatch::Port => Ok(CompileOutcome {
+            message: "[预处理] 识别为 port 接口文件，已转交端口工具链 —— v0.1 端口工具链尚未实现".to_string(),
             artifact: None,
         }),
     }
 }
 
-/// 编译工具链：前端 → 中端 → 后端（logic / library 角色）。
+/// 编译工具链：前端 → 中端 → 后端（logic/script/class/type 角色）。
 fn compile_program(
     opts: &CompileOptions,
     pre: &PreprocessResult,
@@ -172,14 +198,14 @@ fn compile_program(
     // 语义分析（符号表 + 类型检查）
     let sem = analyze(&program).map_err(CompileError::Semantic)?;
 
-    // 入口检查：logic 角色必须定义 main（library 不需要）
+    // 入口检查：logic/script 角色必须定义 main（class/type 库角色不需要）
     if !opts.emit_ir_only
-        && pre.role == FileRole::Logic
+        && matches!(pre.role, FileRole::Logic | FileRole::Script)
         && !sem.funcs.contains_key("main")
     {
         return Err(CompileError::Semantic(SemanticError {
             span: tie_frontend::lexer::Span { line: 1, col: 1 },
-            message: "文件角色为 logic，必须定义入口函数 main".into(),
+            message: "文件角色为 logic/script，必须定义入口函数 main".into(),
         }));
     }
 
@@ -212,28 +238,24 @@ pub fn compile_from_ir(
     pre: &PreprocessResult,
     opts: &CompileOptions,
 ) -> Result<CompileOutcome, CompileError> {
-    // 优化级别优先级：CLI 显式指定 > 头部 `opt=N` > 默认 O2
-    let opt_level = opts
-        .opt_level
-        .or_else(|| header_opt_level(&pre.headers))
-        .unwrap_or_default();
+    // 优化级别仅来自 CLI（旧头部 `opt=` 选项已随 // tie: 指令系统移除）
+    let opt_level = opts.opt_level.unwrap_or_default();
 
-    // 目标三元组优先级：CLI 显式指定 > 头部 `target=三元组` > 本机默认（None）
-    // 两者都经过平台别名规范化（win-x64 → x86_64-pc-windows-msvc）
+    // 目标三元组仅来自 CLI（旧头部 `target=` 选项已随 // tie: 指令系统移除）；
+    // 经平台别名规范化（win-x64 → x86_64-pc-windows-msvc）
     let target = opts
         .target
         .clone()
-        .map(|t| normalize_target(t.trim()))
-        .or_else(|| header_target(&pre.headers));
+        .map(|t| normalize_target(t.trim()));
 
     // opt 中间优化
     let opt_ir_path = ir_path.with_extension("opt.ll");
     optimizer::optimize(ir_path, &opt_ir_path, opt_level).map_err(CompileError::Optimize)?;
 
     // ---- 后端 ----
-    // 按角色区分产物：logic → 链接可执行文件；library → 编译目标文件 + 打包静态库
+    // 按角色区分产物：logic/script → 链接可执行文件；class/type → 编译目标文件 + 打包静态库
     match pre.role {
-        FileRole::Logic => {
+        FileRole::Logic | FileRole::Script => {
             let exe_path = opts
                 .output
                 .clone()
@@ -274,7 +296,7 @@ pub fn compile_from_ir(
                 artifact: Some(exe_path),
             })
         }
-        FileRole::Library => {
+        FileRole::Class | FileRole::Type => {
             let lib_path = opts
                 .output
                 .clone()
@@ -293,8 +315,8 @@ pub fn compile_from_ir(
                 artifact: Some(lib_path),
             })
         }
-        // 理论不可达：compile_from_ir 只由 logic/library 角色调用
-        _ => unreachable!("compile_from_ir 仅处理 logic/library 角色"),
+        // 理论不可达：compile_from_ir 只由 logic/script/class/type 角色调用
+        _ => unreachable!("compile_from_ir 仅处理 logic/script/class/type 角色"),
     }
 }
 
@@ -306,43 +328,9 @@ fn cleanup_intermediates(ir: &Path, opt_ir: &Path, keep: bool) {
     }
 }
 
-/// library 角色默认输出路径：`lib<输入名>.a`（如 `lib_math.tie` → `liblib_math.a` 不友好，
-/// 改为 `<输入名>.a`：`lib_math.a`）。
+/// class/type 角色默认输出路径：`<输入名>.a`（如 `lib_math.tie` → `lib_math.a`）。
 fn lib_output_path(input: &Path) -> PathBuf {
     input.with_extension("a")
-}
-
-/// 从头部 `opt=N` 选项读取优化级别（`// tie:opt=3`）。
-fn header_opt_level(headers: &[preprocess::Header]) -> Option<OptLevel> {
-    for h in headers {
-        if let Some((key, val)) = h.as_option()
-            && key == "opt"
-        {
-            return match val.trim() {
-                "0" => Some(OptLevel::O0),
-                "1" => Some(OptLevel::O1),
-                "2" => Some(OptLevel::O2),
-                "3" => Some(OptLevel::O3),
-                _ => None,
-            };
-        }
-    }
-    None
-}
-
-/// 从头部 `target=...` 选项读取目标三元组（`// tie:target=win-x64`）。
-///
-/// 支持常见平台别名 → LLVM 三元组映射；未知名称按原样作为三元组透传给 clang
-/// （clang 会校验合法性）。
-fn header_target(headers: &[preprocess::Header]) -> Option<String> {
-    for h in headers {
-        if let Some((key, val)) = h.as_option()
-            && key == "target"
-        {
-            return Some(normalize_target(val.trim()));
-        }
-    }
-    None
 }
 
 /// 平台别名 → LLVM 三元组；无别名时原样返回。
@@ -413,9 +401,4 @@ fn resolve_interp_lib() -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// 头部指令文本列表（错误/消息展示用）。
-fn header_texts(pre: &PreprocessResult) -> Vec<&str> {
-    pre.headers.iter().map(|h| h.raw.as_str()).collect()
 }

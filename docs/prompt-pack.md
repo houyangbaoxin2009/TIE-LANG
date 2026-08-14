@@ -15,8 +15,11 @@ cargo build --workspace          # 构建编译器
 cargo run -p tie -- a.tie        # 编译并运行 a.tie
 tie a.tie -o out -O2             # 指定输出与优化级别
 
-【文件头】文件前几行可写 `// tie:logic`（默认，可省略，可执行）/ `// tie:data`（纯数据）/
-`// tie:library`（库）。logic 文件必须含 func main()。ui/db 角色未实现。
+【文件头】文件最前面几行用真正的语法行声明类型：`type tie`（泛型入口）/ `type tie<logic>`
+（默认，可省略，可执行）/ `type tie<data>`（纯数据）/ `type tie<class>`（库，编译 .a）。
+子类型：script/data/ui/class/logic/port/db（`type` 角色由裸 `type tie` 表达）。
+logic 文件必须含 func main()。ui/db/port 角色未实现。文件名 `xxx.<角色>.tie` 可作
+默认角色（头部优先，不一致时警告并采用头部）。
 
 【类型】i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool char string void；
 宽类型 num（数）/text（string+char）/misc（其余）；table（数组）；元组 (T1,T2) 或 (x:T1,y:T2)；类名。
@@ -122,7 +125,7 @@ println(o.x)
 class/this/static（已废弃）。
 
 【示例：验证通过的可运行程序】
-// tie:logic
+// type tie<logic>
 struct Animal {
     var name: string
 }

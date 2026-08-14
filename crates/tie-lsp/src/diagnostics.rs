@@ -518,9 +518,16 @@ const KIND_NAMESPACE: u32 = 9;
 const KIND_KEYWORD: u32 = 14;
 
 /// 关键词补全列表（tie 语言关键字；class/static/this 已废弃为普通标识符，M2.1.8）。
+///
+/// 文件类型声明（`type tie` / `type tie<data>`）：LSP 不对源码做 tie-prep 预处理
+/// （[diagnostics_for_source] 直接对原始源码 [tokenize]），头部声明行会以普通 token
+/// 进入前端——tie-frontend 词法器不把 `type` 保留为关键字（声明行由 tie-prep 在
+/// 编译前剥离），故这里在补全列表补上 `type`，让用户在文件头部书写声明时能获得
+/// 关键字补全。语义高亮无需改动：声明行 `type`/`tie`/子类型被 TextMate 着色，
+/// 单文件命名空间解析产物与块式一致（[classify_ident] 无影响）。
 const KEYWORDS: &[&str] = &[
     "func", "var", "const", "if", "else", "while", "for", "return", "import", "struct",
-    "extends", "switch", "case", "default", "in", "namespace", "pub", "using",
+    "extends", "switch", "case", "default", "in", "namespace", "pub", "using", "type",
 ];
 
 /// 类型名补全列表（tie 类型关键字）。

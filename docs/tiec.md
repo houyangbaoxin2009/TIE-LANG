@@ -32,7 +32,7 @@ tiec（tie compiler）是一套完整的前端到后端编译流水线，全部�
 └──────────────┘   └─────────────────────────┘   └──────────────────┘
 ```
 
-tiec 把 `.tie` 源文件编译为原生可执行文件（`logic` 角色）或静态库（`library` 角色），
+tiec 把 `.tie` 源文件编译为原生可执行文件（`logic`/`script` 角色）或静态库（`class`/`type` 角色），
 中间产物经 `opt` 优化、`clang` 汇编链接，最终落在目标平台的可执行文件上。
 
 ## 2. 与老工具链的关系与自举链
@@ -113,7 +113,7 @@ tiec <input.tie> [-o <out>] [-O0|-O1|-O2|-O3] [--target <三元组>]
 | 选项 | 说明 |
 | --- | --- |
 | `<input.tie>` | 输入源文件（必需） |
-| `-o <file>` | 输出文件路径。logic 角色默认输出输入同名 `.exe`，library 角色默认输出同名 `.a` |
+| `-o <file>` | 输出文件路径。logic/script 角色默认输出输入同名 `.exe`，class/type 角色默认输出同名 `.a` |
 | `-O0` / `-O1` / `-O2` / `-O3` | 优化级别，映射到 `opt -O{0..3}`，默认 `-O2` |
 | `--target <三元组>` | 交叉编译目标（如 `x86_64-pc-windows-msvc`），默认本机 |
 | `--emit-ir` | 只生成 LLVM IR（`.ll`），不继续编译 |
@@ -132,32 +132,34 @@ tiec <input.tie> [-o <out>] [-O0|-O1|-O2|-O3] [--target <三元组>]
 
 ### 角色识别
 
-tiec 通过**头部扫描**识别源文件角色：直接读取源文件头部的注释行，
-查找 `// tie:xxx` 指令（不依赖 prep 模块的 import 机制）。
+tiec 通过**头部扫描**识别源文件角色：读取源文件最前面的连续前导行，
+查找 `type tie` / `type tie<X>` 声明（不依赖 prep 模块的 import 机制）。
 
-| 头部指令 | 角色 | 行为 |
+| 头部声明 | 角色 | 行为 |
 | --- | --- | --- |
-| `// tie:logic` | 逻辑代码 | 编译为可执行文件 |
-| `// tie:library` | 库文件 | 编译为静态库 `.a` |
-| `// tie:data` / `// tie:ui` / `// tie:db` | 数据 / 界面 / 数据库 | 提示对应工具链未实现 |
+| `type tie<logic>` / `type tie<script>` | 逻辑 / 脚本 | 编译为可执行文件 |
+| `type tie<class>` / `type tie` | 类/库 / 泛型入口 | 编译为静态库 `.a` |
+| `type tie<data>` / `type tie<ui>` / `type tie<db>` / `type tie<port>` | 数据 / 界面 / 数据库 / 端口 | 提示对应工具链未实现 |
 
 未声明头时按 `logic` 处理。
+文件名为 `xxx.<角色>.tie` 时可作为默认角色（如 `lib_math.class.tie`），但头部声明
+优先——文件名与头部不一致时**警告并采用头部声明**。
 
-### opt / target 优先级
+### opt / target 仅 CLI
 
 ```
-CLI 显式（-O2 / --target）  >  头部（// tie:opt=N / // tie:target=）  >  默认（-O2 / 本机）
+CLI 显式（-O0..-O3 / --target）  >  默认（-O2 / 本机）
 ```
 
-命令行显式指定的选项优先级最高；未显式指定时读取源文件头部的 `// tie:opt=` 与
-`// tie:target=`；头部也没有则回落到默认值。
+优化级别与交叉编译目标**不再支持头部指令**（旧 `// tie:opt=` / `// tie:target=`
+已随 `// tie:xxx` 注释指令体系一并移除）：只在命令行显式指定，缺省回落默认值。
 
 ### 示例
 
 ```bash
 tiec hello.tie                  # 编译 → hello.exe（默认 -O2）
 tiec hello.tie -o out.exe -O0   # 指定输出与关闭优化
-tiec lib_math.tie               # library 角色 → lib_math.a
+tiec lib_math.tie               # class 角色（type tie<class>）→ lib_math.a
 tiec hello.tie --emit-ir        # 只生成 hello.ll
 tiec hello.tie --keep-ir        # 编译并保留中间 IR
 tiec hello.tie --prep-only      # 只打印角色识别结果
@@ -257,7 +259,7 @@ compiler/
 
 ## 8. 已知限制与当前状态
 
-- **角色支持**：当前只编译 `logic`（可执行）与 `library`（静态库）；`data` / `ui` / `db` 角色提示未实现；
+- **角色支持**：当前只编译 `logic`/`script`（可执行）与 `class`/`type`（静态库）；`data` / `ui` / `db` / `port` 角色提示挂接点未实现；
 - **T5 后续进行中**：irgen 最小集扩展仍在推进，部分高级语法特性（如 enum / 函数指针方向的 B1 规划）暂未覆盖；
 - **解释器桥限制**：需要指针类型的桥函数（如 file_read / str_char / rand_range / arg_*）无法 tie 化，仍走 Rust 底座转发；
 - **自举细节**：tiec 由 Rust 种子编译（唯一 Rust 接触点），此后 0-Rust；老编译器 tie-llvm.exe 仍保留作为种子与对照。

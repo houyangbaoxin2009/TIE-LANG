@@ -1,11 +1,12 @@
-//! tie 编译协调配置：tie:data 格式配置文件解析。
+//! tie 编译协调配置：tie 数据文件格式配置解析。
 //!
 //! Harbor M3 阶段二（协调统筹增强）：`tie` 支持通过配置文件开启
-//! 「多线程分片编译 + 缓存池」。配置文件使用 tie 语言自己的数据交换格式
-//! （tie:data），正文是一个表字面量，键为字符串：
+//! 「多线程分片编译 + 缓存池」。配置文件是 tie 语言的数据交换文件
+//! （以 `type tie<data>` 声明角色，新文件类型声明系统），正文是一个
+//! 表字面量，键为字符串：
 //!
 //! ```tie
-//! // tie:data
+//! type tie<data>
 //! // 协调统筹配置（默认全关闭；`advanced.enabled = true` 开启分片编译）
 //! [
 //!   "advanced": [
@@ -19,6 +20,11 @@
 //!   ],
 //! ]
 //! ```
+//!
+//! 声明行 `type tie<data>` 是**真实语法 token**（不是注释）：解析时先跳过
+//! 开头的文件类型声明 token 序列（`Ident("type") Ident("tie") [Lt Ident(子类型)
+//! Gt] [Semi?]`，守护式——仅当开头恰好是 `type tie` 才消费），再解析正文表。
+//! 无声明行的普通表配置（直接 `[ ... ]` 开头）原样解析，完全兼容。
 //!
 //! 为什么自写解析器而非复用 [tie_frontend::parser::parse_program]：
 //! 1. parser 顶层只允许函数/import/类/命名空间声明，表字面量是表达式，
@@ -110,10 +116,14 @@ pub fn load(explicit: Option<&Path>) -> Result<Config, String> {
     parse(&source).map_err(|e| format!("配置文件 {}: {e}", path.display()))
 }
 
-/// 解析 tie:data 配置文本。
+/// 解析 tie 数据文件配置文本。
 ///
 /// 只关心表字面量：顶层 `[ ... ]`，元素为 `"key": value`，值可为
 /// 整数/浮点/字符串/布尔/嵌套表。其余 token（注释等）由 lexer 自动跳过。
+///
+/// 若文本以 `type tie` / `type tie<data>` 开头（新文件类型声明系统，
+/// 真实 token 而非注释），先跳过声明 token 序列再解析表；无声明的普通
+/// 表配置不受影响。
 pub fn parse(source: &str) -> Result<Config, String> {
     let tokens = tokenize(source).map_err(|e| format!("词法错误: {e}"))?;
     // 空输入（无有效 token，仅 EOF 哨兵）：返回全默认配置（等价于没有配置文件）
@@ -121,6 +131,8 @@ pub fn parse(source: &str) -> Result<Config, String> {
         return Ok(Config::default());
     }
     let mut cursor = Cursor { tokens: &tokens, pos: 0 };
+    // 跳过可选的文件类型声明（`type tie` / `type tie<data>`）
+    skip_type_declaration(&mut cursor);
     let root = parse_table(&mut cursor)?;
     // 顶层表按 "advanced" / "cache" 键取值
     let mut cfg = Config::default();
@@ -231,9 +243,47 @@ fn skip_separators(cursor: &mut Cursor) {
     }
 }
 
+/// 跳过开头的文件类型声明 token 序列（`type tie` / `type tie<data>`）。
+///
+/// 新文件类型声明系统（tie-prep）：文件以 `type tie` / `type tie<X>` 声明
+/// 角色（X ∈ {type, script, data, ui, class, logic, port, db}），这是真实
+/// 语法 token（旧 `// tie:data` 注释指令已完全移除）。配置文件作为数据文件
+/// 通常以 `type tie<data>` 开头，此处识别并整体跳过：
+/// `Ident("type") Ident("tie") [Lt Ident(子类型) Gt] [Semi?]`
+///
+/// **守护式**：仅当 token 流开头恰好是 `Ident("type")` 且紧跟 `Ident("tie")`
+/// 时才消费；否则不消费（普通表配置直接 `[ ... ]` 开头，原样交给表解析）。
+/// `Semi` 可选（ASI 自动补全或显式写出），子类型 `Lt Ident Gt` 可选。
+fn skip_type_declaration(cursor: &mut Cursor) {
+    // 守护：开头必须是 Ident("type") 紧跟 Ident("tie")
+    let is_decl = matches!(peek(cursor), Some(TokenKind::Ident(ref s)) if s == "type")
+        && matches!(peek_at(cursor, 1), Some(TokenKind::Ident(ref s)) if s == "tie");
+    if !is_decl {
+        return;
+    }
+    // 消费 Ident("type") Ident("tie")
+    cursor.pos += 2;
+    // 可选子类型：`Lt Ident(任意) Gt`（如 `type tie<data>`）
+    if matches!(peek(cursor), Some(TokenKind::Lt))
+        && matches!(peek_at(cursor, 1), Some(TokenKind::Ident(_)))
+        && matches!(peek_at(cursor, 2), Some(TokenKind::Gt))
+    {
+        cursor.pos += 3;
+    }
+    // 可选分号（ASI 自动补全或显式写出）
+    if matches!(peek(cursor), Some(TokenKind::Semi)) {
+        cursor.pos += 1;
+    }
+}
+
 /// 取当前 token 种类（不前进）。
 fn peek(cursor: &Cursor) -> Option<TokenKind> {
     cursor.tokens.get(cursor.pos).map(|t| t.kind.clone())
+}
+
+/// 取距当前位置偏移 n 的 token 种类（不前进）。
+fn peek_at(cursor: &Cursor, n: usize) -> Option<TokenKind> {
+    cursor.tokens.get(cursor.pos + n).map(|t| t.kind.clone())
 }
 
 /// 取当前 token 种类并前进。
@@ -271,7 +321,7 @@ mod tests {
     #[test]
     fn 完整配置解析() {
         let src = r#"
-// tie:data
+type tie<data>
 // 协调统筹配置
 [
   "advanced": [
@@ -291,6 +341,37 @@ mod tests {
         assert_eq!(cfg.cache.size_bytes, 1048576);
         assert_eq!(cfg.cache.storage, Storage::File);
         assert_eq!(cfg.cache.path, PathBuf::from(".cache"));
+    }
+
+    #[test]
+    fn 带类型声明行解析配置() {
+        // `type tie<data>` 声明行 + 表 == 无声明的同名表（声明被跳过）
+        let with_decl = r#"
+type tie<data>
+[ "advanced": [ "enabled": true ] ]
+"#;
+        let without_decl = r#"
+[ "advanced": [ "enabled": true ] ]
+"#;
+        assert_eq!(parse(with_decl).unwrap(), parse(without_decl).unwrap());
+        assert!(parse(with_decl).unwrap().advanced.enabled);
+    }
+
+    #[test]
+    fn 类型声明不带子类型解析配置() {
+        // `type tie`（无 `<子类型>`）同样应跳过，正文表正常解析
+        let src = "type tie\n[ \"cache\": [ \"size\": 1024 ] ]";
+        let cfg = parse(src).unwrap();
+        assert_eq!(cfg.cache.size_bytes, 1024);
+        assert_eq!(cfg.cache.storage, Storage::Memory);
+    }
+
+    #[test]
+    fn 无类型声明的普通配置不变() {
+        // 无声明行：守护式跳过不消费任何 token，普通表配置原样解析
+        let src = "[ \"cache\": [ \"size\": 2048 ] ]";
+        let cfg = parse(src).unwrap();
+        assert_eq!(cfg.cache.size_bytes, 2048);
     }
 
     #[test]

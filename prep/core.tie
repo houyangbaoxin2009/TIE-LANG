@@ -1,32 +1,52 @@
-// tie:library
 // prep/core.tie：Harbor M3 预处理器核心模块（tie 语言自写，自举阶段一）
 //
-// 本模块完全用 tie 语言实现预处理逻辑：文件头（// tie: 指令）提取、
-// 文件角色判定、正文重建。由 tie-prep（Rust 壳）解释执行：
+// 本模块完全用 tie 语言实现预处理逻辑：文件类型声明（type tie / type tie<X>）
+// 提取、文件角色判定、正文重建。由 tie-prep（Rust 壳）解释执行：
 //   1. Rust 侧完成字节规范化（去 BOM、CRLF→LF）——tie 字符串字面量
 //      无法表达 BOM 字符（lexer 仅支持 \n \t \r \\ \" \' \0 转义），
 //      且字节规范化属于壳层职责；
 //   2. 通过 eval_call("prep::process", src) 调用本模块入口；
 //   3. Rust 侧解析返回的协议文本，还原 PreprocessResult。
 //
+// 新文件类型声明系统：
+//   文件在头部区（文件最前面的连续前导行，允许其间空行）用真正的语法行
+//   声明类型，形如 `type tie`（泛型入口类型）或 `type tie<X>`（X ∈
+//   script/data/ui/class/logic/port/db）。声明行被剥离出正文；多次声明时
+//   首个合法声明生效（其余声明行同样剥离，静默）。无声明时默认角色为
+//   logic。旧 `// tie:xxx` 注释指令系统已完全移除：该类注释不再被提取/
+//   剥离，作为普通注释留在正文中（词法阶段自然忽略）。
+//   格式错误的声明（如未知子类型 `type tie<library>`、多余尾随内容
+//   `type tie<data> extra`）在协议首行输出 ERROR:<message>，由 Rust 壳
+//   检测后 panic 暴露——文件声明错误是用户错误，应尽早暴露。
+//
 // 协议文本（与 Rust 壳约定）：
-//   第 1 行        ROLE:<role>         角色（logic/ui/db/data/library）
-//   第 2 行        HEADERS:<n>         头部指令数量
-//   接下来 n 行     H:<raw>             每条头部指令原文（剥离 // tie: 前缀后）
-//   再 1 行        BODY:<m>            正文的码点数（str_len 语义——Rust 侧按 str.chars().take(m) 取 m 个字符）
-//   剩余内容       <body>              清理后的正文（不含头部行，原样保留）
+//   无错误：
+//     第 1 行        ROLE:<role>         角色（type/script/data/ui/class/logic/port/db）
+//     第 2 行        BODY:<m>            正文的码点数（str_len 语义——Rust 侧按
+//                                       str.chars().take(m) 取 m 个字符）
+//     剩余内容       <body>              清理后的正文（不含声明行，原样保留）
+//   有声明错误：
+//     第 1 行        ERROR:<message>     声明错误描述（Rust 壳 panic 携带原文）
+//     第 2 行        ROLE:logic          占位（Rust 壳检测到 ERROR 即停止解析）
+//     第 3 行        BODY:0
 //
 // 设计约束（为什么自包含）：
 // - interp 的 eval 不支持 import（REPL v1 限制），模块不能依赖 std/string.tie；
-// - 因此内部自带与 string.tie 等价的最小工具集（trim / slice / is_whitespace），
-//   全部基于语言底座原语 str_char + str_len + 拼接实现；
+// - 因此内部自带与 string.tie 等价的最小工具集（trim / slice / is_whitespace /
+//   starts_with / ends_with），全部基于语言底座原语 str_char + str_len + 拼接实现；
 // - 输出协议文本而不是结构化对象，因为 eval_call 只返回一个字符串。
 //
-// 行为约束（与原 Rust 版 preprocess 逐条对齐）：
-// - 头部区 = 文件最前面连续出现的 // tie: 行，允许其间空行；
-// - 遇到第一个非头部内容行（非空、非 // tie:）即停止扫描，其后全部是正文；
-// - 角色判定按头部指令的首个词（kind）：ui/db/data/library 命中即返回，否则 logic；
-// - 正文重建时丢弃头部行及其后的空行（与原版 lines().skip(body_start).join("\n") 一致）。
+// 行为约束（头部区扫描语义）：
+// - 头部区 = 文件最前面的连续前导行，允许其间空行；
+// - 头部区内的空行与声明行都被剥离（不进入正文）；
+// - 遇到第一个既非空行也非声明行的内容行即停止扫描，其后全部是正文
+//   （正文内形似声明的行只是普通内容）；
+// - 声明行格式：trim 后恰好为 `type tie` 或 `type tie<X>`（X 为 7 个
+//   子类型之一，不含 type 本身——type 由无尖括号的 `type tie` 表达）；
+//   格式不符 → 记录 ERROR（首个错误优先，之后声明行不再解析）；
+// - 多次合法声明：首个决定角色，后续剥离但不生效（静默）。
+// - 正文保留行按原顺序重建，边界统一用 str_len（码点数）——中文等
+//   多字节字符下 len（字节数）会放大边界导致错位/乱码。
 
 namespace prep {
 
@@ -116,6 +136,25 @@ func starts_with(s: string, prefix: string) -> bool {
     return true
 }
 
+// 判断 s 是否以 suffix 结尾（逐码点比较，边界用 str_len）——
+// 声明格式校验（`type tie<X>` 必须以 `>` 结尾）需要
+func ends_with(s: string, suffix: string) -> bool {
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(suffix)
+    if n < m {
+        return false
+    }
+    var start: i64 = n - m
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, start + i) != str_char(suffix, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
 // 按 "\n" 切分行表：保留空行；末尾空串（源以 \n 结尾时 split 产生的尾空）剔除——
 // 与 Rust 的 lines() 语义一致，保证与原版正文重建逐字节对齐
 func split_lines(s: string) -> table {
@@ -169,105 +208,113 @@ func join_lines(lines: table) -> string {
     return result
 }
 
-// 头部指令的 kind：第一个词（按 '=' 或空格切分），用于角色判定
-// （与原版 Header::kind 的 split(['=', ' ']).next().trim() 对齐）
-func header_kind(raw: string) -> string {
-    var n: i64 = str_len(raw)
-    var i: i64 = 0
-    while i < n {
-        var c: string = str_char(raw, i)
-        if c == "=" || c == " " {
-            return trim(slice(raw, 0, i))
-        }
-        i = i + 1
+// 子类型合法性：X ∈ {script, data, ui, class, logic, port, db}
+// （type 本身由 `type tie` 无尖括号声明表达，不在子类型集内——
+//  `type tie<type>` 是格式错误，应由声明系统报错而非接受）
+func is_valid_subtype(name: string) -> bool {
+    if name == "script" {
+        return true
     }
-    return trim(raw)
-}
-
-// 角色判定：按头部指令出现顺序，命中 ui/db/data/library 即返回；否则默认逻辑
-func detect_role(headers: table) -> string {
-    var n: i64 = len(headers)
-    var i: i64 = 0
-    while i < n {
-        var k: string = header_kind(headers[i])
-        if k == "ui" {
-            return "ui"
-        }
-        if k == "db" {
-            return "db"
-        }
-        if k == "data" {
-            return "data"
-        }
-        if k == "library" {
-            return "library"
-        }
-        i = i + 1
+    if name == "data" {
+        return true
     }
-    return "logic"
+    if name == "ui" {
+        return true
+    }
+    if name == "class" {
+        return true
+    }
+    if name == "logic" {
+        return true
+    }
+    if name == "port" {
+        return true
+    }
+    if name == "db" {
+        return true
+    }
+    return false
 }
 
 // 模块入口（协议约定：func process(src: string) -> string）
 // 输入：已由壳层完成去 BOM + CRLF 归一的源码文本
-// 输出：协议文本 ROLE:...\nHEADERS:n\nH:...\nBODY:<码点数>\n<正文>
+// 输出：协议文本 ROLE:...\nBODY:<码点数>\n<正文>；声明错误时首行 ERROR:<message>
 func process(src: string) -> string {
     var lines = split_lines(src)
     var n: i64 = len(lines)
-    var headers = table_new_string()
-    var in_header_zone = true
 
-    // 第一遍：提取头部区（头部行与其间空行），同时记录正文开始
-    var body_start: i64 = 0
-    var content_found = false
+    // 头部区扫描：文件最前面的连续前导行（允许其间空行）。
+    // - 空行：剥离（仍属头部区）
+    // - 声明行（trim 后以 "type tie" 开头）：解析角色或记录错误；剥离
+    // - 其他行：头部区结束，本行起全部保留（正文内形似声明的行只是内容）
+    var role = "logic"              // 默认角色：逻辑代码（编译可执行，需 main）
+    var declared = false            // 首个合法声明是否已生效（首个优先，后续剥离不生效）
+    var err = ""                    // 首个声明错误消息（空 = 无错误）
+    var in_header_zone = true
+    var body_lines = table_new_string()
+
     var i: i64 = 0
     while i < n {
         var line = lines[i]
         var trimmed = trim(line)
-        var skip_to_next = false
+        var keep = true
         if in_header_zone {
             if trimmed == "" {
-                // 头部区域内的空行：跳过（仍算头部区域）
-                skip_to_next = true
-            } else if starts_with(trimmed, "// tie:") {
-                var raw = trim(slice(trimmed, 7, str_len(trimmed)))
-                table_push(headers, raw)
-                skip_to_next = true
+                // 头部区内空行：剥离（不进入正文）
+                keep = false
+            } else if starts_with(trimmed, "type tie") {
+                // 声明行（或格式错误的声明行）：剥离；解析角色/记录错误。
+                // 声明行 trim 后必须恰好是 `type tie` 或 `type tie<X>`——
+                // 其余以 "type tie" 开头的行（未知子类型、多余尾随内容等）
+                // 都是格式错误，输出 ERROR 由壳层 panic 暴露。
+                if err == "" {
+                    if trimmed == "type tie" {
+                        // 泛型入口类型
+                        if !declared {
+                            role = "type"
+                            declared = true
+                        }
+                    } else if starts_with(trimmed, "type tie<") && ends_with(trimmed, ">") {
+                        // 子类型声明：提取尖括号内名称
+                        // （"type tie<" 共 9 个码点，-1 去掉结尾 ">"，slice 左闭右开）
+                        var inner = slice(trimmed, 9, str_len(trimmed) - 1)
+                        if is_valid_subtype(inner) {
+                            if !declared {
+                                role = inner
+                                declared = true
+                            }
+                        } else {
+                            err = "未知子类型 \"" + inner + "\"（合法: script/data/ui/class/logic/port/db）"
+                        }
+                    } else {
+                        err = "声明格式错误: \"" + trimmed + "\"（应为 `type tie` 或 `type tie<X>`）"
+                    }
+                }
+                keep = false
             } else {
-                // 第一个非头部内容行：正文自此开始
+                // 第一个非声明、非空行：头部区结束，本行是正文
                 in_header_zone = false
             }
         }
-        if !skip_to_next && !content_found {
-            body_start = i
-            content_found = true
+        if keep {
+            table_push(body_lines, line)
         }
         i = i + 1
     }
 
-    // 正文重建：body_start 起的所有行（含空行），用 \n 连接
-    var body: string = ""
-    if body_start < n {
-        var body_lines = table_new_string()
-        var j: i64 = body_start
-        while j < n {
-            table_push(body_lines, lines[j])
-            j = j + 1
-        }
-        body = join_lines(body_lines)
-    }
-
-    // 角色判定
-    var role = detect_role(headers)
+    // 正文重建：保留行按原顺序用 \n 连接（无尾部换行，与原版 join 一致）
+    var body = join_lines(body_lines)
 
     // 组装协议文本（text 是保留宽类型名，用 out）
-    var out = "ROLE:" + role + "\n"
-    var nh = len(headers)
-    out = out + "HEADERS:" + to_string(nh) + "\n"
-    var k: i64 = 0
-    while k < nh {
-        out = out + "H:" + headers[k] + "\n"
-        k = k + 1
+    var out = ""
+    if err != "" {
+        // 声明错误：首行 ERROR:<message>，Rust 壳检测后 panic 暴露
+        out = "ERROR:" + err + "\n"
+        out = out + "ROLE:logic\n"
+        out = out + "BODY:0\n"
+        return out
     }
+    out = "ROLE:" + role + "\n"
     out = out + "BODY:" + to_string(str_len(body)) + "\n"
     out = out + body
     return out

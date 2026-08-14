@@ -5043,16 +5043,19 @@ mod tests {
     }
 
     #[test]
-    fn file_delete生成remove调用() {
-        // file_delete：调用 libc remove(path)，返回 i1 = (返回码 == 0)
+    fn file_delete生成UTF8桥调用() {
+        // file_delete：UTF-8 安全桥 tie_file_delete（std::fs::remove_file），
+        // 返回 i8 返回码、icmp ne 0 得到 i1 bool。曾用 libc remove——Windows
+        // ANSI 代码页误读中文路径（a33bf90 全面迁移 UTF-8 桥；声明由 LLVM
+        // 解析器按调用签名自动补全，无需显式 declare，与 tie_file_exists 等一致）。
         let out = 编译_输出("func main() {\n    var ok = file_delete(\"x.txt\")\n    println(ok)\n}");
-        assert!(out.ir.contains("call i32 @remove(ptr "));
-        assert!(out.ir.contains("declare i32 @remove(ptr)"));
-        // 返回值：icmp eq i32 返回码, 0
-        assert!(out.ir.contains("= icmp eq i32 %"));
+        assert!(out.ir.contains("call i8 @tie_file_delete(ptr "));
+        assert!(out.used_externs.contains(&"tie_file_delete".to_string()));
+        // 返回值：icmp ne i8 返回码, 0 → i1
+        assert!(out.ir.contains("= icmp ne i8 %"));
         // 独立语句调用也正常（无堆串，不需释放）
         let out2 = 编译_输出("func main() {\n    file_delete(\"x.txt\")\n}");
-        assert!(out2.ir.contains("call i32 @remove(ptr "));
+        assert!(out2.ir.contains("call i8 @tie_file_delete(ptr "));
     }
 
     #[test]

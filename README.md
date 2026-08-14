@@ -65,6 +65,48 @@ x 大于 y
 9
 ```
 
+## 文件类型声明（Header）
+
+同一个 `.tie` 文件扮演什么角色，由文件**头部的类型声明**决定（不再使用 `// tie:xxx`
+注释指令）。声明写在文件最前面的连续前导行（允许其间空行），是真正的语法行：
+
+```tie
+type tie            # 泛型入口类型（Type 角色，由裸 type tie 表达）
+type tie<script>    # 脚本
+type tie<data>      # 数据文件（纯数据/数据交换）
+type tie<ui>        # 界面文件
+type tie<class>     # 类/库文件 → 编译静态库 .a
+type tie<logic>     # 逻辑代码（默认角色，可省略）
+type tie<port>      # 端口/对外接口文件
+type tie<db>        # 数据库文件
+```
+
+- **子类型**：`script` / `data` / `ui` / `class` / `logic` / `port` / `db`；
+  `type` 角色本身由**裸 `type tie`**（无尖括号）表达，`type tie<type>` 是格式错误；
+- **默认角色**：无声明时默认 `logic`（可执行文件，需 `func main()`）；
+- **文件名约定**：`xxx.<角色>.tie`（如 `app.script.tie`、`schema.db.tie`）可作为默认角色
+  （头部声明优先；文件名与头部不一致时**警告并采用头部声明**）；
+- **角色分派**：
+
+| 角色 | 工具链 |
+| --- | --- |
+| `logic` / `script` | 编译为可执行文件 |
+| `class` / `type` | 编译为静态库 `.a` |
+| `data` / `ui` / `db` / `port` | 对应工具链，挂接点未实现（提示） |
+
+## 单文件命名空间
+
+`namespace foo` 后不加花括号（独占一行，或以 `;` 结尾），表示**从声明处起整份文件
+的剩余内容都属于命名空间 foo**：
+
+```tie
+namespace foo            // 等价于 namespace foo;
+func add(a: i64, b: i64) -> i64 { return a + b }
+```
+
+`namespace foo` 换行（ASI 自动补分号）与手写 `namespace foo;` 完全等价（AST 一致）；
+嵌套单文件命名空间递归生效，块式 `namespace foo { ... }` 仍可用。
+
 ## CLI 用法
 
 主入口 `tie`（四段式调度器，合并原 tie-cli 职责）：
@@ -78,7 +120,7 @@ tie init|add|remove|install|update|build|run|publish|search|info|help   # 包管
 
 | 选项 | 说明 |
 | --- | --- |
-| `-o <file>` | 指定输出文件路径（logic 默认：输入同名 `.exe`；library 默认：输入同名 `.a`；单文件编译时生效） |
+| `-o <file>` | 指定输出文件路径（logic/script 默认：输入同名 `.exe`；class/type 默认：输入同名 `.a`；单文件编译时生效） |
 | `-O0..-O3` | 优化级别（默认 `-O2`），映射到 `opt -O2` |
 | `--target <三元组>` | 交叉编译目标（如 `win-x64` / `x86_64-pc-windows-msvc`，默认本机）。支持平台别名：`win-x64`、`win-x86`、`win-arm64`、`linux-x64`、`linux-arm64`、`macos-x64`、`macos-arm64`，也可直接写 LLVM 三元组 |
 | `--emit-ir` | 只生成 LLVM IR（.ll），不继续编译 |
@@ -111,9 +153,9 @@ tie-llvm 编译链接 interp 库生成），完整 CLI 逻辑全部在 tie 侧�
 构建 `pkg.exe`：`cargo build --release -p tie-interp && compiler/tiec.exe pkg/main.tie -o pkg/pkg.exe`（自举升格：tiec 编译，不再经 Rust 种子）。
 
 流程：`tie-prep` 预处理（清理代码 + 识别文件类型）→ 按角色自动转交工具链
-（`logic` → 编译为可执行文件；`library` → 编译为静态库 `.a`；`data`/`ui`/`db` → 对应工具链，后续版本）。
+（`logic`/`script` → 编译为可执行文件；`class`/`type` → 编译为静态库 `.a`；`data`/`ui`/`db`/`port` → 对应工具链，挂接点未实现）。
 
-**多文件并行编译（Harbor M3 协调统筹增强）**：配置文件（tie:data 格式，键 `advanced` /
+**多文件并行编译（Harbor M3 协调统筹增强）**：配置文件（`type tie<data>` 格式，键 `advanced` /
 `cache`）开启 `advanced.enabled = true` 后，可一次编译多个输入文件（目录输入自动展开
 其中全部 `.tie` 文件）——按文件分片、三阶段（预处理 → 前端+IR → 后端）并行 + 阶段屏障，
 阶段间用缓存池（LRU，`memory` 进程内 / `file` 磁盘目录）中转中间产物。`threads` 为 0
@@ -121,7 +163,7 @@ tie-llvm 编译链接 interp 库生成），完整 CLI 逻辑全部在 tie 侧�
 
 ```tie
 // tie.config
-// tie:data
+type tie<data>
 [
     "advanced": [
         "enabled": true,
@@ -135,7 +177,7 @@ tie-llvm 编译链接 interp 库生成），完整 CLI 逻辑全部在 tie 侧�
 ]
 ```
 
-库编译示例（`// tie:library` 角色，定义函数不定义 main）：
+库编译示例（`type tie<class>` 角色，定义函数不定义 main）：
 
 ```bash
 tie examples/lib_math.tie          # → examples/lib_math.a（经 clang -c 生成 .o，llvm-ar rcs 打包）
@@ -170,7 +212,7 @@ LLVM 工具定位同「快速开始」的发现顺序；发行版自带 `bin/llv
 ```text
 tie/
 ├── crates/
-│   ├── tie-prep/      预处理：清理代码、提取头、识别文件角色（logic/ui/db/data/library）
+│   ├── tie-prep/      预处理：清理代码、提取头、识别文件角色（type/script/data/ui/class/logic/port/db）
 │   │                  Harbor M3 自举：核心逻辑由 tie 语言自写（prep/core.tie），Rust 壳解释执行
 │   ├── tie-frontend/  前端：词法（含 ASI）→ 语法 → 语义（符号表/类型检查）+ import 展开（imports 模块，tie-llvm/tie-lsp 共享），自研；独立 CLI 可调试
 │   ├── tie-llvm/      中端+后端驱动：AST → LLVM IR 文本生成；调用 opt/clang/lld
@@ -276,7 +318,7 @@ tie/
 | M2 | 标准库：`std/`（文件 / 字符串 / 断言 / CSV / 格式化）+ `math`（数学函数）+ 20+ 语言底座原语 + **`log` 控制台信息库（i18n，M4 起迁入 ext/ 扩展库）** + **默认值参数**（可选参数省略时用字面量默认值）；M2.1.2 起 std 库全部采用命名空间形式（`assert.assert` / `str.split` / `math.abs`）；M2.1.6 起命名空间内函数去 `str_` 前缀（`str.split` / `str.trim`）且方法定义统一 `func` 关键字（`static func`）；M2.1.7 起单文件命名空间成为真模块边界——命名空间内函数默认私有（`pub func` 显式导出）、`using` 引入后裸调用、`import as` 别名唯一入口；M2.1.8 起 **struct 数据与逻辑分离**（`class` 改名 `struct` 为纯数据，方法移出为绑定 struct 名的命名空间函数，`obj.method()` 转发且接收者按引用传递；`this`/`static` 废弃），为自举与生态奠定基础 | ✅ 完成 |
 | M3 | 预处理器自举 + 协调统筹：完全用 tie 语言重写 `tie-prep`（编译器自举），并增强为多文件并行编译（配置文件 + 缓存池 + 三阶段并行分片） | ✅ 完成（阶段一：预处理器自举——核心逻辑 tie 语言化 `prep/core.tie`，Rust 壳仅解释执行；阶段二：协调统筹增强——`tie.config` 配置文件 + 缓存池 + 多线程并行分片编译） |
 | M4 | 标准库重构 + 扩展库分层：补全常用函数（str 大小写/join/repeat/trim_start/trim_end、math gcd/lcm/pow_i、format sprintf 占位符、csv_write、assert 浮点与字符串断言）+ 内部 using 简化 + **顶层持久变量**（var/const 全局，纯 tie 表达消息状态）+ log 增强（带参消息/级别/stderr/批量登记/多级回退，移入 **ext/** 扩展库）+ 修复 using 表元素解析/调用结果下标等编译器边界 | ✅ 完成 |
-| M5 | 动态库编译：`// tie:library` 输出 `.dll`（win）/ `.so`（linux）——库公有函数 `dllexport` 导出、跨语言调用约定（标量直传/字符串 C ABI 桥）、C 程序 LoadLibrary/dlopen 消费示例（见 docs/plans/dynamic-library.md） | 📋 规划 |
+| M5 | 动态库编译：`type tie<class>` 输出 `.dll`（win）/ `.so`（linux）——库公有函数 `dllexport` 导出、跨语言调用约定（标量直传/字符串 C ABI 桥）、C 程序 LoadLibrary/dlopen 消费示例（见 docs/plans/dynamic-library.md） | 📋 规划 |
 | M6 | 包管理器（E1/E2 ✅ + E3/E4 ✅）：tie 语言自写 CLI（`pkg/main.tie` → `pkg.exe`，自举）+ tie.pkg 清单解析（`manifest.tie`）+ 三源安装（path 复制 / git 浅克隆 / registry 下载解压，`deps.tie` + `fetch.tie`）+ tie.lock 锁文件幂等恢复（`lock.tie`）+ 递归依赖解析（去重/冲突检测）+ `tie update`/`publish`（打包 tar.gz + git tag/push，`publish.tie`）/`search`/`info`（注册表查询，`search.tie`）；Rust 入口 `crates/tie` 识别 11 个子命令并转发；`init → add（path/git/registry）→ install → build/run` 端到端跑通（见 examples/pkg_demo.md） | ✅ 完成（E1–E4） |
 
 ### 自举（Self-hosting，进行中）

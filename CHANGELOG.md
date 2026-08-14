@@ -1,3 +1,21 @@
+## [文件类型声明系统] 头部声明重构——`type tie` / `type tie<X>` 取代 `// tie:xxx` 注释指令 — 2026-08-14
+
+文件类型声明系统全面重构：旧「`// tie:xxx` 注释头指令」体系彻底移除，改为真正的语法行声明。
+
+- **新头部声明**：文件最前面的连续前导行（允许其间空行）写 `type tie`（Type 角色，
+  由裸 `type tie` 表达）或 `type tie<子类型>`（script/data/ui/class/logic/port/db）；
+  无声明时默认角色 `logic`；
+- **旧指令体系彻底移除**：`// tie:xxx` 注释指令（角色 + `opt=` / `target=` 头部选项）
+  不再被提取/剥离——该类注释作为普通注释留在正文；`opt`/`target` 仅 CLI；
+- **文件命名约定**：`xxx.<角色>.tie`（如 `app.script.tie`）作为默认角色，
+  头部声明优先——文件名与头部不一致时**警告并采用头部声明**；
+- **单文件命名空间**：`namespace foo` 无花括号（独占一行，或以 `;` 结尾）表示
+  从声明处起整份文件剩余内容都属于 foo——`namespace foo` 换行（ASI 补分号）与
+  手写 `namespace foo;` 完全等价（AST 一致），嵌套递归生效；
+- **tiec 同步支持**：头部扫描识别 `type tie` / `type tie<X>` 声明；
+  opt/target 仅 CLI；文件名校验警告规则与 tie 主入口一致；
+- **全项目迁移脚本**：`scripts/migrate_tie_type.tie`（`.tie` 文件头迁移，另行运行）。
+
 ## [rdu] 内置库新增 rdu 层级：嵌入式基础层（无栈）——独立于 std/ext 的第三层 — 2026-08-14
 
 新增第三层内置库 `rdu/`（Rudimentary，嵌入式基础层），专为嵌入式（MCU/裸机

@@ -3,7 +3,7 @@
 //! 用法：
 //! ```text
 //! tie-prep <input.tie>           清理后正文输出到 stdout，角色信息输出到 stderr
-//! tie-prep <input.tie> --info    只输出角色与头部信息（人类可读），不输出正文
+//! tie-prep <input.tie> --info    只输出角色信息（人类可读），不输出正文
 //! tie-prep <input.tie> --module prep/indent.tie
 //!                                 挂载自定义 tie 转换器模块（顶层 process(src)->string），
 //!                                 输出为模块处理后的文本（Harbor M3 可扩展性）
@@ -26,13 +26,13 @@ tie 语言预处理工具（四段式第一段）
   tie-prep <input.tie> [选项]
 
 功能:
-  1. 清理代码（去 BOM、统一换行、剥离头部）
-  2. 识别文件类型（解析文件头 // tie: 指令）
+  1. 清理代码（去 BOM、统一换行、剥离声明行）
+  2. 识别文件类型（解析文件头 type tie / type tie<X> 声明）
   3. 判定角色，供调用方自动转交对应工具链
   4. 挂载 tie 模块（--module）做自定义转换（Harbor M3 可扩展性）
 
 选项:
-  --info            只打印角色与头部信息，不输出正文
+  --info            只打印角色信息，不输出正文
   --module <file>   挂载模块：解释执行该 tie 文件，调用其 process(src)->string
                     输出转换结果（证明新增转换器只需写 tie 模块、不改 Rust）
   --version         显示版本号与内部代号
@@ -108,8 +108,8 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
 
-    // --module 与 --info 语义冲突：info 展示预处理的头部/角色，模块模式下
-    // 输出的是模块转换结果，无头部/角色概念。
+    // --module 与 --info 语义冲突：info 展示预处理的角色信息，模块模式下
+    // 输出的是模块转换结果，无角色概念。
     if module.is_some() && info_only {
         eprintln!("错误: --module 不能与 --info 同时使用\n\n{USAGE}");
         return ExitCode::from(2);
@@ -156,16 +156,10 @@ fn main() -> ExitCode {
     if info_only {
         println!("文件: {input}");
         println!("角色: {}", result.role);
-        println!("头部: {}", if result.headers.is_empty() {
-            "(无)".to_string()
-        } else {
-            result
-                .headers
-                .iter()
-                .map(|h| format!("// tie:{}", h.raw))
-                .collect::<Vec<_>>()
-                .join(" | ")
-        });
+        // 文件名默认角色仅供参考（头部声明优先于文件名声明）
+        if let Some(fr) = tie_prep::role_from_filename(&input) {
+            println!("文件名默认角色: {fr}（头部声明优先）");
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -174,6 +168,6 @@ fn main() -> ExitCode {
         eprintln!("错误: 写入 stdout 失败: {e}");
         return ExitCode::FAILURE;
     }
-    eprintln!("[tie-prep] 文件: {input} | 角色: {} | 头部: {}", result.role, result.headers.len());
+    eprintln!("[tie-prep] 文件: {input} | 角色: {}", result.role);
     ExitCode::SUCCESS
 }

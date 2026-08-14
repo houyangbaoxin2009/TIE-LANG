@@ -151,18 +151,20 @@ func process(src: string) -> string {
 格式（每行一条，`\n` 结尾）：
 
 ```text
-ROLE:logic            ← 第 1 行：角色（logic/ui/db/data/library）
-HEADERS:2             ← 第 2 行：头部指令数量
-H:opt=2               ← 接下来 n 行：每条头部指令原文（已剥 // tie: 前缀）
-H:target=win
-BODY:12               ← 再 1 行：正文码点数（str_len 语义，按 Unicode 码点计数）
+ROLE:logic            ← 第 1 行：角色（type/script/data/ui/class/logic/port/db）
+BODY:12               ← 第 2 行：正文码点数（str_len 语义，按 Unicode 码点计数）
 <正文恰好 12 个码点>   ← 剩余恰好 m 个码点的正文（可含换行/任意内容）
 ```
 
+声明错误时首行为 `ERROR:<message>`（Rust 壳检测后报出）。
+
 - **正文按码点数精确截取**：不按行、不按 `\n` 拆分，正文内的任何字符都不会
   破坏协议（这是 `BODY:<m>` 用码点计数而不是行数的原因）；
-- Rust 壳（`parse_protocol`）逐行识别 4 类前缀（`ROLE:` / `HEADERS:` / `H:` /
-  `BODY:`），其余内容全部视为正文，直到取够 `m` 个码点（`chars().take(m)`）。
+- Rust 壳（`parse_protocol`）逐行识别 `ERROR:` / `ROLE:` / `BODY:` 前缀，其余内容
+  全部视为正文，直到取够 `m` 个码点（`chars().take(m)`）；
+- **旧头部指令已移除**：`HEADERS:` / `H:` 行随 `// tie:xxx` 注释指令体系一并删除——
+  优化级别/编译目标不再进预处理协议（`opt`/`target` 仅 CLI），文件类型由头部
+  `type tie` / `type tie<X>` 声明行表达。
 - 编码约定：BODY 声明的是**码点数**而非字节数。字符串是 UTF-8 编码，
   `len` 返回字节数、`str_len`/`str_char` 按码点索引——中文等多字节字符下
   字节数 ≠ 码点数（一个汉字 3 字节、1 码点），字符串遍历必须用 `str_len`

@@ -31,7 +31,7 @@ tie 语言编译器（前端自研 + LLVM 中后端）
   tie-llvm <input.tie> [选项]
 
 选项:
-  -o <file>      指定输出文件路径（默认: 输入同名 .exe；library 角色默认 .a）
+  -o <file>      指定输出文件路径（默认: 输入同名 .exe；class/type 角色默认 .a）
   -O0|-O1|-O2|-O3
                  优化级别（默认: -O2）
   --target <三元组>

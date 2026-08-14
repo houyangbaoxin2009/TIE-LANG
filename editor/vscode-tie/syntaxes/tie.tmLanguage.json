@@ -4,6 +4,7 @@
   "scopeName": "source.tie",
   "patterns": [
     { "include": "#comments" },
+    { "include": "#filetype" },
     { "include": "#strings" },
     { "include": "#numbers" },
     { "include": "#keywords" },
@@ -15,7 +16,6 @@
   "repository": {
     "comments": {
       "patterns": [
-        { "include": "#head" },
         { "name": "comment.line.double-slash.tie", "match": "//.*$" },
         {
           "name": "comment.block.tie",
@@ -24,15 +24,15 @@
         }
       ]
     },
-    "head": {
+    "filetype": {
       "patterns": [
         {
-          "name": "meta.preprocessor.tie",
-          "match": "(//)(\\s*)(tie:[a-zA-Z_][a-zA-Z0-9_-]*)(.*)$",
+          "name": "meta.filetype-declaration.tie",
+          "match": "^\\s*(type)\\s+(tie)(?:<([a-zA-Z_][a-zA-Z0-9_-]*)>)?",
           "captures": {
-            "1": { "name": "punctuation.definition.comment.tie" },
-            "3": { "name": "keyword.control.directive.tie" },
-            "4": { "name": "string.unquoted.tie" }
+            "1": { "name": "keyword.control.directive.tie" },
+            "2": { "name": "storage.type.tie" },
+            "3": { "name": "entity.name.type.tie" }
           }
         }
       ]
@@ -52,7 +52,7 @@
       "patterns": [
         {
           "name": "keyword.control.tie",
-          "match": "\\b(func|var|const|if|else|while|for|return|import|struct|extends|switch|case|default|in|namespace|pub|using|when)\\b"
+          "match": "\\b(func|var|const|if|else|while|for|return|import|struct|extends|switch|case|default|in|namespace|pub|using|when|type)\\b"
         },
         { "name": "constant.language.tie", "match": "\\b(true|false)\\b" },
         {

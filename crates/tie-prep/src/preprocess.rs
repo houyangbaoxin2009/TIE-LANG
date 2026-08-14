@@ -1,22 +1,36 @@
 //! 预处理核心逻辑：清理代码 + 识别文件类型 + 角色判定。
 //!
-//! Harbor M3 自举：核心逻辑（头部提取/角色判定/正文重建）由 tie 语言编写
+//! Harbor M3 自举：核心逻辑（声明行提取/角色判定/正文重建）由 tie 语言编写
 //! （prep/core.tie，include_str! 内嵌），本文件是解释执行壳——
 //! 1. 字节规范化（去 BOM、CRLF→LF）仍留在壳层（tie 字符串字面量无法表达
 //!    BOM 字符，且字节规范化属壳层职责）；
 //! 2. 通过 tie-interp 的 eval/eval_call 注册并调用 `prep::process`；
 //! 3. 解析模块返回的协议文本，还原 [PreprocessResult]。
 //!
+//! # 新文件类型声明系统
+//!
+//! 文件在头部区（文件最前面的连续前导行，允许其间空行）用真正的语法行声明
+//! 类型，形如：
+//! ```text
+//! type tie          # 泛型入口类型（FileRole::Type）
+//! type tie<data>    # 数据文件（FileRole::Data）
+//! type tie<db>      # 数据库文件（FileRole::Db）
+//! ```
+//! `type tie<X>` 的 X ∈ {script, data, ui, class, logic, port, db}。
+//! 无声明时默认角色为 logic。多次声明首个生效，其余同样剥离。
+//! 旧 `// tie:xxx` 注释指令系统已完全移除——该类注释不再被提取/剥离，
+//! 作为普通注释留在正文中（词法阶段自然忽略）。
+//!
 //! 协议文本（与 prep/core.tie 约定）：
 //! ```text
-//! ROLE:logic
-//! HEADERS:2
-//! H:opt=2
-//! H:target=win
+//! ROLE:data
 //! BODY:12
-//! <正文恰好 12 字节>
+//! <正文恰好 12 码点>
 //! ```
-//! 头部区逐行固定，正文按 BODY 声明的字节数精确截取——正文可含任意内容
+//! 声明错误时模块首行输出 `ERROR:<message>`，Rust 侧检测后 panic 报出
+//! （preprocess 无 Result 签名、调用方一律期望 [PreprocessResult]，以
+//! panic 携带声明错误文本是最简单一致的暴露方式）。
+//! 协议头逐行固定，正文按 BODY 声明的码点数精确截取——正文可含任意内容
 //! （含换行），不会破坏协议。
 
 use std::fmt;
@@ -27,57 +41,80 @@ const PREP_MODULE: &str = include_str!("../../../prep/core.tie");
 /// 模块入口函数全名（命名空间 prep 下的 process）。
 const PREP_ENTRY: &str = "prep::process";
 
-/// 头部指令（文件角色声明）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Header {
-    /// 指令文本：`// tie:logic` 的 `logic`；`// tie:target=win-x64` 的 `target=win-x64`
-    pub raw: String,
-}
-
-impl Header {
-    /// 头部角色关键字（第一个词，如 `logic` / `ui` / `db` / `data`）。
-    pub fn kind(&self) -> &str {
-        self.raw
-            .split(['=', ' '])
-            .next()
-            .unwrap_or("")
-            .trim()
-    }
-
-    /// 是否为 `key=value` 形式的选项，返回 (key, value)。
-    pub fn as_option(&self) -> Option<(&str, &str)> {
-        let mut it = self.raw.splitn(2, '=');
-        let key = it.next()?.trim();
-        let val = it.next()?.trim();
-        if key.is_empty() || val.is_empty() { None } else { Some((key, val)) }
-    }
-}
-
-/// 文件角色：对应 `// tie:` 指令声明，决定转交哪个工具链。
+/// 文件角色：由 `type tie` / `type tie<X>` 声明（或文件名 `<名>.<角色>.tie`）
+/// 决定，表示文件在四段式工具链中的类型，决定转交哪个工具链。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileRole {
-    /// 逻辑代码（默认，编译为可执行文件，需 main）
-    Logic,
-    /// 界面文件（转交 UI 工具链，后续版本）
-    Ui,
-    /// 数据库文件（转交数据库工具链，后续版本）
-    Db,
-    /// 数据交换文件（转交数据解析工具，数据交换格式）
+    /// 泛型入口类型（`type tie` 声明 / xxx.type.tie 文件名默认）
+    Type,
+    /// 脚本（编译可执行）
+    Script,
+    /// 数据文件（存数据/数据交换）
     Data,
-    /// 库文件（转交编译器，编译为库，不要求 main）
-    Library,
+    /// 界面文件
+    Ui,
+    /// 类/库文件（编译静态库 .a）
+    Class,
+    /// 逻辑代码（编译可执行，需 main）——无声明时的默认角色
+    Logic,
+    /// 端口/对外接口文件
+    Port,
+    /// 数据库文件
+    Db,
 }
 
 impl FileRole {
-    /// 角色名（用于消息展示）。
+    /// 角色名（用于消息展示 / 协议文本 / 文件名识别）。
     pub fn as_str(self) -> &'static str {
         match self {
-            FileRole::Logic => "logic",
-            FileRole::Ui => "ui",
-            FileRole::Db => "db",
+            FileRole::Type => "type",
+            FileRole::Script => "script",
             FileRole::Data => "data",
-            FileRole::Library => "library",
+            FileRole::Ui => "ui",
+            FileRole::Class => "class",
+            FileRole::Logic => "logic",
+            FileRole::Port => "port",
+            FileRole::Db => "db",
         }
+    }
+
+    /// 角色名 → 枚举（精确匹配 8 个角色名，未知返回 None）。
+    ///
+    /// 与旧 `role_from_str`（未知回退 logic）不同：未知角色来自声明系统
+    /// 之外（如 `type tie<library>`），必须在 [preprocess] 阶段报错而非
+    /// 静默回退，故返回 Option 交由调用方决定处理方式。
+    pub fn from_str(s: &str) -> Option<FileRole> {
+        match s.trim() {
+            "type" => Some(FileRole::Type),
+            "script" => Some(FileRole::Script),
+            "data" => Some(FileRole::Data),
+            "ui" => Some(FileRole::Ui),
+            "class" => Some(FileRole::Class),
+            "logic" => Some(FileRole::Logic),
+            "port" => Some(FileRole::Port),
+            "db" => Some(FileRole::Db),
+            _ => None,
+        }
+    }
+
+    /// 从文件名推断默认角色：`xxx.<角色>.tie` 形式（文件名默认角色，
+    /// 头部声明优先于文件名声明）。
+    ///
+    /// 仅当文件名以 `.tie` 结尾且倒数第二段（`<名>.<角色>` 中的 `<角色>`）
+    /// 恰好等于 8 个角色名之一时识别：
+    /// - `"main.type.tie"` → [FileRole::Type]
+    /// - `"schema.db.tie"` → [FileRole::Db]
+    /// - `"app.script.tie"` → [FileRole::Script]
+    /// - `"main.tie"` → None（无角色段）
+    /// - `"foo.logic2.tie"` → None（中间段不是合法角色名）
+    /// - `"main.data.txt"` → None（非 `.tie` 后缀）
+    pub fn from_filename(name: &str) -> Option<FileRole> {
+        // 去掉 ".tie" 后缀；非 .tie 文件无角色概念
+        let stem = name.strip_suffix(".tie")?;
+        // 取最后一段作为角色段（"main.type" → "type"）
+        let dot = stem.rfind('.')?;
+        let role_seg = &stem[dot + 1..];
+        Self::from_str(role_seg)
     }
 }
 
@@ -90,31 +127,31 @@ impl fmt::Display for FileRole {
 /// 预处理结果。
 #[derive(Debug, Clone)]
 pub struct PreprocessResult {
-    /// 清理后的正文源码（无 BOM、统一 `\n` 换行、已剥离头部行）
+    /// 清理后的正文源码（无 BOM、统一 `\n` 换行、已剥离声明行）
     pub cleaned_source: String,
-    /// 解析出的头部指令（按出现顺序）
-    pub headers: Vec<Header>,
     /// 文件角色
     pub role: FileRole,
 }
 
-/// 角色名 → 枚举（协议文本解析用）。
-fn role_from_str(s: &str) -> FileRole {
-    match s.trim() {
-        "ui" => FileRole::Ui,
-        "db" => FileRole::Db,
-        "data" => FileRole::Data,
-        "library" => FileRole::Library,
-        _ => FileRole::Logic,
-    }
+/// 从文件名推断默认角色（[FileRole::from_filename] 的壳层转发）。
+///
+/// 供 crates/tie、crates/tie-llvm 等调用方在读取文件前按文件名预判角色；
+/// 注意文件名只是默认，头部声明优先于文件名声明。
+pub fn role_from_filename(name: &str) -> Option<FileRole> {
+    FileRole::from_filename(name)
 }
 
-/// 预处理入口：原始源码 → 清理后的正文 + 头部信息 + 角色。
+/// 预处理入口：原始源码 → 清理后的正文 + 角色。
 ///
 /// 自举实现：字节规范化（去 BOM、CRLF→LF）后，解释执行 prep/core.tie 的
-/// `prep::process`（头部提取/角色判定/正文重建全在 tie 模块内），
+/// `prep::process`（声明行提取/角色判定/正文重建全在 tie 模块内），
 /// 再解析模块返回的协议文本。模块注册与调用失败 → panic 并给出可读信息
 /// （模块内嵌于二进制，失败属于自举链破损，应尽早暴露）。
+///
+/// 文件声明错误（如 `type tie<library>` 未知子类型、`type tie<data> extra`
+/// 多余尾随内容）同样 panic：preprocess 无 Result 签名、所有调用方期望
+/// [PreprocessResult]，以 panic 携带声明错误文本是最简单一致的暴露方式
+/// （错误消息含声明行原文，用户可直接定位修复）。
 pub fn preprocess(source: &str) -> PreprocessResult {
     // 1. 字节规范化（壳层职责）：去 BOM、CRLF 归一
     let source = source.trim_start_matches('\u{FEFF}');
@@ -124,8 +161,8 @@ pub fn preprocess(source: &str) -> PreprocessResult {
     let text = run_module(PREP_MODULE, PREP_ENTRY, &source)
         .unwrap_or_else(|e| panic!("预处理模块执行失败: {e}"));
 
-    // 3. 解析协议文本（ROLE / HEADERS:n / H:raw * n / BODY:m / 正文 m 字节）
-    parse_protocol(&text)
+    // 3. 解析协议文本（ROLE / BODY / 可选 ERROR）；声明错误 → panic 携带原文
+    parse_protocol(&text).unwrap_or_else(|e| panic!("文件声明错误: {e}"))
 }
 
 /// 解释执行任意 tie 模块（Harbor M3 可扩展性证明）。
@@ -144,40 +181,43 @@ pub fn run_module(module_source: &str, entry: &str, source: &str) -> Result<Stri
 
 /// 解析协议文本（与 prep/core.tie 的 process 输出约定一致）。
 ///
-/// 头部区固定 3 + n 行：ROLE:x / HEADERS:n / H:raw * n / BODY:m，
-/// 随后紧跟恰好 m 个字符（码点）的正文。正文按码点数精确截取
-/// （BODY 声明的是 str_len 码点数，与 str.chars().take(m) 对齐），
-/// 可含任意内容（含换行、任意行首文本），不会破坏协议。
-fn parse_protocol(text: &str) -> PreprocessResult {
-    let mut headers = Vec::new();
+/// 协议固定 1 + 2 + 正文 段：ROLE:x / BODY:m / 随后恰好 m 个码点的正文。
+/// 声明错误时首行为 ERROR:<message>，此处以 Err 返回（由 [preprocess]
+/// panic 携带文本暴露）。正文按码点数精确截取（BODY 声明的是 str_len
+/// 码点数，与 str.chars().take(m) 对齐），可含任意内容（含换行、任意
+/// 行首文本），不会破坏协议。
+fn parse_protocol(text: &str) -> Result<PreprocessResult, String> {
     let mut role = FileRole::Logic;
     let mut body_len = 0usize;
     let mut body_start = None; // 正文起始字节偏移（BODY 行之后）
+    let mut error = None;      // 声明错误消息（ERROR: 行，首个生效）
     let mut offset = 0usize;
 
     for line in text.split_inclusive('\n') {
         let content = line.trim_end_matches(['\n', '\r']);
-        if content.starts_with("ROLE:") {
-            role = role_from_str(&content[5..]);
-        } else if content.starts_with("HEADERS:") {
-            let n: usize = content[8..].trim().parse().unwrap_or(0);
-            // 预分配：n 条 H 行
-            headers = Vec::with_capacity(n);
-        } else if content.starts_with("H:") {
-            headers.push(Header { raw: content[2..].to_string() });
+        if content.starts_with("ERROR:") {
+            // 声明错误：记录消息，之后其余协议行不再解析
+            error = Some(content[6..].to_string());
+        } else if content.starts_with("ROLE:") {
+            // 角色名精确匹配；未知角色防御性回退默认 logic（正常协议
+            // 中角色名必合法，未知只可能来自协议损坏/模块 bug）
+            role = FileRole::from_str(&content[5..]).unwrap_or(FileRole::Logic);
         } else if content.starts_with("BODY:") {
             body_len = content[5..].trim().parse().unwrap_or(0);
             // BODY 行之后的位置 = 当前行结尾偏移（含换行）
             body_start = Some(offset + line.len());
-        } else if body_start.is_none() {
-            // 协议损坏（既不是头部行也不是 BODY）→ 空结果（防御）
-            return PreprocessResult {
+        } else if body_start.is_none() && error.is_none() {
+            // 协议损坏（既不是 ERROR/ROLE/BODY 也不是正文）→ 空结果（防御）
+            return Ok(PreprocessResult {
                 cleaned_source: String::new(),
-                headers: Vec::new(),
                 role: FileRole::Logic,
-            };
+            });
         }
         offset += line.len();
+    }
+
+    if let Some(msg) = error {
+        return Err(msg);
     }
 
     // 正文：从 BODY 行后取恰好 body_len 个字符（码点；超出按模块输出截断，缺失补空）
@@ -188,47 +228,165 @@ fn parse_protocol(text: &str) -> PreprocessResult {
         }
         None => String::new(),
     };
-    PreprocessResult { cleaned_source, headers, role }
+    Ok(PreprocessResult { cleaned_source, role })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // ---------- 新文件类型声明系统（type tie / type tie<X>） ----------
+
     #[test]
-    fn 无头文件默认为逻辑角色() {
-        let r = preprocess("fn main() {}");
+    fn 无声明默认为逻辑角色() {
+        let r = preprocess("fn main() {}\n");
         assert_eq!(r.role, FileRole::Logic);
-        assert!(r.headers.is_empty());
         assert!(r.cleaned_source.contains("fn main"));
     }
 
     #[test]
-    fn 识别数据角色() {
-        let r = preprocess("// tie:data\n[\"a\":1]\n");
+    fn 声明type_tie为泛型入口角色() {
+        let r = preprocess("type tie\nfn main() {}\n");
+        assert_eq!(r.role, FileRole::Type);
+        assert!(!r.cleaned_source.contains("type tie"), "声明行应被剥离");
+        assert!(r.cleaned_source.contains("fn main"));
+    }
+
+    #[test]
+    fn 声明type_tie_data为数据角色() {
+        let r = preprocess("type tie<data>\n[\"a\":1]\n");
         assert_eq!(r.role, FileRole::Data);
-        assert_eq!(r.headers.len(), 1);
-        assert!(!r.cleaned_source.contains("tie:data"));
+        assert!(!r.cleaned_source.contains("type tie"), "声明行应被剥离");
+        assert!(r.cleaned_source.contains("\"a\":1"));
     }
 
     #[test]
-    fn 头部与内容分离() {
-        let r = preprocess("// tie:logic\n// tie:opt=2\n\nfn main() {}\n");
-        assert_eq!(r.role, FileRole::Logic);
-        assert_eq!(r.headers.len(), 2);
-        assert_eq!(r.headers[1].as_option(), Some(("opt", "2")));
-        assert!(r.cleaned_source.starts_with("fn main"));
+    fn 声明type_tie_db为数据库角色() {
+        let r = preprocess("type tie<db>\n[\"schema\":{}]\n");
+        assert_eq!(r.role, FileRole::Db);
+        assert!(r.cleaned_source.contains("\"schema\""));
     }
 
     #[test]
-    fn 内容区的tie注释是普通注释() {
-        let r = preprocess("fn main() {\n    // tie:data\n}\n");
-        assert_eq!(r.role, FileRole::Logic);
-        assert_eq!(r.headers.len(), 0);
-        assert!(r.cleaned_source.contains("tie:data"));
+    fn 声明type_tie_class为库角色() {
+        let r = preprocess("type tie<class>\nfunc add(a: i64, b: i64) -> i64 { return a + b }\n");
+        assert_eq!(r.role, FileRole::Class);
     }
 
-    /// 扩展性验证：run_module 能加载任意 tie 转换器模块（Harbor M3）。
+    #[test]
+    #[should_panic(expected = "未知子类型")]
+    fn 未知子类型声明报错() {
+        // library 已随旧 // tie: 指令系统移除，属于未知子类型 → 声明错误
+        let _ = preprocess("type tie<library>\nfn main() {}\n");
+    }
+
+    #[test]
+    #[should_panic(expected = "声明格式错误")]
+    fn 声明行多余尾随内容报错() {
+        // `type tie<data> extra` 不是合法声明（trim 后仍有尾随内容）→ 错误
+        let _ = preprocess("type tie<data> extra\n[1]\n");
+    }
+
+    #[test]
+    fn 声明行从正文剥离() {
+        // 声明行与其后（声明区内的）空行都不进入正文
+        let r = preprocess("type tie<data>\n\n[\"a\":1]\n");
+        assert_eq!(r.role, FileRole::Data);
+        assert!(!r.cleaned_source.contains("type tie"), "声明行应被剥离");
+        assert_eq!(r.cleaned_source, "[\"a\":1]", "声明区空行也应剥离");
+    }
+
+    #[test]
+    fn 旧式注释不再剥离且角色默认逻辑() {
+        // 旧 // tie:xxx 指令系统已移除：头部区的 // tie:logic 是普通注释，
+        // 不剥离、不影响角色（默认 logic）
+        let r = preprocess("// tie:logic\nfn main() {}\n");
+        assert_eq!(r.role, FileRole::Logic);
+        assert!(
+            r.cleaned_source.contains("// tie:logic"),
+            "// tie: 注释应保留在正文，实际: {:?}",
+            r.cleaned_source
+        );
+        assert!(r.cleaned_source.contains("fn main"));
+    }
+
+    #[test]
+    fn 正文内的声明行不是声明() {
+        // 声明行出现在正文中（首个内容行之后）→ 只是普通内容，角色保持默认
+        let r = preprocess("fn main() {}\ntype tie<data>\n");
+        assert_eq!(r.role, FileRole::Logic);
+        assert!(
+            r.cleaned_source.contains("type tie<data>"),
+            "正文内的声明行应原样保留"
+        );
+    }
+
+    #[test]
+    fn 多次声明首个生效() {
+        let r = preprocess("type tie<data>\ntype tie<db>\n[1]\n");
+        assert_eq!(r.role, FileRole::Data, "首个声明应生效");
+        assert!(!r.cleaned_source.contains("type tie"), "后续声明行也应剥离");
+        assert_eq!(r.cleaned_source, "[1]");
+    }
+
+    #[test]
+    fn 声明行尾随空白被trim() {
+        // 声明行尾随空格不影响识别（头部区扫描先 trim）
+        let r = preprocess("type tie<data>  \n[1]\n");
+        assert_eq!(r.role, FileRole::Data);
+    }
+
+    // ---------- 文件名默认角色（xxx.<角色>.tie） ----------
+
+    #[test]
+    fn 从文件名识别角色() {
+        assert_eq!(FileRole::from_filename("main.type.tie"), Some(FileRole::Type));
+        assert_eq!(FileRole::from_filename("schema.db.tie"), Some(FileRole::Db));
+        assert_eq!(FileRole::from_filename("app.script.tie"), Some(FileRole::Script));
+        assert_eq!(FileRole::from_filename("lib.class.tie"), Some(FileRole::Class));
+        assert_eq!(FileRole::from_filename("ui_main.ui.tie"), Some(FileRole::Ui));
+        assert_eq!(FileRole::from_filename("log.logic.tie"), Some(FileRole::Logic));
+        assert_eq!(FileRole::from_filename("svc.port.tie"), Some(FileRole::Port));
+        // 非 `<名>.<角色>.tie` 形式 → None
+        assert_eq!(FileRole::from_filename("main.tie"), None);
+        assert_eq!(FileRole::from_filename("foo.logic2.tie"), None);
+        assert_eq!(FileRole::from_filename("main.data.txt"), None);
+        assert_eq!(FileRole::from_filename("main.type.tie.extra"), None);
+        assert_eq!(FileRole::from_filename("main.Type.tie"), None, "角色名区分大小写");
+    }
+
+    #[test]
+    fn role_from_filename壳层转发() {
+        assert_eq!(role_from_filename("schema.db.tie"), Some(FileRole::Db));
+        assert_eq!(role_from_filename("main.tie"), None);
+    }
+
+    #[test]
+    fn 角色名双向映射() {
+        let all = [
+            FileRole::Type,
+            FileRole::Script,
+            FileRole::Data,
+            FileRole::Ui,
+            FileRole::Class,
+            FileRole::Logic,
+            FileRole::Port,
+            FileRole::Db,
+        ];
+        for r in all {
+            assert_eq!(FileRole::from_str(r.as_str()), Some(r), "角色 {}", r.as_str());
+        }
+        // 未知/空/大小写不符/多余后缀 → None
+        assert_eq!(FileRole::from_str("library"), None);
+        assert_eq!(FileRole::from_str(""), None);
+        assert_eq!(FileRole::from_str("LOGIC"), None);
+        assert_eq!(FileRole::from_str("logic2"), None);
+        assert_eq!(FileRole::from_str(" data "), Some(FileRole::Data), "允许首尾空白");
+    }
+
+    // ---------- 扩展性验证（Harbor M3：run_module 挂载任意 tie 模块） ----------
+
+    /// 扩展性验证：run_module 能加载任意 tie 转换器模块。
     ///
     /// 用 prep/indent.tie（制表符 → 4 空格转换器）证明：新增转换器只需
     /// 写 tie 模块 + 调用 run_module，Rust 侧零逻辑改动。
@@ -261,45 +419,35 @@ mod tests {
 
     #[test]
     fn 中文正文完整保留() {
-        let src = "// tie:logic\nfunc main() {\n    println(\"你好，世界！\")\n}\n";
+        let src = "type tie\nfunc main() {\n    println(\"你好，世界！\")\n}\n";
         let r = preprocess(src);
         assert!(
             r.cleaned_source.contains("你好，世界！"),
             "中文正文应完整保留，实际: {:?}",
             r.cleaned_source
         );
-        assert_eq!(r.role, FileRole::Logic);
-    }
-
-    #[test]
-    fn 中文头部值尾随空格被去除() {
-        // 头部值含中文且带尾随空格：trim 应去掉空格（len 字节语义下 str_char 越界
-        // 返回空串导致尾随空格残留，str_len 码点语义下正确去除）
-        let src = "// tie:author=张三  \nfunc main() {}\n";
-        let r = preprocess(src);
-        assert_eq!(r.headers.len(), 1);
-        assert_eq!(
-            r.headers[0].raw, "author=张三",
-            "头部值不应有尾随空格，实际: {:?}",
-            r.headers[0].raw
-        );
+        assert_eq!(r.role, FileRole::Type);
     }
 
     #[test]
     fn 中文注释行后正文正确重建() {
+        // "// 中文注释头部行" 不是 type tie 声明 → 属于正文（保留）
         let src = "// tie:logic\n// 中文注释头部行\nfunc main() {}\n";
         let r = preprocess(src);
-        // "// 中文注释头部行" 不是 tie: 指令 → 属于正文
         assert!(r.cleaned_source.contains("中文注释头部行"));
         assert_eq!(r.role, FileRole::Logic);
     }
 
     #[test]
     fn 中文数据文件角色判定() {
-        let src = "// tie:data\n[\"键\":\"值\"]\n";
+        let src = "type tie<data>\n[\"键\":\"值\"]\n";
         let r = preprocess(src);
         assert_eq!(r.role, FileRole::Data);
-        assert!(r.cleaned_source.contains("键"), "中文键应保留: {:?}", r.cleaned_source);
+        assert!(
+            r.cleaned_source.contains("键"),
+            "中文键应保留: {:?}",
+            r.cleaned_source
+        );
     }
 
     /// str_len 语义验证：码点数（chars().count）≠ len 字节数（s.len()），

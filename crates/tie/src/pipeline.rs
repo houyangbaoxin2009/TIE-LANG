@@ -135,11 +135,29 @@ impl<'a> Pipeline<'a> {
     /// 返回各切片的编译产物消息。
     pub fn run(&self) -> Result<Vec<CompileOutcome>, String> {
         // ---- 阶段 1：预处理（并行）----
-        // 每个切片 preprocess → 产物（正文 + 头部信息）写入缓存池 `prep:<名>`
+        // 每个切片 preprocess → 产物（正文 + 角色）写入缓存池 `prep:<名>`
         let preps: Vec<PreprocessResult> = self.parallel(&self.slices, |slice| {
             let source = fs::read_to_string(&slice.input)
                 .map_err(|e| format!("读取 {} 失败: {e}", slice.input.display()))?;
             let pre = preprocess(&source);
+            // 文件名默认角色与头部声明一致性检查：头部声明优先，不一致时警告。
+            // `xxx.<角色>.tie` 形式的文件名声明只是默认值，头部 `type tie<X>`
+            // 声明是权威——不一致仅提示、不报错，采用头部声明。
+            let name_role = slice
+                .input
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(FileRole::from_filename);
+            if let Some(r) = name_role
+                && r != pre.role
+            {
+                eprintln!(
+                    "警告: 文件 {} 名称声明为 {}，与头部声明 {} 不一致，已采用头部声明",
+                    slice.input.display(),
+                    r,
+                    pre.role
+                );
+            }
             // 释放到缓存池：正文（后续阶段从此取）
             self.cache.put(
                 format!("prep:{}", slice.name),
@@ -152,8 +170,11 @@ impl<'a> Pipeline<'a> {
         // 每个切片：从缓存池取预处理正文 → 词法/语法/import/语义 → IR 文本入池 `ir:<名>`
         let ir_used: Vec<Vec<String>> = self.parallel(&self.slices, |slice| {
             let idx = self.slices.iter().position(|s| s.name == slice.name).unwrap();
-            // 非编译角色（data/ui/db）跳过：不参与后端
-            if !matches!(preps[idx].role, FileRole::Logic | FileRole::Library) {
+            // 非编译角色（data/ui/db/port）跳过：不参与后端
+            if !matches!(
+                preps[idx].role,
+                FileRole::Logic | FileRole::Script | FileRole::Class | FileRole::Type
+            ) {
                 return Ok(Vec::new());
             }
             let source = self
@@ -179,13 +200,13 @@ impl<'a> Pipeline<'a> {
             // 语义分析
             let sem = tie_frontend::semantic::analyze(&program)
                 .map_err(|e| format!("{}: {e}", slice.input.display()))?;
-            // 入口检查：logic 必须有 main
+            // 入口检查：logic/script 必须有 main（class/type 库角色不需要）
             if !self.emit_ir_only
-                && preps[idx].role == FileRole::Logic
+                && matches!(preps[idx].role, FileRole::Logic | FileRole::Script)
                 && !sem.funcs.contains_key("main")
             {
                 return Err(format!(
-                    "{}: 文件角色为 logic，必须定义入口函数 main",
+                    "{}: 文件角色为 logic/script，必须定义入口函数 main",
                     slice.input.display()
                 ));
             }
@@ -201,7 +222,10 @@ impl<'a> Pipeline<'a> {
         if self.emit_ir_only {
             let mut outcomes = Vec::new();
             for (idx, slice) in self.slices.iter().enumerate() {
-                if !matches!(preps[idx].role, FileRole::Logic | FileRole::Library) {
+                if !matches!(
+                    preps[idx].role,
+                    FileRole::Logic | FileRole::Script | FileRole::Class | FileRole::Type
+                ) {
                     continue;
                 }
                 let ir = self
@@ -223,7 +247,10 @@ impl<'a> Pipeline<'a> {
         let outcomes = self.parallel(&self.slices, |slice| {
             let idx = self.slices.iter().position(|s| s.name == slice.name).unwrap();
             // 非编译角色跳过
-            if !matches!(preps[idx].role, FileRole::Logic | FileRole::Library) {
+            if !matches!(
+                preps[idx].role,
+                FileRole::Logic | FileRole::Script | FileRole::Class | FileRole::Type
+            ) {
                 return Ok(CompileOutcome {
                     message: format!(
                         "[tie] {}: 角色 {}，已跳过编译（该工具链后续版本实现）",
@@ -254,10 +281,10 @@ impl<'a> Pipeline<'a> {
                 keep_intermediate: self.keep_ir,
                 target: self.target.clone(),
             };
-            // 用缓存的头部信息重建 PreprocessResult（供后端读取 opt=/target=）
+            // 用切片角色重建 PreprocessResult（后端按角色分派产物；
+            // 头部信息已随旧 // tie: 指令系统移除，compile_from_ir 不再读头部）
             let pre = PreprocessResult {
                 cleaned_source: String::new(),
-                headers: preps[idx].headers.clone(),
                 role: preps[idx].role,
             };
             let ir_meta = tie_llvm::ir::IrOutput {
