@@ -1,0 +1,96 @@
+type tie<class>
+// std/deque.tie —— 双端队列（VecDeque 语义，命名空间 deque）
+// ============================================================
+// 基于 tie 动态表（i64 元素）：push_back = 原生追加 O(1)；
+// push_front / pop_front / pop_back 因表无原位删除，用重建实现 O(n)（v1 正确性优先）。
+// 约定：
+//   - 修改类函数用 ref 表参数（T0.3）：写回调用方变量；
+//   - pop 空队列返回 0（约定哨兵，调用方先查 size）；
+//   - front/back 空队列返回 0。
+// 参考验收：examples/coll_demo.tie。
+
+namespace deque {
+
+    // 新建空队列（i64）。
+    pub func new() -> table<i64> {
+        return table_new_i64()
+    }
+
+    // 尾部追加（O(1)，原生 table_push）。
+    pub func push_back(d: ref table<i64>, x: i64) {
+        table_push(d, x)
+    }
+
+    // 头部插入（重建：x + 原序）。
+    pub func push_front(d: ref table<i64>, x: i64) {
+        var ns: table<i64> = table_new_i64()
+        table_push(ns, x)
+        var i: i64 = 0
+        while i < len(d) {
+            table_push(ns, d[i])
+            i = i + 1
+        }
+        d = ns
+    }
+
+    // 尾部弹出（取尾元素 + 截断重建）；空队列返回 0。
+    pub func pop_back(d: ref table<i64>) -> i64 {
+        var n = len(d)
+        if n == 0 {
+            return 0
+        }
+        var x = d[n - 1]
+        var ns: table<i64> = table_new_i64()
+        var i: i64 = 0
+        while i < n - 1 {
+            table_push(ns, d[i])
+            i = i + 1
+        }
+        d = ns
+        return x
+    }
+
+    // 头部弹出（取头元素 + 重建）；空队列返回 0。
+    pub func pop_front(d: ref table<i64>) -> i64 {
+        var n = len(d)
+        if n == 0 {
+            return 0
+        }
+        var x = d[0]
+        var ns: table<i64> = table_new_i64()
+        var i: i64 = 1
+        while i < n {
+            table_push(ns, d[i])
+            i = i + 1
+        }
+        d = ns
+        return x
+    }
+
+    // 队头元素（不弹出）；空队列返回 0。
+    pub func front(d: table<i64>) -> i64 {
+        if len(d) == 0 {
+            return 0
+        }
+        return d[0]
+    }
+
+    // 队尾元素（不弹出）；空队列返回 0。
+    pub func back(d: table<i64>) -> i64 {
+        var n = len(d)
+        if n == 0 {
+            return 0
+        }
+        return d[n - 1]
+    }
+
+    // 元素个数。
+    pub func size(d: table<i64>) -> i64 {
+        return len(d)
+    }
+
+    // 清空（重绑定为空表）。
+    pub func clear(d: ref table<i64>) {
+        d = table_new_i64()
+    }
+}

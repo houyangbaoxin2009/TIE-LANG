@@ -1,0 +1,228 @@
+type tie<class>
+// std/set.tie —— 集合（HashSet 语义，命名空间 set）
+// ============================================================
+// 基于有序表 + 二分查找：元素唯一、contains/插入 O(log n)、插入自动排序。
+// 支持 i64 集（set.*）与 string 集（set.*_str）两组同名 API。
+// 约定：
+//   - add/remove 用 ref 表参数（T0.3）：修改直接写回调用方变量；
+//   - remove 不存在元素返回 false；add 已存在返回 false（未新增）；
+//   - to_table 返回有序副本（迭代视图）。
+// 参考验收：examples/coll_demo.tie。
+
+namespace set {
+
+    // ---------- i64 集 ----------
+
+    // 新建空集（i64）。
+    pub func new() -> table<i64> {
+        return table_new_i64()
+    }
+
+    // 二分查找 x 在有序表中的下标；不存在返回 -1。
+    func find(s: table<i64>, x: i64) -> i64 {
+        var lo: i64 = 0
+        var hi = len(s) - 1
+        while lo <= hi {
+            var mid = (lo + hi) / 2
+            var v = s[mid]
+            if v == x {
+                return mid
+            }
+            if v < x {
+                lo = mid + 1
+            } else {
+                hi = mid - 1
+            }
+        }
+        return -1
+    }
+
+    // 是否包含 x。
+    pub func contains(s: table<i64>, x: i64) -> bool {
+        return set.find(s, x) >= 0
+    }
+
+    // 添加 x（去重 + 有序插入）；已存在返回 false。
+    pub func add(s: ref table<i64>, x: i64) -> bool {
+        var lo: i64 = 0
+        var hi = len(s) - 1
+        while lo <= hi {
+            var mid = (lo + hi) / 2
+            var v = s[mid]
+            if v == x {
+                return false
+            }
+            if v < x {
+                lo = mid + 1
+            } else {
+                hi = mid - 1
+            }
+        }
+        // 在 lo 位置插入（重建：前半 + x + 后半）
+        var ns: table<i64> = table_new_i64()
+        var i: i64 = 0
+        while i < lo {
+            table_push(ns, s[i])
+            i = i + 1
+        }
+        table_push(ns, x)
+        i = lo
+        while i < len(s) {
+            table_push(ns, s[i])
+            i = i + 1
+        }
+        s = ns
+        return true
+    }
+
+    // 删除 x；不存在返回 false。
+    pub func remove(s: ref table<i64>, x: i64) -> bool {
+        var idx = set.find(s, x)
+        if idx < 0 {
+            return false
+        }
+        var ns: table<i64> = table_new_i64()
+        var i: i64 = 0
+        while i < len(s) {
+            if i != idx {
+                table_push(ns, s[i])
+            }
+            i = i + 1
+        }
+        s = ns
+        return true
+    }
+
+    // 元素个数。
+    pub func size(s: table<i64>) -> i64 {
+        return len(s)
+    }
+
+    // 有序副本（迭代视图：for x in set.to_table(s)）。
+    pub func to_table(s: table<i64>) -> table<i64> {
+        return s
+    }
+
+    // 并集（返回新集）。
+    pub func union(a: table<i64>, b: table<i64>) -> table<i64> {
+        var r: table<i64> = table_new_i64()
+        var i: i64 = 0
+        while i < len(a) {
+            table_push(r, a[i])
+            i = i + 1
+        }
+        i = 0
+        while i < len(b) {
+            set.add(r, b[i])
+            i = i + 1
+        }
+        return r
+    }
+
+    // 交集（返回新集）。
+    pub func intersect(a: table<i64>, b: table<i64>) -> table<i64> {
+        var r: table<i64> = table_new_i64()
+        var i: i64 = 0
+        while i < len(a) {
+            if set.contains(b, a[i]) {
+                table_push(r, a[i])
+            }
+            i = i + 1
+        }
+        return r
+    }
+
+    // 差集 a - b（返回新集）。
+    pub func diff(a: table<i64>, b: table<i64>) -> table<i64> {
+        var r: table<i64> = table_new_i64()
+        var i: i64 = 0
+        while i < len(a) {
+            if !set.contains(b, a[i]) {
+                table_push(r, a[i])
+            }
+            i = i + 1
+        }
+        return r
+    }
+
+    // ---------- string 集 ----------
+
+    // 新建空集（string）。
+    pub func new_str() -> table<string> {
+        return table_new_string()
+    }
+
+    // 二分查找（string 序）；不存在返回 -1。
+    func find_str(s: table<string>, x: string) -> i64 {
+        var lo: i64 = 0
+        var hi = len(s) - 1
+        while lo <= hi {
+            var mid = (lo + hi) / 2
+            var v = s[mid]
+            if v == x {
+                return mid
+            }
+            if v < x {
+                lo = mid + 1
+            } else {
+                hi = mid - 1
+            }
+        }
+        return -1
+    }
+
+    // 是否包含 x。
+    pub func contains_str(s: table<string>, x: string) -> bool {
+        return set.find_str(s, x) >= 0
+    }
+
+    // 添加 x（去重 + 有序插入）；已存在返回 false。
+    pub func add_str(s: ref table<string>, x: string) -> bool {
+        var lo: i64 = 0
+        var hi = len(s) - 1
+        while lo <= hi {
+            var mid = (lo + hi) / 2
+            var v = s[mid]
+            if v == x {
+                return false
+            }
+            if v < x {
+                lo = mid + 1
+            } else {
+                hi = mid - 1
+            }
+        }
+        var ns: table<string> = table_new_string()
+        var i: i64 = 0
+        while i < lo {
+            table_push(ns, s[i])
+            i = i + 1
+        }
+        table_push(ns, x)
+        i = lo
+        while i < len(s) {
+            table_push(ns, s[i])
+            i = i + 1
+        }
+        s = ns
+        return true
+    }
+
+    // 删除 x；不存在返回 false。
+    pub func remove_str(s: ref table<string>, x: string) -> bool {
+        var idx = set.find_str(s, x)
+        if idx < 0 {
+            return false
+        }
+        var ns: table<string> = table_new_string()
+        var i: i64 = 0
+        while i < len(s) {
+            if i != idx {
+                table_push(ns, s[i])
+            }
+            i = i + 1
+        }
+        s = ns
+        return true
+    }
+}

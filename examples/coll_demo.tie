@@ -1,0 +1,54 @@
+type tie<logic>
+// examples/coll_demo.tie —— 集合库验证（P0-4：std/set + std/deque）
+// ============================================================
+// 期望输出：
+//   set: 3 / true / false / 2
+//   union: 4 / intersect: 2 / diff: 1
+//   strset: 2 / true
+//   deque: 1 / 3 / 0 / 3 / 2 / 2
+
+import "../std/set.tie"
+import "../std/deque.tie"
+
+func main() {
+    // ---- set（i64）----
+    var s: table<i64> = table_new_i64()
+    set.add(s, 3)
+    set.add(s, 1)
+    set.add(s, 2)
+    set.add(s, 2)              // 重复：false，不新增
+    println("set: " + to_string(set.size(s)) + " / " +
+        (set.contains(s, 2) ? "true" : "false") + " / " +
+        (set.contains(s, 5) ? "true" : "false") + " / " +
+        (set.remove(s, 2) ? "true" : "false"))
+    // 集合运算
+    var a: table<i64> = table_new_i64()
+    set.add(a, 1)
+    set.add(a, 2)
+    set.add(a, 3)
+    var b: table<i64> = table_new_i64()
+    set.add(b, 3)
+    set.add(b, 4)
+    println("union: " + to_string(set.size(set.union(a, b))) +
+        " / intersect: " + to_string(set.size(set.intersect(a, b))) +
+        " / diff: " + to_string(set.size(set.diff(a, b))))
+    // ---- set（string）----
+    var ss: table<string> = table_new_string()
+    set.add_str(ss, "b")
+    set.add_str(ss, "a")
+    set.add_str(ss, "a")       // 重复
+    println("strset: " + to_string(len(ss)) + " / " +
+        (set.contains_str(ss, "a") ? "true" : "false"))
+    // ---- deque ----
+    var d: table<i64> = table_new_i64()
+    deque.push_back(d, 1)
+    deque.push_back(d, 2)
+    deque.push_back(d, 3)
+    println("deque: " + to_string(deque.front(d)) + " / " +
+        to_string(deque.back(d)) + " / ")
+    deque.push_front(d, 0)
+    println("deque: " + to_string(deque.front(d)) + " / " +
+        to_string(deque.pop_back(d)) + " / " +
+        to_string(deque.pop_front(d)) + " / " +
+        to_string(deque.size(d)))
+}
