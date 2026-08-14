@@ -15,7 +15,7 @@ func main() {
     vecsearch.flat_add(ids, vecs, 2, 2, [0.0, 1.0])
     vecsearch.flat_add(ids, vecs, 2, 3, [1.0, 1.0])
     vecsearch.flat_add(ids, vecs, 2, 4, [0.5, 0.5])
-    var q = [0.6, 0.6]
+    var q: table<f64> = [0.6, 0.6]
     var hits = vecsearch.flat_search(ids, vecs, 2, q, 2)
     println("top1=" + to_string(hits[0]) + " / top2=" + to_string(hits[1]))
     println("size=" + to_string(vecsearch.flat_size(ids)))
