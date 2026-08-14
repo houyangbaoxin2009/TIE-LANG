@@ -186,6 +186,24 @@ pub extern "C" fn tie_str_char(s: *const c_char, i: i64) -> *mut c_char {
     string_to_c_char(ch.map(|c| c.to_string()).unwrap_or_default())
 }
 
+/// C ABI 桥：Unicode 码点（i64）→ 单字符 UTF-8 字符串（新分配堆串）。
+///
+/// 非法码点（负值、超过 0x10FFFF、代理区 D800-DFFF）返回空串——`char::from_u32`
+/// 对代理区与超上限输入返回 None，负值经 `as u32` 转为 0xFFFF_FFFF 附近的大数
+/// 天然超上限，一并落入 None → 空串分支（不用 NULL 哨兵，调用方无需错误分支）。
+/// 与 [tie_str_char]（下标取字符）[tie_char_code]（字符→码点）同属 Unicode 码点
+/// 家族，提供缺失的「码点 → 字符」逆路径：tie:zd 二进制序列化解码中文的必要前提
+/// （此前 tie 无码点→字符路径，utf.to_char 仅 ASCII 查表、无 \u/\x 转义、eval 受限）。
+#[unsafe(no_mangle)]
+pub extern "C" fn tie_str_from_code(n: i64) -> *mut c_char {
+    // char::from_u32 同时拒绝代理区（D800-DFFF）与超上限（>0x10FFFF）；
+    // 负值 as u32 后成为 >0x10FFFF 的大值，同样返回 None → 空串。
+    let s = char::from_u32(n as u32)
+        .map(|c| c.to_string())
+        .unwrap_or_default();
+    string_to_c_char(s)
+}
+
 /// C ABI 桥：取字符串首字符的 Unicode 标量值（UTF-32 码点，i64）；
 /// 空串返回 -1（哨兵）。与 [tie_str_char] 同源（`chars().next()` 解码），
 /// 供 tie 语言 `char_code` 原语使用——编译器（archive/compiler-v1/lexer.tie）解析
@@ -3009,6 +3027,22 @@ impl<'a> Env<'a> {
                 tie_free_result(r);
                 Ok(Value::Str(s))
             }
+            "str_from_code" => {
+                // Unicode 码点 → 单字符字符串（C ABI 桥与编译路径共用同一实现）。
+                // 非法码点（负值、超过 0x10FFFF、代理区）在桥内返回空串——
+                // 调用方无需错误分支，直接取回字符串（与 str_char 越界语义一致）。
+                if args.len() != 1 {
+                    return Err("str_from_code 需要一个整数参数".into());
+                }
+                let Value::Int(code) = args[0] else {
+                    return Err("str_from_code 需要一个整数参数".into());
+                };
+                let p = tie_str_from_code(code);
+                // 桥保证返回合法 NUL 结尾 UTF-8 堆串（空串也是），读入后释放
+                let s = unsafe { c_char_to_string(p).unwrap_or_default() };
+                tie_free_result(p);
+                Ok(Value::Str(s))
+            }
             "file_write" | "file_append" => {
                 if args.len() != 2 {
                     return Err(format!("{name} 需要两个字符串参数"));
@@ -4210,6 +4244,27 @@ mod tests {
     /// 便捷求值：新会话 + eval。
     fn ev(code: &str) -> Result<String, String> {
         Session::new().eval(code)
+    }
+
+    // ---------- 语言底座原语：str_from_code（码点 → 单字符） ----------
+
+    #[test]
+    fn eval_str_from_code() {
+        // 中文 / ASCII 正例：码点 → 单字符字符串
+        assert_eq!(ev("str_from_code(20013)").unwrap(), "中");
+        assert_eq!(ev("str_from_code(65)").unwrap(), "A");
+        // emoji U+1F600 = 128512 → 4 字节 UTF-8 字符
+        assert_eq!(ev("str_from_code(128512)").unwrap(), "😀");
+        // 非法码点 → 空串：负值 / 超过 0x10FFFF / 代理区（D800-DFFF）
+        assert_eq!(ev("str_from_code(-1)").unwrap(), "");
+        assert_eq!(ev("str_from_code(0x110000)").unwrap(), "");
+        assert_eq!(ev("str_from_code(0xD800)").unwrap(), "");
+        assert_eq!(ev("str_from_code(0xDFFF)").unwrap(), "");
+        // 错误分支：非整数参数
+        assert!(
+            ev("str_from_code(\"中\")").is_err(),
+            "字符串实参应报错"
+        );
     }
 
     // ---------- E1+E5：break/continue + 标签跳转（解释路径） ----------

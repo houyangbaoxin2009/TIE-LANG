@@ -2588,6 +2588,26 @@ impl Analyzer {
                     }
                     return Ok(TypeSpec::Named(TyKw::I64));
                 }
+                // 内置函数 str_from_code：整数（Unicode 码点）→ string（单字符字符串）。
+                // 与 char_code（字符串→码点）对称，构成码点 ↔ 字符双向转换；非法码点
+                // （负值、超过 0x10FFFF、代理区 D800-DFFF）运行时返回空串，编译期只查类型。
+                if name == "str_from_code" {
+                    if args.len() != 1 {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!("str_from_code() 期望 1 个参数，实际 {} 个", args.len()),
+                        });
+                    }
+                    let it = self.infer_expr(&args[0], scope)?;
+                    self.result.expr_types.insert(addr_of(&args[0]), it.clone());
+                    if !it.is_int() {
+                        return Err(SemanticError {
+                            span: expr_span_of(&args[0]),
+                            message: format!("str_from_code() 第 1 个参数必须是整数，实际是 {}", type_name(&it)),
+                        });
+                    }
+                    return Ok(TypeSpec::Named(TyKw::Str));
+                }
                 // ---------- P1 正则表达式内置函数 ----------
                 //
                 // 语义：regex_match 部分匹配即真（RE2 无回溯）；regex_find 返回首个匹配片段；
@@ -4812,6 +4832,23 @@ mod tests {
         expect_err(
             "func join(t: table<string>) -> string {\n    return \"\"\n}\nfunc main() {\n    join([1, 2])\n}\n",
             "表参数元素类型不匹配",
+        );
+    }
+
+    #[test]
+    fn str_from_code签名与类型检查() {
+        // 合法调用：整数参数 → string 返回（语义类型检查通过）
+        analyze_src("func main() {\n    var s = str_from_code(20013)\n}\n")
+            .expect("str_from_code(整数) 应通过语义检查");
+        // 参数个数错误：缺参
+        expect_err(
+            "func main() {\n    var s = str_from_code()\n}\n",
+            "str_from_code() 期望 1 个参数",
+        );
+        // 参数类型错误：字符串实参 → 报类型错误（码点必须是整数）
+        expect_err(
+            "func main() {\n    var s = str_from_code(\"中\")\n}\n",
+            "str_from_code() 第 1 个参数必须是整数",
         );
     }
 

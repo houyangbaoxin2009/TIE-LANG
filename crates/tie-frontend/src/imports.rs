@@ -48,17 +48,23 @@ pub fn expand_imports(
     clean: &dyn Fn(&str) -> String,
 ) -> Result<Program, ImportError> {
     let mut chain: HashSet<PathBuf> = HashSet::new();
-    expand_imports_inner(program, base_dir, &mut chain, clean)
+    let mut done: HashSet<PathBuf> = HashSet::new();
+    expand_imports_inner(program, base_dir, &mut chain, &mut done, clean)
 }
 
 /// 递归展开的实际实现。
 ///
 /// `chain` 是跨递归共享的「展开链」集合（规范化绝对路径），
 /// 用于循环导入检测——必须在同一递归栈内传递，不能每次新建。
+/// `done` 是跨递归共享的「已展开」集合：同一文件在不同分支被多次 import
+/// （钻石依赖，如 compiler 中 std/intern.tie 经 interner 被多条链引用）时，
+/// 只展开一次，避免顶层全局变量/函数重复定义——历史缺陷（"../" 路径拼写
+/// 不同导致的重复展开，见 compiler/frontend/semantic_test.tie 注释）。
 fn expand_imports_inner(
     program: Program,
     base_dir: &Path,
     chain: &mut HashSet<PathBuf>,
+    done: &mut HashSet<PathBuf>,
     clean: &dyn Fn(&str) -> String,
 ) -> Result<Program, ImportError> {
     let mut out = Vec::new();
@@ -66,9 +72,9 @@ fn expand_imports_inner(
         match stmt {
             Stmt::Import(imp) => {
                 let import_path = base_dir.join(&imp.path);
-                // 规范化路径（解析 . / ..），用于循环检测
+                // 规范化路径（解析 . / ..），用于循环检测与去重
                 let canon = fs::canonicalize(&import_path).unwrap_or_else(|_| import_path.clone());
-                if !chain.insert(canon.clone()) {
+                if chain.contains(&canon) {
                     return Err(ImportError {
                         span: imp.span,
                         message: format!("循环导入：文件 '{}' 已在导入链中", imp.path),
@@ -88,13 +94,24 @@ fn expand_imports_inner(
                     span: imp.span,
                     message: format!("导入文件 {} 语法错误: {}", imp.path, e.message),
                 })?;
+                // 已展开去重：文件此前已在其他分支完整展开过，只补命名空间视图
+                // （保留 import 语句供语义层构建别名/前缀映射），不重复输出其语句。
+                if done.contains(&canon) {
+                    let mut ns_paths = Vec::new();
+                    collect_ns_paths(&sub_program.stmts, &mut Vec::new(), &mut ns_paths);
+                    let mut imp = imp;
+                    imp.ns_paths = ns_paths;
+                    out.push(Stmt::Import(imp));
+                    continue;
+                }
+                chain.insert(canon.clone());
                 // 递归展开被导入文件的 import（以该文件所在目录为基准）
                 let sub_dir = import_path
                     .parent()
                     .map(|p| p.to_path_buf())
                     .unwrap_or_else(|| PathBuf::from("."));
                 let expanded =
-                    expand_imports_inner(sub_program, &sub_dir, chain, clean)?;
+                    expand_imports_inner(sub_program, &sub_dir, chain, done, clean)?;
                 // M2.1.7：收集被导入文件声明的全部命名空间路径（顶层 + 嵌套），
                 // 填回 import 语句的 ns_paths——语义层据此把别名/前缀映射到全名。
                 // 被导入文件自身的 import 语句已被吞掉（不构成导入方视图）。
@@ -105,8 +122,10 @@ fn expand_imports_inner(
                 // 保留当前文件的 import 语句（携带 ns_paths），其后跟展开的语句
                 out.push(Stmt::Import(imp));
                 out.extend(expanded.stmts);
-                // 弹出当前文件，允许同目录下其他文件再次导入它（非循环）
+                // 弹出当前文件，允许同目录下其他文件再次导入它（非循环）；
+                // 但标记为「已展开」，再次遇到时去重跳过（见上方 done 分支）。
                 chain.remove(&canon);
+                done.insert(canon);
             }
             other => out.push(other),
         }

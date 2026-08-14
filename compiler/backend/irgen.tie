@@ -1474,7 +1474,7 @@ func is_builtin_name(nm: string) -> bool {
     if nm == "exec_code" || nm == "time_now" || nm == "get_env" || nm == "exec_output" {
         return true
     }
-    if nm == "str_len" || nm == "char_code" || nm == "str_char" {
+    if nm == "str_len" || nm == "char_code" || nm == "str_char" || nm == "str_from_code" {
         return true
     }
     if nm == "to_string" || nm == "parse_int" || nm == "parse_float" || nm == "parse_trit" {
@@ -1573,6 +1573,28 @@ func builtin_expr(nm: string, id: i64) -> i64 {
             return -1
         }
         g_builtin_res = gen_ext_call2("tie_str_char", v, types.named(TK_STR), i, types.named(TK_I64), types.named(TK_STR))
+        return 0
+    }
+    if nm == "str_from_code" {
+        // 码点 → 单字符字符串（与 char_code 对称）。桥签名 (i64) -> ptr（堆串），
+        // 独立语句时调用方 gen_stmt 统一 free（与 str_char 同机制）。
+        g_used_interp = true
+        var v = gen_expr(call_arg(id, 0))
+        if v < 0 {
+            return -1
+        }
+        // 实参类型：i64 直传；窄整数（trit/char/i8/i16/i32 等）先 sext 到 i64
+        // （桥只收 i64，直传会生成 `call ptr @tie_str_from_code(i64 %i8)` 类型错）
+        var vt = node_types[call_arg(id, 0)]
+        if vt == types.named(TK_I64) || vt == types.named(TK_U64) || vt < 0 {
+            g_builtin_res = gen_ext_call1("tie_str_from_code", v, types.named(TK_I64), types.named(TK_STR))
+        } else {
+            var sv = gen_sext(v, vt, types.named(TK_I64))
+            if sv < 0 {
+                return -1
+            }
+            g_builtin_res = gen_ext_call1("tie_str_from_code", sv, types.named(TK_I64), types.named(TK_STR))
+        }
         return 0
     }
     if nm == "to_string" {

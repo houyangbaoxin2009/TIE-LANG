@@ -17,7 +17,7 @@
 //! type tie<db>      # 数据库文件（FileRole::Db）
 //! type tie<ir>      # IR 文件（FileRole::Ir，直接生成 LLVM IR .ll）
 //! ```
-//! `type tie<X>` 的 X ∈ {script, data, ui, class, logic, port, db, ir}。
+//! `type tie<X>` 的 X ∈ {script, data, ui, class, logic, port, db, ir, zd}。
 //! 无声明时默认角色为 logic。多次声明首个生效，其余同样剥离。
 //! 旧 `// tie:xxx` 注释指令系统已完全移除——该类注释不再被提取/剥离，
 //! 作为普通注释留在正文中（词法阶段自然忽略）。
@@ -85,6 +85,10 @@ pub enum FileRole {
     /// IR 文件（`type tie<ir>` 声明 / xxx.ir.tie 文件名默认）——
     /// 检测到即直接生成 LLVM IR（.ll），不继续 opt/clang 链接
     Ir,
+    /// 压缩的 tie:data（`type tie<zd>` 声明 / xxx.zd.tie 文件名默认）——
+    /// 二进制、人类不可读，主要用文件名 `xxx.zd.tie` 声明；
+    /// 必须按文件名预判并在任何文本读取之前短接
+    Zd,
 }
 
 impl FileRole {
@@ -100,10 +104,11 @@ impl FileRole {
             FileRole::Port => "port",
             FileRole::Db => "db",
             FileRole::Ir => "ir",
+            FileRole::Zd => "zd",
         }
     }
 
-    /// 角色名 → 枚举（精确匹配 9 个角色名，未知返回 None）。
+    /// 角色名 → 枚举（精确匹配 10 个角色名，未知返回 None）。
     ///
     /// 与旧 `role_from_str`（未知回退 logic）不同：未知角色来自声明系统
     /// 之外（如 `type tie<library>`），必须在 [preprocess] 阶段报错而非
@@ -119,6 +124,7 @@ impl FileRole {
             "port" => Some(FileRole::Port),
             "db" => Some(FileRole::Db),
             "ir" => Some(FileRole::Ir),
+            "zd" => Some(FileRole::Zd),
             _ => None,
         }
     }
@@ -384,6 +390,7 @@ mod tests {
         assert_eq!(FileRole::from_filename("log.logic.tie"), Some(FileRole::Logic));
         assert_eq!(FileRole::from_filename("svc.port.tie"), Some(FileRole::Port));
         assert_eq!(FileRole::from_filename("code.ir.tie"), Some(FileRole::Ir));
+        assert_eq!(FileRole::from_filename("app.zd.tie"), Some(FileRole::Zd));
         // 非 `<名>.<角色>.tie` 形式 → None
         assert_eq!(FileRole::from_filename("main.tie"), None);
         assert_eq!(FileRole::from_filename("foo.logic2.tie"), None);
@@ -410,6 +417,7 @@ mod tests {
             FileRole::Port,
             FileRole::Db,
             FileRole::Ir,
+            FileRole::Zd,
         ];
         for r in all {
             assert_eq!(FileRole::from_str(r.as_str()), Some(r), "角色 {}", r.as_str());

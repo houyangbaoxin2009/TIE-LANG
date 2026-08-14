@@ -1,0 +1,41 @@
+type tie<logic>
+
+// str_from_code 原语验收（Unicode 码点 → 单字符 UTF-8 字符串）：
+// - 正例：中文 20013→"中"、ASCII 65→"A"、emoji 128512（U+1F600）→ 4 字节字符；
+// - 非法码点（负值、超过 0x10FFFF、代理区 D800-DFFF）→ 空串 ""；
+// - 与 char_code / str_char / utf.codepoint 双向 roundtrip 一致。
+// 用途：tie:zd 二进制序列化解码中文的必要前提——此前 tie 无「码点 → 字符」路径
+// （utf.to_char 仅 ASCII 查表、无 \u/\x 转义、eval 受限）。
+// 预期输出：str_from_code 验收通过（全部断言通过，无 assert 失败退出）。
+import "../../std/assert.tie"
+import "../../std/utf.tie"
+using assert;
+using utf;
+
+func main() {
+    // ---- 基础正例：码点 → 单字符（中文 / ASCII / emoji）----
+    assert.assert_eq_str(str_from_code(20013), "中")
+    assert.assert_eq_str(str_from_code(65), "A")
+    assert.assert_eq_str(str_from_code(97), "a")
+    assert.assert_eq_str(str_from_code(0x4E2D), "中")
+    // emoji 😀 U+1F600 = 128512，UTF-8 4 字节（1 码点）
+    assert.assert_eq(str_len(str_from_code(128512)), 1)
+    assert.assert_eq(utf.byte_len(str_from_code(128512)), 4)
+    // ---- 非法码点 → 空串：负值 / 超过 0x10FFFF / 代理区 ----
+    assert.assert_eq_str(str_from_code(-1), "")
+    assert.assert_eq_str(str_from_code(-128), "")
+    assert.assert_eq_str(str_from_code(0x110000), "")
+    assert.assert_eq_str(str_from_code(0x7FFFFFFF), "")
+    assert.assert_eq_str(str_from_code(0xD800), "")
+    assert.assert_eq_str(str_from_code(0xDBFF), "")
+    assert.assert_eq_str(str_from_code(0xDFFF), "")
+    // ---- 与 utf.codepoint / str_char 双向 roundtrip ----
+    assert.assert_eq(utf.codepoint(str_from_code(utf.codepoint("中"))), utf.codepoint("中"))
+    assert.assert_eq_str(str_from_code(utf.codepoint("中")), "中")
+    assert.assert_eq(utf.codepoint(str_from_code(utf.codepoint("😀"))), 128512)
+    // str_char 取出的单字符可经 from_code 还原（码点 → 字符 → 码点闭环）
+    assert.assert_eq_str(str_from_code(char_code(str_char("中文", 0))), "中")
+    assert.assert_eq(utf.codepoint("四"), 0x56DB)
+    assert.assert_eq_str(str_from_code(utf.codepoint("四")), "四")
+    println("str_from_code 验收通过")
+}

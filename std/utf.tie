@@ -13,8 +13,9 @@ type tie<class>
 // 32..126 可打印 ASCII 查表 char↔code。
 // 调用：import 后 utf.codepoint(...) / utf.byte_len(...)；命名空间内互调为裸调用。
 // 命名规范：命名空间内函数不加 utf_ 前缀（统一 func 写法，Harbor M2.1.6）。
-// 局限：tie 无「码点 → 任意字符」构造原语，char 仅支持可打印 ASCII 查表，
-// 非 ASCII 码点无法从 i64 还原为字符串字符，返回空串。
+// 码点 → 字符：底座原语 str_from_code（任意合法 Unicode 码点，含中文/emoji；
+// 非法码点返回空串），本模块 from_code 为其封装，与 codepoint（字符 → 码点）对称；
+// utf.to_char 仍保留 ASCII 查表方案（码点 → 可打印 ASCII 单字符，历史约定）。
 
 namespace utf {
 // 单字符字符串 → Unicode 码点（UTF-32）。空串 / 非单字符返回 -1。
@@ -25,6 +26,15 @@ pub func codepoint(ch: string) -> i64 {
         return -1
     }
     return char_code(ch)
+}
+
+// 码点 → 单字符字符串（UTF-8 编码）。与 codepoint 对称（码点 ↔ 字符 双向转换）。
+// 底层原语 str_from_code 使用 Rust char::from_u32 校验：非法码点（负值、超过
+// 0x10FFFF、代理区 D800-DFFF）返回空串。此前 tie 无「码点 → 任意字符」路径
+// （utf.to_char 仅可打印 ASCII 查表），本函数补齐完整 Unicode——tie:zd 二进制
+// 序列化解码中文的必要前提。
+pub func from_code(n: i64) -> string {
+    return str_from_code(n)
 }
 
 // 码点 → UTF-8 字节数：≤0x7F 1 字节；≤0x7FF 2 字节；≤0xFFFF 3 字节；≤0x10FFFF 4 字节；
@@ -125,9 +135,9 @@ pub func is_letter(cp: i64) -> bool {
 }
 
 // 可打印 ASCII 码点（32..126）→ 单字符；越界返回空串。
-// 查表方案：常量字符串含 32..126 全部 95 个可打印字符，str_char(表, cp-32) 定位
-// （tie 无码点→任意字符原语，用查表实现）。
-// 局限：非 ASCII 码点（如 0x4E2D "中"）无法还原为字符，返回空串。
+// 查表方案：常量字符串含 32..126 全部 95 个可打印字符，str_char(表, cp-32) 定位。
+// 局限：非 ASCII 码点（如 0x4E2D "中"）无法还原为字符，返回空串——完整 Unicode
+// 码点 → 字符用底座原语 str_from_code（本模块 from_code 封装）。
 // 命名说明：函数名本应为 char，但 char 是 tie 类型关键字（TyKw::Char）保留字，
 // 不能用作函数名，故以 to_char 命名（码点→字符的转换语义）。
 pub func to_char(cp: i64) -> string {

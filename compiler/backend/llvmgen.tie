@@ -474,6 +474,10 @@ func extern_decl(sym: string) -> string {
     if sym == "tie_str_char" {
         return "declare ptr @tie_str_char(ptr, i64)"
     }
+    if sym == "tie_str_from_code" {
+        // 码点 → 单字符 UTF-8 字符串（返回堆串，调用方 tie_free_result）
+        return "declare ptr @tie_str_from_code(i64)"
+    }
     if sym == "tie_to_string_i64" {
         return "declare ptr @tie_to_string_i64(i64)"
     }

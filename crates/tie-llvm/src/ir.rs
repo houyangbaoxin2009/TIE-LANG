@@ -271,6 +271,10 @@ impl<'p> IrGenerator<'p> {
         if self.used_externs.iter().any(|s| s == "tie_str_char") {
             self.out.push_str("declare ptr @tie_str_char(ptr, i64)\n");
         }
+        // str_from_code（Unicode 码点 → 单字符 UTF-8 字符串；返回堆串，调用方释放）。
+        if self.used_externs.iter().any(|s| s == "tie_str_from_code") {
+            self.out.push_str("declare ptr @tie_str_from_code(i64)\n");
+        }
         // char_code（自举阶段 2 新增）：首字符 → Unicode 标量（i64，UTF-32 码点）。
         if self.used_externs.iter().any(|s| s == "tie_char_code") {
             self.out.push_str("declare i64 @tie_char_code(ptr)\n");
@@ -3225,6 +3229,19 @@ impl<'p> IrGenerator<'p> {
             self.line(&format!("{tmp} = call i64 @tie_char_code(ptr {s})"));
             return Ok((tmp, "i64"));
         }
+        // 内置 str_from_code：整数（Unicode 码点）→ string（单字符字符串）。
+        // 走 C ABI 桥（Rust char::from_u32 解码），返回堆串——独立语句时在
+        // gen_stmt 的 Expr 分支统一 tie_free_result（与 file_read/str_char 同机制）。
+        if name == "str_from_code" {
+            self.mark_used("tie_str_from_code");
+            self.mark_used("tie_free_result");
+            let (v, v_ty) = self.gen_expr(&args[0])?;
+            // 窄整数（i8/i16/i32）统一扩展到 i64（C ABI 桥第一个参数类型）
+            let v64 = self.extend_int_to_i64(&v, v_ty, &args[0])?;
+            let tmp = self.new_reg();
+            self.line(&format!("{tmp} = call ptr @tie_str_from_code(i64 {v64})"));
+            return Ok((tmp, "ptr"));
+        }
         // 内置 to_string：单数字参数（i64/f64），返回 string（数字格式化）。
         // 按实参类型分派 i64/f64 桥（与解释路径一致）。
         if name == "to_string" {
@@ -5047,6 +5064,25 @@ mod tests {
         let program = parse_program(&toks).map_err(|e| format!("语法: {e}"))?;
         let sem = analyze(&program).map_err(|e| format!("语义: {e}"))?;
         gen_ir(&program, &sem).map(|o| o.ir).map_err(|e| format!("IR: {e}"))
+    }
+
+    // ---------- 语言底座原语：str_from_code（码点 → 单字符） ----------
+
+    #[test]
+    fn str_from_code生成调用() {
+        // 生成 tie_str_from_code 调用 + declare 声明（码点 → 单字符字符串）
+        let ir = 编译("func main() {\n    println(str_from_code(20013))\n}");
+        assert!(
+            ir.contains("declare ptr @tie_str_from_code(i64)"),
+            "应声明 tie_str_from_code"
+        );
+        assert!(
+            ir.contains("call ptr @tie_str_from_code(i64"),
+            "应生成 tie_str_from_code 调用"
+        );
+        // 独立语句场景：堆串结果统一 tie_free_result（与 file_read/str_char 同机制）
+        let ir2 = 编译("func main() {\n    str_from_code(20013)\n}");
+        assert!(ir2.contains("tie_free_result"), "独立语句堆串应释放");
     }
 
     // ---------- E1+E5：break/continue + 标签跳转（IR 生成） ----------

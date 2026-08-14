@@ -436,6 +436,20 @@ fn main() -> ExitCode {
     // ---- 默认路径：单文件编译（行为与原版本完全一致）----
     let input = &args.inputs[0];
 
+    // ---- zd 二进制预判（必须在任何文本读取之前）----
+    // `.zd.tie` 是二进制文件（压缩的 tie:data），人类不可读，不能按文本
+    // read_to_string —— 若读作文本会解码失败/乱码。按文件名后缀预判并
+    // 直接短接，跳过文本读取与预处理（zd 原语 tiedb compact/decompress 处理）。
+    if input
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".zd.tie"))
+    {
+        println!("[tie] 文件: {} | 角色: zd", input.display());
+        println!("识别为 zd 压缩数据文件（tie:data 压缩格式，用 tiedb compact/decompress 处理）");
+        return ExitCode::SUCCESS;
+    }
+
     // ---- 第 1 段：预处理（tie-prep）----
     let source = match fs::read_to_string(input) {
         Ok(s) => s,
@@ -516,6 +530,13 @@ fn dispatch_role(role: FileRole, args: &Args, input: PathBuf) -> Result<CompileO
         }),
         FileRole::Port => Ok(CompileOutcome {
             message: "[tie] 角色为 port（接口文件），已转交端口工具链 —— v0.1 尚未实现".to_string(),
+            artifact: None,
+        }),
+        // zd → 压缩数据（tie:data 二进制变体）：数据文件不编译，提示用
+        // tiedb compact/decompress 原语处理（主入口已在文本读取前按文件名
+        // 预判 `.zd.tie` 短接；此分支覆盖头部 `type tie<zd>` 声明场景）
+        FileRole::Zd => Ok(CompileOutcome {
+            message: "[tie] 识别为 zd 压缩数据文件（tie:data 压缩格式，用 tiedb compact/decompress 处理）".to_string(),
             artifact: None,
         }),
         // ir → tie-llvm 编译工具链，但强制 emit_ir_only=true：

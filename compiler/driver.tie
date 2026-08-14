@@ -11,10 +11,12 @@ type tie<logic>
 //                    [--emit-ir] [--keep-ir] [--prep-only] [--config <f>] [--help]
 // 退出码：0 成功 / 1 编译失败 / 2 参数错误。
 //
-// 角色识别：**头部扫描**（读源文件头部注释行找 `// tie:xxx`），不依赖
+// 角色识别：**头部扫描**（`type tie` / `type tie<X>` 声明），不依赖
 // prep/core.tie 的 import（避免 import 路径与编译兼容性风险；prep 协议
-// 后续可替换）。识别 logic/library/ui/db/data；logic/library → 编译工具链，
-// data/ui/db → 提示对应工具链未实现。
+// 后续可替换）。识别 logic/script/class/type/data/ui/db/port/ir/zd；
+// logic/script/class/type → 编译工具链，data/ui/db/port/zd → 提示对应
+// 工具链未实现。zd 是 tie:data 的二进制压缩变体（xxx.zd.tie），人类不可读，
+// 必须在 file_read（文本读取）之前按文件名预判并直接短接。
 //
 // opt/target 优先级：CLI 显式 > 头部 `// tie:opt=N` / `// tie:target=` > 默认 O2/无。
 import "./backend/irgen.tie"
@@ -141,7 +143,7 @@ func normalize_target(t: string) -> string {
 // ==================== 头部扫描（文件类型声明） ====================
 
 // 从源码头部识别文件类型声明（新体系）：
-//   `type tie` → 类型 type；`type tie<X>` → X（X ∈ script/data/ui/class/logic/port/db/ir）。
+//   `type tie` → 类型 type；`type tie<X>` → X（X ∈ script/data/ui/class/logic/port/db/ir/zd）。
 //   ir 角色：直接生成 LLVM IR（.ll），不继续 opt/clang 链接（等价 --emit-ir）。
 // 头部区 = 文件最前连续行（允许空行），遇第一个非空非声明行即结束；
 // 只扫前 20 行。无声明默认 logic（可执行）。
@@ -168,11 +170,11 @@ func scan_header(src: string) -> i64 {
             // 期望 `<X>` 形式，且无尾随内容
             if str_len(rest) >= 3 && str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">" {
                 var sub = trim(slice(rest, 1, str_len(rest) - 1))
-                if sub == "script" || sub == "data" || sub == "ui" || sub == "class" || sub == "logic" || sub == "port" || sub == "db" || sub == "ir" {
+                if sub == "script" || sub == "data" || sub == "ui" || sub == "class" || sub == "logic" || sub == "port" || sub == "db" || sub == "ir" || sub == "zd" {
                     g_role = sub
                     return 0
                 }
-                println("文件类型声明错误: 未知类型 '" + sub + "'（第 " + to_string(i + 1) + " 行），合法类型: script/data/ui/class/logic/port/db/ir")
+                println("文件类型声明错误: 未知类型 '" + sub + "'（第 " + to_string(i + 1) + " 行），合法类型: script/data/ui/class/logic/port/db/ir/zd")
                 return -1
             }
             println("文件类型声明错误: 非法声明 '" + ln + "'（第 " + to_string(i + 1) + " 行），应为 `type tie` 或 `type tie<类型>`")
@@ -277,6 +279,14 @@ func main() -> i64 {
         println("读取源码失败: " + g_input)
         return 1
     }
+    // zd 二进制预判：xxx.zd.tie 是二进制文件（压缩的 tie:data），人类不可读，
+    // 必须在 file_read（文本读取）之前按文件名后缀预判并直接短接——二进制
+    // 内容文本解码必然失败/乱码。zd 文件由 tiedb compact/decompress 原语处理。
+    var zd_len: i64 = str_len(g_input)
+    if zd_len >= 7 && slice(g_input, zd_len - 7, zd_len) == ".zd.tie" {
+        println("[预处理] 识别为 zd 压缩数据文件（头: " + g_input + "），tie:data 压缩格式，用 tiedb compact/decompress 处理")
+        return 0
+    }
     var src = file_read(g_input)
     if str_len(src) == 0 {
         println("读取源码失败: " + g_input)
@@ -316,6 +326,13 @@ func main() -> i64 {
     }
     if g_role == "port" {
         println("[预处理] 识别为 port 端口文件（头: " + g_input + "），已转交端口工具链 —— v0.1 端口工具链尚未实现")
+        return 0
+    }
+    // zd 角色：压缩数据文件（tie:data 二进制变体），不编译。正常流程下已按
+    // 文件名 `.zd.tie` 预判短接（file_read 之前），此分支兜底头部
+    // `type tie<zd>` 声明（非 .zd.tie 文件名）的场景。
+    if g_role == "zd" {
+        println("[预处理] 识别为 zd 压缩数据文件（头: " + g_input + "），已转交 tiedb 压缩工具链 —— v0.1 尚未实现")
         return 0
     }
     // ir 角色：直接生成 LLVM IR（.ll），不继续 opt/clang 链接（等价 --emit-ir，
@@ -607,7 +624,7 @@ func role_from_filename(name: string) -> string {
         return ""
     }
     var role = slice(name, first_dot + 1, last_dot)
-    if role == "type" || role == "script" || role == "data" || role == "ui" || role == "class" || role == "logic" || role == "port" || role == "db" || role == "ir" {
+    if role == "type" || role == "script" || role == "data" || role == "ui" || role == "class" || role == "logic" || role == "port" || role == "db" || role == "ir" || role == "zd" {
         return role
     }
     return ""

@@ -254,25 +254,26 @@ func ensure_builtins() {
         "print", "print_err", "println", "rand_range", "read_line",
         "regex_find", "regex_find_all", "regex_group", "regex_match",
         "regex_replace", "remove_dir_all", "round", "set_env", "sin",
-        "sqrt", "str_char", "str_len", "table_at", "table_new_bool",
+        "sqrt", "str_from_code", "str_char", "str_len", "table_at",
+        "table_new_bool",
         "table_new_f64", "table_new_i64", "table_new_string",
         "table_push", "tan", "time_now", "to_string", "untar_gz",
         "unzip", "walk_dir"]
     // 参数个数（-1 = 任意，println/print）
     var nargs: table<i64> = [0, 1, 2, 3, 2, 1, 2, 1, 1, 2, 1, 0, 1, 2, 1,
         1, 1, 1, 2, 2, 1, 1, 2, 1, 2, 1, 1, 1, 2, 1, 1, 1, 1, 0, 3, 1, 1,
-        2, 1, 1, 1, 2, 2, -1, 1, -1, 2, 0, 2, 2, 3, 2, 3, 1, 1, 2, 1, 1,
+        2, 1, 1, 1, 2, 2, -1, 1, -1, 2, 0, 2, 2, 3, 2, 3, 1, 1, 2, 1, 1, 1,
         2, 1, 2, 0, 0, 0, 0, 2, 1, 0, 1, 2, 2, 1]
     // 返回编码 kind（0=Named 1=table<Named> 2=裸 table）
     var kinds: table<i64> = [0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1]
+        0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1]
     // 返回编码 kw（TyKw 索引；kind=0/1 时有效）
     var kws: table<i64> = [3, 13, 3, 10, 0, 3, 10, 9, 3, 10, 9, 13, 13,
         13, 3, 13, 14, 9, 10, 10, 10, 10, 10, 13, 10, 9, 13, 13, 10, 3,
         13, 9, 10, 13, 14, 14, 13, 13, 9, 3, 3, 13, 9, 14, 14, 14, 3, 13,
-        13, 13, 13, 10, 13, 10, 9, 14, 9, 9, 13, 3, 3, 10, 9, 3, 13, 14,
+        13, 13, 13, 10, 13, 10, 9, 14, 9, 9, 13, 13, 3, 3, 10, 9, 3, 13, 14,
         9, 3, 13, 10, 10, 13]
     bi_keys = table_new_string()
     bi_nargs = table_new_i64()
@@ -286,7 +287,7 @@ func ensure_builtins() {
     }
 }
 
-// 内置函数条目总数（权威 72）。
+// 内置函数条目总数（权威 73）。
 pub func builtin_count() -> i64 {
     ensure_builtins()
     return len(bi_keys)

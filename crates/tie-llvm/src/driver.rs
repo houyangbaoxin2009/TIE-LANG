@@ -114,6 +114,10 @@ enum Dispatch {
     Port,
     /// IR 生成工具链（ir）：直接产出 LLVM IR（.ll），不继续编译
     EmitIr,
+    /// 压缩数据工具链（zd）：tie:data 的二进制压缩变体（xxx.zd.tie），
+    /// 文本不可读——必须按文件名预判并在 read_to_string 之前短接，
+    /// 由 tiedb compact/decompress 原语处理
+    Zd,
 }
 
 /// 按角色分派工具链（预处理识别 → 自动转交对应工具）。
@@ -127,6 +131,8 @@ fn dispatch(role: FileRole) -> Dispatch {
         FileRole::Port => Dispatch::Port,
         // ir 角色：直接生成 LLVM IR（.ll），不继续 opt/clang 链接
         FileRole::Ir => Dispatch::EmitIr,
+        // zd 角色：压缩数据文件（tie:data 二进制变体），不编译
+        FileRole::Zd => Dispatch::Zd,
     }
 }
 
@@ -134,6 +140,21 @@ fn dispatch(role: FileRole) -> Dispatch {
 ///
 /// 返回编译产物（消息 + 路径）。
 pub fn compile(opts: &CompileOptions) -> Result<CompileOutcome, CompileError> {
+    // ---- zd 二进制预判（必须在任何文本读取之前）----
+    // `.zd.tie` 是二进制文件（压缩的 tie:data），按文件名预判并直接短接：
+    // 跳过 read_to_string 与预处理——二进制内容文本解码必然失败/乱码。
+    if opts
+        .input
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".zd.tie"))
+    {
+        return Ok(CompileOutcome {
+            message: "[预处理] 识别为 zd 压缩数据文件（tie:data 压缩格式），已转交 tiedb compact/decompress 工具链 —— v0.1 尚未实现".to_string(),
+            artifact: None,
+        });
+    }
+
     // ---- 第 1 段：预处理 ----
     // 读取源码（原始文本）
     let source = fs::read_to_string(&opts.input).map_err(|e| CompileError::Read(e.to_string()))?;
@@ -178,6 +199,13 @@ pub fn compile(opts: &CompileOptions) -> Result<CompileOutcome, CompileError> {
         }),
         Dispatch::Port => Ok(CompileOutcome {
             message: "[预处理] 识别为 port 接口文件，已转交端口工具链 —— v0.1 端口工具链尚未实现".to_string(),
+            artifact: None,
+        }),
+        // zd 角色：压缩数据文件（tie:data 二进制变体），由 tiedb 原语处理。
+        // 正常情况下 compile() 入口已按文件名 `.zd.tie` 预判短接，此分支
+        // 覆盖头部 `type tie<zd>` 声明（非 .zd.tie 文件名）的兜底场景。
+        Dispatch::Zd => Ok(CompileOutcome {
+            message: "[预处理] 识别为 zd 压缩数据文件（tie:data 压缩格式），已转交 tiedb compact/decompress 工具链 —— v0.1 尚未实现".to_string(),
             artifact: None,
         }),
         // ir 角色：构造 emit_ir_only=true 的编译选项副本，走 compile_program
