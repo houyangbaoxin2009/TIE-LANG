@@ -1,0 +1,181 @@
+type tie<class>
+// ext/vecsearch/flat.tie —— 向量检索：Flat 精确索引（命名空间 vecsearch）
+// ============================================================
+// Flat = 暴力精确检索（全量线性扫描），是向量检索的基准实现，也是
+// HNSW/IVF-PQ/DiskANN 等近似索引的召回率对照。纯 tie 实现。
+// 数据模型：集合用并行表 ids: table<i64> + vecs: table<f64>（**展平存储**：
+// 每向量 dim 个连续元素，第 i 个向量位于 vecs[i*dim .. i*dim+dim)）——
+// tie 嵌套表（table<table<f64>>）受"空表恒 i64、嵌套元素类型检查"限制，展平更稳。
+// 检索语义：距离越小越相似（l2 欧氏 / cosine 余弦距离 1-sim）；
+// flat_search 返回按距离升序的 top-k id 表。
+// 参考验收：examples/vec_demo.tie。
+
+namespace vecsearch {
+
+    // ---------- 距离函数 ----------
+
+    // 欧氏距离 L2：sqrt(sum((a[i]-b[i])^2))。维度不一致按较短者。
+    pub func l2(a: table<f64>, b: table<f64>) -> f64 {
+        var s: f64 = 0.0
+        var n = len(a)
+        if len(b) < n {
+            n = len(b)
+        }
+        var i: i64 = 0
+        while i < n {
+            var d = a[i] - b[i]
+            s = s + d * d
+            i = i + 1
+        }
+        return sqrt(s)
+    }
+
+    // 余弦距离 1 - cos：1 - dot/(|a|*|b|)，值域 [0,2]，越小越相似。
+    pub func cosine(a: table<f64>, b: table<f64>) -> f64 {
+        var dot: f64 = 0.0
+        var na: f64 = 0.0
+        var nb: f64 = 0.0
+        var n = len(a)
+        if len(b) < n {
+            n = len(b)
+        }
+        var i: i64 = 0
+        while i < n {
+            dot = dot + a[i] * b[i]
+            na = na + a[i] * a[i]
+            nb = nb + b[i] * b[i]
+            i = i + 1
+        }
+        if na == 0.0 || nb == 0.0 {
+            return 1.0
+        }
+        return 1.0 - dot / (sqrt(na) * sqrt(nb))
+    }
+
+    // ---------- Flat 索引（展平存储） ----------
+
+    // 添加向量（ids/vecs 并行表，ref 写回调用方；dim = 向量维度）。
+    // id 重复时覆盖（下标写 dim 个元素）。
+    pub func flat_add(ids: ref table<i64>, vecs: ref table<f64>, dim: i64, id: i64, v: table<f64>) {
+        var i: i64 = 0
+        while i < len(ids) {
+            if ids[i] == id {
+                // 覆盖：vecs[i*dim + j] = v[j]
+                var j: i64 = 0
+                while j < dim {
+                    vecs[i * dim + j] = v[j]
+                    j = j + 1
+                }
+                return
+            }
+            i = i + 1
+        }
+        table_push(ids, id)
+        var j: i64 = 0
+        while j < dim {
+            table_push(vecs, v[j])
+            j = j + 1
+        }
+    }
+
+    // 删除向量（按 id，重建并行表）；不存在则忽略。
+    pub func flat_remove(ids: ref table<i64>, vecs: ref table<f64>, dim: i64, id: i64) {
+        var i: i64 = 0
+        while i < len(ids) {
+            if ids[i] == id {
+                var nids: table<i64> = table_new_i64()
+                var nvecs: table<f64> = table_new_f64()
+                var j: i64 = 0
+                while j < len(ids) {
+                    if j != i {
+                        table_push(nids, ids[j])
+                        var k2: i64 = 0
+                        while k2 < dim {
+                            table_push(nvecs, vecs[j * dim + k2])
+                            k2 = k2 + 1
+                        }
+                    }
+                    j = j + 1
+                }
+                ids = nids
+                vecs = nvecs
+                return
+            }
+            i = i + 1
+        }
+    }
+
+    // 向量个数。
+    pub func flat_size(ids: table<i64>) -> i64 {
+        return len(ids)
+    }
+
+    // 按 id 取向量（构造 table<f64> 副本）；不存在返回空表。
+    pub func flat_get(ids: table<i64>, vecs: table<f64>, dim: i64, id: i64) -> table<f64> {
+        var i: i64 = 0
+        while i < len(ids) {
+            if ids[i] == id {
+                var out: table<f64> = table_new_f64()
+                var j: i64 = 0
+                while j < dim {
+                    table_push(out, vecs[i * dim + j])
+                    j = j + 1
+                }
+                return out
+            }
+            i = i + 1
+        }
+        return table_new_f64()
+    }
+
+    // 检索 top-k（L2 距离升序，返回真实 id 表）。k 超过总数时返回全部。
+    // 实现：逐向量块拷贝 + l2 + 选择排序取前 k。
+    pub func flat_search(ids: table<i64>, vecs: table<f64>, dim: i64, q: table<f64>, k: i64) -> table<i64> {
+        var n = len(ids)
+        var out: table<i64> = table_new_i64()
+        if n == 0 || k <= 0 {
+            return out
+        }
+        // 距离表（并行）：dists + id
+        var dists: table<f64> = table_new_f64()
+        var sids: table<i64> = table_new_i64()
+        var i: i64 = 0
+        while i < n {
+            // 块拷贝第 i 个向量
+            var v: table<f64> = table_new_f64()
+            var j: i64 = 0
+            while j < dim {
+                table_push(v, vecs[i * dim + j])
+                j = j + 1
+            }
+            table_push(dists, vecsearch.l2(v, q))
+            table_push(sids, ids[i])
+            i = i + 1
+        }
+        // 选择排序取前 k（k > n 时取 n）
+        var take = k
+        if take > n {
+            take = n
+        }
+        var t: i64 = 0
+        while t < take {
+            var best = t
+            var b: i64 = t + 1
+            while b < n {
+                if dists[b] < dists[best] {
+                    best = b
+                }
+                b = b + 1
+            }
+            var td = dists[t]
+            var ti = sids[t]
+            dists[t] = dists[best]
+            sids[t] = sids[best]
+            dists[best] = td
+            sids[best] = ti
+            table_push(out, sids[t])
+            t = t + 1
+        }
+        return out
+    }
+}

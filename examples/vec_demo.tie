@@ -1,0 +1,28 @@
+type tie<logic>
+// examples/vec_demo.tie —— 向量检索验证（P0-3：ext/vecsearch Flat 索引）
+// ============================================================
+// 4 个二维向量，查询 [0.6,0.6] 的最近 top-2（L2 距离）。
+// 期望：最近 id=4（[0.5,0.5]），次近 id=3（[1,1]）——输出 "4 / 3"
+// 距离验证：l2([1,0],[0.5,0.5]) = 0.7071；cosine([1,0],[0,1]) = 1.0
+
+import "../ext/vecsearch/flat.tie"
+import "../std/string.tie"
+
+func main() {
+    var ids: table<i64> = table_new_i64()
+    var vecs: table<f64> = table_new_f64()
+    vecsearch.flat_add(ids, vecs, 2, 1, [1.0, 0.0])
+    vecsearch.flat_add(ids, vecs, 2, 2, [0.0, 1.0])
+    vecsearch.flat_add(ids, vecs, 2, 3, [1.0, 1.0])
+    vecsearch.flat_add(ids, vecs, 2, 4, [0.5, 0.5])
+    var q = [0.6, 0.6]
+    var hits = vecsearch.flat_search(ids, vecs, 2, q, 2)
+    println("top1=" + to_string(hits[0]) + " / top2=" + to_string(hits[1]))
+    println("size=" + to_string(vecsearch.flat_size(ids)))
+    println("l2=" + str.slice(to_string(vecsearch.l2([1.0, 0.0], [0.5, 0.5])), 0, 6))
+    println("cos=" + str.slice(to_string(vecsearch.cosine([1.0, 0.0], [0.0, 1.0])), 0, 4))
+    // 删除 4 后检索：最近应为 3
+    vecsearch.flat_remove(ids, vecs, 2, 4)
+    var hits2 = vecsearch.flat_search(ids, vecs, 2, q, 1)
+    println("after remove top1=" + to_string(hits2[0]))
+}
