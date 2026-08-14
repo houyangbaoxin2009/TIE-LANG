@@ -15,8 +15,9 @@
 //! type tie          # 泛型入口类型（FileRole::Type）
 //! type tie<data>    # 数据文件（FileRole::Data）
 //! type tie<db>      # 数据库文件（FileRole::Db）
+//! type tie<ir>      # IR 文件（FileRole::Ir，直接生成 LLVM IR .ll）
 //! ```
-//! `type tie<X>` 的 X ∈ {script, data, ui, class, logic, port, db}。
+//! `type tie<X>` 的 X ∈ {script, data, ui, class, logic, port, db, ir}。
 //! 无声明时默认角色为 logic。多次声明首个生效，其余同样剥离。
 //! 旧 `// tie:xxx` 注释指令系统已完全移除——该类注释不再被提取/剥离，
 //! 作为普通注释留在正文中（词法阶段自然忽略）。
@@ -81,6 +82,9 @@ pub enum FileRole {
     Port,
     /// 数据库文件
     Db,
+    /// IR 文件（`type tie<ir>` 声明 / xxx.ir.tie 文件名默认）——
+    /// 检测到即直接生成 LLVM IR（.ll），不继续 opt/clang 链接
+    Ir,
 }
 
 impl FileRole {
@@ -95,10 +99,11 @@ impl FileRole {
             FileRole::Logic => "logic",
             FileRole::Port => "port",
             FileRole::Db => "db",
+            FileRole::Ir => "ir",
         }
     }
 
-    /// 角色名 → 枚举（精确匹配 8 个角色名，未知返回 None）。
+    /// 角色名 → 枚举（精确匹配 9 个角色名，未知返回 None）。
     ///
     /// 与旧 `role_from_str`（未知回退 logic）不同：未知角色来自声明系统
     /// 之外（如 `type tie<library>`），必须在 [preprocess] 阶段报错而非
@@ -113,6 +118,7 @@ impl FileRole {
             "logic" => Some(FileRole::Logic),
             "port" => Some(FileRole::Port),
             "db" => Some(FileRole::Db),
+            "ir" => Some(FileRole::Ir),
             _ => None,
         }
     }
@@ -121,10 +127,11 @@ impl FileRole {
     /// 头部声明优先于文件名声明）。
     ///
     /// 仅当文件名以 `.tie` 结尾且倒数第二段（`<名>.<角色>` 中的 `<角色>`）
-    /// 恰好等于 8 个角色名之一时识别：
+    /// 恰好等于 9 个角色名之一时识别：
     /// - `"main.type.tie"` → [FileRole::Type]
     /// - `"schema.db.tie"` → [FileRole::Db]
     /// - `"app.script.tie"` → [FileRole::Script]
+    /// - `"code.ir.tie"` → [FileRole::Ir]
     /// - `"main.tie"` → None（无角色段）
     /// - `"foo.logic2.tie"` → None（中间段不是合法角色名）
     /// - `"main.data.txt"` → None（非 `.tie` 后缀）
@@ -294,6 +301,15 @@ mod tests {
     }
 
     #[test]
+    fn 声明type_tie_ir为IR角色() {
+        // ir 角色：直接生成 LLVM IR（.ll），不继续 opt/clang 链接
+        let r = preprocess("type tie<ir>\nfunc main() { println(\"ir\") }\n");
+        assert_eq!(r.role, FileRole::Ir);
+        assert!(!r.cleaned_source.contains("type tie"), "声明行应被剥离");
+        assert!(r.cleaned_source.contains("println"));
+    }
+
+    #[test]
     #[should_panic(expected = "未知子类型")]
     fn 未知子类型声明报错() {
         // library 已随旧 // tie: 指令系统移除，属于未知子类型 → 声明错误
@@ -367,6 +383,7 @@ mod tests {
         assert_eq!(FileRole::from_filename("ui_main.ui.tie"), Some(FileRole::Ui));
         assert_eq!(FileRole::from_filename("log.logic.tie"), Some(FileRole::Logic));
         assert_eq!(FileRole::from_filename("svc.port.tie"), Some(FileRole::Port));
+        assert_eq!(FileRole::from_filename("code.ir.tie"), Some(FileRole::Ir));
         // 非 `<名>.<角色>.tie` 形式 → None
         assert_eq!(FileRole::from_filename("main.tie"), None);
         assert_eq!(FileRole::from_filename("foo.logic2.tie"), None);
@@ -392,6 +409,7 @@ mod tests {
             FileRole::Logic,
             FileRole::Port,
             FileRole::Db,
+            FileRole::Ir,
         ];
         for r in all {
             assert_eq!(FileRole::from_str(r.as_str()), Some(r), "角色 {}", r.as_str());

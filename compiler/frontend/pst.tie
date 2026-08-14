@@ -16,6 +16,20 @@ var g_pending_lines: table<i64>;  // 虚拟 token 的旁路行号
 var g_pending_cols: table<i64>;   // 虚拟 token 的旁路列号
 var g_pending_lexemes: table<i64>; // 虚拟 token 的旁路 lexeme 池 id（split 分裂用）
 
+// ---------- 泛型探测位置保存/恢复（try 回退，2026-08-14）----------
+// save_pos 快照 token 流（真实游标 + pending 队列完整内容 + 错误槽）到 g_save_*；
+// restore_pos 恢复到保存时刻（探测期间 split 追加/原位覆盖均被还原）。
+// 注意：save/restore 成对使用且不嵌套（泛型调用探测是同步的）。
+var g_save_pos: i64 = 0;          // 真实 token 流游标快照
+var g_save_idx: i64 = 0;          // pending 队列游标快照
+var g_save_pending: table<i64>;   // pending 队列 tag 快照
+var g_save_pending_lines: table<i64>;  // pending 队列行号快照
+var g_save_pending_cols: table<i64>;   // pending 队列列号快照
+var g_save_pending_lexemes: table<i64>;// pending 队列 lexeme 池 id 快照
+var g_save_err_line: i64 = 0;     // 语法错误槽行号快照
+var g_save_err_col: i64 = 0;      // 语法错误槽列号快照
+var g_save_err_msg: string = "";  // 语法错误槽消息快照
+
 // ---------- 语法错误槽位（parse 返回 ERR: 协议）----------
 var p_err_line: i64 = 0;
 var p_err_col: i64 = 0;

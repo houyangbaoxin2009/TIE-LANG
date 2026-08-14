@@ -14,9 +14,17 @@ type tie<class>
 //   map<V>   ：id = 2<<40 | V
 //   struct S ：id = 3<<40 | struct_索引（struct 表行号）
 //   tuple    ：id = 4<<40 | tuple_索引（tuple 表行号）
+//   TypeVar  ：id = 5<<40 | intern 池 id（泛型类型参数，名字即身份——
+//     同名类型参数全局同 id、跨函数稳定，mangling 友好；intern 池 id
+//     < 2^40 保证不碰撞。语义层登记泛型形参时调用 var_of 获取）。
 //   高位分离保证任意嵌套组合不冲突（负载 < 2^40）。
-//   解码：kind(id) 判类别（0=Named 1=Table 2=Map 3=Struct 4=Tuple），
-//   low(id) 取负载（元素类型/索引）。
+//   解码：kind(id) 判类别（0=Named 1=Table 2=Map 3=Struct 4=Tuple
+//   5=TypeVar），low(id) 取负载（元素类型/索引/intern 池 id）。
+//   TypeVar 兼容性：table<TypeVar>/map<TypeVar> 走嵌套聚合序号表路径
+//   （var_of 结果恒 ≥ NEST_SLOT_OFF，table_of 查/登记 nest_tbl_elems），
+//   table_elem 可完整还原回 TypeVar id；判据族（is_int/is_float/
+//   is_number/is_bool_like/is_wide/is_table/is_map）对 TypeVar 均 false
+//   ——TypeVar 不是任何具体类型，须在单态化时替换为具体类型后再判定。
 //
 // # 判据族（语义检查/IR 生成共用，从 semantic 提炼）
 //   is_int / is_float / is_number / is_bool_like / is_wide
@@ -33,12 +41,15 @@ type tie<class>
 // 调用：import 后 types.named(...) / types.type_name(...)
 // 命名规范：命名空间内函数不加 types_ 前缀；内部工具私有（非 pub）。
 
+import "../lib/interner.tie"
+
 // ---------- 类型类别常量（kind(id) 返回值）----------
 const K_NAMED: i64 = 0;
 const K_TABLE: i64 = 1;
 const K_MAP: i64 = 2;
 const K_STRUCT: i64 = 3;
 const K_TUPLE: i64 = 4;
+const K_TYPEVAR: i64 = 5;
 const K_SHIFT: i64 = 40;           // 高位分离位移量（负载 < 2^40）
 
 // ---------- TyKw 索引常量（0..20，对齐 Rust TyKw 变体顺序）----------
@@ -64,11 +75,13 @@ const TK_MISC: i64 = 18;
 const TK_TABLE: i64 = 19;
 const TK_MAP: i64 = 20;
 
-// 高位基数常量（= 1<<40 / 2<<40 / 3<<40 / 4<<40，写死字面量避免运行期位移）
+// 高位基数常量（= 1<<40 / 2<<40 / 3<<40 / 4<<40 / 5<<40，写死字面量避免运行期位移）
+// 5<<40 = 5497558138880，i64 有符号下远小于 2^63 无溢出。
 const BASE_TABLE: i64 = 1099511627776;
 const BASE_MAP: i64 = 2199023255552;
 const BASE_STRUCT: i64 = 3298534883328;
 const BASE_TUPLE: i64 = 4398046511104;
+const BASE_TYPEVAR: i64 = 5497558138880;
 
 // ---------- 全局状态（懒构建）----------
 var tykw_names: table<string>;   // TyKw 索引 -> 类型名（错误消息用）
@@ -137,15 +150,27 @@ pub func tuple_of(idx: i64) -> i64 {
     return BASE_TUPLE + idx
 }
 
+// TypeVar（泛型类型参数）：id = 5<<40 | intern.intern(name)。
+// 名字即身份——同名类型参数全局同 id、跨函数稳定（mangling 友好）；
+// intern 池 id < 2^40 保证不碰撞（named/table/map/struct/tuple 均 < 5<<40）。
+// 供语义层登记泛型形参使用；还原名字走 type_name（interner.lookup(low(t))）。
+pub func var_of(name: string) -> i64 {
+    return BASE_TYPEVAR + interner.intern(name)
+}
+
 // ---------- 类型 id 解码 ----------
 
-// 类型类别：0=Named 1=Table 2=Map 3=Struct 4=Tuple。
+// 类型类别：0=Named 1=Table 2=Map 3=Struct 4=Tuple 5=TypeVar。
 // Named 判定用 id < 100（TyKw 索引 0..20，留余量）；
-// 其余按高位阈值顺序判别（>= 4<<40 -> Tuple，>= 3<<40 -> Struct，
-// >= 2<<40 -> Map，其余为 Table——与 semantic ty_kind 一致）。
+// 其余按高位阈值顺序判别（>= 5<<40 -> TypeVar，>= 4<<40 -> Tuple，
+// >= 3<<40 -> Struct，>= 2<<40 -> Map，其余为 Table——与 semantic ty_kind
+// 一致）。TypeVar 段（5<<40）最高，必须最先判，否则被误判为 Tuple。
 pub func kind(id: i64) -> i64 {
     if id < 100 {
         return K_NAMED
+    }
+    if id >= BASE_TYPEVAR {
+        return K_TYPEVAR
     }
     if id >= BASE_TUPLE {
         return K_TUPLE
@@ -159,9 +184,12 @@ pub func kind(id: i64) -> i64 {
     return K_TABLE
 }
 
-// 类型负载：Table/Map 的元素类型 id、Struct/Tuple 的索引；
-// Named 类型无意义（调用方先判 kind）。
+// 类型负载：Table/Map 的元素类型 id、Struct/Tuple 的索引、TypeVar 的
+// intern 池 id；Named 类型无意义（调用方先判 kind）。
 pub func low(id: i64) -> i64 {
+    if id >= BASE_TYPEVAR {
+        return id - BASE_TYPEVAR
+    }
     if id >= BASE_TUPLE {
         return id - BASE_TUPLE
     }
@@ -250,6 +278,16 @@ pub func is_map(t: i64) -> bool {
     return false
 }
 
+// TypeVar 判据：kind == K_TYPEVAR（5<<40 段）。
+// 供语义层识别泛型形参（如函数签名类型槽位里出现 TypeVar 时走单态化
+// 替换路径）；单态化替换后应还原为具体类型再走其余判据族。
+pub func is_typevar(t: i64) -> bool {
+    if kind(t) == K_TYPEVAR {
+        return true
+    }
+    return false
+}
+
 // 表元素类型：参数化 table<T>/map<V> 返回负载 T；
 // 裸 table/map 关键字返回 -1（元素类型未知）。
 // 嵌套聚合负载（≥ NEST_SLOT_OFF）查序号表还原真实元素类型。
@@ -324,7 +362,8 @@ func ensure_tykw_names() {
 
 // 类型 id -> 名字（递归）：Named 查 tykw_names；Table/Map 递归
 // 拼 "table<T>"/"map<V>"；Struct 查 st_names（未登记回退 "struct"）；
-// Tuple 固定 "tuple"。错误消息用（与 semantic type_name 一致）。
+// Tuple 固定 "tuple"；TypeVar 经 interner.lookup(low(t)) 还原参数名
+// （intern 池 id 越界兜底 "?"）。错误消息用（与 semantic type_name 一致）。
 pub func type_name(t: i64) -> string {
     var k = kind(t)
     if k == K_NAMED {
@@ -346,6 +385,13 @@ pub func type_name(t: i64) -> string {
             return st_names[idx]
         }
         return "struct"
+    }
+    if k == K_TYPEVAR {
+        var iv = low(t)
+        if interner.is_valid(iv) {
+            return interner.lookup(iv)
+        }
+        return "?"   // intern 池 id 越界兜底（理论不发生，防御性）
     }
     return "tuple"
 }

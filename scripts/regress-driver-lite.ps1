@@ -14,7 +14,8 @@
 #   库文件跳过  头部 tie:library，driver-lite 暂不做库角色（T3.x）
 #
 # 语料：examples\hello.tie + tests\language\*.tie + examples\*.tie（剔除
-# oop_neg_* 负例与 tie:library 库文件）。
+# oop_neg_* 负例、tie:library 库文件与 *.ir.tie——ir 角色直接产出 .ll 不产
+# 可执行文件，不参与"编译运行比对"）。
 # 中间产物统一放 $env:TEMP\t29_regress\，脚本结束自动清理。
 # 等价率 = PASS / (PASS + DIFF)，成功标准 ≥ 90%。
 
@@ -36,12 +37,13 @@ New-Item -ItemType Directory -Force -Path $tieDir, $rustDir | Out-Null
 
 # ---------- 运行可执行文件并捕获 stdout（带超时防挂起） ----------
 function Invoke-Captured {
-    param([string]$FilePath, [int]$TimeoutMs = 15000)
+    param([string]$FilePath, [string[]]$ArgumentList = @(), [int]$TimeoutMs = 15000)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $FilePath
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    foreach ($a in $ArgumentList) { $null = $psi.ArgumentList.Add($a) }
     $p = [System.Diagnostics.Process]::Start($psi)
     $outTask = $p.StandardOutput.ReadToEndAsync()
     $null = $p.StandardError.ReadToEndAsync()
@@ -55,8 +57,8 @@ function Invoke-Captured {
 # ---------- 语料收集 ----------
 $files = New-Object System.Collections.Generic.List[string]
 $files.Add('examples\hello.tie')
-Get-ChildItem (Join-Path $root 'tests\language\*.tie') | ForEach-Object { $files.Add("tests\language\$($_.Name)") }
-Get-ChildItem (Join-Path $root 'examples\*.tie') | Where-Object { $_.Name -notlike 'oop_neg_*' } | ForEach-Object { $files.Add("examples\$($_.Name)") }
+Get-ChildItem (Join-Path $root 'tests\language\*.tie') | Where-Object { $_.Name -notlike '*.ir.tie' } | ForEach-Object { $files.Add("tests\language\$($_.Name)") }
+Get-ChildItem (Join-Path $root 'examples\*.tie') | Where-Object { $_.Name -notlike 'oop_neg_*' -and $_.Name -notlike '*.ir.tie' } | ForEach-Object { $files.Add("examples\$($_.Name)") }
 # 去重（hello.tie 既显式加入又在 examples glob 中）
 $files = $files | Select-Object -Unique
 
@@ -80,15 +82,26 @@ foreach ($rel in $files) {
         continue
     }
 
-    # 1) Rust 基线编译
+    # 1) Rust 基线编译（带超时防挂起）
     $rustExe = Join-Path $rustDir "$base.exe"
-    & $rust $full -o $rustExe 2>$null | Out-Null
-    $rustRC = $LASTEXITCODE
+    $rustRes = Invoke-Captured $rust -ArgumentList @($full, '-o', $rustExe) -TimeoutMs 60000
+    $rustRC = $rustRes.ExitCode
+    if ($rustRes.Timeout) {
+        $stats.Timeout++
+        $results.Add("TIME  $rel  (Rust 编译超时被终止)")
+        continue
+    }
 
-    # 2) driver-lite 编译（合并 stderr 用于分类）
+    # 2) driver-lite 编译（合并 stderr 用于分类；带超时防编译器挂起拖死整个回归）
     $tieExe = Join-Path $tieDir "$base.exe"
-    $tieOut = & $driver $full -o $tieExe 2>&1 | Out-String
-    $tieRC = $LASTEXITCODE
+    $tieRes = Invoke-Captured $driver -ArgumentList @($full, '-o', $tieExe) -TimeoutMs 60000
+    $tieOut = $tieRes.Stdout
+    $tieRC = $tieRes.ExitCode
+    if ($tieRes.Timeout) {
+        $stats.Timeout++
+        $results.Add("TIME  $rel  (编译超时被终止——编译器疑似挂起)")
+        continue
+    }
 
     if ($rustRC -ne 0) {
         # Rust 自身失败（文件有错/无 main）——双失败可接受

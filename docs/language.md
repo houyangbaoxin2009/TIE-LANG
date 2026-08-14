@@ -55,9 +55,10 @@ func main() {
 | `type tie<class>` | 类/库文件 | 编译为静态库 `.a`，不生成 main          |
 | `type tie<script>` | 脚本     | 脚本文件（编译可执行）                  |
 | `type tie<port>`  | 端口/接口  | 端口/对外接口文件                    |
+| `type tie<ir>`    | IR 文件   | 直接生成 LLVM IR（.ll），不继续 opt/clang 链接 |
 
 **未声明头**时默认按 `logic` 处理（可执行文件）。
-子类型全集：`script` / `data` / `ui` / `class` / `logic` / `port` / `db`；
+子类型全集：`script` / `data` / `ui` / `class` / `logic` / `port` / `db` / `ir`；
 `type` 角色由裸 `type tie` 表达（`type tie<type>` 是格式错误）。
 优化级别 / 交叉编译目标等选项不再放头部——`opt` / `target` **仅 CLI**。
 
@@ -84,7 +85,7 @@ Rust 侧仅剩解释执行壳：
 3. 模块返回**协议文本**，壳层解析还原角色/正文（声明行已剥离）：
 
 ```text
-ROLE:logic          ← 角色（type/script/data/ui/class/logic/port/db）
+ROLE:logic          ← 角色（type/script/data/ui/class/logic/port/db/ir）
 BODY:12             ← 正文码点数（str_len 语义，Rust 侧按字符截取）
 <正文恰好 12 个字符> ← 清理后的正文（不含声明行）
 ```
@@ -361,6 +362,90 @@ var n: i32 = 1        // 显式标注为 i32
 const s: string = "hi"   // 不可变变量，初始化后不可再赋值
 var arr: table = [1, 2, 3]
 ```
+
+### 3.7 泛型（编译期单态化，2026-08-14 实现）
+
+tie 支持用户定义的泛型：**泛型函数**与**泛型 struct**。类型参数在声明处
+显式写出 `<T1, T2, ...>`，调用/构造点从实参类型推断（必要时可显式写出）。
+实例化机制为**编译期单态化**——每个具体类型参数组合展开为独立代码，零运行时
+开销（tie 无函数指针、无运行时类型信息，单态化是唯一自然路径）。
+
+**泛型函数**：
+
+```c
+func max<T>(a: T, b: T) -> T {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+func pick<A, B>(a: A, b: B) -> A {
+    return a
+}
+```
+
+- 类型参数列表紧跟函数名，逗号分隔，允许 1 个或多个；
+- 类型参数可在形参类型、返回类型、函数体内出现（作类型使用）；
+- 类型参数名允许任意标识符，作用域内**遮蔽内置类型名**（如 `func f<int>(x: int)`
+  中 `int` 是类型参数而非内置类型）。
+
+**泛型 struct**：
+
+```c
+struct Box<T> {
+    var value: T
+}
+```
+
+- 类型参数列表紧跟 struct 名；字段类型可引用类型参数；
+- struct 构造 `Box(实参)` 可从构造实参推断；`Box<i64>()`（无参构造）必须显式。
+
+**实例化（使用点）**：
+
+```c
+var m1 = max(3, 5)           // T = i64（调用点推断）
+var m2 = max(3.5, 1.2)       // T = f64
+var m3 = max<i64>(9, 4)      // 显式类型实参
+var b = Box<i64>(42)         // 显式 + 构造
+var b2 = Box(3.14)           // 构造参数推断（T = f64）
+var nb = Box<table<i64>>(t)  // 嵌套：实参可为内建泛型
+```
+
+- **调用点推断**：逐实参匹配形参类型中类型参数的位置；同一类型参数多处推断
+  必须一致，不一致报错（`类型参数 T 推断冲突: i64 vs f64`）；
+- **显式类型实参优先**：`max<i64>(...)` 指定部分不参与推断；未指定部分继续推断；
+- **无法推断**：无信息实参（如 `identity<T>()` 无参调用）→ 报错要求显式指定
+  （`无法推断类型参数 T（调用点无足够信息，请显式指定类型实参）`）；
+- 返回类型含类型参数且由参数推断 → 调用表达式类型 = 替换后的返回类型。
+
+**泛型 struct 方法（数据逻辑分离）**：方法定义在绑定 struct 名的命名空间，
+接收者类型为 `Box<T>` 时 T 从接收者实例类型推断：
+
+```c
+namespace Box {
+    pub func get<T>(b: Box<T>) -> T {
+        return b.value
+    }
+}
+var v: i64 = b.get()     // T 从接收者 Box<i64> 推断
+```
+
+**符号 mangling（单态化展开产物）**：实例化函数/struct 以
+`全名 + '$' + 类型实参片段` 命名（如 `max$i64`、`Box$table_i64`、`pick$i64$string`），
+片段递归规范化（`table<i64>` → `table_i64`、`map<string>` → `map_string`）。
+单态化展开产物走现有类型检查：模板体内对 T 的操作在替换为具体类型后被现有
+类型系统验证，错误在实例化点报告。
+
+**内建泛型**：`table<T>` / `map<T>` 保持内建，不改为用户泛型；用户泛型实参
+可为内建泛型实例，用户泛型函数形参可为 `table<T>`（T 为类型参数时：
+`func sum<T>(xs: table<T>) -> T`——实例化时整体替换）。
+
+**错误用例**：推断冲突 / 无法推断 / 实例化后类型错误 / 实例化深度超限
+（递归自引用模板触发 64 层防御）。
+
+**参考验收**：`tests/language/generics.tie`（9 个正例：推断/显式/嵌套/方法/多类型
+参数）、`tests/language/generics_neg.tie`（5 个负例）。
 
 ## 4. 语句与分隔符（ASI 自动补全）
 

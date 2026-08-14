@@ -1210,12 +1210,12 @@ func gen_expr(id: i64) -> i64 {
         }
         // 用户函数：裸调用名解析（当前命名空间补全）
         var full = resolve_call_name(nm)
-        // tiec parser 对 `myns.add(...)` 生成 children=[receiver, 实参...]
-        // （与 MethodCall 同构）——Call 名含 "." 时实参从 children[1] 开始，
-        // 否则 children[0]（路径节点）会被误当实参（gen_expr(Var) 未定义）
-        var aoff = 0
+        // Call children = [泛型槽, 实参...] → 实参从 children[slot_off] 起
+        var aoff = sstate.slot_off(id)
+        // 兼容旧式点号名（历史 parser 曾对 `myns.add(...)` 生成 children=[接收者,
+        // 实参...]；新 parser 不再产出，防御保留 +1 语义）
         if find_char(nm, ".") >= 0 {
-            aoff = 1
+            aoff = aoff + 1
         }
         return gen_user_call_from(full, id, aoff)
     }
@@ -1380,7 +1380,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     }
     if nm == "str_len" {
         g_used_interp = true
-        var v = gen_expr(sstate.child(id, 0))
+        var v = gen_expr(call_arg(id, 0))
         if v < 0 {
             return -1
         }
@@ -1389,7 +1389,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     }
     if nm == "char_code" {
         g_used_interp = true
-        var v = gen_expr(sstate.child(id, 0))
+        var v = gen_expr(call_arg(id, 0))
         if v < 0 {
             return -1
         }
@@ -1398,11 +1398,11 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     }
     if nm == "str_char" {
         g_used_interp = true
-        var v = gen_expr(sstate.child(id, 0))
+        var v = gen_expr(call_arg(id, 0))
         if v < 0 {
             return -1
         }
-        var i = gen_expr(sstate.child(id, 1))
+        var i = gen_expr(call_arg(id, 1))
         if i < 0 {
             return -1
         }
@@ -1411,14 +1411,14 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     }
     if nm == "to_string" {
         g_used_interp = true
-        var v = gen_expr(sstate.child(id, 0))
+        var v = gen_expr(call_arg(id, 0))
         if v < 0 {
             return -1
         }
         // 实参类型：f64 → tie_to_string_f64；窄整数（i8/i16/i32/trit/char）→
         // 先 sext 到 i64 再 tie_to_string_i64（C ABI 桥只收 i64；trit 值 -1/0/1
         // 以 i8 存储，直传会生成 `call ptr @tie_to_string_i64(i64 %i8)` 类型错）
-        var vt = node_types[sstate.child(id, 0)]
+        var vt = node_types[call_arg(id, 0)]
         if vt == types.named(TK_F64) || vt == types.named(TK_F32) {
             g_builtin_res = gen_ext_call1("tie_to_string_f64", v, types.named(TK_F64), types.named(TK_STR))
         } else if vt == types.named(TK_I64) || vt == types.named(TK_U64) || vt < 0 {
@@ -1435,7 +1435,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     }
     if nm == "parse_int" {
         g_used_interp = true
-        var v = gen_expr(sstate.child(id, 0))
+        var v = gen_expr(call_arg(id, 0))
         if v < 0 {
             return -1
         }
@@ -1451,7 +1451,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         // 浮点解析：Rust 桥签名 (ptr s, ptr ok) -> double；ok 出参必须占位
         // （ABI 错位会写垃圾指针崩溃，与 parse_int 同类）
         g_used_interp = true
-        var v = gen_expr(sstate.child(id, 0))
+        var v = gen_expr(call_arg(id, 0))
         if v < 0 {
             return -1
         }
@@ -1464,7 +1464,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     if nm == "parse_trit" {
         // trit 解析：Rust 桥签名 (ptr s, ptr ok) -> i8（值域 -1/0/1）
         g_used_interp = true
-        var v = gen_expr(sstate.child(id, 0))
+        var v = gen_expr(call_arg(id, 0))
         if v < 0 {
             return -1
         }
@@ -1476,7 +1476,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     }
     if nm == "len" {
         // len(表) → tie_table_len；len(字符串) → strlen
-        var a = sstate.child(id, 0)
+        var a = call_arg(id, 0)
         var at = node_types[a]
         if at == types.named(TK_STR) {
             // 字符串：strlen（libc）
@@ -1512,7 +1512,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     if nm == "table_push" {
         g_used_interp = true
         // 第 1 参数 = 表变量（语义已保证）；元素类型查 lv_telem/gb_telem
-        var tname_node = sstate.child(id, 0)
+        var tname_node = call_arg(id, 0)
         var tname = sstate.name_str(tname_node)
         var elem: i64 = types.named(TK_I64)
         // 优先 irgen 作用域完整类型（table_new_f64() 初始化的变量 scope 里是
@@ -1541,7 +1541,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         if t < 0 {
             return -1
         }
-        var x = gen_expr(sstate.child(id, 1))
+        var x = gen_expr(call_arg(id, 1))
         if x < 0 {
             return -1
         }
@@ -1550,7 +1550,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         // 结果 push 进 i64 表会 push_i64(double) 类型错，Rust 按值类型选桥）
         var suffix = bridge_suffix(elem)
         var pty = types.named(TK_I64)
-        var vt = node_types[sstate.child(id, 1)]
+        var vt = node_types[call_arg(id, 1)]
         if vt >= 0 && (types.is_table(vt) || types.is_map(vt) || vt == types.named(TK_STR)) {
             suffix = "string"
             pty = types.named(TK_STR)
@@ -1568,7 +1568,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     }
     if nm == "exit" {
         g_used_interp = true
-        var v = gen_expr(sstate.child(id, 0))
+        var v = gen_expr(call_arg(id, 0))
         if v < 0 {
             return -1
         }
@@ -1585,7 +1585,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     }
     if nm == "arg_string" {
         g_used_interp = true
-        var i = gen_expr(sstate.child(id, 0))
+        var i = gen_expr(call_arg(id, 0))
         if i < 0 {
             return -1
         }
@@ -1594,7 +1594,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     }
     if nm == "file_read" {
         g_used_interp = true
-        var p = gen_expr(sstate.child(id, 0))
+        var p = gen_expr(call_arg(id, 0))
         if p < 0 {
             return -1
         }
@@ -1603,11 +1603,11 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     }
     if nm == "file_write" || nm == "file_append" {
         // UTF-8 安全桥（tie_file_write / tie_file_append，std::fs；返回 bool i1）
-        var p = gen_expr(sstate.child(id, 0))
+        var p = gen_expr(call_arg(id, 0))
         if p < 0 {
             return -1
         }
-        var c = gen_expr(sstate.child(id, 1))
+        var c = gen_expr(call_arg(id, 1))
         if c < 0 {
             return -1
         }
@@ -1616,7 +1616,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     }
     if nm == "file_size" {
         // UTF-8 桥：文件字节大小（tie_file_size，失败返回 -1）
-        var p = gen_expr(sstate.child(id, 0))
+        var p = gen_expr(call_arg(id, 0))
         if p < 0 {
             return -1
         }
@@ -1625,7 +1625,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     }
     if nm == "file_is_dir" || nm == "file_is_file" {
         // UTF-8 桥：路径类型判定（tie_file_is_dir / tie_file_is_file，i8 → bool）
-        var p = gen_expr(sstate.child(id, 0))
+        var p = gen_expr(call_arg(id, 0))
         if p < 0 {
             return -1
         }
@@ -1637,7 +1637,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         return 0
     }
     if nm == "file_exists" {
-        var p = gen_expr(sstate.child(id, 0))
+        var p = gen_expr(call_arg(id, 0))
         if p < 0 {
             return -1
         }
@@ -1645,7 +1645,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         return 0
     }
     if nm == "file_delete" {
-        var p = gen_expr(sstate.child(id, 0))
+        var p = gen_expr(call_arg(id, 0))
         if p < 0 {
             return -1
         }
@@ -1656,7 +1656,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     }
     if nm == "print_err" {
         g_used_interp = true
-        var v = gen_expr(sstate.child(id, 0))
+        var v = gen_expr(call_arg(id, 0))
         if v < 0 {
             return -1
         }
@@ -1666,7 +1666,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     }
     if nm == "mkdir_all" {
         g_used_interp = true
-        var p = gen_expr(sstate.child(id, 0))
+        var p = gen_expr(call_arg(id, 0))
         if p < 0 {
             return -1
         }
@@ -1675,11 +1675,11 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     }
     if nm == "regex_find_all" {
         g_used_interp = true
-        var s = gen_expr(sstate.child(id, 0))
+        var s = gen_expr(call_arg(id, 0))
         if s < 0 {
             return -1
         }
-        var p = gen_expr(sstate.child(id, 1))
+        var p = gen_expr(call_arg(id, 1))
         if p < 0 {
             return -1
         }
@@ -1691,11 +1691,11 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     // 整数实参（sqrt(4)）→ sitofp 提升为 f64（LLVM 类型必须匹配）
     if nm == "sqrt" || nm == "sin" || nm == "cos" || nm == "tan" ||
         nm == "exp" || nm == "log" || nm == "floor" || nm == "ceil" || nm == "round" {
-        var mv = gen_expr(sstate.child(id, 0))
+        var mv = gen_expr(call_arg(id, 0))
         if mv < 0 {
             return -1
         }
-        var mvt = node_types[sstate.child(id, 0)]
+        var mvt = node_types[call_arg(id, 0)]
         var mf = gen_to_f64(mv, mvt)
         if mf < 0 {
             return -1
@@ -1704,16 +1704,16 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         return 0
     }
     if nm == "pow" {
-        var pv1 = gen_expr(sstate.child(id, 0))
+        var pv1 = gen_expr(call_arg(id, 0))
         if pv1 < 0 {
             return -1
         }
-        var pv2 = gen_expr(sstate.child(id, 1))
+        var pv2 = gen_expr(call_arg(id, 1))
         if pv2 < 0 {
             return -1
         }
-        var p1t = node_types[sstate.child(id, 0)]
-        var p2t = node_types[sstate.child(id, 1)]
+        var p1t = node_types[call_arg(id, 0)]
+        var p2t = node_types[call_arg(id, 1)]
         var pf1 = gen_to_f64(pv1, p1t)
         var pf2 = gen_to_f64(pv2, p2t)
         if pf1 < 0 || pf2 < 0 {
@@ -1735,7 +1735,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         nm == "path_basename" || nm == "path_dirname" || nm == "path_abs" ||
         nm == "path_normalize" || nm == "http_get" || nm == "msg_t" {
         g_used_interp = true
-        var sv = gen_expr(sstate.child(id, 0))
+        var sv = gen_expr(call_arg(id, 0))
         if sv < 0 {
             return -1
         }
@@ -1745,7 +1745,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     if nm == "eval" {
         // eval：桥名 tie_eval_expr（非 tie_eval——C ABI 桥签名 (ptr) -> ptr）
         g_used_interp = true
-        var sv = gen_expr(sstate.child(id, 0))
+        var sv = gen_expr(call_arg(id, 0))
         if sv < 0 {
             return -1
         }
@@ -1755,11 +1755,11 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     // 双字符串参数 → ptr 返回（path_join/msg_t_lang/eval_call/regex_find）
     if nm == "path_join" || nm == "msg_t_lang" || nm == "eval_call" || nm == "regex_find" {
         g_used_interp = true
-        var a1 = gen_expr(sstate.child(id, 0))
+        var a1 = gen_expr(call_arg(id, 0))
         if a1 < 0 {
             return -1
         }
-        var a2 = gen_expr(sstate.child(id, 1))
+        var a2 = gen_expr(call_arg(id, 1))
         if a2 < 0 {
             return -1
         }
@@ -1769,15 +1769,15 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     // 三字符串参数 → ptr（regex_replace：s, pattern, replacement）
     if nm == "regex_replace" {
         g_used_interp = true
-        var r1 = gen_expr(sstate.child(id, 0))
+        var r1 = gen_expr(call_arg(id, 0))
         if r1 < 0 {
             return -1
         }
-        var r2 = gen_expr(sstate.child(id, 1))
+        var r2 = gen_expr(call_arg(id, 1))
         if r2 < 0 {
             return -1
         }
-        var r3 = gen_expr(sstate.child(id, 2))
+        var r3 = gen_expr(call_arg(id, 2))
         if r3 < 0 {
             return -1
         }
@@ -1795,15 +1795,15 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     // regex_group：字符串 + 字符串 + i64 → ptr
     if nm == "regex_group" {
         g_used_interp = true
-        var g1 = gen_expr(sstate.child(id, 0))
+        var g1 = gen_expr(call_arg(id, 0))
         if g1 < 0 {
             return -1
         }
-        var g2 = gen_expr(sstate.child(id, 1))
+        var g2 = gen_expr(call_arg(id, 1))
         if g2 < 0 {
             return -1
         }
-        var g3 = gen_expr(sstate.child(id, 2))
+        var g3 = gen_expr(call_arg(id, 2))
         if g3 < 0 {
             return -1
         }
@@ -1821,11 +1821,11 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     // regex_match：字符串 + 字符串 + ok 出参 → i8 → bool
     if nm == "regex_match" {
         g_used_interp = true
-        var m1 = gen_expr(sstate.child(id, 0))
+        var m1 = gen_expr(call_arg(id, 0))
         if m1 < 0 {
             return -1
         }
-        var m2 = gen_expr(sstate.child(id, 1))
+        var m2 = gen_expr(call_arg(id, 1))
         if m2 < 0 {
             return -1
         }
@@ -1854,7 +1854,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     // mkdir_all；此处补 remove_dir_all）
     if nm == "remove_dir_all" {
         g_used_interp = true
-        var rv = gen_expr(sstate.child(id, 0))
+        var rv = gen_expr(call_arg(id, 0))
         if rv < 0 {
             return -1
         }
@@ -1865,11 +1865,11 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     if nm == "file_copy" || nm == "file_move" || nm == "untar_gz" || nm == "unzip" ||
         nm == "copy_dir" || nm == "http_get_file" {
         g_used_interp = true
-        var f1 = gen_expr(sstate.child(id, 0))
+        var f1 = gen_expr(call_arg(id, 0))
         if f1 < 0 {
             return -1
         }
-        var f2 = gen_expr(sstate.child(id, 1))
+        var f2 = gen_expr(call_arg(id, 1))
         if f2 < 0 {
             return -1
         }
@@ -1879,11 +1879,11 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     // byte_write：路径 + 字节表 → i8 → bool
     if nm == "byte_write" {
         g_used_interp = true
-        var w1 = gen_expr(sstate.child(id, 0))
+        var w1 = gen_expr(call_arg(id, 0))
         if w1 < 0 {
             return -1
         }
-        var w2 = gen_expr(sstate.child(id, 1))
+        var w2 = gen_expr(call_arg(id, 1))
         if w2 < 0 {
             return -1
         }
@@ -1893,11 +1893,11 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     // bit_read：字节表 + 位置 → i64；bit_write：字节表 + 位置 + 位 → i8 → bool
     if nm == "bit_read" {
         g_used_interp = true
-        var b1 = gen_expr(sstate.child(id, 0))
+        var b1 = gen_expr(call_arg(id, 0))
         if b1 < 0 {
             return -1
         }
-        var b2 = gen_expr(sstate.child(id, 1))
+        var b2 = gen_expr(call_arg(id, 1))
         if b2 < 0 {
             return -1
         }
@@ -1912,15 +1912,15 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     }
     if nm == "bit_write" {
         g_used_interp = true
-        var bw1 = gen_expr(sstate.child(id, 0))
+        var bw1 = gen_expr(call_arg(id, 0))
         if bw1 < 0 {
             return -1
         }
-        var bw2 = gen_expr(sstate.child(id, 1))
+        var bw2 = gen_expr(call_arg(id, 1))
         if bw2 < 0 {
             return -1
         }
-        var bw3 = gen_expr(sstate.child(id, 2))
+        var bw3 = gen_expr(call_arg(id, 2))
         if bw3 < 0 {
             return -1
         }
@@ -1946,11 +1946,11 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     // byte_concat：字节表 + 字节表 → 字节表
     if nm == "byte_concat" {
         g_used_interp = true
-        var c1 = gen_expr(sstate.child(id, 0))
+        var c1 = gen_expr(call_arg(id, 0))
         if c1 < 0 {
             return -1
         }
-        var c2 = gen_expr(sstate.child(id, 1))
+        var c2 = gen_expr(call_arg(id, 1))
         if c2 < 0 {
             return -1
         }
@@ -1960,12 +1960,12 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     // set_env：双字符串参数 void；msg_set_lang：单字符串参数 void；msg_register：三字符串 void
     if nm == "set_env" || nm == "msg_set_lang" {
         g_used_interp = true
-        var e1 = gen_expr(sstate.child(id, 0))
+        var e1 = gen_expr(call_arg(id, 0))
         if e1 < 0 {
             return -1
         }
         if nm == "set_env" {
-            var e2 = gen_expr(sstate.child(id, 1))
+            var e2 = gen_expr(call_arg(id, 1))
             if e2 < 0 {
                 return -1
             }
@@ -1978,15 +1978,15 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     }
     if nm == "msg_register" {
         g_used_interp = true
-        var q1 = gen_expr(sstate.child(id, 0))
+        var q1 = gen_expr(call_arg(id, 0))
         if q1 < 0 {
             return -1
         }
-        var q2 = gen_expr(sstate.child(id, 1))
+        var q2 = gen_expr(call_arg(id, 1))
         if q2 < 0 {
             return -1
         }
-        var q3 = gen_expr(sstate.child(id, 2))
+        var q3 = gen_expr(call_arg(id, 2))
         if q3 < 0 {
             return -1
         }
@@ -2005,11 +2005,11 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     // rand_range：i64 + i64 + ok 出参 → i64（对齐 Rust 桥签名）
     if nm == "rand_range" {
         g_used_interp = true
-        var d1 = gen_expr(sstate.child(id, 0))
+        var d1 = gen_expr(call_arg(id, 0))
         if d1 < 0 {
             return -1
         }
-        var d2 = gen_expr(sstate.child(id, 1))
+        var d2 = gen_expr(call_arg(id, 1))
         if d2 < 0 {
             return -1
         }
@@ -2029,18 +2029,18 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     // table_at：表 + 下标 → 元素（与 t[i] 同语义；元素类型 fallback 判定）
     if nm == "table_at" {
         g_used_interp = true
-        var tb = gen_expr(sstate.child(id, 0))
+        var tb = gen_expr(call_arg(id, 0))
         if tb < 0 {
             return -1
         }
-        var ti = gen_expr(sstate.child(id, 1))
+        var ti = gen_expr(call_arg(id, 1))
         if ti < 0 {
             return -1
         }
         // 元素类型：语义节点类型（表实参的 node_types 可能是 TK_TABLE——元素类型
         // 按 var_table_elem 尽力推断，失败 fallback i64）
         var elem: i64 = types.named(TK_I64)
-        var tn = sstate.child(id, 0)
+        var tn = call_arg(id, 0)
         if s_tags[tn] == 6 {
             var te = sinfer.var_table_elem(intern.intern(sstate.name_str(tn)))
             if te >= 0 {
@@ -2078,11 +2078,13 @@ func builtin_expr(nm: string, id: i64) -> i64 {
 // 符号 tie_<name>；返回 i64 或 string）
 func gen_runtime_call(nm: string, id: i64) -> i64 {
     g_used_runtime = true
-    var nc = sstate.nchild(id)
+    // Call children = [泛型槽, 实参...]：实参从 children[slot_off] 起
+    var off = sstate.slot_off(id)
+    var nc = sstate.nchild(id) - off
     var argvals = table_new_i64()
     var k: i64 = 0
     while k < nc {
-        var av = gen_expr(sstate.child(id, k))
+        var av = gen_expr(sstate.child(id, off + k))
         if av < 0 {
             return -1
         }
@@ -2128,12 +2130,20 @@ func elem_size(t: i64) -> i64 {
     return 8
 }
 
+// Call/MethodCall 实参节点读取（2026-08-14 泛型槽偏移，权威约定见 ast.tie 头）：
+// children[0] 是泛型槽（-1 哨兵或 N_TYPE_ARGS），实参从 children[slot_off] 起。
+// k 为实参序号（0 起）。与语义层 sstate.slot_off 同源，保证偏移判定一致。
+func call_arg(id: i64, k: i64) -> i64 {
+    return sstate.child(id, sstate.slot_off(id) + k)
+}
+
 // 生成用户函数调用（顶层/命名空间函数）→ call(35) 指令。
 // full_name 为函数全名（裸调用已 resolve，MethodCall 已拼 prefix::method）。
-// arg_start：实参起始 child 下标（Call=0；MethodCall=1，children[0] 是 receiver）。
+// arg_start：实参起始 child 下标（Call=slot_off；MethodCall=1+slot_off，
+// children[0] 是泛型槽、children[1] 是 receiver）。
 // 操作数布局：[0]=符号池id, [1]=返回类型id(IMM), 然后每参数 [类型id(IMM), 值]。
 func gen_user_call(full: string, id: i64) -> i64 {
-    return gen_user_call_from(full, id, 0)
+    return gen_user_call_from(full, id, sstate.slot_off(id))
 }
 
 func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
@@ -2216,7 +2226,8 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
 // receiver 是 Path/Var/FieldAccess 链（未绑定）→ ns 调用；绑定实例 → struct
 // 方法转发（obj.method() → StructName::method(obj, ...)，语义层已校验签名）。
 func gen_method_call(id: i64) -> i64 {
-    var recv = sstate.child(id, 0)
+    // MethodCall 接收者 = children[slot_off]（新布局 children[0]=泛型槽→偏移 1）
+    var recv = sstate.child(id, sstate.slot_off(id))
     var mname = sstate.name_str(id)
     // 接收者是已绑定实例（局部/全局变量）且类型为 struct → 实例方法转发：
     // 函数全名 = <struct 名>::<方法>，实参 = [receiver 值] + 显式实参
@@ -2236,8 +2247,8 @@ func gen_method_call(id: i64) -> i64 {
         return -1
     }
     var full = prefix + "::" + mname
-    // 实参从 children[1] 开始（children[0] 是 receiver）
-    return gen_user_call_from(full, id, 1)
+    // 实参从 children[slot_off + 1] 开始（children[slot_off]=receiver）
+    return gen_user_call_from(full, id, 1 + sstate.slot_off(id))
 }
 
 // struct 实例方法转发调用：函数 = StructName::method，首参 = receiver 聚合值，
@@ -2277,9 +2288,10 @@ func gen_struct_method_call(full: string, id: i64, recv: i64, rty: i64) -> i64 {
     } else {
         table_push(argtys, rty)
     }
-    // 其余实参（children[1..]）
+    // 其余实参（从 children[slot_off + 1] 起：children[slot_off]=receiver）
+    var soff2 = sstate.slot_off(id)
     var nc = sstate.nchild(id)
-    var k: i64 = 1
+    var k: i64 = 1 + soff2
     while k < nc {
         var av = gen_expr(sstate.child(id, k))
         if av < 0 {
@@ -2287,8 +2299,11 @@ func gen_struct_method_call(full: string, id: i64, recv: i64, rty: i64) -> i64 {
         }
         table_push(argvals, av)
         var apty = types.named(TK_I64)
-        if k < nparams {
-            apty = ptys[k]
+        // 形参下标 = 实参序号 + 1（首参 0 = 接收者，已单独压入）；child 下标
+        // 与形参下标相差 slot_off（新布局 +1）——ptys[k - soff2] 即该实参的
+        // 形参类型（旧布局 soff2=0 → ptys[k]，与历史行为一致）
+        if k - soff2 < nparams {
+            apty = ptys[k - soff2]
         }
         table_push(argtys, apty)
         k = k + 1
@@ -2578,13 +2593,15 @@ func gen_struct_construct(id: i64, nm: string) -> i64 {
     var ap = ir.get_value(alloca)
     var off = cls_fldoff[si]
     var nf = cls_nfld[si]
-    var nc = sstate.nchild(id)
+    // 构造调用 children = [泛型槽, 实参...]：实参从 children[slot_off] 起
+    var soff = sstate.slot_off(id)
+    var nc = sstate.nchild(id) - soff
     var i: i64 = 0
     while i < nf {
         var fty = fld_tys[off + i]
         var v: i64 = -1
         if i < nc {
-            v = gen_expr(sstate.child(id, i))
+            v = gen_expr(sstate.child(id, soff + i))
             if v < 0 {
                 return -1
             }
@@ -3307,7 +3324,8 @@ func gen_switch(id: i64) -> i64 {
 // 最小集：空 → "\n"；字符串 → "%s\n" + ptr；整数 → "%lld\n" + i64
 // 格式串用真实文本（tie 字符串中 % 原样、\n 为换行），llvmgen 端转义为 c"...\00"
 func gen_println(id: i64, newline: bool) -> i64 {
-    var nc = sstate.nchild(id)
+    // Call children = [泛型槽, 实参...]：`println()` 槽占位 → 实参数 = nchild-1
+    var nc = sstate.nchild(id) - sstate.slot_off(id)
     var nl = "\n"
     if !newline {
         nl = ""
@@ -3321,7 +3339,8 @@ func gen_println(id: i64, newline: bool) -> i64 {
         ir.add_operand(inst, fmt, 0)  // OK_VALUE 格式串池 id
         return ir.get_value(inst)
     }
-    var arg = sstate.child(id, 0)
+    // 实参 = children[slot_off]（children[0] 是泛型槽）
+    var arg = sstate.child(id, sstate.slot_off(id))
     var atag = s_tags[arg]
     if atag == 2 {
         // 字符串参数：格式 "%s\n" + 字符串指针
@@ -3435,7 +3454,7 @@ func gen_stmt(id: i64) -> i64 {
         var init = sstate.child(id, 1)
         var ty: i64 = types.named(3)  // 默认 i64
         if ty_node >= 0 {
-            ty = stype.parse_type_node(ty_node)
+            ty = sgen.parse_generic_type_node(ty_node)
             if ty < 0 {
                 return -1
             }
@@ -4192,7 +4211,7 @@ pub func gen_src(src: string, base_dir: string) -> i64 {
 // 标量全局 → @g = global T <字面量零值>。
 func gen_global_var(s: i64) {
     var nm = sstate.name_str(s)
-    var ty = stype.parse_type_node(sstate.child(s, 0))
+    var ty = sgen.parse_generic_type_node(sstate.child(s, 0))
     if ty < 0 {
         ty = types.named(TK_I64)  // 无标注：语义已推断，兜底 i64
     }
@@ -4264,6 +4283,15 @@ func gen_ns(ns_node: i64, prefix: string) -> i64 {
 // 函数定义 → tie-IR 函数。prefix 为命名空间前缀（顶层函数传 ""）。
 // 函数全名 = prefix::name（命名空间函数）；LLVM 符号由 llvmgen 转 $。
 func gen_fn_def(fn_node: i64, prefix: string) -> i64 {
+    // 泛型模板声明（children[0] == N_TYPE_PARAMS）：T3b 单态化前不生成 IR——
+    // 模板体内 TypeVar 类型（"T"）无法静态编码，生成会报"类 'T' 未定义"。
+    // 语义层已把模板登记进 gt_* 表并跳过普通函数检查；此处对称跳过生成。
+    if sstate.nchild(fn_node) > 0 {
+        var slot0 = sstate.child(fn_node, 0)
+        if slot0 >= 0 && s_tags[slot0] == S_N_TYPE_PARAMS {
+            return 0
+        }
+    }
     var bare = sstate.name_str(fn_node)
     var full_name: string = bare
     if prefix != "" {
@@ -4282,8 +4310,9 @@ func gen_fn_def(fn_node: i64, prefix: string) -> i64 {
     g_tv_keys = table_new_i64()
     g_tv_elems = table_new_i64()
     var nparams = s_aux[fn_node]
-    // 返回类型：children[0]
-    var ret_ty = stype.parse_type_node(sstate.child(fn_node, 0))
+    // 返回类型：children[slot_off]（新布局 children[0]=泛型槽→偏移 1；
+    // 旧布局无槽→children[0]=返回类型。slot_off 统一判定保证自举双兼容）
+    var ret_ty = sgen.parse_generic_type_node(sstate.child(fn_node, sstate.slot_off(fn_node)))
     if ret_ty < 0 {
         if str_len(sm_err_msg) == 0 {
             sm_err_msg = "函数 " + full_name + " 返回类型解析失败"
@@ -4302,8 +4331,9 @@ func gen_fn_def(fn_node: i64, prefix: string) -> i64 {
     }
     var i: i64 = 0
     while i < nparams {
-        var p = sstate.child(fn_node, 1 + i)
-        var pt = stype.parse_type_node(sstate.child(p, 0))
+        // 第 i 个参数：children[slot_off + 1 + i]
+        var p = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + i)
+        var pt = sgen.parse_generic_type_node(sstate.child(p, 0))
         if pt < 0 {
             if str_len(sm_err_msg) == 0 {
                 sm_err_msg = "函数 " + full_name + " 参数类型解析失败"
@@ -4331,7 +4361,8 @@ func gen_fn_def(fn_node: i64, prefix: string) -> i64 {
     var sig_off = sg_off[sig0]
     i = 0
     while i < nparams {
-        var p = sstate.child(fn_node, 1 + i)
+        // 第 i 个参数：children[slot_off + 1 + i]
+        var p = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + i)
         var pname = sstate.name_str(p)
         var pty = params[i]
         // by_ref 标志：sstate sp_refs（语义层已收集）。
@@ -4381,8 +4412,8 @@ func gen_fn_def(fn_node: i64, prefix: string) -> i64 {
             gi = gi + 1
         }
     }
-    // 函数体：children[1 + nparams]（StmtList）
-    var body = sstate.child(fn_node, 1 + nparams)
+    // 函数体：children[slot_off + 1 + nparams]
+    var body = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + nparams)
     var r = gen_block_stmts(body)
     if r < 0 {
         return -1

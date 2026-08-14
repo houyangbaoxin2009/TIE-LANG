@@ -12,7 +12,7 @@ type tie<script>
 // 新文件类型声明系统：
 //   文件在头部区（文件最前面的连续前导行，允许其间空行）用真正的语法行
 //   声明类型，形如 `type tie`（泛型入口类型）或 `type tie<X>`（X ∈
-//   script/data/ui/class/logic/port/db）。声明行被剥离出正文；多次声明时
+//   script/data/ui/class/logic/port/db/ir）。声明行被剥离出正文；多次声明时
 //   首个合法声明生效（其余声明行同样剥离，静默）。无声明时默认角色为
 //   logic。旧 `// tie:xxx` 注释指令系统已完全移除：该类注释不再被提取/
 //   剥离，作为普通注释留在正文中（词法阶段自然忽略）。
@@ -22,7 +22,7 @@ type tie<script>
 //
 // 协议文本（与 Rust 壳约定）：
 //   无错误：
-//     第 1 行        ROLE:<role>         角色（type/script/data/ui/class/logic/port/db）
+//     第 1 行        ROLE:<role>         角色（type/script/data/ui/class/logic/port/db/ir）
 //     第 2 行        BODY:<m>            正文的码点数（str_len 语义——Rust 侧按
 //                                       str.chars().take(m) 取 m 个字符）
 //     剩余内容       <body>              清理后的正文（不含声明行，原样保留）
@@ -42,7 +42,7 @@ type tie<script>
 // - 头部区内的空行与声明行都被剥离（不进入正文）；
 // - 遇到第一个既非空行也非声明行的内容行即停止扫描，其后全部是正文
 //   （正文内形似声明的行只是普通内容）；
-// - 声明行格式：trim 后恰好为 `type tie` 或 `type tie<X>`（X 为 7 个
+// - 声明行格式：trim 后恰好为 `type tie` 或 `type tie<X>`（X 为 8 个
 //   子类型之一，不含 type 本身——type 由无尖括号的 `type tie` 表达）；
 //   格式不符 → 记录 ERROR（首个错误优先，之后声明行不再解析）；
 // - 多次合法声明：首个决定角色，后续剥离但不生效（静默）。
@@ -209,9 +209,10 @@ func join_lines(lines: table) -> string {
     return result
 }
 
-// 子类型合法性：X ∈ {script, data, ui, class, logic, port, db}
+// 子类型合法性：X ∈ {script, data, ui, class, logic, port, db, ir}
 // （type 本身由 `type tie` 无尖括号声明表达，不在子类型集内——
 //  `type tie<type>` 是格式错误，应由声明系统报错而非接受）
+// ir 是 IR 角色：检测到即直接生成 LLVM IR（.ll），不继续 opt/clang 链接。
 func is_valid_subtype(name: string) -> bool {
     if name == "script" {
         return true
@@ -232,6 +233,9 @@ func is_valid_subtype(name: string) -> bool {
         return true
     }
     if name == "db" {
+        return true
+    }
+    if name == "ir" {
         return true
     }
     return false
@@ -285,7 +289,7 @@ func process(src: string) -> string {
                                 declared = true
                             }
                         } else {
-                            err = "未知子类型 \"" + inner + "\"（合法: script/data/ui/class/logic/port/db）"
+                            err = "未知子类型 \"" + inner + "\"（合法: script/data/ui/class/logic/port/db/ir）"
                         }
                     } else {
                         err = "声明格式错误: \"" + trimmed + "\"（应为 `type tie` 或 `type tie<X>`）"

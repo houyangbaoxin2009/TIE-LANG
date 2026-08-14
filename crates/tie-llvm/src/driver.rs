@@ -14,6 +14,8 @@
 //!         → clang 链接生成可执行 [backend]
 //!   └── 其他工具链（data / ui / db / port）：由预处理识别角色后转交，
 //!         v0.1 阶段挂接点已就绪（后续版本实现）
+//!   └── IR 工具链（ir）：由预处理识别角色后直接生成 LLVM IR（.ll），
+//!         不继续 opt/clang 链接（等价 `--emit-ir`，但由角色触发）——已实现
 //! ```
 //!
 //! 文件角色由 `type tie` / `type tie<X>` 声明（新文件类型声明系统）或
@@ -110,6 +112,8 @@ enum Dispatch {
     Db,
     /// 端口/对外接口工具链（port）
     Port,
+    /// IR 生成工具链（ir）：直接产出 LLVM IR（.ll），不继续编译
+    EmitIr,
 }
 
 /// 按角色分派工具链（预处理识别 → 自动转交对应工具）。
@@ -121,6 +125,8 @@ fn dispatch(role: FileRole) -> Dispatch {
         FileRole::Ui => Dispatch::Ui,
         FileRole::Db => Dispatch::Db,
         FileRole::Port => Dispatch::Port,
+        // ir 角色：直接生成 LLVM IR（.ll），不继续 opt/clang 链接
+        FileRole::Ir => Dispatch::EmitIr,
     }
 }
 
@@ -174,6 +180,15 @@ pub fn compile(opts: &CompileOptions) -> Result<CompileOutcome, CompileError> {
             message: "[预处理] 识别为 port 接口文件，已转交端口工具链 —— v0.1 端口工具链尚未实现".to_string(),
             artifact: None,
         }),
+        // ir 角色：构造 emit_ir_only=true 的编译选项副本，走 compile_program
+        // 的 IR 生成路径（前端 → IR 文本 → 写 .ll 后返回"已生成 LLVM IR"）。
+        // main 入口检查已被 !opts.emit_ir_only 守卫——ir 角色不需要 main，
+        // emit_ir_only=true 时自然跳过，无需额外处理。
+        Dispatch::EmitIr => {
+            let mut ir_opts = opts.clone();
+            ir_opts.emit_ir_only = true;
+            compile_program(&ir_opts, &pre)
+        }
     }
 }
 

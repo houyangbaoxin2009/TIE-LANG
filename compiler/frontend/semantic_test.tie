@@ -9,6 +9,9 @@ type tie<logic>
 //   3) check_debug 输出类型表/签名摘要（人工比对 Rust）；
 //   4) 输出「semantic 验收通过」exit 0。
 // 编译运行：target\release\tie-llvm.exe compiler\frontend\semantic_test.tie
+// 注：types 命名空间经 semantic 树（scheck→scollect→sinfer→sbuiltin→stype→data→
+// types.tie）内联提供，无需显式 import——显式 import 会产生未归一化路径
+// （"../" 不折叠）导致同一文件被重复展开（intern_pool 重复定义）。
 import "./semantic.tie"
 
 // 断言辅助
@@ -110,6 +113,12 @@ func main() {
         if at_end {
             var line = str.slice(corpus, line_start, pos)
             var line_len = str_len(line)
+            // 兼容 CRLF 行尾（corpus.txt 为 CRLF）：剥离尾随 \r，
+            // 否则 role 字段变成 "pass\r" 匹配失败 → corpus 恒 0/0
+            if line_len > 0 && str_char(line, line_len - 1) == "\r" {
+                line = str.slice(line, 0, line_len - 1)
+                line_len = line_len - 1
+            }
             var is_comment: bool = false
             if line_len > 0 {
                 if str_char(line, 0) == "#" {
@@ -177,6 +186,33 @@ func main() {
     var dbg = semantic.check_debug_src(hello, "examples/")
     println("类型表/签名摘要：")
     println(dbg)
+
+    // ============ TypeVar 类型参数（types.tie，泛型单态化铺垫）============
+    // 编码：5<<40 = 5497558138880；kind(5<<40 段) = 5（K_TYPEVAR）。
+    // 名字即身份：同名类型参数全局同 id、跨函数稳定（mangling 友好）。
+    var tv_t = types.var_of("T")
+    var tv_u = types.var_of("U")
+    ok = tcheck(tv_t != tv_u, "TypeVar 编码唯一（T ≠ U）") && ok
+    ok = tcheck(types.var_of("T") == tv_t, "TypeVar 幂等（同名同 id）") && ok
+    ok = tcheck(tv_t >= 5497558138880, "TypeVar id 落在 5<<40 段") && ok
+    ok = tcheck(types.kind(tv_t) == 5, "TypeVar kind = K_TYPEVAR(5)") && ok
+    ok = tcheck(types.is_typevar(tv_t) && !types.is_typevar(types.named(3)), "is_typevar 判定（TypeVar 真/普通类型假）") && ok
+    ok = tcheck(types.type_name(tv_t) == "T", "type_name 还原类型参数名") && ok
+    // table<TypeVar>：var_of 结果恒 ≥ NEST_SLOT_OFF(100)，table_of 走嵌套
+    // 聚合序号表路径（nest_tbl_elems 查/登记），table_elem 可完整还原。
+    var tv_tbl = types.table_of(tv_t)
+    ok = tcheck(types.kind(tv_tbl) == 1, "table<TypeVar> kind = K_TABLE(1)") && ok
+    ok = tcheck(types.table_elem(tv_tbl) == tv_t, "table_elem 还原回 TypeVar id") && ok
+    ok = tcheck(types.is_typevar(types.table_elem(tv_tbl)), "table 元素 is_typevar") && ok
+    ok = tcheck(types.type_name(tv_tbl) == "table<T>", "table<TypeVar> type_name") && ok
+    // TypeVar 不是任何具体类型：判据族全 false
+    ok = tcheck(!types.is_int(tv_t) && !types.is_float(tv_t) && !types.is_number(tv_t), "TypeVar 非数值") && ok
+    ok = tcheck(!types.is_bool_like(tv_t) && !types.is_wide(tv_t), "TypeVar 非布尔/宽类型") && ok
+    ok = tcheck(!types.is_table(tv_t) && !types.is_map(tv_t), "TypeVar 非表/映射") && ok
+    // 现有编码零破坏：内置/表/映射/tuple 行为不变
+    ok = tcheck(types.kind(types.named(3)) == 0 && types.type_name(types.named(3)) == "i64", "内置类型编码不变") && ok
+    ok = tcheck(types.kind(types.table_of(3)) == 1 && types.type_name(types.table_of(3)) == "table<i64>", "table<i64> 编码不变") && ok
+    ok = tcheck(types.kind(types.tuple_of(0)) == 4 && types.type_name(types.tuple_of(0)) == "tuple", "tuple 编码不变") && ok
 
     if !ok {
         exit(1)

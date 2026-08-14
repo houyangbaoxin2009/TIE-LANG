@@ -43,10 +43,27 @@ func is_scalar_t(t: i64) -> bool {
 
 // 顶层函数签名收集（含参数/返回类型解析 + 默认值/ref 校验）
 pub func collect_fn(fn_node: i64, full: string) -> i64 {
+    // 泛型模板登记分派（2026-08-14 泛型语法）：children[0] == N_TYPE_PARAMS
+    // 时按模板登记（sstate.reg_generic → gt_* 表），**不**按普通函数收集——
+    // 否则模板参数类型（TypeVar 名如 "T"）经 stype.parse_type_node 会报
+    // "类 'T' 未定义"。单态化展开语义由 T3b 负责，本任务只保证泛型声明
+    // 本身不使语义崩溃 + 模板结构就位。
+    if sstate.nchild(fn_node) > 0 {
+        var slot0 = sstate.child(fn_node, 0)
+        if slot0 >= 0 && s_tags[slot0] == S_N_TYPE_PARAMS {
+            var gret = sstate.reg_generic(full, fn_node, 0)
+            if gret < 0 {
+                return -1
+            }
+            return 0
+        }
+    }
     var nparams = s_aux[fn_node]
     var is_pub = s_vals[fn_node]
-    var rt_node = sstate.child(fn_node, 0)
-    var ret_ty = stype.parse_type_node(rt_node)
+    // 返回类型：FnDef children[slot_off]（新布局 children[0]=泛型槽→偏移 1；
+    // 旧布局无槽→children[0]=返回类型。slot_off 统一判定保证自举双兼容）
+    var rt_node = sstate.child(fn_node, sstate.slot_off(fn_node))
+    var ret_ty = sgen.parse_generic_type_node(rt_node)
     if ret_ty < 0 {
         return -1
     }
@@ -58,8 +75,9 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
     var seen_default: bool = false
     var k: i64 = 0
     while k < nparams {
-        var p = sstate.child(fn_node, 1 + k)
-        var pt = stype.parse_type_node(sstate.child(p, 0))
+        // 第 k 个参数：children[slot_off + 1 + k]
+        var p = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + k)
+        var pt = sgen.parse_generic_type_node(sstate.child(p, 0))
         if pt < 0 {
             return -1
         }
@@ -179,6 +197,49 @@ func ig_slice2(s: string, start: i64, end: i64) -> string {
     return out
 }
 
+// 顶层 struct 声明登记分派（泛型语法 2026-08-14）：
+// children[0] == N_TYPE_PARAMS → 泛型 struct 模板登记（sstate.reg_generic →
+// gt_* 表，跳过普通 struct 收集——模板字段的 TypeVar 类型无法静态解析，
+// collect_struct_fields 会因"类 'T' 未定义"崩溃）；否则普通 reg_struct。
+// 返回 0 成功 / -1 错误（sm_err_* 已置）。
+func collect_struct_decl(s: i64) -> i64 {
+    var nm = sstate.name_str(s)
+    if sstate.nchild(s) > 0 {
+        var slot0 = sstate.child(s, 0)
+        if slot0 >= 0 && s_tags[slot0] == S_N_TYPE_PARAMS {
+            var gret = sstate.reg_generic(nm, s, 1)
+            if gret < 0 {
+                return -1
+            }
+            return 0
+        }
+    }
+    var parent = ""
+    var p = s_aux[s]
+    if p >= 0 {
+        parent = intern.lookup(p)
+    }
+    // struct 与函数名冲突（对齐 Rust check_struct_namespace：struct 名不能与
+    // 同命名空间函数同名——构造调用 vs 函数调用的歧义）
+    var snid = intern.intern(nm)
+    if sstate.bs_find(fn_keys, snid) >= 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        sm_err_msg = "struct 名 '" + nm + "' 与函数名冲突"
+        return -1
+    }
+    var idx = sstate.reg_struct(nm, parent)
+    if idx < 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        return -1
+    }
+    // struct 名登记（types.type_name / 泛型 mangling 片段还原用；追加式与
+    // reg_struct 索引顺序一致——实例化 struct 由 sgen.instantiate_struct 同步登记）
+    types.set_struct_name(idx, nm)
+    return 0
+}
+
 // 查找顶层 struct 定义节点（按名字）
 pub func find_struct_node(name: string) -> i64 {
     var n = sstate.nchild(g_root)
@@ -193,6 +254,37 @@ pub func find_struct_node(name: string) -> i64 {
         i = i + 1
     }
     return -1
+}
+
+// 泛型类型引用预实例化（2026-08-14 泛型字段类型修复）。
+// 遍历已登记 struct（st_keys，动态增长）的字段类型节点，用泛型感知解析触发
+// 模板 struct 引用（如 `A<i64>`）的 instantiate_struct。必须发生在
+// collect_all_struct_fields 之前——否则字段类型解析的实例化副作用会把
+// cls_fldoff 顶偏（详见 collect_struct_fields 注释）。此时实例化已幂等，
+// 正式字段拍平不再产生新副作用，off 稳定。
+pub func pre_instantiate_field_types() -> i64 {
+    var i: i64 = 0
+    while i < len(st_keys) {
+        var nm = intern.lookup(st_keys[i])
+        var snode = find_struct_node(nm)
+        if snode >= 0 {
+            var soff = sstate.slot_off(snode)
+            var nf = sstate.nchild(snode) - soff
+            var k: i64 = 0
+            while k < nf {
+                var f = sstate.child(snode, soff + k)
+                var fty = sgen.parse_generic_type_node(sstate.child(f, 0))
+                if fty < 0 {
+                    sm_err_line = s_lines[f]
+                    sm_err_col = s_cols[f]
+                    return -1
+                }
+                k = k + 1
+            }
+        }
+        i = i + 1  // len(st_keys) 每次重求——实例化增长自动覆盖
+    }
+    return 0
 }
 
 // 收集单个 struct 的拍平字段（含继承）
@@ -255,19 +347,47 @@ pub func collect_struct_fields(si: i64) -> i64 {
         sm_err_msg = "内部错误：struct '" + nm + "' 定义节点未找到"
         return -1
     }
-    // 自身字段
-    var nf = sstate.nchild(snode)
+    // 自身字段：Struct children = [泛型槽, ClassField...]，字段从 children[1] 起
+    var soff = sstate.slot_off(snode)  // struct 泛型槽偏移（恒 1；防御读取）
+    var nf = sstate.nchild(snode) - soff
+    // 2026-08-14 泛型修复：先预解析全部字段类型到临时表，再设 cls_fldoff，最后统一
+    // push。原因：字段类型中的模板 struct 引用（如 `A<i64>`）经 sgen.parse_generic_type_node
+    // 会触发 instantiate_struct → 立即把实例化 struct 的字段 push 进 fld_*。若 cls_fldoff
+    // 在解析前设置，这些副作用字段会把 off 顶偏（构造时读到别的 struct 的字段段，
+    // 报"字段 'v' 期望 i64，实际 A$i64"这类错位）。先解析 → off 取解析后的长度 →
+    // 自身字段 push 在副作用字段之后，off 恒正确。
+    var f_ids: table<i64> = table_new_i64()
+    var f_tys: table<i64> = table_new_i64()
+    var f_defs: table<i64> = table_new_i64()
     var k: i64 = 0
     while k < nf {
-        var f = sstate.child(snode, k)
-        var fty = stype.parse_type_node(sstate.child(f, 0))
+        var f = sstate.child(snode, soff + k)
+        var fty = sgen.parse_generic_type_node(sstate.child(f, 0))
         if fty < 0 {
             sm_err_line = s_lines[f]
             sm_err_col = s_cols[f]
             return -1
         }
-        var fnid = intern.intern(sstate.name_str(f))
-        // 字段名跨继承链唯一
+        table_push(f_ids, intern.intern(sstate.name_str(f)))
+        table_push(f_tys, fty)
+        // 字段默认值（`var y: i64 = 10` → child(f, 1)；无默认值 -1）
+        var fdef: i64 = -1
+        if sstate.nchild(f) > 1 {
+            fdef = sstate.child(f, 1)
+        }
+        table_push(f_defs, fdef)
+        k = k + 1
+    }
+    // 字段段起点：无父 = 类型解析完成后 fld_* 的当前长度（副作用字段已在其内，
+    // off 恒正确）；有父 = 继承父字段段（前面 294-310 已设 off/nfld，不覆盖）
+    if cls_parent[si] < 0 {
+        cls_fldoff[si] = len(fld_names)
+        cls_nfld[si] = 0
+    }
+    // 统一 push 自身字段（重名检查覆盖继承字段 + 已 push 的自身字段）
+    var kk: i64 = 0
+    while kk < nf {
+        var fnid = f_ids[kk]
         var d: i64 = 0
         var dup: bool = false
         while d < cls_nfld[si] {
@@ -278,21 +398,17 @@ pub func collect_struct_fields(si: i64) -> i64 {
             d = d + 1
         }
         if dup {
-            sm_err_line = s_lines[f]
-            sm_err_col = s_cols[f]
-            sm_err_msg = "字段 '" + nm + "." + sstate.name_str(f) + "' 与继承链中的字段重名（字段名必须跨继承链唯一）"
+            var f2 = sstate.child(snode, soff + kk)
+            sm_err_line = s_lines[f2]
+            sm_err_col = s_cols[f2]
+            sm_err_msg = "字段 '" + nm + "." + sstate.name_str(f2) + "' 与继承链中的字段重名（字段名必须跨继承链唯一）"
             return -1
         }
         table_push(fld_names, fnid)
-        table_push(fld_tys, fty)
-        // 字段默认值（`var y: i64 = 10` → child(f, 1)；无默认值 -1）
-        var fdef: i64 = -1
-        if sstate.nchild(f) > 1 {
-            fdef = sstate.child(f, 1)
-        }
-        table_push(fld_defs, fdef)
+        table_push(fld_tys, f_tys[kk])
+        table_push(fld_defs, f_defs[kk])
         cls_nfld[si] = cls_nfld[si] + 1
-        k = k + 1
+        kk = kk + 1
     }
     return 0
 }
@@ -345,7 +461,8 @@ pub func scan_return_elem(e: i64) -> i64 {
         var nm = sstate.name_str(e)
         // 查本函数体内同名 var 声明的初始化
         var nparams = s_aux[g_cur_scan_fn]
-        return scan_blk(sstate.child(g_cur_scan_fn, 1 + nparams), nm)
+        // 函数体：children[slot_off + 1 + nparams]
+        return scan_blk(sstate.child(g_cur_scan_fn, sstate.slot_off(g_cur_scan_fn) + 1 + nparams), nm)
     }
     return -1
 }
@@ -441,7 +558,8 @@ pub func collect_all_return_tables() -> i64 {
                 if fn_node >= 0 {
                     g_cur_scan_fn = fn_node
                     var nparams = s_aux[fn_node]
-                    var e = scan_blk(sstate.child(fn_node, 1 + nparams), "")
+                    // 函数体：children[slot_off + 1 + nparams]
+                    var e = scan_blk(sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + nparams), "")
                     if e >= 0 {
                         if sstate.bs_find(tre_keys, fn_keys[i]) < 0 {
                             sstate.sorted_insert(tre_keys, tre_vals, fn_keys[i], e)
@@ -486,24 +604,9 @@ pub func collect_ns(ns_node: i64) -> i64 {
                 return -1
             }
         } else if tag == S_N_STRUCT {
-            var nm = sstate.name_str(s)
-            var parent = ""
-            var p = s_aux[s]
-            if p >= 0 {
-                parent = intern.lookup(p)
-            }
-            // struct 与函数名冲突（对齐 Rust：struct 名不能与同命名空间函数同名）
-            var snid = intern.intern(nm)
-            if sstate.bs_find(fn_keys, snid) >= 0 {
-                sm_err_line = s_lines[s]
-                sm_err_col = s_cols[s]
-                sm_err_msg = "struct 名 '" + nm + "' 与函数名冲突"
-                return -1
-            }
-            var idx = sstate.reg_struct(nm, parent)
-            if idx < 0 {
-                sm_err_line = s_lines[s]
-                sm_err_col = s_cols[s]
+            // 泛型 struct 模板 / 普通 struct 统一分派登记
+            var rd = collect_struct_decl(s)
+            if rd < 0 {
                 return -1
             }
         }
@@ -531,7 +634,7 @@ pub func collect_global_var(v: i64) -> i64 {
         sm_err_msg = "全局变量 '" + nm + "' 必须显式标注类型（如 var x: i64）"
         return -1
     }
-    var ty = stype.parse_type_node(ty_node)
+    var ty = sgen.parse_generic_type_node(ty_node)
     if ty < 0 {
         return -1
     }
@@ -623,25 +726,9 @@ pub func collect_top() -> i64 {
                 return -1
             }
         } else if tag == S_N_STRUCT {
-            var nm = sstate.name_str(s)
-            var parent = ""
-            var p = s_aux[s]
-            if p >= 0 {
-                parent = intern.lookup(p)
-            }
-            // struct 与函数名冲突（对齐 Rust check_struct_namespace：struct 名
-            // 不能与顶层函数同名——构造调用 vs 函数调用的歧义）
-            var snid = intern.intern(nm)
-            if sstate.bs_find(fn_keys, snid) >= 0 {
-                sm_err_line = s_lines[s]
-                sm_err_col = s_cols[s]
-                sm_err_msg = "struct 名 '" + nm + "' 与函数名冲突"
-                return -1
-            }
-            var idx = sstate.reg_struct(nm, parent)
-            if idx < 0 {
-                sm_err_line = s_lines[s]
-                sm_err_col = s_cols[s]
+            // 泛型 struct 模板 / 普通 struct 统一分派登记
+            var rd = collect_struct_decl(s)
+            if rd < 0 {
                 return -1
             }
         } else if tag == S_N_VAR_DECL {
@@ -659,7 +746,7 @@ pub func collect_top() -> i64 {
                 sm_err_msg = "extern 函数 '" + full + "' 与已有函数重复定义"
                 return -1
             }
-            var ret_ty = stype.parse_type_node(sstate.child(s, 0))
+            var ret_ty = sgen.parse_generic_type_node(sstate.child(s, 0))
             if ret_ty < 0 {
                 return -1
             }
@@ -682,7 +769,7 @@ pub func collect_top() -> i64 {
             var k: i64 = 0
             while k < nparams {
                 var p = sstate.child(s, 1 + k)
-                var pt = stype.parse_type_node(sstate.child(p, 0))
+                var pt = sgen.parse_generic_type_node(sstate.child(p, 0))
                 if pt < 0 {
                     return -1
                 }

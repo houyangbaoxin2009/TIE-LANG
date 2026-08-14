@@ -82,6 +82,111 @@ func to_int(s: string) -> i64 {
     return v
 }
 
+// 子串包含判断（parse_debug 输出抽样断言用，无标准库依赖）
+func contains(hay: string, needle: string) -> bool {
+    var n = str_len(needle)
+    var m = str_len(hay)
+    var i: i64 = 0
+    while i + n <= m {
+        var j: i64 = 0
+        var hit = true
+        while j < n {
+            if str_char(hay, i + j) != str_char(needle, j) {
+                hit = false
+            }
+            j = j + 1
+        }
+        if hit {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ---------- 头部剥离用字符串工具（零依赖，与 driver 同款逻辑）----------
+
+// 按 \n 拆行（去行尾 \r）。
+func split_lines(s: string) -> table<string> {
+    var rows = table_new_string()
+    var n: i64 = str_len(s)
+    var line: string = ""
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "\n" {
+            table_push(rows, line)
+            line = ""
+        } else if c == "\r" {
+        } else {
+            line = line + c
+        }
+        i = i + 1
+    }
+    if str_len(line) > 0 {
+        table_push(rows, line)
+    }
+    return rows
+}
+
+// 取字符串 [start, end) 子串（码点级）。
+func slice(s: string, start: i64, end: i64) -> string {
+    var out: string = ""
+    var i: i64 = start
+    while i < end {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+// 去除字符串首尾空白（空格/制表）。
+func trim(s: string) -> string {
+    var n: i64 = str_len(s)
+    var start: i64 = 0
+    var end: i64 = n
+    while start < end && (str_char(s, start) == " " || str_char(s, start) == "\t") {
+        start = start + 1
+    }
+    while end > start && (str_char(s, end - 1) == " " || str_char(s, end - 1) == "\t") {
+        end = end - 1
+    }
+    return slice(s, start, end)
+}
+
+// 剥离文件类型声明行（`type tie` / `type tie<X>`）——新文件类型声明体系
+// （b46f5d3，2026-08-14）中声明是真语法行，parse_src 前须移除（与
+// driver.strip_type_header 同款逻辑）。头部区 = 文件最前连续行（允许空行），
+// 遇第一个非空非声明行即停止；声明行之外的行原样保留，\n 重连。
+func strip_type_header(src: string) -> string {
+    var lines = split_lines(src)
+    var n: i64 = len(lines)
+    var out: string = ""
+    var in_header = true
+    var i: i64 = 0
+    while i < n {
+        var ln = lines[i]
+        var t = trim(ln)
+        if in_header {
+            if str_len(t) == 0 {
+                // 头部区空行：保留
+            } else if putil.has_prefix(t, "type tie") {
+                // 声明行：剥离
+                i = i + 1
+                continue
+            } else {
+                in_header = false
+            }
+        }
+        if str_len(out) > 0 {
+            out = out + "\n"
+        }
+        out = out + ln
+        i = i + 1
+    }
+    return out
+}
+
 func main() {
     var ok: bool = true
 
@@ -108,7 +213,7 @@ func main() {
     var i: i64 = 0
     while i < len(files) {
         var src = file_read(files[i])
-        var ast_proto = parser.parse_src(src)
+        var ast_proto = parser.parse_src(strip_type_header(src))
         if has_err(ast_proto) {
             println("[" + files[i] + "] 解析失败: " + fmt_syn_err(ast_proto))
             ok = false
@@ -128,7 +233,7 @@ func main() {
     i = 0
     while i < len(ast_files) {
         var src = file_read(ast_files[i])
-        var ast_proto = parser.parse_src(src)
+        var ast_proto = parser.parse_src(strip_type_header(src))
         if has_err(ast_proto) {
             println("[" + ast_files[i] + "] AST 失败")
             ok = false
@@ -176,6 +281,54 @@ func main() {
         println("          实际: [" + got + "]")
         ok = check_str(got, neg_expected[m], "负例[" + to_string(m) + "]") && ok
         m = m + 1
+    }
+
+    // ---------- 泛型语法用例（2026-08-14 泛型 parser 层验收）----------
+    // 断言策略：parse_src 无错误（ERR: 前缀判定）+ parse_debug 树形输出抽样
+    // 节点名（TypeParams/TypeParam/TypeArgs/StructType）+ 比较运算符不被破坏。
+    var gen_srcs: table<string> = [
+        // [0] 泛型函数声明 + 泛型调用 max<i64>(3, 5)
+        "func max<T>(a: T, b: T) -> T { if a > b { return a; }\nreturn b; }\nfunc main() { var m: i64 = max<i64>(3, 5); }\n",
+        // [1] 泛型 struct 声明 + 泛型构造 Box<i64>(42) + 类型引用 var b: Box<i64>
+        "struct Box<T> { var value: T; }\nfunc main() { var b: Box<i64> = Box<i64>(42); }\n",
+        // [2] 嵌套 Box<Box<i64>>（类型引用 + 构造；>> 分裂）
+        "struct Box<T> { var value: T; }\nfunc main() { var b: Box<Box<i64>> = Box<Box<i64>>(42); }\n",
+        // [3] a < b 比较不被误判为泛型调用
+        "func main() { var a: i64 = 1;\nvar b: i64 = 2;\nif a < b { println(\"lt\"); } }\n",
+        // [4] 链式比较 f < g > h 不被误判为泛型调用
+        "func main() { var f: i64 = 1;\nvar g: i64 = 2;\nvar h: i64 = 3;\nif f < g > h { println(\"x\"); } }\n",
+        // [5] 命名空间路径泛型调用 ns::max<i64>(3, 5)
+        "namespace ns { pub func max<T>(a: T, b: T) -> T { if a > b { return a; }\nreturn b; }\n }\nfunc main() { var m: i64 = ns::max<i64>(3, 5); }\n",
+        // [6] 泛型 struct 无类型实参构造 Box(1) 保持普通调用（Var 初值推断）
+        "struct Box<T> { var value: T; }\nfunc main() { var b = Box(1); }\n"
+    ]
+    var gen_checks: table<string> = ["TypeParams", "TypeArgs", "TypeArgs",
+        " < ", " < ", "TypeArgs", "Call"]
+    var g: i64 = 0
+    while g < len(gen_srcs) {
+        var gr = parser.parse_src(gen_srcs[g])
+        if has_err(gr) {
+            println("[泛型用例 " + to_string(g) + "] 解析失败: " + fmt_syn_err(gr))
+            ok = false
+        } else {
+            println("[泛型用例 " + to_string(g) + "] 解析成功")
+        }
+        // parse_debug 树形抽样（节点名 / 运算符符号）
+        var gd = parser.parse_debug(gen_srcs[g])
+        var probe = gen_checks[g]
+        var hit = contains(gd, probe)
+        var hit_desc = "否"
+        if hit {
+            hit_desc = "是"
+        }
+        println("  节点抽样: 期望含 [" + probe + "] → " + hit_desc)
+        ok = check(hit, "泛型用例[" + to_string(g) + "] 节点抽样含 " + probe) && ok
+        if g == 3 || g == 4 {
+            // 比较用例额外断言：不得产出 TypeArgs 节点（未被误判为泛型）
+            var no_targs = !contains(gd, "TypeArgs")
+            ok = check(no_targs, "泛型用例[" + to_string(g) + "] 不产出 TypeArgs") && ok
+        }
+        g = g + 1
     }
 
     if !ok {

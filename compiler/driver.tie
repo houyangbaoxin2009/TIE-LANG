@@ -141,7 +141,8 @@ func normalize_target(t: string) -> string {
 // ==================== 头部扫描（文件类型声明） ====================
 
 // 从源码头部识别文件类型声明（新体系）：
-//   `type tie` → 类型 type；`type tie<X>` → X（X ∈ script/data/ui/class/logic/port/db）。
+//   `type tie` → 类型 type；`type tie<X>` → X（X ∈ script/data/ui/class/logic/port/db/ir）。
+//   ir 角色：直接生成 LLVM IR（.ll），不继续 opt/clang 链接（等价 --emit-ir）。
 // 头部区 = 文件最前连续行（允许空行），遇第一个非空非声明行即结束；
 // 只扫前 20 行。无声明默认 logic（可执行）。
 // 旧 `// tie:xxx` 注释指令体系已彻底移除：该类行只是普通注释，不再识别
@@ -167,11 +168,11 @@ func scan_header(src: string) -> i64 {
             // 期望 `<X>` 形式，且无尾随内容
             if str_len(rest) >= 3 && str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">" {
                 var sub = trim(slice(rest, 1, str_len(rest) - 1))
-                if sub == "script" || sub == "data" || sub == "ui" || sub == "class" || sub == "logic" || sub == "port" || sub == "db" {
+                if sub == "script" || sub == "data" || sub == "ui" || sub == "class" || sub == "logic" || sub == "port" || sub == "db" || sub == "ir" {
                     g_role = sub
                     return 0
                 }
-                println("文件类型声明错误: 未知类型 '" + sub + "'（第 " + to_string(i + 1) + " 行），合法类型: script/data/ui/class/logic/port/db")
+                println("文件类型声明错误: 未知类型 '" + sub + "'（第 " + to_string(i + 1) + " 行），合法类型: script/data/ui/class/logic/port/db/ir")
                 return -1
             }
             println("文件类型声明错误: 非法声明 '" + ln + "'（第 " + to_string(i + 1) + " 行），应为 `type tie` 或 `type tie<类型>`")
@@ -316,6 +317,11 @@ func main() -> i64 {
     if g_role == "port" {
         println("[预处理] 识别为 port 端口文件（头: " + g_input + "），已转交端口工具链 —— v0.1 端口工具链尚未实现")
         return 0
+    }
+    // ir 角色：直接生成 LLVM IR（.ll），不继续 opt/clang 链接（等价 --emit-ir，
+    // 但由角色触发而非 CLI 选项）。复用编译工具链 + g_emit_ir 短路。
+    if g_role == "ir" {
+        g_emit_ir = true
     }
     return compile_program(clean)
 }
@@ -601,7 +607,7 @@ func role_from_filename(name: string) -> string {
         return ""
     }
     var role = slice(name, first_dot + 1, last_dot)
-    if role == "type" || role == "script" || role == "data" || role == "ui" || role == "class" || role == "logic" || role == "port" || role == "db" {
+    if role == "type" || role == "script" || role == "data" || role == "ui" || role == "class" || role == "logic" || role == "port" || role == "db" || role == "ir" {
         return role
     }
     return ""

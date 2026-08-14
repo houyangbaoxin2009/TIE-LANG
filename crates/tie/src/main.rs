@@ -87,8 +87,8 @@ tie 语言总入口（四段式调度器 + REPL）
 
 流程:
   1. tie-prep 预处理（清理代码 + 识别文件类型，`type tie` / `type tie<X>` 声明）
-  2. 按角色自动转交工具链（logic/script/class/type → tie-llvm 编译；
-     data/ui/db/port → 对应工具链，后续版本）
+  2. 按角色自动转交工具链（logic/script/class/type/ir → tie-llvm 编译；
+     ir 直接生成 LLVM IR（.ll），不继续编译；data/ui/db/port → 对应工具链，后续版本）
 
 选项:
   -o <file>      指定输出文件路径（默认: 输入同名 .exe；class/type 角色默认 .a；
@@ -518,5 +518,19 @@ fn dispatch_role(role: FileRole, args: &Args, input: PathBuf) -> Result<CompileO
             message: "[tie] 角色为 port（接口文件），已转交端口工具链 —— v0.1 尚未实现".to_string(),
             artifact: None,
         }),
+        // ir → tie-llvm 编译工具链，但强制 emit_ir_only=true：
+        // 直接生成 LLVM IR（.ll），不继续 opt/clang 链接（等价 `--emit-ir`，
+        // 由角色触发而非 CLI 选项；driver 内部已有该路径）
+        FileRole::Ir => {
+            let opts = CompileOptions {
+                input,
+                output: args.output.clone(),
+                opt_level: args.opt_level,
+                emit_ir_only: true,
+                keep_intermediate: args.keep_ir,
+                target: args.target.clone(),
+            };
+            tie_llvm::driver::compile(&opts).map_err(|e| e.to_string())
+        }
     }
 }

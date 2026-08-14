@@ -96,6 +96,37 @@ var tup_tys: table<i64>;      // tuple 字段类型 id（扁平段）
 var tup_offs: table<i64>;     // tuple 字段段偏移
 var tup_n: table<i64>;        // tuple 字段数
 
+// ==================== 泛型模板登记（T3b 单态化展开器预置，2026-08-14）====================
+// T1 泛型语法（`func max<T>` / `struct Box<T>`）落地后，本表预置模板登记
+// 结构：供 T3b 单态化展开器使用（本任务只建结构 + 查询/登记辅助函数，不实现
+// 展开）。登记时机：scollect.collect_fn / collect_struct_decl 检测到 children[0]
+// == N_TYPE_PARAMS 时调用 sstate.reg_generic。所有表在 semantic.check_impl /
+// check_ast 状态重置时清零。
+var gty_keys: table<i64>;      // 泛型模板全名 id（intern，升序）
+var gty_vals: table<i64>;      // 模板索引（与 gty_keys 并行，sorted_insert 同插）
+var gtyp_nparams: table<i64>;  // 模板索引 -> 类型参数个数
+var gtyp_off: table<i64>;      // 模板索引 -> 类型参数名段偏移（gtyp_names 扁平段）
+var gtyp_names: table<i64>;    // 类型参数名 id（intern，扁平段；取自 N_TYPE_PARAM.name）
+var gty_node: table<i64>;      // 模板索引 -> 定义 AST 节点 id（FnDef / Struct）
+var gty_is_struct: table<i64>; // 模板索引 -> 0=函数模板 1=struct 模板
+
+// 实例化记录表（gin_*，T3b 单态化展开器 2026-08-14）：
+// 同（模板名, 类型实参组合）只展开一次——mangled 名即去重键。
+// gin_keys/gin_vals：mangled 名 id（升序）→ 记录索引（sorted_insert 同插）。
+// gin_tmpl/gin_off/gin_nargs/gin_is_struct：记录索引 → 模板索引 / 类型实参
+// 段偏移（garg_vals 扁平段）/ 实参个数 / 0=函数 1=struct。
+// garg_vals：类型实参 id 扁平段（按模板类型参数顺序）。
+// 所有表在 semantic.check_impl / check_ast 状态重置时清零。
+var gin_keys: table<i64>;      // 实例化 mangled 名 id（升序）
+var gin_vals: table<i64>;      // 记录索引（与 gin_keys 并行）
+var gin_tmpl: table<i64>;      // 记录索引 -> 模板索引（gty_vals）
+var gin_off: table<i64>;       // 记录索引 -> 类型实参段偏移（garg_vals）
+var gin_nargs: table<i64>;     // 记录索引 -> 类型实参个数
+var gin_is_struct: table<i64>; // 记录索引 -> 0=函数 1=struct
+var garg_vals: table<i64>;     // 类型实参 id 扁平段
+// 实例化递归深度计数（防无限递归，上限 64）
+var g_inst_depth: i64 = 0;
+
 // 顶层 StmtList 根（parse_program 创建的最后节点 id）
 var g_root: i64 = 0;
 
@@ -155,6 +186,13 @@ const S_N_TUPLE_TYPE: i64 = 201;
 const S_N_STRUCT_TYPE: i64 = 202;
 const S_N_TABLE_TYPE: i64 = 203;
 const S_N_MAP_TYPE: i64 = 204;
+// 泛型语法节点（2026-08-14，与 ast.tie 同号权威）：N_TYPE_PARAMS（声明点
+// 类型参数列表）/ N_TYPE_PARAM（单个类型参数）/ N_TYPE_ARGS（使用点类型
+// 实参列表）。语义层在 FnDef/Struct/Call/MethodCall/StructType 的 children
+// 头部读取「泛型槽」时用这三个常量判定（配合 sstate.slot_off 统一偏移）。
+const S_N_TYPE_PARAMS: i64 = 125;
+const S_N_TYPE_PARAM: i64 = 126;
+const S_N_TYPE_ARGS: i64 = 127;
 namespace sstate {
 
 // ==================== 工具：协议解析 ====================
@@ -492,6 +530,28 @@ pub func name_str(id: i64) -> string {
     return intern.lookup(nid)
 }
 
+// 泛型槽偏移判定（2026-08-14 泛型语法布局，权威约定见 ast.tie 头部注释）：
+// 返回 1 表示 children 头部有「泛型槽/类型实参槽」——children[0] == -1 哨兵
+// （非泛型但槽仍占位）或 children[0] 是 N_TYPE_PARAMS / N_TYPE_ARGS 节点。
+// 消费方读取「返回类型 / 第 i 个参数 / 第 i 个字段 / 第 i 个实参 / 接收者」
+// 等位置时必须 +1 偏移。适用节点：FnDef / Struct（N_TYPE_PARAMS 槽）、
+// Call / MethodCall / StructType（N_TYPE_ARGS 槽）——T1 起这些节点恒有槽，
+// 故对它们恒返回 1。无子节点（nchild==0）或首子节点非槽 → 0。
+pub func slot_off(node: i64) -> i64 {
+    if s_nchild[node] <= 0 {
+        return 0
+    }
+    var c0 = s_children[s_coff[node]]
+    if c0 < 0 {
+        return 1  // -1 哨兵：泛型槽存在但为空
+    }
+    var t0 = s_tags[c0]
+    if t0 == S_N_TYPE_PARAMS || t0 == S_N_TYPE_ARGS {
+        return 1
+    }
+    return 0
+}
+
 // ==================== 可寻址与可见性辅助 ====================
 // P8 可寻址判定（对齐 Rust is_addressable_expr）：只有变量或字段访问链可寻址。
 pub func is_addressable(id: i64) -> bool {
@@ -728,6 +788,123 @@ pub func reg_struct(name: string, parent: string) -> i64 {
     sorted_insert(st_keys, st_vals, nid, idx)
     // struct 名登记由上层（stype）经 types.set_struct_name 完成
     return idx
+}
+
+// ==================== 泛型模板登记辅助（T3b 单态化展开器预置）====================
+
+// 泛型模板索引查询（全名 -> 模板索引；-1 = 未登记）。
+// 模板名与普通函数/struct 名分表存储：同一全名只可能在 gty_keys 或
+// fn_keys/st_keys 之一（collect 阶段分派，重复定义在各自登记处报错）。
+pub func gt_find(full_name: string) -> i64 {
+    var nid = intern.intern(full_name)
+    var idx = bs_find(gty_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return gty_vals[idx]
+}
+
+// 泛型模板登记：node 的 children[0] 必为 N_TYPE_PARAMS（调用方已判定）。
+// 提取类型参数名段（N_TYPE_PARAM 序列的 name 字段，扁平存入 gtyp_names）+
+// 登记定义节点 id / 类别。重复定义返回 -1（sm_err_* 已置）；成功返回模板
+// 索引。登记本身不检查模板体内 TypeVar 引用（T3b 单态化展开时处理）。
+pub func reg_generic(full_name: string, node: i64, is_struct: i64) -> i64 {
+    if gt_find(full_name) >= 0 {
+        sm_err_line = s_lines[node]
+        sm_err_col = s_cols[node]
+        sm_err_msg = "泛型模板 '" + full_name + "' 重复定义"
+        return -1
+    }
+    var tp = child(node, 0)  // N_TYPE_PARAMS 节点
+    var npar = s_nchild[tp]
+    var idx = len(gtyp_nparams)
+    var off = len(gtyp_names)
+    var i: i64 = 0
+    while i < npar {
+        var p = child(tp, i)  // N_TYPE_PARAM 节点（name = 类型参数名 id）
+        table_push(gtyp_names, s_names[p])
+        i = i + 1
+    }
+    table_push(gtyp_nparams, npar)
+    table_push(gtyp_off, off)
+    table_push(gty_node, node)
+    table_push(gty_is_struct, is_struct)
+    sorted_insert(gty_keys, gty_vals, intern.intern(full_name), idx)
+    return idx
+}
+
+// ==================== 实例化记录辅助（T3b 单态化展开器）====================
+
+// 实例化记录查询（mangled 名 -> 记录索引；-1 = 未实例化）。
+// 去重键 = mangled 名（含类型实参片段），同名即同组合。
+pub func gin_find(mangled: string) -> i64 {
+    var nid = intern.intern(mangled)
+    var idx = bs_find(gin_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return gin_vals[idx]
+}
+
+// 实例化记录登记：mangled 名 + 模板索引 + 类型实参表（按模板类型参数顺序）
+// + 类别。返回记录索引。调用方保证未重复（gin_find 已判定）。
+pub func gin_reg(mangled: string, gti: i64, args: table<i64>, is_struct: i64) -> i64 {
+    var rec = len(gin_tmpl)
+    var off = len(garg_vals)
+    var k: i64 = 0
+    while k < len(args) {
+        table_push(garg_vals, args[k])
+        k = k + 1
+    }
+    table_push(gin_tmpl, gti)
+    table_push(gin_off, off)
+    table_push(gin_nargs, len(args))
+    table_push(gin_is_struct, is_struct)
+    sorted_insert(gin_keys, gin_vals, intern.intern(mangled), rec)
+    return rec
+}
+
+// 第 rec 条记录的第 k 个类型实参 id（越界返回 -1）
+pub func gin_arg_at(rec: i64, k: i64) -> i64 {
+    if rec < 0 || rec >= len(gin_tmpl) {
+        return -1
+    }
+    var n = gin_nargs[rec]
+    if k < 0 || k >= n {
+        return -1
+    }
+    return garg_vals[gin_off[rec] + k]
+}
+
+// 第 rec 条记录的类型实参表副本（推断/匹配用）
+pub func gin_args(rec: i64) -> table<i64> {
+    var out: table<i64> = table_new_i64()
+    if rec < 0 || rec >= len(gin_tmpl) {
+        return out
+    }
+    var n = gin_nargs[rec]
+    var k: i64 = 0
+    while k < n {
+        table_push(out, garg_vals[gin_off[rec] + k])
+        k = k + 1
+    }
+    return out
+}
+
+// 模板类型参数名 id 表（按声明顺序；返回新表）
+pub func gt_param_names(gti: i64) -> table<i64> {
+    var out: table<i64> = table_new_i64()
+    if gti < 0 || gti >= len(gtyp_nparams) {
+        return out
+    }
+    var n = gtyp_nparams[gti]
+    var off = gtyp_off[gti]
+    var k: i64 = 0
+    while k < n {
+        table_push(out, gtyp_names[off + k])
+        k = k + 1
+    }
+    return out
 }
 
 // ==================== 命名空间栈 ====================

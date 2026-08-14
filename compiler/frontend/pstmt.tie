@@ -3,9 +3,12 @@ type tie<class>
 // ============================================================
 // 里程碑：自举 v2 计划 T2.5 完整 parser 再拆分（2026-08-11）：
 // 原 pstmt.tie 拆出「var/const 声明 + 元组解构 + 表达式赋值语句」部分。
-// 依赖：./pexpr_type.tie（类型解析，经其传递可达 pexpr 表达式链 + putil/ast）。
+// 依赖：./pexpr.tie（表达式优先级链，经其传递可达 pexpr_type 类型解析 +
+// putil/ast）。2026-08-14 import 由 pexpr_type 改为 pexpr（pexpr import
+// pexpr_type），保持本模块对 pexpr_type.parse_type 的传递可达，树仍无环：
+//   pstmt → pexpr → pexpr_type → putil
 // 树式无环：由 pstmt_flow.tie import。
-import "./pexpr_type.tie"
+import "./pexpr.tie"
 
 namespace pstmt {
 

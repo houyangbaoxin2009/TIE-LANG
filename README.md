@@ -9,6 +9,8 @@
 tie 是一门**通用编程语言**：用一门语言写逻辑、写界面、写数据库、当数据交换格式。
 同一个 `.tie` 文件扮演什么角色，由文件头（Header）声明——四段式架构（预处理 → 前端 → 中端 → 后端）。
 内置类型含 `trit`（平衡三进制三值逻辑，数论常用）与多进制字面量（`0x`/`0b`/`0o`/`0t`）。
+支持**用户泛型**（泛型函数 `func max<T>(a: T, b: T) -> T` + 泛型 struct
+`struct Box<T>`，编译期单态化 + 调用点类型推断，tiec 实现）。
 
 > 语法规范见 [docs/language.md](docs/language.md)；本文件是工程入口（用法、结构、流水线、路线图）。
 
@@ -23,7 +25,7 @@ tie 是一门**通用编程语言**：用一门语言写逻辑、写界面、写
 | [docs/tie-script.md](docs/tie-script.md) | tie:script 模块协议：tie 脚本的注册/调用机制、模块约定、协议文本格式、三层调用入口（Rust/CLI/tie 程序内） |
 | [docs/ai-guide.md](docs/ai-guide.md) | AI 教学指南：语言用法 + 负例 + 编译器架构（教 AI 用/开发 tie） |
 | [docs/prompt-pack.md](docs/prompt-pack.md) | 可粘贴 Prompt 包：自包含简介，直接发给任何 AI |
-| [docs/plans/](docs/plans/) | 后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法 / 动态库编译 / 包管理器 / 算法库分类 / 嵌入式基础层 rdu） |
+| [docs/plans/](docs/plans/) | 后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法 / 动态库编译 / 包管理器 / 算法库分类 / 嵌入式基础层 rdu / **泛型系统（已实现**）） |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更记录（按里程碑） |
 
 ## 快速开始
@@ -79,9 +81,10 @@ type tie<class>     # 类/库文件 → 编译静态库 .a
 type tie<logic>     # 逻辑代码（默认角色，可省略）
 type tie<port>      # 端口/对外接口文件
 type tie<db>        # 数据库文件
+type tie<ir>        # IR 文件（直接生成 LLVM IR .ll）
 ```
 
-- **子类型**：`script` / `data` / `ui` / `class` / `logic` / `port` / `db`；
+- **子类型**：`script` / `data` / `ui` / `class` / `logic` / `port` / `db` / `ir`；
   `type` 角色本身由**裸 `type tie`**（无尖括号）表达，`type tie<type>` 是格式错误；
 - **默认角色**：无声明时默认 `logic`（可执行文件，需 `func main()`）；
 - **文件名约定**：`xxx.<角色>.tie`（如 `app.script.tie`、`schema.db.tie`）可作为默认角色
@@ -92,6 +95,7 @@ type tie<db>        # 数据库文件
 | --- | --- |
 | `logic` / `script` | 编译为可执行文件 |
 | `class` / `type` | 编译为静态库 `.a` |
+| `ir` | 生成 LLVM IR（.ll），不继续编译 |
 | `data` / `ui` / `db` / `port` | 对应工具链，挂接点未实现（提示） |
 
 ## 单文件命名空间
@@ -153,7 +157,8 @@ tie-llvm 编译链接 interp 库生成），完整 CLI 逻辑全部在 tie 侧�
 构建 `pkg.exe`：`cargo build --release -p tie-interp && compiler/tiec.exe pkg/main.tie -o pkg/pkg.exe`（自举升格：tiec 编译，不再经 Rust 种子）。
 
 流程：`tie-prep` 预处理（清理代码 + 识别文件类型）→ 按角色自动转交工具链
-（`logic`/`script` → 编译为可执行文件；`class`/`type` → 编译为静态库 `.a`；`data`/`ui`/`db`/`port` → 对应工具链，挂接点未实现）。
+（`logic`/`script` → 编译为可执行文件；`class`/`type` → 编译为静态库 `.a`；`ir` → 直接生成 LLVM IR（.ll）；
+`data`/`ui`/`db`/`port` → 对应工具链，挂接点未实现）。
 
 **多文件并行编译（Harbor M3 协调统筹增强）**：配置文件（`type tie<data>` 格式，键 `advanced` /
 `cache`）开启 `advanced.enabled = true` 后，可一次编译多个输入文件（目录输入自动展开
@@ -212,7 +217,7 @@ LLVM 工具定位同「快速开始」的发现顺序；发行版自带 `bin/llv
 ```text
 tie/
 ├── crates/
-│   ├── tie-prep/      预处理：清理代码、提取头、识别文件角色（type/script/data/ui/class/logic/port/db）
+│   ├── tie-prep/      预处理：清理代码、提取头、识别文件角色（type/script/data/ui/class/logic/port/db/ir）
 │   │                  Harbor M3 自举：核心逻辑由 tie 语言自写（prep/core.tie），Rust 壳解释执行
 │   ├── tie-frontend/  前端：词法（含 ASI）→ 语法 → 语义（符号表/类型检查）+ import 展开（imports 模块，tie-llvm/tie-lsp 共享），自研；独立 CLI 可调试
 │   ├── tie-llvm/      中端+后端驱动：AST → LLVM IR 文本生成；调用 opt/clang/lld

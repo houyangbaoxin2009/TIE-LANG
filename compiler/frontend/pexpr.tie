@@ -4,9 +4,11 @@ type tie<class>
 // 里程碑：自举 v2 计划 T2.5（.omo/plans/self-hosting-v2.md）完整 parser
 // 拆分为 4 模块之一（本文件 = 表达式优先级链 + 一元/主表达式 + 元组/表
 // 字面量 + 类型解析）。对应 proto/parser.tie 1726-2636 行逻辑搬移。
-// 依赖：./putil.tie（token 流/工具，经其传递可达 pst 状态 + ast 节点池 +
-// errors/interner/string）。树式无环，由 pstmt.tie import。
-import "./putil.tie"
+// 依赖：./pexpr_type.tie（类型解析，经其传递可达 putil token 流 + pst 状态 +
+// ast 节点池 + errors/interner/string）。2026-08-14 泛型语法：调用点类型实参
+// 解析（parse_type_args）由 pexpr_type 提供，故本模块 import pexpr_type。
+// 树式无环：由 pstmt.tie import。
+import "./pexpr_type.tie"
 
 namespace pexpr {
 
@@ -420,14 +422,27 @@ pub func parse_unary() -> i64 {
                 putil.set_err(putil.peek_line(), putil.peek_col(), "字段访问 '.' 后必须是字段名/方法名/数字下标，实际是 " + putil.describe(putil.peek_tag()))
                 return -1
             }
+            var type_args: i64 = -1
+            if putil.peek_tag() == lex_lt {
+                // 泛型方法调用探测：`obj.method<i64>(args)`。'<' 后是「完整
+                // 类型实参列表 + '>' + '('」才按泛型处理，否则 '<' 留给后续
+                // 比较运算符（is_generic_call_ahead 内部 save/restore 不消费）。
+                if putil.is_generic_call_ahead() {
+                    type_args = pexpr_type.parse_type_args()
+                    if type_args < 0 {
+                        return -1
+                    }
+                }
+            }
             if putil.eat(lex_lparen) {
-                // 方法调用：obj.m(args)
+                // 方法调用：obj.m(args) / obj.m<i64>(args)
                 var args: table<i64> = table_new_i64()
                 if !parse_args_after_lparen(args) {
                     return -1
                 }
                 var mc = ast.new_node(N_METHOD_CALL, field, -1, -1, ast.line(expr), ast.col(expr))
                 var mkids: table<i64> = table_new_i64()
+                table_push(mkids, type_args)
                 table_push(mkids, expr)
                 var k: i64 = 0
                 while k < len(args) {
@@ -531,6 +546,38 @@ func parse_primary() -> i64 {
                 }
                 table_push(segs, s)
             }
+            // 路径尾段后跟调用：`ns::max(...)` / `ns::max<i64>(...)`
+            // （2026-08-14 泛型语法）。段收集完毕，最后一段即函数名；产出
+            // N_CALL（name=最后段，children=[类型实参槽, 实参...]）。若后跟
+            // '.' 等则维持 N_PATH 原样（由 parse_unary 后缀链继续处理）。
+            var last = segs[len(segs) - 1]
+            var targs = -1
+            if putil.peek_tag() == lex_lt {
+                // 泛型调用探测：`ns::max<i64>(...)`。非泛型 '<'（比较）不消费。
+                if putil.is_generic_call_ahead() {
+                    targs = pexpr_type.parse_type_args()
+                    if targs < 0 {
+                        return -1
+                    }
+                }
+            }
+            if putil.peek_tag() == lex_lparen {
+                putil.advance()
+                var args: table<i64> = table_new_i64()
+                if !parse_args_after_lparen(args) {
+                    return -1
+                }
+                var call = ast.new_node(N_CALL, last, -1, -1, line, col)
+                var ckids: table<i64> = table_new_i64()
+                table_push(ckids, targs)
+                var k: i64 = 0
+                while k < len(args) {
+                    table_push(ckids, args[k])
+                    k = k + 1
+                }
+                ast.set_children(call, ckids)
+                return call
+            }
             var path = ast.new_node(N_PATH, -1, -1, -1, line, col)
             var pkids: table<i64> = table_new_i64()
             var i: i64 = 0
@@ -541,6 +588,18 @@ func parse_primary() -> i64 {
             ast.set_children(path, pkids)
             return path
         }
+        // 泛型调用/构造探测：`max<i64>(3, 5)` / `Box<i64>(42)`（2026-08-14）。
+        // '<' 后是「完整类型实参列表 + '>' + '('」才按泛型处理，否则 '<' 是
+        // 普通比较运算符（is_generic_call_ahead 内部 save/restore，不消费 token）。
+        var targs = -1
+        if putil.peek_tag() == lex_lt {
+            if putil.is_generic_call_ahead() {
+                targs = pexpr_type.parse_type_args()
+                if targs < 0 {
+                    return -1
+                }
+            }
+        }
         // 函数调用
         if putil.eat(lex_lparen) {
             var args: table<i64> = table_new_i64()
@@ -548,7 +607,14 @@ func parse_primary() -> i64 {
                 return -1
             }
             var call = ast.new_node(N_CALL, name, -1, -1, line, col)
-            ast.set_children(call, args)
+            var ckids: table<i64> = table_new_i64()
+            table_push(ckids, targs)
+            var k: i64 = 0
+            while k < len(args) {
+                table_push(ckids, args[k])
+                k = k + 1
+            }
+            ast.set_children(call, ckids)
             return call
         }
         return ast.new_node(N_VAR, name, -1, -1, line, col)

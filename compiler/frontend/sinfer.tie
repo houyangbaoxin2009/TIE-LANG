@@ -9,6 +9,7 @@ type tie<class>
 // 依赖：./sstate.tie（AST 全局 + 符号表 + 工具）+ ./stype.tie（类型匹配）+
 // ./sbuiltin.tie（内置函数签名）。树式无环：由 scollect.tie import。
 import "./sbuiltin.tie"
+import "./sgen.tie"
 
 namespace sinfer {
 
@@ -203,9 +204,14 @@ pub func arg_table_elem_ty(a: i64) -> i64 {
 // ==================== 裸调用名解析（M2.1.7） ====================
 // 候选 1：顶层裸名；候选 2：当前命名空间前缀补全（逐级外层）；
 // 候选 3：using 引入的命名空间。返回实际注册键（全名）。
+// T3b 泛型扩展：候选命中判定同时覆盖普通函数（fn_sig）与泛型模板（gt_find）
+// ——模板不进入 fn_keys，裸调用名解析须能定位到 gt_* 表。
 pub func resolve_call_name(name: string) -> string {
     var nid = intern.intern(name)
     if sstate.fn_sig(name) >= 0 {
+        return name
+    }
+    if sstate.gt_find(name) >= 0 {
         return name
     }
     // 候选 2：当前命名空间逐级外层补全
@@ -227,7 +233,7 @@ pub func resolve_call_name(name: string) -> string {
             } else {
                 cand = name
             }
-            if sstate.fn_sig(cand) >= 0 {
+            if sstate.fn_sig(cand) >= 0 || sstate.gt_find(cand) >= 0 {
                 return cand
             }
             depth = depth - 1
@@ -248,7 +254,7 @@ pub func resolve_call_name(name: string) -> string {
             i = i + 1
         }
         var cand = full + "::" + name
-        if sstate.fn_sig(cand) >= 0 {
+        if sstate.fn_sig(cand) >= 0 || sstate.gt_find(cand) >= 0 {
             return cand
         }
         off = off + ln
@@ -807,12 +813,14 @@ pub func infer_expr(id: i64) -> i64 {
 // 函数调用推断
 pub func infer_call(id: i64) -> i64 {
     var fnm = sstate.name_str(id)
-    // 实参收集
+    // 实参收集：Call children = [泛型槽(-1或N_TYPE_ARGS), 实参...]，
+    // 实参从 children[slot_off] 起（slot_off 恒 1，统一走辅助保证一致）
     var args: table<i64> = table_new_i64()
-    var nc = sstate.nchild(id)
+    var off = sstate.slot_off(id)
+    var nc = sstate.nchild(id) - off
     var i: i64 = 0
     while i < nc {
-        table_push(args, sstate.child(id, i))
+        table_push(args, sstate.child(id, off + i))
         i = i + 1
     }
     // 内置函数：先校验个数（-2=参数错误已报），通过后逐个推断实参
@@ -934,8 +942,17 @@ pub func infer_call(id: i64) -> i64 {
         g_typed = g_typed + 1
         return types.struct_of(si)
     }
-    // 用户函数（裸调用解析：顶层 / 当前命名空间补全 / using 前缀补全）
+    // T3b 泛型（2026-08-14）：普通函数/struct 未命中但 gt_* 模板表命中 →
+    // 泛型调用路径（构造或函数，调用点推断 + 单态化展开）
     var full_name = resolve_call_name(fnm)
+    var gti = sstate.gt_find(full_name)
+    if gti >= 0 && gty_is_struct[gti] == 1 {
+        return infer_generic_struct_construct(full_name, gti, id, args)
+    }
+    if gti >= 0 && gty_is_struct[gti] == 0 {
+        return infer_generic_fn_call(full_name, gti, id, args)
+    }
+    // 用户函数（裸调用解析：顶层 / 当前命名空间补全 / using 前缀补全）
     var sig = sstate.fn_sig(full_name)
     if sig < 0 {
         sm_err_line = s_lines[id]
@@ -1023,13 +1040,190 @@ pub func infer_call(id: i64) -> i64 {
     return rt
 }
 
+// ==================== 泛型调用路径（T3b 单态化 + 调用点推断）====================
+// 实参表类型细化：`table_new_*()` 变量/返回的类型是裸 table（元素类型在
+// var_table_elem / table_ret_elem），泛型推断需带元素类型（table<T> 匹配）。
+// 例如 Box<table<i64>>(t)：t 的裸 table 若直接绑定 T 会与显式 table<i64> 冲突。
+func refine_arg_ty(a: i64, t: i64) -> i64 {
+    if t == TK_TABLE || t == TK_MAP {
+        var te: i64 = -1
+        if s_tags[a] == S_N_VAR {
+            te = var_table_elem(intern.intern(sstate.name_str(a)))
+        }
+        if te >= 0 {
+            if t == TK_MAP {
+                return types.map_of(te)
+            }
+            return types.table_of(te)
+        }
+    }
+    return t
+}
+
+// 显式类型实参解析（调用点 N_TYPE_ARGS → 类型实参表；-1 槽 = 无显式实参）。
+// 返回实参表；解析失败返回空表且 sm_err_* 已置（调用方据 sm_err_msg 判定）。
+func parse_explicit_args(id: i64) -> table<i64> {
+    var out: table<i64> = table_new_i64()
+    var off = sstate.slot_off(id)
+    if off == 1 && sstate.nchild(id) > 0 {
+        var slot = sstate.child(id, 0)
+        if slot >= 0 && s_tags[slot] == S_N_TYPE_ARGS {
+            out = sgen.parse_type_args_ast(slot)
+            // 无显式实参 → 空表；解析失败也是空表（sm_err_* 区分）
+        }
+    }
+    return out
+}
+
+// 泛型函数调用：`max(3, 5)`（推断）/ `max<i64>(9, 4)`（显式）/ `pick(5, "hi")`。
+// 流程：显式实参解析 → 实参类型表 → 模板形参 AST 模式匹配绑定 TypeVar →
+// 构造 mangled 名 → 单态化展开（instantiate_fn）→ 重写调用名 → 实例化签名
+// 的常规参数检查 → 返回实例化返回类型。
+pub func infer_generic_fn_call(full_name: string, gti: i64, id: i64, args: table<i64>) -> i64 {
+    var nc = len(args)
+    var explicit = parse_explicit_args(id)
+    if len(explicit) == 0 && str_len(sm_err_msg) > 0 {
+        return -1  // 显式类型实参解析失败（sm_err_* 已置）
+    }
+    // 实参类型表（infer_expr 已知类型）
+    var arg_tys: table<i64> = table_new_i64()
+    var k: i64 = 0
+    while k < nc {
+        var at = infer_expr(args[k])
+        if at < 0 {
+            return -1
+        }
+        at = refine_arg_ty(args[k], at)
+        table_push(arg_tys, at)
+        k = k + 1
+    }
+    // 推断类型实参（AST 模式匹配绑定 TypeVar）
+    var tmpl_node = gty_node[gti]
+    var args_t = sgen.infer_type_args(tmpl_node, gti, explicit, 0, arg_tys, id)
+    if len(args_t) == 0 {
+        return -1  // 推断失败/冲突已报错
+    }
+    // 单态化展开
+    var mangled = sgen.mangle(full_name, args_t)
+    var sig = sgen.instantiate_fn(gti, args_t, s_lines[id], s_cols[id])
+    if sig < 0 {
+        return -1
+    }
+    // 重写调用名 → mangled（irgen 按名生成；检查循环去重后走普通路径）
+    s_names[id] = intern.intern(mangled)
+    // 可见性校验
+    var vr = sstate.check_visibility(mangled, sig, id)
+    if vr < 0 {
+        return -1
+    }
+    // 参数个数（实例化签名）
+    var req = sg_required[sig]
+    var total = sg_nparams[sig]
+    if nc < req || nc > total {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "函数 '" + full_name + "' 期望 " + to_string(req) + " 个参数，实际 " + to_string(nc) + " 个"
+        return -1
+    }
+    // 参数类型检查（实例化形参已具体化 → 现有类型系统自然验证）
+    var off = sg_off[sig]
+    var j2: i64 = 0
+    while j2 < nc {
+        var want = sp_tys[off + j2]
+        var at = arg_tys[j2]
+        if !stype.types_compatible(want, at) && !stype.types_match(want, at, args[j2]) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "调用 '" + full_name + "' 参数类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(at)
+            return -1
+        }
+        // ref 参数实参校验（对齐普通路径）
+        if sp_refs[off + j2] == 1 {
+            if !sstate.is_addressable(args[j2]) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "调用 '" + full_name + "' 的 ref 参数需要可寻址的变量实参（不能是字面量/下标/调用结果等不可取地址）"
+                return -1
+            }
+        }
+        j2 = j2 + 1
+    }
+    var rt = sg_ret[sig]
+    node_types[id] = rt
+    g_typed = g_typed + 1
+    return rt
+}
+
+// 泛型 struct 构造：`Box<i64>(42)`（显式）/ `Box(3.14)`（推断）。
+// 流程：显式实参解析 → 实参类型表 → 模板字段类型 AST 匹配绑定 TypeVar →
+// 展开 struct（instantiate_struct，字段拍平）→ 重写调用名 → 实例化字段类型
+// 校验 → 返回实例化 struct 类型 id。
+pub func infer_generic_struct_construct(full_name: string, gti: i64, id: i64, args: table<i64>) -> i64 {
+    var nc = len(args)
+    var explicit = parse_explicit_args(id)
+    if len(explicit) == 0 && str_len(sm_err_msg) > 0 {
+        return -1  // 显式类型实参解析失败
+    }
+    var arg_tys: table<i64> = table_new_i64()
+    var k: i64 = 0
+    while k < nc {
+        var at = infer_expr(args[k])
+        if at < 0 {
+            return -1
+        }
+        at = refine_arg_ty(args[k], at)
+        table_push(arg_tys, at)
+        k = k + 1
+    }
+    var tmpl_node = gty_node[gti]
+    var nfld = sstate.nchild(tmpl_node) - 1
+    if nc > nfld {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "构造 '" + full_name + "' 最多 " + to_string(nfld) + " 个参数（字段数），实际 " + to_string(nc) + " 个"
+        return -1
+    }
+    // 推断类型实参（字段类型与实参匹配）
+    var args_t = sgen.infer_type_args_fields(tmpl_node, gti, explicit, arg_tys, id)
+    if len(args_t) == 0 {
+        return -1  // 推断失败/冲突已报错
+    }
+    // 展开 struct（reg_struct + 字段拍平 + gin 记录）
+    var si = sgen.instantiate_struct(gti, args_t)
+    if si < 0 {
+        return -1
+    }
+    var mangled = sgen.mangle(full_name, args_t)
+    // 重写调用名 → mangled（irgen 构造路径按 st_keys 命中）
+    s_names[id] = intern.intern(mangled)
+    // 实例化字段类型校验（非 TypeVar 字段的实参匹配也在此暴露）
+    var off = cls_fldoff[si]
+    var j: i64 = 0
+    while j < nc {
+        if !stype.types_match(fld_tys[off + j], arg_tys[j], args[j]) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "构造 '" + mangled + "' 参数类型不匹配：字段 '" + intern.lookup(fld_names[off + j]) + "' 期望 " + types.type_name(fld_tys[off + j]) + "，实际 " + types.type_name(arg_tys[j])
+            return -1
+        }
+        j = j + 1
+    }
+    var rt = types.struct_of(si)
+    node_types[id] = rt
+    g_typed = g_typed + 1
+    return rt
+}
+
 // 方法调用推断（命名空间函数 / struct 方法转发）
 pub func infer_method_call(id: i64) -> i64 {
-    var recv = sstate.child(id, 0)
+    // MethodCall 接收者 = children[slot_off]（新布局 children[0]=泛型槽→偏移 1；
+    // 旧布局无槽→children[0]=接收者。slot_off 统一判定保证自举双兼容）
+    var recv = sstate.child(id, sstate.slot_off(id))
     var mname = sstate.name_str(id)
     var args: table<i64> = table_new_i64()
     var nc = sstate.nchild(id)
-    var i: i64 = 1
+    var off = sstate.slot_off(id)  // 泛型槽偏移（新布局恒 1，旧布局 0）
+    var i: i64 = off + 1
     while i < nc {
         table_push(args, sstate.child(id, i))
         i = i + 1
@@ -1166,6 +1360,23 @@ pub func infer_struct_method(recv: i64, recv_ty: i64, mname: string, args: table
     var full = sname + "::" + mname
     var sig = sstate.fn_sig(full)
     if sig < 0 {
+        // T3b 泛型方法（2026-08-14）：接收者是实例化 struct（如 Box$i64）→
+        // 目标函数 = 模板方法（Box::get）→ 从接收者类型提取类型实参 → 展开
+        var rec = sstate.gin_find(sname)
+        if rec >= 0 && gin_is_struct[rec] == 1 {
+            var tmpl_full = intern.lookup(gty_keys[gin_tmpl[rec]])  // "Box"
+            var tmpl_method = tmpl_full + "::" + mname              // "Box::get"
+            var m_gti = sstate.gt_find(tmpl_method)
+            if m_gti >= 0 && gty_is_struct[m_gti] == 0 {
+                var gr = infer_generic_method(rec, m_gti, tmpl_method, recv, recv_ty, args, id)
+                if gr >= 0 {
+                    return gr
+                }
+                if str_len(sm_err_msg) > 0 {
+                    return -1  // 泛型方法推断/展开失败（已报错）
+                }
+            }
+        }
         sm_err_line = s_lines[id]
         sm_err_col = s_cols[id]
         sm_err_msg = "struct '" + sname + "'（含继承链）没有方法 '" + mname + "'"
@@ -1212,6 +1423,87 @@ pub func infer_struct_method(recv: i64, recv_ty: i64, mname: string, args: table
         j = j + 1
     }
     var rt = sg_ret[sig]
+    node_types[id] = rt
+    g_typed = g_typed + 1
+    return rt
+}
+
+// ==================== 泛型方法调用（T3b） ====================
+// 接收者 = 实例化 struct（rec 为其 gin 记录），目标 = 模板方法（tmpl_method
+// 如 "Box::get"）。类型实参：首参（接收者，Box<T> ↔ recv_ty）匹配 + 其余实参
+// 推断；然后展开方法模板（mangled = Box$i64::get，与 irgen 方法分派一致）。
+// 返回实例化返回类型；失败 -1（推断/展开失败已报错；未报错 = 不适用）。
+func infer_generic_method(rec: i64, m_gti: i64, tmpl_method: string, recv: i64, recv_ty: i64, args: table<i64>, id: i64) -> i64 {
+    // 显式类型实参（MethodCall 的 N_TYPE_ARGS，`b.get<i64>(...)`）
+    var explicit = parse_explicit_args(id)
+    if len(explicit) == 0 && str_len(sm_err_msg) > 0 {
+        return -1
+    }
+    // 实参类型表：接收者为首参（类型 = 实例化 struct）
+    var m_args_t: table<i64> = table_new_i64()
+    table_push(m_args_t, recv_ty)
+    var k: i64 = 0
+    while k < len(args) {
+        var at = infer_expr(args[k])
+        if at < 0 {
+            return -1
+        }
+        table_push(m_args_t, at)
+        k = k + 1
+    }
+    // 推断类型实参（首参 Box<T> ↔ recv_ty 绑定 T，其余实参补全）
+    var tmpl_node = gty_node[m_gti]
+    var args_t = sgen.infer_type_args(tmpl_node, m_gti, explicit, 0, m_args_t, id)
+    if len(args_t) == 0 {
+        return -1  // 推断失败/冲突已报错
+    }
+    // 展开方法模板（mangled = Box$i64::get，与 irgen gen_method_call 分派名一致）
+    var mangled = sgen.mangle(tmpl_method, args_t)
+    var sig2 = sgen.instantiate_fn(m_gti, args_t, s_lines[id], s_cols[id])
+    if sig2 < 0 {
+        return -1
+    }
+    // 可见性校验
+    var vr = sstate.check_visibility(mangled, sig2, id)
+    if vr < 0 {
+        return -1
+    }
+    // 参数个数（含接收者对象）
+    var req_m = sg_required[sig2]
+    var total = sg_nparams[sig2]
+    var n_args = len(args) + 1
+    if n_args < req_m || n_args > total {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "方法 '" + tmpl_method + "' 期望 " + to_string(req_m) + "-" + to_string(total) + " 个参数（含接收者对象），实际 " + to_string(n_args) + " 个"
+        return -1
+    }
+    // 接收者类型匹配（首参 = 实例化 struct，与实例化形参一致）
+    var off = sg_off[sig2]
+    var want = sp_tys[off]
+    if !stype.types_compatible(want, recv_ty) {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "方法 '" + tmpl_method + "' 首参类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(recv_ty)
+        return -1
+    }
+    // 其余实参类型检查（实例化形参已具体化）
+    var j: i64 = 0
+    while j < len(args) {
+        var at = infer_expr(args[j])
+        if at < 0 {
+            return -1
+        }
+        var want2 = sp_tys[off + 1 + j]
+        if !stype.types_compatible(want2, at) && !stype.types_match(want2, at, args[j]) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "方法 '" + tmpl_method + "' 参数类型不匹配：期望 " + types.type_name(want2) + "，实际 " + types.type_name(at)
+            return -1
+        }
+        j = j + 1
+    }
+    var rt = sg_ret[sig2]
     node_types[id] = rt
     g_typed = g_typed + 1
     return rt

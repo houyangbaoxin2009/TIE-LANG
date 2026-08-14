@@ -1,0 +1,9 @@
+type tie<ir>
+
+// 端到端验证语料：ir 角色（type tie<ir>）——检测到即直接生成 LLVM IR
+// （.ll 文件），不继续 opt/clang 链接（等价 `--emit-ir`，但由角色触发）。
+// 文件名 filetype_ir.ir.tie 的角色段（ir）与头部声明一致，无警告。
+// 预期产物：tests/language/filetype_ir.ir.ll，内容含 define @"main"。
+func main() {
+    println("ir")
+}

@@ -27,19 +27,19 @@ type tie<class>
 // # 节点字段布局规范（children 列表按序，-1 = 无；权威见 parser.tie 头）
 //   表达式：IntLit[val=值] / FloatLit[name=lexeme] / StrLit[name=lexeme]
 //     CharLit[name=lexeme] / BoolLit[val=0/1] / TritLit[val=-1/0/1]
-//     Var[name] / Call[name=函数名, children=实参...]
+//     Var[name] / Call[name=函数名, children=[类型实参槽, 实参...]]
 //     Unary[val=一元 op 码, children=[操作数]]
 //     Binary[val=二元 op 码, children=[左, 右]]
 //     Ternary[children=[条件, 真支, 假支]] / Range[children=[起点, 终点]]
 //     TableLit[children=TableCell...] / Index[children=[基址, 下标]]
 //     TupleLit[children=TupleField...]
 //     FieldAccess[name=字段名, children=[基址]] / Path[children=Segment...]
-//     TypeLit[children=[类型节点]] / MethodCall[name=方法名, children=[接收者, 实参...]]
+//     TypeLit[children=[类型节点]] / MethodCall[name=方法名, children=[类型实参槽, 接收者, 实参...]]
 //     TableCell[val=行号, children=[TableId 或 -1, 值]]
 //     TableId[name=字符串键池 id(-1=数字键), val=数字键值]
 //     TupleField[name=字段名(-1=匿名), children=[值]] / Segment[name=段名池 id]
 //   语句：VarDecl[name, val=is_const, children=[类型或 -1, 初值]]
-//     FnDef[name=函数名, val=is_pub, aux=nparams, children=[返回类型]+参数...+[函数体]]
+//     FnDef[name=函数名, val=is_pub, aux=nparams, children=[泛型槽, 返回类型]+参数...+[函数体]]
 //     ExprStmt[children=[表达式]] / Assign[name=目标名, val=op 码(-1=普通), children=[值]]
 //     Return[children=[表达式或 -1]] / If[children=[条件, then, else]]
 //     While[name=循环标签(-1=无), children=[条件, 体]]
@@ -48,7 +48,7 @@ type tie<class>
 //     Switch[aux=ncases, children=[主体]+cases...+[default]]
 //     Import[name=路径池 id, aux=别名(-1=无)] / Using[aux=nsegs, children=Segment...]
 //     Namespace[aux=nsegs, children=Segment...+[体]]
-//     Struct[name, aux=父名(-1=无), children=ClassField...]
+//     Struct[name, aux=父名(-1=无), children=[泛型槽, ClassField...]]
 //     FieldAssign[name=字段名, val=op 码, children=[基址, 值]]
 //     IndexAssign[val=op 码, children=[目标, 值]]
 //     Extern[name, aux=nparams, children=[返回类型]+参数...]
@@ -57,6 +57,23 @@ type tie<class>
 //     PatternList[children=模式...] / StmtList[children=语句...]
 //     ClassField[name, children=[类型或 -1, 默认值或 -1]]
 //     TupleTypeField[name=字段名(-1=匿名), children=[类型]]
+//
+// # 泛型槽布局约定（2026-08-14，泛型语法 parser 层）
+//   泛型语法（`func max<T>(...)` / `struct Box<T>` / `max<i64>(...)` / `Box<i64>`）
+//   在以下节点 children 头部插入「泛型槽」/「类型实参槽」，**-1 哨兵 = 非泛型**
+//   （硬性约定：所有下游——语义/irgen——按 children[0] 判断 tag 是否
+//   N_TYPE_PARAMS/N_TYPE_ARGS 来偏移，见各消费方适配任务）：
+//     FnDef    : children = [type_params(-1或N_TYPE_PARAMS), 返回类型, 参数..., 函数体]
+//     Struct   : children = [type_params(-1或N_TYPE_PARAMS), ClassField...]
+//     Call     : children = [type_args(-1或N_TYPE_ARGS), 实参...]
+//     MethodCall: children = [type_args(-1或N_TYPE_ARGS), 接收者, 实参...]
+//     StructType: children = [type_args(-1或N_TYPE_ARGS)]  —— `Box<i64>` 类型引用
+//   N_TYPE_PARAMS（声明处类型参数列表）children = N_TYPE_PARAM 节点序列，
+//   N_TYPE_PARAM 的 name 字段 = 类型参数名（如 "T"，存 interner 池 id）。
+//   N_TYPE_ARGS（使用处类型实参列表）children = 现有 parse_type 产出的类型节点
+//   序列（N_NAMED_TYPE / N_TABLE_TYPE / N_MAP_TYPE / N_STRUCT_TYPE / N_TUPLE_TYPE）。
+//   注意：内建泛型 table<T> / map<T> 的 N_TABLE_TYPE/N_MAP_TYPE 布局不变，
+//   它们不占泛型槽（children 直接是元素/值类型节点）。
 //
 // # 设计修订（实测语言边界，2026-08-10，parser 同款）
 //   子节点不用嵌套表，改用**全局扁平表 + 段偏移**：节点创建即确定
@@ -113,13 +130,18 @@ const N_FIELD_ASSIGN: i64 = 115;
 const N_INDEX_ASSIGN: i64 = 116;
 const N_EXTERN: i64 = 117;
 const N_PARAM: i64 = 118;
-// 语句辅助段（120-124；125 Label 预留未用）
+// 语句辅助段（120-124；125-127 泛型语法节点，2026-08-14 占用原 Label 预留）
 const N_SWITCH_CASE: i64 = 120;
 const N_PATTERN_LIST: i64 = 121;
 const N_STMTLIST: i64 = 122;
 const N_CLASS_FIELD: i64 = 123;
 const N_TUPLE_TYPE_FIELD: i64 = 124;
+const N_TYPE_PARAMS: i64 = 125;  // 泛型声明类型参数列表（children = N_TYPE_PARAM 序列）
+const N_TYPE_PARAM: i64 = 126;   // 单个类型参数（name 字段 = 类型参数名，如 "T"）
+const N_TYPE_ARGS: i64 = 127;    // 类型实参列表（children = parse_type 产出的类型节点序列）
 // 类型段（val=TyKw 索引，name=类型关键字文本池 id）
+//   StructType[name=结构名, children=[类型实参槽]]——`Box<i64>` 引用含 N_TYPE_ARGS
+//   子节点；`Box` 裸引用 children[0] = -1（兼容现有）。
 const N_NAMED_TYPE: i64 = 200;
 const N_TUPLE_TYPE: i64 = 201;
 const N_STRUCT_TYPE: i64 = 202;

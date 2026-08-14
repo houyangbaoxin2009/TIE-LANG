@@ -1,3 +1,44 @@
+## [泛型系统] 泛型函数 + 泛型 struct——编译期单态化全链路落地（tiec 实现） — 2026-08-14
+
+tie 语言引入用户可定义泛型（此前仅内建 `table<T>`/`map<T>` 预置类型参数），
+按「能用 tie 就用 tie」原则**全部在 tie 自写编译器 compiler/（tiec）实现**，
+Rust 链不做泛型（仅作行为对照基线）。
+
+- **语法**：泛型函数 `func max<T>(a: T, b: T) -> T`、泛型 struct
+  `struct Box<T> { var value: T }`、多类型参数 `pick<A, B>`、嵌套
+  `Box<table<i64>>`、显式类型实参 `max<i64>(9, 4)`、构造推断 `Box(3.14)`、
+  泛型方法 `Box::get<T>(b: Box<T>) -> T`（接收者推断）；
+- **实例化机制**：编译期单态化——模板按类型实参组合展开为独立代码，零运行时
+  开销；去重缓存（同组合只展开一次）；递归实例化深度上限 64（超限报
+  「实例化深度超限」）；mangling `全名$类型片段`（`max$i64`、`Box$table_i64`）；
+- **类型推断**：调用点逐实参匹配（同一类型参数多处推断必须一致，冲突报
+  「类型参数 T 推断冲突」）；显式实参优先；无信息实参报「无法推断类型参数 T」；
+  实例化后类型错误在实例化点报告（模板体操作经替换后走现有类型检查）；
+- **实现分层**（compiler/）：parser 泛型语法（AST 泛型槽布局 + N_TYPE_PARAMS/
+  N_TYPE_ARGS 节点 + `<` 前瞻歧义处理，parse_test 7 用例）→ TypeVar 类型编码
+  （5<<40|intern(name)，types.var_of/is_typevar）→ 语义/irgen 泛型槽适配 +
+  模板表（slot_off/reg_generic/gt_*）→ 单态化展开器 sgen.tie + 调用点推断 +
+  mangling；
+- **验收**：`tests/language/generics.tie` 9 正例输出全对（5/3.5/y/42/7/9/99/3.14/5）、
+  `tests/language/generics_neg.tie` 5 负例（推断冲突/无法推断/实例化后类型错误/
+  深度超限）、行为等价回归 93.5% PASS（≥90% 达标）、自举闭环
+  tiec→tiec2→tiec3 全绿、semantic_test/parse_test 回归通过。
+
+## [文件类型 ir] 新增 IR 角色 `type tie<ir>`——检测到即直接生成 LLVM IR（.ll），不继续 opt/clang 链接 — 2026-08-14
+
+- **新子类型 `ir`**（第 9 种）：`type tie<ir>` 声明 / `xxx.ir.tie` 文件名默认；
+  语义 = 等价 `--emit-ir`，但由角色触发而非 CLI 选项——直接产出 `.ll` 后停止编译链；
+- **prep/core.tie（tie 语言自写权威）**：`is_valid_subtype` 接受 `ir`；
+  头部注释（子类型列表 / 协议角色列表 / "8 个子类型"）与声明错误消息同步含 `ir`；
+- **tie-prep（Rust 壳）**：`FileRole` 新增 `Ir` 变体（Db 之后）+ as_str/from_str 映射 +
+  文件名推断（`code.ir.tie` → Ir）+ 声明解析/文件名/双向映射测试补齐；
+- **tie-llvm driver**：`Dispatch` 新增 `EmitIr`——dispatch 识别 ir 角色后构造
+  `emit_ir_only=true` 的选项副本走 compile_program，写 `.ll` 后返回
+  `已生成 LLVM IR: <path>`（main 入口检查已被 `!emit_ir_only` 守卫，ir 不需 main）；
+- **tie CLI**：`dispatch_role` 新增 `FileRole::Ir` 分支（`emit_ir_only: true`）转交 tie-llvm；
+- **端到端语料**：`tests/language/filetype_ir.ir.tie`（ir 角色文件名约定，头部与文件名一致）；
+- **文档同步**：README / docs/language.md 角色表、子类型全集、角色分派表、协议文本注释补 `ir`。
+
 ## [文件类型声明系统] 头部声明重构——`type tie` / `type tie<X>` 取代 `// tie:xxx` 注释指令 — 2026-08-14
 
 文件类型声明系统全面重构：旧「`// tie:xxx` 注释头指令」体系彻底移除，改为真正的语法行声明。

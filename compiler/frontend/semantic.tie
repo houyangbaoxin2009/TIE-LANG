@@ -19,10 +19,15 @@ type tie<class>
 // semantic 树 = sstate/stype/sbuiltin/sinfer/scollect/scheck），无环无重复。
 import "./parser.tie"
 import "./scheck.tie"
+import "./sgen.tie"
 
 // ==================== import 展开状态 ====================
 // 当前文件目录（相对 import 解析基准）
 var g_cur_dir: string = "";
+
+// 泛型预扫描展开状态（T3b）：g_extra_tops 已扫描位置游标（新展开的函数
+// 追加到 g_extra_tops 末尾，主循环从该位置续扫）
+var g_scan_extra_last: i64 = 0;
 
 namespace semantic {
 
@@ -236,7 +241,9 @@ func expand_imports() -> i64 {
 
 // 便捷入口：源码字符串 + 基准目录 → 可读语义摘要
 pub func check_debug_src(src: string, base_dir: string) -> string {
-    var ast_text = parser.parse_src(src)
+    // 剥离文件类型声明头部（type tie / type tie<X>）——真实管线由预处理完成，
+    // check 路径须等效（否则头部声明被当顶层标识符报错）
+    var ast_text = parser.parse_src(strip_type_decl(src))
     if sstate.has_prefix_str(ast_text, "ERR:") {
         return ast_text
     }
@@ -251,7 +258,10 @@ pub func check(ast_text: string) -> string {
 
 // 便捷入口：源码字符串 + 基准目录 → 完整语义检查（parse + import 展开 + check）
 pub func check_src(src: string, base_dir: string) -> string {
-    var ast_text = parser.parse_src(src)
+    // 剥离文件类型声明头部（type tie / type tie<X>）——真实管线由预处理完成，
+    // check 路径须等效（否则头部声明被当顶层标识符报错；strip_type_decl 与
+    // 展开 import 时同规则，行号占位保一致）
+    var ast_text = parser.parse_src(strip_type_decl(src))
     if sstate.has_prefix_str(ast_text, "ERR:") {
         return ast_text
     }
@@ -315,6 +325,23 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     g_curfn = -1
     g_typed = 0
     sm_err_msg = ""
+    // 泛型模板登记表重置（gt_*，T3b 单态化展开器预置；每次编译清零）
+    gty_keys = table_new_i64()
+    gty_vals = table_new_i64()
+    gtyp_nparams = table_new_i64()
+    gtyp_off = table_new_i64()
+    gtyp_names = table_new_i64()
+    gty_node = table_new_i64()
+    gty_is_struct = table_new_i64()
+    // 实例化记录表重置（gin_*，T3b 单态化展开器；每次编译清零）
+    gin_keys = table_new_i64()
+    gin_vals = table_new_i64()
+    gin_tmpl = table_new_i64()
+    gin_off = table_new_i64()
+    gin_nargs = table_new_i64()
+    gin_is_struct = table_new_i64()
+    garg_vals = table_new_i64()
+    g_inst_depth = 0
     if len(tre_bi_keys) == 0 {
         scollect.tre_bi_init()
     }
@@ -331,6 +358,21 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     if r < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
+    // 泛型单态化预扫描展开（T3b）：遍历模板 → 扫描调用点 → 展开 → 去重 →
+    // 递归处理新实例化（展开产物进入 fn_keys/st_keys 后由后续阶段覆盖）。
+    // 须在 collect_all_struct_fields 之前——展开的 struct 字段拍平由
+    // instantiate_struct 即时完成，主流程再遍历 st_keys 时 cls_done 跳过
+    var ge = expand_generics()
+    if ge < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
+    // 泛型字段类型预实例化（2026-08-14）：字段类型中的模板 struct 引用（如
+    // `A<i64>`）在此先行实例化，避免 collect_all_struct_fields 拍平时实例化
+    // 副作用顶偏 cls_fldoff（详见 scollect.pre_instantiate_field_types 注释）
+    var pr = scollect.pre_instantiate_field_types()
+    if pr < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
     // struct 字段拍平收集（含继承；须在逐函数检查前完成）
     var r3 = scollect.collect_all_struct_fields()
     if r3 < 0 {
@@ -341,14 +383,35 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     if r4 < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
-    var i: i64 = 0
-    while i < len(fn_keys) {
-        var fname = intern.lookup(fn_keys[i])
-        var r2 = scheck.check_fn_walk(fname)
-        if r2 < 0 {
-            return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    // 逐函数检查（T3b 稳定化：检查期间 infer_call 会触发展开新实例化 → fn_keys
+    // 增长，循环重扫直到无新函数——防 sorted_insert 把新签名插到游标之前被跳过）
+    var checked: table<i64> = table_new_i64()
+    var again: bool = true
+    while again {
+        again = false
+        var i: i64 = 0
+        while i < len(fn_keys) {
+            var fid = fn_keys[i]
+            var chk: i64 = 0
+            var has: bool = false
+            while chk < len(checked) {
+                if checked[chk] == fid {
+                    has = true
+                    break
+                }
+                chk = chk + 1
+            }
+            if !has {
+                table_push(checked, fid)
+                again = true
+                var fname = intern.lookup(fid)
+                var r2 = scheck.check_fn_walk(fname)
+                if r2 < 0 {
+                    return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+                }
+            }
+            i = i + 1
         }
-        i = i + 1
     }
     return "OK:" + to_string(g_typed)
 }
@@ -416,6 +479,23 @@ pub func check_ast(base_dir: string) -> string {
     g_curfn = -1
     g_typed = 0
     sm_err_msg = ""
+    // 泛型模板登记表重置（gt_*，T3b 单态化展开器预置；每次编译清零）
+    gty_keys = table_new_i64()
+    gty_vals = table_new_i64()
+    gtyp_nparams = table_new_i64()
+    gtyp_off = table_new_i64()
+    gtyp_names = table_new_i64()
+    gty_node = table_new_i64()
+    gty_is_struct = table_new_i64()
+    // 实例化记录表重置（gin_*，T3b 单态化展开器；每次编译清零）
+    gin_keys = table_new_i64()
+    gin_vals = table_new_i64()
+    gin_tmpl = table_new_i64()
+    gin_off = table_new_i64()
+    gin_nargs = table_new_i64()
+    gin_is_struct = table_new_i64()
+    garg_vals = table_new_i64()
+    g_inst_depth = 0
     if len(tre_bi_keys) == 0 {
         scollect.tre_bi_init()
     }
@@ -433,6 +513,18 @@ pub func check_ast(base_dir: string) -> string {
     if r < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
+    // 泛型单态化预扫描展开（T3b）：同 check_impl（见其注释）
+    var ge = expand_generics()
+    if ge < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
+    // 泛型字段类型预实例化（2026-08-14）：字段类型中的模板 struct 引用（如
+    // `A<i64>`）在此先行实例化，避免 collect_all_struct_fields 拍平时实例化
+    // 副作用顶偏 cls_fldoff（详见 scollect.pre_instantiate_field_types 注释）
+    var pr = scollect.pre_instantiate_field_types()
+    if pr < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
     // struct 字段拍平收集（含继承；须在逐函数检查前完成）
     var r3 = scollect.collect_all_struct_fields()
     if r3 < 0 {
@@ -443,16 +535,289 @@ pub func check_ast(base_dir: string) -> string {
     if r4 < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
-    var i: i64 = 0
-    while i < len(fn_keys) {
-        var fname = intern.lookup(fn_keys[i])
-        var r2 = scheck.check_fn_walk(fname)
-        if r2 < 0 {
-            return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    // 逐函数检查（T3b 稳定化，同 check_impl）
+    var checked: table<i64> = table_new_i64()
+    var again: bool = true
+    while again {
+        again = false
+        var i: i64 = 0
+        while i < len(fn_keys) {
+            var fid = fn_keys[i]
+            var chk: i64 = 0
+            var has: bool = false
+            while chk < len(checked) {
+                if checked[chk] == fid {
+                    has = true
+                    break
+                }
+                chk = chk + 1
+            }
+            if !has {
+                table_push(checked, fid)
+                again = true
+                var fname = intern.lookup(fid)
+                var r2 = scheck.check_fn_walk(fname)
+                if r2 < 0 {
+                    return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+                }
+            }
+            i = i + 1
         }
-        i = i + 1
     }
     return "OK:" + to_string(g_typed)
+}
+
+// ==================== 泛型单态化预扫描（T3b） ====================
+// 在 collect_top 之后、collect_all_struct_fields 之前调用：遍历 g_extra_tops
+// 中的函数体（顶层 + 命名空间递归），重建扫描期局部变量表后逐个推断函数体
+// 表达式——infer_call 遇到泛型调用/构造/方法调用时触发 sgen.instantiate_*
+// 展开（复制 AST + TypeVar 替换 + mangled 名登记符号表）。展开产生的新函数
+// 追加到 g_extra_tops → 入队继续扫描，直到无新函数（去重由 done 表保证）。
+// 推断失败静默跳过（错误状态恢复）——正式逐函数检查阶段 infer_call 会再次
+// 推断并报告错误，此处只做"能确定就提前展开"的预扫描。
+// 返回 0 成功 / -1 内部错误（sm_err_* 已置）。
+func expand_generics() -> i64 {
+    var queue: table<i64> = table_new_i64()
+    var qpos: i64 = 0
+    var done: table<i64> = table_new_i64()
+    g_scan_extra_last = 0
+    // 初始收集：g_extra_tops 顶层 FnDef（非模板）+ 命名空间递归
+    var n0 = len(g_extra_tops)
+    var i0: i64 = 0
+    while i0 < n0 {
+        var s0 = g_extra_tops[i0]
+        var t0 = s_tags[s0]
+        if t0 == S_N_FN_DEF {
+            if !is_tmpl_fn(s0) {
+                table_push(queue, s0)
+            }
+        } else if t0 == S_N_NAMESPACE {
+            collect_ns_fns(s0, queue)
+        }
+        i0 = i0 + 1
+    }
+    // 主循环：扫描函数体（触发展开）→ 新函数入队
+    var total: i64 = 0
+    while qpos < len(queue) {
+        var fn_node = queue[qpos]
+        qpos = qpos + 1
+        var h: i64 = 0
+        var has: bool = false
+        while h < len(done) {
+            if done[h] == fn_node {
+                has = true
+                break
+            }
+            h = h + 1
+        }
+        if has {
+            continue
+        }
+        table_push(done, fn_node)
+        scan_fn_light(fn_node)
+        total = total + 1
+        if total > 2000 {
+            sm_err_line = s_lines[fn_node]
+            sm_err_col = s_cols[fn_node]
+            sm_err_msg = "泛型实例化规模超限（超过 2000 个实例化函数），疑似无限递归实例化"
+            return -1
+        }
+        // 新展开的函数追加到 g_extra_tops → 入队（去重由 done 保证）
+        var n = len(g_extra_tops)
+        var i = g_scan_extra_last
+        while i < n {
+            var s = g_extra_tops[i]
+            if s_tags[s] == S_N_FN_DEF && !is_tmpl_fn(s) {
+                table_push(queue, s)
+            }
+            i = i + 1
+        }
+        g_scan_extra_last = len(g_extra_tops)
+    }
+    return 0
+}
+
+// 泛型模板函数判定（children[0] == N_TYPE_PARAMS）
+func is_tmpl_fn(s: i64) -> bool {
+    if sstate.nchild(s) > 0 {
+        var c0 = sstate.child(s, 0)
+        if c0 >= 0 && s_tags[c0] == S_N_TYPE_PARAMS {
+            return true
+        }
+    }
+    return false
+}
+
+// 命名空间体内递归收集 FnDef（非模板）入队
+func collect_ns_fns(ns_node: i64, queue: ref table<i64>) {
+    var nsegs = s_aux[ns_node]
+    var body = sstate.child(ns_node, nsegs)
+    var nb = sstate.nchild(body)
+    var j: i64 = 0
+    while j < nb {
+        var s = sstate.child(body, j)
+        var tag = s_tags[s]
+        if tag == S_N_FN_DEF {
+            if !is_tmpl_fn(s) {
+                table_push(queue, s)
+            }
+        } else if tag == S_N_NAMESPACE {
+            collect_ns_fns(s, queue)
+        }
+        j = j + 1
+    }
+}
+
+// 推断函数体单函数：重建扫描期局部变量表 → 扫描语句
+func scan_fn_light(fn_node: i64) {
+    // 重建 lv_*（sinfer.infer_expr 依赖局部作用域）
+    lv_keys = table_new_i64()
+    lv_vals = table_new_i64()
+    lv_const = table_new_i64()
+    lv_telem = table_new_i64()
+    lv_dyn = table_new_i64()
+    var nparams = s_aux[fn_node]
+    var k: i64 = 0
+    while k < nparams {
+        var p = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + k)
+        var pname = sstate.name_str(p)
+        var pty = sgen.parse_generic_type_node(sstate.child(p, 0))
+        if pty >= 0 {
+            var telem: i64 = -1
+            var dyn: i64 = 0
+            if types.is_table(pty) {
+                telem = types.table_elem(pty)
+                if telem < 0 {
+                    telem = types.named(TK_STR)
+                }
+                dyn = 1
+            }
+            sinfer.lv_insert(intern.intern(pname), pty, 0, telem, dyn)
+        }
+        k = k + 1
+    }
+    var body = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + nparams)
+    scan_stmt_light(body)
+}
+
+// 推断表达式（错误状态保存/恢复：预扫描阶段的失败不是真错误，
+// 正式检查阶段会再次推断并报告）
+func infer_expr_safe(e: i64) -> i64 {
+    var sl = sm_err_line
+    var sc = sm_err_col
+    var smg = sm_err_msg
+    var t = sinfer.infer_expr(e)
+    sm_err_line = sl
+    sm_err_col = sc
+    sm_err_msg = smg
+    return t
+}
+
+// 递归扫描语句：推断表达式（触发泛型展开）+ 维护扫描期局部变量表
+func scan_stmt_light(s: i64) {
+    var tag = s_tags[s]
+    if tag == S_N_VAR_DECL {
+        var ty_node = sstate.child(s, 0)
+        var init = sstate.child(s, 1)
+        var ty: i64 = -1
+        var it: i64 = -1
+        if ty_node >= 0 {
+            var sl = sm_err_line
+            var sc = sm_err_col
+            var smg = sm_err_msg
+            ty = sgen.parse_generic_type_node(ty_node)
+            sm_err_line = sl
+            sm_err_col = sc
+            sm_err_msg = smg
+        }
+        if init >= 0 {
+            it = infer_expr_safe(init)
+        }
+        var use_ty = ty
+        if use_ty < 0 {
+            use_ty = it
+        }
+        if use_ty >= 0 {
+            var telem: i64 = -1
+            var dyn: i64 = 0
+            if types.is_table(use_ty) {
+                telem = types.table_elem(use_ty)
+                if telem < 0 {
+                    telem = types.named(TK_STR)
+                }
+                dyn = 1
+            }
+            sinfer.lv_insert(intern.intern(sstate.name_str(s)), use_ty, s_vals[s], telem, dyn)
+        }
+        return
+    }
+    if tag == S_N_IF {
+        infer_expr_safe(sstate.child(s, 0))
+        scan_stmt_light(sstate.child(s, 1))
+        var el = sstate.child(s, 2)
+        if el >= 0 {
+            scan_stmt_light(el)
+        }
+        return
+    }
+    if tag == S_N_WHILE {
+        infer_expr_safe(sstate.child(s, 0))
+        scan_stmt_light(sstate.child(s, 1))
+        return
+    }
+    if tag == S_N_FOR {
+        infer_expr_safe(sstate.child(s, 0))
+        scan_stmt_light(sstate.child(s, 1))
+        return
+    }
+    if tag == S_N_SWITCH {
+        infer_expr_safe(sstate.child(s, 0))
+        var ncases = s_aux[s]
+        var k: i64 = 0
+        while k < ncases {
+            var c = sstate.child(s, 1 + k)
+            scan_stmt_light(sstate.child(c, 2))
+            k = k + 1
+        }
+        var dflt = sstate.child(s, 1 + ncases)
+        if dflt >= 0 {
+            scan_stmt_light(dflt)
+        }
+        return
+    }
+    if tag == S_N_RETURN {
+        var v = sstate.child(s, 0)
+        if v >= 0 {
+            infer_expr_safe(v)
+        }
+        return
+    }
+    if tag == S_N_EXPR_STMT {
+        infer_expr_safe(sstate.child(s, 0))
+        return
+    }
+    if tag == S_N_ASSIGN {
+        var v = sstate.child(s, 1)
+        if v >= 0 {
+            infer_expr_safe(v)
+        }
+        return
+    }
+    if tag == S_N_FIELD_ASSIGN {
+        var v = sstate.child(s, 2)
+        if v >= 0 {
+            infer_expr_safe(v)
+        }
+        return
+    }
+    if tag == S_N_INDEX_ASSIGN {
+        var v = sstate.child(s, 1)
+        if v >= 0 {
+            infer_expr_safe(v)
+        }
+        return
+    }
+    // 其他语句类型：忽略（内含表达式由子语句递归覆盖）
 }
 
 // ==================== 内存版 AST 表复制（T5.3 消除协议往返）====================

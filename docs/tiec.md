@@ -139,6 +139,7 @@ tiec 通过**头部扫描**识别源文件角色：读取源文件最前面的�
 | --- | --- | --- |
 | `type tie<logic>` / `type tie<script>` | 逻辑 / 脚本 | 编译为可执行文件 |
 | `type tie<class>` / `type tie` | 类/库 / 泛型入口 | 编译为静态库 `.a` |
+| `type tie<ir>` | IR | 直接生成 LLVM IR（`.ll`），不继续 opt/clang 链接（等价 `--emit-ir`） |
 | `type tie<data>` / `type tie<ui>` / `type tie<db>` / `type tie<port>` | 数据 / 界面 / 数据库 / 端口 | 提示对应工具链未实现 |
 
 未声明头时按 `logic` 处理。
@@ -259,7 +260,7 @@ compiler/
 
 ## 8. 已知限制与当前状态
 
-- **角色支持**：当前只编译 `logic`/`script`（可执行）与 `class`/`type`（静态库）；`data` / `ui` / `db` / `port` 角色提示挂接点未实现；
+- **角色支持**：当前只编译 `logic`/`script`（可执行）与 `class`/`type`（静态库）、`ir`（直接产出 `.ll`）；`data` / `ui` / `db` / `port` 角色提示挂接点未实现；
 - **T5 后续进行中**：irgen 最小集扩展仍在推进，部分高级语法特性（如 enum / 函数指针方向的 B1 规划）暂未覆盖；
 - **解释器桥限制**：需要指针类型的桥函数（如 file_read / str_char / rand_range / arg_*）无法 tie 化，仍走 Rust 底座转发；
 - **自举细节**：tiec 由 Rust 种子编译（唯一 Rust 接触点），此后 0-Rust；老编译器 tie-llvm.exe 仍保留作为种子与对照。

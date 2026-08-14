@@ -3,9 +3,13 @@ type tie<class>
 // ============================================================
 // 里程碑：自举 v2 计划 T2.5 完整 parser 再拆分（2026-08-11）：
 // 原 pexpr.tie 拆出「类型解析 parse_type + parse_tuple_type」部分。
-// 依赖：./pexpr.tie（优先级链，经其传递可达 putil/pst/ast/errors/interner/string）。
-// 树式无环：由 pstmt.tie import（传递可达上层）。
-import "./pexpr.tie"
+// 依赖：./putil.tie（token 流/工具，经其传递可达 pst/ast/errors/interner/string）。
+// 2026-08-14 泛型语法：原 import ./pexpr.tie 改为 ./putil.tie——本模块不调用
+// pexpr 命名空间函数（只调 putil/ast/interner），改为平级依赖后 pexpr 才能
+// import 本模块（调用 parse_type_args），树仍无环：
+//   pstmt → pexpr → pexpr_type → putil
+// 树式无环：由 pexpr.tie import（传递可达上层）。
+import "./putil.tie"
 
 namespace pexpr_type {
 
@@ -63,12 +67,59 @@ pub func parse_type() -> i64 {
         return parse_tuple_type(line, col)
     }
     if tag == lex_ident {
+        // 结构类型引用：`Box` 或 `Box<i64>`（2026-08-14 泛型类型实参）。
+        // N_STRUCT_TYPE children = [类型实参槽]：`Box<i64>` → N_TYPE_ARGS 子节点；
+        // `Box` 裸引用 → children[0] = -1（兼容现有布局）。
         var name = interner.intern(putil.peek_lexeme())
         putil.advance()
-        return ast.new_node(N_STRUCT_TYPE, name, -1, -1, line, col)
+        var t = ast.new_node(N_STRUCT_TYPE, name, -1, -1, line, col)
+        var tkids: table<i64> = table_new_i64()
+        if putil.peek_tag() == lex_lt {
+            var targs = parse_type_args()
+            if targs < 0 {
+                return -1
+            }
+            table_push(tkids, targs)
+        } else {
+            table_push(tkids, -1)
+        }
+        ast.set_children(t, tkids)
+        return t
     }
     putil.set_err(line, col, "期望类型，实际是 " + putil.describe(tag))
     return -1
+}
+
+// 类型实参列表：`<T1, T2, ...>`（使用点，如 `Box<i64>` / `max<i64>(...)`）。
+// 逐个用 parse_type 递归解析实参（实参可为内建泛型 table<T>/map<T>、嵌套
+// 结构引用 Box<i64>、元组类型等）；闭合用 expect_type_gt（自动处理 `>>` 分裂）。
+// 返回 N_TYPE_ARGS 节点（children = 类型节点序列）。
+// 前提：当前 peek 为 '<'（本函数消费之）。
+pub func parse_type_args() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    if !putil.expect(lex_lt, "'<'") {
+        return -1
+    }
+    var args: table<i64> = table_new_i64()
+    var a = parse_type()
+    if a < 0 {
+        return -1
+    }
+    table_push(args, a)
+    while putil.eat(lex_comma) {
+        a = parse_type()
+        if a < 0 {
+            return -1
+        }
+        table_push(args, a)
+    }
+    if !putil.expect_type_gt("类型实参列表后需 '>'") {
+        return -1
+    }
+    var n = ast.new_node(N_TYPE_ARGS, -1, -1, -1, line, col)
+    ast.set_children(n, args)
+    return n
 }
 
 // 元组类型：`(T1, T2, ...)` / `(name: T1, name: T2, ...)`

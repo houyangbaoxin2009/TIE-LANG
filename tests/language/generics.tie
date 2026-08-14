@@ -1,0 +1,84 @@
+type tie<logic>
+
+// ============================================================
+// 泛型系统验收测试（T3b 单态化展开器 + 调用点类型推断 + 符号 mangling）
+//
+// 覆盖场景：
+//   1. 泛型函数调用点推断：max(3,5) → T=i64；max(3.5,1.2) → T=f64；
+//      max("x","y") → T=string（string 支持 > 比较）
+//   2. 泛型 struct 显式构造：Box<i64>(42)
+//   3. 泛型方法调用推断：b.get() 从接收者类型 Box<i64> 提取 T
+//   4. 嵌套类型实参：Box<table<i64>> / max 的泛型实参 identity<table<i64>>
+//   5. 显式类型实参调用：max<i64>(9, 4)
+//   6. 构造参数推断：Box(3.14) → T=f64
+//   7. 多类型参数：pick<A,B>(a,b) -> A（mangling pick$i64$string）
+//
+// 期望输出：
+//   5 / 3.5 / y / 42 / 7 / 9 / 99 / 3.14 / 5
+// ============================================================
+
+// ----- 泛型函数：max（单类型参数，返回类型也是 T）-----
+func max<T>(a: T, b: T) -> T {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// ----- 泛型函数：identity（恒等，用于嵌套表显式实例化）-----
+func identity<T>(x: T) -> T {
+    return x
+}
+
+// ----- 泛型函数：pick（多类型参数 A、B，返回 A）-----
+func pick<A, B>(a: A, b: B) -> A {
+    return a
+}
+
+// ----- 泛型 struct：Box<T>（数据与逻辑分离）-----
+struct Box<T> {
+    var value: T
+}
+
+// 绑定 Box 命名空间的泛型方法 get<T>(b: Box<T>) -> T
+namespace Box {
+    pub func get<T>(b: Box<T>) -> T {
+        return b.value
+    }
+}
+
+func main() {
+    var m1 = max(3, 5)
+    println(m1)
+    // 2. T=f64（浮点 > 比较）
+    var m2 = max(3.5, 1.2)
+    println(m2)
+    // 3. T=string（字符串 > 比较，按字节序）
+    var s = max("x", "y")
+    println(s)
+    // 4. 泛型 struct 显式构造 + 方法推断（T 从接收者 Box<i64> 提取）
+    var b = Box<i64>(42)
+    var v: i64 = b.get()
+    println(v)
+    // 5. 嵌套类型实参 Box<table<i64>>：字段 value: table<i64>
+    var t = table_new_i64()
+    table_push(t, 7)
+    var b2 = Box<table<i64>>(t)
+    var u: table<i64> = b2.get()
+    println(u[0])
+    // 6. 显式类型实参调用 max<i64>(9, 4)
+    var m3 = max<i64>(9, 4)
+    println(m3)
+    // 7. 嵌套表类型实参 identity<table<i64>>
+    var t2 = table_new_i64()
+    table_push(t2, 99)
+    var id = identity<table<i64>>(t2)
+    println(id[0])
+    // 8. 构造参数推断：Box(3.14) → T=f64
+    var b3 = Box(3.14)
+    var f: f64 = b3.get()
+    println(f)
+    // 9. 多类型参数 pick<A,B>：A=i64（a），B=string（b）
+    var p = pick(5, "hi")
+    println(p)
+}

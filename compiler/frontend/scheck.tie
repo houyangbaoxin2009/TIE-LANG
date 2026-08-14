@@ -158,7 +158,7 @@ pub func check_switch_case(c: i64, subj_ty: i64) -> i64 {
         // 因为 infer_expr 对 TypeLit 直接报通用错误）
         if s_tags[p] == S_N_TYPE_LIT {
             var tynode = sstate.child(p, 0)
-            var tyname = types.type_name(stype.parse_type_node(tynode))
+            var tyname = types.type_name(sgen.parse_generic_type_node(tynode))
             sm_err_line = s_lines[c]
             sm_err_col = s_cols[c]
             sm_err_msg = "case 类型匹配（" + tyname + "）仅支持宽类型或动态容器对象，当前 switch 对象是静态类型 " + types.type_name(subj_ty)
@@ -626,7 +626,7 @@ pub func check_var_decl(s: i64) -> i64 {
     var ty_node = sstate.child(s, 0)
     var init = sstate.child(s, 1)
     if ty_node >= 0 {
-        var ty = stype.parse_type_node(ty_node)
+        var ty = sgen.parse_generic_type_node(ty_node)
         if ty < 0 {
             return -1
         }
@@ -738,7 +738,8 @@ pub func check_var_decl(s: i64) -> i64 {
                 }
             } else if s_tags[init] == S_N_METHOD_CALL {
                 // 方法调用返回表：recv::mname 查返回表元素（如 str.split → str::split）
-                var recv = sstate.child(init, 0)
+                // MethodCall 接收者 = children[slot_off]（新布局 children[0]=泛型槽）
+                var recv = sstate.child(init, sstate.slot_off(init))
                 var rname = sstate.name_str(recv)
                 var mname = sstate.name_str(init)
                 var full2 = rname + "::" + mname
@@ -781,7 +782,8 @@ pub func check_fn(fn_node: i64, full: string) -> i64 {
     var off = sg_off[sig]
     var i: i64 = 0
     while i < nparams {
-        var pnode = sstate.child(fn_node, 1 + i)
+        // 第 i 个参数节点：children[slot_off + 1 + i]（slot_off 双布局兼容）
+        var pnode = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + i)
         var pname = sstate.name_str(pnode)
         var pnid = intern.intern(pname)
         var pty = sp_tys[off + i]
@@ -798,7 +800,8 @@ pub func check_fn(fn_node: i64, full: string) -> i64 {
         sinfer.lv_insert(pnid, pty, 0, telem, dyn)
         i = i + 1
     }
-    var body = sstate.child(fn_node, 1 + nparams)
+    // 函数体：children[slot_off + 1 + nparams]
+    var body = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + nparams)
     var r = check_block(body)
     if r < 0 {
         return -1

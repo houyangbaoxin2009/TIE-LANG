@@ -214,6 +214,167 @@ pub func expect_type_gt(what: string) -> bool {
     return false
 }
 
+// ---------- token 位置保存/恢复（泛型调用 try 探测回退，2026-08-14）----------
+// save_pos 快照真实游标 g_pos + pending 队列完整内容 + 语法错误槽；
+// restore_pos 恢复到保存时刻。泛型调用点 `<` 歧义处理（`a < b` vs `max<i64>(...)`）
+// 用「尝试解析 + 失败回退」：探测期间 split_current_gt 可能原位覆盖 pending 元素
+// 或往队尾 push 虚拟 token，restore 必须整体还原——故 save 采用完整快照复制
+// （表无 pop/截断原语，重建整表是唯一可靠回退方式）。
+pub func save_pos() {
+    g_save_pos = g_pos
+    g_save_idx = g_pending_idx
+    g_save_pending = table_new_i64()
+    g_save_pending_lines = table_new_i64()
+    g_save_pending_cols = table_new_i64()
+    g_save_pending_lexemes = table_new_i64()
+    var i: i64 = 0
+    while i < len(g_pending) {
+        table_push(g_save_pending, g_pending[i])
+        table_push(g_save_pending_lines, g_pending_lines[i])
+        table_push(g_save_pending_cols, g_pending_cols[i])
+        table_push(g_save_pending_lexemes, g_pending_lexemes[i])
+        i = i + 1
+    }
+    g_save_err_line = p_err_line
+    g_save_err_col = p_err_col
+    g_save_err_msg = p_err_msg
+}
+
+// 恢复 token 流与错误槽到最近一次 save_pos 时刻（重建 pending 快照）。
+pub func restore_pos() {
+    g_pos = g_save_pos
+    g_pending_idx = g_save_idx
+    g_pending = table_new_i64()
+    g_pending_lines = table_new_i64()
+    g_pending_cols = table_new_i64()
+    g_pending_lexemes = table_new_i64()
+    var i: i64 = 0
+    while i < len(g_save_pending) {
+        table_push(g_pending, g_save_pending[i])
+        table_push(g_pending_lines, g_save_pending_lines[i])
+        table_push(g_pending_cols, g_save_pending_cols[i])
+        table_push(g_pending_lexemes, g_save_pending_lexemes[i])
+        i = i + 1
+    }
+    p_err_line = g_save_err_line
+    p_err_col = g_save_err_col
+    p_err_msg = g_save_err_msg
+}
+
+// ---------- 泛型调用点 '<' 歧义探测（token 层，无副作用，2026-08-14）----------
+// 调用点 `ident<...>(...)` 与比较 `a < b` / 链式 `f < g > h` 共用 '<' token。
+// 判据：'<' 后是「完整类型实参列表 + '>' + 紧接着 '('」才按泛型调用处理，
+// 否则回退为比较。本函数只做 token 结构扫描（不建 AST 节点、不消费 token，
+// 内部 save/restore 还原），命中后由调用方以 parse_type_args 正式解析。
+
+// 当前是否为「泛型调用前缀」：`< 完整类型实参列表 > (`。
+// 返回 true 时当前位置（'<'）未消费，由调用方决定正式解析。
+pub func is_generic_call_ahead() -> bool {
+    if peek_tag() != lex_lt {
+        return false
+    }
+    save_pos()
+    advance()   // 消费 '<'
+    var ok = scan_type_arg_list()
+    if ok {
+        ok = peek_tag() == lex_lparen
+    }
+    restore_pos()
+    return ok
+}
+
+// 扫描「类型实参列表」：至少一个类型实参，实参间逗号分隔，以 '>' 闭合。
+// 闭合支持 Shr/Ge/ShrEq 复合 token 分裂（与 expect_type_gt 同款映射——
+// 分裂副作用由调用方 save/restore 还原）。
+func scan_type_arg_list() -> bool {
+    if !scan_one_type_arg() {
+        return false
+    }
+    var d = false
+    while !d {
+        var tag = peek_tag()
+        if tag == lex_comma {
+            advance()
+            if !scan_one_type_arg() {
+                return false
+            }
+        } else if tag == lex_gt {
+            advance()
+            d = true
+        } else if tag == lex_shr {
+            // >> 分裂：第 1 个 '>' 为闭合，余下 Gt 顶替当前位置
+            split_current_gt(lex_gt)
+            d = true
+        } else if tag == lex_ge {
+            split_current_gt(lex_eq)
+            d = true
+        } else if tag == lex_shreq {
+            split_current_gt(lex_ge)
+            d = true
+        } else {
+            return false
+        }
+    }
+    return true
+}
+
+// 扫描单个类型实参（token 形态）：内建类型关键字（含 table/map 嵌套泛型）、
+// 标识符（含嵌套泛型类型引用）、元组类型 `(...)`。与 pexpr_type.parse_type
+// 接受的形态一致（探测结果与正式解析保证等价）。
+func scan_one_type_arg() -> bool {
+    var tag = peek_tag()
+    if tag == lex_typekw {
+        var lex = peek_lexeme()
+        advance()
+        if lex == "table" || lex == "map" {
+            if peek_tag() == lex_lt {
+                advance()   // '<'
+                if !scan_type_arg_list() {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+    if tag == lex_ident {
+        advance()
+        if peek_tag() == lex_lt {
+            advance()   // '<'
+            if !scan_type_arg_list() {
+                return false
+            }
+        }
+        return true
+    }
+    if tag == lex_lparen {
+        // 元组类型 (T1, T2) / (name: T1, ...)：圆括号配平跳过（内部可含
+        // 表/泛型等任意类型 token，遇到 ')' 才结束）
+        advance()
+        var depth: i64 = 1
+        var d = false
+        while !d {
+            var t2 = peek_tag()
+            if t2 == lex_eof {
+                return false
+            }
+            if t2 == lex_lparen {
+                depth = depth + 1
+            } else if t2 == lex_rparen {
+                depth = depth - 1
+                if depth == 0 {
+                    advance()
+                    d = true
+                }
+            }
+            if !d {
+                advance()
+            }
+        }
+        return true
+    }
+    return false
+}
+
 // ---------- 类型关键字与整数字面量 ----------
 
 // 类型关键字文本 → TyKw 索引（对齐 Rust TyKw 枚举顺序）

@@ -1,7 +1,12 @@
 # tie 泛型系统设计（v1）— 2026-08-14
 
-> 状态：设计定稿，待实现。决策拍板：泛型函数 + 泛型 struct；编译期单态化；
-> 声明显式 `<T>` + 调用点类型推断。
+> 状态：**已实现**（2026-08-14 完成）。决策拍板：泛型函数 + 泛型 struct；编译期
+> 单态化；声明显式 `<T>` + 调用点类型推断。实现：tiec（compiler/，tie 自写）
+> 全链路——parser 泛型语法（T1）→ TypeVar 编码（T2）→ 语义/irgen 泛型槽适配 +
+> 模板登记（T3a）→ 单态化展开器 sgen + 调用点推断 + mangling（T3b）。验收：
+> tests/language/generics.tie 9 正例全对、generics_neg.tie 5 负例、行为等价回归
+> 93.5% PASS、自举闭环 tiec→tiec2→tiec3 全绿。Rust 链（crates/）未实现泛型
+> （按「能用 tie 就用 tie」决策，Rust 链仅作行为对照基线）。
 
 ## 目标
 
