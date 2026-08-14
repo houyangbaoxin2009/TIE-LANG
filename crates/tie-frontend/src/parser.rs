@@ -559,9 +559,9 @@ impl Parser {
                 let pspan = self.peek().span;
                 let pname = self.expect_ident()?;
                 self.expect(TokenKind::Colon, "':'")?;
-                // extern 形参不支持 ref/默认值（链接期声明无调用语义）；类型限标量
+                // extern 形参不支持 ref/默认值/变参（链接期声明无调用语义）；类型限标量
                 let pty = self.parse_type()?;
-                params.push(Param { name: pname, ty: pty, default: None, by_ref: false, span: pspan });
+                params.push(Param { name: pname, ty: pty, default: None, by_ref: false, variadic: false, span: pspan });
                 if self.eat(&TokenKind::Comma) {
                     continue;
                 }
@@ -597,17 +597,36 @@ impl Parser {
                 // 按引用传递修饰（T0.3 by_ref）：`name: ref table<T>`——ref 表形参
                 // 是真引用（内容修改/重绑定写回调用方）。仅限表参数（语义层校验）。
                 let by_ref = self.eat(&TokenKind::Ref);
+                // 变参标记（特性④）：`name: ...T`——接收 0..n 个实参，函数体内
+                // 打包为动态表（table<T>）。`...` 与 ref/默认值互斥（语法层拦截）。
+                let variadic = self.eat(&TokenKind::DotDotDot);
+                if variadic && by_ref {
+                    return Err(self.err(format!(
+                        "参数 '{}' 的变参（...）不能与 ref 修饰同时使用",
+                        pname
+                    )));
+                }
                 let pty = self.parse_type()?;
                 // 默认值（可选参数）：`name: Ty = 字面量`。限字面量（含空表 []），
                 // 与类字段默认值规则一致（语义层校验类型，语法层只负责解析）。
-                // ref 参数不允许默认值（语义层校验：引用目标无法由默认值表达）。
-                let default = if self.eat(&TokenKind::Eq) {
+                // ref 参数不允许默认值（语义层校验：引用目标无法由默认值表达）；
+                // 变参参数不允许默认值（语法层直接拦截，实参个数由调用点决定）。
+                let default = if variadic && *self.peek_kind() == TokenKind::Eq {
+                    return Err(self.err(format!(
+                        "参数 '{}' 的变参（...）不能有默认值",
+                        pname
+                    )));
+                } else if self.eat(&TokenKind::Eq) {
                     Some(self.parse_expr()?)
                 } else {
                     None
                 };
-                params.push(Param { name: pname, ty: pty, default, by_ref, span: pspan });
+                params.push(Param { name: pname, ty: pty, default, by_ref, variadic, span: pspan });
                 if self.eat(&TokenKind::Comma) {
+                    // 变参必须是最后一个参数：变参后仍有逗号 → 语法错误
+                    if variadic {
+                        return Err(self.err("变参（...）必须是函数的最后一个参数".into()));
+                    }
                     continue;
                 }
                 self.expect(TokenKind::RParen, "')'")?;
@@ -1381,6 +1400,11 @@ impl Parser {
     /// - 分号 `;` 分隔行
     /// - 元素可为 `value` 或 `id:value`（id 可选）
     /// - id 可为数字下标（`0:1`）或带引号字符串键（`"a":1`）
+    ///
+    /// 二维表（分号分行）在语法层**降级（desugar）为嵌套表**：
+    /// `[1,2;3,4]` → `[[1,2],[3,4]]`（外层表元素 = 每行一个内层子表）。
+    /// 这样下游语义/IR/解释层零改动即可复用 E1 嵌套表路径
+    /// （`[[0,1],[0,2]]` 已支持 table<table<i64>> 全链路）。
     fn parse_table_lit(&mut self, span: Span) -> Result<Expr, ParseError> {
         self.expect(TokenKind::LBracket, "'['")?;
         let mut cells = Vec::new();
@@ -1416,7 +1440,65 @@ impl Parser {
                 }
             }
         }
-        Ok(Expr::TableLit { cells, span })
+        self.desugar_2d_table(cells, span)
+    }
+
+    /// 二维表 desugar（特性①）：若存在 `row > 0` 的元素 → 按行分组为嵌套表。
+    ///
+    /// 规则：
+    /// - 行长度不必一致（与嵌套表规则相同，由语义层检查元素类型一致性）；
+    /// - 多行且存在任何 id 元素（`TableId::Num`/`TableId::Str`）→ 语法错误
+    ///   （二维表只支持纯位置元素，id 语义在嵌套表中无意义）；
+    /// - 单行（全部 row == 0）→ 原样返回（与既有行为完全一致）。
+    ///
+    /// desugar 后的子表 cell 的 row 全部清零——下游语义层 1025 行的
+    /// 「二维表暂不支持」检查据此不再触发，元素类型检查由嵌套表路径覆盖。
+    fn desugar_2d_table(&mut self, cells: Vec<TableCell>, span: Span) -> Result<Expr, ParseError> {
+        // 单行表（无分号）→ 保持原样（既有行为，零回归）
+        if cells.iter().all(|c| c.row == 0) {
+            return Ok(Expr::TableLit { cells, span });
+        }
+        // 多行且存在 id 元素：二维表不支持 id（数字下标/字符串键）
+        if cells.iter().any(|c| c.id.is_some()) {
+            return Err(self.err("二维表（分号分行）不支持 id 元素（数字下标/字符串键）".into()));
+        }
+        // 按 row 分组：cells 按出现顺序排列、row 单调不减，
+        // 顺序遍历即可保持「行序 = 源顺序」。
+        let mut rows: Vec<Vec<TableCell>> = Vec::new();
+        for cell in cells {
+            // 行号跳变 → 开新行；连续同号 → 追加到当前行
+            if rows.len() <= cell.row {
+                rows.push(Vec::new());
+            }
+            rows[cell.row].push(cell);
+        }
+        // 每行构造一个子表字面量（row 全部清零），作为外层表的元素
+        let nested_cells = rows
+            .into_iter()
+            .map(|row_cells| {
+                // 子表 span：取行内首个元素的表达式 span（更贴近源码位置），
+                // 找不到则回退用外层表 span
+                let sub_span = row_cells
+                    .first()
+                    .and_then(|c| expr_span(&c.value))
+                    .unwrap_or(span);
+                // 行内元素 row 全部置 0（已是 0——该行元素在解析时记录的就是本行号，
+                // 但 desugar 后作为单行子表必须从 0 起，语义层只认 row==0 的单行表）
+                let sub_cells: Vec<TableCell> = row_cells
+                    .into_iter()
+                    .map(|mut c| {
+                        c.row = 0;
+                        c
+                    })
+                    .collect();
+                TableCell {
+                    id: None,
+                    value: Expr::TableLit { cells: sub_cells, span: sub_span },
+                    row: 0,
+                }
+            })
+            .collect();
+        Ok(Expr::TableLit { cells: nested_cells, span })
     }
 
     /// 解析表单元格：`id:value`（id 为数字或带引号字符串）或普通 `value`。
@@ -2376,5 +2458,93 @@ mod tests {
             "错误消息：{}",
             err.message
         );
+    }
+
+    // ---------- 特性①：二维表 desugar ----------
+
+    /// `[1,2;3,4]` 解析后 desugar 为嵌套表：外层 cells = 两个内层 TableLit。
+    #[test]
+    fn 二维表分号分行desugar为嵌套表() {
+        let prog = parse("func main() {\n    var t = [1, 2; 3, 4]\n}\n");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::VarDecl(v) = &f.body[0] else { panic!("期望变量声明") };
+        // 外层必须是表字面量，其每个 cell 的 value 都是内层表字面量
+        let Expr::TableLit { cells, .. } = &v.init else {
+            panic!("二维表应 desugar 为外层表字面量，实际 {:#?}", v.init)
+        };
+        assert_eq!(cells.len(), 2, "外层应有 2 行");
+        for c in cells {
+            assert!(c.id.is_none(), "desugar 后外层元素不应带 id");
+            assert_eq!(c.row, 0, "desugar 后外层元素 row 应为 0");
+            let Expr::TableLit { cells: sub, .. } = &c.value else {
+                panic!("外层元素应为内层表字面量，实际 {:#?}", c.value)
+            };
+            assert_eq!(sub.len(), 2, "每行应有 2 列");
+            assert!(sub.iter().all(|sc| sc.row == 0), "内层元素 row 应为 0");
+        }
+    }
+
+    /// 二维表含 id 元素（`[1,2; 3:4]`）→ 语法错误。
+    #[test]
+    fn 二维表含id元素报错() {
+        let err = parse_err("func main() {\n    var t = [1, 2; 3: 4]\n}\n");
+        assert!(
+            err.message.contains("二维表"),
+            "错误消息：{}",
+            err.message
+        );
+    }
+
+    /// 行长度不一致合法：`[1; 2,3]` → 行 0 一列、行 1 两列。
+    #[test]
+    fn 二维表行长度不一致合法() {
+        let prog = parse("func main() {\n    var t = [1; 2, 3]\n}\n");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::VarDecl(v) = &f.body[0] else { panic!("期望变量声明") };
+        let Expr::TableLit { cells, .. } = &v.init else {
+            panic!("二维表应 desugar 为外层表字面量，实际 {:#?}", v.init)
+        };
+        assert_eq!(cells.len(), 2, "外层应有 2 行");
+        // 行 0：1 列；行 1：2 列（desugar 前 row 已不可见，按外层 cells 顺序验证）
+        let Expr::TableLit { cells: r0, .. } = &cells[0].value else { panic!("行 0 应为表") };
+        let Expr::TableLit { cells: r1, .. } = &cells[1].value else { panic!("行 1 应为表") };
+        assert_eq!(r0.len(), 1, "行 0 应为 1 列");
+        assert_eq!(r1.len(), 2, "行 1 应为 2 列");
+    }
+
+    /// 单行表（无分号）保持原样：非嵌套表、元素 row 全 0。
+    #[test]
+    fn 单行表不desugar() {
+        let prog = parse("func main() {\n    var t = [1, 2, 3]\n}\n");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        let Stmt::VarDecl(v) = &f.body[0] else { panic!("期望变量声明") };
+        let Expr::TableLit { cells, .. } = &v.init else { panic!("期望表字面量") };
+        assert_eq!(cells.len(), 3);
+        // 单行表元素保持原始值表达式（数字字面量，而非内层表）
+        assert!(cells.iter().all(|c| matches!(c.value, Expr::IntLit(_))));
+        assert!(cells.iter().all(|c| c.row == 0));
+    }
+
+    // ---------- 特性④：变参函数参数解析 ----------
+
+    /// `func f(rest: ...i64)` 解析出 variadic 标记；`...` 与默认值互斥。
+    #[test]
+    fn 变参参数解析与默认值互斥() {
+        let prog = parse("func f(rest: ...i64) {}\nfunc main() {}\n");
+        let Stmt::FnDef(f) = &prog.stmts[0] else { panic!("期望函数定义") };
+        assert_eq!(f.params.len(), 1);
+        assert!(f.params[0].variadic, "变参标记应解析为 variadic=true");
+
+        // 变参 + 默认值 → 语法错误
+        let err = parse_err("func f(rest: ...i64 = 1) {}\nfunc main() {}\n");
+        assert!(err.message.contains("默认值"), "错误消息：{}", err.message);
+
+        // 变参后仍有参数 → 语法错误（变参必须最后一个）
+        let err = parse_err("func f(a: ...i64, b: i64) {}\nfunc main() {}\n");
+        assert!(err.message.contains("最后一个参数"), "错误消息：{}", err.message);
+
+        // 变参 + ref → 语法错误（`ref` 修饰与 `...` 互斥）
+        let err = parse_err("func f(a: ref ...table<i64>) {}\nfunc main() {}\n");
+        assert!(err.message.contains("ref"), "错误消息：{}", err.message);
     }
 }

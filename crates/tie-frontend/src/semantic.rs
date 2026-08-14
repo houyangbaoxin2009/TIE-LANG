@@ -9,7 +9,7 @@
 //! （IR 生成时无需重复推导类型）。
 
 use super::ast::{
-    BinaryOp, ClassField, Expr, FnDefStmt, Program, Stmt, StructDefStmt, TableId,
+    BinaryOp, ClassField, Expr, FnDefStmt, Param, Program, Stmt, StructDefStmt, TableId,
     TupleField, TypeSpec, UnaryOp,
 };
 use super::lexer::{Span, TyKw};
@@ -82,11 +82,28 @@ pub struct TableInfo {
     pub dynamic: bool,
 }
 
+/// 函数签名参数类型收集：变参形参（`rest: ...T`）类型转为 table<T>（特性④）。
+///
+/// 变参形参在签名/函数体内的语义类型是**动态表**（元素类型 T）——调用点
+/// 多余实参逐个与 T 匹配、IR/interp 层按动态表打包传递；函数体内对变参名的
+/// len/下标/for 遍历走既有动态表路径（table_vars 元数据，见 check_fn）。
+fn sig_param_tys(params: &[Param]) -> Vec<TypeSpec> {
+    params
+        .iter()
+        .map(|p| {
+            if p.variadic {
+                TypeSpec::Table(Box::new(p.ty.clone()))
+            } else {
+                p.ty.clone()
+            }
+        })
+        .collect()
+}
+
 /// 函数签名。
 #[derive(Debug, Clone)]
 pub struct FuncSig {
-    pub param_tys: Vec<TypeSpec>,
-    /// 参数默认值（可选参数）：与 param_tys 等长对齐，None = 必选参数。
+    pub param_tys: Vec<TypeSpec>,    /// 参数默认值（可选参数）：与 param_tys 等长对齐，None = 必选参数。
     /// 调用点省略实参时按此补齐（LLVM 函数签名不变，缺省实参在调用点生成）。
     pub param_defaults: Vec<Option<Expr>>,
     /// 参数是否按引用传递（T0.3 by_ref）：与 param_tys 等长对齐。true =
@@ -95,6 +112,11 @@ pub struct FuncSig {
     /// + 方法函数首参（`namespace <struct名>` 内首参类型 == 该 struct 名，
     /// 与 IR 层旧名字约定等价，改由语义层显式登记、IR 直接查询）。
     pub param_by_ref: Vec<bool>,
+    /// 是否变参函数（特性④）：最后一个形参是 `rest: ...T`——调用点可传
+    /// 0..n 个实参，运行时打包为动态表（table<T>）传给变参形参。
+    /// 变参形参的类型已在 param_tys 中登记为 table<T>（调用点按元素类型
+    /// T 校验多余实参；IR/interp 层按动态表打包/传递）。
+    pub variadic: bool,
     pub ret_ty: TypeSpec,
     /// 是否公有（M2.1.7 单文件命名空间）：命名空间内函数默认私有（仅同命名
     /// 空间可见，`pub func` 显式导出）；顶层函数恒为 true。
@@ -142,11 +164,13 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
         match stmt {
             Stmt::FnDef(f) => {
                 let sig = FuncSig {
-                    param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
+                    param_tys: sig_param_tys(&f.params),
                     param_defaults: f.params.iter().map(|p| p.default.clone()).collect(),
                     // 顶层函数无命名空间（裸名），不可能命中方法名字约定——
                     // 仅登记显式 `ref` 修饰的形参（T0.3 by_ref）
                     param_by_ref: f.params.iter().map(|p| p.by_ref).collect(),
+                    // 变参标记：函数签名携带（调用点按变参放行多余实参）
+                    variadic: f.params.last().map(|p| p.variadic).unwrap_or(false),
                     ret_ty: f.ret_ty.clone(),
                     // 顶层函数恒公有（与现状兼容）
                     is_pub: true,
@@ -200,6 +224,8 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
                     param_tys: e.params.iter().map(|p| p.ty.clone()).collect(),
                     param_defaults: vec![None; e.params.len()],
                     param_by_ref: vec![false; e.params.len()],
+                    // extern 无变参（C ABI 链接期声明，变参是 tie 层打包语义）
+                    variadic: false,
                     ret_ty: e.ret_ty.clone(),
                     is_pub: true,
                 };
@@ -223,17 +249,10 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
                 };
                 // T0.4 顶层表全局变量：`var g: table<i64>`（动态表，main 入口运行时
                 // 创建）。元素类型由标注决定（裸 table 约定 string）；初始化限空表
-                // []（缺省由解析层合成）；const 暂不支持（IR 需要 main 入口初始化）。
+                // []（缺省由解析层合成）。
+                // const 全局表（特性③）：合法——布局与 var 全局表完全一致（IR 层
+                // main 入口运行时创建），仅登记 const_globals 以拦截重绑定赋值。
                 if ty.is_table() {
-                    if v.is_const {
-                        return Err(SemanticError {
-                            span: v.span,
-                            message: format!(
-                                "const 全局表暂不支持：'{}'（表在 main 入口运行时创建，无法静态初始化）",
-                                v.name
-                            ),
-                        });
-                    }
                     let is_empty_lit = matches!(&v.init, Expr::TableLit { cells, .. } if cells.is_empty());
                     if !is_empty_lit {
                         return Err(SemanticError {
@@ -263,6 +282,12 @@ pub fn analyze(program: &Program) -> Result<SemanticResult, SemanticError> {
                     let info = TableInfo { elem_ty, len: 0, dynamic: true };
                     ctx.result.global_table_vars.insert(v.name.clone(), info);
                     ctx.result.globals.insert(v.name.clone(), ty);
+                    // const 全局表（特性③）：登记不可变集合——`g = ...` 重绑定在
+                    // Assign 检查处（const_globals 命中）报错，内容修改（table_push
+                    // 等）仍允许（与函数内 const 表语义一致：绑定不可变、内容可变）。
+                    if v.is_const {
+                        ctx.result.const_globals.insert(v.name.clone());
+                    }
                     continue;
                 }
                 // 全局变量限标量类型（i64/f64/bool/char/string）——IR 需要静态初始化布局
@@ -665,7 +690,7 @@ impl Analyzer {
                             matches!(ty, TypeSpec::Struct(sn) if ns == sn)
                         });
                     let sig = FuncSig {
-                        param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
+                        param_tys: sig_param_tys(&f.params),
                         param_defaults: f.params.iter().map(|p| p.default.clone()).collect(),
                         // 显式 ref 形参 + 方法函数首参（i==0）都按引用传递
                         param_by_ref: f
@@ -674,6 +699,8 @@ impl Analyzer {
                             .enumerate()
                             .map(|(i, p)| p.by_ref || (is_method && i == 0))
                             .collect(),
+                        // 变参标记：命名空间内函数同样支持（调用点按变参放行）
+                        variadic: f.params.last().map(|p| p.variadic).unwrap_or(false),
                         ret_ty: f.ret_ty.clone(),
                         // 命名空间内函数默认私有；`pub func` 显式导出（M2.1.7）
                         is_pub: f.is_pub,
@@ -732,10 +759,17 @@ impl Analyzer {
             segs.push(f.name.clone());
             segs.join("::")
         };
-        // 函数体内作用域：参数先入表
+        // 函数体内作用域：参数先入表。变参形参（`rest: ...T`，特性④）在函数
+        // 体内是动态表——作用域类型登记为 table<T>（元素类型 = 声明类型），
+        // 与显式 `table<T>` 形参一致（for/len/下标走既有表路径）。
         let mut scope: HashMap<String, TypeSpec> = HashMap::new();
         for p in &f.params {
-            if scope.insert(p.name.clone(), p.ty.clone()).is_some() {
+            let pty = if p.variadic {
+                TypeSpec::Table(Box::new(p.ty.clone()))
+            } else {
+                p.ty.clone()
+            };
+            if scope.insert(p.name.clone(), pty).is_some() {
                 return Err(SemanticError {
                     span: p.span,
                     message: format!("参数 '{}' 重复", p.name),
@@ -768,6 +802,29 @@ impl Analyzer {
                     message: format!("参数 '{}' 的 ref 参数不能有默认值（必须在调用点传实参）", p.name),
                 });
             }
+            // 变参形参校验（特性④）：
+            // - 必须是最后一个参数（parser 已拦截，此处防御——命名空间/泛型路径）
+            // - 元素类型限标量（i8..u64/f32/f64/bool/char/string）——变参打包为
+            //   动态表 table<T>，表/结构体/元组/键值表元素超出当前 IR 打包能力
+            if p.variadic && !is_scalar_extern_ty(&p.ty) {
+                return Err(SemanticError {
+                    span: p.span,
+                    message: format!(
+                        "变参 '{}' 的元素类型必须是标量（i8..u64/f32/f64/bool/char/string），实际是 {}",
+                        p.name,
+                        type_name(&p.ty)
+                    ),
+                });
+            }
+        }
+        // 变参必须是最后一个参数（parser 已保证，此处兜底防御）
+        if let Some((i, _)) = f.params.iter().enumerate().find(|(_, p)| p.variadic)
+            && i + 1 != f.params.len()
+        {
+            return Err(SemanticError {
+                span: f.params[i].span,
+                message: format!("变参 '{}' 必须是函数的最后一个参数", f.params[i].name),
+            });
         }
         let mut seen_default = false;
         for p in &f.params {
@@ -821,14 +878,20 @@ impl Analyzer {
         // 表参数：按「动态表」登记布局元数据（A1）。`table<T>` 用声明的元素类型 T；
         // `table` 裸类型约定为字符串表（M2 无泛型时代的兼容默认）。
         // 使函数体内可对表参数做 for 遍历 / len / table_at / 下标访问，元素类型确定。
+        // 变参形参（`rest: ...T`，特性④）同样登记为动态表（元素类型 = T）——
+        // 调用点把多余实参打包成表传参，函数体内按表操作（len/下标/for）。
         for p in &f.params {
-            if p.ty.is_table() {
-                // 元素类型：table<T> 用 T；裸 table 默认 string（兼容历史约定）
-                let elem_ty = p
-                    .ty
-                    .table_elem_ty()
-                    .cloned()
-                    .unwrap_or(TypeSpec::Named(TyKw::Str));
+            if p.ty.is_table() || p.variadic {
+                // 元素类型：显式表参数 table<T> 用 T / 裸 table 默认 string；
+                // 变参形参直接取声明类型 T
+                let elem_ty = if p.variadic {
+                    p.ty.clone()
+                } else {
+                    p.ty
+                        .table_elem_ty()
+                        .cloned()
+                        .unwrap_or(TypeSpec::Named(TyKw::Str))
+                };
                 let info = TableInfo { elem_ty, len: 0, dynamic: true };
                 // 键用 cur_fn 全名（命名空间函数 = 路径::函数名），与 IR 层查询一致；
                 // 用裸名 f.name 会导致命名空间函数内下标访问查不到布局元数据。
@@ -1715,10 +1778,14 @@ impl Analyzer {
 
     /// 实参表达式的表元素类型（A1）：表字面量查 tables 元数据；表变量查
     /// table_vars；返回表的函数调用查 table_ret_elems；非表实参返回 None。
+    ///
+    /// 说明：scope 参数为调用点类型检查的常规签名约定，本函数只查语义
+    /// 元数据表（tables / table_vars / table_ret_elems），不查作用域——
+    /// 保留该参数仅为调用点统一传参（避免两处签名漂移）。
     fn arg_table_elem_ty(
         &self,
         expr: &Expr,
-        scope: &HashMap<String, TypeSpec>,
+        _scope: &HashMap<String, TypeSpec>,
     ) -> Result<Option<TypeSpec>, SemanticError> {
         match expr {
             // 表字面量：元素类型来自布局元数据（check_stmt 已登记）
@@ -2950,14 +3017,34 @@ impl Analyzer {
                 if call_name != *name {
                     self.result.resolved_calls.insert(addr_of(expr), call_name.clone());
                 }
-                // 参数个数区间检查（默认值参数）：实参数必须在 [必选数, 总形参数] 内。
-                // 必选数 = 无默认值的形参数（可选参数连续排在尾部，已由 check_fn 保证）。
+                // 参数个数区间检查（默认值参数 + 变参，特性④）：
+                // 变参函数（sig.variadic）：实参数下限 = 必选数，上限 = 无上限
+                //（多余实参逐个打包进变参表 table<T>）；非变参函数：实参数必须
+                // 在 [必选数, 总形参数] 内。
+                // 必选数 = 非变参、无默认值的形参数——精确过滤（take_while 在
+                // 变参前存在默认值形参时会提前停止，无法表达「变参不含下限」）。
+                let total_params = sig.param_tys.len();
                 let required = sig
                     .param_defaults
                     .iter()
-                    .take_while(|d| d.is_none())
+                    .enumerate()
+                    .filter(|(i, d)| {
+                        // 变参形参不贡献必选下限（可接收零个实参）
+                        !(sig.variadic && *i == total_params - 1) && d.is_none()
+                    })
                     .count();
-                if args.len() < required || args.len() > sig.param_tys.len() {
+                if sig.variadic {
+                    if args.len() < required {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!(
+                                "函数 '{call_name}' 期望至少 {} 个参数，实际 {} 个",
+                                required,
+                                args.len()
+                            ),
+                        });
+                    }
+                } else if args.len() < required || args.len() > sig.param_tys.len() {
                     return Err(SemanticError {
                         span: *span,
                         message: format!(
@@ -2967,7 +3054,56 @@ impl Analyzer {
                         ),
                     });
                 }
-                for (i, (a, want)) in args.iter().zip(sig.param_tys.iter()).enumerate() {
+                // 变参元素类型：sig.param_tys 最后一个形参登记为 table<T>，取 T
+                //（语义层 check_fn 已保证；变参函数必有变参形参）。
+                let variadic_elem: Option<TypeSpec> = if sig.variadic {
+                    match sig.param_tys.last() {
+                        Some(TypeSpec::Table(e)) => Some((**e).clone()),
+                        _ => {
+                            return Err(SemanticError {
+                                span: *span,
+                                message: format!("内部错误：变参函数 '{call_name}' 的最后一个形参不是 table<T>"),
+                            })
+                        }
+                    }
+                } else {
+                    None
+                };
+                // 固定形参数：变参函数 = 变参形参之前的形参数（变参形参本身按
+                // 打包表传递，不逐个匹配）；非变参 = 全部形参数。
+                let fixed_len = if sig.variadic {
+                    sig.param_tys.len() - 1
+                } else {
+                    sig.param_tys.len()
+                };
+                for (i, a) in args.iter().enumerate() {
+                    // 变参实参（i >= fixed_len）：逐个与元素类型 T 匹配，类型不符
+                    // 即报错（提示期望的元素类型）——不做表参数的元素级桥校验。
+                    if i >= fixed_len {
+                        let elem = match variadic_elem.as_ref() {
+                            Some(e) => e,
+                            None => {
+                                return Err(SemanticError {
+                                    span: *span,
+                                    message: format!("内部错误：变参函数 '{call_name}' 缺元素类型"),
+                                })
+                            }
+                        };
+                        let at = self.infer_expr(a, scope)?;
+                        self.result.expr_types.insert(addr_of(a), at.clone());
+                        if !types_match(elem, &at, Some(a)) {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!(
+                                    "调用 '{call_name}' 的变参元素类型不匹配：期望 {}，实际 {}",
+                                    type_name(elem),
+                                    type_name(&at)
+                                ),
+                            });
+                        }
+                        continue;
+                    }
+                    let want = &sig.param_tys[i];
                     // T0.3 by_ref：ref 形参的实参必须可寻址（表变量）——IR 层按实参
                     // 槽地址传参（by_ptr 绑定省一次 load），重绑定写回调用方槽。
                     // 字面量/下标/调用结果无变量槽；定长表变量是 [N x T] 数组布局
@@ -3185,11 +3321,15 @@ impl Analyzer {
                         if matches!(&lt, TypeSpec::Named(TyKw::Str)) {
                             return Ok(TypeSpec::Named(TyKw::Bool));
                         }
-                        // 元组比较本期不支持（逐字段 == 留待后续版本）
+                        // 元组比较（特性②）：== / != 支持——逐字段比较（IR 层展开），
+                        // 结果恒为 bool；< > <= >= 对元组无全序意义，继续报错。
                         if matches!(&lt, TypeSpec::Tuple(_)) {
+                            if *op == BinaryOp::Eq || *op == BinaryOp::NotEq {
+                                return Ok(TypeSpec::Named(TyKw::Bool));
+                            }
                             return Err(SemanticError {
                                 span: *span,
-                                message: "元组暂不支持比较运算（逐字段比较留待后续版本）".into(),
+                                message: "元组只支持 ==/!= 比较（< > <= >= 无全序意义）".into(),
                             });
                         }
                         // 平衡三进制比较（M4 补齐）：trit 可比较（==/!=/</>/<=/>=），
@@ -3607,23 +3747,80 @@ impl Analyzer {
                         })?;
                     // 可见性校验（M2.1.7）：私有函数仅同命名空间内可调
                     self.check_visibility(&full, &sig, span)?;
-                    // 参数个数区间检查（默认值参数）：实参数必须在 [必选数, 总形参数] 内。
+                    // 参数个数区间检查（默认值参数 + 变参，特性④）：与裸调用同规则
+                    // ——必选数 = 非变参、无默认值的形参数；变参无实参数上限。
+                    let total_params = sig.param_tys.len();
                     let required = sig
                         .param_defaults
                         .iter()
-                        .take_while(|d| d.is_none())
+                        .enumerate()
+                        .filter(|(i, d)| {
+                            !(sig.variadic && *i == total_params - 1) && d.is_none()
+                        })
                         .count();
-                    if args.len() < required || args.len() > sig.param_tys.len() {
+                    if sig.variadic {
+                        if args.len() < required {
+                            return Err(SemanticError {
+                                span: *span,
+                                message: format!(
+                                    "命名空间函数 '{full}' 期望至少 {} 个参数，实际 {} 个",
+                                    required,
+                                    args.len()
+                                ),
+                            });
+                        }
+                    } else if args.len() < required || args.len() > total_params {
                         return Err(SemanticError {
                             span: *span,
                             message: format!(
                                 "命名空间函数 '{full}' 期望 {} 个参数，实际 {} 个",
-                                param_count_desc(required, sig.param_tys.len()),
+                                param_count_desc(required, total_params),
                                 args.len()
                             ),
                         });
                     }
-                    for (a, want) in args.iter().zip(sig.param_tys.iter()) {
+                    // 变参元素类型（若变参）：最后一个形参登记为 table<T>
+                    let variadic_elem: Option<TypeSpec> = if sig.variadic {
+                        match sig.param_tys.last() {
+                            Some(TypeSpec::Table(e)) => Some((**e).clone()),
+                            _ => {
+                                return Err(SemanticError {
+                                    span: *span,
+                                    message: format!("内部错误：变参函数 '{full}' 的最后一个形参不是 table<T>"),
+                                })
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    // 固定形参数（变参形参之前）；变参实参逐个与元素类型匹配
+                    let fixed_len = if sig.variadic { total_params - 1 } else { total_params };
+                    for (i, a) in args.iter().enumerate() {
+                        if i >= fixed_len {
+                            let elem = match variadic_elem.as_ref() {
+                                Some(e) => e,
+                                None => {
+                                    return Err(SemanticError {
+                                        span: *span,
+                                        message: format!("内部错误：变参函数 '{full}' 缺元素类型"),
+                                    })
+                                }
+                            };
+                            let at = self.infer_expr(a, scope)?;
+                            if !types_match(elem, &at, Some(a)) {
+                                return Err(SemanticError {
+                                    span: expr_span_of(a),
+                                    message: format!(
+                                        "调用 '{full}' 的变参元素类型不匹配：期望 {}，实际 {}",
+                                        type_name(elem),
+                                        type_name(&at)
+                                    ),
+                                });
+                            }
+                            self.result.expr_types.insert(addr_of(a), at);
+                            continue;
+                        }
+                        let want = &sig.param_tys[i];
                         let at = self.infer_expr(a, scope)?;
                         if !types_match(want, &at, Some(a)) {
                             return Err(SemanticError {
@@ -3692,15 +3889,32 @@ impl Analyzer {
                 let sig = self.result.funcs.get(&full).cloned().expect("上方已确认存在");
                 // 方法函数必须 pub（私有 → 拦截）
                 self.check_visibility(&full, &sig, span)?;
-                // 参数个数：总实参 = [receiver] + args（首参是隐含的接收者）
-                let required = sig.param_defaults.iter().take_while(|d| d.is_none()).count();
-                let total = sig.param_tys.len();
+                // 参数个数：总实参 = [receiver] + args（首参是隐含的接收者）。
+                // 变参（特性④）：必选数排除变参形参，变参无实参数上限。
+                let total_params = sig.param_tys.len();
+                let required = sig
+                    .param_defaults
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, d)| {
+                        !(sig.variadic && *i == total_params - 1) && d.is_none()
+                    })
+                    .count();
                 let n_args = args.len() + 1;
-                if n_args < required || n_args > total {
+                if sig.variadic {
+                    if n_args < required {
+                        return Err(SemanticError {
+                            span: *span,
+                            message: format!(
+                                "方法 '{full}' 期望至少 {required} 个参数（含接收者对象），实际 {n_args} 个"
+                            ),
+                        });
+                    }
+                } else if n_args < required || n_args > total_params {
                     return Err(SemanticError {
                         span: *span,
                         message: format!(
-                            "方法 '{full}' 期望 {required}-{total} 个参数（含接收者对象），实际 {n_args} 个"
+                            "方法 '{full}' 期望 {required}-{total_params} 个参数（含接收者对象），实际 {n_args} 个"
                         ),
                     });
                 }
@@ -3716,8 +3930,51 @@ impl Analyzer {
                         ),
                     });
                 }
-                // 其余实参逐个校验
-                for (a, want) in args.iter().zip(sig.param_tys.iter().skip(1)) {
+                // 变参元素类型（若变参）：最后一个形参登记为 table<T>
+                let variadic_elem: Option<TypeSpec> = if sig.variadic {
+                    match sig.param_tys.last() {
+                        Some(TypeSpec::Table(e)) => Some((**e).clone()),
+                        _ => {
+                            return Err(SemanticError {
+                                span: *span,
+                                message: format!("内部错误：变参方法 '{full}' 的最后一个形参不是 table<T>"),
+                            })
+                        }
+                    }
+                } else {
+                    None
+                };
+                // 其余实参逐个校验：跳过变参形参位（i == total-1 且变参），
+                // 变参实参逐个与元素类型匹配（实参索引 = 形参索引 - 1，receiver 占位）
+                let fixed_len = if sig.variadic { total_params - 1 } else { total_params };
+                for (i, a) in args.iter().enumerate() {
+                    // i 是实参索引（不含 receiver），对应形参索引 i+1
+                    let pi = i + 1;
+                    if pi >= fixed_len && sig.variadic {
+                        let elem = match variadic_elem.as_ref() {
+                            Some(e) => e,
+                            None => {
+                                return Err(SemanticError {
+                                    span: *span,
+                                    message: format!("内部错误：变参方法 '{full}' 缺元素类型"),
+                                })
+                            }
+                        };
+                        let at = self.infer_expr(a, scope)?;
+                        if !types_match(elem, &at, Some(a)) {
+                            return Err(SemanticError {
+                                span: expr_span_of(a),
+                                message: format!(
+                                    "调用 '{full}' 的变参元素类型不匹配：期望 {}，实际 {}",
+                                    type_name(elem),
+                                    type_name(&at)
+                                ),
+                            });
+                        }
+                        self.result.expr_types.insert(addr_of(a), at);
+                        continue;
+                    }
+                    let want = &sig.param_tys[pi];
                     let at = self.infer_expr(a, scope)?;
                     if !types_match(want, &at, Some(a)) {
                         return Err(SemanticError {
@@ -6512,11 +6769,20 @@ mod tests {
     }
 
     #[test]
-    fn const全局表报错() {
-        // 设计决策：const 全局表暂不支持（IR 需要 main 入口运行时创建）
+    fn const全局表支持与赋值报错() {
+        // 特性③：const 全局表合法（顶层 `const g: table<i64>;` 通过语义检查，
+        // IR 层 main 入口运行时创建，与 var 全局表同布局）。
+        analyze_src("const g: table<i64>;\nfunc main() {}")
+            .expect("const 全局表声明应通过语义检查");
+        // 内容修改（table_push）允许——const 只约束重绑定
+        analyze_src(
+            "const g: table<i64>;\nfunc main() {\n    table_push(g, 1)\n}\n",
+        )
+        .expect("const 全局表内容修改（table_push）应通过语义检查");
+        // 重绑定赋值报错：const 变量不可赋值
         expect_err(
-            "const g: table<i64>;\nfunc main() {}",
-            "const 全局表暂不支持",
+            "const g: table<i64>;\nfunc main() {\n    g = table_new_i64()\n}\n",
+            "不能给 const 变量",
         );
     }
 
@@ -6614,6 +6880,120 @@ mod tests {
         expect_err(
             "func main() {\n    bar(1)\n}\n",
             "未定义的函数",
+        );
+    }
+
+    // ---------- 特性④：变参函数语义 ----------
+
+    /// 变参函数声明 + 调用（0..n 实参）通过；变参形参在函数体内是动态表。
+    #[test]
+    fn 变参函数声明与调用通过() {
+        // 纯变参：sum() / sum(1) / sum(1,2,3) 都合法；函数体内 len/for 遍历
+        analyze_src(
+            r#"
+            func sum(rest: ...i64) -> i64 {
+                var s: i64 = 0
+                for x in rest {
+                    s = s + x
+                }
+                return s
+            }
+            func main() {
+                println(sum(1, 2, 3))
+                println(sum())
+            }
+            "#,
+        )
+        .expect("变参函数声明与调用应通过语义检查");
+        // 固定参数 + 变参混用（变参元素类型 = string）
+        analyze_src(
+            r#"
+            func g(a: i64, rest: ...string) -> i64 {
+                var n: i64 = a
+                for s in rest {
+                    n = n + len(s)
+                }
+                return n
+            }
+            func main() {
+                println(g(1, "hi", "ab"))
+            }
+            "#,
+        )
+        .expect("固定 + 变参混用应通过语义检查");
+    }
+
+    /// 变参元素类型不匹配 → 报错（多余实参逐个与元素类型匹配）。
+    #[test]
+    fn 变参元素类型不匹配报错() {
+        expect_err(
+            r#"
+            func sum(rest: ...i64) -> i64 {
+                return 0
+            }
+            func main() {
+                println(sum(1, "x"))
+            }
+            "#,
+            "变参元素类型不匹配",
+        );
+    }
+
+    /// 变参实参不足（少于必选固定参数）→ 报错。
+    #[test]
+    fn 变参必选参数不足报错() {
+        // g(a, ...)：必选 a，g() 缺少 a
+        expect_err(
+            r#"
+            func g(a: i64, rest: ...i64) -> i64 {
+                return a
+            }
+            func main() {
+                println(g())
+            }
+            "#,
+            "期望至少",
+        );
+    }
+
+    /// 变参元素类型限标量/string（表/元组/struct 元素 → 报错）。
+    #[test]
+    fn 变参元素类型限标量() {
+        expect_err(
+            r#"
+            func f(rest: ...table<i64>) { }
+            func main() { }
+            "#,
+            "元素类型必须是标量",
+        );
+    }
+
+    // ---------- 特性②：元组 ==/!= ----------
+
+    /// 元组 ==/!= 通过（返回 bool）；< > <= >= 报错。
+    #[test]
+    fn 元组比较等值判断通过() {
+        analyze_src(
+            r#"
+            func main() {
+                var a = (1, 2) == (1, 2)
+                var b = (1, "x") != (1, "y")
+                var c = ((1, 2), 3) == ((1, 2), 3)
+                println(a)
+                println(b)
+                println(c)
+            }
+            "#,
+        )
+        .expect("元组 ==/!= 应通过语义检查");
+    }
+
+    /// 元组 < > <= >= 仍报错（无全序意义）。
+    #[test]
+    fn 元组大小比较仍报错() {
+        expect_err(
+            "func main() {\n    var a = (1, 2) < (1, 3)\n}\n",
+            "元组只支持 ==/!=",
         );
     }
 }

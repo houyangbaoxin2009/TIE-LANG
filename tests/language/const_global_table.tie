@@ -1,0 +1,28 @@
+type tie<logic>
+
+// ============================================================
+// const 全局表验收（特性③）：`const g: table<i64>;` 顶层合法——main 入口
+// 运行时创建（与 var 全局表同布局），内容修改（table_push）允许，
+// 重绑定赋值（g = ...）编译报错（见 const_global_table_neg.tie 负例）。
+//
+// 覆盖场景：
+//   1. const 全局表声明 + 跨函数 table_push 持久化
+//   2. len(g) 长度读取 / g[0] 下标读取
+//
+// 期望输出：
+//   2 / 1 / 2
+// ============================================================
+
+const g: table<i64>;
+
+func add(x: i64) {
+    table_push(g, x)
+}
+
+func main() {
+    add(1)
+    add(2)
+    println(len(g)) // 2
+    println(g[0])   // 1
+    println(g[1])   // 2
+}

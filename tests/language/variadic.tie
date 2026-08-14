@@ -1,0 +1,49 @@
+type tie<logic>
+
+// ============================================================
+// 变参函数验收（特性④）：`func f(a: i64, rest: ...i64)`——多余实参打包为
+// 动态表（table<T>），函数体内可 len / 下标 / for 遍历；变参可为零个实参。
+//
+// 覆盖场景：
+//   1. 纯变参 sum(...)：sum(1,2,3) = 6、sum() = 0、sum(5) = 5
+//   2. 固定参数 + 变参混用：g(a, ...string)，变参为字符串元素
+//   3. 函数体内变参按表操作：len(rest) / rest[0]
+//
+// 期望输出：
+//   6 / 0 / 5 / 5 / 4
+// ============================================================
+
+func sum(rest: ...i64) -> i64 {
+    var s: i64 = 0
+    for x in rest {
+        s = s + x
+    }
+    return s
+}
+
+func g(a: i64, rest: ...string) -> i64 {
+    var n: i64 = a
+    for s in rest {
+        n = n + len(s)
+    }
+    return n
+}
+
+func first_plus_len(rest: ...i64) -> i64 {
+    var l: i64 = len(rest)
+    if l == 0 {
+        return 0
+    }
+    return l + rest[0]
+}
+
+func main() {
+    // 1. 纯变参：sum(1,2,3) = 6、sum() = 0、sum(5) = 5
+    println(sum(1, 2, 3))        // 6
+    println(sum())               // 0
+    println(sum(5))              // 5
+    // 2. 固定 + 变参混用：1 + len("hi") + len("ab") = 5
+    println(g(1, "hi", "ab"))    // 5
+    // 3. 变参按表操作：len(rest)=2，rest[0]=2 → 2+2=4
+    println(first_plus_len(2, 3)) // 4
+}

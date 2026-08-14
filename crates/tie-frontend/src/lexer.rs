@@ -116,7 +116,8 @@ pub enum TokenKind {
     /// 分号（显式写出或 ASI 自动补全）
     Semi,
     Dot,
-    DotDot,   // ..
+    DotDot,     // ..
+    DotDotDot,  // ...（特性④：变参函数标记 `rest: ...i64`）
     Arrow,    // ->
     Plus,
     Minus,
@@ -445,6 +446,7 @@ impl<'a> Lexer<'a> {
                                 | TokenKind::DoubleColon
                                 | TokenKind::Dot
                                 | TokenKind::DotDot
+                                | TokenKind::DotDotDot
                                 | TokenKind::LParen
                                 | TokenKind::LBracket
                                 | TokenKind::LBrace
@@ -861,6 +863,19 @@ impl<'a> Lexer<'a> {
                 }
                 let kind = if c == '<' { TokenKind::Shl } else { TokenKind::Shr };
                 return Ok(Token::new(kind, line, col));
+            }
+            // 三连点 `...`（特性④ 变参标记）：最长匹配，优先于双字符 `..` 范围
+            // 运算符——先看第二个字符是 '.'，再消费第二个、探测第三个。
+            if c == '.' && next == '.' {
+                self.consume_char(); // 消费第二个 '.'
+                // 第三个字符是 '.' → 变参标记 `...`
+                if self.chars.peek() == Some(&'.') {
+                    self.consume_char(); // 消费第三个 '.'
+                    return Ok(Token::new(TokenKind::DotDotDot, line, col));
+                }
+                // 只有两个点 → 回退为范围运算符 `..`（token 已消费第二个 '.',
+                // 与下方双字符 pair 消费行为一致）
+                return Ok(Token::new(TokenKind::DotDot, line, col));
             }
         }
         // 双字符符号

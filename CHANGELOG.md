@@ -1,3 +1,19 @@
+## [修复] tiec 嵌套表 for 遍历桥选错（for row in t，t 为 table<table<i64>>） — 2026-08-14
+
+tie 自写编译器 compiler/（tiec）在 `for row in t`（t 为二维表 desugar 出的
+嵌套表 `table<table<i64>>`）时生成错误桥 `tie_table_at_i64`，返回 i64 存入
+循环变量 ptr 槽，LLVM 报 `'%66' defined with type 'i64' but expected 'ptr'`。
+
+- **根因**：irgen.tie `gen_for_table` 用 `bridge_suffix(elem)` 选桥，而
+  `bridge_suffix` 对表类型（行类型 table<i64>）兜底返回 "i64"。
+- **修复**：元素类型是表/map 时改走 `tie_table_at_string`（返回 ptr）桥，
+  循环变量 LLVM 类型取 TK_STR（ptr）——与 gen_table_at 3228 行既有修复
+  （嵌套表元素读取 at_string）同约定；`len(t[0])`/`len(u[1])`（内层行数）
+  路径无需改动（gen_table_at 已返回 ptr）。
+- **验证**：`2d_table.tie` 输出 `2 / 3 / 2 / 2 / 2 / 2 / 10` 与头注释一致；
+  自举链 tiec→tiec2 IR 逐字节一致；examples/hello.tie 正常；
+  compiler/tests/interp 11 文件全 PASS。
+
 ## [四语言特性] 二维表字面量 / 元组 ==/!= / const 全局表 / 变参函数（tiec 实现） — 2026-08-14
 
 tie 语言新增 4 个语言级特性，**全部在 tie 自写编译器 compiler/（tiec）实现**，

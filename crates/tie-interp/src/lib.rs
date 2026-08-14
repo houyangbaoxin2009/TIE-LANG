@@ -1820,8 +1820,17 @@ impl Session {
             .get(name)
             .cloned()
             .ok_or_else(|| format!("eval_call: 未定义的函数 '{name}'"))?;
-        // 参数检查：期望恰好 1 个参数（模块入口约定），且为字符串
-        let required = f.params.iter().take_while(|p| p.default.is_none()).count();
+        // 参数检查：期望恰好 1 个参数（模块入口约定），且为字符串。
+        // 变参函数（特性④）：必选数 = 非变参、无默认值的形参数（精确过滤，
+        // 变参形参不贡献下限——见 call_fn 同款算法）。
+        let variadic = f.params.last().map(|p| p.variadic).unwrap_or(false);
+        let total_params = f.params.len();
+        let required = f
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| !(variadic && *i == total_params - 1) && p.default.is_none())
+            .count();
         if required > 1 || f.params.len() < 1 {
             return Err(format!(
                 "eval_call: 函数 '{name}' 必须恰好接收 1 个字符串参数（实际形参 {} 个）",
@@ -1839,6 +1848,16 @@ impl Session {
         // 压新作用域绑定参数：第一个参数绑定字符串值，其余（可选）用默认值补齐
         env.scopes.push(std::collections::HashMap::new());
         for (i, p) in f.params.iter().enumerate() {
+            // 变参形参：把当前及后续实参打包为表（eval_call 只提供第 1 个字符串
+            // 实参；变参形参在 i==0 → 单元素表，i>0 → 空表）
+            if p.variadic {
+                let mut vals = Vec::new();
+                if i == 0 {
+                    vals.push(Value::Str(arg.to_string()));
+                }
+                env.scopes.last_mut().unwrap().insert(p.name.clone(), Value::Table(vals));
+                continue;
+            }
             let v = if i == 0 {
                 Value::Str(arg.to_string())
             } else if let Some(d) = &p.default {
@@ -3844,14 +3863,29 @@ impl<'a> Env<'a> {
             _ => {
                 // 用户函数（REPL 中定义的；命名空间函数以全名注册）
                 if let Some(f) = self.session.funcs.get(name).cloned() {
-                    // 参数个数区间检查（默认值参数）：实参数必须在 [必选数, 总形参数] 内。
-                    // 必选数 = 无默认值的形参数（可选参数连续排在尾部，语义层已保证）。
-                    let required = f.params.iter().take_while(|p| p.default.is_none()).count();
-                    if args.len() < required || args.len() > f.params.len() {
+                    // 参数个数区间检查（默认值参数 + 变参，特性④）：
+                    // 必选数 = 非变参、无默认值的形参数（精确过滤——take_while
+                    // 在变参前存在默认值形参时会提前停止，无法表达「变参不含
+                    // 下限」）；变参无实参数上限（多余实参打包为 Value::Table）。
+                    let variadic = f.params.last().map(|p| p.variadic).unwrap_or(false);
+                    let total_params = f.params.len();
+                    let required = f
+                        .params
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, p)| {
+                            !(variadic && *i == total_params - 1) && p.default.is_none()
+                        })
+                        .count();
+                    if args.len() < required || (!variadic && args.len() > f.params.len()) {
                         return Err(format!(
                             "函数 '{name}' 期望 {}-{} 个参数，实际 {} 个",
                             required,
-                            f.params.len(),
+                            if variadic {
+                                "N".to_string()
+                            } else {
+                                f.params.len().to_string()
+                            },
                             args.len()
                         ));
                     }
@@ -3901,6 +3935,13 @@ impl<'a> Env<'a> {
                             ref_layer.insert(p.name.clone(), target);
                             continue;
                         }
+                        // 变参形参（特性④）：把 args[i..] 的全部实参打包为 Value::Table
+                        //（空实参 → 空表），函数体内按动态表操作（len/下标/for）。
+                        if p.variadic {
+                            let rest = args.get(i..).unwrap_or_default().to_vec();
+                            self.scopes.last_mut().unwrap().insert(p.name.clone(), Value::Table(rest));
+                            continue;
+                        }
                         let v = if let Some(v) = args.get(i) {
                             v.clone()
                         } else if let Some(d) = &p.default {
@@ -3912,8 +3953,7 @@ impl<'a> Env<'a> {
                             ));
                         };
                         self.scopes.last_mut().unwrap().insert(p.name.clone(), v);
-                    }
-                    self.refs.push(ref_layer);
+                    }                    self.refs.push(ref_layer);
                     self.scope_base = self.scopes.len() - 1;
                     let result = self.exec_block(&f.body);
                     self.scopes.pop();

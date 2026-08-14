@@ -299,6 +299,12 @@ pub struct Param {
     /// 是否按引用传递（T0.3 by_ref）：`t: ref table<i64>`——ref 表形参 = 真引用，
     /// 内容修改与变量重绑定都写回调用方实参槽。仅限表参数（语义层校验）。
     pub by_ref: bool,
+    /// 是否变参（特性④）：`rest: ...i64`——接收 0..n 个实参，函数体内打包为
+    /// 动态表（table<T>，T = 元素类型）。语法层保证：
+    /// - `...` 必须是最后一个参数；
+    /// - 与 ref / 默认值互斥（语法层直接拦截）。
+    /// 语义层把变参形参在 FuncSig / 作用域中的类型登记为 table<T>。
+    pub variadic: bool,
     pub span: Span,
 }
 

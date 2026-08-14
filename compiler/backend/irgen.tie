@@ -4205,7 +4205,15 @@ func gen_for_table(id: i64, iter: i64, body: i64) -> i64 {
     }
     var suffix = bridge_suffix(elem)
     var elem_llvm_ty = types.named(TK_I64)
-    if suffix == "string" {
+    // 嵌套表元素（elem 是 table/map，如 `for row in t`，t 为 table<table<i64>>）：
+    // 元素在动态表中存 ptr，for 读行必须用 at_string 桥（返回 ptr）——曾按
+    // bridge_suffix 落 at_i64，返回 i64 与循环变量 ptr 槽不符（`store ptr %r,
+    // ptr %slot` 但 %r 是 i64，LLVM 拒收），导致 tie_table_len 收到 i64。对齐
+    // gen_table_at 3228 行的既有修复（同一约定：表/映射元素 → string 桥）。
+    if types.is_table(elem) || types.is_map(elem) {
+        suffix = "string"
+        elem_llvm_ty = types.named(TK_STR)
+    } else if suffix == "string" {
         elem_llvm_ty = types.named(TK_STR)
     } else if suffix == "bool" {
         elem_llvm_ty = types.named(TK_BOOL)

@@ -607,6 +607,11 @@ impl<'p> IrGenerator<'p> {
         for (i, p) in f.params.iter().enumerate() {
             if method_receiver && i == 0 {
                 params.push(format!("ptr {}", mangle(&p.name)));
+            } else if p.ty.is_table() || p.variadic {
+                // 表参数 / 变参形参（特性④）：LLVM 类型恒为 ptr（动态表指针）。
+                // 变参形参声明类型是元素类型（`rest: ...i64`），但调用点打包为
+                // 动态表传参——定义侧必须按 ptr 接收，与调用侧一致。
+                params.push(format!("ptr {}", mangle(&p.name)));
             } else {
                 params.push(format!("{} {}", self.llvm_ty(&p.ty), mangle(&p.name)));
             }
@@ -627,7 +632,9 @@ impl<'p> IrGenerator<'p> {
         // 按 by_ptr 绑定（表操作经 tie_table_* 桥访问），不 alloca。
         let mut scope = HashMap::new();
         for (i, p) in f.params.iter().enumerate() {
-            let is_table_param = p.ty.is_table();
+            // 变参形参（特性④）：声明类型是元素类型（`rest: ...i64`），但签名/
+            // 函数体内是动态表（table<T>，LLVM ptr）——与表参数同布局绑定。
+            let is_table_param = p.ty.is_table() || p.variadic;
             let ty = if is_table_param { "ptr" } else { self.llvm_ty(&p.ty) };
             let pname = mangle(&p.name);
             if method_receiver && i == 0 {
@@ -1392,6 +1399,9 @@ impl<'p> IrGenerator<'p> {
                     // E1 嵌套表（元素是表，dynamic=true 走此分支）：表字面量初始化时
                     // 逐元素递归展开为内层动态表并 push_ptr（[[0,1],[0,2]] → 外层表
                     // 含两个内层 i64 表指针）。标量元素表（table_new_* 等）保持空表。
+                    // 注意必须 mark_used push_ptr 桥——此前缺失导致嵌套表变量初始化
+                    // 生成的 call 引用了未声明符号（opt 报 undefined value）。
+                    self.mark_used("tie_table_push_ptr");
                     for cell in cells {
                         if let Expr::TableLit { cells: sub, .. } = &cell.value {
                             let sub_t = self.gen_table_lit_arg(&cell.value, sub)?;
@@ -2623,7 +2633,84 @@ impl<'p> IrGenerator<'p> {
         if lhs_is_trit || rhs_is_trit {
             return self.gen_binary_trit(op, lhs_is_trit, lv, lt, rv, rt);
         }
+        // 元组比较（特性②）：语义层已保证 op 是 ==/!=（< > <= >= 已拦截），
+        // 逐字段比较并合并（数字 icmp/fcmp、字符串 strcmp、嵌套元组递归）。
+        if let Some(TypeSpec::Tuple(_)) = lhs_sem.as_ref() {
+            let lhs_ty = lhs_sem.ok_or_else(|| IrError {
+                message: format!("内部错误：元组比较缺少左侧语义类型（函数 {}）", self.cur_fn),
+            })?;
+            return self.gen_binary_tuple(op, &lhs_ty, lv, rv);
+        }
         self.gen_binary_on_regs(op, lhs_is_str || rhs_is_str, lv, lt, rv, is_unsigned)
+    }
+
+    /// 元组 `==`/`!=` 逐字段比较（特性②）。
+    ///
+    /// 两个元组值（LLVM 聚合寄存器）按字段逐个提取（extractvalue）比较：
+    /// - 数字/字符/布尔字段 → icmp/fcmp（[gen_binary_on_regs]，按符号性）
+    /// - 字符串字段 → strcmp 结果与 0 比较（[gen_binary_str]）
+    /// - 嵌套元组字段 → 递归 [gen_binary_tuple]
+    ///
+    /// 合并规则：`==` = 全部字段比较结果的 and；`!=` = 该结果取反。
+    /// 返回 i1（与普通比较一致，供 if 条件/赋值使用）。
+    fn gen_binary_tuple(
+        &mut self,
+        op: BinaryOp,
+        lhs_ty: &TypeSpec,
+        lv: String,
+        rv: String,
+    ) -> Result<(String, &'static str), IrError> {
+        // 防御：仅 ==/!= 合法（语义层已拦截其余比较，此处避免 unreachable panic）
+        if op != BinaryOp::Eq && op != BinaryOp::NotEq {
+            return Err(IrError {
+                message: format!("元组二元运算只允许 ==/!=（不支持的运算符：{op:?}）"),
+            });
+        }
+        let TypeSpec::Tuple(tfs) = lhs_ty else {
+            return Err(IrError {
+                message: format!("内部错误：元组比较的左侧类型不是元组（函数 {}）", self.cur_fn),
+            });
+        };
+        let agg_ty = self.llvm_ty(lhs_ty);
+        // 逐字段比较：extractvalue 提取两侧同一字段寄存器后按字段类型分派
+        let mut eqs: Vec<String> = Vec::with_capacity(tfs.len());
+        for (i, tf) in tfs.iter().enumerate() {
+            let lf = self.new_reg();
+            self.line(&format!("{lf} = extractvalue {agg_ty} {lv}, {i}"));
+            let rf = self.new_reg();
+            self.line(&format!("{rf} = extractvalue {agg_ty} {rv}, {i}"));
+            let f_llvm = self.llvm_ty(&tf.ty);
+            // 字段比较：恒用 Eq 比较（合并时统一处理顶层 != 取反）
+            let (c, _ct) = match &tf.ty {
+                // 嵌套元组字段：递归逐字段比较
+                TypeSpec::Tuple(_) => self.gen_binary_tuple(BinaryOp::Eq, &tf.ty, lf, rf)?,
+                // 字符串字段：strcmp(l,r) == 0 才相等
+                TypeSpec::Named(TyKw::Str) => self.gen_binary_str(BinaryOp::Eq, lf, rf)?,
+                // 数字/字符/布尔字段：按符号性生成 icmp/fcmp（Eq/NotEq）
+                _ => {
+                    let is_unsigned = matches!(
+                        &tf.ty,
+                        TypeSpec::Named(TyKw::U8 | TyKw::U16 | TyKw::U32 | TyKw::U64)
+                    );
+                    self.gen_binary_on_regs(BinaryOp::Eq, false, lf, f_llvm, rf, is_unsigned)?
+                }
+            };
+            eqs.push(c);
+        }
+        // and 合并全部字段结果（== 语义：全部字段相等才算相等）
+        let mut acc = eqs.remove(0);
+        for e in eqs {
+            let a = self.new_reg();
+            self.line(&format!("{a} = and i1 {acc}, {e}"));
+            acc = a;
+        }
+        // != 取反：任一字段不等 → 整体不等
+        if op == BinaryOp::NotEq {
+            let n = self.new_reg();
+            self.line(&format!("{n} = xor i1 {acc}, true"));
+            acc = n;
+        }
+        Ok((acc, "i1"))
     }
 
     /// 在已求值的寄存器对上执行二元运算（gen_binary 与复合赋值共用的核心）。
@@ -3801,6 +3888,44 @@ impl<'p> IrGenerator<'p> {
         // 默认值参数（可选参数）：实参不足时按签名默认值补齐——LLVM 函数签名不变
         // （含全部形参），缺省实参在调用点直接生成（默认值限字面量/空表，无作用域依赖）。
         for (i, want_ty) in sig.param_tys.iter().enumerate() {
+            // 变参形参（特性④）：最后一个形参（语义层已保证）。把从「变参实参
+            // 起点」起的全部实参打包为动态表（tie_table_new + 逐元素 push），
+            // 作为单个表实参传递——被调函数按 table<T> 形参接收（函数体内
+            // len/下标/for 走既有动态表路径）。元素类型/桥后缀按语义元素类型选。
+            if sig.variadic && i == sig.param_tys.len() - 1 {
+                // 变参实参起点：实例转发（first=Some）时 receiver 占一个实参位
+                let start = if first.is_some() { i - 1 } else { i };
+                // 变参形参类型已由语义层登记为 table<T>，取元素类型 T
+                let elem_ty = match want_ty {
+                    TypeSpec::Table(e) => (**e).clone(),
+                    _ => {
+                        return Err(IrError {
+                            message: format!(
+                                "内部错误：变参形参（函数 '{name}'）的类型不是 table<T>（函数 {}）",
+                                self.cur_fn
+                            ),
+                        })
+                    }
+                };
+                let elem_llvm = self.llvm_ty(&elem_ty);
+                let elem_size = if elem_llvm == "i1" { 1 } else { 8 };
+                // 新建空动态表（元素宽度与 table_new_* 一致：i1=1 字节，其余 8）
+                self.mark_used("tie_table_new");
+                let t = self.new_reg();
+                self.line(&format!("{t} = call ptr @tie_table_new(i64 {elem_size})"));
+                // 桥后缀按语义元素类型选择（string → push_string；数字 → push_i64 等）
+                let suffix = self.table_bridge_suffix(&elem_ty);
+                self.mark_used(&format!("tie_table_push_{suffix}"));
+                // 逐个求值实参并 push（空切片 → 空表，sum() 合法）
+                for ea in &args[start..] {
+                    let (v, _vt) = self.gen_expr(ea)?;
+                    self.line(&format!(
+                        "call void @tie_table_push_{suffix}(ptr {t}, {elem_llvm} {v})"
+                    ));
+                }
+                arg_list.push(format!("ptr {t}"));
+                continue;
+            }
             // 首参（i==0）且是实例转发（first=Some）→ receiver（隐含接收者，无默认值）
             let is_first = first.is_some() && i == 0;
             let a: &Expr = if is_first {
