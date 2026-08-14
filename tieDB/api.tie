@@ -1,0 +1,180 @@
+type tie<class>
+// tieDB/api.tie —— tieDB 统一数据库 API（命名空间 tiedb）
+// ============================================================
+// tieDB 是 tie 自写的数据库接口库（非独立程序），核心交付 tiedbapi。
+// v1（P0）落地本地向量集合：
+//   - tiedb.connect(path) → 连接句柄（i64）
+//   - tiedb.collection(conn, name) → 集合句柄（i64）
+//   - tiedb.insert(coll, id, vector) / search(coll, q, k) / remove / size
+//   - tiedb.save(coll, path) / load(coll, path) —— zd 压缩持久化
+// 存储：全局单集合（g_ids/g_vecs 展平 + g_dim），索引 = ext/vecsearch Flat。
+//
+// ⚠️ 形态说明（2026-08-15）：规划为两级对象（Connection/Collection + obj.method()），
+// 但 tiec 对跨文件 struct 值传递存在 IR 缺陷（struct 值按 ptr 表示而构造按聚合，
+// store 类型不匹配），方法转发接收者（struct by_ref）同样受影响。v1 先以
+// **句柄模式**落地（可用 + 可验证），struct 定义保留，tiec 修复后无缝升级两级对象。
+// 关系型/外部后端（SQLite/PostgreSQL/MongoDB）与多集合为后续阶段（docs/plans/tiedb.md）。
+
+import "../std/string.tie"
+import "../ext/vecsearch/flat.tie"
+import "./persist/zd.tie"
+
+// ---------- 全局存储（v1：单向量集合，跨函数共享） ----------
+
+var g_ids: table<i64>;        // 向量 id 表
+var g_vecs: table<f64>;       // 向量展平表（每向量 g_dim 个连续元素）
+var g_dim: i64 = 0;           // 向量维度（首个 insert 时定）
+
+// ---------- 对象形态（规划；tiec struct 值传递修复后启用） ----------
+
+struct Connection {
+    var path: string
+    var tag: i64
+}
+
+struct Collection {
+    var conn: Connection
+    var name: string
+}
+
+namespace tiedb {
+
+    // 连接：path 为数据载体路径（v1 仅记录）。返回连接句柄（0 = 默认连接）。
+    pub func connect(path: string) -> i64 {
+        return 0
+    }
+
+    // 取集合（v1 单集合）。返回集合句柄（0 = 默认集合）。
+    pub func collection(conn: i64, name: string) -> i64 {
+        return 0
+    }
+
+    // 插入向量（首插定维度）；id 重复覆盖（下标写）。返回 true。
+    pub func insert(coll: i64, id: i64, v: table<f64>) -> bool {
+        if g_dim == 0 {
+            g_dim = len(v)
+        }
+        var i: i64 = 0
+        while i < len(g_ids) {
+            if g_ids[i] == id {
+                var j: i64 = 0
+                while j < g_dim {
+                    g_vecs[i * g_dim + j] = v[j]
+                    j = j + 1
+                }
+                return true
+            }
+            i = i + 1
+        }
+        table_push(g_ids, id)
+        var j: i64 = 0
+        while j < g_dim {
+            table_push(g_vecs, v[j])
+            j = j + 1
+        }
+        return true
+    }
+
+    // 向量检索：L2 距离升序 top-k（返回 id 表）。
+    pub func search(coll: i64, q: table<f64>, k: i64) -> table<i64> {
+        var out: table<i64> = table_new_i64()
+        var n = len(g_ids)
+        if n == 0 || k <= 0 {
+            return out
+        }
+        var dists: table<f64> = table_new_f64()
+        var sids: table<i64> = table_new_i64()
+        var i: i64 = 0
+        while i < n {
+            var v: table<f64> = table_new_f64()
+            var j: i64 = 0
+            while j < g_dim {
+                table_push(v, g_vecs[i * g_dim + j])
+                j = j + 1
+            }
+            table_push(dists, vecsearch.l2(v, q))
+            table_push(sids, g_ids[i])
+            i = i + 1
+        }
+        var take = k
+        if take > n {
+            take = n
+        }
+        var t: i64 = 0
+        while t < take {
+            var best = t
+            var b: i64 = t + 1
+            while b < n {
+                if dists[b] < dists[best] {
+                    best = b
+                }
+                b = b + 1
+            }
+            var td = dists[t]
+            var ti = sids[t]
+            dists[t] = dists[best]
+            sids[t] = sids[best]
+            dists[best] = td
+            sids[best] = ti
+            table_push(out, sids[t])
+            t = t + 1
+        }
+        return out
+    }
+
+    // 删除向量（按 id，重建全局表）。返回 true。
+    pub func remove(coll: i64, id: i64) -> bool {
+        var i: i64 = 0
+        while i < len(g_ids) {
+            if g_ids[i] == id {
+                var nids: table<i64> = table_new_i64()
+                var nvecs: table<f64> = table_new_f64()
+                var j: i64 = 0
+                while j < len(g_ids) {
+                    if j != i {
+                        table_push(nids, g_ids[j])
+                        var k2: i64 = 0
+                        while k2 < g_dim {
+                            table_push(nvecs, g_vecs[j * g_dim + k2])
+                            k2 = k2 + 1
+                        }
+                    }
+                    j = j + 1
+                }
+                g_ids = nids
+                g_vecs = nvecs
+                return true
+            }
+            i = i + 1
+        }
+        return true
+    }
+
+    // 向量个数。
+    pub func size(coll: i64) -> i64 {
+        return len(g_ids)
+    }
+
+    // 保存到 zd 文件（tie:zd 压缩二进制：dim + ids + vecs 顺序编码）。
+    pub func save(coll: i64, path: string) -> bool {
+        var bytes = zd.encode_i64(g_dim)
+        bytes = zd.concat(bytes, zd.encode_i64_array(g_ids))
+        bytes = zd.concat(bytes, zd.encode_f64_array(g_vecs))
+        return zd.save(path, bytes)
+    }
+
+    // 从 zd 文件载入（校验头 + 顺序解码）。
+    pub func load(coll: i64, path: string) -> bool {
+        var bytes = zd.load(path)
+        if len(bytes) == 0 {
+            return false
+        }
+        var (dim, p1) = zd.decode_i64(bytes, 0)
+        var (ids, p2) = zd.decode_table(bytes, p1, 0)
+        var (vecs, _p3) = zd.decode_table(bytes, p2, 1)
+        g_dim = dim
+        g_ids = ids
+        g_vecs = vecs
+        return true
+    }
+}

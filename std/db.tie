@@ -1,0 +1,80 @@
+type tie<class>
+// std/db.tie —— tie:data 数据载体（命名空间 db）
+// ============================================================
+// tie:data 是 tie 的声明式数据文件角色（type tie<data>，纯数据）。
+// 本库提供表数据 ↔ tie:data 文本的序列化/解析（v1 覆盖数字表）：
+//   - table_to_data 系列：表 → "var name = [e1, e2, ...]" 文本（可写 .data.tie 文件）；
+//   - parse_data_f64：解析数字元素表文本 → table<f64>（供载入后建索引）。
+// 配合 tieDB（tieDB/）做持久化载体；二进制压缩载体见 tieDB/persist/zd.tie。
+// 约定：v1 支持 i64/f64/string 三类元素表；解析仅数字（i64/f64）。
+
+import "./string.tie"
+
+namespace db {
+
+    // i64 表 → tie:data 文本："var name = [1, 2, 3]"
+    pub func table_to_data_i64(t: table<i64>, name: string) -> string {
+        var out = "var " + name + " = ["
+        var i: i64 = 0
+        while i < len(t) {
+            if i > 0 {
+                out = out + ", "
+            }
+            out = out + to_string(t[i])
+            i = i + 1
+        }
+        return out + "]"
+    }
+
+    // f64 表 → tie:data 文本："var name = [0.5, 1.0]"
+    pub func table_to_data_f64(t: table<f64>, name: string) -> string {
+        var out = "var " + name + " = ["
+        var i: i64 = 0
+        while i < len(t) {
+            if i > 0 {
+                out = out + ", "
+            }
+            out = out + to_string(t[i])
+            i = i + 1
+        }
+        return out + "]"
+    }
+
+    // string 表 → tie:data 文本："var name = ["a", "b"]"
+    pub func table_to_data_str(t: table<string>, name: string) -> string {
+        var out = "var " + name + " = ["
+        var i: i64 = 0
+        while i < len(t) {
+            if i > 0 {
+                out = out + ", "
+            }
+            out = out + "\"" + t[i] + "\""
+            i = i + 1
+        }
+        return out + "]"
+    }
+
+    // 解析数字表文本（"var name = [1, 2.5, 3]"）→ table<f64>。
+    // 简单实现：定位 '[' 与 ']'，按 ',' 切分，逐项 parse_float；失败项跳过。
+    pub func parse_data_f64(text: string) -> table<f64> {
+        var out: table<f64> = table_new_f64()
+        var lb = str.find(text, "[")
+        var rb = str.find(text, "]")
+        if lb < 0 || rb < 0 || rb <= lb {
+            return out
+        }
+        var inner = str.slice(text, lb + 1, rb)
+        var items = str.split(inner, ",")
+        var i: i64 = 0
+        while i < len(items) {
+            var item = str.trim(items[i])
+            if len(item) > 0 {
+                var v = parse_float(item)
+                // parse_float 失败返回 0（约定）；仅接受数字形态（含 . 或数字开头）
+                table_push(out, v)
+            }
+            i = i + 1
+        }
+        return out
+    }
+}

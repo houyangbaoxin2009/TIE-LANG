@@ -1,0 +1,54 @@
+type tie<class>
+// rdu/rdb.tie —— 嵌入式数据库子集（rdu 无栈纪律：纯标量）
+// ============================================================
+// rdu（Rudimentary）嵌入式基础层纪律：零原语调用/零动态内存/零数组/无递归/
+// 零全局可变状态/零运行时依赖，只用 i64/f64/bool 标量。
+// 在此约束下 rdb 提供 tieDB API 的**小部分纯标量功能**——查询条件求值：
+//   等值 / 范围 / 大小比较，供 MCU/裸机上的简易数据筛选逻辑使用。
+// 完整数据库（存储/索引/持久化）由 tieDB（tieDB/）承担，本模块是它的嵌入式孪生子集。
+// 参考验收：examples/rdu_rdb_demo.tie（或并入嵌入式示例）。
+
+namespace rdu_rdb {
+
+    // 等值匹配：v == target。
+    pub func cond_eq(v: i64, target: i64) -> bool {
+        return v == target
+    }
+
+    // 范围匹配：lo <= v < hi（左闭右开，与 tie 区间语义一致）。
+    pub func cond_range(v: i64, lo: i64, hi: i64) -> bool {
+        return v >= lo && v < hi
+    }
+
+    // 大于：v > x。
+    pub func cond_gt(v: i64, x: i64) -> bool {
+        return v > x
+    }
+
+    // 小于：v < x。
+    pub func cond_lt(v: i64, x: i64) -> bool {
+        return v < x
+    }
+
+    // 浮点等值（精确位比较；嵌入式场景常用定点数，此处直接 ==）。
+    pub func cond_eq_f(v: f64, target: f64) -> bool {
+        return v == target
+    }
+
+    // 浮点范围：lo <= v < hi。
+    pub func cond_range_f(v: f64, lo: f64, hi: f64) -> bool {
+        return v >= lo && v < hi
+    }
+
+    // 三路比较（trit 风格）：v < x → -1；v == x → 0；v > x → 1。
+    // 供排序/查找逻辑直接消费（与 tie 的 trit 比较语义一致）。
+    pub func cmp_i64(v: i64, x: i64) -> i64 {
+        if v < x {
+            return -1
+        }
+        if v > x {
+            return 1
+        }
+        return 0
+    }
+}

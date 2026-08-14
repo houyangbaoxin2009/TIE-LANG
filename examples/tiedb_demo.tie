@@ -1,0 +1,35 @@
+type tie<logic>
+// examples/tiedb_demo.tie —— tieDB 统一 API 验证（P0-3）
+// ============================================================
+// 两级对象：tiedb.connect → Connection；conn.collection → Collection。
+// 流程：insert 4 向量 → search top-2 → save zd → 清空 → load 恢复 → 再 search。
+// 期望输出：
+//   top1=4 / top2=3
+//   saved / cleared / loaded
+//   after load top1=4
+
+import "../tieDB/api.tie"
+
+func main() {
+    var db = tiedb.connect("demo")
+    var coll = tiedb.collection(db, "vecs")
+    tiedb.insert(coll, 1, [1.0, 0.0])
+    tiedb.insert(coll, 2, [0.0, 1.0])
+    tiedb.insert(coll, 3, [1.0, 1.0])
+    tiedb.insert(coll, 4, [0.5, 0.5])
+    var q: table<f64> = [0.6, 0.6]
+    var hits = tiedb.search(coll, q, 2)
+    println("top1=" + to_string(hits[0]) + " / top2=" + to_string(hits[1]))
+    println("size=" + to_string(tiedb.size(coll)))
+    // 持久化：save → 清空 → load
+    println("saved=" + (tiedb.save(coll, "demo.zd") ? "true" : "false"))
+    tiedb.remove(coll, 1)
+    tiedb.remove(coll, 2)
+    tiedb.remove(coll, 3)
+    tiedb.remove(coll, 4)
+    println("cleared size=" + to_string(tiedb.size(coll)))
+    println("loaded=" + (tiedb.load(coll, "demo.zd") ? "true" : "false"))
+    println("after load size=" + to_string(tiedb.size(coll)))
+    var hits2 = tiedb.search(coll, q, 1)
+    println("after load top1=" + to_string(hits2[0]))
+}
