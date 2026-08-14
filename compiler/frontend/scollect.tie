@@ -285,10 +285,11 @@ func collect_struct_decl(s: i64) -> i64 {
 
 // 查找顶层 struct 定义节点（按名字）
 pub func find_struct_node(name: string) -> i64 {
-    var n = sstate.nchild(g_root)
+    // import 展开后 struct 可能在 g_extra_tops（全部文件顶层，与 find_fn_node 一致）
+    var n = len(g_extra_tops)
     var i: i64 = 0
     while i < n {
-        var s = sstate.child(g_root, i)
+        var s = g_extra_tops[i]
         if s_tags[s] == S_N_STRUCT {
             if sstate.name_str(s) == name {
                 return s

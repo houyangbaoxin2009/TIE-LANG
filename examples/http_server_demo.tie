@@ -1,0 +1,44 @@
+type tie<logic>
+// examples/http_server_demo.tie —— HTTP 服务端演示（P0：std/net + std/http_server）
+// ============================================================
+// 监听 8080，if 链路由：
+//   GET /        → 200 "Hello, tie!"
+//   GET /api     → 200 JSON {"ok":true}
+//   POST /echo   → 200 回显请求体
+//   其他         → 404 "Not Found"
+// 验证：curl http://127.0.0.1:8080/ 等。
+
+import "../std/net.tie"
+import "../std/string.tie"
+import "../std/http_server.tie"
+
+func main() {
+    var srv = httpsrv.listen(8080)
+    if srv < 0 {
+        println("listen failed")
+        return
+    }
+    println("http server on 8080")
+    while true {
+        var conn = httpsrv.accept(srv)
+        if conn < 0 {
+            break
+        }
+        var req = httpsrv.read_request(conn)
+        if req.method == "" {
+            // 对端异常关闭
+            httpsrv.close(conn)
+            continue
+        }
+        // 路由（if 链分派：tie 无函数指针，路径字符串比较）
+        if req.path == "/" {
+            httpsrv.send(conn, 200, "text/plain", "Hello, tie!")
+        } else if req.path == "/api" {
+            httpsrv.send(conn, 200, "application/json", "{\"ok\":true}")
+        } else if str.starts_with(req.path, "/echo") {
+            httpsrv.send(conn, 200, "text/plain", req.body)
+        } else {
+            httpsrv.send(conn, 404, "text/plain", "Not Found")
+        }
+    }
+}

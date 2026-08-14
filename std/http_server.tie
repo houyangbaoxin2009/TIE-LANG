@@ -1,0 +1,163 @@
+type tie<class>
+// std/http_server.tie —— HTTP/1.1 服务端框架（P0：std/net 之上，纯 tie）
+// ============================================================
+// 基于 std/net（TCP），提供请求解析 + 响应构造的框架风格 API：
+//   1. listen(port) 监听（返回监听句柄）
+//   2. accept(srv) 接受连接（阻塞）
+//   3. read_request(conn) 读完整请求（请求行 + headers + body）→ Request
+//   4. send(conn, status, content_type, body) 发送响应（短连接，Connection: close）
+//   5. close(conn) 关闭连接
+// 路由由调用方以 if 链分派（tie 无函数指针/闭包，用 req.path 字符串比较）——
+// 见 examples/http_server_demo.tie。
+// 约定：
+//   - 仅 HTTP/1.1 短连接（一次请求一次响应后关闭），无 keep-alive；
+//   - body 按 Content-Length 读取（无 chunked）；
+//   - headers 存原始行表（"Name: value"），header() 线性查找（忽略大小写）。
+// 参考验收：examples/http_server_demo.tie + curl / tie http 客户端。
+
+// ---------- 请求结构（顶层 struct，纯数据） ----------
+
+struct Request {
+    var method: string
+    var path: string
+    var version: string
+    var headers_text: string   // 原始头文本（请求行之后、空行之前，\r\n 分隔）
+    var body: string
+}
+
+namespace httpsrv {
+
+    // 监听 0.0.0.0:port，返回监听句柄（失败 -1，透传 std/net）。
+    pub func listen(port: i64) -> i64 {
+        return net.tcp_listen(port)
+    }
+
+    // 接受连接（阻塞），返回连接句柄（失败 -1）。
+    pub func accept(srv: i64) -> i64 {
+        return net.tcp_accept(srv)
+    }
+
+    // 读取一个完整请求：请求行 + headers + body（按 Content-Length）。
+    // 读取策略：循环 recv 拼接缓冲直到找到头结束符 "\r\n\r\n"，
+    // 再按 Content-Length 读满 body；解析失败返回空 Request（method 为空）。
+    pub func read_request(conn: i64) -> Request {
+        var req = Request("", "/", "HTTP/1.1", "", "")
+        var buff = ""
+        // 阶段 1：读头部（直到 \r\n\r\n）
+        while !str.contains(buff, "\r\n\r\n") {
+            var chunk = net.tcp_recv(conn, 8192)
+            if len(chunk) == 0 {
+                return req              // 对端关闭
+            }
+            buff = buff + chunk
+        }
+        // 拆分头与 body 剩余
+        var head_end = str.find(buff, "\r\n\r\n")
+        var head = str.slice(buff, 0, head_end)
+        var remain = str.slice(buff, head_end + 4, len(buff))
+        // 请求行：第一行
+        var lines = str.split(head, "\r\n")
+        if len(lines) >= 1 {
+            var parts = str.split(lines[0], " ")
+            if len(parts) >= 3 {
+                req.method = parts[0]
+                req.path = parts[1]
+                req.version = parts[2]
+            }
+        }
+        // headers 文本：请求行之后的部分（原样保留，header() 内解析）
+        var line_end = str.find(head, "\r\n")
+        if line_end < 0 {
+            req.headers_text = ""
+        } else {
+            req.headers_text = str.slice(head, line_end + 2, len(head))
+        }
+        // body：按 Content-Length 读满
+        var cl = header(req, "Content-Length")
+        if len(cl) > 0 {
+            var want = parse_int(cl)
+            if want < 0 {
+                want = 0
+            }
+            var have = len(remain)
+            while have < want {
+                var chunk = net.tcp_recv(conn, 8192)
+                if len(chunk) == 0 {
+                    break
+                }
+                remain = remain + chunk
+                have = len(remain)
+            }
+            req.body = str.slice(remain, 0, want)
+        } else {
+            req.body = remain
+        }
+        return req
+    }
+
+    // 按名字查 header（忽略大小写，线性查找）；未找到返回空串。
+    pub func header(req: Request, name: string) -> string {
+        var lines = str.split(req.headers_text, "\r\n")
+        var i: i64 = 0
+        while i < len(lines) {
+            var line = lines[i]
+            var colon = str.find(line, ":")
+            if colon > 0 {
+                var key = str.trim(str.slice(line, 0, colon))
+                if key == name || key == str.to_lower(name) || key == str.to_upper(name) {
+                    return str.trim(str.slice(line, colon + 1, len(line)))
+                }
+            }
+            i = i + 1
+        }
+        return ""
+    }
+
+    // 状态码 → 原因短语（v1 常用子集）。
+    func reason(status: i64) -> string {
+        if status == 200 {
+            return "OK"
+        }
+        if status == 201 {
+            return "Created"
+        }
+        if status == 204 {
+            return "No Content"
+        }
+        if status == 301 {
+            return "Moved Permanently"
+        }
+        if status == 400 {
+            return "Bad Request"
+        }
+        if status == 403 {
+            return "Forbidden"
+        }
+        if status == 404 {
+            return "Not Found"
+        }
+        if status == 405 {
+            return "Method Not Allowed"
+        }
+        if status == 500 {
+            return "Internal Server Error"
+        }
+        return "OK"
+    }
+
+    // 发送响应并关闭连接（短连接：Connection: close）。
+    // 自动组装状态行 + Content-Type + Content-Length + 空行 + body。
+    pub func send(conn: i64, status: i64, content_type: string, body: string) {
+        var head = "HTTP/1.1 " + to_string(status) + " " + reason(status) + "\r\n"
+        head = head + "Content-Type: " + content_type + "\r\n"
+        head = head + "Content-Length: " + to_string(len(body)) + "\r\n"
+        head = head + "Connection: close\r\n\r\n"
+        net.tcp_send(conn, head + body)
+        net.close(conn)
+    }
+
+    // 关闭连接（透传 std/net）。
+    pub func close(conn: i64) {
+        net.close(conn)
+    }
+}
