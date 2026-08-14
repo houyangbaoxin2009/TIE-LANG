@@ -422,6 +422,13 @@ pub func infer_expr(id: i64) -> i64 {
         } else if op == 0 && lhs == TK_STR && rhs == TK_STR {
             // 字符串拼接
             type_ok = true
+        } else if op >= 5 && op <= 10 && types.kind(lhs) == K_TUPLE &&
+            types.kind(rhs) == K_TUPLE && stype.tuple_equal(lhs, rhs) {
+            // 元组比较：结构相等（逐字段类型一致，嵌套元组递归）即合法——
+            // `(1,2) == (1,2)` 两侧各登记独立 tuple 类型 id，须按字段结构
+            // 比较（对齐 Rust 行为）；==/!= 放行，< > <= >= 在下文 op 分组
+            // 检查中报「比较运算符不能用于 tuple」
+            type_ok = true
         }
         if !type_ok {
             sm_err_line = s_lines[id]
@@ -451,8 +458,17 @@ pub func infer_expr(id: i64) -> i64 {
                 return -1
             }
         } else if op <= 10 {
-            // 比较：数字/字符串/bool/trit
-            if !types.is_number(lhs) && lhs != TK_STR && !types.is_bool_like(lhs) {
+            // 比较：数字/字符串/bool/trit；元组仅 ==/!=（逐字段），< > <= >= 仍报错
+            if types.kind(lhs) == K_TUPLE {
+                if op == 5 || op == 6 {
+                    // 元组相等比较：合法（结果 bool，rt 在下方比较分支统一处理）
+                } else {
+                    sm_err_line = s_lines[id]
+                    sm_err_col = s_cols[id]
+                    sm_err_msg = "比较运算符不能用于 " + types.type_name(lhs)
+                    return -1
+                }
+            } else if !types.is_number(lhs) && lhs != TK_STR && !types.is_bool_like(lhs) {
                 sm_err_line = s_lines[id]
                 sm_err_col = s_cols[id]
                 sm_err_msg = "比较运算符不能用于 " + types.type_name(lhs)
@@ -810,6 +826,18 @@ pub func infer_expr(id: i64) -> i64 {
     return -1
 }
 
+// 变参元素类型（`...T` → T；非变参 -1）。签名存的是 table<T>。
+func sstate_fn_variadic_elem(sig: i64) -> i64 {
+    var n = sg_nparams[sig]
+    if n <= 0 {
+        return -1
+    }
+    if sp_vars[sg_off[sig] + n - 1] != 1 {
+        return -1
+    }
+    return types.table_elem(sp_tys[sg_off[sig] + n - 1])
+}
+
 // 函数调用推断
 pub func infer_call(id: i64) -> i64 {
     var fnm = sstate.name_str(id)
@@ -967,11 +995,15 @@ pub func infer_call(id: i64) -> i64 {
     }
     var req = sg_required[sig]
     var total = sg_nparams[sig]
-    if nc < req || nc > total {
+    var has_var = sstate.fn_has_variadic(sig) == 1
+    // 变参函数：实参数无上界（固定部分 + 任意个额外元素实参）
+    if nc < req || (!has_var && nc > total) {
         sm_err_line = s_lines[id]
         sm_err_col = s_cols[id]
         var cnt_desc = ""
-        if req == total {
+        if has_var {
+            cnt_desc = to_string(req) + "+"
+        } else if req == total {
             cnt_desc = to_string(total)
         } else {
             cnt_desc = to_string(req) + "-" + to_string(total)
@@ -987,6 +1019,14 @@ pub func infer_call(id: i64) -> i64 {
             return -1
         }
         var want = sp_tys[off + j2]
+        // 变参：超过固定形参数（total-1）的实参与变参元素类型 T 匹配
+        var want_fixed: bool = true
+        if has_var {
+            if j2 >= total - 1 {
+                want = sstate_fn_variadic_elem(sig)
+                want_fixed = false
+            }
+        }
         // 表形参（table<T>）的元素不匹配留给 A1 专用检查；非表类型 mismatch 报通用消息
         var want_is_tbl = types.kind(want) == K_TABLE
         var at_is_tbl = types.kind(at) == K_TABLE
@@ -1000,7 +1040,7 @@ pub func infer_call(id: i64) -> i64 {
         }
         // A1：形参 table<T> 的元素类型校验——实参表字面量/动态表变量/返回表的调用，
         // 其元素类型须与 T 一致（裸 table 形参不校验，对齐 Rust）
-        if want_is_tbl && !(want == TK_TABLE) {
+        if want_fixed && want_is_tbl && !(want == TK_TABLE) {
             var want_elem = types.table_elem(want)
             var got_elem = arg_table_elem_ty(args[j2])
             if got_elem >= 0 {
@@ -1014,7 +1054,7 @@ pub func infer_call(id: i64) -> i64 {
         }
         // ref 参数实参校验（对齐 Rust T0.3 by_ref）：实参必须是可寻址变量（变量/字段链），
         // 且必须是动态表（table_new_* 创建）——IR 需取地址写回
-        if sp_refs[off + j2] == 1 {
+        if want_fixed && sp_refs[off + j2] == 1 {
             if !sstate.is_addressable(args[j2]) {
                 sm_err_line = s_lines[id]
                 sm_err_col = s_cols[id]
@@ -1268,9 +1308,12 @@ pub func infer_method_call(id: i64) -> i64 {
     }
     var req = sg_required[sig]
     var total = sg_nparams[sig]
-    if len(args) < req || len(args) > total {
+    var has_var = sstate.fn_has_variadic(sig) == 1
+    if len(args) < req || (!has_var && len(args) > total) {
         var cnt_desc2 = ""
-        if req == total {
+        if has_var {
+            cnt_desc2 = to_string(req) + "+"
+        } else if req == total {
             cnt_desc2 = to_string(total)
         } else {
             cnt_desc2 = to_string(req) + "-" + to_string(total)
@@ -1288,6 +1331,11 @@ pub func infer_method_call(id: i64) -> i64 {
             return -1
         }
         var want = sp_tys[off + j]
+        if has_var {
+            if j >= total - 1 {
+                want = sstate_fn_variadic_elem(sig)   // 变参：元素类型匹配
+            }
+        }
         if !stype.types_compatible(want, at) && !stype.types_match(want, at, args[j]) {
             sm_err_line = s_lines[id]
             sm_err_col = s_cols[id]
@@ -1391,11 +1439,20 @@ pub func infer_struct_method(recv: i64, recv_ty: i64, mname: string, args: table
     // required = sg_required（含接收者必选数），total = 形参数，n_args = args+1
     var req_m = sg_required[sig]
     var total = sg_nparams[sig]
+    var has_var = sstate.fn_has_variadic(sig) == 1
     var n_args = len(args) + 1
-    if n_args < req_m || n_args > total {
+    if n_args < req_m || (!has_var && n_args > total) {
         sm_err_line = s_lines[id]
         sm_err_col = s_cols[id]
-        sm_err_msg = "方法 '" + full + "' 期望 " + to_string(req_m) + "-" + to_string(total) + " 个参数（含接收者对象），实际 " + to_string(n_args) + " 个"
+        var cnt_m = ""
+        if has_var {
+            cnt_m = to_string(req_m) + "+"
+        } else if req_m == total {
+            cnt_m = to_string(total)
+        } else {
+            cnt_m = to_string(req_m) + "-" + to_string(total)
+        }
+        sm_err_msg = "方法 '" + full + "' 期望 " + cnt_m + " 个参数（含接收者对象），实际 " + to_string(n_args) + " 个"
         return -1
     }
     // 接收者类型匹配（首参）
@@ -1414,6 +1471,11 @@ pub func infer_struct_method(recv: i64, recv_ty: i64, mname: string, args: table
             return -1
         }
         var want2 = sp_tys[off + 1 + j]
+        if has_var {
+            if 1 + j >= total - 1 {
+                want2 = sstate_fn_variadic_elem(sig)   // 变参：元素类型匹配
+            }
+        }
         if !stype.types_compatible(want2, at) && !stype.types_match(want2, at, args[j]) {
             sm_err_line = s_lines[id]
             sm_err_col = s_cols[id]

@@ -741,7 +741,59 @@ func parse_table_lit(line: i64, col: i64) -> i64 {
         }
     }
     var t = ast.new_node(N_TABLE_LIT, -1, -1, -1, line, col)
-    ast.set_children(t, cells)
+    // 二维表 desugar：存在 row > 0 的 cell（出现过 `;` 分行）→ 按行分组，
+    // 每行构造一个**子表字面量**（N_TABLE_LIT，含该行全部 cell 作其子节点）
+    // 作为外层表字面量的 cell——`[1,2;3,4]` 等价于 `[[1,2],[3,4]]`（嵌套表）。
+    // 对齐 Rust 侧行为：多行 + 任何 id 元素（`id:value`）→ 报错。
+    var max_row: i64 = 0
+    var has_id: bool = false
+    var c0: i64 = 0
+    while c0 < len(cells) {
+        var cc = cells[c0]
+        var r = ast.val(cc)
+        if r > max_row {
+            max_row = r
+        }
+        if ast.child_at(cc, 0) >= 0 {
+            has_id = true
+        }
+        c0 = c0 + 1
+    }
+    if max_row > 0 {
+        if has_id {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "二维表不支持 id 元素")
+            return -1
+        }
+        // 外层表字面量的 cell 必须是 N_TABLE_CELL 包装（与手写嵌套表
+        // `[[1,2],[3,4]]` 结构一致：cell = [TableId或-1, 值]）——语义层
+        // TableLit 推断按「cell → child(cell,1) 取值」遍历，直接放子表
+        // 字面量作 cell 会被误当值节点（"无法推断表达式（节点 19）"）。
+        var sub: table<i64> = table_new_i64()
+        var r0: i64 = 0
+        while r0 <= max_row {
+            var rcells: table<i64> = table_new_i64()
+            var c1: i64 = 0
+            while c1 < len(cells) {
+                if ast.val(cells[c1]) == r0 {
+                    table_push(rcells, cells[c1])
+                }
+                c1 = c1 + 1
+            }
+            var subn = ast.new_node(N_TABLE_LIT, -1, -1, -1, line, col)
+            ast.set_children(subn, rcells)
+            // 每行包一个 N_TABLE_CELL（无 id，值为子表）
+            var wcell = ast.new_node(N_TABLE_CELL, -1, -1, -1, line, col)
+            var wkids: table<i64> = table_new_i64()
+            table_push(wkids, -1)
+            table_push(wkids, subn)
+            ast.set_children(wcell, wkids)
+            table_push(sub, wcell)
+            r0 = r0 + 1
+        }
+        ast.set_children(t, sub)
+    } else {
+        ast.set_children(t, cells)
+    }
     return t
 }
 

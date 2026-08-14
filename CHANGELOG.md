@@ -1,3 +1,31 @@
+## [四语言特性] 二维表字面量 / 元组 ==/!= / const 全局表 / 变参函数（tiec 实现） — 2026-08-14
+
+tie 语言新增 4 个语言级特性，**全部在 tie 自写编译器 compiler/（tiec）实现**，
+Rust 侧并行实现同语义（仅作行为对照基线）。
+
+- **二维表字面量** `[1,2;3,4]`：parser 层 desugar 为嵌套表 `[[1,2],[3,4]]`
+  （N_TABLE_CELL 包装，与手写嵌套表结构一致）；多行 + id 元素报错
+  「二维表不支持 id 元素」。连带修复 irgen 嵌套表字面量 push 选桥
+  （按值类型选 push_string）与嵌套表元素读取（at_string 返回 ptr）——
+  此前 `[[1,2],[3,4]]` 字面量/读取在 LLVM 层类型错。
+- **元组 ==/!=**：`(1,2) == (1,2)` → true；`< > <= >=` 对元组仍报错
+  「比较运算符不能用于 tuple」。逐字段递归比较（标量 icmp / 浮点 fcmp /
+  字符串 strcmp / 嵌套元组递归），`==` 全部字段 and 合并、`!=` 取反；
+  新增 stype.tuple_equal 深层结构相等判定（嵌套元组字段独立 tuple id）。
+- **const 全局表**：`const g: table<i64>;` 合法；整变量重绑定
+  `g = ...` 报「不能给 const 变量赋值」（scheck 既有 gb_const_of 拦截）；
+  table_push / 下标修改内容允许。
+- **变参函数**：`func f(a: i64, rest: ...i64)`（元素类型限标量
+  i8..u64/f32/f64/bool/char/string）；只允许最后一个、与 ref/默认值互斥；
+  调用点 `f(1, 2, 3)` 多余实参打包为动态表实参，函数体内 `rest` 以
+  table<T> 动态表登记（支持 len/下标/for）；interp 同步打包 Value 表。
+  连带修复 tie 自写 interp 的**泛型槽偏移**缺陷（Call/MethodCall/table_push/
+  FnDef 参数访问按 slot_off 偏移——此前所有函数调用多收一个哑参、
+  形参错位，interp_eval_call 用例转绿）。
+- **验证**：`compiler/tests/interp` 11 文件全 PASS（含此前失败的
+  interp_eval_call）；semantic_test / parse_test 回归通过；自举链
+  tiec→tiec2 全程；新增最小探针覆盖 4 特性正反用例。
+
 ## [泛型系统] 泛型函数 + 泛型 struct——编译期单态化全链路落地（tiec 实现） — 2026-08-14
 
 tie 语言引入用户可定义泛型（此前仅内建 `table<T>`/`map<T>` 预置类型参数），

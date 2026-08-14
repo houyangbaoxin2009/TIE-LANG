@@ -54,6 +54,7 @@ const lex_pipe: i64 = 72; const lex_caret: i64 = 73;
 const lex_shl: i64 = 74; const lex_shr: i64 = 75;
 const lex_inc: i64 = 76; const lex_dec: i64 = 77;
 const lex_question: i64 = 78; const lex_eof: i64 = 79;
+const lex_ellipsis: i64 = 80;   // `...` 变参标记（func f(rest: ...i64)）
 
 namespace lextok {
 
@@ -119,7 +120,8 @@ func is_bin_op(tag: i64) -> bool {
 // 是否「行尾不可结束语句」集合（Rust finish_line 排除表；RBracket 不在其中）
 func no_semi_end(tag: i64) -> bool {
     var bad: table<i64> = [lex_comma, lex_colon, lex_dcolon, lex_dot, lex_dotdot,
-        lex_lparen, lex_lbracket, lex_lbrace, lex_rbrace, lex_semi, lex_else, lex_in]
+        lex_ellipsis, lex_lparen, lex_lbracket, lex_lbrace, lex_rbrace, lex_semi,
+        lex_else, lex_in]
     var i: i64 = 0
     while i < len(bad) {
         if bad[i] == tag {

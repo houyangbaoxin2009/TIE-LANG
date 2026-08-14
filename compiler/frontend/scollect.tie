@@ -70,7 +70,16 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
     var p_tys: table<i64> = table_new_i64()
     var p_refs: table<i64> = table_new_i64()
     var p_defs: table<i64> = table_new_i64()
+    var p_vars: table<i64> = table_new_i64()
     var required: i64 = nparams
+    // 变参函数：必选数初值扣掉变参本身（调用方可传 0 个额外实参；
+    // 下方循环对变参跳过时保留该初值——如 `sum(rest: ...i64)` 需 0）
+    if nparams > 0 {
+        var lastp = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + (nparams - 1))
+        if s_aux[lastp] == 1 {
+            required = nparams - 1
+        }
+    }
     // 默认值校验：ref 不能带默认值 + 可选参数必须连续 + 默认值必须字面量 + 类型匹配
     var seen_default: bool = false
     var k: i64 = 0
@@ -82,6 +91,7 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
             return -1
         }
         var is_ref = s_vals[p]
+        var is_var = s_aux[p]   // 变参标志（`name: ...T`，parser 写入 aux）
         var has_def: i64 = 0
         var def_node: i64 = -1
         if sstate.nchild(p) > 1 {
@@ -89,6 +99,36 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
             if def_node >= 0 {
                 has_def = 1
             }
+        }
+        // 变参（`...T`）：必须最后一个、无 ref、无默认值、元素类型限标量
+        if is_var == 1 {
+            if k != nparams - 1 {
+                sm_err_line = s_lines[p]
+                sm_err_col = s_cols[p]
+                sm_err_msg = "变参参数 '" + sstate.name_str(p) + "' 必须是最后一个参数"
+                return -1
+            }
+            if is_ref == 1 {
+                sm_err_line = s_lines[p]
+                sm_err_col = s_cols[p]
+                sm_err_msg = "变参参数 '" + sstate.name_str(p) + "' 不能同时使用 ref 修饰"
+                return -1
+            }
+            if has_def == 1 {
+                sm_err_line = s_lines[p]
+                sm_err_col = s_cols[p]
+                sm_err_msg = "变参参数 '" + sstate.name_str(p) + "' 不能有默认值"
+                return -1
+            }
+            // 元素类型限标量（i8..u64/f32/f64/bool/char/string；对齐 extern 标量集）
+            if !is_scalar_t(pt) {
+                sm_err_line = s_lines[p]
+                sm_err_col = s_cols[p]
+                sm_err_msg = "变参参数 '" + sstate.name_str(p) + "' 元素类型必须是标量（i8..u64/f32/f64/bool/char/string），实际是 " + types.type_name(pt)
+                return -1
+            }
+            // 变参在函数体/调用点表现为 table<T>（签名登记表类型）
+            pt = types.table_of(pt)
         }
         // ref 参数不能有默认值（对齐 Rust：必须在调用点传实参）
         if is_ref == 1 && has_def == 1 {
@@ -105,9 +145,10 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
             return -1
         }
         // 可选参数（带默认值）必须连续排在必选参数之后
+        // （变参不参与该约束——它恒居末位，前面允许可选参数）
         if has_def == 1 {
             seen_default = true
-        } else if seen_default {
+        } else if seen_default && is_var == 0 {
             sm_err_line = s_lines[p]
             sm_err_col = s_cols[p]
             sm_err_msg = "参数 '" + sstate.name_str(p) + "' 缺少默认值：可选参数（带默认值）必须连续排在必选参数之后"
@@ -155,7 +196,9 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
         table_push(p_tys, pt)
         table_push(p_refs, is_ref)
         table_push(p_defs, has_def)
-        if has_def == 0 {
+        table_push(p_vars, is_var)
+        // 必选数：变参本身不计数（调用方可传 0 个额外实参）
+        if has_def == 0 && is_var == 0 {
             required = k + 1
         }
         k = k + 1
@@ -178,7 +221,7 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
             }
         }
     }
-    if sstate.reg_fn(full, is_pub, nparams, required, ret_ty, p_tys, p_refs, p_defs) < 0 {
+    if sstate.reg_fn(full, is_pub, nparams, required, ret_ty, p_tys, p_refs, p_defs, p_vars) < 0 {
         sm_err_line = s_lines[fn_node]
         sm_err_col = s_cols[fn_node]
         return -1
@@ -653,13 +696,8 @@ pub func collect_global_var(v: i64) -> i64 {
     }
     var k = types.kind(ty)
     if k == K_TABLE || k == K_MAP || ty == TK_TABLE || ty == TK_MAP {
-        // 表全局：const 不支持；初始化必须空表
-        if is_const == 1 {
-            sm_err_line = s_lines[v]
-            sm_err_col = s_cols[v]
-                sm_err_msg = "const 全局表暂不支持：'" + nm + "'（表在 main 入口运行时创建，无法静态初始化）"
-            return -1
-        }
+        // 表全局：const 支持（内容修改如 table_push 允许，整变量重绑定由
+        // scheck 的 gb_const_of 拦截）；初始化必须空表
         // 初始化若非空表字面量（对齐 Rust：元素类型可由标注推导，非空表
         // 的静态布局与调用点克隆不一致）——拦截
         if init >= 0 {
@@ -766,6 +804,7 @@ pub func collect_top() -> i64 {
             var p_tys: table<i64> = table_new_i64()
             var p_refs: table<i64> = table_new_i64()
             var p_defs: table<i64> = table_new_i64()
+            var p_vars: table<i64> = table_new_i64()
             var k: i64 = 0
             while k < nparams {
                 var p = sstate.child(s, 1 + k)
@@ -783,9 +822,10 @@ pub func collect_top() -> i64 {
                 table_push(p_tys, pt)
                 table_push(p_refs, 0)
                 table_push(p_defs, 0)
+                table_push(p_vars, 0)
                 k = k + 1
             }
-            if sstate.reg_fn(full, 1, nparams, nparams, ret_ty, p_tys, p_refs, p_defs) < 0 {
+            if sstate.reg_fn(full, 1, nparams, nparams, ret_ty, p_tys, p_refs, p_defs, p_vars) < 0 {
                 sm_err_line = s_lines[s]
                 sm_err_col = s_cols[s]
                 return -1

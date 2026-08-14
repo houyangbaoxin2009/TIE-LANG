@@ -639,6 +639,11 @@ func gen_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
     if lhs_f || rhs_f {
         return gen_binary_float(op, lv, rv)
     }
+    // 元组 ==/!=：逐字段递归比较（语义层已校验两侧为结构相等元组；
+    // < > <= >= 在语义层已被拦截，此处仅处理 5/6）
+    if types.kind(lhs_t) == K_TUPLE {
+        return gen_tuple_compare(op, lhs, rhs, lv, rv)
+    }
     // op 码（ast）：0=+ 1=- 2=* 3=/ 4=% 5== 6!= 7< 8> 9<= 10>= 11&& 12||
     // 13& 14| 15^ 16<< 17>>（逻辑已在短路分支处理；此处为位运算）
     // tie-IR opcode：add(0) sub(1) mul(2) div(3) mod(4) icmp(12) and(6) or(7)
@@ -748,6 +753,167 @@ func gen_binary_float(op: i64, lv: i64, rv: i64) -> i64 {
         ir.add_operand(inst, cmp, 2)
     }
     return ir.get_value(inst)
+}
+
+// ==================== 元组 ==/!= 比较（逐字段递归，对齐 Rust 行为）====================
+// `(a,b) == (c,d)` → 逐字段比较后全部 and 合并；`!=` 对 == 结果 xor 取反。
+// 字段提取复用聚合地址 + agg_gep + load；标量 icmp/fcmp，字符串 strcmp 后
+// icmp，嵌套元组字段递归（值落内存再 GEP）。表/映射字段不支持（报错）。
+
+// 元组比较入口：op 仅 5(==)/6(!=)；两侧语义类型为结构相等元组。
+// lv/rv 为 gen_binary 已求值的左右值——表达式操作数直接落内存（避免
+// 二次求值副作用），Var 操作数走槽地址（不重复求值）。
+func gen_tuple_compare(op: i64, lhs: i64, rhs: i64, lv: i64, rv: i64) -> i64 {
+    if op != 5 && op != 6 {
+        sm_err_msg = "元组仅支持 ==/!= 比较（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var agg = node_types[lhs]
+    if types.kind(agg) != K_TUPLE {
+        sm_err_msg = "元组比较目标不是元组（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var laddr = gen_agg_operand_addr(lhs, lv, agg)
+    if laddr < 0 {
+        return -1
+    }
+    var raddr = gen_agg_operand_addr(rhs, rv, agg)
+    if raddr < 0 {
+        return -1
+    }
+    var eq = gen_agg_cmp_fields(agg, laddr, raddr)
+    if eq < 0 {
+        return -1
+    }
+    if op == 6 {
+        // !=：xor i1 eq, true
+        var nx = ir.new_inst(g_cur_block, 8, types.named(TK_BOOL))
+        ir.add_operand(nx, eq, 0)
+        ir.add_operand(nx, 1, 2)
+        return ir.get_value(nx)
+    }
+    return eq
+}
+
+// 聚合比较操作数地址：Var → 槽地址（gen_agg_addr，不重复求值）；
+// 表达式 → 已求值值落内存（agg_val_to_addr）。
+func gen_agg_operand_addr(node: i64, pre_val: i64, agg: i64) -> i64 {
+    if s_tags[node] == 6 {
+        return gen_agg_addr(node, agg)
+    }
+    return agg_val_to_addr(pre_val, agg)
+}
+
+// 比较两个同类型聚合地址的全部字段（== 语义）：逐字段比较 + and 合并。
+// 返回 i1（全部字段相等 → true）；空元组恒真。
+func gen_agg_cmp_fields(agg: i64, laddr: i64, raddr: i64) -> i64 {
+    var t = agg - BASE_TUPLE
+    var nf = tup_n[t]
+    var off = tup_offs[t]
+    var acc: i64 = -1
+    var i: i64 = 0
+    while i < nf {
+        var fty = tup_tys[off + i]
+        var lgp = ir.new_inst(g_cur_block, 27, agg)  // agg_gep 左字段地址
+        ir.add_operand(lgp, laddr, 0)
+        ir.add_operand(lgp, i, 2)
+        var lfv = gen_agg_field_load(ir.get_value(lgp), fty)
+        if lfv < 0 {
+            return -1
+        }
+        var rgp = ir.new_inst(g_cur_block, 27, agg)  // agg_gep 右字段地址
+        ir.add_operand(rgp, raddr, 0)
+        ir.add_operand(rgp, i, 2)
+        var rfv = gen_agg_field_load(ir.get_value(rgp), fty)
+        if rfv < 0 {
+            return -1
+        }
+        var fc = gen_agg_field_cmp(fty, lfv, rfv)
+        if fc < 0 {
+            return -1
+        }
+        if acc < 0 {
+            acc = fc
+        } else {
+            // and i1 acc, fc（任一字段不等 → false）
+            var a2 = ir.new_inst(g_cur_block, 6, types.named(TK_BOOL))
+            ir.add_operand(a2, acc, 0)
+            ir.add_operand(a2, fc, 0)
+            acc = ir.get_value(a2)
+        }
+        i = i + 1
+    }
+    if acc < 0 {
+        // 空元组 () 语义层已拦截；防御恒真
+        return gen_bool_lit(1)
+    }
+    return acc
+}
+
+// 字段地址 → 字段值（load；ins_ty = 字段类型 fty）
+func gen_agg_field_load(faddr: i64, fty: i64) -> i64 {
+    var ld = ir.new_inst(g_cur_block, 21, fty)
+    ir.add_operand(ld, faddr, 0)
+    return ir.get_value(ld)
+}
+
+// 聚合值 → 内存地址（嵌套元组字段值落 alloca，供 agg_gep 寻址）
+func agg_val_to_addr(v: i64, agg: i64) -> i64 {
+    var alloca = ir.new_inst(g_cur_block, 20, agg)  // alloca
+    ir.add_operand(alloca, agg, 2)
+    var ap = ir.get_value(alloca)
+    var st = ir.new_inst(g_cur_block, 22, -1)  // store
+    ir.add_operand(st, agg, 2)
+    ir.add_operand(st, v, 0)
+    ir.add_operand(st, ap, 0)
+    return ap
+}
+
+// 单字段比较（==）：标量 icmp / 浮点 fcmp / 字符串 strcmp+icmp /
+// 嵌套元组递归；表/映射字段不支持。
+func gen_agg_field_cmp(fty: i64, lfv: i64, rfv: i64) -> i64 {
+    if fty == types.named(TK_STR) {
+        // strcmp(lfv, rfv) == 0
+        var cmp = gen_ext_call2("strcmp", lfv, types.named(TK_STR), rfv, types.named(TK_STR), types.named(TK_I32))
+        if cmp < 0 {
+            return -1
+        }
+        var inst = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp i1
+        ir.add_operand(inst, cmp, 0)
+        ir.add_operand(inst, 0, 2)
+        ir.add_operand(inst, 0, 2)  // eq
+        return ir.get_value(inst)
+    }
+    if fty == types.named(TK_F64) || fty == types.named(TK_F32) {
+        // fcmp oeq
+        var f = ir.new_inst(g_cur_block, 18, types.named(TK_BOOL))
+        ir.add_operand(f, lfv, 0)
+        ir.add_operand(f, rfv, 0)
+        ir.add_operand(f, 0, 2)  // oeq
+        return ir.get_value(f)
+    }
+    if types.kind(fty) == K_TUPLE {
+        // 嵌套元组：值落内存后递归逐字段比较
+        var la = agg_val_to_addr(lfv, fty)
+        if la < 0 {
+            return -1
+        }
+        var ra = agg_val_to_addr(rfv, fty)
+        if ra < 0 {
+            return -1
+        }
+        return gen_agg_cmp_fields(fty, la, ra)
+    }
+    if types.is_table(fty) || types.is_map(fty) {
+        sm_err_msg = "元组字段为表类型，不支持 ==/!= 比较（字段类型 " + types.type_name(fty) + "）"
+        return -1
+    }
+    // 整数/bool/char/trit：icmp eq
+    var ic = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+    ir.add_operand(ic, lfv, 0)
+    ir.add_operand(ic, rfv, 0)
+    ir.add_operand(ic, 0, 2)  // eq
+    return ir.get_value(ic)
 }
 
 // trit 二元运算（对齐 Rust gen_binary_trit）：
@@ -2162,16 +2328,31 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
     var ptys = fn_param_tys(sig)
     var sym = interner.intern(full)
     llvmgen.call_sym_reg(sym)
+    // 变参（`...T`）：固定形参数 = nparams - 1，多余实参打包为动态表实参
+    var has_var = sstate.fn_has_variadic(sig) == 1
+    var fixed_n: i64 = nparams
+    var var_elem: i64 = -1
+    if has_var {
+        fixed_n = nparams - 1
+        var_elem = types.table_elem(ptys[nparams - 1])
+    }
     // 实参全求值（by_ref 形参 + Var 实参 → 传槽地址跳过 load）
     var nc = sstate.nchild(id)
     var argvals: table<i64> = table_new_i64()
     var argisref: table<i64> = table_new_i64()  // 并行：ref 实参标志（类型 → ptr）
+    var extra_nodes: table<i64> = table_new_i64()  // 变参多余实参（稍后打包）
     var k: i64 = arg_start
     while k < nc {
         var arg_node = sstate.child(id, k)
         var av: i64 = -1
         var is_ref_arg: i64 = 0
         var arg_idx = k - arg_start  // 实参序号（aoff=1 时 children[0] 是路径节点）
+        if has_var && arg_idx >= fixed_n {
+            // 变参多余实参：收集节点，最后统一打包成表实参（不单独求值/压参）
+            table_push(extra_nodes, arg_node)
+            k = k + 1
+            continue
+        }
         if arg_idx < nparams {
             // T0.3 by_ref：实参是 Var 时传实参槽地址（局部 alloca %N / 全局 @g），
             // 函数内 load/store 透过该槽 → 内容修改 + 重绑定都写回调用方。
@@ -2192,6 +2373,15 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
         table_push(argvals, av)
         table_push(argisref, is_ref_arg)
         k = k + 1
+    }
+    // 变参打包：多余实参 → 动态表（无多余实参也要传空表）
+    if has_var {
+        var tbl = gen_variadic_table(extra_nodes, var_elem)
+        if tbl < 0 {
+            return -1
+        }
+        table_push(argvals, tbl)
+        table_push(argisref, 0)
     }
     var ty35: i64 = -1
     if ret_ty != types.named(TK_VOID) {
@@ -2220,6 +2410,39 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
         return gen_int_lit(0)  // void 结果：哑值（调用方丢弃）
     }
     return ir.get_value(inst)
+}
+
+// 变参打包：多余实参节点 → 动态表（tie_table_new + 逐元素 push）。
+// 元素类型 = 变参元素类型 T（标量）。按值类型选桥（对齐 gen_table_lit）。
+func gen_variadic_table(nodes: table<i64>, elem: i64) -> i64 {
+    g_used_interp = true
+    var size = elem_size(elem)
+    var size_v = gen_int_lit_ty(size, types.named(TK_I64))
+    var t = gen_ext_call1("tie_table_new", size_v, types.named(TK_I64), types.named(TK_STR))
+    var i: i64 = 0
+    while i < len(nodes) {
+        var v = gen_expr(nodes[i])
+        if v < 0 {
+            return -1
+        }
+        var suffix = bridge_suffix(elem)
+        var pty = types.named(TK_I64)
+        var vt = node_types[nodes[i]]
+        if vt >= 0 && (types.is_table(vt) || types.is_map(vt) || vt == types.named(TK_STR)) {
+            suffix = "string"
+            pty = types.named(TK_STR)
+        } else if vt >= 0 && (vt == types.named(TK_F64) || vt == types.named(TK_F32)) {
+            suffix = "f64"
+            pty = types.named(TK_F64)
+        } else if suffix == "string" {
+            pty = types.named(TK_STR)
+        } else if suffix == "bool" {
+            pty = types.named(TK_BOOL)
+        }
+        gen_ext_call2v("tie_table_push_" + suffix, t, types.named(TK_STR), v, pty)
+        i = i + 1
+    }
+    return t
 }
 
 // 方法调用（MethodCall，tag 18）：receiver + 方法名 → 命名空间函数全名。
@@ -2291,9 +2514,20 @@ func gen_struct_method_call(full: string, id: i64, recv: i64, rty: i64) -> i64 {
     // 其余实参（从 children[slot_off + 1] 起：children[slot_off]=receiver）
     var soff2 = sstate.slot_off(id)
     var nc = sstate.nchild(id)
+    var has_var = sstate.fn_has_variadic(sig) == 1
+    var fixed_m: i64 = nparams - 1   // 去掉接收者后的固定参数（含变参位置）
+    var extra_nodes: table<i64> = table_new_i64()
     var k: i64 = 1 + soff2
     while k < nc {
-        var av = gen_expr(sstate.child(id, k))
+        var arg_node = sstate.child(id, k)
+        var arg_idx = k - soff2  // 形参序号（0 = 接收者）
+        if has_var && arg_idx >= fixed_m {
+            // 变参多余实参：收集打包（不单独求值/压参）
+            table_push(extra_nodes, arg_node)
+            k = k + 1
+            continue
+        }
+        var av = gen_expr(arg_node)
         if av < 0 {
             return -1
         }
@@ -2307,6 +2541,16 @@ func gen_struct_method_call(full: string, id: i64, recv: i64, rty: i64) -> i64 {
         }
         table_push(argtys, apty)
         k = k + 1
+    }
+    // 变参打包：多余实参 → 动态表（无多余也要传空表）
+    if has_var {
+        var var_elem2 = types.table_elem(ptys[nparams - 1])
+        var tbl2 = gen_variadic_table(extra_nodes, var_elem2)
+        if tbl2 < 0 {
+            return -1
+        }
+        table_push(argvals, tbl2)
+        table_push(argtys, ptys[nparams - 1])   // table<T> → ptr
     }
     // 生成 call（同 gen_user_call_from 尾部；实参类型用 argtys 并行表）
     var ty35: i64 = -1
@@ -2677,15 +2921,31 @@ func gen_table_lit(id: i64) -> i64 {
         if v < 0 {
             return -1
         }
+        // 桥选择按**值**的实际类型判定（对齐 table_push 内建路径 + Rust
+        // table_elem_suffix）：嵌套表/键值表/字符串值 → push_string 存 ptr；
+        // 浮点值 → push_f64；否则按声明元素类型（i64/bool）。
+        // 背景：二维表/嵌套表字面量 `[[1,2],[3,4]]` 的外层元素类型是
+        // table<i64>，若按 elem 选桥会 push_i64(ptr) 类型错（LLVM 拒收）；
+        // 且空内层表 `[]` 的 node_types 落 i64 兜底——只要 elem 本身是表，
+        // 全部元素一律 push_string（元素全是 ptr）。
         var suffix = bridge_suffix(elem)
         var pty = types.named(TK_I64)
-        if suffix == "string" {
+        if types.is_table(elem) || types.is_map(elem) {
+            suffix = "string"
             pty = types.named(TK_STR)
-        } else if suffix == "f64" {
-            // 浮点表字面量 [1.0, 2.0]：push_f64 值参数 double
-            pty = types.named(TK_F64)
-        } else if suffix == "bool" {
-            pty = types.named(TK_BOOL)
+        } else {
+            var vt = node_types[val]
+            if vt >= 0 && (types.is_table(vt) || types.is_map(vt) || vt == types.named(TK_STR)) {
+                suffix = "string"
+                pty = types.named(TK_STR)
+            } else if vt >= 0 && (vt == types.named(TK_F64) || vt == types.named(TK_F32)) {
+                suffix = "f64"
+                pty = types.named(TK_F64)
+            } else if suffix == "string" {
+                pty = types.named(TK_STR)
+            } else if suffix == "bool" {
+                pty = types.named(TK_BOOL)
+            }
         }
         gen_ext_call2v("tie_table_push_" + suffix, t, types.named(TK_STR), v, pty)
         i = i + 1
@@ -2961,7 +3221,14 @@ func gen_index_read(id: i64) -> i64 {
     }
     var suffix = bridge_suffix(elem)
     var ret_ty = types.named(TK_I64)
-    if suffix == "string" {
+    // 嵌套表元素（elem 是 table/map）：元素在动态表中存 ptr，读回必须用
+    // at_string 桥（返回 ptr）——曾按 bridge_suffix 落 at_i64，返回 i64 与
+    // 嵌套表变量的 ptr 槽不符（`var sub = t[i]` → `store ptr %r, ptr %slot`
+    // 但 %r 是 i64，LLVM 拒收）。对齐 gen_table_lit 的按值类型选桥。
+    if types.is_table(elem) || types.is_map(elem) {
+        suffix = "string"
+        ret_ty = types.named(TK_STR)
+    } else if suffix == "string" {
         ret_ty = types.named(TK_STR)
     } else if suffix == "f64" {
         // f64 表元素：返回类型 double（曾落默认 i64 → call i64 @tie_table_at_f64
@@ -4343,6 +4610,13 @@ func gen_fn_def(fn_node: i64, prefix: string) -> i64 {
         var is_ref_pre = 0
         if sig0_pre >= 0 && sig_off_pre + i < len(sp_refs) {
             is_ref_pre = sp_refs[sig_off_pre + i]
+        }
+        // 变参参数：签名类型为 table<T>（parser 的 AST 类型节点只有元素类型 T，
+        // 必须用语义层已解析的签名类型——LLVM 形参声明为 ptr 表指针）
+        if sig0_pre >= 0 && sig_off_pre + i < len(sp_vars) {
+            if sp_vars[sig_off_pre + i] == 1 {
+                pt = sp_tys[sig_off_pre + i]
+            }
         }
         if is_ref_pre == 1 {
             table_push(params, types.named(TK_STR))  // 引用 → ptr 形参

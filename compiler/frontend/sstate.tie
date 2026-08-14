@@ -33,6 +33,7 @@ var sg_off: table<i64>;       // 参数段偏移（sp_tys/sp_refs/sp_defs）
 var sp_tys: table<i64>;       // 参数类型 id（扁平段）
 var sp_refs: table<i64>;      // 参数 by_ref 标志（扁平段）
 var sp_defs: table<i64>;      // 参数有默认值（扁平段）
+var sp_vars: table<i64>;      // 参数变参标志（扁平段；1 = `name: ...T`）
 
 var st_keys: table<i64>;      // struct 名 id（升序）
 var st_vals: table<i64>;      // struct 索引
@@ -725,7 +726,7 @@ pub func sorted_insert_gb(keys: table<i64>, vals: table<i64>, cons: table<i64>, 
 }
 
 // 函数签名登记（重复定义检查，返回签名 id 或 -1）
-pub func reg_fn(full_name: string, is_pub: i64, nparams: i64, required: i64, ret_ty: i64, p_tys: table<i64>, p_refs: table<i64>, p_defs: table<i64>) -> i64 {
+pub func reg_fn(full_name: string, is_pub: i64, nparams: i64, required: i64, ret_ty: i64, p_tys: table<i64>, p_refs: table<i64>, p_defs: table<i64>, p_vars: table<i64>) -> i64 {
     var nid = intern.intern(full_name)
     if bs_find(fn_keys, nid) >= 0 {
         sm_err_line = 1
@@ -753,6 +754,7 @@ pub func reg_fn(full_name: string, is_pub: i64, nparams: i64, required: i64, ret
         table_push(sp_tys, p_tys[i])
         table_push(sp_refs, p_refs[i])
         table_push(sp_defs, p_defs[i])
+        table_push(sp_vars, p_vars[i])
         i = i + 1
     }
     sorted_insert(fn_keys, fn_vals, nid, sig)
@@ -767,6 +769,15 @@ pub func fn_sig(full_name: string) -> i64 {
         return -1
     }
     return fn_vals[idx]
+}
+
+// 函数是否含变参（最后一个形参 sp_vars == 1）；nparams=0 或非变参 → 0
+pub func fn_has_variadic(sig: i64) -> i64 {
+    var n = sg_nparams[sig]
+    if n <= 0 {
+        return 0
+    }
+    return sp_vars[sg_off[sig] + n - 1]
 }
 
 // struct 登记（重复/冲突检查，返回 struct 索引或 -1）

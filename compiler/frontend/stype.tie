@@ -186,6 +186,42 @@ pub func types_compatible(a: i64, b: i64) -> bool {
     return false
 }
 
+// 元组结构相等（递归）：字段类型逐层比较（含嵌套元组字段）。
+// 背景：types_compatible 的元组分支用 `!=` 逐字段比较，嵌套元组字段
+// 每处字面量独立登记 tuple id（如 ((1,2),3) 的字段类型 tuple#0/tuple#1），
+// 数值不等 → 误判不兼容。元组 ==/!= 比较需深层结构相等判定。
+pub func tuple_equal(a: i64, b: i64) -> bool {
+    var ka = types.kind(a)
+    var kb = types.kind(b)
+    if ka != K_TUPLE || kb != K_TUPLE {
+        return false
+    }
+    var ia = types.low(a)
+    var ib = types.low(b)
+    if tup_n[ia] != tup_n[ib] {
+        return false
+    }
+    var offa = tup_offs[ia]
+    var offb = tup_offs[ib]
+    var i: i64 = 0
+    while i < tup_n[ia] {
+        var fa = tup_tys[offa + i]
+        var fb = tup_tys[offb + i]
+        if fa != fb {
+            // 字段不同：同为元组 → 递归结构比较；否则不等
+            if types.kind(fa) == K_TUPLE && types.kind(fb) == K_TUPLE {
+                if !tuple_equal(fa, fb) {
+                    return false
+                }
+            } else {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
 // 类型匹配（含字面量适配：整数字面量可作任意整数/浮点/trit 标注等）
 pub func types_match(want: i64, got: i64, init_node: i64) -> bool {
     if types_compatible(want, got) {

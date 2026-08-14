@@ -426,6 +426,7 @@ pub func instantiate_fn(gti: i64, args: table<i64>, line: i64, col: i64) -> i64 
     var p_tys: table<i64> = table_new_i64()
     var p_refs: table<i64> = table_new_i64()
     var p_defs: table<i64> = table_new_i64()
+    var p_vars: table<i64> = table_new_i64()
     var required: i64 = nparams
     var seen_default: bool = false
     var k: i64 = 0
@@ -439,6 +440,11 @@ pub func instantiate_fn(gti: i64, args: table<i64>, line: i64, col: i64) -> i64 
             }
             return -1
         }
+        // 变参（`...T`，parser 写入 aux）：签名存 table<T>（对齐 collect_fn）
+        var is_var = s_aux[p]
+        if is_var == 1 {
+            pt = types.table_of(pt)
+        }
         // ref 形参仅支持表（对齐 collect_fn 校验）
         if s_vals[p] == 1 && !types.is_table(pt) {
             g_inst_depth = g_inst_depth - 1
@@ -449,6 +455,7 @@ pub func instantiate_fn(gti: i64, args: table<i64>, line: i64, col: i64) -> i64 
         }
         table_push(p_tys, pt)
         table_push(p_refs, s_vals[p])
+        table_push(p_vars, is_var)
         var has_def: i64 = 0
         if sstate.nchild(p) > 1 {
             if sstate.child(p, 1) >= 0 {
@@ -458,14 +465,14 @@ pub func instantiate_fn(gti: i64, args: table<i64>, line: i64, col: i64) -> i64 
         table_push(p_defs, has_def)
         if has_def == 1 {
             seen_default = true
-        } else if seen_default {
+        } else if seen_default && is_var == 0 {
             g_inst_depth = g_inst_depth - 1
             sm_err_line = line
             sm_err_col = col
             sm_err_msg = "实例化 '" + mangled + "' 参数 '" + sstate.name_str(p) + "' 缺少默认值：可选参数（带默认值）必须连续排在必选参数之后"
             return -1
         }
-        if has_def == 0 {
+        if has_def == 0 && is_var == 0 {
             required = k + 1
         }
         k = k + 1
@@ -487,7 +494,7 @@ pub func instantiate_fn(gti: i64, args: table<i64>, line: i64, col: i64) -> i64 
             }
         }
     }
-    var sig = sstate.reg_fn(mangled, is_pub, nparams, required, ret_ty, p_tys, p_refs, p_defs)
+    var sig = sstate.reg_fn(mangled, is_pub, nparams, required, ret_ty, p_tys, p_refs, p_defs, p_vars)
     if sig < 0 {
         g_inst_depth = g_inst_depth - 1
         sm_err_line = line

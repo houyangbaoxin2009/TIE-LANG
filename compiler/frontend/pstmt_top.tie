@@ -449,9 +449,17 @@ func parse_fn_def() -> i64 {
             if !putil.expect(lex_colon, "':'") {
                 return -1
             }
+            var is_var: i64 = 0
+            if putil.eat(lex_ellipsis) {
+                is_var = 1   // 变参：`name: ...T`（必须是最后一个参数）
+            }
             var by_ref: i64 = 0
             if putil.eat(lex_ref) {
                 by_ref = 1
+            }
+            if is_var == 1 && by_ref == 1 {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "变参参数不能同时使用 ref 修饰")
+                return -1
             }
             var pty = pexpr_type.parse_type()
             if pty < 0 {
@@ -459,12 +467,20 @@ func parse_fn_def() -> i64 {
             }
             var pdef = -1
             if putil.eat(lex_eq) {
+                if is_var == 1 {
+                    putil.set_err(putil.peek_line(), putil.peek_col(), "变参参数不能有默认值")
+                    return -1
+                }
                 pdef = pexpr.parse_expr()
                 if pdef < 0 {
                     return -1
                 }
             }
-            var p = ast.new_node(N_PARAM, pname, by_ref, -1, putil.peek_line(), putil.peek_col())
+            if is_var == 1 && putil.peek_tag() == lex_comma {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "变参参数必须是最后一个参数")
+                return -1
+            }
+            var p = ast.new_node(N_PARAM, pname, by_ref, is_var, putil.peek_line(), putil.peek_col())
             var pkids: table<i64> = table_new_i64()
             table_push(pkids, pty)
             table_push(pkids, pdef)
