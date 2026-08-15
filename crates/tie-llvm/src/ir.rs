@@ -110,6 +110,11 @@ struct IrGenerator<'p> {
     /// 重新分配栈空间，循环体内密集 alloca（如表读 ok 标志）会逐次累积导致栈溢出
     /// （0xC00000FD）。统一收集后 flush 到函数 entry 块末尾，根治该缺陷。
     entry_allocas: Vec<String>,
+    /// 当前基本块（块结构生成用）：block_start 时更新。
+    /// 逻辑短路/三目的 phi 汇合需要「值实际产生块」作为 incoming 前驱——
+    /// 嵌套短路时值在内层 merge 块产生（对齐 tiec 的 tv_blk/ev_blk 逻辑），
+    /// 用写死的分支标签会违反 LLVM phi 支配规则。
+    cur_block: String,
 }
 
 /// IR 生成入口：程序 AST + 语义结果 → LLVM IR 文本。
@@ -128,6 +133,7 @@ pub fn gen_ir(program: &Program, sem: &SemanticResult) -> Result<IrOutput, IrErr
         cur_fn: String::new(),
         loop_ctx: Vec::new(),
         entry_allocas: Vec::new(),
+        cur_block: String::new(),
     };
     generator.run()?;
     // F1：alloca 提升后 entry 块编号可能倒挂（%54 在 %1 之前），LLVM 要求递增，
@@ -2640,19 +2646,14 @@ impl<'p> IrGenerator<'p> {
         (trunc, "i8")
     }
 
-    /// 二元运算生成：两侧表达式求值后交给 [gen_binary_on_regs] 统一生成指令。
+    /// 二元运算生成：逻辑 &&/|| 短路分派先行（求 rhs 之前），其余求值后交给
+    /// [gen_binary_on_regs] 统一生成指令。
     fn gen_binary(
         &mut self,
         op: BinaryOp,
         lhs: &Expr,
         rhs: &Expr,
     ) -> Result<(String, &'static str), IrError> {
-        let (lv, lt) = self.gen_expr(lhs)?;
-        let (rv, rt) = self.gen_expr(rhs)?;
-        // 字符串操作：拼接（+）与比较（== != < > <= >=）走运行时函数。
-        // 通过语义类型判断（LLVM 类型名 "ptr" 无法区分字符串与裸指针）。
-        let lhs_is_str = matches!(self.sem_ty_of(lhs), Some(TypeSpec::Named(TyKw::Str)));
-        let rhs_is_str = matches!(self.sem_ty_of(rhs), Some(TypeSpec::Named(TyKw::Str)));
         // 无符号性：查语义类型（LLVM 类型名 "i32" 无法区分 u32/i32）
         let lhs_sem = self.sem_ty_of(lhs);
         let is_unsigned = matches!(
@@ -2661,11 +2662,28 @@ impl<'p> IrGenerator<'p> {
         );
         // 平衡三进制 trit（M4 补齐）：走专门的 trit 运算生成
         //（Kleene 逻辑 min/max、饱和算术 clamp、trit×i64 sext 混合）。
+        // trit 判定先行（对齐 tiec gen_binary 分派顺序）：trit 的 &&/|| 是 Kleene
+        // min/max（**非短路**），短路分支只服务 bool——故 trit 判断必须在短路之前。
         let lhs_is_trit = matches!(lhs_sem, Some(TypeSpec::Named(TyKw::Trit)));
         let rhs_is_trit = matches!(self.sem_ty_of(rhs), Some(TypeSpec::Named(TyKw::Trit)));
         if lhs_is_trit || rhs_is_trit {
+            // trit 是非短路求值（min/max 需两侧值），此处才求值
+            let (lv, lt) = self.gen_expr(lhs)?;
+            let (rv, rt) = self.gen_expr(rhs)?;
             return self.gen_binary_trit(op, lhs_is_trit, lv, lt, rv, rt);
         }
+        // 逻辑短路：&& / || → cond_br + phi 三块（[gen_logic_short]，对齐 tiec）。
+        // 必须在求 rhs **之前**分派——短路的意义就是 rhs 可能不求值
+        //（如 `false && 10/0 == 2` 右侧除零表达式不该被求值，否则生成 sdiv 运行时崩溃）。
+        if matches!(op, BinaryOp::And | BinaryOp::Or) {
+            return self.gen_logic_short(op, lhs, rhs);
+        }
+        let (lv, lt) = self.gen_expr(lhs)?;
+        let (rv, _rt) = self.gen_expr(rhs)?;
+        // 字符串操作：拼接（+）与比较（== != < > <= >=）走运行时函数。
+        // 通过语义类型判断（LLVM 类型名 "ptr" 无法区分字符串与裸指针）。
+        let lhs_is_str = matches!(self.sem_ty_of(lhs), Some(TypeSpec::Named(TyKw::Str)));
+        let rhs_is_str = matches!(self.sem_ty_of(rhs), Some(TypeSpec::Named(TyKw::Str)));
         // 元组比较（特性②）：语义层已保证 op 是 ==/!=（< > <= >= 已拦截），
         // 逐字段比较并合并（数字 icmp/fcmp、字符串 strcmp、嵌套元组递归）。
         if let Some(TypeSpec::Tuple(_)) = lhs_sem.as_ref() {
@@ -2675,6 +2693,73 @@ impl<'p> IrGenerator<'p> {
             return self.gen_binary_tuple(op, &lhs_ty, lv, rv);
         }
         self.gen_binary_on_regs(op, lhs_is_str || rhs_is_str, lv, lt, rv, is_unsigned)
+    }
+
+    /// 逻辑短路 && / || 生成（对齐 tiec irgen.tie gen_logic_short 1241-1305 行）。
+    ///
+    /// 短路求值语义——右侧表达式在结果已确定时**不求值**：
+    /// - `a && b`：a 真 → 求 b；a 假 → false（短路假，b 不求值）
+    /// - `a || b`：a 真 → true（短路真，b 不求值）；a 假 → 求 b
+    ///
+    /// IR 结构（cond_br + phi 三块，与三目运算同构）：
+    ///   br i1 %lv, label %sc.then.N, label %sc.else.N
+    ///   sc.then.N:   && → 求 rhs；|| → true（i1 字面量）→ br merge
+    ///   sc.else.N:   && → false（i1 字面量）；|| → 求 rhs → br merge
+    ///   sc.merge.N:  %r = phi i1 [ tv, %tv_blk ], [ ev, %ev_blk ]
+    ///
+    /// phi 的 incoming 前驱块必须用「值实际产生块」（tv_blk/ev_blk）而非写死的
+    /// then/else 标签：rhs 若为嵌套短路（如 `a && (b || c)`），其内部会再建
+    /// sc.* 块，值实际产生于内层 merge 块——用写死的分支标签会违反 LLVM phi
+    /// 支配规则（值不支配 phi）。实际产生块取自 self.cur_block（block_start 维护）。
+    /// 分支内 rhs 求值后若块已终止（ret/br），跳过汇合 br（[block_terminated]），
+    /// 避免 terminator 后追加死代码导致 LLVM「指令编号不连续」报错。
+    fn gen_logic_short(
+        &mut self,
+        op: BinaryOp,
+        lhs: &Expr,
+        rhs: &Expr,
+    ) -> Result<(String, &'static str), IrError> {
+        let (lv, _lt) = self.gen_expr(lhs)?;
+        let then_label = self.new_label("sc.then");
+        let else_label = self.new_label("sc.else");
+        let merge_label = self.new_label("sc.merge");
+        // cond_br：lv 真 → then 分支，假 → else 分支（target 顺序与 tiec 一致）
+        self.line(&format!("br i1 {lv}, label %{then_label}, label %{else_label}"));
+
+        // then 分支：&& → 求 rhs；|| → 短路真（i1 字面量 true，同 Expr::BoolLit 文本）
+        self.block_start(&then_label);
+        let (tv, _t_ty) = if op == BinaryOp::And {
+            self.gen_expr(rhs)?
+        } else {
+            ("true".to_string(), "i1")
+        };
+        // 值实际产生块：rhs 若为嵌套短路，gen_expr 已切到其内层 merge 块
+        let tv_blk = self.cur_block.clone();
+        if !self.block_terminated() {
+            self.line(&format!("br label %{merge_label}"));
+        }
+        self.block_end();
+
+        // else 分支：&& → 短路假；|| → 求 rhs
+        self.block_start(&else_label);
+        let (ev, _e_ty) = if op == BinaryOp::And {
+            ("false".to_string(), "i1")
+        } else {
+            self.gen_expr(rhs)?
+        };
+        let ev_blk = self.cur_block.clone();
+        if !self.block_terminated() {
+            self.line(&format!("br label %{merge_label}"));
+        }
+        self.block_end();
+
+        // 合并块：phi 汇合两分支值（两侧恒为 i1：短路字面量或 rhs 的 bool 结果）
+        self.block_start(&merge_label);
+        let phi = self.new_reg();
+        self.line(&format!(
+            "{phi} = phi i1 [ {tv}, %{tv_blk} ], [ {ev}, %{ev_blk} ]"
+        ));
+        Ok((phi, "i1"))
     }
 
     /// 元组 `==`/`!=` 逐字段比较（特性②）。
@@ -4847,6 +4932,9 @@ impl<'p> IrGenerator<'p> {
 
     /// 基本块起始：输出标签行。
     fn block_start(&mut self, label: &str) {
+        // 记录当前基本块（逻辑短路/三目的 phi 前驱块判定依赖它——嵌套短路时
+        // 需用「值实际产生块」self.cur_block 而非写死的分支标签）
+        self.cur_block = label.to_string();
         // 标签行不缩进
         self.out.push_str(&format!("{label}:\n"));
         self.indent();
@@ -5621,6 +5709,61 @@ mod tests {
         assert!(ir.contains("tern.else."));
         assert!(ir.contains("tern.merge."));
         assert!(ir.contains("= phi i64"));
+    }
+
+    // ---------- 逻辑短路 &&/||（对齐 tiec gen_logic_short） ----------
+
+    #[test]
+    fn 逻辑短路生成cond_br与phi汇合() {
+        // 非 trit 的 &&：cond_br 按 lv 分流 → sc.then / sc.else 两分支 → sc.merge phi i1
+        let ir = 编译("func main() {\n    var a: bool = true\n    var b: bool = false\n    println(a && b)\n}");
+        assert!(ir.contains("sc.then."), "应有 sc.then 分支:\n{ir}");
+        assert!(ir.contains("sc.else."), "应有 sc.else 分支:\n{ir}");
+        assert!(ir.contains("sc.merge."), "应有 sc.merge 合并块:\n{ir}");
+        // 两侧恒为 i1：短路字面量或 rhs 的 bool 结果，phi 类型必须是 i1
+        assert!(ir.contains("= phi i1"), "短路应 phi i1 汇合:\n{ir}");
+        // 分流指令：br i1 %lv → sc.then / sc.else
+        assert!(ir.contains("br i1 "), "应有 cond_br 条件跳转:\n{ir}");
+    }
+
+    #[test]
+    fn 逻辑短路右侧不求值() {
+        // `false && 10 / 0 == 2`：左侧恒假 → 短路。短路语义是**控制流**层面——
+        // 右侧的指令仍会出现在 IR 文本中，但被隔离在 cond_br 不可达的分支内：
+        // cond_br 条件为编译期常量 false，运行时恒跳 else（短路假）分支，
+        // then 分支（含右侧除法 sdiv，运行时除零崩溃）永不执行。
+        // 验证点：① cond_br 条件必须是常量 false；② sdiv 被隔离在 then 块内；
+        // ③ 短路字面量分支（else）不含右侧任何指令。
+        let ir = 编译("func main() {\n    println(false && 10 / 0 == 2)\n}");
+        // cond 是编译期常量 false：cond_br 恒跳 else，then 分支运行时不可达
+        assert!(
+            ir.contains("br i1 false, label %sc.then."),
+            "cond_br 条件应为常量 false（运行时恒短路跳 else）:\n{ir}"
+        );
+        // 行级判定 sdiv 的归属块（不能用字符串切片：cond_br 行同时含 then/else
+        // 两个标签文本）。标签行以 `sc.xxx.N:` 开头，块归属随标签行切换。
+        let mut in_then = false;
+        let mut in_else = false;
+        let (mut sdiv_in_then, mut sdiv_in_else) = (false, false);
+        for line in ir.lines() {
+            let t = line.trim();
+            if t.starts_with("sc.then.") {
+                in_then = true;
+                in_else = false;
+            } else if t.starts_with("sc.else.") {
+                in_then = false;
+                in_else = true;
+            }
+            if t.contains("sdiv") {
+                sdiv_in_then |= in_then;
+                sdiv_in_else |= in_else;
+            }
+        }
+        assert!(sdiv_in_then, "sdiv 应被隔离在 then 分支内:\n{ir}");
+        assert!(
+            !sdiv_in_else,
+            "else 短路分支不应含右侧除法（右侧未求值路径）:\n{ir}"
+        );
     }
 
     #[test]
