@@ -1,4 +1,12 @@
 
+## [升级] LLVM 工具链 18.1.8 → 22.1.8（S1.1 独立里程碑）—— 2026-08-15
+
+- **版本**：LLVM 从 18.1.8 升级到 22.1.8（最新稳定版；23 仍 RC3 未用，等稳定再议）
+- **破坏点适配**：clang 22 起 Windows 默认链接器从 link.exe 改为 lld-link（18 为 link.exe），而 lld-link 解析 Rust staticlib（tie_interp.lib）的 CRT 符号有缺陷（`undefined symbol: printf`）→ `toolchain.tie` `link_exe` 非 vendored 场景（无 TIE_LLVM_HOME）显式加 `-fuse-ld=link` 恢复 link.exe 行为；vendored（TIE_LLVM_HOME）场景保持 `-fuse-ld=lld`（无 VS 环境用随包 lld）
+- **SwitchInst 验证**：tie 的 switch 走 icmp 比较链（非 LLVM switch 指令，irgen 注释明确），22 的 SwitchInst case 值不再作 operand 变更对 tie **零影响**（实测确认）
+- **回归全绿**：interp 11/11 + _driver_test 行为等价 PASS + tests/language 24 PASS（无新增失败，3 个预存失败 18/22 一致）+ 自举闭环 tiec2==tiec3 sha 一致（可复现构建）+ G4 闸门 PASS（91 文件 88 可编译 96.7%，ratio 1.458 < 硬性 3.0）+ vendored 场景 hello 与库编译链（clang -c + llvm-ar rcs）正常
+- **本机切换**：D:\LLVM 升级为 22.1.8（18.1.8 备份至 D:\LLVM18 便于回退）；打包脚本 package.ps1 默认 -LlvmDir D:\LLVM 路径不变自动取 22
+
 ## [新增] enum 枚举语言特性（ADT 标签联合 + 泛型，tiec 全链路实现）—— 2026-08-15
 
 tie 语言新增 **enum 枚举**（Rust 风格 ADT），tiec（tie 自写编译器，compiler/）

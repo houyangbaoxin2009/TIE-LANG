@@ -42,12 +42,14 @@
 
 > 目标：语言核心互操作能力 + 内存模型底座。**并行波 1**。
 
-### S1.1 LLVM 升级（独立，先行）
+### S1.1 LLVM 升级（独立，先行）✅ 已完成（2026-08-15）
 
 - **内容**：LLVM 18.1.8 → 22.1.8（见 [llvm-upgrade.md](llvm-upgrade.md)）
 - **交付**：vendored LLVM 22.1.8 替换 + 回归全绿
 - **验收**：compiler/tests + _driver_test 行为等价通过；IR 语法无错；MSVC ABI 回归
 - **并行**：与其他会话完全独立
+- **实现记录**：D:\LLVM 切换 22.1.8（18 备份 D:\LLVM18）；toolchain.tie 适配 clang 22
+  默认 lld-link（非 vendored 显式 -fuse-ld=link）；回归全绿（详见 llvm-upgrade.md §5.2a）
 
 ### S1.2 M0：unsafe 语法（语言地基）
 

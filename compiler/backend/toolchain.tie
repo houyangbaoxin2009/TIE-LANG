@@ -162,9 +162,6 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
     // （编译 driver 自身）时递归/嵌套调用栈深，默认 1MB 栈会 0xC00000FD 溢出
     // -fuse-ld=lld 仅对「vendored LLVM」生效：clang 必须来自 TIE_LLVM_HOME
     // 指定的目录（发布包场景，用户无 MSVC → 用随包 lld-link）。
-    // 本机开发（clang 来自 PATH/固定目录，VS link.exe 可用）不加——lld 解析
-    // Rust staticlib（tie_interp.lib）的 CRT 符号有缺陷（printf undefined），
-    // 必须保留默认 link.exe 行为（repl 自举等依赖）。
     var lld_flag = ""
     var home = get_env("TIE_LLVM_HOME")
     if str_len(home) > 0 {
@@ -173,6 +170,13 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
                 lld_flag = " -fuse-ld=lld"
             }
         }
+    } else {
+        // 本机开发（无 TIE_LLVM_HOME，clang 来自 PATH/固定目录）：必须显式
+        // 加 -fuse-ld=link 恢复 link.exe 行为——clang 22 起 Windows 默认链接器
+        // 已从 link.exe 改为 lld-link，而 lld-link 解析 Rust staticlib
+        // （tie_interp.lib）的 CRT 符号有缺陷（undefined symbol: printf），
+        // 会破坏 interp 桥程序（repl/pkg/interp 测试）的链接。
+        lld_flag = " -fuse-ld=link"
     }
     var cmd = tool + lld_flag + " " + input_opt + " -o " + output_exe + " -Wl,/Brepro -Wl,/STACK:16777216"
     if str_len(target) > 0 {

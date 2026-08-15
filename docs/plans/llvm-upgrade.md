@@ -1,6 +1,6 @@
 # 规划：LLVM 工具链升级（18.1.8 → 22.1.8）
 
-> 状态：**规划**（2026-08-15 调研定稿，未实现）
+> 状态：**已实现**（2026-08-15，S1.1 完成；commit 见 git log）
 > 本文档定义 tie 的 LLVM 工具链升级计划：**18.1.8 → 22.1.8**。
 > 结论：**升级到 22.1.8（最新稳定版），成本低收益明确；23 等稳定后再议。**
 > 关联：toolchain.tie（opt/clang/llvm-ar/lld 驱动）、vendored LLVM（bin/llvm/）、
@@ -102,6 +102,20 @@
 2. 若 TIE_LLVM_HOME 指向外部安装：更新到 22.1.8
 3. 回归测试全绿后提交
 4. 更新 README 中的 LLVM 版本说明
+
+### 5.2a 实现记录（2026-08-15，S1.1 完成）
+
+- **二进制**：官方 GitHub releases `LLVM-22.1.8-win64.exe`（安装器需管理员）/
+  `clang+llvm-22.1.8-x86_64-pc-windows-msvc.tar.xz`（归档包，解压即用，本机采用）
+- **本机切换**：D:\LLVM 升级为 22.1.8；18.1.8 备份至 D:\LLVM18（便于回退）；
+  PATH/TIE_LLVM_HOME 均无需改（路径不变）
+- **关键适配**：clang 22 起 Windows 默认链接器从 link.exe 改为 lld-link（实测 -v 确认），
+  lld-link 解析 Rust staticlib（tie_interp.lib）CRT 符号缺陷（printf undefined）导致
+  interp 桥程序链接失败 → `compiler/backend/toolchain.tie` `link_exe` 非 vendored 场景
+  显式 `-fuse-ld=link`；vendored（TIE_LLVM_HOME）场景保持 `-fuse-ld=lld`
+- **回归结果**：interp 11/11 + _driver_test PASS + tests/language 24 PASS（零新增失败）+
+  自举闭环 tiec2==tiec3 sha 一致 + G4 闸门 PASS（ratio 1.458）+ vendored hello/库编译链正常
+- **SwitchInst**：tie switch 走 icmp 比较链（非 LLVM switch 指令）——22 变更零影响（实测确认）
 
 ### 5.3 wasm 目标适配（webui 启用时）
 
