@@ -72,7 +72,8 @@ func main() {
         "tests/errors/golden/err_056.tie", "tests/errors/golden/err_057.tie",
         "tests/errors/golden/err_058.tie", "tests/errors/golden/err_059.tie",
         "tests/errors/golden/err_060.tie", "tests/errors/golden/err_061.tie",
-        "tests/errors/golden/err_062.tie"
+        "tests/errors/golden/err_062.tie", "tests/errors/golden/err_063.tie",
+        "tests/errors/golden/err_064.tie", "tests/errors/golden/err_065.tie"
     ]
     var i: i64 = 0
     while i < len(files) {

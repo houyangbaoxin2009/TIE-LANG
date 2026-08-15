@@ -17,9 +17,10 @@ type tie<class>
 //   TypeVar  ：id = 5<<40 | intern 池 id（泛型类型参数，名字即身份——
 //     同名类型参数全局同 id、跨函数稳定，mangling 友好；intern 池 id
 //     < 2^40 保证不碰撞。语义层登记泛型形参时调用 var_of 获取）。
+//   enum E  ：id = 6<<40 | enum_索引（enum 表行号，最高段）
 //   高位分离保证任意嵌套组合不冲突（负载 < 2^40）。
 //   解码：kind(id) 判类别（0=Named 1=Table 2=Map 3=Struct 4=Tuple
-//   5=TypeVar），low(id) 取负载（元素类型/索引/intern 池 id）。
+//   5=TypeVar 6=Enum），low(id) 取负载（元素类型/索引/intern 池 id）。
 //   TypeVar 兼容性：table<TypeVar>/map<TypeVar> 走嵌套聚合序号表路径
 //   （var_of 结果恒 ≥ NEST_SLOT_OFF，table_of 查/登记 nest_tbl_elems），
 //   table_elem 可完整还原回 TypeVar id；判据族（is_int/is_float/
@@ -50,6 +51,7 @@ const K_MAP: i64 = 2;
 const K_STRUCT: i64 = 3;
 const K_TUPLE: i64 = 4;
 const K_TYPEVAR: i64 = 5;
+const K_ENUM: i64 = 6;
 const K_SHIFT: i64 = 40;           // 高位分离位移量（负载 < 2^40）
 
 // ---------- TyKw 索引常量（0..20，对齐 Rust TyKw 变体顺序）----------
@@ -75,17 +77,20 @@ const TK_MISC: i64 = 18;
 const TK_TABLE: i64 = 19;
 const TK_MAP: i64 = 20;
 
-// 高位基数常量（= 1<<40 / 2<<40 / 3<<40 / 4<<40 / 5<<40，写死字面量避免运行期位移）
-// 5<<40 = 5497558138880，i64 有符号下远小于 2^63 无溢出。
+// 高位基数常量（= 1<<40 / 2<<40 / 3<<40 / 4<<40 / 5<<40 / 6<<40，
+// 写死字面量避免运行期位移）
+// 6<<40 = 6597069766656，i64 有符号下远小于 2^63 无溢出。
 const BASE_TABLE: i64 = 1099511627776;
 const BASE_MAP: i64 = 2199023255552;
 const BASE_STRUCT: i64 = 3298534883328;
 const BASE_TUPLE: i64 = 4398046511104;
 const BASE_TYPEVAR: i64 = 5497558138880;
+const BASE_ENUM: i64 = 6597069766656;
 
 // ---------- 全局状态（懒构建）----------
 var tykw_names: table<string>;   // TyKw 索引 -> 类型名（错误消息用）
 var st_names: table<string>;     // struct 名表（索引 -> 名字；type_name 还原用）
+var en_names: table<string>;     // enum 名表（索引 -> 名字；type_name 还原用）
 // 嵌套聚合登记表（序号 → 元素/值类型 id）：table<table<T>> / map<聚合> 的编码载体。
 // 背景：table_of(聚合) 若直接 BASE_TABLE + 聚合，会因聚合 id ≥ 2^40 进位撞入
 // map 段（table<table<i64>> = 2^41+3 == map<i64>）——嵌套类型必须查表编码。
@@ -158,16 +163,24 @@ pub func var_of(name: string) -> i64 {
     return BASE_TYPEVAR + interner.intern(name)
 }
 
+// enum E：id = 6<<40 | enum_索引（enum 表行号）。
+pub func enum_of(idx: i64) -> i64 {
+    return BASE_ENUM + idx
+}
+
 // ---------- 类型 id 解码 ----------
 
-// 类型类别：0=Named 1=Table 2=Map 3=Struct 4=Tuple 5=TypeVar。
+// 类型类别：0=Named 1=Table 2=Map 3=Struct 4=Tuple 5=TypeVar 6=Enum。
 // Named 判定用 id < 100（TyKw 索引 0..20，留余量）；
-// 其余按高位阈值顺序判别（>= 5<<40 -> TypeVar，>= 4<<40 -> Tuple，
-// >= 3<<40 -> Struct，>= 2<<40 -> Map，其余为 Table——与 semantic ty_kind
-// 一致）。TypeVar 段（5<<40）最高，必须最先判，否则被误判为 Tuple。
+// 其余按高位阈值顺序判别（Enum 段 6<<40 最高必须最先判；之后
+// >= 5<<40 -> TypeVar，>= 4<<40 -> Tuple，>= 3<<40 -> Struct，
+// >= 2<<40 -> Map，其余为 Table——与 semantic ty_kind 一致）。
 pub func kind(id: i64) -> i64 {
     if id < 100 {
         return K_NAMED
+    }
+    if id >= BASE_ENUM {
+        return K_ENUM
     }
     if id >= BASE_TYPEVAR {
         return K_TYPEVAR
@@ -184,9 +197,12 @@ pub func kind(id: i64) -> i64 {
     return K_TABLE
 }
 
-// 类型负载：Table/Map 的元素类型 id、Struct/Tuple 的索引、TypeVar 的
+// 类型负载：Table/Map 的元素类型 id、Struct/Tuple/Enum 的索引、TypeVar 的
 // intern 池 id；Named 类型无意义（调用方先判 kind）。
 pub func low(id: i64) -> i64 {
+    if id >= BASE_ENUM {
+        return id - BASE_ENUM
+    }
     if id >= BASE_TYPEVAR {
         return id - BASE_TYPEVAR
     }
@@ -278,6 +294,15 @@ pub func is_map(t: i64) -> bool {
     return false
 }
 
+// 枚举判据：kind == K_ENUM（6<<40 段）。
+// 供语义层识别枚举类型（构造/匹配/类型检查按 kind 分派）。
+pub func is_enum(t: i64) -> bool {
+    if kind(t) == K_ENUM {
+        return true
+    }
+    return false
+}
+
 // TypeVar 判据：kind == K_TYPEVAR（5<<40 段）。
 // 供语义层识别泛型形参（如函数签名类型槽位里出现 TypeVar 时走单态化
 // 替换路径）；单态化替换后应还原为具体类型再走其余判据族。
@@ -318,7 +343,7 @@ pub func table_elem(t: i64) -> i64 {
     return -1
 }
 
-// ---------- struct 名登记（type_name 还原用）----------
+// ---------- struct / enum 名登记（type_name 还原用）----------
 
 // 登记 struct 索引 -> 名字（语义阶段收集 struct 时调用；
 // 追加式，索引 = 登记顺序，与语义 struct 表行号对应）。
@@ -327,6 +352,15 @@ pub func set_struct_name(idx: i64, nm: string) {
         table_push(st_names, "")
     }
     table_push(st_names, nm)
+}
+
+// 登记 enum 索引 -> 名字（语义阶段收集 enum 时调用；追加式，
+// 索引 = 登记顺序，与语义 enum 表行号对应）。
+pub func set_enum_name(idx: i64, nm: string) {
+    while len(en_names) < idx {
+        table_push(en_names, "")
+    }
+    table_push(en_names, nm)
 }
 
 // ---------- 类型名字（错误消息用；递归还原）----------
@@ -385,6 +419,13 @@ pub func type_name(t: i64) -> string {
             return st_names[idx]
         }
         return "struct"
+    }
+    if k == K_ENUM {
+        var eidx = low(t)
+        if eidx >= 0 && eidx < len(en_names) {
+            return en_names[eidx]
+        }
+        return "enum"   // 未登记兜底（理论不发生，防御性）
     }
     if k == K_TYPEVAR {
         var iv = low(t)

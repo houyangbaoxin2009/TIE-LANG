@@ -78,6 +78,33 @@ var g_ren_next: i64 = 1;
 
 namespace llvmgen {
 
+// 本地字符串切片 [start, end)（码点级；对齐 irgen.ig_slice）。
+// 历史 bug：global_ref 曾调用未定义的裸 `slice`，导致所有 import 本模块的
+// 程序（driver-lite/driver）编译报"未定义的函数 'slice'"。本辅助补齐。
+func l_slice(s: string, start: i64, end: i64) -> string {
+    var out: string = ""
+    var i: i64 = start
+    while i < end {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+// 查找字符串中第一个指定字符的下标（-1 = 无）。
+// 历史 bug：const_f 曾调用未定义的裸 `find_char`，本辅助补齐。
+func l_find_char(s: string, c: string) -> i64 {
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == c {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
 // 全局变量登记：表全局（global ptr null + main 初始化）/ 标量（零值 global）。
 // 供 irgen.gen_global_var 调用（driver 树顶层 VarDecl 439 个）。
 pub func global_table_reg(nm: string) {
@@ -173,7 +200,25 @@ func emit_agg_types() {
         line(out)
         i = i + 1
     }
-    if len(st_vals) > 0 {
+    // enum 类型输出（2026-08-15 enum 语言特性）：`%enum.<名> = type { i64, i64×K }`。
+    // 布局：槽 0 = tag（变体号 i64），槽 1..K = payload（K = en_nslot[ei]，
+    // 所有变体 payload 字段数最大值）。**循环独立于 st_vals**——en_vals 是
+    // 按 enum 名升序排列的索引表（与 en_keys 并行），不可复用上面 st_vals 循环。
+    var ne = len(en_vals)
+    var ei2: i64 = 0
+    while ei2 < ne {
+        var eidx = en_vals[ei2]
+        var eout: string = "%enum." + sstate.enum_name_of(eidx) + " = type { i64"
+        var k2: i64 = 0
+        while k2 < en_nslot[eidx] {
+            eout = eout + ", i64"
+            k2 = k2 + 1
+        }
+        eout = eout + " }"
+        line(eout)
+        ei2 = ei2 + 1
+    }
+    if len(st_vals) > 0 || len(en_vals) > 0 {
         line("")
     }
 }
@@ -571,6 +616,13 @@ func llvm_ty(t: i64) -> string {
     if agg_k == K_STRUCT {
         var sidx2 = t - BASE_STRUCT
         return "%struct." + sstate.struct_name_of(sidx2)
+    }
+    // enum 聚合类型（2026-08-15 enum 语言特性）：命名结构体 %enum.<名字>，
+    // emit_agg_types 输出 `%enum.<名> = type { i64, i64, ..., i64 }`
+    //（槽 0 = tag，槽 1..K = payload；K = en_nslot 见 emit_agg_types）。
+    if agg_k == K_ENUM {
+        var eidx2 = t - BASE_ENUM
+        return "%enum." + sstate.enum_name_of(eidx2)
     }
     // string/table/map 等 → ptr（引用类型）
     return "ptr"
@@ -1043,21 +1095,25 @@ func opnd_ref(inst_id: i64, k: i64) -> string {
     if kind == 1 {
         return "label %bb" + to_string(v)
     }
-    // 形参引用优先（参数值 id 无定义指令，且 %N 全局编号在 LLVM 中不存在）
+    // 全局地址（kind 3）必须优先于参数检查：全局常量 value id 与参数值 id
+    // 可能撞号（同属 ir_ops 值池），误判会把全局地址输出为 `%N` 参数引用
+    // （如 `load i64, ptr %0` 类型错误，opt 报 defined with type 'i64' but
+    // expected 'ptr'）。pnames 字符串池顺序变化曾触发此路径。
+    if kind == 3 {
+        var gref = global_ref(v)
+        if str_len(gref) > 0 {
+            return gref
+        }
+        return "%" + to_string(v)  // 防御（理论上不达）
+    }
+    // 形参引用（仅 kind 0 的普通值引用才可能是参数：参数值 id 无定义指令，
+    // 且 %N 全局编号在 LLVM 中不存在）
     var pr = param_ref(v)
     if pr != "" {
         return pr
     }
     if kind == 0 {
         return "%" + to_string(v)
-    }
-    if kind == 3 {
-        // 全局地址（irgen 伪绑定 "@name" 池 id）→ @name 直接引用
-        var gref = global_ref(v)
-        if str_len(gref) > 0 {
-            return gref
-        }
-        return "%" + to_string(v)  // 防御（理论上不达）
     }
     return to_string(v)
 }
@@ -1069,7 +1125,7 @@ func opnd_ref(inst_id: i64, k: i64) -> string {
 func global_ref(v: i64) -> string {
     var nm = intern.lookup(v)
     if str_len(nm) > 0 && str_char(nm, 0) == "@" {
-        nm = slice(nm, 1, str_len(nm))
+        nm = l_slice(nm, 1, str_len(nm))
     }
     var nid = interner.intern(nm)
     var i: i64 = 0
@@ -1351,7 +1407,7 @@ func gen_inst(inst_id: i64) {
         // f64→文本转换；LLVM 要求字面量含小数点/指数）
         var lit = intern.lookup(ir.ins_opnd(inst_id, 0))
         var lit_txt = lit
-        if find_char(lit, ".") < 0 && find_char(lit, "e") < 0 && find_char(lit, "E") < 0 {
+        if l_find_char(lit, ".") < 0 && l_find_char(lit, "e") < 0 && l_find_char(lit, "E") < 0 {
             lit_txt = lit + ".0"
         }
         var fty2 = llvm_ty(ir.ins_ty(inst_id))

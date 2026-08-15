@@ -575,6 +575,21 @@ func ig_slice(s: string, start: i64, end: i64) -> string {
     return out
 }
 
+// 查找字符串中第一个指定字符的下标（-1 = 无）。
+// 历史 bug：gen_call 曾调用未定义的裸 `find_char`（老式点号名兼容探测），
+// 导致所有 import 本模块的程序编译报"未定义的函数 'find_char'"。本辅助补齐。
+func ig_find_char(s: string, c: string) -> i64 {
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == c {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
 // 命名空间函数全名 → LLVM 符号（:: → $；对齐 llvmgen.ns_replace）
 func ig_ns_sym(full: string) -> string {
     var out: string = ""
@@ -1360,6 +1375,12 @@ func gen_expr(id: i64) -> i64 {
         if is_struct_name(nm) {
             return gen_struct_construct(id, nm)
         }
+        // 枚举构造调用（防御路径：旧式点号名 `EnumName.Variant(...)` 若 parser
+        // 产出 Call 则在此处理；现行 parser 对枚举构造产 FieldAccess/MethodCall，
+        // 见 tag 15/tag 18 分支。nm 为点号全名时只取枚举段匹配。）
+        if is_enum_name(nm) {
+            return gen_enum_construct(sstate.bs_find(en_keys, interner.intern(nm)), "", id, sstate.slot_off(id))
+        }
         // 内置（语言底座原语 → tie_* 桥或 libc）：非用户函数。
         // 名字命中内置集后失败必须传播（-1 保留原 sm_err_msg），绝不降级为
         // 用户调用——否则内置参数内的未支持表达式会连锁成"函数 X 无签名"
@@ -1380,7 +1401,7 @@ func gen_expr(id: i64) -> i64 {
         var aoff = sstate.slot_off(id)
         // 兼容旧式点号名（历史 parser 曾对 `myns.add(...)` 生成 children=[接收者,
         // 实参...]；新 parser 不再产出，防御保留 +1 语义）
-        if find_char(nm, ".") >= 0 {
+        if ig_find_char(nm, ".") >= 0 {
             aoff = aoff + 1
         }
         return gen_user_call_from(full, id, aoff)
@@ -1454,7 +1475,18 @@ func gen_expr(id: i64) -> i64 {
         return gen_tuple_lit(id)
     }
     if tag == 15 {
-        // FieldAccess：.q / .Item1 / .0 字段访问（元组/struct）→ 地址 + GEP + load
+        // FieldAccess：.q / .Item1 / .0 字段访问（元组/struct）→ 地址 + GEP + load。
+        // 枚举变体常量探测（EnumName.Variant 无 payload）：base 是未绑定变量且
+        // 命中 en_keys → 枚举构造（仿 sinfer FieldAccess 分支，必须先于
+        // gen_field_access——否则枚举名被当变量查作用域报错）
+        var base_node15 = sstate.child(id, 0)
+        if s_tags[base_node15] == 6 {  // Var
+            var bnm15 = sstate.name_str(base_node15)
+            var eidx15 = sstate.bs_find(en_keys, interner.intern(bnm15))
+            if eidx15 >= 0 {
+                return gen_enum_construct(eidx15, sstate.name_str(id), id, -1)
+            }
+        }
         return gen_field_access(id)
     }
     if tag == 12 {
@@ -2558,6 +2590,17 @@ func gen_method_call(id: i64) -> i64 {
     // MethodCall 接收者 = children[slot_off]（新布局 children[0]=泛型槽→偏移 1）
     var recv = sstate.child(id, sstate.slot_off(id))
     var mname = sstate.name_str(id)
+    // 枚举变体构造探测（EnumName.Variant(args)）：接收者是未绑定变量且命中
+    // en_keys → 枚举构造（仿 sinfer.infer_method_call 的枚举分支；实参从
+    // children[slot_off + 1] 起）。须先于 struct 实例方法转发——枚举名不可
+    // 能是已绑定实例，互不冲突。
+    if s_tags[recv] == 6 {
+        var rnm = sstate.name_str(recv)
+        var eidx2 = sstate.bs_find(en_keys, interner.intern(rnm))
+        if eidx2 >= 0 {
+            return gen_enum_construct(eidx2, mname, id, 1 + sstate.slot_off(id))
+        }
+    }
     // 接收者是已绑定实例（局部/全局变量）且类型为 struct → 实例方法转发：
     // 函数全名 = <struct 名>::<方法>，实参 = [receiver 值] + 显式实参
     if s_tags[recv] == 6 {
@@ -2924,6 +2967,156 @@ func gen_field_assign(id: i64) -> i64 {
 func is_struct_name(nm: string) -> bool {
     var nid = interner.intern(nm)
     return sstate.bs_find(st_keys, nid) >= 0
+}
+
+// enum 名判定（2026-08-15 enum 语言特性）：枚举名命中 en_keys。
+// 仿 is_struct_name——构造分派点（FieldAccess/MethodCall/Call）用。
+func is_enum_name(nm: string) -> bool {
+    var nid = interner.intern(nm)
+    return sstate.bs_find(en_keys, nid) >= 0
+}
+
+// 枚举变体 tag 解析：枚举名 + 变体名 → tag 值（0..nvar-1）；-1 = 未找到。
+// 在 en_vnames 拍平段（en_varoff[ei] 起 en_nvar[ei] 个）线性查找变体名。
+// 供 gen_enum_construct（构造）与 gen_switch（case 模式 → tag 常量）共用。
+func enum_variant_tag(ei: i64, vname: string) -> i64 {
+    var varoff = en_varoff[ei]
+    var nvar = en_nvar[ei]
+    var k: i64 = 0
+    while k < nvar {
+        if intern.lookup(en_vnames[varoff + k]) == vname {
+            return en_vtags[varoff + k]
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// 枚举 switch 的 case 模式 → tag 常量（-1 = 非法模式）。
+// 模式形态：FieldAccess(Enum.Variant)——base 是枚举名 Var，name 是变体名。
+// 枚举名解析：普通 enum 直接查 en_keys；泛型 enum 模板名（如 Option）经
+// gin 记录反查——subject 是对应模板的实例化时，解析到 subject 的实例
+//（scheck 已做同款校验，此处防御性复核）。返回变体 tag 值（0..nvar-1）。
+func enum_case_tag(pat: i64, subj_ty: i64) -> i64 {
+    var ei = types.low(subj_ty)
+    if s_tags[pat] != 15 {
+        return -1  // 非 FieldAccess（scheck 已拦截，防御）
+    }
+    var base = sstate.child(pat, 0)
+    if s_tags[base] != 6 {
+        return -1  // base 非 Var（scheck 已拦截，防御）
+    }
+    var bname = sstate.name_str(base)
+    var eidx = sstate.bs_find(en_keys, interner.intern(bname))
+    var ei2: i64 = -1
+    if eidx >= 0 {
+        ei2 = en_vals[eidx]
+    } else {
+        // 泛型 enum 模板：subject 必须是对应模板的实例化
+        var gidx = sstate.gt_find(bname)
+        if gidx >= 0 && gty_is_struct[gidx] == 2 {
+            var rec = sstate.gin_find(sstate.enum_name_of(ei))
+            if rec >= 0 && gin_tmpl[rec] == gidx {
+                ei2 = ei
+            }
+        }
+    }
+    if ei2 != ei {
+        return -1  // base 不是同枚举（scheck 已拦截，防御）
+    }
+    return enum_variant_tag(ei, sstate.name_str(pat))
+}
+
+// 枚举构造：EnumName.Variant(args) → 聚合值。
+// eidx：en_keys 下标（构造名反查的枚举）；vname：变体名；id：AST 节点
+//（MethodCall 取实参；FieldAccess 无实参）；arg_start：实参起始 child
+// 下标（MethodCall = slot_off + 1；FieldAccess/无实参 = -1）。
+// 布局（对齐 gen_struct_construct）：alloca %enum.X → store tag（槽 0）→
+// 逐 payload 槽 store（实参覆盖前 nfld 个；其余槽零值）→ load 聚合值。
+// 槽类型统一 i64：窄整数/字符/布尔 payload 经 sext 升宽到 i64（一期白名单
+// 限整数系；string payload 无现成 ptr↔i64 桥 → 报"暂不支持"）。
+func gen_enum_construct(eidx: i64, vname: string, id: i64, arg_start: i64) -> i64 {
+    var ei = en_vals[eidx]
+    var ename = sstate.enum_name_of(ei)
+    var tag = enum_variant_tag(ei, vname)
+    if tag < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "枚举 '" + ename + "' 没有变体 '" + vname + "'（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var varoff = en_varoff[ei]
+    var nfld = en_vnfld[varoff + tag]
+    var foff = en_vfldoff[varoff + tag]
+    var nslot = en_nslot[ei]
+    var agg = types.enum_of(ei)
+    // alloca 聚合（类型 = %enum.X）
+    var alloca = ir.new_inst(g_cur_block, 20, agg)
+    ir.add_operand(alloca, agg, 2)
+    var ap = ir.get_value(alloca)
+    // store tag（槽 0，i64）
+    var tagv = gen_int_lit_ty(tag, types.named(TK_I64))
+    var g0 = ir.new_inst(g_cur_block, 27, agg)  // agg_gep 下标 0
+    ir.add_operand(g0, ap, 0)
+    ir.add_operand(g0, 0, 2)
+    var g0p = ir.get_value(g0)
+    var st0 = ir.new_inst(g_cur_block, 22, -1)  // store
+    ir.add_operand(st0, types.named(TK_I64), 2)
+    ir.add_operand(st0, tagv, 0)
+    ir.add_operand(st0, g0p, 0)
+    // 逐 payload 槽（槽下标 1..nslot；i 从 0 起对应槽 1+i）
+    var i: i64 = 0
+    while i < nslot {
+        var fty: i64 = types.named(TK_I64)
+        var v: i64 = -1
+        if i < nfld {
+            fty = en_ftys[foff + i]
+            // string payload 一期暂不支持（槽是 i64，string 值是指针，
+            // 需 ptrtoint/inttoptr 桥；llvmgen 无现成内联桥）
+            if fty == types.named(TK_STR) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "枚举变体 string payload 暂不支持（一期仅支持整数系 payload）"
+                return -1
+            }
+            var arg = sstate.child(id, arg_start + i)
+            // 窄整数字段 + 整数字面量：按字段类型生成常量（i32 槽 i32 值）——
+            // 否则字面量走 gen_expr 恒 i64，sext i32 %i64 类型不匹配。
+            // 非字面量（变量/表达式）gen_expr 产出天然窄类型（i32 变量 load i32、
+            // 字符/布尔字面量 i32/i1），sext 源类型与 fty 一致。
+            if fty != types.named(TK_I64) && fty != types.named(TK_U64) && s_tags[arg] == 0 {
+                v = gen_int_lit_ty(s_vals[arg], fty)
+            } else {
+                v = gen_expr(arg)
+            }
+            if v < 0 {
+                return -1
+            }
+            // 窄整数/字符/布尔/trit → sext 升宽到 i64（槽统一 i64；u 类型
+            // 升宽用 sext——一期仅 i64 payload 参与验收，符号扩展边界已注释）
+            if fty != types.named(TK_I64) && fty != types.named(TK_U64) {
+                var se = ir.new_inst(g_cur_block, 19, types.named(TK_I64))  // sext
+                ir.add_operand(se, fty, 2)
+                ir.add_operand(se, v, 0)
+                v = ir.get_value(se)
+            }
+        } else {
+            // 无 payload 变体 / 超出实参的槽：零值（聚合不含未定义位）
+            v = gen_int_lit_ty(0, types.named(TK_I64))
+        }
+        var gp = ir.new_inst(g_cur_block, 27, agg)  // agg_gep 下标 1+i
+        ir.add_operand(gp, ap, 0)
+        ir.add_operand(gp, 1 + i, 2)
+        var gpp = ir.get_value(gp)
+        var st = ir.new_inst(g_cur_block, 22, -1)  // store i64
+        ir.add_operand(st, types.named(TK_I64), 2)
+        ir.add_operand(st, v, 0)
+        ir.add_operand(st, gpp, 0)
+        i = i + 1
+    }
+    var ld = ir.new_inst(g_cur_block, 21, agg)  // load 聚合值
+    ir.add_operand(ld, ap, 0)
+    return ir.get_value(ld)
 }
 
 // struct 构造调用：StructName(args...) → 聚合值。
@@ -3653,8 +3846,26 @@ func gen_switch(id: i64) -> i64 {
     if sv < 0 {
         return -1
     }
-    // subject 类型分派：字符串 → strcmp 比较链；整数/char → icmp 比较链
+    // subject 类型分派：字符串 → strcmp 比较链；整数/char → icmp 比较链；
+    // 枚举 → 提取 tag（槽 0）后与 case 的 tag 常量 icmp 比较
     var subj_is_str = node_types[subject] == types.named(TK_STR)
+    var subj_ty = node_types[subject]
+    var subj_is_enum = types.kind(subj_ty) == K_ENUM
+    var enum_tag_v: i64 = -1
+    if subj_is_enum {
+        // 枚举 subject：gen_agg_addr(subject) → agg_gep 下标 0 → load i64（tag）
+        var eaddr = gen_agg_addr(subject, subj_ty)
+        if eaddr < 0 {
+            return -1
+        }
+        var egp = ir.new_inst(g_cur_block, 27, subj_ty)
+        ir.add_operand(egp, eaddr, 0)
+        ir.add_operand(egp, 0, 2)
+        var egpp = ir.get_value(egp)
+        var eld = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+        ir.add_operand(eld, egpp, 0)
+        enum_tag_v = ir.get_value(eld)
+    }
     var ncases = s_aux[id]
     var exit_blk = ir.new_block(g_cur_func, interner.intern("sw.exit"))
     // 逐个 case：PatternList 多模式（任一命中 → body；含 Range 范围模式）
@@ -3671,7 +3882,24 @@ func gen_switch(id: i64) -> i64 {
         while i < npat {
             var pat = sstate.child(pl, i)
             var eq_v: i64 = -1
-            if s_tags[pat] == 11 {
+            if subj_is_enum {
+                // 枚举 case：模式 = FieldAccess(Enum.Variant) → 解析为 tag 常量，
+                // 与提取出的 subject tag icmp eq（scheck 已校验变体合法）。
+                // 不可用 gen_expr(pat)——FieldAccess 枚举分支会构造聚合值。
+                var ptag = enum_case_tag(pat, subj_ty)
+                if ptag < 0 {
+                    sm_err_line = s_lines[id]
+                    sm_err_col = s_cols[id]
+                    sm_err_msg = "case 值不是枚举 '" + types.type_name(subj_ty) + "' 的变体引用（函数 " + g_cur_fn_name + "）"
+                    return -1
+                }
+                var pv2 = gen_int_lit_ty(ptag, types.named(TK_I64))
+                var is_eq2 = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+                ir.add_operand(is_eq2, enum_tag_v, 0)
+                ir.add_operand(is_eq2, pv2, 0)
+                ir.add_operand(is_eq2, 0, 2)  // eq
+                eq_v = ir.get_value(is_eq2)
+            } else if s_tags[pat] == 11 {
                 // Range 模式（case 3..7 → sv >= 3 && sv < 7）
                 var rs = gen_expr(sstate.child(pat, 0))
                 if rs < 0 {
@@ -3933,8 +4161,10 @@ func gen_stmt(id: i64) -> i64 {
                 // 浮点推断（f64/f32）：mean(...) 返回 f64 → alloca double 槽
                 //（曾落默认 i64 → store i64 %double 类型错）
                 ty = it
-            } else if it >= 0 && (types.kind(it) == K_TUPLE || types.kind(it) == K_STRUCT) {
+            } else if it >= 0 && (types.kind(it) == K_TUPLE || types.kind(it) == K_STRUCT || types.kind(it) == K_ENUM) {
                 // 聚合变量：alloca 聚合槽，init（构造调用/元组字面量/返回）求聚合值
+                // （K_ENUM 2026-08-15：枚举变量同 struct——alloca %enum.X 槽，
+                // init 的 FieldAccess/MethodCall 构造求聚合值，store 类型匹配）
                 ty = it
             }
         }

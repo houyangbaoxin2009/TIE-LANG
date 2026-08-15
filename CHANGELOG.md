@@ -1,5 +1,19 @@
 
+## [新增] enum 枚举语言特性（ADT 标签联合 + 泛型，tiec 全链路实现）—— 2026-08-15
+
+tie 语言新增 **enum 枚举**（Rust 风格 ADT），tiec（tie 自写编译器，compiler/）
+全链路实现（词法→语法→语义→IR→LLVM），完全不用 Rust：
+
+- **语法**：`enum Color { Red Green Blue }`（无数据变体）+ `enum Shape { Circle(i64) Rect(i64, i64) }`（带 payload 变体）+ `enum Option<T> { Some(T) None }`（泛型）
+- **构造**：`Color.Red`（无 payload 常量）/ `Shape.Circle(5)`（构造调用）/ `Option.Some(42)`（实参推断 T）
+- **匹配**：switch 对枚举 subject 匹配变体（case 变体引用解析为 tag 常量，走整数比较链）
+- **LLVM 表示**：静态结构体 `{ i64 tag, i64×K 槽 }`（K = 最大变体 payload 字段数，Oracle 确认方案 B），零运行时开销；泛型枚举编译期单态化（mangle + clone_subst + gin_reg）
+- **一期限制**：payload 白名单限整数族/bool/char/trit（string/f64 等报暂不支持）；枚举 `==` 比较暂不支持；REPL 报"暂不支持 enum 定义"
+- **修复两个 latent bug**：llvmgen `opnd_ref` 全局地址（kind 3）优先于参数检查（防全局 value id 与参数撞号）；pnames `tok_debug_name`/`node_tag_name` 越界保护（防新增 token tag 越界崩溃）
+- **验收**：`tests/language/enum.tie`（11 输出全对）、`enum_neg.tie`、错误 golden err_063-065；自举链 tiec→tiec2 编译自身成功、IR 逐字节一致；行为等价回归 24/26（2 个 extern declare 既有失败）
+
 ## [新增] P0 库级四件套（std/net + HTTP 服务端 + 集合 + 向量 db）—— 2026-08-15
+
 
 对比报告（docs/language-comparison.md）路线图 P0 全部落地，tie 实现优先：
 

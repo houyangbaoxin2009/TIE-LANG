@@ -45,6 +45,22 @@ var fld_names: table<i64>;    // 拍平字段名 id
 var fld_tys: table<i64>;      // 拍平字段类型 id
 var fld_defs: table<i64>;     // 拍平字段默认值表达式节点 id（-1 = 无；Point.y = 10）
 
+// ==================== enum 状态表（2026-08-15 enum 语言特性）====================
+// enum 表按「名 id（升序）→ 索引」登记，索引行号 = types.enum_of 的负载。
+// 变体信息拍平段（en_vnames/en_vtags/en_vfldoff/en_vnfld 共用 en_varoff 段偏移；
+// payload 类型单独拍平进 en_ftys，变体经 en_vfldoff 定位其字段段）。
+var en_keys: table<i64>;      // enum 名 id（升序，二分）
+var en_vals: table<i64>;      // enum 索引
+var en_done: table<i64>;      // 变体收集完成标志（0/1，防重复收集）
+var en_nvar: table<i64>;      // 变体数
+var en_varoff: table<i64>;    // 变体段偏移（en_vnames/en_vtags/en_vfldoff/en_vnfld 共用段）
+var en_nslot: table<i64>;     // 槽数 K（所有变体 payload 字段数最大值；后端聚合布局用）
+var en_vnames: table<i64>;    // 变体名 id（拍平段）
+var en_vtags: table<i64>;     // 变体 tag 值（0..nvar-1，拍平段）
+var en_vfldoff: table<i64>;   // 变体 payload 字段段偏移（en_ftys）
+var en_vnfld: table<i64>;     // 变体 payload 字段数
+var en_ftys: table<i64>;      // 变体 payload 字段类型 id（拍平段）
+
 var gb_keys: table<i64>;      // 全局变量名 id（升序）
 var gb_vals: table<i64>;      // 类型 id
 var gb_const: table<i64>;     // 0/1
@@ -194,6 +210,8 @@ const S_N_MAP_TYPE: i64 = 204;
 const S_N_TYPE_PARAMS: i64 = 125;
 const S_N_TYPE_PARAM: i64 = 126;
 const S_N_TYPE_ARGS: i64 = 127;
+const S_N_ENUM: i64 = 128;
+const S_N_ENUM_VARIANT: i64 = 129;
 namespace sstate {
 
 // ==================== 工具：协议解析 ====================
@@ -799,6 +817,38 @@ pub func reg_struct(name: string, parent: string) -> i64 {
     sorted_insert(st_keys, st_vals, nid, idx)
     // struct 名登记由上层（stype）经 types.set_struct_name 完成
     return idx
+}
+
+// enum 登记（重名检查，返回 enum 索引或 -1）。
+// 入参为枚举名的 interner 池 id（升序二分键）。登记时只 push 变体信息
+// 表的占位行（en_nvar/en_varoff/en_nslot/en_done），变体内容由
+// scollect.collect_enum_variants 在 check 前统一填充（对齐 struct 两遍收集）。
+pub func reg_enum(name_id: i64) -> i64 {
+    if bs_find(en_keys, name_id) >= 0 {
+        sm_err_msg = "枚举 '" + intern.lookup(name_id) + "' 重复定义"
+        return -1
+    }
+    var idx = len(en_nvar)
+    table_push(en_nvar, 0)
+    table_push(en_varoff, len(en_vnames))
+    table_push(en_nslot, 0)
+    table_push(en_done, 0)
+    sorted_insert(en_keys, en_vals, name_id, idx)
+    // enum 名登记由上层（scollect）经 types.set_enum_name 完成
+    return idx
+}
+
+// enum 索引 -> 名字（en_keys 按名字排序，须经 en_vals 反查索引位置）
+pub func enum_name_of(idx: i64) -> string {
+    var n = len(en_keys)
+    var i: i64 = 0
+    while i < n {
+        if en_vals[i] == idx {
+            return intern.lookup(en_keys[i])
+        }
+        i = i + 1
+    }
+    return "?"
 }
 
 // ==================== 泛型模板登记辅助（T3b 单态化展开器预置）====================

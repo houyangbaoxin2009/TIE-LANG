@@ -40,10 +40,16 @@ pub func parse_type_node(tid: i64) -> i64 {
         var nid = intern.intern(nm)
         var idx = sstate.bs_find(st_keys, nid)
         if idx < 0 {
-            sm_err_line = s_lines[tid]
-            sm_err_col = s_cols[tid]
-            sm_err_msg = "类 '" + nm + "' 未定义"
-            return -1
+            // 枚举类型引用（复用 N_STRUCT_TYPE 承载标识符类型，按名分派）：
+            // 先查 st_keys（struct），未命中查 en_keys（enum）
+            var eidx = sstate.bs_find(en_keys, nid)
+            if eidx < 0 {
+                sm_err_line = s_lines[tid]
+                sm_err_col = s_cols[tid]
+                sm_err_msg = "类型 '" + nm + "' 未定义"
+                return -1
+            }
+            return types.enum_of(en_vals[eidx])
         }
         return types.struct_of(st_vals[idx])
     }
@@ -163,6 +169,10 @@ pub func types_compatible(a: i64, b: i64) -> bool {
         return types_compatible(types.table_elem(a), types.table_elem(b))
     }
     if ka == K_STRUCT && kb == K_STRUCT {
+        return a == b
+    }
+    if ka == K_ENUM && kb == K_ENUM {
+        // 枚举按名等价：同名同类型（不同 enum 不兼容）
         return a == b
     }
     if ka == K_TUPLE && kb == K_TUPLE {

@@ -1,0 +1,75 @@
+type tie<logic>
+
+// ============================================================
+// enum 语言特性负例验收（2026-08-15：ADT 枚举 前端+后端+泛型）
+//
+// 每例以注释标注期望错误 + 代码触发（编译应失败）。
+// 单文件编译时**第一个错误即停**（属预期）——全部负例覆盖于此，
+// 实际触发顺序由语义阶段决定：collect_top 的 enum 登记（reg_enum，
+// 查重/查冲突）→ 变体收集（collect_enum_variants，重复变体/白名单）
+// → 函数体检查（未定义类型/== 比较/裸引用）→ IR 生成（string payload）。
+//
+// 覆盖场景（对照 compiler/frontend 语义检查，均已实测确认消息）：
+//   1. 枚举重复定义：enum D { A } enum D { B } →
+//      "枚举 'DupEnum' 重复定义"（reg_enum 登记，本文件首个实际错误）
+//   2. 枚举名与函数名冲突：func Color() {} + enum Color →
+//      "枚举名 'Color' 与函数名冲突"（登记阶段查函数表）
+//   3. 重复变体：enum Palette { Red Red } →
+//      "变体 'Red' 重复定义"（collect_enum_variants）
+//   4. payload 白名单违规：enum Foo { A(f64) } →
+//      "变体 'A' 的 payload 暂不支持类型 'f64'"（白名单校验）
+//   5. 未定义枚举类型：var x: Nonexistent →
+//      "类型 'Nonexistent' 未定义"（函数体类型解析）
+//   6. 枚举 == 比较：if c == Color.Red →
+//      "枚举暂不支持 == 比较"（函数体二元运算）
+//   7. 带 payload 变体裸引用：var s = Shape.Circle（无参数）→
+//      "变体 'Shape.Circle' 需要 payload 参数（不能裸引用，请用 Shape.Circle(...) 构造）"
+//   8. string payload（仅构造调用时触发，IR 生成阶段）：
+//      enum Foo { A(string) } + Foo.A("hi") →
+//      "IR 生成失败: 枚举变体 string payload 暂不支持（一期仅支持整数系 payload）"
+// ============================================================
+
+// ----- 负例 1：枚举重复定义（登记阶段，本文件首个实际错误）-----
+enum DupEnum {
+    A
+}
+enum DupEnum {
+    B
+}
+
+// ----- 负例 2：枚举名与函数名冲突（登记阶段查函数表）-----
+func Color() {}
+enum Color {
+    Red
+}
+
+// ----- 负例 3：重复变体（变体收集阶段）-----
+enum Palette {
+    Red
+    Red
+}
+
+// ----- 负例 4/8 共用模板：Foo（payload 白名单 + string）-----
+enum Foo {
+    A(f64)        // 负例 4：f64 不在 payload 白名单
+    B(string)     // 负例 8：string payload 一期不支持（构造时触发）
+}
+
+// ----- 负例 6/7 共用模板：Shape（带 payload 变体）-----
+enum Shape {
+    Circle(i64)
+}
+
+func main() {
+    // 负例 5：未定义枚举类型（函数体类型解析报错）
+    var x: Nonexistent = 0
+    // 负例 6：枚举 == 比较（语义层二元运算拦截）
+    var c = Color.Red
+    if c == Color.Red {
+        println(1)
+    }
+    // 负例 7：带 payload 变体裸引用（无参数构造）
+    var s = Shape.Circle
+    // 负例 8：string payload 构造调用（IR 生成阶段报错）
+    var f = Foo.B("hi")
+}

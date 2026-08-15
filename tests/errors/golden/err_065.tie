@@ -1,0 +1,10 @@
+enum Color {
+    Red
+    Green
+}
+func main() {
+    var c = Color.Red
+    if c == Color.Red {
+        println(1)
+    }
+}

@@ -129,6 +129,17 @@ pub func type_node_from_id(t: i64) -> i64 {
         set_children_ast(nd, kids)
         return nd
     }
+    if k == K_ENUM {
+        // 枚举类型实参（2026-08-15 泛型 enum）：复用 N_STRUCT_TYPE 承载标识符
+        // 类型，name = 枚举名（mangled）。语义层按名分派：st_keys 未命中查
+        // en_keys（枚举实例已 reg_enum 登记 mangled 名）。
+        var ename = sstate.enum_name_of(types.low(t))
+        var kids: table<i64> = table_new_i64()
+        table_push(kids, -1)
+        var nd = push_node(S_N_STRUCT_TYPE, intern.intern(ename), -1, -1, 0, 0)
+        set_children_ast(nd, kids)
+        return nd
+    }
     sm_err_line = 0
     sm_err_col = 0
     sm_err_msg = "类型实参不能是元组类型（泛型系统首轮不支持 tuple 实参）"
@@ -336,6 +347,7 @@ pub func parse_generic_type_node(tid: i64) -> i64 {
         var nm = sstate.name_str(tid)
         var nid = intern.intern(nm)
         var sidx = sstate.bs_find(st_keys, nid)
+        var eidx = sstate.bs_find(en_keys, nid)
         var gidx = sstate.gt_find(nm)
         // 带类型实参槽（N_TYPE_ARGS）
         if sstate.nchild(tid) > 0 {
@@ -352,21 +364,42 @@ pub func parse_generic_type_node(tid: i64) -> i64 {
                     }
                     return types.struct_of(si)
                 }
+                if gidx >= 0 && gty_is_struct[gidx] == 2 {
+                    // 泛型 enum 实例化（2026-08-15）：Option<i64> → instantiate_enum
+                    var args = parse_type_args_ast(slot)
+                    if len(args) == 0 {
+                        return -1
+                    }
+                    var ei = instantiate_enum(gidx, args)
+                    if ei < 0 {
+                        return -1
+                    }
+                    return types.enum_of(ei)
+                }
                 if sidx >= 0 {
                     sm_err_line = s_lines[tid]
                     sm_err_col = s_cols[tid]
                     sm_err_msg = "struct '" + nm + "' 不接受类型参数（非泛型 struct）"
                     return -1
                 }
+                if eidx >= 0 {
+                    sm_err_line = s_lines[tid]
+                    sm_err_col = s_cols[tid]
+                    sm_err_msg = "枚举 '" + nm + "' 不接受类型参数（非泛型 enum）"
+                    return -1
+                }
                 sm_err_line = s_lines[tid]
                 sm_err_col = s_cols[tid]
-                sm_err_msg = "类 '" + nm + "' 未定义"
+                sm_err_msg = "类型 '" + nm + "' 未定义"
                 return -1
             }
         }
-        // 裸 struct 引用
+        // 裸 struct / enum 引用
         if sidx >= 0 {
             return types.struct_of(st_vals[sidx])
+        }
+        if eidx >= 0 {
+            return types.enum_of(en_vals[eidx])
         }
         if gidx >= 0 && gty_is_struct[gidx] == 1 {
             sm_err_line = s_lines[tid]
@@ -374,9 +407,15 @@ pub func parse_generic_type_node(tid: i64) -> i64 {
             sm_err_msg = "泛型 struct '" + nm + "' 必须显式指定类型参数（如 " + nm + "<i64>）"
             return -1
         }
+        if gidx >= 0 && gty_is_struct[gidx] == 2 {
+            sm_err_line = s_lines[tid]
+            sm_err_col = s_cols[tid]
+            sm_err_msg = "泛型 enum '" + nm + "' 必须显式指定类型参数（如 " + nm + "<i64>）"
+            return -1
+        }
         sm_err_line = s_lines[tid]
         sm_err_col = s_cols[tid]
-        sm_err_msg = "类 '" + nm + "' 未定义"
+        sm_err_msg = "类型 '" + nm + "' 未定义"
         return -1
     }
     // tuple 等：复用现有解析（首轮 tuple 类型实参内不含模板 struct）
@@ -590,6 +629,134 @@ pub func instantiate_struct(gti: i64, args: table<i64>) -> i64 {
     sstate.gin_reg(mangled, gti, args, 1)
     g_inst_depth = g_inst_depth - 1
     return si
+}
+
+// ==================== 泛型 enum 实例化（2026-08-15 enum 语言特性）====================
+
+// 实例化泛型 enum 模板 → enum 索引。仿 instantiate_struct：
+//  1. mangle 模板名 + 类型实参（如 Option + i64 → Option$i64）
+//  2. 幂等：en_keys 已命中（reg_enum 登记过 mangled 名）→ 直接返回
+//  3. 实参个数校验（gtyp_nparams 对比）
+//  4. clone_subst 克隆模板 N_ENUM 节点（TypeVar → 实参类型替换）
+//  5. reg_enum(mangled) + 变体收集（payload 类型已具体化）
+//  6. set_enum_name + gin_reg 登记
+// 返回 enum 索引（types.enum_of 负载）；-1 错误（sm_err_* 已置）。
+pub func instantiate_enum(gti: i64, args: table<i64>) -> i64 {
+    var full = intern.lookup(gty_keys[gti])
+    var mangled = mangle(full, args)
+    var eidx = sstate.bs_find(en_keys, intern.intern(mangled))
+    if eidx >= 0 {
+        return en_vals[eidx]  // 已实例化（幂等）
+    }
+    // 实参个数校验
+    var n_tp = gtyp_nparams[gti]
+    if len(args) != n_tp {
+        sm_err_line = 1
+        sm_err_col = 1
+        sm_err_msg = "泛型 enum '" + full + "' 需要 " + to_string(n_tp) + " 个类型参数，实际 " + to_string(len(args)) + " 个"
+        return -1
+    }
+    g_inst_depth = g_inst_depth + 1
+    if g_inst_depth > 64 {
+        g_inst_depth = g_inst_depth - 1
+        sm_err_msg = "泛型实例化深度超限（超过 64 层），疑似无限递归实例化：'" + full + "'"
+        return -1
+    }
+    var node = gty_node[gti]
+    var new_node = clone_subst(node, gti, args)
+    if new_node < 0 {
+        g_inst_depth = g_inst_depth - 1
+        return -1
+    }
+    // enum 名 → mangled（collect_enum_variants 经 find_enum_node 按名查找）
+    s_names[new_node] = intern.intern(mangled)
+    // 登记 enum（重名检查）+ 追加 g_extra_tops（须先于变体收集——find_enum_node
+    // 在 g_extra_tops 里找定义节点）
+    var ei = sstate.reg_enum(intern.intern(mangled))
+    if ei < 0 {
+        g_inst_depth = g_inst_depth - 1
+        sm_err_line = 1
+        sm_err_col = 1
+        return -1
+    }
+    // enum 名登记（types.type_name 还原 / mangle 片段用；须在变体收集前——
+    // collect_enum_variants 用 enum_name_of 还原名字）
+    types.set_enum_name(ei, mangled)
+    table_push(g_extra_tops, new_node)
+    // 变体收集（TypeVar 已替换为具体类型；en_done 置位 → collect_all_enums 跳过）
+    var cr = scollect.collect_enum_variants(ei)
+    if cr < 0 {
+        g_inst_depth = g_inst_depth - 1
+        return -1
+    }
+    // 去重记录（is_struct=2 与模板登记的 enum 类别对齐）
+    sstate.gin_reg(mangled, gti, args, 2)
+    g_inst_depth = g_inst_depth - 1
+    return ei
+}
+
+// 推断泛型 **enum** 模板的类型实参（构造调用 Option.Some(42)）：
+// 模板 enum 布局 = children[slot_off + k] 是 N_ENUM_VARIANT（name = 变体名，
+// children = payload 类型）；本函数定位变体后用 match_type_node 把 payload
+// 类型节点中的 TypeVar 绑定到实参类型。explicit / arg_tys / 返回约定同
+// infer_type_args。variant_name：构造的变体名（用于定位 payload 布局）。
+pub func infer_type_args_variants(tmpl_node: i64, gti: i64, variant_name: string, explicit: table<i64>, arg_tys: table<i64>, call_id: i64) -> table<i64> {
+    var tp_names = sstate.gt_param_names(gti)
+    var n_tp = len(tp_names)
+    var bk: table<i64> = table_new_i64()
+    var bv: table<i64> = table_new_i64()
+    var e: i64 = 0
+    while e < len(explicit) {
+        if explicit[e] >= 0 {
+            table_push(bk, tp_names[e])
+            table_push(bv, explicit[e])
+        }
+        e = e + 1
+    }
+    if len(explicit) > n_tp {
+        sm_err_line = s_lines[call_id]
+        sm_err_col = s_cols[call_id]
+        sm_err_msg = "类型实参过多：enum 模板需要 " + to_string(n_tp) + " 个类型参数，实际 " + to_string(len(explicit)) + " 个"
+        return table_new_i64()
+    }
+    // 定位变体（模板 children[slot_off + k]，name = 变体名）
+    var soff = sstate.slot_off(tmpl_node)
+    var nv = sstate.nchild(tmpl_node) - soff
+    var vi: i64 = -1
+    var k: i64 = 0
+    while k < nv {
+        var v = sstate.child(tmpl_node, soff + k)
+        if sstate.name_str(v) == variant_name {
+            vi = k
+            break
+        }
+        k = k + 1
+    }
+    if vi < 0 {
+        sm_err_line = s_lines[call_id]
+        sm_err_col = s_cols[call_id]
+        sm_err_msg = "枚举 '" + sstate.name_str(tmpl_node) + "' 没有变体 '" + variant_name + "'"
+        return table_new_i64()
+    }
+    var v = sstate.child(tmpl_node, soff + vi)
+    var np = sstate.nchild(v)
+    // 逐个 payload 类型匹配实参（bind TypeVar）
+    var j: i64 = 0
+    while j < len(arg_tys) {
+        if j >= np {
+            sm_err_line = s_lines[call_id]
+            sm_err_col = s_cols[call_id]
+            sm_err_msg = "构造 '" + sstate.name_str(tmpl_node) + "." + variant_name + "' 参数过多（payload 字段数 " + to_string(np) + "）"
+            return table_new_i64()
+        }
+        var pty_node = sstate.child(v, j)
+        var mr = match_type_node(pty_node, arg_tys[j], tp_names, bk, bv, call_id)
+        if mr == -2 {
+            return table_new_i64()
+        }
+        j = j + 1
+    }
+    return finish_args(tp_names, bk, bv, call_id)
 }
 
 // ==================== 返回表元素类型登记（实例化函数用）====================

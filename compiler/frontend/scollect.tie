@@ -50,12 +50,14 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
     // 本身不使语义崩溃 + 模板结构就位。
     if sstate.nchild(fn_node) > 0 {
         var slot0 = sstate.child(fn_node, 0)
-        if slot0 >= 0 && s_tags[slot0] == S_N_TYPE_PARAMS {
-            var gret = sstate.reg_generic(full, fn_node, 0)
-            if gret < 0 {
-                return -1
+        if slot0 >= 0 {
+            if s_tags[slot0] == S_N_TYPE_PARAMS {
+                var gret = sstate.reg_generic(full, fn_node, 0)
+                if gret < 0 {
+                    return -1
+                }
+                return 0
             }
-            return 0
         }
     }
     var nparams = s_aux[fn_node]
@@ -249,12 +251,14 @@ func collect_struct_decl(s: i64) -> i64 {
     var nm = sstate.name_str(s)
     if sstate.nchild(s) > 0 {
         var slot0 = sstate.child(s, 0)
-        if slot0 >= 0 && s_tags[slot0] == S_N_TYPE_PARAMS {
-            var gret = sstate.reg_generic(nm, s, 1)
-            if gret < 0 {
-                return -1
+        if slot0 >= 0 {
+            if s_tags[slot0] == S_N_TYPE_PARAMS {
+                var gret = sstate.reg_generic(nm, s, 1)
+                if gret < 0 {
+                    return -1
+                }
+                return 0
             }
-            return 0
         }
     }
     var parent = ""
@@ -293,6 +297,123 @@ pub func find_struct_node(name: string) -> i64 {
         if s_tags[s] == S_N_STRUCT {
             if sstate.name_str(s) == name {
                 return s
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 顶层 enum 声明登记分派（泛型语法 2026-08-15，对齐 collect_struct_decl）：
+// children[0] == N_TYPE_PARAMS → 泛型 enum 模板登记（sstate.reg_generic →
+// gt_* 表，gty_is_struct=2 表示 enum；**本阶段只登记不实例化**——模板变体
+// payload 的 TypeVar 类型无法静态解析，collect_enum_variants 会报错，故跳过）；
+// 否则普通 reg_enum + set_enum_name。返回 0 成功 / -1 错误（sm_err_* 已置）。
+func collect_enum_decl(s: i64) -> i64 {
+    var nm = sstate.name_str(s)
+    if sstate.nchild(s) > 0 {
+        var slot0 = sstate.child(s, 0)
+        if slot0 >= 0 {
+            var st0 = s_tags[slot0]
+            if st0 == S_N_TYPE_PARAMS {
+                var gret = sstate.reg_generic(nm, s, 2)
+                if gret < 0 {
+                    return -1
+                }
+                return 0
+            }
+        }
+    }
+    // enum 与函数名冲突（对齐 Rust check_struct_namespace 的构造调用歧义拦截）
+    var enid = intern.intern(nm)
+    if sstate.bs_find(fn_keys, enid) >= 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        sm_err_msg = "枚举名 '" + nm + "' 与函数名冲突"
+        return -1
+    }
+    // enum 与 struct 名冲突（类型解析先查 st_keys，同名会使 enum 不可达）
+    if sstate.bs_find(st_keys, enid) >= 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        sm_err_msg = "枚举名 '" + nm + "' 与 struct 名冲突"
+        return -1
+    }
+    var idx = sstate.reg_enum(enid)
+    if idx < 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        return -1
+    }
+    // enum 名登记（types.type_name / 泛型 mangling 片段还原用；追加式与
+    // reg_enum 索引顺序一致）
+    types.set_enum_name(idx, nm)
+    return 0
+}
+
+// 查找顶层 enum 定义节点（按名字；g_extra_tops 顶层 + 命名空间递归）。
+// import 展开后 enum 可能在 g_extra_tops（全部文件顶层）；命名空间体内的
+// enum 节点在 namespace 的 body StmtList 中，须递归查找（对齐 find_fn_node）。
+pub func find_enum_node(name: string) -> i64 {
+    var n = len(g_extra_tops)
+    var i: i64 = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        var tag = s_tags[s]
+        if tag == S_N_ENUM {
+            if sstate.name_str(s) == name {
+                return s
+            }
+        } else if tag == S_N_NAMESPACE {
+            var nsegs = s_aux[s]
+            var k: i64 = 0
+            while k < nsegs {
+                sstate.ns_push(s_names[sstate.child(s, k)])
+                k = k + 1
+            }
+            var body = sstate.child(s, nsegs)
+            var found = find_enum_in_ns(body, name)
+            k = 0
+            while k < nsegs {
+                sstate.ns_pop()
+                k = k + 1
+            }
+            if found >= 0 {
+                return found
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 命名空间体内递归查找 enum 节点（含嵌套 namespace）
+func find_enum_in_ns(blk: i64, name: string) -> i64 {
+    var n = sstate.nchild(blk)
+    var i: i64 = 0
+    while i < n {
+        var s = sstate.child(blk, i)
+        var tag = s_tags[s]
+        if tag == S_N_ENUM {
+            if sstate.name_str(s) == name {
+                return s
+            }
+        } else if tag == S_N_NAMESPACE {
+            var nsegs = s_aux[s]
+            var j: i64 = 0
+            while j < nsegs {
+                sstate.ns_push(s_names[sstate.child(s, j)])
+                j = j + 1
+            }
+            var body = sstate.child(s, nsegs)
+            var found = find_enum_in_ns(body, name)
+            j = 0
+            while j < nsegs {
+                sstate.ns_pop()
+                j = j + 1
+            }
+            if found >= 0 {
+                return found
             }
         }
         i = i + 1
@@ -464,6 +585,125 @@ pub func collect_all_struct_fields() -> i64 {
     while i < n {
         var si = st_vals[i]
         var r = collect_struct_fields(si)
+        if r < 0 {
+            return -1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 收集单个 enum 的变体信息（payload 类型拍平 + 白名单校验 + 槽数 K）。
+// 布局：Enum children = [泛型槽(-1或N_TYPE_PARAMS), EnumVariant...]，
+// 变体从 children[slot_off] 起；EnumVariant children = [payload 类型...]。
+// 白名单（一期）：整数族（i8..u64）/ bool / char / trit / string；
+// f32/f64/struct/table/map/嵌套 enum → "变体 'X' 的 payload 暂不支持类型 'Y'"。
+// 槽数 K = 所有变体 payload 字段数的最大值（后端聚合布局：{i64 tag, i64×K}）。
+pub func collect_enum_variants(ei: i64) -> i64 {
+    if en_done[ei] == 1 {
+        return 0
+    }
+    en_done[ei] = 1
+    var nm = sstate.enum_name_of(ei)
+    var enode = find_enum_node(nm)
+    if enode < 0 {
+        sm_err_line = 1
+        sm_err_col = 1
+        sm_err_msg = "内部错误：枚举 '" + nm + "' 定义节点未找到"
+        return -1
+    }
+    var soff = sstate.slot_off(enode)  // enum 泛型槽偏移（恒 1；防御读取）
+    var nv = sstate.nchild(enode) - soff
+    // 先解析全部变体到临时表（payload 类型中的模板 struct 引用如 `Box<i64>`
+    // 经 parse_generic_type_node 会触发实例化副作用——复用 struct 字段收集的
+    // 先解析后落盘策略，避免副作用把变体段偏移顶偏）
+    var v_names: table<i64> = table_new_i64()
+    var v_nfld: table<i64> = table_new_i64()
+    var v_fldoff: table<i64> = table_new_i64()
+    var v_ftys: table<i64> = table_new_i64()
+    var max_slot: i64 = 0
+    var k: i64 = 0
+    while k < nv {
+        var v = sstate.child(enode, soff + k)
+        var vname = sstate.name_str(v)
+        var vnid = intern.intern(vname)
+        // 变体重名检查（本 enum 内）
+        var d: i64 = 0
+        var dup: bool = false
+        while d < len(v_names) {
+            if v_names[d] == vnid {
+                dup = true
+                break
+            }
+            d = d + 1
+        }
+        if dup {
+            sm_err_line = s_lines[v]
+            sm_err_col = s_cols[v]
+            sm_err_msg = "变体 '" + vname + "' 重复定义"
+            return -1
+        }
+        // payload 类型解析 + 白名单校验
+        var np = sstate.nchild(v)
+        var foff = len(v_ftys)
+        var j: i64 = 0
+        while j < np {
+            var fty = sgen.parse_generic_type_node(sstate.child(v, j))
+            if fty < 0 {
+                return -1
+            }
+            // 白名单：整数族 / bool / char / trit / string（一期）
+            var ok: bool = false
+            if types.is_int(fty) || fty == TK_BOOL || fty == TK_CHAR || fty == TK_TRIT || fty == TK_STR {
+                ok = true
+            }
+            if !ok {
+                sm_err_line = s_lines[v]
+                sm_err_col = s_cols[v]
+                sm_err_msg = "变体 '" + vname + "' 的 payload 暂不支持类型 '" + types.type_name(fty) + "'"
+                return -1
+            }
+            table_push(v_ftys, fty)
+            j = j + 1
+        }
+        if np > max_slot {
+            max_slot = np
+        }
+        table_push(v_names, vnid)
+        table_push(v_nfld, np)
+        table_push(v_fldoff, foff)
+        k = k + 1
+    }
+    // 落盘：变体段起点 = 当前 en_vnames 末尾（无继承，直接追加）
+    var vbase = len(en_vnames)
+    en_varoff[ei] = vbase
+    en_nvar[ei] = len(v_names)
+    en_nslot[ei] = max_slot
+    var kk: i64 = 0
+    while kk < len(v_names) {
+        table_push(en_vnames, v_names[kk])
+        table_push(en_vtags, kk)
+        table_push(en_vfldoff, v_fldoff[kk])
+        table_push(en_vnfld, v_nfld[kk])
+        kk = kk + 1
+    }
+    // payload 类型拍平追加（与 v_fldoff 段对齐）
+    var z: i64 = 0
+    while z < len(v_ftys) {
+        table_push(en_ftys, v_ftys[z])
+        z = z + 1
+    }
+    return 0
+}
+
+// 全部 enum 变体收集（check 前调用；须在 collect_all_struct_fields 之后——
+// 变体 payload 类型可能引用 struct，其字段须已拍平）
+pub func collect_all_enums() -> i64 {
+    var n = len(en_keys)
+    var i: i64 = 0
+    while i < n {
+        var ei = en_vals[i]
+        var r = collect_enum_variants(ei)
         if r < 0 {
             return -1
         }
@@ -653,6 +893,12 @@ pub func collect_ns(ns_node: i64) -> i64 {
             if rd < 0 {
                 return -1
             }
+        } else if tag == S_N_ENUM {
+            // 泛型 enum 模板 / 普通 enum 统一分派登记
+            var re = collect_enum_decl(s)
+            if re < 0 {
+                return -1
+            }
         }
         j = j + 1
     }
@@ -768,6 +1014,12 @@ pub func collect_top() -> i64 {
             // 泛型 struct 模板 / 普通 struct 统一分派登记
             var rd = collect_struct_decl(s)
             if rd < 0 {
+                return -1
+            }
+        } else if tag == S_N_ENUM {
+            // 泛型 enum 模板 / 普通 enum 统一分派登记
+            var re = collect_enum_decl(s)
+            if re < 0 {
                 return -1
             }
         } else if tag == S_N_VAR_DECL {

@@ -299,6 +299,18 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     cls_done = table_new_i64()
     fld_names = table_new_i64()
     fld_tys = table_new_i64()
+    // enum 状态表重置（2026-08-15 enum 语言特性；每次编译清零）
+    en_keys = table_new_i64()
+    en_vals = table_new_i64()
+    en_done = table_new_i64()
+    en_nvar = table_new_i64()
+    en_varoff = table_new_i64()
+    en_nslot = table_new_i64()
+    en_vnames = table_new_i64()
+    en_vtags = table_new_i64()
+    en_vfldoff = table_new_i64()
+    en_vnfld = table_new_i64()
+    en_ftys = table_new_i64()
     gb_keys = table_new_i64()
     gb_vals = table_new_i64()
     gb_const = table_new_i64()
@@ -379,6 +391,11 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     if r3 < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
+    // enum 变体收集（须在 struct 字段拍平之后——payload 类型可能引用 struct）
+    var r5 = scollect.collect_all_enums()
+    if r5 < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
     // 返回表元素预扫描（先于逐函数 check）
     var r4 = scollect.collect_all_return_tables()
     if r4 < 0 {
@@ -454,6 +471,18 @@ pub func check_ast(base_dir: string) -> string {
     cls_done = table_new_i64()
     fld_names = table_new_i64()
     fld_tys = table_new_i64()
+    // enum 状态表重置（2026-08-15 enum 语言特性；每次编译清零）
+    en_keys = table_new_i64()
+    en_vals = table_new_i64()
+    en_done = table_new_i64()
+    en_nvar = table_new_i64()
+    en_varoff = table_new_i64()
+    en_nslot = table_new_i64()
+    en_vnames = table_new_i64()
+    en_vtags = table_new_i64()
+    en_vfldoff = table_new_i64()
+    en_vnfld = table_new_i64()
+    en_ftys = table_new_i64()
     gb_keys = table_new_i64()
     gb_vals = table_new_i64()
     gb_const = table_new_i64()
@@ -530,6 +559,11 @@ pub func check_ast(base_dir: string) -> string {
     // struct 字段拍平收集（含继承；须在逐函数检查前完成）
     var r3 = scollect.collect_all_struct_fields()
     if r3 < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
+    // enum 变体收集（须在 struct 字段拍平之后——payload 类型可能引用 struct）
+    var r5 = scollect.collect_all_enums()
+    if r5 < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
     // 返回表元素预扫描（先于逐函数 check）

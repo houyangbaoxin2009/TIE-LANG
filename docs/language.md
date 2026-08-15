@@ -447,6 +447,80 @@ var v: i64 = b.get()     // T 从接收者 Box<i64> 推断
 **参考验收**：`tests/language/generics.tie`（9 个正例：推断/显式/嵌套/方法/多类型
 参数）、`tests/language/generics_neg.tie`（5 个负例）。
 
+### 3.8 枚举 enum（ADT 标签联合，2026-08-15 实现）
+
+tie 支持 **Rust 风格 ADT 枚举**：无数据变体（C 风格常量组）与带数据变体
+（payload 元组式），并支持泛型 enum。枚举在 LLVM 层表示为静态结构体
+`{ i64 tag, i64×K 槽 }`（K = 最大变体 payload 字段数），零运行时开销。
+
+**无数据变体**：
+
+```c
+enum Color {
+    Red
+    Green
+    Blue
+}
+```
+
+**带数据变体（payload）**：
+
+```c
+enum Shape {
+    Circle(i64)
+    Rect(i64, i64)
+}
+```
+
+**泛型 enum**：
+
+```c
+enum Option<T> {
+    Some(T)
+    None
+}
+```
+
+- 变体之间无分隔符（ASI 自动分号，与 struct 字段同风格）。
+- payload 为类型列表（元组式，无字段名）。
+- 泛型：`enum Name<T1, T2>`，变体 payload 可引用类型参数（编译期单态化，
+  与泛型 struct 同机制）。
+
+**构造**：
+
+```c
+var c = Color.Red            // 无 payload 变体 = 常量
+var s = Shape.Circle(5)      // 带 payload 变体 = 构造调用
+var o = Option.Some(42)      // 泛型构造（实参推断 T = i64）
+var c2: Color = Color.Green  // 类型注解
+```
+
+- `EnumName.Variant`（无括号）引用无 payload 变体 → 常量值；
+- `EnumName.Variant(args...)`（带括号）构造带 payload 变体；
+- 带 payload 变体裸引用（无参数）→ 报错"需要 payload 参数"。
+
+**匹配（switch）**：
+
+```c
+switch s {
+    case Shape.Circle: println("circle")
+    case Shape.Rect:   println("rect")
+    default:           println("other")
+}
+```
+
+- switch 对象可为枚举（case 变体引用解析为 tag 常量，走整数比较链）。
+
+**当前限制（一期）**：
+- payload 类型白名单：整数族（i8..u64）/bool/char/trit；f32/f64、string、
+  struct、table/map payload 暂不支持（报"变体 payload 暂不支持类型"）；
+- 枚举值 `==`/`!=` 比较暂不支持（报"枚举暂不支持 == 比较"）；
+- REPL（interp）暂不支持 enum 定义（报"REPL v1 暂不支持 enum 定义"）；
+- 泛型 enum 无 payload 变体裸引用（如 `Option.None`）无法推断 T → 报错。
+
+**参考验收**：`tests/language/enum.tie`（无数据/带数据/泛型/struct 字段/跨函数）、
+`tests/language/enum_neg.tie`（重名变体/payload 白名单/== 比较/函数名冲突）。
+
 ## 4. 语句与分隔符（ASI 自动补全）
 
 ### 4.1 分号规则（核心特性）

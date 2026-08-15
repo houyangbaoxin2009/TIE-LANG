@@ -1,0 +1,4 @@
+enum Foo {
+    A(f64)
+}
+func main() {}

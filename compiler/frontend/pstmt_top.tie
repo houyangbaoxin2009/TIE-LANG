@@ -50,6 +50,12 @@ pub func parse_program() -> i64 {
                 return -1
             }
             ast.collect_stmt(stmts, s)
+        } else if tag == lex_enum {
+            var s = parse_enum()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
         } else if tag == lex_namespace {
             var s = parse_namespace()
             if s < 0 {
@@ -75,7 +81,7 @@ pub func parse_program() -> i64 {
             }
             ast.collect_stmt(stmts, s)
         } else {
-            putil.set_err(putil.peek_line(), putil.peek_col(), "顶层只允许函数定义、import、using、struct、命名空间声明、extern 声明或全局变量，实际是 " + putil.describe(tag))
+            putil.set_err(putil.peek_line(), putil.peek_col(), "顶层只允许函数定义、import、using、struct、enum、命名空间声明、extern 声明或全局变量，实际是 " + putil.describe(tag))
             return -1
         }
     }
@@ -213,6 +219,12 @@ func parse_namespace() -> i64 {
                     return -1
                 }
                 table_push(body_stmts, st)
+            } else if tag == lex_enum {
+                var st = parse_enum()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
             } else if tag == lex_namespace {
                 var st = parse_namespace()
                 if st < 0 {
@@ -256,6 +268,12 @@ func parse_namespace() -> i64 {
                     return -1
                 }
                 table_push(body_stmts, st)
+            } else if tag == lex_enum {
+                var st = parse_enum()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
             } else if tag == lex_namespace {
                 var st = parse_namespace()
                 if st < 0 {
@@ -281,7 +299,7 @@ func parse_namespace() -> i64 {
                 }
                 table_push(body_stmts, st)
             } else {
-                putil.set_err(putil.peek_line(), putil.peek_col(), "顶层只允许函数定义、import、using、struct、命名空间声明、extern 声明或全局变量，实际是 " + putil.describe(tag))
+                putil.set_err(putil.peek_line(), putil.peek_col(), "顶层只允许函数定义、import、using、struct、enum、命名空间声明、extern 声明或全局变量，实际是 " + putil.describe(tag))
                 return -1
             }
         }
@@ -615,6 +633,92 @@ func parse_struct() -> i64 {
     }
     ast.set_children(s, skids)
     return s
+}
+
+// `enum Name [<T1, T2>] { VariantA VariantB(i64, string) }`（ADT 枚举，2026-08-15）
+// 泛型（对齐 struct）：enum 名后紧跟类型参数列表；产出 N_ENUM
+// children = [泛型槽(-1或N_TYPE_PARAMS), EnumVariant...]。
+// 每个变体 = N_ENUM_VARIANT[name=变体名, children=[payload 类型...]]；
+// 无 payload 变体 children 为空。变体之间无分隔符（ASI 自动补分号）。
+// payload 类型逐个用 pexpr_type.parse_type() 解析（可为内建泛型/struct 引用，
+// 一期白名单由语义层校验）。
+func parse_enum() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // enum
+    var name = putil.expect_ident()
+    if name < 0 {
+        return -1
+    }
+    var type_params = -1
+    if putil.peek_tag() == lex_lt {
+        type_params = parse_type_params()
+        if type_params < 0 {
+            return -1
+        }
+    }
+    if !putil.expect(lex_lbrace, "'{'") {
+        return -1
+    }
+    var variants: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        var tag = putil.peek_tag()
+        if tag == lex_rbrace {
+            putil.advance()
+            done = true
+        } else if tag == lex_eof {
+            if !putil.expect(lex_rbrace, "'}'") {
+                return -1
+            }
+            done = true
+        } else {
+            // 变体：`VariantA` 或 `VariantB(i64, string)`
+            var vline = putil.peek_line()
+            var vcol = putil.peek_col()
+            var vname = putil.expect_ident()
+            if vname < 0 {
+                return -1
+            }
+            var ptys: table<i64> = table_new_i64()
+            if putil.eat(lex_lparen) {
+                if !putil.eat(lex_rparen) {
+                    var d = false
+                    while !d {
+                        var pty = pexpr_type.parse_type()
+                        if pty < 0 {
+                            return -1
+                        }
+                        table_push(ptys, pty)
+                        if putil.eat(lex_comma) {
+                            // 继续
+                        } else {
+                            if !putil.expect(lex_rparen, "')'") {
+                                return -1
+                            }
+                            d = true
+                        }
+                    }
+                }
+            }
+            if !putil.expect(lex_semi, "变体声明结束符") {
+                return -1
+            }
+            var v = ast.new_node(N_ENUM_VARIANT, vname, -1, -1, vline, vcol)
+            ast.set_children(v, ptys)
+            table_push(variants, v)
+        }
+    }
+    var e = ast.new_node(N_ENUM, name, -1, -1, line, col)
+    var ekids: table<i64> = table_new_i64()
+    table_push(ekids, type_params)
+    var vi: i64 = 0
+    while vi < len(variants) {
+        table_push(ekids, variants[vi])
+        vi = vi + 1
+    }
+    ast.set_children(e, ekids)
+    return e
 }
 
 // ---------- 块 / 控制流语句 ----------

@@ -18,16 +18,16 @@ var sym_vals: table<i64>;
 namespace lexsym {
 
 // ---------- 关键字表构建与二分 ----------
-// 48 项 ASCII/strcmp 升序（TypeKw 值=32，具体类型由 lexeme 区分——同 Rust 单变体）
+// 49 项 ASCII/strcmp 升序（TypeKw 值=32，具体类型由 lexeme 区分——同 Rust 单变体）
 func build_kw() {
     var k: table<string> = ["as", "bool", "break", "case", "char", "code",
-        "const", "continue", "default", "else", "extends", "extern", "f32",
-        "f64", "false", "for", "func", "i16", "i32", "i64", "i8", "if",
+        "const", "continue", "default", "else", "enum", "extends", "extern",
+        "f32", "f64", "false", "for", "func", "i16", "i32", "i64", "i8", "if",
         "import", "in", "map", "misc", "namespace", "num", "pub", "ref",
         "return", "string", "struct", "switch", "table", "text", "trit",
         "true", "u16", "u32", "u64", "u8", "using", "var", "void", "when",
         "while", "zero"]
-    var v: table<i64> = [21, 32, 14, 17, 32, 32, 7, 15, 18, 9, 23, 27, 32,
+    var v: table<i64> = [21, 32, 14, 17, 32, 32, 7, 15, 18, 9, 81, 23, 27, 32,
         32, 29, 11, 5, 32, 32, 32, 32, 8, 20, 12, 32, 32, 24, 32, 25, 31,
         13, 32, 22, 16, 32, 32, 32, 28, 32, 32, 32, 32, 26, 6, 32, 19, 10, 30]
     kw_keys = table_new_string()

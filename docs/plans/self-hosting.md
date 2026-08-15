@@ -532,19 +532,21 @@ func main() {
 
 - **enum**：`enum Node { IntLit(i64), Binary{..}, ... }` 编译期 desugar 为
   tag 表（B1 编码天然就是 desugar 目标）——语义层检查穷尽性，IR 层生成
-  switch 判别；
+  switch 判别；**✅ enum 已实现（2026-08-15，tiec 全链路：无数据/带数据/
+  泛型变体、构造/匹配、静态结构体 `{i64 tag, i64×K 槽}` 布局、单态化）**；
 - **函数类型**：`func (node: table<i64>) -> string` 类型，函数值可存入表、
   传给其他函数——C1 字符串分派自动升级为真函数值（分派表从 `table<string>`
-  变为函数值表），编译期类型检查补上 C1 的「无类型安全」短板；
+  变为函数值表），编译期类型检查补上 C1 的「无类型安全」短板；📋 仍规划；
 - 编译器 `compiler/` 逐步迁移到 enum + 函数值，tag 表编码保留为序列化格式
   （跨进程/持久化用）。
 
 **验收标准**：
 
 - enum 与函数类型在语义/IR 两路径可用，有 demo 与测试；
-- 用新特性重写 `compiler/` 至少一个模块（如 lexer 状态机），行为不变；
-- 双实现（tie 编译器 vs Rust 编译器）对同一批样例输出一致；
-- workspace 编译零错误。
+  **enum 部分 ✅（`tests/language/enum.tie` / `enum_neg.tie` / golden err_063-065）**；
+- 用新特性重写 `compiler/` 至少一个模块（如 lexer 状态机），行为不变；📋
+- 双实现（tie 编译器 vs Rust 编译器）对同一批样例输出一致；📋
+- workspace 编译零错误；✅
 
 ## 6. 影响范围
 

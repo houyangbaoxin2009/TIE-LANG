@@ -401,6 +401,15 @@ pub func infer_expr(id: i64) -> i64 {
         if rhs < 0 {
             return -1
         }
+        // 枚举 ==/!= 比较拦截（一期）：枚举按 tag 比较语义未定义，报错
+        if op == 5 || op == 6 {
+            if types.kind(lhs) == K_ENUM || types.kind(rhs) == K_ENUM {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "枚举暂不支持 == 比较"
+                return -1
+            }
+        }
         // 两侧类型一致（trit×i64 例外；int×float 混用；string+string 拼接）
         var type_ok: bool = false
         if lhs == rhs {
@@ -605,11 +614,59 @@ pub func infer_expr(id: i64) -> i64 {
     }
     // FieldAccess
     if tag == S_N_FIELD_ACCESS {
-        var base = infer_expr(sstate.child(id, 0))
+        var base_node = sstate.child(id, 0)
+        var fnm = sstate.name_str(id)
+        // 枚举变体常量探测（EnumName.Variant）：base 是未绑定变量（枚举名）时，
+        // 查 en_keys 命中 → 变体引用。必须在 infer_expr(base) 之前拦截——
+        // 否则枚举名被当未声明变量报错。无 payload 变体 = 常量值；带 payload
+        // 变体的裸引用报错（须用 EnumName.Variant(...) 构造）。
+        if s_tags[base_node] == S_N_VAR {
+            var bname = sstate.name_str(base_node)
+            var eidx = sstate.bs_find(en_keys, intern.intern(bname))
+            if eidx >= 0 {
+                var ei = en_vals[eidx]
+                var varoff = en_varoff[ei]
+                var nvar = en_nvar[ei]
+                var found: i64 = -1
+                var k: i64 = 0
+                while k < nvar {
+                    if intern.lookup(en_vnames[varoff + k]) == fnm {
+                        found = k
+                        break
+                    }
+                    k = k + 1
+                }
+                if found >= 0 {
+                    if en_vnfld[varoff + found] == 0 {
+                        // 无 payload 变体：枚举常量值
+                        node_types[id] = types.enum_of(ei)
+                        g_typed = g_typed + 1
+                        return types.enum_of(ei)
+                    }
+                    sm_err_line = s_lines[id]
+                    sm_err_col = s_cols[id]
+                    sm_err_msg = "变体 '" + bname + "." + fnm + "' 需要 payload 参数（不能裸引用，请用 " + bname + "." + fnm + "(...) 构造）"
+                    return -1
+                }
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "枚举 '" + bname + "' 没有变体 '" + fnm + "'"
+                return -1
+            }
+            // 泛型 enum 模板的裸变体引用（Option.None）：无实参可推断类型实参 →
+            // 报错（一期不支持；构造调用带 payload 实参可推断）
+            var gidx2 = sstate.gt_find(bname)
+            if gidx2 >= 0 && gty_is_struct[gidx2] == 2 {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "泛型枚举变体 '" + bname + "." + fnm + "' 无法推断类型参数（裸引用无实参，请用带 payload 的构造调用，如 " + bname + ".Some(...)）"
+                return -1
+            }
+        }
+        var base = infer_expr(base_node)
         if base < 0 {
             return -1
         }
-        var fnm = sstate.name_str(id)
         var bk = types.kind(base)
         if bk == K_TUPLE {
             var ti = types.low(base)
@@ -1254,7 +1311,7 @@ pub func infer_generic_struct_construct(full_name: string, gti: i64, id: i64, ar
     return rt
 }
 
-// 方法调用推断（命名空间函数 / struct 方法转发）
+// 方法调用推断（命名空间函数 / struct 方法转发 / 枚举变体构造）
 pub func infer_method_call(id: i64) -> i64 {
     // MethodCall 接收者 = children[slot_off]（新布局 children[0]=泛型槽→偏移 1；
     // 旧布局无槽→children[0]=接收者。slot_off 统一判定保证自举双兼容）
@@ -1267,6 +1324,23 @@ pub func infer_method_call(id: i64) -> i64 {
     while i < nc {
         table_push(args, sstate.child(id, i))
         i = i + 1
+    }
+    // 枚举变体构造探测（EnumName.Variant(args)）：接收者是未绑定变量且命中
+    // en_keys → 枚举构造。带 payload 变体校验实参个数与类型；无 payload 变体
+    // 空参调用视为常量值，多余实参报错。
+    if s_tags[recv] == S_N_VAR {
+        var rname = sstate.name_str(recv)
+        var eidx = sstate.bs_find(en_keys, intern.intern(rname))
+        if eidx >= 0 {
+            return infer_enum_construct(eidx, mname, args, id)
+        }
+        // 泛型 enum 模板构造（Option.Some(42)）：接收者是模板名（gt_* 表，
+        // gty_is_struct==2），从 payload 实参推断类型实参后实例化。
+        // 须先于 recv_path_name 的 ns 解析（"Option::Some" 无签名会误报）。
+        var gidx = sstate.gt_find(rname)
+        if gidx >= 0 && gty_is_struct[gidx] == 2 {
+            return infer_generic_enum_construct(gidx, mname, args, id)
+        }
     }
     // 接收者是命名空间路径（Var 未绑定）→ ns 调用
     var full = ""
@@ -1345,6 +1419,164 @@ pub func infer_method_call(id: i64) -> i64 {
         j = j + 1
     }
     var rt = sg_ret[sig]
+    node_types[id] = rt
+    g_typed = g_typed + 1
+    return rt
+}
+
+// 枚举变体构造推断：EnumName.Variant(args)（MethodCall，name = 变体名）。
+// - 变体未找到 → "枚举 'X' 没有变体 'Y'"
+// - 无 payload 变体：空参调用 = 常量值；多余实参报错
+// - 带 payload 变体：实参个数必须等于 payload 字段数，逐个类型匹配
+// 返回枚举类型 id（types.enum_of(ei)）。
+func infer_enum_construct(eidx: i64, vname: string, args: table<i64>, id: i64) -> i64 {
+    var ei = en_vals[eidx]
+    var ename = sstate.enum_name_of(ei)
+    var varoff = en_varoff[ei]
+    var nvar = en_nvar[ei]
+    var found: i64 = -1
+    var k: i64 = 0
+    while k < nvar {
+        if intern.lookup(en_vnames[varoff + k]) == vname {
+            found = k
+            break
+        }
+        k = k + 1
+    }
+    if found < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "枚举 '" + ename + "' 没有变体 '" + vname + "'"
+        return -1
+    }
+    var nfld = en_vnfld[varoff + found]
+    var nc = len(args)
+    if nfld == 0 {
+        if nc != 0 {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "无 payload 变体 '" + ename + "." + vname + "' 不接受参数，实际 " + to_string(nc) + " 个"
+            return -1
+        }
+        // 无 payload 变体空参调用：等价常量值
+        node_types[id] = types.enum_of(ei)
+        g_typed = g_typed + 1
+        return types.enum_of(ei)
+    }
+    if nc != nfld {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "构造 '" + ename + "." + vname + "' 期望 " + to_string(nfld) + " 个参数，实际 " + to_string(nc) + " 个"
+        return -1
+    }
+    // 逐个 payload 字段类型匹配
+    var foff = en_vfldoff[varoff + found]
+    var j: i64 = 0
+    while j < nc {
+        var at = infer_expr(args[j])
+        if at < 0 {
+            return -1
+        }
+        var want = en_ftys[foff + j]
+        if !stype.types_match(want, at, args[j]) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "构造 '" + ename + "." + vname + "' 参数类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(at)
+            return -1
+        }
+        j = j + 1
+    }
+    node_types[id] = types.enum_of(ei)
+    g_typed = g_typed + 1
+    return types.enum_of(ei)
+}
+
+// 泛型 enum 模板构造推断（Option.Some(42)）：模板 gti（gty_is_struct==2），
+// 变体 vname，实参 args。流程：
+//  1. 模板节点定位变体（children[slot_off+k]，name = 变体名）
+//  2. payload 字段数 ≠ 实参数 → 报错（无 payload 变体空参调用：T 无法推断 → 报错）
+//  3. 逐个实参推断类型 → sgen.infer_type_args_variants 绑定 TypeVar → 类型实参
+//  4. sgen.instantiate_enum → 实例化 enum 索引
+//  5. 重写接收者名 → mangled 实例名（irgen 构造分派按 en_keys 命中实例）
+// 返回枚举类型 id（types.enum_of(实例索引)）。
+func infer_generic_enum_construct(gti: i64, vname: string, args: table<i64>, id: i64) -> i64 {
+    var tmpl_node = gty_node[gti]
+    var full = intern.lookup(gty_keys[gti])
+    var soff = sstate.slot_off(tmpl_node)
+    var nv = sstate.nchild(tmpl_node) - soff
+    var vi: i64 = -1
+    var k: i64 = 0
+    while k < nv {
+        if sstate.name_str(sstate.child(tmpl_node, soff + k)) == vname {
+            vi = k
+            break
+        }
+        k = k + 1
+    }
+    if vi < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "枚举 '" + full + "' 没有变体 '" + vname + "'"
+        return -1
+    }
+    var v = sstate.child(tmpl_node, soff + vi)
+    var np = sstate.nchild(v)
+    var nc = len(args)
+    if np == 0 {
+        // 无 payload 变体（如 Option.None）：无实参可推断类型实参 → 报错
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "泛型枚举 '" + full + "' 的无 payload 变体 '" + vname + "' 无法推断类型参数（一期请用带 payload 变体构造或显式类型标注，如 '" + full + "<i64>." + vname + "' 后续支持）"
+        return -1
+    }
+    if nc != np {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "构造 '" + full + "." + vname + "' 期望 " + to_string(np) + " 个参数，实际 " + to_string(nc) + " 个"
+        return -1
+    }
+    // 逐个实参推断类型
+    var arg_tys: table<i64> = table_new_i64()
+    var j: i64 = 0
+    while j < nc {
+        var at = infer_expr(args[j])
+        if at < 0 {
+            return -1
+        }
+        at = refine_arg_ty(args[j], at)
+        table_push(arg_tys, at)
+        j = j + 1
+    }
+    // 推断类型实参（payload 类型节点绑定 TypeVar；显式实参一期不支持 → 空表）
+    var explicit: table<i64> = table_new_i64()
+    var args_t = sgen.infer_type_args_variants(tmpl_node, gti, vname, explicit, arg_tys, id)
+    if len(args_t) == 0 {
+        return -1  // 推断失败/冲突已报错
+    }
+    // 实例化 enum（reg_enum + 变体收集 + gin 记录）
+    var ei = sgen.instantiate_enum(gti, args_t)
+    if ei < 0 {
+        return -1
+    }
+    var mangled = sgen.mangle(full, args_t)
+    // 重写接收者名 → mangled 实例名（irgen 的 gen_method_call 按 en_keys 命中）
+    s_names[sstate.child(id, sstate.slot_off(id))] = intern.intern(mangled)
+    // 实例化 payload 类型校验（非 TypeVar 字段的实参匹配在此暴露）
+    var varoff = en_varoff[ei]
+    var vtag = en_vtags[varoff + vi]
+    var foff = en_vfldoff[varoff + vi]
+    var jj: i64 = 0
+    while jj < nc {
+        var want = en_ftys[foff + jj]
+        if !stype.types_match(want, arg_tys[jj], args[jj]) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "构造 '" + mangled + "." + vname + "' 参数类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(arg_tys[jj])
+            return -1
+        }
+        jj = jj + 1
+    }
+    var rt = types.enum_of(ei)
     node_types[id] = rt
     g_typed = g_typed + 1
     return rt

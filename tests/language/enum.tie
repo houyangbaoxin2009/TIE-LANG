@@ -1,0 +1,140 @@
+type tie<logic>
+
+// ============================================================
+// enum 语言特性验收测试（2026-08-15：ADT 枚举 前端+后端+泛型）
+//
+// 覆盖场景：
+//   1. 无数据变体构造 + switch 匹配 + default 分支
+//   2. 带 payload 变体构造 + switch 匹配（Shape.Circle(5) / Shape.Rect(1,2)）
+//   3. 枚举类型注解 + 函数参数/返回值 + 跨函数传递
+//   4. 枚举作为 struct 字段（struct Holder { var c: Color }）
+//   5. 泛型 enum：Option<i64> 类型注解、Option.Some(42) 构造、switch 匹配
+//   6. 多变体带 payload 的 tag 区分（Circle vs Rect 匹配各自分支）
+//   7. 枚举变量赋值传递
+//
+// 期望输出（逐行，与 println 一一对应）：
+//   红       场景1 color_name(Color.Red)
+//   蓝       场景1 color_name(Color.Blue)
+//   绿       场景1 color_name(Color.Green)
+//   非红     场景1 default 分支 is_red(Color.Green)
+//   圆       场景2+6 shape_desc(Shape.Circle(5))
+//   矩形     场景2+6 shape_desc(Shape.Rect(1,2))
+//   红       场景3 跨函数传递 color_chain(Color.Red)
+//   蓝       场景4 struct 字段 h.c（Holder(Color.Blue)）
+//   有值     场景5 option_desc(Option.Some(42))
+//   有值     场景5 构造推断 T=i64 再验证
+//   红       场景7 赋值传递 b = a
+// ============================================================
+
+// ----- 无数据变体（C 风格）-----
+enum Color {
+    Red
+    Green
+    Blue
+}
+
+// ----- 带 payload 变体（Rust 风格 ADT）-----
+enum Shape {
+    Circle(i64)
+    Rect(i64, i64)
+}
+
+// ----- 泛型 enum：Option<T> -----
+enum Option<T> {
+    Some(T)
+    None
+}
+
+// 场景 1：无数据变体 switch 匹配（case 变体引用解析为 tag 常量走整数比较）
+func color_name(c: Color) -> string {
+    switch c {
+        case Color.Red:
+            return "红"
+        case Color.Green:
+            return "绿"
+        case Color.Blue:
+            return "蓝"
+        default:
+            return "未知"
+    }
+}
+
+// 场景 1：default 分支触发（只列一个 case，其余变体落入 default）
+func is_red(c: Color) -> string {
+    switch c {
+        case Color.Red:
+            return "红"
+        default:
+            return "非红"
+    }
+}
+
+// 场景 2+6：带 payload 变体 tag 区分（构造实参类型经语义校验；
+// payload 一期无直接读取语法，tag 判别即验证构造携带 payload 成功）
+func shape_desc(s: Shape) -> string {
+    switch s {
+        case Shape.Circle:
+            return "圆"
+        case Shape.Rect:
+            return "矩形"
+        default:
+            return "未知"
+    }
+}
+
+// 场景 3：枚举作为函数参数/返回值 + 跨函数传递
+func pass_through(c: Color) -> Color {
+    return c
+}
+
+func color_chain(c: Color) -> string {
+    return color_name(pass_through(c))
+}
+
+// 场景 4：枚举作为 struct 字段
+struct Holder {
+    var c: Color
+}
+
+// 场景 5：泛型 enum 函数（类型注解 Option<i64>，switch case 用模板名）
+func option_desc(o: Option<i64>) -> string {
+    switch o {
+        case Option.Some:
+            return "有值"
+        default:
+            return "无值"
+    }
+}
+
+func main() {
+    // 场景 1：无数据变体构造 + switch 匹配
+    var c1: Color = Color.Red
+    println(color_name(c1))
+    println(color_name(Color.Blue))
+    println(color_name(Color.Green))
+    // default 分支（未列出的变体落入 default）
+    println(is_red(Color.Green))
+
+    // 场景 2+6：带 payload 变体构造 + tag 区分
+    var cir = Shape.Circle(5)
+    var rect = Shape.Rect(1, 2)
+    println(shape_desc(cir))
+    println(shape_desc(rect))
+
+    // 场景 3：跨函数传递（参数/返回类型注解）
+    println(color_chain(Color.Red))
+
+    // 场景 4：枚举作为 struct 字段
+    var h = Holder(Color.Blue)
+    println(color_name(h.c))
+
+    // 场景 5：泛型 enum 构造（Option.Some(42) 推断 T=i64）+ 类型注解
+    var o: Option<i64> = Option.Some(42)
+    println(option_desc(o))
+    println(option_desc(Option.Some(7)))
+
+    // 场景 7：枚举变量赋值传递
+    var a = Color.Red
+    var b = a
+    println(color_name(b))
+}

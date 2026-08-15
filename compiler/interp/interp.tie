@@ -281,6 +281,9 @@ func register_top_level() -> string {
         } else if t == N_STRUCT {
             g_err = "REPL v1 暂不支持 struct 定义"
             return g_err
+        } else if t == N_ENUM {
+            g_err = "REPL v1 暂不支持 enum 定义"
+            return g_err
         } else if t == N_IMPORT {
             g_err = "REPL v1 暂不支持 import"
             return g_err
@@ -420,6 +423,10 @@ func exec_stmt(id: i64) {
         g_lastval = -1
     } else if t == N_STRUCT {
         g_err = "REPL v1 暂不支持 struct 定义"
+        g_flow = FL_NORMAL
+        g_lastval = -1
+    } else if t == N_ENUM {
+        g_err = "REPL v1 暂不支持 enum 定义"
         g_flow = FL_NORMAL
         g_lastval = -1
     } else if t == N_IMPORT {

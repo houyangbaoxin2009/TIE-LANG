@@ -3,7 +3,7 @@ type tie<class>
 // ============================================================
 // 里程碑：自举 v2 计划 T2.1 模块化地基。把阶段 1 原型中散落的
 // **硬编码编号表**数据化为统一数据表（TableGen 风格）：
-//   1. AST 节点 tag 表（52 条目：表达式 0-22 / 语句 100-118 /
+//   1. AST 节点 tag 表（57 条目：表达式 0-22 / 语句 100-129 /
 //      语句辅助 120-124 / 类型 200-204）——权威定义见
 //      proto parser.tie 文件头注释与 ensure_tag_names；
 //   2. 运算符表（二元 18：0-17 / 一元 6：0-5）——对齐 Rust
@@ -68,7 +68,7 @@ func ret_of(kind: i64, kw: i64) -> i64 {
     return types.named(kw)
 }
 
-// ---------- AST 节点 tag 表（懒构建，权威 52 条目）----------
+// ---------- AST 节点 tag 表（懒构建，权威 57 条目）----------
 
 func ensure_tags() {
     if len(gt_keys) > 0 {
@@ -77,7 +77,7 @@ func ensure_tags() {
     var keys: table<i64> = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
         16, 17, 18, 19, 20, 21, 22, 100, 101, 102, 103, 104, 105, 106, 107, 108,
         109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 120, 121, 122, 123,
-        124, 200, 201, 202, 203, 204]
+        124, 125, 126, 127, 128, 129, 200, 201, 202, 203, 204]
     var names: table<string> = ["IntLit", "FloatLit", "StrLit", "CharLit",
         "BoolLit", "TritLit", "Var", "Call", "Unary", "Binary", "Ternary",
         "Range", "TableLit", "Index", "TupleLit", "FieldAccess", "Path",
@@ -86,12 +86,13 @@ func ensure_tags() {
         "While", "For", "Break", "Continue", "Switch", "Import", "Namespace",
         "Using", "Struct", "FieldAssign", "IndexAssign", "Extern", "Param",
         "SwitchCase", "PatternList", "StmtList", "ClassField",
-        "TupleTypeField", "NamedType", "TupleType", "StructType", "TableType",
+        "TupleTypeField", "TypeParams", "TypeParam", "TypeArgs", "Enum",
+        "EnumVariant", "NamedType", "TupleType", "StructType", "TableType",
         "MapType"]
-    // 段：0-22 表达式；100-118 与 120-124 语句；200-204 类型
+    // 段：0-22 表达式（23 项）；100-129 语句（100-118 + 120-129，29 项）；200-204 类型（5 项）
     var segs: table<i64> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-        1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2]
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2]
     gt_keys = table_new_i64()
     gt_names = table_new_string()
     gt_segs = table_new_i64()
@@ -104,7 +105,7 @@ func ensure_tags() {
     }
 }
 
-// tag 表条目总数（权威 52）。
+// tag 表条目总数（权威 57）。
 pub func tag_count() -> i64 {
     ensure_tags()
     return len(gt_keys)
