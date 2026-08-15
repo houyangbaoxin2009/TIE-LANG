@@ -291,6 +291,34 @@ pub func scan_number(pos: i64) -> i64 {
     if is_float {
         tag = lex_float
     }
+    // S1.3 L3 后缀字面量：数字后紧跟类型后缀（i8/i16/i32/i64/u8/u16/u32/u64/
+    // f32/f64，无空白）→ 吞并进 lexeme（如 "42i32" / "0x80u16" / "1.5f32"）。
+    // 浮点后缀（f32/f64）把 token 标记为 lex_float（parser 按后缀定类型）。
+    // 只吞精确后缀串：非后缀字母序列不吞（"42abc" 保持 42 + abc，parser 报错）。
+    if pos < g_n {
+        var c = g_codes[pos]
+        if (c >= 97 && c <= 122) || (c >= 65 && c <= 90) {
+            var j = pos
+            var suf: string = ""
+            while j < g_n {
+                // 后缀串 = 字母开头 + 字母数字混合（i32/u8/f64）：
+                // 收集 is_ident_cont（字母/数字/_）再精确匹配
+                if lextok.is_ident_cont(g_codes[j]) {
+                    suf = suf + str_char(g_src, j)
+                    j = j + 1
+                } else {
+                    break
+                }
+            }
+            if suf == "i8" || suf == "i16" || suf == "i32" || suf == "i64" ||
+                suf == "u8" || suf == "u16" || suf == "u32" || suf == "u64" {
+                pos = j
+            } else if suf == "f32" || suf == "f64" {
+                tag = lex_float
+                pos = j
+            }
+        }
+    }
     var lid = interner.intern(str.slice(g_src, start, pos))
     lextok.push_token_at(tag, start, lid)
     return pos

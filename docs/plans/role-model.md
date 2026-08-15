@@ -1,12 +1,25 @@
 # 规划：tie 文件角色扩展（R2 多角色叠加 + R3 角色参数化）
 
-> 状态：**规划**（2026-08-15 设计讨论定稿，未实现）
+> 状态：**已实现**（2026-08-15，S1.4 落地；prep + driver 双端，0-Rust）
 > 本文档定义 tie 文件角色体系的扩展。决策汇总：
 > **R2**（多角色叠加：基础角色唯一 + 修饰角色可叠加）+ **R3**（角色参数化）。
 > 覆盖：unsafe/owned/embedded 修饰角色、tieir 分发角色、test/bench 领域角色、
 > **db:vector 向量数据库角色**、ui/port 落地、角色语法子集约束。
 > 关联：unsafe 模型（文件级 unsafe U3）、内存模型（owned 模式 P3）、
 > 并发模型（embedded 子集）、包模型（tieir 分发）、UI 框架（ui/port 实现）。
+>
+> ## 实现记录（2026-08-15，S1.4）
+> - prep/core.tie：多角色解析（逗号分隔 `type tie<db:vector, unsafe>`）、
+>   基础唯一/修饰查重/参数白名单（ui:window/web/embedded、db:schema/seed/
+>   vector、data:config/asset）；ROLE 协议扩展 `<base>[:<param>][;<mod>...]`
+> - driver：scan_header 同步多角色解析；文件名 F1 连字符格式
+>   （xxx.db-vector.tie / xxx.class-unsafe.tie）；R3 文件名-头部一致性检查
+>   **升级为编译错误**（基础/参数/修饰集合比较，顺序无关）
+> - 文件级 unsafe 角色：type tie<..., unsafe> → g_unsafe_depth +1（与 S1.2
+>   unsafe 模型咬合）
+> - 新增角色：tieir/test/bench（白名单 + 分派）
+> - 测试：db-vector-unsafe/lib.class-unsafe 正例 + R3 不一致负例（参数/
+>   修饰均拦截）
 
 ## 1. 现状（10 角色，3 个挂接点未实现）
 

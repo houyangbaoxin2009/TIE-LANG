@@ -143,6 +143,10 @@ const N_TYPE_PARAM: i64 = 126;   // 单个类型参数（name 字段 = 类型参
 const N_TYPE_ARGS: i64 = 127;    // 类型实参列表（children = parse_type 产出的类型节点序列）
 const N_ENUM: i64 = 128;         // 枚举声明：Enum[name, children=[泛型槽(-1或N_TYPE_PARAMS), EnumVariant...]]
 const N_ENUM_VARIANT: i64 = 129; // 枚举变体：EnumVariant[name=变体名, children=[payload 类型...]]
+const N_UNSAFE_BLOCK: i64 = 130; // unsafe 块（S1.2 U3）：UnsafeBlock[children=[StmtList]]
+const N_ASM: i64 = 131;          // asm! 内联汇编（S1.2 I1）：Asm[name=模板串池 id,
+                                 //   children=[操作数...]；操作数 Param 复用：val=0=in
+                                 //   1=out 2=inout，children=[表达式]]
 // 类型段（val=TyKw 索引，name=类型关键字文本池 id）
 //   StructType[name=结构名, children=[类型实参槽]]——`Box<i64>` 引用含 N_TYPE_ARGS
 //   子节点；`Box` 裸引用 children[0] = -1（兼容现有）。

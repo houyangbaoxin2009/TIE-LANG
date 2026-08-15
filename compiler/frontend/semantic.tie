@@ -20,6 +20,7 @@ type tie<class>
 import "./parser.tie"
 import "./scheck.tie"
 import "./sgen.tie"
+import "./smove.tie"
 
 // ==================== import 展开状态 ====================
 // 当前文件目录（相对 import 解析基准）
@@ -145,7 +146,7 @@ func strip_type_decl(src: string) -> string {
 func expand_one_import(imp_node: i64) -> i64 {
     var p = sstate.name_str(imp_node)
     var full = resolve_import_path(p)
-    if imported_has(full) {
+    if imported_has(str.clone(full)) {
         return 0
     }
     table_push(g_imported, full)
@@ -423,9 +424,25 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
                 table_push(checked, fid)
                 again = true
                 var fname = intern.lookup(fid)
+                // S1.5 移动语义：每函数检查前重置 live/moved 状态表
+                // （lv_* 局部表在 scheck.check_fn 重置；lv_moved 独立表在此
+                // 同步重置——sstate 定义，见 lv_moved_reset）
+                sstate.lv_moved_reset()
                 var r2 = scheck.check_fn_walk(fname)
                 if r2 < 0 {
                     return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+                }
+                // S1.5 移动语义独立 pass：类型检查后遍历函数体，跟踪 live/moved
+                // （复用已重置的 lv_moved；内置/原语调用借用，用户函数按值堆参数移动）。
+                // **默认关闭**（TIE_MOVE_CHECK=1 开启）：现有 std/compiler 代码
+                // 大量共享语义，迁移完成前开启会导致编译器自身编译失败（干扰
+                // S1.2-1.4 并行会话）。std/compiler 全量迁移完成后默认开启。
+                var mv_env = get_env("TIE_MOVE_CHECK")
+                if str_len(mv_env) > 0 {
+                    var r_mv = smove.check_fn_walk(fname)
+                    if r_mv < 0 {
+                        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+                    }
                 }
             }
             i = i + 1
@@ -592,9 +609,19 @@ pub func check_ast(base_dir: string) -> string {
                 table_push(checked, fid)
                 again = true
                 var fname = intern.lookup(fid)
+                // S1.5 移动语义：每函数检查前重置 live/moved 状态表（同 check_impl）
+                sstate.lv_moved_reset()
                 var r2 = scheck.check_fn_walk(fname)
                 if r2 < 0 {
                     return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+                }
+                // S1.5 移动语义独立 pass（同 check_impl，TIE_MOVE_CHECK=1 开启）
+                var mv_env2 = get_env("TIE_MOVE_CHECK")
+                if str_len(mv_env2) > 0 {
+                    var r_mv = smove.check_fn_walk(fname)
+                    if r_mv < 0 {
+                        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+                    }
                 }
             }
             i = i + 1

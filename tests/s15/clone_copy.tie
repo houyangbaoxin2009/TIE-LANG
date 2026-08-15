@@ -1,0 +1,43 @@
+type tie<logic>
+// tests/s15/clone_copy.tie —— S1.5 显式复制（clone/copy）验收（正例）
+// ============================================================
+// 覆盖：字符串深拷贝（s + "" 复用 str_cat 指令）、借用语义
+// （clone/copy 后源仍可用，TIE_MOVE_CHECK=1 不报错）、
+// 深拷贝行为（改副本不影响源）。
+// 注：本文件本地定义 clone/copy（与 std/string.tie 的 str.clone/str.copy
+// 行为一致——smove 对 clone/copy 调用点特判借用）。std 库内部只读参数
+// 的移动语义迁移（形参 ref）属 S1.5 std 迁移项，单独推进。
+// 预期输出：
+//   hello
+//   world
+//   hello
+//   hello
+//   changed
+
+// 深拷贝字符串：s + "" 生成全新缓冲（str_cat 指令，malloc+memcpy）
+func clone(s: string) -> string {
+    return s + ""
+}
+
+// copy = clone 别名（显式复制，不移动源）
+func copy(s: string) -> string {
+    return clone(s)
+}
+
+func main() {
+    // clone：深拷贝——改副本 b 不影响源 a
+    var a = "hello"
+    var b = clone(a)
+    b = "world"
+    println(a)   // hello（源不受影响 = 深拷贝）
+    println(b)   // world
+
+    // clone 后源 a 仍可用（借用语义，TIE_MOVE_CHECK=1 不报 use-of-moved）
+    println(a)   // hello
+
+    // copy：clone 的语义别名，同样深拷贝 + 借用
+    var c = copy(a)
+    c = "changed"
+    println(a)   // hello（copy 后源仍可用）
+    println(c)   // changed
+}

@@ -1,0 +1,6 @@
+type tie<logic>
+// S1.3 负例：as_* 参数必须数字
+func main() {
+    var a = as_i8("hello")
+    println(to_string(a))
+}

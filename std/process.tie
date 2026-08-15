@@ -23,13 +23,15 @@ type tie<class>
 // 命名规范：命名空间内函数不加 process_ 前缀；pub func 显式导出。
 
 // extern 声明：libc system（执行命令，返回退出码）。仅顶层裸名（无命名空间限定）。
-extern fn system(cmd: string) -> i32;
+unsafe extern fn system(cmd: string) -> i32;
 
 namespace process {
 // 执行命令并返回退出码（0 = 成功，非 0 = 失败；Windows 上为命令的退出码）。
 // 包装 libc system（extern 声明，编译路径走 LLVM declare + clang 链接 msvcrt）。
 pub func exec_code(cmd: string) -> i32 {
-    return system(cmd)
+    unsafe {
+        return system(cmd)
+    }
 }
 
 // 执行命令并返回其全部输出（stdout + stderr 合并；输出为空返回空串）。
@@ -41,7 +43,9 @@ pub func exec_output(cmd: string) -> string {
     var tmp = ".tie_exec_" + to_string(time_now()) + "_" + to_string(rand_range(10000, 99999)) + ".tmp"
     // 重定向命令 stdout + stderr 到临时文件（cmd.exe 的 `2>&1` 语法）
     var full = cmd + " > " + tmp + " 2>&1"
-    system(full)
+    unsafe {
+        system(full)
+    }
     var out = file_read(tmp)
     file_delete(tmp)
     return out

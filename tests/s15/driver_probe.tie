@@ -1,0 +1,35 @@
+type tie<logic>
+// tests/s15/driver_probe.tie —— 复现 driver.tie scan_header 的 has_prefix(str.clone(ln)) 模式
+// 目的：确定 str.clone 点号调用在顶层裸函数内是否触发借用特判
+import "../../std/string.tie"
+
+func has_prefix(s: string, prefix: string) -> bool {
+    return str_len(s) >= str_len(prefix) && str.slice(s, 0, str_len(prefix)) == prefix
+}
+
+func scan_header(src: string) -> i64 {
+    var lines = str.split(src, "\n")
+    var n = len(lines)
+    var i: i64 = 0
+    while i < n {
+        var ln = str.trim(lines[i])
+        if str_len(ln) == 0 {
+            i = i + 1
+            continue
+        }
+        if has_prefix(str.clone(ln), "type tie") {
+            var rest = str.trim(str.slice(ln, 8, str_len(ln)))
+            if str_len(rest) == 0 {
+                println("type role detected")
+                return 0
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+func main() {
+    var r = scan_header("type tie\n")
+    println(r)
+}

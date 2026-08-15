@@ -52,6 +52,9 @@ const K_STRUCT: i64 = 3;
 const K_TUPLE: i64 = 4;
 const K_TYPEVAR: i64 = 5;
 const K_ENUM: i64 = 6;
+const K_PTR: i64 = 7;        // ptr<T> 类型化指针（S1.2）
+const K_SLICE: i64 = 8;      // slice<T> 切片（指针+长度，S1.2）
+const K_ATOMIC: i64 = 9;     // atomic<T> 原子类型（S1.2）
 const K_SHIFT: i64 = 40;           // 高位分离位移量（负载 < 2^40）
 
 // ---------- TyKw 索引常量（0..20，对齐 Rust TyKw 变体顺序）----------
@@ -80,12 +83,16 @@ const TK_MAP: i64 = 20;
 // 高位基数常量（= 1<<40 / 2<<40 / 3<<40 / 4<<40 / 5<<40 / 6<<40，
 // 写死字面量避免运行期位移）
 // 6<<40 = 6597069766656，i64 有符号下远小于 2^63 无溢出。
+// S1.2 新增 ptr/slice/atomic 段：7/8/9 << 40。
 const BASE_TABLE: i64 = 1099511627776;
 const BASE_MAP: i64 = 2199023255552;
 const BASE_STRUCT: i64 = 3298534883328;
 const BASE_TUPLE: i64 = 4398046511104;
 const BASE_TYPEVAR: i64 = 5497558138880;
 const BASE_ENUM: i64 = 6597069766656;
+const BASE_PTR: i64 = 7696581394432;
+const BASE_SLICE: i64 = 8796093022208;
+const BASE_ATOMIC: i64 = 9895604649984;
 
 // ---------- 全局状态（懒构建）----------
 var tykw_names: table<string>;   // TyKw 索引 -> 类型名（错误消息用）
@@ -96,6 +103,10 @@ var en_names: table<string>;     // enum 名表（索引 -> 名字；type_name �
 // map 段（table<table<i64>> = 2^41+3 == map<i64>）——嵌套类型必须查表编码。
 var nest_tbl_elems: table<i64>;  // 嵌套表元素段（序号 → 元素类型 id）
 var nest_map_vals: table<i64>;   // 嵌套 map 值段（序号 → 值类型 id）
+// S1.2 不安全类型嵌套负载段（序号 → 元素类型 id；同 table_of 防进位方案）
+var nest_ptr_elems: table<i64>;    // 嵌套 ptr 元素段
+var nest_slice_elems: table<i64>;  // 嵌套 slice 元素段
+var nest_atomic_elems: table<i64>; // 嵌套 atomic 元素段
 
 // 嵌套负载序号偏移（避开 named 负载段 0..99；named 仅 0..20 安全余量）
 const NEST_SLOT_OFF: i64 = 100;
@@ -168,16 +179,79 @@ pub func enum_of(idx: i64) -> i64 {
     return BASE_ENUM + idx
 }
 
+// ---------- S1.2 不安全类型（ptr/slice/atomic）构造 ----------
+// 嵌套聚合负载（T ≥ NEST_SLOT_OFF）走各自序号表（同 table_of 方案防进位碰撞）。
+// ptr<T>：id = 7<<40 | T。T 为任意类型 id（含嵌套聚合）。
+pub func ptr_of(elem: i64) -> i64 {
+    if elem < NEST_SLOT_OFF {
+        return BASE_PTR + elem
+    }
+    var n = len(nest_ptr_elems)
+    var i: i64 = 0
+    while i < n {
+        if nest_ptr_elems[i] == elem {
+            return BASE_PTR + NEST_SLOT_OFF + i
+        }
+        i = i + 1
+    }
+    table_push(nest_ptr_elems, elem)
+    return BASE_PTR + NEST_SLOT_OFF + n
+}
+
+// slice<T>：id = 8<<40 | T（指针 + 长度；元素类型）。
+pub func slice_of(elem: i64) -> i64 {
+    if elem < NEST_SLOT_OFF {
+        return BASE_SLICE + elem
+    }
+    var n = len(nest_slice_elems)
+    var i: i64 = 0
+    while i < n {
+        if nest_slice_elems[i] == elem {
+            return BASE_SLICE + NEST_SLOT_OFF + i
+        }
+        i = i + 1
+    }
+    table_push(nest_slice_elems, elem)
+    return BASE_SLICE + NEST_SLOT_OFF + n
+}
+
+// atomic<T>：id = 9<<40 | T（原子类型，第一版 i64/f64/bool）。
+pub func atomic_of(elem: i64) -> i64 {
+    if elem < NEST_SLOT_OFF {
+        return BASE_ATOMIC + elem
+    }
+    var n = len(nest_atomic_elems)
+    var i: i64 = 0
+    while i < n {
+        if nest_atomic_elems[i] == elem {
+            return BASE_ATOMIC + NEST_SLOT_OFF + i
+        }
+        i = i + 1
+    }
+    table_push(nest_atomic_elems, elem)
+    return BASE_ATOMIC + NEST_SLOT_OFF + n
+}
+
 // ---------- 类型 id 解码 ----------
 
-// 类型类别：0=Named 1=Table 2=Map 3=Struct 4=Tuple 5=TypeVar 6=Enum。
+// 类型类别：0=Named 1=Table 2=Map 3=Struct 4=Tuple 5=TypeVar 6=Enum
+// 7=Ptr 8=Slice 9=Atomic。
 // Named 判定用 id < 100（TyKw 索引 0..20，留余量）；
-// 其余按高位阈值顺序判别（Enum 段 6<<40 最高必须最先判；之后
-// >= 5<<40 -> TypeVar，>= 4<<40 -> Tuple，>= 3<<40 -> Struct，
-// >= 2<<40 -> Map，其余为 Table——与 semantic ty_kind 一致）。
+// 其余按高位阈值顺序判别（Atomic 段 9<<40 最高必须最先判；之后
+// Slice 8<<40、Ptr 7<<40、Enum 6<<40、TypeVar、Tuple、Struct、Map，
+// 其余为 Table——与 semantic ty_kind 一致）。
 pub func kind(id: i64) -> i64 {
     if id < 100 {
         return K_NAMED
+    }
+    if id >= BASE_ATOMIC {
+        return K_ATOMIC
+    }
+    if id >= BASE_SLICE {
+        return K_SLICE
+    }
+    if id >= BASE_PTR {
+        return K_PTR
     }
     if id >= BASE_ENUM {
         return K_ENUM
@@ -197,9 +271,18 @@ pub func kind(id: i64) -> i64 {
     return K_TABLE
 }
 
-// 类型负载：Table/Map 的元素类型 id、Struct/Tuple/Enum 的索引、TypeVar 的
-// intern 池 id；Named 类型无意义（调用方先判 kind）。
+// 类型负载：Table/Map/Ptr/Slice/Atomic 的元素类型 id、Struct/Tuple/Enum 的
+// 索引、TypeVar 的 intern 池 id；Named 类型无意义（调用方先判 kind）。
 pub func low(id: i64) -> i64 {
+    if id >= BASE_ATOMIC {
+        return id - BASE_ATOMIC
+    }
+    if id >= BASE_SLICE {
+        return id - BASE_SLICE
+    }
+    if id >= BASE_PTR {
+        return id - BASE_PTR
+    }
     if id >= BASE_ENUM {
         return id - BASE_ENUM
     }
@@ -313,7 +396,7 @@ pub func is_typevar(t: i64) -> bool {
     return false
 }
 
-// 表元素类型：参数化 table<T>/map<V> 返回负载 T；
+// 表元素类型：参数化 table<T>/map<V>/ptr<T>/slice<T>/atomic<T> 返回负载 T；
 // 裸 table/map 关键字返回 -1（元素类型未知）。
 // 嵌套聚合负载（≥ NEST_SLOT_OFF）查序号表还原真实元素类型。
 pub func table_elem(t: i64) -> i64 {
@@ -340,7 +423,70 @@ pub func table_elem(t: i64) -> i64 {
         }
         return -1
     }
+    if k == K_PTR {
+        var lp = low(t)
+        if lp < NEST_SLOT_OFF {
+            return lp
+        }
+        var sp = lp - NEST_SLOT_OFF
+        if sp >= 0 && sp < len(nest_ptr_elems) {
+            return nest_ptr_elems[sp]
+        }
+        return -1
+    }
+    if k == K_SLICE {
+        var ls = low(t)
+        if ls < NEST_SLOT_OFF {
+            return ls
+        }
+        var ss = ls - NEST_SLOT_OFF
+        if ss >= 0 && ss < len(nest_slice_elems) {
+            return nest_slice_elems[ss]
+        }
+        return -1
+    }
+    if k == K_ATOMIC {
+        var la = low(t)
+        if la < NEST_SLOT_OFF {
+            return la
+        }
+        var sa = la - NEST_SLOT_OFF
+        if sa >= 0 && sa < len(nest_atomic_elems) {
+            return nest_atomic_elems[sa]
+        }
+        return -1
+    }
     return -1
+}
+
+// ---------- S1.2 不安全类型判据 ----------
+// ptr/slice/atomic 判据（kind 段判别）。
+pub func is_ptr(t: i64) -> bool {
+    if kind(t) == K_PTR {
+        return true
+    }
+    return false
+}
+pub func is_slice(t: i64) -> bool {
+    if kind(t) == K_SLICE {
+        return true
+    }
+    return false
+}
+pub func is_atomic(t: i64) -> bool {
+    if kind(t) == K_ATOMIC {
+        return true
+    }
+    return false
+}
+
+// 是否不安全类型（指针/切片/原子——安全代码不可见，S1.2 S1 全归 unsafe）
+pub func is_unsafe_ty(t: i64) -> bool {
+    var k = kind(t)
+    if k == K_PTR || k == K_SLICE || k == K_ATOMIC {
+        return true
+    }
+    return false
 }
 
 // ---------- struct / enum 名登记（type_name 还原用）----------
@@ -412,6 +558,15 @@ pub func type_name(t: i64) -> string {
     }
     if k == K_MAP {
         return "map<" + type_name(table_elem(t)) + ">"
+    }
+    if k == K_PTR {
+        return "ptr<" + type_name(table_elem(t)) + ">"
+    }
+    if k == K_SLICE {
+        return "slice<" + type_name(table_elem(t)) + ">"
+    }
+    if k == K_ATOMIC {
+        return "atomic<" + type_name(table_elem(t)) + ">"
     }
     if k == K_STRUCT {
         var idx = low(t)

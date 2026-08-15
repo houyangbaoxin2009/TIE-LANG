@@ -15,6 +15,152 @@ namespace sbuiltin {
 // 内置函数签名检查（参数个数 + 返回类型）
 pub func builtin_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 {
     var nargs = len(args)
+    // ---------- S1.2 unsafe 指针/内存内置（固定返回类型部分） ----------
+    // 动态返回类型（addr_of/deref/slice_of/ptr_add）由调用点 infer 特判。
+    if fn_name == "is_null" || fn_name == "slice_len" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        if fn_name == "is_null" {
+            return types.named(TK_BOOL)
+        }
+        return types.named(TK_I64)
+    }
+    if fn_name == "ptr_to_int" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "ptr_to_int() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+    }
+    if fn_name == "int_to_ptr" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "int_to_ptr() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.ptr_of(types.named(TK_U8))
+    }
+    if fn_name == "alloc" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "alloc() 期望 1 个参数（字节数），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.ptr_of(types.named(TK_U8))
+    }
+    if fn_name == "free" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "free() 期望 1 个参数（指针），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+    }
+    if fn_name == "deref_write" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "deref_write() 期望 2 个参数（指针, 值），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+    }
+    if fn_name == "addr_of_field" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "addr_of_field() 期望 2 个参数（对象, 字段名），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.ptr_of(types.named(TK_I64))  // 实际由调用点按对象类型细化
+    }
+    if fn_name == "memcpy" || fn_name == "memset" {
+        if nargs != 3 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 3 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+    }
+    // 动态返回类型 unsafe 内置（个数检查；类型由调用点 infer 特判）
+    if fn_name == "addr_of" || fn_name == "deref" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+    }
+    if fn_name == "ptr_add" || fn_name == "slice_index" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 2 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+    }
+    if fn_name == "slice_of" {
+        if nargs != 3 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "slice_of() 期望 3 个参数（对象, 起点, 长度），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.slice_of(types.named(TK_I64))
+    }
+    // ---------- S1.3 as_* 显式数值转换族 ----------
+    // as_i8/as_i16/as_i32/as_i64/as_u8/as_u16/as_u32/as_u64/as_f32/as_f64：
+    // 1 参数字 → 目标类型。参数必须是数字由调用点（infer_call）检查。
+    if fn_name == "as_i8" || fn_name == "as_i16" || fn_name == "as_i32" || fn_name == "as_i64" ||
+        fn_name == "as_u8" || fn_name == "as_u16" || fn_name == "as_u32" || fn_name == "as_u64" ||
+        fn_name == "as_f32" || fn_name == "as_f64" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 1 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        if fn_name == "as_i8" {
+            return types.named(TK_I8)
+        }
+        if fn_name == "as_i16" {
+            return types.named(TK_I16)
+        }
+        if fn_name == "as_i32" {
+            return types.named(TK_I32)
+        }
+        if fn_name == "as_i64" {
+            return types.named(TK_I64)
+        }
+        if fn_name == "as_u8" {
+            return types.named(TK_U8)
+        }
+        if fn_name == "as_u16" {
+            return types.named(TK_U16)
+        }
+        if fn_name == "as_u32" {
+            return types.named(TK_U32)
+        }
+        if fn_name == "as_u64" {
+            return types.named(TK_U64)
+        }
+        if fn_name == "as_f32" {
+            return types.named(TK_F32)
+        }
+        return types.named(TK_F64)
+    }
     // 精确个数匹配组
     if fn_name == "println" || fn_name == "print" {
         return types.named(TK_VOID)

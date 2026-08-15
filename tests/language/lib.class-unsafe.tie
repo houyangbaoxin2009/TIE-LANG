@@ -1,0 +1,5 @@
+type tie<class, unsafe>
+// S1.4 验收：class + unsafe 修饰（无 main，类库）
+pub func helper() -> i64 {
+    return 1
+}

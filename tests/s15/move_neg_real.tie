@@ -1,0 +1,17 @@
+type tie<logic>
+// tests/s15/move_neg_real.tie —— S1.5 移动语义负例（真实触发 use-of-moved）
+// ============================================================
+// 本文件包含真实的 use-of-moved 错误：`var b = a` 移动 a 后再次读取 a。
+// 编译应报错："变量 'a' 已移动（所有权已转移），不可再次使用"。
+// 验证命令：TIE_MOVE_CHECK=1 tiec tests/s15/move_neg_real.tie --emit-ir
+
+func take_owned(s: string) -> string {
+    return s
+}
+
+func main() {
+    var a = "hello"
+    var b = a       // a 移动给 b
+    println(b)
+    println(a)      // ← 错误：a 已移动
+}

@@ -1,0 +1,7 @@
+type tie<logic>
+// S1.3 负例：同宽 i↔u 不隐式互转（C4，必须 as_*）
+func main() {
+    var a: i32 = 5
+    var b: u32 = a
+    println(to_string(b))
+}

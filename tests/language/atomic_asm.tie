@@ -1,0 +1,27 @@
+type tie<logic>
+// S1.2 A1/I1 验收：atomic<T> + asm!（等自举解锁后运行）
+unsafe fn atomic_work() -> i64 {
+    var c: atomic<i64> = 0
+    c.store(10, Release)
+    var old = c.fetch_add(5, AcqRel)
+    var cur = c.load(Acquire)
+    var ok = c.compare_exchange(15, 100, SeqCst)
+    println(to_string(old))
+    println(to_string(cur))
+    if ok {
+        println("cas-ok")
+    } else {
+        println("cas-fail")
+    }
+    return c.load(SeqCst)
+}
+
+func main() {
+    unsafe {
+        println(to_string(atomic_work()))
+        // asm! 内联汇编：x86-64 AT&T 语法（寄存器需 % 前缀，操作数用 $N）
+        var rax: i64 = 0
+        asm!("mov $0, %rax", out(reg) rax)
+        println(to_string(rax))
+    }
+}

@@ -68,6 +68,10 @@ var gb_telem: table<i64>;     // 全局表元素类型 id（-1=非表）
 
 var ext_keys: table<i64>;     // extern 函数名 id（升序）
 
+// S1.2：unsafe 上下文深度（0 = 安全代码）。unsafe fn 体 / unsafe 块 /
+// 文件级 type tie<unsafe> 各 +1；语义层触底操作检查 g_unsafe_depth == 0 报错。
+var g_unsafe_depth: i64 = 0;
+
 var tre_keys: table<i64>;     // 返回表的函数名 id（升序）
 var tre_vals: table<i64>;     // 元素类型 id
 
@@ -79,6 +83,14 @@ var lv_vals: table<i64>;      // 类型 id
 var lv_const: table<i64>;     // 0/1
 var lv_telem: table<i64>;     // 表变量元素类型 id（-1=非表）
 var lv_dyn: table<i64>;       // 表变量动态标志（0/1）
+// S1.5 移动语义：变量状态跟踪（live/moved）。**独立升序表**（非 lv_* 并行）：
+// 存在即 moved（bs_find >= 0）。移动规则（docs/plans/ui-framework.md §4.2）：
+// 堆类型（string/table/含堆字段聚合）赋值/按值传参/返回即转移所有权，源变量
+// moved；此后读取 = 编译错误（"use of moved value"）。栈类型不跟踪。
+// 维护点：scheck.check_var_decl/check_stmt（赋值/返回移动登记）+ sinfer
+// infer_expr S_N_VAR（读取检查）；函数边界（check_fn）重置。独立表的好处：
+// 不依赖 lv_insert 同步（lv_* 并行表由 sinfer 维护，S1.2-1.4 并行会话在改）。
+var lv_moved: table<i64>;     // 已移动变量名 id（升序，二分）
 
 var lp_stack: table<i64>;     // 循环标签栈（break/continue 上下文；-1=无标签）
 var lp_top: i64 = 0;          // lp_stack 逻辑栈顶游标（tie 表无法截断，用游标模拟 pop）
@@ -212,6 +224,8 @@ const S_N_TYPE_PARAM: i64 = 126;
 const S_N_TYPE_ARGS: i64 = 127;
 const S_N_ENUM: i64 = 128;
 const S_N_ENUM_VARIANT: i64 = 129;
+const S_N_UNSAFE_BLOCK: i64 = 130;  // unsafe 块（S1.2 U3）
+const S_N_ASM: i64 = 131;           // asm! 内联汇编（S1.2 I1）
 namespace sstate {
 
 // ==================== 工具：协议解析 ====================
@@ -622,7 +636,8 @@ pub func rfind_ns(s: string) -> i64 {
 // 规则：显式 pub 放行；顶层函数（全名无 ::）恒放行；同命名空间或**子命名空间**
 // 放行（ns_stack 前缀匹配 prefix）；否则报私有调用错误。
 pub func check_visibility(full_name: string, sig: i64, call_node: i64) -> i64 {
-    if sg_pub[sig] == 1 {
+    // S1.2：sg_pub 复用为标志位（bit0=pub, bit1=unsafe）
+    if (sg_pub[sig] & 1) == 1 {
         return 0
     }
     var last = rfind_ns(full_name)
@@ -675,6 +690,99 @@ pub func bs_find(keys: table<i64>, k: i64) -> i64 {
         }
     }
     return -1
+}
+
+// ==================== S1.5 移动语义：变量 live/moved 状态 ====================
+// 独立升序表 lv_moved：存在即 moved（复用 bs_find 二分）。函数边界（check_fn
+// 入口）调用 lv_moved_reset 清空；赋值/按值传参/返回移动时 lv_moved_mark 登记；
+// 读取变量前 lv_moved_is 查询——moved 则报 "use of moved value"。
+// 表为独立存储（不并入 lv_* 并行表）：S1.2-1.4 并行会话在改 sinfer 的
+// lv_insert 五表同步，本表由 scheck/sinfer 额外维护，避免与该同步耦合。
+
+// 重置 moved 状态（每函数开始时调用）
+pub func lv_moved_reset() {
+    lv_moved = table_new_i64()
+}
+
+// 标记变量为 moved（有序插入；重复标记幂等）
+pub func lv_moved_mark(nid: i64) {
+    if bs_find(lv_moved, nid) >= 0 {
+        return
+    }
+    var n = len(lv_moved)
+    var lo: i64 = 0
+    var hi: i64 = n - 1
+    var pos: i64 = n
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if lv_moved[mid] < nid {
+            lo = mid + 1
+        } else {
+            pos = mid
+            hi = mid - 1
+        }
+    }
+    table_push(lv_moved, 0)
+    var i: i64 = n
+    while i > pos {
+        lv_moved[i] = lv_moved[i - 1]
+        i = i - 1
+    }
+    lv_moved[pos] = nid
+}
+
+// 变量是否已移动（1=moved / 0=live）
+pub func lv_moved_is(nid: i64) -> i64 {
+    if bs_find(lv_moved, nid) >= 0 {
+        return 1
+    }
+    return 0
+}
+
+// 清除单个变量的 moved 标记（重新赋值后变量恢复 live）。
+// tie 表无法物理截断，直接重建表（每函数 moved 量极小，成本可忽略）。
+pub func lv_moved_unmark(nid: i64) {
+    var idx = bs_find(lv_moved, nid)
+    if idx < 0 {
+        return
+    }
+    var rebuild = table_new_i64()
+    var n = len(lv_moved)
+    var j: i64 = 0
+    while j < n {
+        if lv_moved[j] != nid {
+            table_push(rebuild, lv_moved[j])
+        }
+        j = j + 1
+    }
+    lv_moved = rebuild
+}
+
+// 快照当前 moved 状态（深拷贝独立表）。分支检查用：保存分支入口状态，
+// 分支结束用 lv_moved_restore 恢复——分支内 return/赋值触发的移动标记
+// **不泄漏到分支外**（分支互斥路径，如 `if m == 0 { return s }` 后 s 仍 live）。
+// std/compiler 迁移关键：无分支敏感时此类合法模式被误报 use-of-moved。
+pub func lv_moved_snap() -> table<i64> {
+    var snap = table_new_i64()
+    var n = len(lv_moved)
+    var i: i64 = 0
+    while i < n {
+        table_push(snap, lv_moved[i])
+        i = i + 1
+    }
+    return snap
+}
+
+// 恢复 moved 状态（深拷贝重建独立表，避免与快照共享底层数组）。
+pub func lv_moved_restore(snap: table<i64>) {
+    var rebuild = table_new_i64()
+    var n = len(snap)
+    var j: i64 = 0
+    while j < n {
+        table_push(rebuild, snap[j])
+        j = j + 1
+    }
+    lv_moved = rebuild
 }
 
 // 有序插入 keys（返回插入位置），vals 并行同步插入
@@ -796,6 +904,15 @@ pub func fn_has_variadic(sig: i64) -> i64 {
         return 0
     }
     return sp_vars[sg_off[sig] + n - 1]
+}
+
+// S1.2：函数是否 unsafe（签名标志位 bit1）。1 = unsafe fn（调用必须在
+// unsafe 上下文，安全代码调用 = 编译错误）
+pub func sig_unsafe(sig: i64) -> i64 {
+    if sig < 0 {
+        return 0
+    }
+    return (sg_pub[sig] >> 1) & 1
 }
 
 // struct 登记（重复/冲突检查，返回 struct 索引或 -1）

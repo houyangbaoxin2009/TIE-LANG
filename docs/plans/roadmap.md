@@ -58,6 +58,8 @@
   （见 [unsafe-model.md](unsafe-model.md)）
 - **交付**：编译器支持 unsafe 全能力；示例：unsafe fn 调 Win32 API
 - **验收**：编译零错误；unsafe 边界检查生效；repr(C) 布局精确
+- **状态**：✅ 完成（2026-08-15，S1.2 落地，tiec 自举 0-Rust；
+  详见 unsafe-model.md 实现记录）
 
 ### S1.3 窄整数（互操作前置）
 
@@ -65,6 +67,8 @@
   O3 溢出/A1 算术/B2 移位）（见 [int-model.md](int-model.md)）
 - **交付**：窄整数完整语义 + checked_* + as_* 转换族
 - **验收**：repr(C) 结构体字段宽度精确匹配 C ABI
+- **状态**：✅ 完成（2026-08-15，S1.3 落地，tiec 自举 0-Rust；
+  详见 int-model.md 实现记录）
 
 ### S1.4 角色系统扩展
 
@@ -72,6 +76,8 @@
   + db:vector 向量数据库角色（见 [role-model.md](role-model.md)）
 - **交付**：`type tie<db:vector, owned>` 解析 + `xxx.db-vector.tie` 文件名一致检查
 - **验收**：不一致 = 编译错误；角色语法子集约束生效
+- **状态**：✅ 完成（2026-08-15，S1.4 落地，prep+driver 双端；
+  详见 role-model.md 实现记录）
 
 ### S1.5 M3：移动语义 + arena（提前到阶段 1）
 

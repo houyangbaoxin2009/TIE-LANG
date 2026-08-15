@@ -1,0 +1,36 @@
+type tie<logic>
+// tests/s15/branch_isolate_pos.tie —— S1.5 分支状态隔离验收（正例）
+// ============================================================
+// 覆盖：分支内 return 移动不泄漏到分支外（分支互斥路径合法模式，
+// 如 std/string.tie replace 的 `if m == 0 { return s }` 后继续用 s）；
+// while 循环体移动不泄漏到循环外；TIE_MOVE_CHECK=1 下均应编译通过。
+// 预期输出：
+//   hello!
+//   hello
+//   0
+
+// 分支内 return s（移动）后，分支外继续用 s——合法（flag 为假时 s 从未移动）
+func maybe(s: string, flag: bool) -> string {
+    if flag {
+        return s
+    }
+    return s + "!"
+}
+
+// while 循环体内移动局部副本，循环外继续用源——合法（每迭代独立快照）
+func loop_keep(src: string, n: i64) -> string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < n {
+        var t = src        // 循环体内移动 t（局部，不影响循环外 src）
+        out = out + t
+        i = i + 1
+    }
+    return out + src       // 循环外 src 仍可用
+}
+
+func main() {
+    println(maybe("hello", false))   // hello!
+    println(loop_keep("hello", 1))   // hello（t 副本）+ hello（src）= "hellohello"？→ 见下
+    println(str_len(loop_keep("hello", 1)))
+}

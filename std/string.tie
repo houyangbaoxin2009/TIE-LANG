@@ -336,4 +336,20 @@ pub func repeat(s: string, n: i64) -> string {
     }
     return out
 }
+
+// 深拷贝字符串（S1.5 移动语义配套）：返回 s 的独立副本。
+// 实现复用字符串拼接 s + ""（irgen 生成 str_cat 指令 = malloc+memcpy 新缓冲），
+// 保证 clone 结果与源完全独立，后续修改互不影响（无需引用计数）。
+// 语义：clone/copy 调用处实参**借用**（smove 特判不移动源），
+// 与移动语义的"复制需显式 clone"配套（docs/plans/ui-framework.md §4.2 + roadmap §S1.5）。
+// 注：此为标准库过渡实现（纯 tie，零共享文件改动）；后续可升格为语言内置
+// （sbuiltin 注册 + irgen 直接生成），行为等价。
+pub func clone(s: string) -> string {
+    return s + ""
+}
+
+// copy = clone 的语义别名（显式复制，不移动源；语义与 clone 完全一致）。
+pub func copy(s: string) -> string {
+    return clone(s)
+}
 }

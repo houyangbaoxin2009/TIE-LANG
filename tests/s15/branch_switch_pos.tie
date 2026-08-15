@@ -1,0 +1,57 @@
+type tie<logic>
+// tests/s15/branch_switch_pos.tie —— S1.5 分支状态隔离验收：Switch/For
+// ============================================================
+// 覆盖：switch 分支内移动不泄漏到分支外（互斥路径）；for 循环体移动
+// 局部不泄漏；循环后源变量仍可用。
+// 预期输出：
+//   alpha
+//   alpha
+//   2
+//   beta
+//   beta
+
+func classify(n: i64) -> string {
+    var s = "alpha"
+    switch n {
+    case 1:
+        var moved = s       // 分支内移动（互斥路径）
+        return moved
+    case 2:
+        var moved2 = s      // 另一互斥分支，s 未被污染
+        return moved2
+    default:
+        return s
+    }
+}
+
+func main() {
+    // switch 分支互斥：case 1 移动 s 不影响 case 2 的 s
+    println(classify(1))    // alpha
+    println(classify(2))    // alpha
+    // for 循环体移动局部不泄漏
+    var total = ""
+    var i: i64 = 0
+    while i < 2 {
+        var tmp = "x"
+        var moved_tmp = tmp     // 循环体内移动
+        total = total + moved_tmp
+        i = i + 1
+    }
+    println(len(total))     // 2
+    // 循环后源变量仍可用
+    var base = "beta"
+    var j: i64 = 0
+    while j < 2 {
+        var tmp2 = base     // 循环体内移动 base（快照语义）
+        total = total + tmp2
+        j = j + 1
+    }
+    println(base)           // beta（移动未泄漏出循环）
+    var k: i64 = 0
+    while k < 1 {
+        var tmp3 = base
+        total = total + tmp3
+        k = k + 1
+    }
+    println(base)           // beta
+}

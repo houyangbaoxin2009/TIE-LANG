@@ -1,0 +1,7 @@
+type tie<logic>
+// S1.2 负例 3：extern 无 unsafe 标注 = 编译错误（E3 强制）
+extern fn system(cmd: string) -> i32;
+
+func main() {
+    println("no extern call")
+}

@@ -1,0 +1,9 @@
+type tie<logic>
+// S1.2 负例 1：安全代码调用 unsafe fn = 编译错误
+unsafe fn risky() -> i64 {
+    return 42
+}
+
+func main() {
+    println(to_string(risky()))
+}

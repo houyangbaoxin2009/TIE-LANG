@@ -345,6 +345,36 @@ pub func parse_generic_type_node(tid: i64) -> i64 {
     }
     if tag == S_N_STRUCT_TYPE {
         var nm = sstate.name_str(tid)
+        // S1.2 内建不安全类型引用：`ptr<T>` / `slice<T>` / `atomic<T>`
+        // （N_STRUCT_TYPE 承载标识符类型引用，按名特判——不做关键字，
+        // 避免与 str.slice 等方法名冲突）
+        if nm == "ptr" || nm == "slice" || nm == "atomic" {
+            var slot = sstate.child(tid, 0)
+            if slot < 0 || s_tags[slot] != S_N_TYPE_ARGS {
+                sm_err_line = s_lines[tid]
+                sm_err_col = s_cols[tid]
+                sm_err_msg = "类型 '" + nm + "' 必须显式指定元素类型（如 " + nm + "<i64>）"
+                return -1
+            }
+            var arg0 = sstate.child(slot, 0)
+            if arg0 < 0 {
+                sm_err_line = s_lines[tid]
+                sm_err_col = s_cols[tid]
+                sm_err_msg = "类型 '" + nm + "' 缺少元素类型实参"
+                return -1
+            }
+            var elem = parse_generic_type_node(arg0)
+            if elem < 0 {
+                return -1
+            }
+            if nm == "ptr" {
+                return types.ptr_of(elem)
+            }
+            if nm == "slice" {
+                return types.slice_of(elem)
+            }
+            return types.atomic_of(elem)
+        }
         var nid = intern.intern(nm)
         var sidx = sstate.bs_find(st_keys, nid)
         var eidx = sstate.bs_find(en_keys, nid)

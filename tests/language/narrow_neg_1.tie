@@ -1,0 +1,6 @@
+type tie<logic>
+// S1.3 负例：常量超范围必须编译错误
+func main() {
+    var a: i8 = 200
+    println(to_string(a))
+}

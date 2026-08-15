@@ -242,7 +242,167 @@ func is_valid_subtype(name: string) -> bool {
     if name == "zd" {
         return true
     }
+    if name == "tieir" {
+        return true
+    }
+    if name == "test" {
+        return true
+    }
+    if name == "bench" {
+        return true
+    }
     return false
+}
+
+// ---------- S1.4 R2/R3 多角色与参数化 ----------
+// 修饰角色白名单：unsafe / owned / embedded（可叠加）
+func is_valid_mod(name: string) -> bool {
+    if name == "unsafe" {
+        return true
+    }
+    if name == "owned" {
+        return true
+    }
+    if name == "embedded" {
+        return true
+    }
+    return false
+}
+
+// 参数化角色参数白名单（R3）：<基础>:<参数>
+func is_valid_param(base: string, param: string) -> bool {
+    if base == "ui" {
+        if param == "window" || param == "web" || param == "embedded" {
+            return true
+        }
+    }
+    if base == "db" {
+        if param == "schema" || param == "seed" || param == "vector" {
+            return true
+        }
+    }
+    if base == "data" {
+        if param == "config" || param == "asset" {
+            return true
+        }
+    }
+    return false
+}
+
+// 按分隔符拆分子串（手写；不依赖 std）
+func split_char(s: string, sep: string) -> table {
+    var out = table_new_string()
+    var n = str_len(s)
+    var start: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == sep {
+            table_push(out, slice(s, start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    table_push(out, slice(s, start, n))
+    return out
+}
+
+// 多角色解析（S1.4 R2/R3）：输入尖括号内文本（如 "db:vector, unsafe" /
+// "class, unsafe" / "ui:window"），解析到全局槽：
+//   g_role_base  = 基础角色（唯一；无 = 默认 logic）
+//   g_role_param = 基础角色参数（空 = 无）
+//   g_role_mods  = 修饰角色表（可多个）
+// 错误消息写 g_role_err（空 = 成功）。
+var g_role_base: string = "";
+var g_role_param: string = "";
+var g_role_mods: table = table_new_string();
+var g_role_err: string = "";
+
+func parse_roles(inner: string) {
+    g_role_base = ""
+    g_role_param = ""
+    g_role_mods = table_new_string()
+    g_role_err = ""
+    var items = split_char(inner, ",")
+    var n = len(items)
+    var i: i64 = 0
+    var base_set = false
+    while i < n {
+        var item = trim(items[i])
+        if str_len(item) == 0 {
+            i = i + 1
+            continue
+        }
+        // 带参数形式 `基础:参数`（冒号拆分，最多一段）
+        var colon = -1
+        var k: i64 = 0
+        while k < str_len(item) {
+            if str_char(item, k) == ":" {
+                colon = k
+                break
+            }
+            k = k + 1
+        }
+        if colon >= 0 {
+            var base = slice(item, 0, colon)
+            var param = slice(item, colon + 1, str_len(item))
+            if base_set {
+                g_role_err = "基础角色重复：\"" + item + "\"（基础角色只能声明一个）"
+                return
+            }
+            if !is_valid_subtype(base) {
+                g_role_err = "未知基础角色 \"" + base + "\"（合法: script/data/ui/class/logic/port/db/ir/zd/tieir/test/bench）"
+                return
+            }
+            if !is_valid_param(base, param) {
+                g_role_err = "角色 \"" + base + "\" 不支持参数 \"" + param + "\"（合法参数: ui:window/web/embedded、db:schema/seed/vector、data:config/asset）"
+                return
+            }
+            g_role_base = base
+            g_role_param = param
+            base_set = true
+        } else if is_valid_mod(item) {
+            // 修饰角色：查重（重复 = 错误）
+            var j: i64 = 0
+            while j < len(g_role_mods) {
+                if g_role_mods[j] == item {
+                    g_role_err = "修饰角色重复：\"" + item + "\""
+                    return
+                }
+                j = j + 1
+            }
+            table_push(g_role_mods, item)
+        } else if is_valid_subtype(item) {
+            if base_set {
+                g_role_err = "基础角色重复：\"" + item + "\"（基础角色只能声明一个）"
+                return
+            }
+            g_role_base = item
+            base_set = true
+        } else {
+            g_role_err = "未知角色 \"" + item + "\"（基础: script/data/ui/class/logic/port/db/ir/zd/tieir/test/bench；修饰: unsafe/owned/embedded）"
+            return
+        }
+        i = i + 1
+    }
+    // 无基础角色 → 默认 logic（修饰角色仍生效）
+    if !base_set {
+        g_role_base = "logic"
+    }
+}
+
+// 协议 ROLE 行：`<base>[:<param>][;<mod>...]`（参数用冒号、修饰用分号——
+// 与文件名连字符格式 F1 对应：db:vector ↔ db-vector、class,unsafe ↔ class-unsafe）
+func role_protocol_line() -> string {
+    var out = g_role_base
+    if str_len(g_role_param) > 0 {
+        out = out + ":" + g_role_param
+    }
+    var i: i64 = 0
+    while i < len(g_role_mods) {
+        out = out + ";" + g_role_mods[i]
+        i = i + 1
+    }
+    return out
 }
 
 // 模块入口（协议约定：func process(src: string) -> string）
@@ -287,13 +447,15 @@ func process(src: string) -> string {
                         // 子类型声明：提取尖括号内名称
                         // （"type tie<" 共 9 个码点，-1 去掉结尾 ">"，slice 左闭右开）
                         var inner = slice(trimmed, 9, str_len(trimmed) - 1)
-                        if is_valid_subtype(inner) {
+                        // S1.4 R2/R3：多角色解析（逗号分隔基础+参数+修饰）
+                        parse_roles(inner)
+                        if str_len(g_role_err) == 0 {
                             if !declared {
-                                role = inner
+                                role = g_role_base
                                 declared = true
                             }
                         } else {
-                            err = "未知子类型 \"" + inner + "\"（合法: script/data/ui/class/logic/port/db/ir/zd）"
+                            err = g_role_err
                         }
                     } else {
                         err = "声明格式错误: \"" + trimmed + "\"（应为 `type tie` 或 `type tie<X>`）"
@@ -324,6 +486,14 @@ func process(src: string) -> string {
         return out
     }
     out = "ROLE:" + role + "\n"
+    // S1.4：角色含参数/修饰时在 ROLE 行附加完整声明
+    //（格式 `<base>[:<param>][;<mod>...]`；裸 type tie 无附加）
+    if role != "type" {
+        var full_role = role_protocol_line()
+        if full_role != role {
+            out = "ROLE:" + full_role + "\n"
+        }
+    }
     out = out + "BODY:" + to_string(str_len(body)) + "\n"
     out = out + body
     return out

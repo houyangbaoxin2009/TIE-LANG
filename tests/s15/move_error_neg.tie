@@ -1,0 +1,26 @@
+type tie<logic>
+// tests/s15/move_error_neg.tie —— S1.5 移动语义错误用例（负例）
+// ============================================================
+// 本文件每段含一个 use-of-moved 错误（编译应报错）。
+// 当前编译器不支持错误编译运行——本文件供 semantic 层实现后
+// 手动验证（tiec 编译应报 "use of moved value"）。
+//
+// 错误 1：赋值移动后读取源
+//   var a = "x"
+//   var b = a
+//   println(a)          // ← 错误：a 已移动
+//
+// 错误 2：传参移动后读取源
+//   var s = "y"
+//   take_owned(s)
+//   println(s)          // ← 错误：s 已移动
+//
+// 错误 3：返回移动后读取源
+//   func f() -> string {
+//       var x = "z"
+//       var r = g(x)
+//       return x        // ← 错误：x 已移动（g 传参）
+//   }
+func take_owned(s: string) -> string {
+    return s
+}

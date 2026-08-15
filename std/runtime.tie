@@ -45,29 +45,35 @@ type tie<class>
 
 // extern 声明（T0.7）：链接期 libc 符号，clang 自动解析 msvcrt/CRT。
 // system：`int system(const char*)`，声明 i64 返回（RAX 零扩展保证，见上）。
-extern fn system(cmd: string) -> i64;
+unsafe extern fn system(cmd: string) -> i64;
 // getenv：`char *getenv(const char*)`，string 参数 + string 返回（extern 返回限标量，
 // string 是标量 extern 类型，LLVM 映射 ptr ↔ char*，直接转发）。
-extern fn getenv(name: string) -> string;
+unsafe extern fn getenv(name: string) -> string;
 // time：`time_t time(time_t*)`——传 NULL 返回当前 Unix 秒；tie 无指针类型，
 // 声明 i64 参数传 0（x64 调用约定 i64 与指针同寄存器，实参侧等价 NULL）。
-extern fn time(t: i64) -> i64;
+unsafe extern fn time(t: i64) -> i64;
 
 // tie_exec_code：执行命令，返回退出码（0 成功；启动失败零扩展 4294967295，
 // 见文件头行为差异）。替代 Rust tie-interp 的同名 C ABI 桥。
 func tie_exec_code(cmd: string) -> i64 {
-    return system(cmd)
+    unsafe {
+        return system(cmd)
+    }
 }
 
 // tie_get_env：读取环境变量，返回其值。变量不存在时 getenv 返回 NULL——
 // tie 无法判空，返回 NULL 当字符串用有崩溃风险（限制清单 #3）；常驻变量安全。
 // 替代 Rust tie-interp 的同名 C ABI 桥（Rust 桥缺失变量返回空串）。
 func tie_get_env(name: string) -> string {
-    return getenv(name)
+    unsafe {
+        return getenv(name)
+    }
 }
 
 // tie_time_now：返回 Unix 纪元秒数（与 Rust 桥 SystemTime 同一量纲）。
 // 替代 Rust tie-interp 的同名 C ABI 桥。
 func tie_time_now() -> i64 {
-    return time(0)
+    unsafe {
+        return time(0)
+    }
 }

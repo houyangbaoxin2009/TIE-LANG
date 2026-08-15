@@ -269,11 +269,25 @@ pub func infer_expr(id: i64) -> i64 {
     var tag = s_tags[id]
     // 字面量
     if tag == 0 {
+        // S1.3 L3 后缀字面量：aux = 后缀类型 TyKw（-1 = 无后缀 → i64）
+        var sfx = s_aux[id]
+        if sfx >= 0 && sfx <= 9 {
+            node_types[id] = types.named(sfx)
+            g_typed = g_typed + 1
+            return types.named(sfx)
+        }
         node_types[id] = types.named(TK_I64)
         g_typed = g_typed + 1
         return types.named(TK_I64)
     }
     if tag == 1 {
+        // S1.3 L3 浮点后缀：aux = f32(8)/f64(9)（parser 已定，无后缀默认 f64）
+        var sfx2 = s_aux[id]
+        if sfx2 == TK_F32 {
+            node_types[id] = types.named(TK_F32)
+            g_typed = g_typed + 1
+            return types.named(TK_F32)
+        }
         node_types[id] = types.named(TK_F64)
         g_typed = g_typed + 1
         return types.named(TK_F64)
@@ -499,6 +513,51 @@ pub func infer_expr(id: i64) -> i64 {
         if types.is_float(lhs) && types.is_int(rhs) {
             rt = lhs
         }
+        // S1.3 A1 混合宽度整数运算：结果 = 宽度更大者（i8 + i16 → i16 算术；
+        // i8 + u16 → 16 位算术。同宽度 i/u 混合 → 保持 lhs（LLVM 位模式一致，
+        // 无符号性区分——与 tie 现状有符号语义保持一致）。
+        // L2 上下文推断：字面量侧常量在对方窄类型范围内 → 按对方类型
+        // （`f + 1`：f 是 u8，常量 1 在 u8 范围 → u8 算术，结果 u8）
+        if types.is_int(lhs) && types.is_int(rhs) {
+            var l_node = sstate.child(id, 0)
+            var r_node = sstate.child(id, 1)
+            var l_lit = s_tags[l_node] == 0
+            var r_lit = s_tags[r_node] == 0
+            var lw = stype.int_width(lhs)
+            var rw = stype.int_width(rhs)
+            if l_lit && !r_lit {
+                // 左字面量、右变量：左常量在右类型范围 → 右类型；否则宽者
+                if lit_in_range(s_vals[l_node], rhs) {
+                    rt = rhs
+                } else if rw > lw {
+                    rt = rhs
+                } else {
+                    rt = lhs
+                }
+            } else if r_lit && !l_lit {
+                // 右字面量、左变量：右常量在左类型范围 → 左类型；否则宽者
+                if lit_in_range(s_vals[r_node], lhs) {
+                    rt = lhs
+                } else if lw > rw {
+                    rt = lhs
+                } else {
+                    rt = rhs
+                }
+            } else if !l_lit && !r_lit {
+                // 两侧变量：宽者
+                if rw > lw {
+                    rt = rhs
+                } else {
+                    rt = lhs
+                }
+            }
+            // 两侧字面量：无上下文 → 保持 i64（默认），由目标标注截断
+        }
+        // S1.3 f32 算术：f32 与 f64 混合 → f64；f32+f32 → 提升 f64 计算
+        // （f32 仅 extern/repr(C) 互操作，算术统一 f64——int-model 未决问题 1）
+        if (lhs == TK_F32 || rhs == TK_F32) && (lhs == TK_F64 || rhs == TK_F64) {
+            rt = types.named(TK_F64)
+        }
         // trit × i64 混合（t + 5 / 5 - t）：结果 i64（irgen 生成 i64 运算并
         // sext trit 侧——曾按 lhs 标 TK_TRIT，IR 结果 i64 却被当 i8 转换/打印）
         if lhs == TK_TRIT && types.is_int(rhs) {
@@ -560,6 +619,29 @@ pub func infer_expr(id: i64) -> i64 {
         sm_err_col = s_cols[id]
         sm_err_msg = "类型字面量只能用作 switch 的 case 类型匹配"
         return -1
+    }
+    // S1.2 I1 asm!：unsafe 上下文 + 操作数表达式推断；返回 void
+    if tag == S_N_ASM {
+        if g_unsafe_depth == 0 {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "asm! 内联汇编必须在 unsafe 块或 unsafe 函数中使用（安全代码禁止触底）"
+            return -1
+        }
+        var nc = sstate.nchild(id)
+        var k: i64 = 0
+        while k < nc {
+            var op = sstate.child(id, k)
+            var e = sstate.child(op, 0)
+            var ot = infer_expr(e)
+            if ot < 0 {
+                return -1
+            }
+            k = k + 1
+        }
+        node_types[id] = types.named(TK_VOID)
+        g_typed = g_typed + 1
+        return types.named(TK_VOID)
     }
     // Index
     if tag == S_N_INDEX {
@@ -896,6 +978,56 @@ func sstate_fn_variadic_elem(sig: i64) -> i64 {
 }
 
 // 函数调用推断
+// ---------- S1.3 字面量范围判定 ----------
+// 常量值 v 是否在类型 ty 的范围内（与 stype.types_match 的 C3 范围检查
+// 同一套边界；i64/u64 原生范围恒 true）。Binary 混合宽度上下文推断用。
+func lit_in_range(v: i64, ty: i64) -> bool {
+    if ty == TK_I8 && (v < -128 || v > 127) {
+        return false
+    }
+    if ty == TK_I16 && (v < -32768 || v > 32767) {
+        return false
+    }
+    if ty == TK_I32 && (v < -2147483648 || v > 2147483647) {
+        return false
+    }
+    if ty == TK_U8 && (v < 0 || v > 255) {
+        return false
+    }
+    if ty == TK_U16 && (v < 0 || v > 65535) {
+        return false
+    }
+    if ty == TK_U32 && (v < 0 || v > 4294967295) {
+        return false
+    }
+    return true
+}
+
+// ---------- S1.3 checked_* 返回元组登记 ----------
+// (T, bool) 二元组类型 id：查重（已登记直接返回）或追加登记
+// （tup_offs/tup_n/tup_names/tup_tys/tuple_tys 为 sstate 顶层全局，
+// 与 stype.parse_type_node 的 tuple 登记同布局）。irgen 的 cmpxchg 提取也复用。
+pub func tuple2_of(t0: i64, t1: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(tuple_tys) {
+        var off = tup_offs[i]
+        if tup_n[i] == 2 && tup_tys[off] == t0 && tup_tys[off + 1] == t1 {
+            return tuple_tys[i]
+        }
+        i = i + 1
+    }
+    var idx = len(tuple_tys)
+    var off2 = len(tup_names)
+    table_push(tup_offs, off2)
+    table_push(tup_n, 2)
+    table_push(tuple_tys, types.tuple_of(idx))
+    table_push(tup_names, -1)
+    table_push(tup_tys, t0)
+    table_push(tup_names, -1)
+    table_push(tup_tys, t1)
+    return types.tuple_of(idx)
+}
+
 pub func infer_call(id: i64) -> i64 {
     var fnm = sstate.name_str(id)
     // 实参收集：Call children = [泛型槽(-1或N_TYPE_ARGS), 实参...]，
@@ -908,9 +1040,75 @@ pub func infer_call(id: i64) -> i64 {
         table_push(args, sstate.child(id, off + i))
         i = i + 1
     }
+    // ---------- S1.3 checked_* 溢出检测函数族 ----------
+    // checked_add/sub/mul/div/shl/shr（2 参整数）+ checked_neg（1 参整数）
+    // → 返回 (T, bool) 元组（T = 公共宽度类型；bool = 溢出标志）。
+    // 先于 builtin_call（返回 -3 会误入用户函数路径报"无签名"）。
+    if fnm == "checked_add" || fnm == "checked_sub" || fnm == "checked_mul" ||
+        fnm == "checked_div" || fnm == "checked_shl" || fnm == "checked_shr" ||
+        fnm == "checked_neg" {
+        var need = 2
+        if fnm == "checked_neg" {
+            need = 1
+        }
+        if nc != need {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = fnm + "() 期望 " + to_string(need) + " 个参数，实际 " + to_string(nc) + " 个"
+            return -1
+        }
+        var t0 = infer_expr(args[0])
+        if t0 < 0 {
+            return -1
+        }
+        if !types.is_int(t0) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = fnm + "() 参数必须是整数，实际是 " + types.type_name(t0)
+            return -1
+        }
+        var ct = t0
+        if need == 2 {
+            var t1 = infer_expr(args[1])
+            if t1 < 0 {
+                return -1
+            }
+            if !types.is_int(t1) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = fnm + "() 参数必须是整数，实际是 " + types.type_name(t1)
+                return -1
+            }
+            if stype.int_width(t1) > stype.int_width(t0) {
+                ct = t1
+            }
+            if stype.is_signed(t0) != stype.is_signed(t1) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = fnm + "() 不支持有符号与无符号混合（" + types.type_name(t0) + " 与 " + types.type_name(t1) + "）"
+                return -1
+            }
+        }
+        var rt = tuple2_of(ct, types.named(TK_BOOL))
+        node_types[id] = rt
+        g_typed = g_typed + 1
+        return rt
+    }
     // 内置函数：先校验个数（-2=参数错误已报），通过后逐个推断实参
     var br = sbuiltin.builtin_call(fnm, args, id)
     if br >= -1 && br != -3 {
+        // S1.2 安全边界：unsafe 内置（指针/内存操作）在安全代码中调用 = 编译错误
+        if g_unsafe_depth == 0 {
+            if fnm == "addr_of" || fnm == "addr_of_field" || fnm == "deref" || fnm == "deref_write" ||
+                fnm == "is_null" || fnm == "ptr_add" || fnm == "ptr_to_int" || fnm == "int_to_ptr" ||
+                fnm == "alloc" || fnm == "free" || fnm == "memcpy" || fnm == "memset" ||
+                fnm == "slice_of" || fnm == "slice_len" || fnm == "slice_index" {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "调用 unsafe 内置 '" + fnm + "' 必须在 unsafe 块或 unsafe 函数中（安全代码禁止触底）"
+                return -1
+            }
+        }
         // 实参类型推断（未声明变量/类型错误在此暴露；只做检查不改结果）
         var ka: i64 = 0
         while ka < nc {
@@ -919,6 +1117,104 @@ pub func infer_call(id: i64) -> i64 {
                 return -1
             }
             ka = ka + 1
+        }
+        // S1.2 动态返回类型特判（builtin_call 无法静态确定）：
+        // addr_of(x) → ptr<实参类型>；deref(p) → 指针元素类型；
+        // slice_of(a, s, n) → slice<元素类型>；ptr_add(p, n) → ptr<元素类型>
+        if fnm == "addr_of" {
+            var a0 = infer_expr(args[0])
+            if a0 < 0 {
+                return -1
+            }
+            node_types[id] = types.ptr_of(a0)
+            g_typed = g_typed + 1
+            return node_types[id]
+        }
+        if fnm == "deref" || fnm == "ptr_add" {
+            var p0 = infer_expr(args[0])
+            if p0 < 0 {
+                return -1
+            }
+            if !types.is_ptr(p0) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = fnm + "() 第 1 个参数必须是指针类型，实际是 " + types.type_name(p0)
+                return -1
+            }
+            var e0 = types.table_elem(p0)
+            if fnm == "deref" {
+                node_types[id] = e0
+            } else {
+                node_types[id] = types.ptr_of(e0)
+            }
+            g_typed = g_typed + 1
+            return node_types[id]
+        }
+        if fnm == "slice_of" {
+            var a1 = infer_expr(args[0])
+            if a1 < 0 {
+                return -1
+            }
+            // S1.2：第一版 slice_of 只支持字符串（ptr 即数据指针）；
+            // 动态表数据区在运行时桥内无数据指针桥（后置）。
+            var et1: i64 = types.named(TK_U8)
+            if a1 != TK_STR {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "slice_of() 第一版只支持字符串（表的数据指针桥后置），实际是 " + types.type_name(a1)
+                return -1
+            }
+            node_types[id] = types.slice_of(et1)
+            g_typed = g_typed + 1
+            return node_types[id]
+        }
+        if fnm == "slice_index" {
+            var s0 = infer_expr(args[0])
+            if s0 < 0 {
+                return -1
+            }
+            if !types.is_slice(s0) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "slice_index() 第 1 个参数必须是切片类型，实际是 " + types.type_name(s0)
+                return -1
+            }
+            node_types[id] = types.table_elem(s0)
+            g_typed = g_typed + 1
+            return node_types[id]
+        }
+        if fnm == "slice_len" {
+            var s1 = infer_expr(args[0])
+            if s1 < 0 {
+                return -1
+            }
+            if !types.is_slice(s1) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "slice_len() 参数必须是切片类型，实际是 " + types.type_name(s1)
+                return -1
+            }
+            node_types[id] = types.named(TK_I64)
+            g_typed = g_typed + 1
+            return node_types[id]
+        }
+        // as_* 特殊检查（S1.3）：参数必须是数字（整数/浮点），转换才有意义
+        if fnm == "as_i8" || fnm == "as_i16" || fnm == "as_i32" || fnm == "as_i64" ||
+            fnm == "as_u8" || fnm == "as_u16" || fnm == "as_u32" || fnm == "as_u64" ||
+            fnm == "as_f32" || fnm == "as_f64" {
+            var a_ty = infer_expr(args[0])
+            if a_ty < 0 {
+                return -1
+            }
+            if !types.is_number(a_ty) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = fnm + "() 参数必须是数字（整数/浮点），实际是 " + types.type_name(a_ty)
+                return -1
+            }
+            node_types[id] = br
+            g_typed = g_typed + 1
+            return br
         }
         // table_push 特殊检查（对齐 Rust）：第 1 参数必须表变量 + 动态表 + 元素类型匹配
         if fnm == "table_push" {
@@ -1050,6 +1346,13 @@ pub func infer_call(id: i64) -> i64 {
     if vr < 0 {
         return -1
     }
+    // S1.2 安全边界：unsafe 函数（含 extern）在安全代码中调用 = 编译错误
+    if sstate.sig_unsafe(sig) == 1 && g_unsafe_depth == 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "调用 unsafe 函数 '" + fnm + "' 必须在 unsafe 块或 unsafe 函数中（安全代码禁止触底）"
+        return -1
+    }
     var req = sg_required[sig]
     var total = sg_nparams[sig]
     var has_var = sstate.fn_has_variadic(sig) == 1
@@ -1137,8 +1440,160 @@ pub func infer_call(id: i64) -> i64 {
     return rt
 }
 
-// ==================== 泛型调用路径（T3b 单态化 + 调用点推断）====================
-// 实参表类型细化：`table_new_*()` 变量/返回的类型是裸 table（元素类型在
+// ==================== S1.2 A1 atomic<T> 内置方法 ====================
+// 方法集（第一版 i64/f64/bool 元素）：
+//   load() → T                    （无参）
+//   store(v, order)               （2 参，返回 void）
+//   fetch_add/sub/and/or/xor(v, order) → T（读改写，返回旧值）
+//   compare_exchange(exp, new, order) → bool（CAS 成功标志）
+// order 参数：Relaxed/Acquire/Release/AcqRel/SeqCst 标识符 → IMM 0..4。
+// 全部要求 unsafe 上下文。
+func infer_atomic_method(aty: i64, mname: string, args: table<i64>, id: i64) -> i64 {
+    if g_unsafe_depth == 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "原子操作 '" + mname + "()' 必须在 unsafe 块或 unsafe 函数中使用（安全代码禁止触底）"
+        return -1
+    }
+    var elem = types.table_elem(aty)
+    var nargs = len(args)
+    if mname == "load" {
+        if nargs > 1 {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "atomic.load() 期望 0 或 1 个参数（内存序），实际 " + to_string(nargs) + " 个"
+            return -1
+        }
+        if nargs == 1 {
+            if infer_asm_order(args[0], id) < 0 {
+                return -1
+            }
+        }
+        node_types[id] = elem
+        g_typed = g_typed + 1
+        return elem
+    }
+    if mname == "store" {
+        if nargs != 2 {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "atomic.store() 期望 2 个参数（值, 内存序），实际 " + to_string(nargs) + " 个"
+            return -1
+        }
+        var vt = infer_expr(args[0])
+        if vt < 0 {
+            return -1
+        }
+        if !stype.types_match(elem, vt, args[0]) && !stype.types_compatible(elem, vt) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "atomic.store() 值类型不匹配：期望 " + types.type_name(elem) + "，实际 " + types.type_name(vt)
+            return -1
+        }
+        if infer_asm_order(args[1], id) < 0 {
+            return -1
+        }
+        node_types[id] = types.named(TK_VOID)
+        g_typed = g_typed + 1
+        return types.named(TK_VOID)
+    }
+    if mname == "fetch_add" || mname == "fetch_sub" || mname == "fetch_and" ||
+        mname == "fetch_or" || mname == "fetch_xor" {
+        if nargs != 2 {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "atomic." + mname + "() 期望 2 个参数（增量, 内存序），实际 " + to_string(nargs) + " 个"
+            return -1
+        }
+        var vt2 = infer_expr(args[0])
+        if vt2 < 0 {
+            return -1
+        }
+        if !stype.types_match(elem, vt2, args[0]) && !stype.types_compatible(elem, vt2) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "atomic." + mname + "() 值类型不匹配：期望 " + types.type_name(elem) + "，实际 " + types.type_name(vt2)
+            return -1
+        }
+        if infer_asm_order(args[1], id) < 0 {
+            return -1
+        }
+        node_types[id] = elem
+        g_typed = g_typed + 1
+        return elem
+    }
+    if mname == "compare_exchange" {
+        if nargs != 3 {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "atomic.compare_exchange() 期望 3 个参数（期望值, 新值, 内存序），实际 " + to_string(nargs) + " 个"
+            return -1
+        }
+        var et = infer_expr(args[0])
+        if et < 0 {
+            return -1
+        }
+        if !stype.types_match(elem, et, args[0]) && !stype.types_compatible(elem, et) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "atomic.compare_exchange() 期望值类型不匹配：期望 " + types.type_name(elem) + "，实际 " + types.type_name(et)
+            return -1
+        }
+        var nt = infer_expr(args[1])
+        if nt < 0 {
+            return -1
+        }
+        if !stype.types_match(elem, nt, args[1]) && !stype.types_compatible(elem, nt) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "atomic.compare_exchange() 新值类型不匹配：期望 " + types.type_name(elem) + "，实际 " + types.type_name(nt)
+            return -1
+        }
+        if infer_asm_order(args[2], id) < 0 {
+            return -1
+        }
+        node_types[id] = types.named(TK_BOOL)
+        g_typed = g_typed + 1
+        return types.named(TK_BOOL)
+    }
+    sm_err_line = s_lines[id]
+    sm_err_col = s_cols[id]
+    sm_err_msg = "atomic<T> 不支持方法 '" + mname + "'（支持: load/store/fetch_add/fetch_sub/fetch_and/fetch_or/fetch_xor/compare_exchange）"
+    return -1
+}
+
+// 内存序参数解析：标识符 Relaxed/Acquire/Release/AcqRel/SeqCst → 0..4。
+// 返回 0 成功；-1 报错（sm_err_* 已置）。
+func infer_asm_order(node: i64, id: i64) -> i64 {
+    if s_tags[node] != S_N_VAR {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "内存序必须是 Relaxed / Acquire / Release / AcqRel / SeqCst（标识符常量）"
+        return -1
+    }
+    var nm = sstate.name_str(node)
+    if nm == "Relaxed" {
+        return 0
+    }
+    if nm == "Acquire" {
+        return 1
+    }
+    if nm == "Release" {
+        return 2
+    }
+    if nm == "AcqRel" {
+        return 3
+    }
+    if nm == "SeqCst" {
+        return 4
+    }
+    sm_err_line = s_lines[id]
+    sm_err_col = s_cols[id]
+    sm_err_msg = "未知内存序 '" + nm + "'（合法: Relaxed/Acquire/Release/AcqRel/SeqCst）"
+    return -1
+}
+
+// ==================== 泛型调用路径（T3b 单态化 + 调用点推断）====================// 实参表类型细化：`table_new_*()` 变量/返回的类型是裸 table（元素类型在
 // var_table_elem / table_ret_elem），泛型推断需带元素类型（table<T> 匹配）。
 // 例如 Box<table<i64>>(t)：t 的裸 table 若直接绑定 T 会与显式 table<i64> 冲突。
 func refine_arg_ty(a: i64, t: i64) -> i64 {
@@ -1211,6 +1666,13 @@ pub func infer_generic_fn_call(full_name: string, gti: i64, id: i64, args: table
     // 可见性校验
     var vr = sstate.check_visibility(mangled, sig, id)
     if vr < 0 {
+        return -1
+    }
+    // S1.2 安全边界：泛型 unsafe 函数在安全代码中调用 = 编译错误
+    if sstate.sig_unsafe(sig) == 1 && g_unsafe_depth == 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "调用 unsafe 函数 '" + full_name + "' 必须在 unsafe 块或 unsafe 函数中（安全代码禁止触底）"
         return -1
     }
     // 参数个数（实例化签名）
@@ -1354,6 +1816,9 @@ pub func infer_method_call(id: i64) -> i64 {
         if rt2 < 0 {
             // 未绑定：命名空间前缀
             full = rname + "::" + mname
+        } else if types.kind(rt2) == K_ATOMIC {
+            // S1.2 A1 atomic<T> 内置方法（c.load() / c.fetch_add(1, Relaxed)）
+            return infer_atomic_method(rt2, mname, args, id)
         } else {
             // struct 实例方法转发
             return infer_struct_method(recv, rt2, mname, args, id)
@@ -1378,6 +1843,13 @@ pub func infer_method_call(id: i64) -> i64 {
     // 可见性校验
     var vr = sstate.check_visibility(full, sig, id)
     if vr < 0 {
+        return -1
+    }
+    // S1.2 安全边界：unsafe 命名空间函数在安全代码中调用 = 编译错误
+    if sstate.sig_unsafe(sig) == 1 && g_unsafe_depth == 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "调用 unsafe 函数 '" + full + "' 必须在 unsafe 块或 unsafe 函数中（安全代码禁止触底）"
         return -1
     }
     var req = sg_required[sig]
@@ -1665,6 +2137,13 @@ pub func infer_struct_method(recv: i64, recv_ty: i64, mname: string, args: table
     // 方法函数必须 pub
     var vr = sstate.check_visibility(full, sig, id)
     if vr < 0 {
+        return -1
+    }
+    // S1.2 安全边界：unsafe 方法在安全代码中调用 = 编译错误
+    if sstate.sig_unsafe(sig) == 1 && g_unsafe_depth == 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "调用 unsafe 方法 '" + full + "' 必须在 unsafe 块或 unsafe 函数中（安全代码禁止触底）"
         return -1
     }
     // 方法：首参 = 接收者（按引用）。参数个数（含接收者对象，对齐 Rust）：

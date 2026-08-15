@@ -1,0 +1,41 @@
+type tie<logic>
+// S1.5 探针5：复现 driver 167-173 模式
+// var rest = trim(str.slice(ln, 8, str_len(ln))) —— trim 是用户函数（裸）返回 string
+// 然后 str_len(rest)/str_char(rest, ...) 复用
+func slice(s: string, start: i64, end: i64) -> string {
+    var out: string = ""
+    var i: i64 = start
+    while i < end {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+func trim(s: string) -> string {
+    var n: i64 = str_len(s)
+    var start: i64 = 0
+    var end: i64 = n
+    while start < end && (str_char(s, start) == " " || str_char(s, start) == "\t") {
+        start = start + 1
+    }
+    while end > start && (str_char(s, end - 1) == " " || str_char(s, end - 1) == "\t") {
+        end = end - 1
+    }
+    return slice(s, start, end)
+}
+
+func main() {
+    var ln: string = "type tie<logic>"
+    // 167 行模式：trim(裸函数) 接收 str.slice(方法) 的结果
+    var rest = trim(str.slice(ln, 8, str_len(ln)))
+    if str_len(rest) == 0 {
+        println("empty")
+    }
+    // 173 行模式：rest 复用链
+    if str_len(rest) >= 3 && str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">" {
+        println("angle:" + rest)
+    }
+    // 168 后再次使用 rest
+    println("rest:" + rest)
+}

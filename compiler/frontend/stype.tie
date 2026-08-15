@@ -37,6 +37,35 @@ pub func parse_type_node(tid: i64) -> i64 {
     }
     if tag == S_N_STRUCT_TYPE {
         var nm = sstate.name_str(tid)
+        // S1.2 内建不安全类型引用：`ptr<T>` / `slice<T>` / `atomic<T>`
+        // （与 sgen.parse_generic_type_node 同款特判；tuple 字段类型走本路径）
+        if nm == "ptr" || nm == "slice" || nm == "atomic" {
+            var tslot = sstate.child(tid, 0)
+            if tslot < 0 || s_tags[tslot] != S_N_TYPE_ARGS {
+                sm_err_line = s_lines[tid]
+                sm_err_col = s_cols[tid]
+                sm_err_msg = "类型 '" + nm + "' 必须显式指定元素类型（如 " + nm + "<i64>）"
+                return -1
+            }
+            var targ0 = sstate.child(tslot, 0)
+            if targ0 < 0 {
+                sm_err_line = s_lines[tid]
+                sm_err_col = s_cols[tid]
+                sm_err_msg = "类型 '" + nm + "' 缺少元素类型实参"
+                return -1
+            }
+            var telem = parse_type_node(targ0)
+            if telem < 0 {
+                return -1
+            }
+            if nm == "ptr" {
+                return types.ptr_of(telem)
+            }
+            if nm == "slice" {
+                return types.slice_of(telem)
+            }
+            return types.atomic_of(telem)
+        }
         var nid = intern.intern(nm)
         var idx = sstate.bs_find(st_keys, nid)
         if idx < 0 {
@@ -124,6 +153,34 @@ pub func parse_type_node(tid: i64) -> i64 {
     return -1
 }
 
+// ---------- S1.3 窄整数辅助（位宽/符号性） ----------
+// 整数位宽：i8/u8=8 ... i64/u64=64；非整数返回 0。
+// pub：sinfer/irgen 在命名空间外调用（窄整数拓宽/缩窄判定）。
+pub func int_width(t: i64) -> i64 {
+    if t == TK_I8 || t == TK_U8 {
+        return 8
+    }
+    if t == TK_I16 || t == TK_U16 {
+        return 16
+    }
+    if t == TK_I32 || t == TK_U32 {
+        return 32
+    }
+    if t == TK_I64 || t == TK_U64 {
+        return 64
+    }
+    return 0
+}
+
+// 有符号判定：i 族（u 族 false；非整数 false）
+// pub：sinfer/irgen 在命名空间外调用（窄整数拓宽/缩窄判定）。
+pub func is_signed(t: i64) -> bool {
+    if t == TK_I8 || t == TK_I16 || t == TK_I32 || t == TK_I64 {
+        return true
+    }
+    return false
+}
+
 // 类型兼容判定（宽类型框/裸表/嵌套逐层，对齐 Rust wide_accepts 与
 // proto types_compatible）
 pub func types_compatible(a: i64, b: i64) -> bool {
@@ -192,6 +249,31 @@ pub func types_compatible(a: i64, b: i64) -> bool {
             i = i + 1
         }
         return true
+    }
+    // ---------- S1.3 C2 隐式拓宽 ----------
+    // 同符号整数窄→宽：i8→i16→i32→i64、u8→u16→u32→u64（got 宽度严格小于
+    // want）。同宽度 i↔u 不隐式（C4：必须显式 as_*）。
+    // u → i 拓宽（目标有符号且严格更宽）：u8/u16/u32 → i64（zext 无损——
+    // i64 值域容纳全部无符号窄值）。反向 i → u 不隐式（负值无法表示，C4）。
+    if types.is_int(a) && types.is_int(b) {
+        if int_width(b) < int_width(a) && is_signed(a) == is_signed(b) {
+            return true
+        }
+        if !is_signed(b) && is_signed(a) && int_width(b) < int_width(a) {
+            return true
+        }
+        return false
+    }
+    // 整数 → 浮点隐式（C2 无损方向：i64 → f64；窄整数 → f32/f64）。
+    // 反向 float → int 不隐式（C4：必须显式 as_*）。
+    if types.is_float(a) && types.is_int(b) {
+        return true
+    }
+    // f32 → f64 隐式拓宽（f64 → f32 缩窄不隐式，走 as_f32）
+    if types.is_float(a) && types.is_float(b) {
+        if (a == TK_F32 && b == TK_F64) || (a == TK_F64 && b == TK_F32) {
+            return true
+        }
     }
     return false
 }
@@ -269,8 +351,33 @@ pub func types_match(want: i64, got: i64, init_node: i64) -> bool {
             }
         }
         if tag == S_N_INT_LIT {
-            // IntLit：整数/浮点标注 + trit（对齐 Rust）
+            // IntLit：整数/浮点标注 + trit（对齐 Rust）+ S1.3 C3 常量缩窄范围
+            // 检查——窄类型标注的字面量必须在类型范围内（超范围 = 编译错误，
+            // 非回绕；防止静默截断）。i64/u64 原生范围不查。
+            // S1.2 A1：atomic<T> 初始化字面量适配元素类型（`var c: atomic<i64> = 0`）
+            if types.kind(want) == K_ATOMIC {
+                want = types.table_elem(want)
+            }
             if types.is_int(want) || types.is_float(want) {
+                var lit = s_vals[init_node]
+                if want == TK_I8 && (lit < -128 || lit > 127) {
+                    return false
+                }
+                if want == TK_I16 && (lit < -32768 || lit > 32767) {
+                    return false
+                }
+                if want == TK_I32 && (lit < -2147483648 || lit > 2147483647) {
+                    return false
+                }
+                if want == TK_U8 && (lit < 0 || lit > 255) {
+                    return false
+                }
+                if want == TK_U16 && (lit < 0 || lit > 65535) {
+                    return false
+                }
+                if want == TK_U32 && (lit < 0 || lit > 4294967295) {
+                    return false
+                }
                 return true
             }
             if want == TK_TRIT {
@@ -295,8 +402,59 @@ pub func types_match(want: i64, got: i64, init_node: i64) -> bool {
                 return true
             }
         }
+        // S1.3 O3 窄域常量算术：目标窄整数 + 二元运算两侧都是 IntLit 且
+        // 常量都在目标类型范围 → 放行（irgen 按目标类型截断 = 回绕语义，
+        // `var c: i8 = 100 + 100` → -56。与 C3 的单字面量超范围报错区分：
+        // 表达式在窄域计算，字面量直接标注超范围仍拒绝）。
+        if tag == S_N_BINARY {
+            if types.is_int(want) && int_width(want) < 64 {
+                var ln = sstate.child(init_node, 0)
+                var rn = sstate.child(init_node, 1)
+                if s_tags[ln] == 0 && s_tags[rn] == 0 {
+                    if lit_in_range_stype(s_vals[ln], want) && lit_in_range_stype(s_vals[rn], want) {
+                        return true
+                    }
+                }
+            }
+        }
+        // S1.3 负数字面量适配：`var g: i8 = -4` → Unary(Neg, IntLit)，
+        // 常量取负后仍在目标范围 → 放行（irgen coerce 截断）
+        if tag == S_N_UNARY {
+            if types.is_int(want) && int_width(want) < 64 {
+                var un = sstate.child(init_node, 0)
+                if s_vals[init_node] == 0 && s_tags[un] == 0 {
+                    if lit_in_range_stype(0 - s_vals[un], want) {
+                        return true
+                    }
+                }
+            }
+        }
     }
     return false
+}
+
+// 常量值是否在类型范围内（C3 边界；与 sinfer.lit_in_range 同套逻辑，
+// stype 侧独立副本避免循环依赖）
+func lit_in_range_stype(v: i64, ty: i64) -> bool {
+    if ty == TK_I8 && (v < -128 || v > 127) {
+        return false
+    }
+    if ty == TK_I16 && (v < -32768 || v > 32767) {
+        return false
+    }
+    if ty == TK_I32 && (v < -2147483648 || v > 2147483647) {
+        return false
+    }
+    if ty == TK_U8 && (v < 0 || v > 255) {
+        return false
+    }
+    if ty == TK_U16 && (v < 0 || v > 65535) {
+        return false
+    }
+    if ty == TK_U32 && (v < 0 || v > 4294967295) {
+        return false
+    }
+    return true
 }
 
 }

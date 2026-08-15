@@ -1,0 +1,13 @@
+type tie<logic>
+// tests/s15/set_remove_probe.tie —— 复现 set.remove 内部 set.find 的移动误报
+import "../../std/set.tie"
+using set;
+
+func main() {
+    var a = set.new()
+    var r1 = set.add(a, 1)
+    var r2 = set.remove(a, 1)   // 内部调 set.find(s, x)（库函数，应借用）
+    println(r2)                 // true
+    println(r1)                 // true
+    println(len(a))             // 0
+}

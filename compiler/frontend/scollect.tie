@@ -62,11 +62,20 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
     }
     var nparams = s_aux[fn_node]
     var is_pub = s_vals[fn_node]
+    // S1.2：函数 unsafe 标志（val bit1）。参数/返回含指针类型的函数必须是
+    // unsafe fn（安全函数不能触碰指针）。
+    var is_unsafe = (is_pub >> 1) & 1
     // 返回类型：FnDef children[slot_off]（新布局 children[0]=泛型槽→偏移 1；
     // 旧布局无槽→children[0]=返回类型。slot_off 统一判定保证自举双兼容）
     var rt_node = sstate.child(fn_node, sstate.slot_off(fn_node))
     var ret_ty = sgen.parse_generic_type_node(rt_node)
     if ret_ty < 0 {
+        return -1
+    }
+    if types.is_unsafe_ty(ret_ty) && is_unsafe == 0 {
+        sm_err_line = s_lines[fn_node]
+        sm_err_col = s_cols[fn_node]
+        sm_err_msg = "返回指针/切片/原子类型 '" + types.type_name(ret_ty) + "' 的函数必须标注 unsafe（`unsafe fn`）"
         return -1
     }
     var p_tys: table<i64> = table_new_i64()
@@ -90,6 +99,13 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
         var p = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + k)
         var pt = sgen.parse_generic_type_node(sstate.child(p, 0))
         if pt < 0 {
+            return -1
+        }
+        // S1.2：安全函数参数不能是指针/切片/原子类型
+        if types.is_unsafe_ty(pt) && is_unsafe == 0 {
+            sm_err_line = s_lines[p]
+            sm_err_col = s_cols[p]
+            sm_err_msg = "参数 '" + sstate.name_str(p) + "' 的指针/切片/原子类型 '" + types.type_name(pt) + "' 只能在 unsafe 函数中使用"
             return -1
         }
         var is_ref = s_vals[p]
@@ -1030,6 +1046,13 @@ pub func collect_top() -> i64 {
         } else if tag == S_N_EXTERN {
             var full = sstate.name_str(s)
             var nparams = s_aux[s]
+            // S1.2 E3 强制：extern 声明必须带 unsafe 标注（val = 1）
+            if s_vals[s] == 0 {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "extern 声明必须标注 unsafe（`unsafe extern fn " + full + "(...)`），安全代码禁止直接调用外部符号"
+                return -1
+            }
             // extern 与已有函数重复定义（对齐 Rust：extern 专用消息）
             if sstate.fn_sig(full) >= 0 {
                 sm_err_line = s_lines[s]
@@ -1078,7 +1101,8 @@ pub func collect_top() -> i64 {
                 table_push(p_vars, 0)
                 k = k + 1
             }
-            if sstate.reg_fn(full, 1, nparams, nparams, ret_ty, p_tys, p_refs, p_defs, p_vars) < 0 {
+            // S1.2：extern 签名登记为 unsafe（pub 位 + unsafe 位，sg_pub 组合标志）
+            if sstate.reg_fn(full, 1 + s_vals[s] * 2, nparams, nparams, ret_ty, p_tys, p_refs, p_defs, p_vars) < 0 {
                 sm_err_line = s_lines[s]
                 sm_err_col = s_cols[s]
                 return -1

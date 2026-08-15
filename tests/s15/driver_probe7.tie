@@ -1,0 +1,16 @@
+type tie<logic>
+// S1.5 探针7：probe3 结构 + 嵌套 if 作用域
+// 目标：验证 rest 在嵌套作用域声明后移动状态是否正确恢复
+func main() {
+    var flag = true
+    if flag {
+        var rest: string = "abc"
+        if str_len(rest) >= 3 && str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">" {
+            println("if-pass")
+        } else {
+            println("if-else")
+        }
+        var n = str_len(rest)
+        println(to_string(n))
+    }
+}

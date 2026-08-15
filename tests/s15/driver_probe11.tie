@@ -1,0 +1,24 @@
+type tie<logic>
+// S1.5 探针11：probe8 + continue 语句
+// 目标：验证 continue 是否影响后续嵌套作用域移动状态
+func main() {
+    var i: i64 = 0
+    while i < 2 {
+        var ln = "abc"
+        if str_len(ln) == 0 {
+            i = i + 1
+            continue
+        }
+        if str_len(ln) > 0 {
+            var rest: string = "abc"
+            if str_len(rest) >= 3 && str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">" {
+                println("if-pass")
+            } else {
+                println("if-else")
+            }
+            var n = str_len(rest)
+            println(to_string(n))
+        }
+        i = i + 1
+    }
+}

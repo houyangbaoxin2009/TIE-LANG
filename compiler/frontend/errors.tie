@@ -154,4 +154,11 @@ pub func syn_no_init(actual: string) -> string {
     return "无法从 " + actual + " 初始化"
 }
 
+// ---------- S1.5 移动语义错误消息（use-of-moved）----------
+// 参数化消息：变量 {name} 已移动（所有权已转移），不可再次使用。
+// 对齐 Rust use-of-moved-value 语义：堆类型赋值/按值传参/返回即转移。
+pub func sem_use_moved(name: string) -> string {
+    return "变量 '" + name + "' 已移动（所有权已转移），不可再次使用（需要复制请用 clone）"
+}
+
 }   // namespace errors

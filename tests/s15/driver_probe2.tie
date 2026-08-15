@@ -1,0 +1,62 @@
+type tie<logic>
+// tests/s15/driver_probe2.tie —— 1:1 复现 driver.tie scan_header（裸顶层函数形态）
+// 目的：定位裸函数形态下 ln 被移动的精确路径
+import "../../std/string.tie"
+
+var g_role: string = "logic"
+
+func trim(s: string) -> string {
+    return str.trim(s)
+}
+
+func split_lines(s: string) -> table<string> {
+    return str.split(s, "\n")
+}
+
+func slice(s: string, start: i64, end: i64) -> string {
+    return str.slice(s, start, end)
+}
+
+func has_prefix(s: string, prefix: string) -> bool {
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(prefix)
+    if n < m {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(prefix, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+func scan_header(src: string) -> i64 {
+    var lines = split_lines(src)
+    var n: i64 = len(lines)
+    var i: i64 = 0
+    while i < n && i < 20 {
+        var ln = trim(lines[i])
+        if str_len(ln) == 0 {
+            i = i + 1
+            continue
+        }
+        if has_prefix(str.clone(ln), "type tie") {
+            var rest = trim(str.slice(ln, 8, str_len(ln)))
+            if str_len(rest) == 0 {
+                g_role = "type"
+                return 0
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+func main() {
+    var r = scan_header("type tie\n")
+    println(r)
+    println(g_role)
+}

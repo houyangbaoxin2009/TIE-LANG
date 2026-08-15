@@ -1,6 +1,6 @@
 # 规划：tie unsafe 模型（指针/切片/repr(C)/extern/原子/汇编/手动内存）
 
-> 状态：**规划**（2026-08-15 设计讨论定稿，未实现）
+> 状态：**已实现**（2026-08-15，S1.2 落地；tiec 自举编译，0-Rust）
 > 本文档定义 tie 的 unsafe 完整模型——所有底层能力的总闸门。
 > 决策汇总：
 > **U3**（unsafe 语法：块/函数为主 + 文件级逃生舱）
@@ -12,6 +12,24 @@
 > + **M1**（语言级 alloc/free）。
 > 关联：闭包模型（函数指针 C2）、接口模型（vtable 手写 I2）、内存模型
 > （移动语义+arena）、并发模型（协程/无锁）、UI 框架。
+>
+> ## 实现记录（2026-08-15，S1.2）
+> - 语法：`unsafe fn`（fn 字样）/ `unsafe { }` 块 / `type tie<..., unsafe>` 文件级
+>   （修饰角色，与 S1.4 多角色系统咬合）
+> - 类型：`ptr<T>` / `slice<T>` / `atomic<T>` 走 N_STRUCT_TYPE 标识符引用
+>   （不做关键字，避免与 str.slice 等方法名冲突），types 编码段 7/8/9<<40
+> - 语义：安全边界检查（5 处调用点拦截）、E3 extern 强制 unsafe（std 三文件
+>   一次性改造：path/process/runtime）、指针类型安全上下文限制
+> - 操作集：addr_of/addr_of_field/deref/deref_write/is_null/ptr_add/ptr_to_int/
+>   int_to_ptr/alloc/free/memcpy/memset/slice_of（字符串）/slice_len/slice_index
+> - atomic<T>：load/store/fetch_add/sub/and/or/xor/compare_exchange（方法形态，
+>   内存序 Relaxed/Acquire/Release/AcqRel/SeqCst，LLVM 原子指令发射）
+> - asm!：Rust 风格 `{N}` 占位符 → LLVM `$N` 自动转换；in/out/inout(reg) 约束
+> - repr(C)：LLVM 结构体天然 C 布局（字段类型精确到窄整数），窄字段构造/赋值
+>   经 gen_coerce 转换
+> - 测试：tests/language/unsafe_full/atomic_asm/reprc_probe + 4 负例
+> - 后置：slice_of 对动态表的数据指针桥（运行时表结构在桥内）；asm! 平台
+>   条件编译（#[target(arch)]）；volatile 读写
 
 ## 1. 目标与原则
 

@@ -1,0 +1,18 @@
+type tie<logic>
+// S1.2 R1 前置验证：窄整数字段 struct 布局（repr(C) 的数据基础）
+struct Header {
+    var magic: u32
+    var version: i16
+    var count: i64
+    var flags: u8
+}
+
+func main() {
+    var h = Header(0x4D4748, 2, 100, 1)
+    println(to_string(h.magic))
+    println(to_string(h.version))
+    println(to_string(h.count))
+    println(to_string(h.flags))
+    h.version = 3
+    println(to_string(h.version))
+}

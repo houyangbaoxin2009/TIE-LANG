@@ -1,0 +1,60 @@
+type tie<logic>
+// S1.2 验收：unsafe 语法 + 指针操作 + alloc/free + slice
+unsafe fn addr_roundtrip(x: i64) -> i64 {
+    var p = addr_of(x)
+    return deref(p)
+}
+
+unsafe fn ptr_walk(base: ptr<i64>, n: i64) -> i64 {
+    var sum: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        sum = sum + deref(ptr_add(base, i))
+        i = i + 1
+    }
+    return sum
+}
+
+func main() {
+    // unsafe 块 + 指针读写
+    var v: i64 = 42
+    unsafe {
+        var p = addr_of(v)
+        deref_write(p, 99)
+        println(to_string(deref(p)))
+        if is_null(p) {
+            println("null")
+        } else {
+            println("not-null")
+        }
+    }
+    println(to_string(v))
+    // unsafe fn 调用（main 是安全函数 → 需 unsafe 块）
+    unsafe {
+        println(to_string(addr_roundtrip(7)))
+    }
+    // alloc/free + 指针步长
+    unsafe {
+        var buf = alloc(32)
+        deref_write(buf, 5)
+        deref_write(ptr_add(buf, 1), 6)
+        deref_write(ptr_add(buf, 2), 7)
+        println(to_string(deref(buf)))
+        println(to_string(deref(ptr_add(buf, 2))))
+        free(buf)
+    }
+    // slice：字符串 → 字节切片视图
+    unsafe {
+        var s = slice_of("Hello tie", 6, 3)
+        println(to_string(slice_len(s)))
+        println(to_string(slice_index(s, 0)))
+        println(to_string(slice_index(s, 2)))
+    }
+    // ptr 与 i64 互转
+    unsafe {
+        var q = addr_of(v)
+        var i = ptr_to_int(q)
+        var q2 = int_to_ptr(i)
+        println(to_string(deref(q2)))
+    }
+}

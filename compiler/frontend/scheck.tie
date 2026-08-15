@@ -341,6 +341,18 @@ func check_enum_switch_case(c: i64, subj_ty: i64) -> i64 {
 // 语句检查
 pub func check_stmt(s: i64) -> i64 {
     var tag = s_tags[s]
+    if tag == S_N_UNSAFE_BLOCK {
+        // S1.2 U3：unsafe 块 → 块内开启 unsafe 上下文（+1 深度）
+        var saved2 = g_unsafe_depth
+        g_unsafe_depth = g_unsafe_depth + 1
+        var blk2 = sstate.child(s, 0)
+        var r2: i64 = 0
+        if blk2 >= 0 {
+            r2 = check_block(blk2)
+        }
+        g_unsafe_depth = saved2
+        return r2
+    }
     if tag == S_N_VAR_DECL {
         return check_var_decl(s)
     }
@@ -748,6 +760,13 @@ pub func check_var_decl(s: i64) -> i64 {
         if ty < 0 {
             return -1
         }
+        // S1.2 S1 指针全归 unsafe：安全代码不能声明指针/切片/原子类型变量
+        if types.is_unsafe_ty(ty) && g_unsafe_depth == 0 {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "变量 '" + nm + "' 的指针/切片/原子类型 '" + types.type_name(ty) + "' 只能在 unsafe 代码中使用"
+            return -1
+        }
         var it: i64 = -1
         if init >= 0 {
             it = sinfer.infer_expr(init)
@@ -920,7 +939,14 @@ pub func check_fn(fn_node: i64, full: string) -> i64 {
     }
     // 函数体：children[slot_off + 1 + nparams]
     var body = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + nparams)
+    // S1.2：unsafe 函数体内开启 unsafe 上下文（safe 代码进 unsafe fn 已被调用
+    // 检查拦截；unsafe fn 内部零标记触底）
+    var saved_depth = g_unsafe_depth
+    if sstate.sig_unsafe(sig) == 1 {
+        g_unsafe_depth = g_unsafe_depth + 1
+    }
     var r = check_block(body)
+    g_unsafe_depth = saved_depth
     if r < 0 {
         return -1
     }

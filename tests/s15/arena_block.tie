@@ -1,0 +1,30 @@
+type tie<logic>
+// tests/s15/arena_block.tie —— S1.5 arena 块验收
+// ============================================================
+// 覆盖：arena 块内字符串/表分配归 arena；显式 clone 逃逸出块；
+// 块结束整体释放（无泄漏无悬垂）。本文件为移动语义 + arena 下
+// 的合法代码。
+// 预期输出：
+//   in-arena
+//   2
+//   1
+//   2
+
+func main() {
+    var out = ""
+    var out_t = table_new_i64()
+    arena {
+        // 块内字符串分配归 arena
+        var s = "in-arena"
+        out = clone(s)      // 显式复制出块（独立对象，s 归 arena）
+        // 块内表分配归 arena
+        var t = table_new_i64()
+        table_push(t, 1)
+        table_push(t, 2)
+        out_t = clone(t)    // 表副本逃逸出块
+    }                       // s/t 随块整体释放
+    println(out)
+    println(len(out_t))
+    println(out_t[0])
+    println(out_t[1])
+}

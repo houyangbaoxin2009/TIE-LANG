@@ -1,0 +1,23 @@
+type tie<logic>
+// S1.3 B2 移位语义：移过量 >= 位宽有定义（非 UB）
+func main() {
+    // 左移移过量 >= 宽度 → 0
+    var a: u8 = 0x80
+    var b = a << 1
+    println(to_string(b))
+    var c = a << 8
+    println(to_string(c))
+    var d = a << 9
+    println(to_string(d))
+    // 右移：u8 逻辑右移
+    var e = a >> 1
+    println(to_string(e))
+    var f = a >> 8
+    println(to_string(f))
+    // i8 算术右移（符号保持）
+    var g: i8 = -4
+    var h = g >> 1
+    println(to_string(h))
+    var i = g >> 9
+    println(to_string(i))
+}

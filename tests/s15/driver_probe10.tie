@@ -1,0 +1,55 @@
+type tie<logic>
+// S1.5 探针10：probe8 + 裸函数定义（无 import std）
+func slice(s: string, start: i64, end: i64) -> string {
+    var out: string = ""
+    var i: i64 = start
+    while i < end {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+func trim(s: string) -> string {
+    var n: i64 = str_len(s)
+    var start: i64 = 0
+    var end: i64 = n
+    while start < end && (str_char(s, start) == " " || str_char(s, start) == "\t") {
+        start = start + 1
+    }
+    while end > start && (str_char(s, end - 1) == " " || str_char(s, end - 1) == "\t") {
+        end = end - 1
+    }
+    return slice(s, start, end)
+}
+func has_prefix(s: string, prefix: string) -> bool {
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(prefix)
+    if n < m {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(prefix, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+func main() {
+    var i: i64 = 0
+    while i < 1 {
+        var flag = true
+        if flag {
+            var rest: string = "abc"
+            if str_len(rest) >= 3 && str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">" {
+                println("if-pass")
+            } else {
+                println("if-else")
+            }
+            var n = str_len(rest)
+            println(to_string(n))
+        }
+        i = i + 1
+    }
+}

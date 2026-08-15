@@ -78,7 +78,7 @@ pub func run_lex(src: string) -> bool {
     g_paren_depth = 0
     g_err_msg = ""
     // 源文本 → 码点表（regex 一次切分 O(N)；替代 str_char 逐位取 O(N²)）
-    g_src = src
+    g_src = str.clone(src)
     var chars = regex_find_all(src, "(?s).")
     g_codes = table_new_i64()
     var i: i64 = 0

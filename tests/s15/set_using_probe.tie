@@ -1,0 +1,16 @@
+type tie<logic>
+// tests/s15/set_using_probe.tie —— 验证 using 引入后裸名调用（add/remove）不误报移动
+import "../../std/set.tie"
+using set;
+
+func main() {
+    var a = set.new()
+    var r1 = add(a, 1)       // using 裸名调用（sinfer 候选 3 解析 set::add；smove 解析不到 → 内置借用）
+    var r2 = add(a, 2)
+    println(r1)              // true
+    println(r2)              // true
+    println(len(a))          // 2（a 未被移动）
+    var r3 = remove(a, 1)
+    println(r3)              // true
+    println(len(a))          // 1
+}

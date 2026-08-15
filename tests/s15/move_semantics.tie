@@ -1,0 +1,55 @@
+type tie<logic>
+// tests/s15/move_semantics.tie —— S1.5 移动语义验收（正例）
+// ============================================================
+// 覆盖：赋值移动（源失效）、clone 显式复制、传参移动、返回移动、
+// 表移动。本文件全部为移动语义下的**合法代码**（移动后源不再引用）。
+// 预期输出：
+//   hello
+//   hello
+//   hello
+//   world
+//   world
+//   2
+//   1
+//   2
+
+// 传参移动 + 返回移动：s 所有权转给函数，返回值所有权转出
+func take_owned(s: string) -> string {
+    return s
+}
+
+// 深拷贝字符串（与 std/string.tie str.clone 行为一致：s + "" 复用 str_cat）
+func clone(s: string) -> string {
+    return s + ""
+}
+
+func main() {
+    // 赋值移动：a 移动给 b，a 此后不可用（本文件不引用 a）
+    var a = "hello"
+    var b = a
+    println(b)
+
+    // 显式复制：clone 后两边都可用
+    var c = clone(b)
+    var d = b      // b 移动给 d（b 此后不可用）
+    println(c)
+    println(d)
+
+    // 传参移动：s 所有权转给函数（此后 s 不可用）
+    var s = "world"
+    var r = take_owned(s)
+    println(r)
+
+    // 字面量直接传参：无变量所有权问题
+    var r2 = take_owned("world")
+    println(r2)
+
+    // 表移动：t 移动给 u（u 拥有）
+    var t = table_new_i64()
+    table_push(t, 1)
+    table_push(t, 2)
+    var u = t
+    println(len(u))
+    println(u[0])
+    println(u[1])
+}

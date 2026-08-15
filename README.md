@@ -12,7 +12,15 @@ tie 是一门**通用编程语言**：用一门语言写逻辑、写界面、写
 支持**用户泛型**（泛型函数 `func max<T>(a: T, b: T) -> T` + 泛型 struct
 `struct Box<T>`，编译期单态化 + 调用点类型推断，tiec 实现）与 **enum 枚举**
 （Rust 风格 ADT：无数据/带 payload/泛型变体，静态结构体布局 + switch 匹配，
-tiec 实现）。
+tiec 实现）。阶段 1 语言地基（2026-08-15）新增三大系统能力：
+**unsafe 模型**（`unsafe fn`/`unsafe { }` 块 + `ptr<T>`/`slice<T>`/`atomic<T>` +
+`repr(C)` struct + extern 强制 unsafe + `asm!` 内联汇编 + alloc/free，见
+[docs/plans/unsafe-model.md](docs/plans/unsafe-model.md)）、**窄整数**
+（`i8`/`i16`/`i32`/`u8`/`u16`/`u32`/`u64`/`f32`：后缀字面量 `42i32`、
+`as_*` 转换族、`checked_*` 溢出检测族、明确移位语义，见
+[docs/plans/int-model.md](docs/plans/int-model.md)）、**角色扩展**
+（多角色叠加 `type tie<db:vector, unsafe>` + 角色参数化 + 文件名一致性
+= 编译错误，见 [docs/plans/role-model.md](docs/plans/role-model.md)）。
 
 > 语法规范见 [docs/language.md](docs/language.md)；本文件是工程入口（用法、结构、流水线、路线图）。
 
@@ -90,9 +98,14 @@ type tie<zd>        # 压缩数据文件（tie:data 二进制变体，主要用�
 
 - **子类型**：`script` / `data` / `ui` / `class` / `logic` / `port` / `db` / `ir` / `zd`；
   `type` 角色本身由**裸 `type tie`**（无尖括号）表达，`type tie<type>` 是格式错误；
+- **多角色叠加（S1.4）**：角色可逗号叠加——基础角色唯一 + 修饰/参数化角色可叠加：
+  `type tie<db:vector, unsafe>`（向量数据库 + 文件级 unsafe）、`type tie<class, unsafe>`；
+  参数白名单：`ui:window/web/embedded`、`db:schema/seed/vector`、`data:config/asset`；
 - **默认角色**：无声明时默认 `logic`（可执行文件，需 `func main()`）；
-- **文件名约定**：`xxx.<角色>.tie`（如 `app.script.tie`、`schema.db.tie`）可作为默认角色
-  （头部声明优先；文件名与头部不一致时**警告并采用头部声明**）；
+- **文件名约定**：`xxx.<角色>.tie`（如 `app.script.tie`、`schema.db.tie`、
+  `xxx.db-vector.tie`、`lib.class-unsafe.tie`）可作为默认角色；
+  **R3 一致性**（S1.4 起）：文件名与头部不一致 = **编译错误**（基础/参数/修饰
+  集合比较，顺序无关）；
 - **角色分派**：
 
 | 角色 | 工具链 |

@@ -1,0 +1,59 @@
+type tie<logic>
+// S1.3 验收测试：后缀/拓宽/缩窄/as_*/checked_*/边界
+func main() {
+    // L3 后缀字面量
+    var a = 42i32
+    var b = 7u8
+    var c = 0x80u16
+    var d = 1.5f32
+    println(to_string(a))
+    println(to_string(b))
+    println(to_string(c))
+    // C2 拓宽：窄 → 宽隐式
+    var e: i16 = 300
+    var f: i64 = e
+    println(to_string(f))
+    var g: u8 = 200
+    var h: i64 = g
+    println(to_string(h))
+    // 显式转换 as_*
+    var big: i64 = 300
+    var small: i8 = as_i8(big)
+    println(to_string(small))
+    var ux: u8 = as_u8(big)
+    println(to_string(ux))
+    var ix: i32 = as_i32(3.9)
+    println(to_string(ix))
+    // 窄算术混合宽度（i8 + i16 → i16）
+    var x: i8 = 100
+    var y: i16 = 1000
+    var z: i16 = x + y
+    println(to_string(z))
+    // checked_add 溢出检测
+    var (sum1, ok1) = checked_add(as_i8(100), as_i8(100))
+    println(to_string(sum1))
+    if ok1 {
+        println("overflow")
+    } else {
+        println("no-overflow")
+    }
+    var (sum2, ok2) = checked_add(as_i8(100), as_i8(20))
+    println(to_string(sum2))
+    if ok2 {
+        println("overflow")
+    } else {
+        println("no-overflow")
+    }
+    // checked_sub 借位
+    var (s3, o3) = checked_sub(as_i8(-100), as_i8(100))
+    println(to_string(s3))
+    if o3 {
+        println("overflow")
+    } else {
+        println("no-overflow")
+    }
+    // 无符号回绕 + 范围检查
+    var uv: u8 = 255
+    var uw: u8 = uv + 1
+    println(to_string(uw))
+}

@@ -1,0 +1,14 @@
+type tie<logic>
+// S1.5 探针3：复现 driver @173:55 rest moved 误报
+// 模式：str_len(rest) + str_char(rest, 0) 链式读取，rest 应保持 live
+func main() {
+    var rest: string = "abc"
+    if str_len(rest) >= 3 && str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">" {
+        println("if-pass")
+    } else {
+        println("if-else")
+    }
+    // rest 复用应合法
+    var n = str_len(rest)
+    println(to_string(n))
+}

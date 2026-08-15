@@ -53,7 +53,47 @@ pub func parse_stmt() -> i64 {
         putil.set_err(putil.peek_line(), putil.peek_col(), "extern 声明只能出现在文件顶层")
         return -1
     }
+    if tag == lex_unsafe {
+        // S1.2 U3：`unsafe { ... }` 局部逃逸块（块内可触底）
+        return parse_unsafe_block()
+    }
     return pstmt.parse_expr_or_assign()
+}
+
+// unsafe 块：`unsafe { stmts }` → N_UNSAFE_BLOCK（children=[StmtList 或直接语句]）。
+// 与普通块同结构（N_STMTLIST 包装体），语义层按节点标记开启 unsafe 上下文。
+func parse_unsafe_block() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // unsafe
+    if !putil.expect(lex_lbrace, "'{'") {
+        return -1
+    }
+    var stmts: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        if putil.peek_tag() == lex_rbrace {
+            putil.advance()
+            done = true
+        } else if putil.peek_tag() == lex_eof {
+            if !putil.expect(lex_rbrace, "'}'") {
+                return -1
+            }
+            done = true
+        } else {
+            var s = parse_stmt()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        }
+    }
+    var n = ast.new_node(N_UNSAFE_BLOCK, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, ast.new_node(N_STMTLIST, -1, -1, -1, line, col))
+    ast.set_children(n, kids)
+    ast.set_children(ast.child_at(n, 0), stmts)
+    return n
 }
 
 // ---------- 顶层 import / using / namespace / extern ----------

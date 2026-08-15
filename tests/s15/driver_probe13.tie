@@ -1,0 +1,99 @@
+type tie<logic>
+// S1.5 探针6：1:1 复现 driver scan_header 段（裸函数 + std import 链）
+// 目标：定位 @173:55 rest moved 触发点
+// import removed
+
+func has_prefix(s: string, prefix: string) -> bool {
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(prefix)
+    if n < m {
+        return false
+    }
+    var i: i64 = 0
+    while i < m {
+        if str_char(s, i) != str_char(prefix, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+func slice(s: string, start: i64, end: i64) -> string {
+    var out: string = ""
+    var i: i64 = start
+    while i < end {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
+}
+
+func trim(s: string) -> string {
+    var n: i64 = str_len(s)
+    var start: i64 = 0
+    var end: i64 = n
+    while start < end && (str_char(s, start) == " " || str_char(s, start) == "\t") {
+        start = start + 1
+    }
+    while end > start && (str_char(s, end - 1) == " " || str_char(s, end - 1) == "\t") {
+        end = end - 1
+    }
+    return slice(s, start, end)
+}
+
+var g_role: string = ""
+
+func scan_header(s: string) -> i64 {
+    var lines = split_lines2(s)
+    var i: i64 = 0
+    while i < len(lines) {
+        var ln = trim(lines[i])
+        if str_len(ln) == 0 {
+            i = i + 1
+            continue
+        }
+        if str_len(ln) > 0 {
+            var rest = trim(str.slice(ln, 8, str_len(ln)))
+            if str_len(rest) == 0 {
+                g_role = "type"
+                return 0
+            }
+            // 173 行：rest 复用链
+            if str_len(rest) >= 3 && str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">" {
+                var sub = trim(slice(rest, 1, str_len(rest) - 1))
+                println("sub:" + sub)
+            } else {
+                println("rest:" + rest)
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+func split_lines2(s: string) -> table<string> {
+    var rows = table_new_string()
+    var n: i64 = str_len(s)
+    var line: string = ""
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "\n" {
+            table_push(rows, line)
+            line = ""
+        } else {
+            line = line + c
+        }
+        i = i + 1
+    }
+    if str_len(line) > 0 {
+        table_push(rows, line)
+    }
+    return rows
+}
+
+func main() {
+    var r = scan_header("type tie<logic>\n")
+    println(to_string(r))
+}

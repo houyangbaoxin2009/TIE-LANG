@@ -1,4 +1,55 @@
 
+## [新增] 阶段 1 语言地基三件套（S1.2 unsafe + S1.3 窄整数 + S1.4 角色扩展）—— 2026-08-15
+
+tie 语言阶段 1 语言地基（M0 级）三任务全部落地，tiec（tie 自写编译器，
+compiler/）全链路实现（词法→语法→语义→IR→LLVM），完全不用 Rust：
+
+### S1.2 unsafe 模型（docs/plans/unsafe-model.md 实现记录）
+- **语法**：`unsafe fn`（fn 字样）/ `unsafe { }` 块 / `type tie<..., unsafe>` 文件级
+- **类型**：`ptr<T>` / `slice<T>` / `atomic<T>` 走 N_STRUCT_TYPE 标识符引用
+  （不做关键字，避免与 str.slice 等方法名冲突）；types 编码段 7/8/9<<40
+- **语义**：安全边界检查（5 处调用点拦截）、E3 extern 强制 unsafe
+  （std 三文件 path/process/runtime 一次性改造）、指针类型安全上下文限制
+- **操作集**：addr_of/addr_of_field/deref/deref_write/is_null/ptr_add/ptr_to_int/
+  int_to_ptr/alloc/free/memcpy/memset/slice_of（字符串）/slice_len/slice_index
+- **atomic\<T\>**：load/store/fetch_add/sub/and/or/xor/compare_exchange
+  （方法形态，内存序 Relaxed/Acquire/Release/AcqRel/SeqCst，LLVM 原子指令发射）
+- **asm!**：Rust 风格 `{N}` 占位符 → LLVM `$N` 自动转换（asm_tmpl_convert）；
+  in/out/inout(reg) 约束
+- **repr(C)**：LLVM 结构体天然 C 布局，窄字段构造/赋值经 gen_coerce 转换
+- **llvmgen 补全**：gep(23)/ptrtoint(24)/inttoptr(25) 原来全是 TODO 占位，已实现
+- **验收**：tests/language/unsafe_full（指针读写/alloc+ptr_add/slice 视图/
+  ptr↔int roundtrip 全对）、atomic_asm（store Release→fetch_add AcqRel→
+  load Acquire→CAS SeqCst→load 全对）、reprc_probe（窄字段 C 布局全对）、
+  asm 两探针 + 4 个安全边界负例全拒（unsafe fn/内置/无 unsafe extern/指针参数）
+
+### S1.3 窄整数（docs/plans/int-model.md 实现记录）
+- **后缀字面量**：`42i32` / `7u8` / `0x80u16` / `1.5f32`（lexer 吞并 + parser aux）
+- **C2 拓宽**：同符号窄→宽 + u→i 无损拓宽（zext）；float→int 不隐式
+- **C3 常量范围**：`var b: i8 = 200` 编译错误；表达式窄域回绕
+- **as_\* 族**：as_i8..as_u64/as_f32/as_f64（trunc/sext/zext/fptosi/sitofp 映射）
+- **checked_\* 族**：checked_add/sub/mul/div/neg/shl/shr → (值, 溢出标志) 二元组
+  （比较法检测 + select 防 poison；无符号用 ult/ugt + udiv 反算）
+- **A1/B2**：窄宽度算术类型保持 + 混合提升；无符号逻辑右移（lshr）/有符号
+  算术右移（ashr），移过量≥位宽有定义（select 保护）
+- **新增 tie-IR opcode**：zext(29)/trunc(37)/fptosi(38)/fpext(39)/udiv(46) +
+  icmp 无符号比较码 6-9
+- **验收**：tests/language/narrow_full（42/7/128/300/200/44/44/3/1100/-56/
+  overflow/120/no-overflow/56/overflow/0 全对）、shift_neg_free、负例 3 个全拒
+
+### S1.4 角色系统扩展（docs/plans/role-model.md 实现记录）
+- **多角色**：`type tie<db:vector, unsafe>` 逗号叠加（基础唯一 + 修饰可叠加）
+- **参数化**：参数白名单（ui:window/web/embedded、db:schema/seed/vector、
+  data:config/asset）；ROLE 协议扩展 `<base>[:<param>][;<mod>...]`
+- **文件名一致性**：F1 连字符格式（xxx.db-vector.tie / xxx.class-unsafe.tie）；
+  **R3 升级为编译错误**（基础/参数/修饰集合比较，顺序无关）
+- **文件级 unsafe**：type tie<..., unsafe> → g_unsafe_depth +1（与 S1.2 咬合）
+- **新增角色**：tieir/test/bench（白名单 + 分派）
+- **验收**：db-vector-unsafe/lib.class-unsafe 正例 + R3 不一致负例
+  （参数 db:schema vs db:vector、修饰 class-unsafe vs class 均报编译错误）
+
+**回归**：tests/language 24/24 PASS + 新测试全绿 + _driver_test PASS。
+
 ## [升级] LLVM 工具链 18.1.8 → 22.1.8（S1.1 独立里程碑）—— 2026-08-15
 
 - **版本**：LLVM 从 18.1.8 升级到 22.1.8（最新稳定版；23 仍 RC3 未用，等稳定再议）

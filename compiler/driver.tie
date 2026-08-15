@@ -155,26 +155,29 @@ func scan_header(src: string) -> i64 {
     var n: i64 = len(lines)
     var i: i64 = 0
     g_role = "logic"
+    g_role_param = ""
+    g_role_mods = table_new_string()
     while i < n && i < 20 {
         var ln = trim(lines[i])
         if str_len(ln) == 0 {
             i = i + 1
             continue
         }
-        if has_prefix(ln, "type tie") {
-            var rest = trim(slice(ln, 8, str_len(ln)))
+        if has_prefix(str.clone(ln), "type tie") {
+            var rest = trim(str.slice(ln, 8, str_len(ln)))
             if str_len(rest) == 0 {
                 g_role = "type"
                 return 0
             }
             // 期望 `<X>` 形式，且无尾随内容
             if str_len(rest) >= 3 && str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">" {
-                var sub = trim(slice(rest, 1, str_len(rest) - 1))
-                if sub == "script" || sub == "data" || sub == "ui" || sub == "class" || sub == "logic" || sub == "port" || sub == "db" || sub == "ir" || sub == "zd" {
-                    g_role = sub
+                var sub = trim(slice(str.clone(rest), 1, str_len(rest) - 1))
+                // S1.4 R2/R3：多角色解析（基础[:参数][, 修饰...]）
+                if parse_role_decl(sub) == 0 {
+                    g_role = g_role_base
                     return 0
                 }
-                println("文件类型声明错误: 未知类型 '" + sub + "'（第 " + to_string(i + 1) + " 行），合法类型: script/data/ui/class/logic/port/db/ir/zd")
+                println("文件类型声明错误: " + g_role_err + "（第 " + to_string(i + 1) + " 行）")
                 return -1
             }
             println("文件类型声明错误: 非法声明 '" + ln + "'（第 " + to_string(i + 1) + " 行），应为 `type tie` 或 `type tie<类型>`")
@@ -184,6 +187,136 @@ func scan_header(src: string) -> i64 {
         break
     }
     return 0
+}
+
+// ---------- S1.4 R2/R3 多角色解析（driver 侧，与 prep/core.tie 同规则） ----------
+var g_role_param: string = "";           // 基础角色参数（如 db:vector 的 vector）
+var g_role_mods: table<string>;          // 修饰角色（unsafe/owned/embedded）
+var g_role_base: string = "";            // 解析中间结果：基础角色
+var g_role_err: string = "";             // 解析错误消息（空 = 成功）
+
+// 修饰角色白名单
+func is_valid_mod_role(name: string) -> bool {
+    if name == "unsafe" {
+        return true
+    }
+    if name == "owned" {
+        return true
+    }
+    if name == "embedded" {
+        return true
+    }
+    return false
+}
+
+// 参数白名单
+func is_valid_role_param(base: string, param: string) -> bool {
+    if base == "ui" {
+        if param == "window" || param == "web" || param == "embedded" {
+            return true
+        }
+    }
+    if base == "db" {
+        if param == "schema" || param == "seed" || param == "vector" {
+            return true
+        }
+    }
+    if base == "data" {
+        if param == "config" || param == "asset" {
+            return true
+        }
+    }
+    return false
+}
+
+// 基础角色白名单
+func is_valid_base_role(name: string) -> bool {
+    if name == "type" || name == "script" || name == "data" || name == "ui" ||
+        name == "class" || name == "logic" || name == "port" || name == "db" ||
+        name == "ir" || name == "zd" || name == "tieir" || name == "test" || name == "bench" {
+        return true
+    }
+    return false
+}
+
+// 按逗号/冒号拆分角色声明 `db:vector, unsafe` → 全局槽。返回 0 成功。
+func parse_role_decl(sub: string) -> i64 {
+    g_role_base = ""
+    g_role_param = ""
+    g_role_mods = table_new_string()
+    g_role_err = ""
+    var parts = split_char(sub, ",")
+    var k: i64 = 0
+    var base_set = false
+    while k < len(parts) {
+        var item = trim(parts[k])
+        if str_len(item) == 0 {
+            k = k + 1
+            continue
+        }
+        var colon = find_char(str.clone(item), ":")
+        if colon >= 0 {
+            var base = trim(slice(str.clone(item), 0, colon))
+            var param = trim(slice(str.clone(item), colon + 1, str_len(item)))
+            if base_set {
+                g_role_err = "基础角色重复: '" + item + "'"
+                return -1
+            }
+            if !is_valid_base_role(str.clone(base)) {
+                g_role_err = "未知基础角色 '" + base + "'"
+                return -1
+            }
+            if !is_valid_role_param(str.clone(base), str.clone(param)) {
+                g_role_err = "角色 '" + base + "' 不支持参数 '" + param + "'"
+                return -1
+            }
+            g_role_base = base
+            g_role_param = param
+            base_set = true
+        } else if is_valid_mod_role(str.clone(item)) {
+            var j: i64 = 0
+            while j < len(g_role_mods) {
+                if g_role_mods[j] == item {
+                    g_role_err = "修饰角色重复: '" + item + "'"
+                    return -1
+                }
+                j = j + 1
+            }
+            table_push(g_role_mods, item)
+        } else if is_valid_base_role(str.clone(item)) {
+            if base_set {
+                g_role_err = "基础角色重复: '" + item + "'"
+                return -1
+            }
+            g_role_base = item
+            base_set = true
+        } else {
+            g_role_err = "未知角色 '" + item + "'（基础: script/data/ui/class/logic/port/db/ir/zd/tieir/test/bench；修饰: unsafe/owned/embedded）"
+            return -1
+        }
+        k = k + 1
+    }
+    if !base_set {
+        g_role_base = "logic"
+    }
+    return 0
+}
+
+// 按字符拆分（码点级；driver 自写工具）
+func split_char(s: string, sep: string) -> table<string> {
+    var out = table_new_string()
+    var n = str_len(s)
+    var start: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == sep {
+            table_push(out, slice(s, start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    table_push(out, slice(s, start, n))
+    return out
 }
 
 // 剥离头部区的文件类型声明行（`type tie` / `type tie<X>`），返回清理后源码。
@@ -198,7 +331,7 @@ func strip_type_header(src: string) -> string {
     var i: i64 = 0
     while i < n {
         var ln = lines[i]
-        var t = trim(ln)
+        var t = trim(str.clone(ln))
         if in_header {
             if str_len(t) == 0 {
                 // 头部区空行：保留
@@ -232,7 +365,7 @@ func frontend(src: string, base_dir: string) -> i64 {
         return -1
     }
     var sem = semantic.check_ast(base_dir)
-    if has_prefix(sem, "ERR:") {
+    if has_prefix(str.clone(sem), "ERR:") {
         println("语义错误 " + err_span(sem))
         return -1
     }
@@ -241,8 +374,8 @@ func frontend(src: string, base_dir: string) -> i64 {
 
 // ERR 协议文本 → "行:列: 消息"（协议 ERR:<line> <col> <msg>）。
 func err_span(proto: string) -> string {
-    var rest = slice(proto, 4, str_len(proto))
-    var sp1 = find_char(rest, " ")
+    var rest = slice(str.clone(proto), 4, str_len(proto))
+    var sp1 = find_char(str.clone(rest), " ")
     if sp1 < 0 {
         return proto
     }
@@ -258,8 +391,8 @@ func err_span(proto: string) -> string {
     if sp2 < 0 {
         return rest
     }
-    return "@" + slice(rest, 0, sp1) + ":" + slice(rest, sp1 + 1, sp2) + ": " +
-        slice(rest, sp2 + 1, str_len(rest))
+    return "@" + slice(str.clone(rest), 0, sp1) + ":" + slice(str.clone(rest), sp1 + 1, sp2) + ": " +
+        slice(str.clone(rest), sp2 + 1, str_len(rest))
 }
 
 // ==================== 主流程 ====================
@@ -283,7 +416,7 @@ func main() -> i64 {
     // 必须在 file_read（文本读取）之前按文件名后缀预判并直接短接——二进制
     // 内容文本解码必然失败/乱码。zd 文件由 tiedb compact/decompress 原语处理。
     var zd_len: i64 = str_len(g_input)
-    if zd_len >= 7 && slice(g_input, zd_len - 7, zd_len) == ".zd.tie" {
+    if zd_len >= 7 && slice(str.clone(g_input), zd_len - 7, zd_len) == ".zd.tie" {
         println("[预处理] 识别为 zd 压缩数据文件（头: " + g_input + "），tie:data 压缩格式，用 tiedb compact/decompress 处理")
         return 0
     }
@@ -293,18 +426,56 @@ func main() -> i64 {
         return 1
     }
     // 头部扫描（文件类型声明 / 角色）
-    if scan_header(src) < 0 {
+    if scan_header(str.clone(src)) < 0 {
         return 1
     }
     // 剥离头部声明行（`type tie` / `type tie<X>` 是真语法行，须从正文移除；
     // 旧 `// tie:` 是注释由 lexer 跳过，无需处理）
     var clean = strip_type_header(src)
-    // 文件名角色检查：`xxx.<角色>.tie` 提供默认角色，与头部声明不一致时警告
-    // （头部声明优先，文件名仅作为提示）
-    var fname = file_name_of(g_input)
+    // S1.4 R3 文件名-头部一致性检查（F1）：`xxx.<基础>[-<参数>][-<修饰>...].tie`
+    // 与头部声明不一致 = 编译错误（单一真相，升级自现状警告）。
+    var fname = file_name_of(str.clone(g_input))
     var name_role = role_from_filename(fname)
-    if str_len(name_role) > 0 && name_role != g_role {
-        println("警告: 文件 " + g_input + " 名称声明为 " + name_role + "，与头部声明 " + g_role + " 不一致，已采用头部声明")
+    if str_len(name_role) > 0 {
+        var mismatch: string = ""
+        if name_role != g_role {
+            mismatch = "基础角色不一致: 文件名 '" + name_role + "' vs 头部 '" + g_role + "'"
+        } else if str_len(g_name_param) > 0 && g_name_param != g_role_param {
+            mismatch = "角色参数不一致: 文件名 '" + g_name_param + "' vs 头部 '" + g_role_param + "'"
+        } else {
+            // 修饰角色集合比较（顺序无关）
+            var k2: i64 = 0
+            while k2 < len(g_name_mods) {
+                var found2 = false
+                var j2: i64 = 0
+                while j2 < len(g_role_mods) {
+                    if g_role_mods[j2] == g_name_mods[k2] {
+                        found2 = true
+                        break
+                    }
+                    j2 = j2 + 1
+                }
+                if !found2 {
+                    mismatch = "修饰角色不一致: 文件名含 '" + g_name_mods[k2] + "'，头部未声明"
+                    break
+                }
+                k2 = k2 + 1
+            }
+        }
+        if str_len(mismatch) > 0 {
+            println("错误: 文件 " + g_input + " 名称声明与头部声明不一致——" + mismatch)
+            println("（R3 单一真相原则：文件名与头部都是角色声明源，不一致 = 编译错误）")
+            return 1
+        }
+    }
+    // S1.2 文件级 unsafe 角色（type tie<..., unsafe>）：整文件 unsafe 上下文
+    var k3: i64 = 0
+    while k3 < len(g_role_mods) {
+        if g_role_mods[k3] == "unsafe" {
+            g_unsafe_depth = g_unsafe_depth + 1
+            break
+        }
+        k3 = k3 + 1
     }
     if g_prep_only {
         println("[预处理] 识别为 " + g_role + " 文件（头: " + g_input + "）")
@@ -346,7 +517,7 @@ func main() -> i64 {
 // 编译工具链（logic / library）：前端 → 中端 → 后端。
 func compile_program(src: string) -> i64 {
     // base_dir：输入路径的目录（import 展开需要）；\\ 归一化为 /
-    var base_dir = dir_of(g_input)
+    var base_dir = dir_of(str.clone(g_input))
     // 前端
     if frontend(src, base_dir) < 0 {
         return 1
@@ -379,7 +550,7 @@ func compile_program(src: string) -> i64 {
         return 0
     }
     // 后端：opt → 链接/归档
-    var opt_path = replace_ext(ir_path, "opt.ll")
+    var opt_path = replace_ext(str.clone(ir_path), "opt.ll")
     var level = g_opt_level
     if !g_opt_set {
         level = 2
@@ -574,7 +745,7 @@ func replace_ext(path: string, new_ext: string) -> string {
         }
         i = i + 1
     }
-    var base: string = path
+    var base: string = str.clone(path)
     if last_dot > 0 {
         base = slice(path, 0, last_dot)
     }
@@ -599,10 +770,14 @@ func file_name_of(path: string) -> string {
     return slice(path, last + 1, n)
 }
 
-// 从文件名推断角色：`xxx.<角色>.tie` → 角色名；否则空串。
-// （新体系文件命名约定：xxx.type.tie → type、xxx.logic.tie → logic 等；
-// 头部声明优先，文件名仅作默认，不一致时警告采用头部声明）
+// 从文件名推断角色（S1.4 F1 连字符格式）：`xxx.<基础>[-<参数>][-<修饰>...].tie`
+// → 基础角色（分派用）。参数/修饰写入 g_name_param / g_name_mods（一致性
+// 检查用）。无角色段返回空串。
+var g_name_param: string = "";
+var g_name_mods: table<string>;
 func role_from_filename(name: string) -> string {
+    g_name_param = ""
+    g_name_mods = table_new_string()
     var n: i64 = str_len(name)
     var first_dot: i64 = -1
     var last_dot: i64 = -1
@@ -620,12 +795,41 @@ func role_from_filename(name: string) -> string {
     if first_dot < 0 || last_dot <= first_dot {
         return ""
     }
-    if slice(name, last_dot + 1, n) != "tie" {
+    if slice(str.clone(name), last_dot + 1, n) != "tie" {
         return ""
     }
     var role = slice(name, first_dot + 1, last_dot)
-    if role == "type" || role == "script" || role == "data" || role == "ui" || role == "class" || role == "logic" || role == "port" || role == "db" || role == "ir" || role == "zd" {
-        return role
+    // F1 连字符拆分：第一段 = 基础角色；后续段 = 参数（紧跟基础）或修饰
+    var segs = split_char(role, "-")
+    var base = segs[0]
+    if !is_valid_base_role(str.clone(base)) {
+        // 非角色名（如 schema.db.tie 的 db 在第二段）：按现状约定多段解析——
+        // 从后往前找已知角色段
+        var k = len(segs) - 1
+        while k >= 0 {
+            if is_valid_base_role(segs[k]) {
+                base = segs[k]
+                return base
+            }
+            k = k - 1
+        }
+        return ""
     }
-    return ""
+    // 参数：第二个连字符段命中参数白名单 → g_name_param；其余段修饰
+    var seg_i: i64 = 1
+    while seg_i < len(segs) {
+        var seg = segs[seg_i]
+        if str_len(g_name_param) == 0 && is_valid_role_param(str.clone(base), str.clone(seg)) {
+            g_name_param = seg
+        } else if is_valid_mod_role(str.clone(seg)) {
+            table_push(g_name_mods, seg)
+        } else {
+            // 未知段：非角色文件名（默认逻辑）
+            g_name_param = ""
+            g_name_mods = table_new_string()
+            return ""
+        }
+        seg_i = seg_i + 1
+    }
+    return base
 }

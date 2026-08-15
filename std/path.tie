@@ -16,10 +16,10 @@ type tie<class>
 // 命名规范：命名空间内函数不加 path_ 前缀（统一 func 写法，Harbor M2.1.6）。
 
 // extern 声明：C ABI 路径桥（链接 tie-interp 静态库）。仅顶层裸名。
-extern fn tie_path_basename(p: string) -> string;
-extern fn tie_path_dirname(p: string) -> string;
-extern fn tie_path_abs(p: string) -> string;
-extern fn tie_path_normalize(p: string) -> string;
+unsafe extern fn tie_path_basename(p: string) -> string;
+unsafe extern fn tie_path_dirname(p: string) -> string;
+unsafe extern fn tie_path_abs(p: string) -> string;
+unsafe extern fn tie_path_normalize(p: string) -> string;
 
 namespace path {
 // 拼接两个路径段（a + 分隔符 + b；桥处理分隔符归一）。底座 path_join 包装。
@@ -29,29 +29,39 @@ pub func join(a: string, b: string) -> string {
 
 // 取路径最后一段（文件名或目录名）。C ABI 桥包装。
 pub func basename(p: string) -> string {
-    return tie_path_basename(p)
+    unsafe {
+        return tie_path_basename(p)
+    }
 }
 
 // 取路径所在目录（不含最后一段）。C ABI 桥包装。
 pub func dirname(p: string) -> string {
-    return tie_path_dirname(p)
+    unsafe {
+        return tie_path_dirname(p)
+    }
 }
 
 // 取路径的绝对形式（基于当前工作目录）。C ABI 桥包装。
 pub func abs(p: string) -> string {
-    return tie_path_abs(p)
+    unsafe {
+        return tie_path_abs(p)
+    }
 }
 
 // 规范化路径（解析 . 与 ..，归一化分隔符）。C ABI 桥包装。
 pub func normalize(p: string) -> string {
-    return tie_path_normalize(p)
+    unsafe {
+        return tie_path_normalize(p)
+    }
 }
 
 // 取扩展名（basename 中最后一个 . 之后的部分，不含点）：无扩展名、
 // 点在首位的隐藏文件（如 .git）或空串返回空串。
 // 纯 tie 实现：找 basename 中最后一个 '.' 的位置。
 pub func ext(p: string) -> string {
-    var base = tie_path_basename(p)
+    unsafe {
+        var base = tie_path_basename(p)
+    }
     var n: i64 = str_len(base)
     var dot: i64 = -1
     var i: i64 = 0
@@ -71,7 +81,9 @@ pub func ext(p: string) -> string {
 // 去扩展名（basename 去掉 ext 部分）：无扩展名时返回 basename 原样。
 // 纯 tie 实现，与 ext 共用"找最后点"逻辑。
 pub func stem(p: string) -> string {
-    var base = tie_path_basename(p)
+    unsafe {
+        var base = tie_path_basename(p)
+    }
     var n: i64 = str_len(base)
     var dot: i64 = -1
     var i: i64 = 0

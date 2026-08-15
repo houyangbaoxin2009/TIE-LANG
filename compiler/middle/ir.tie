@@ -89,21 +89,22 @@ func ensure_opcodes() {
         return
     }
     var ks: table<i64> = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
-        15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30, 31, 32, 33, 34, 35,
-        36, 40, 41, 42, 43, 44, 45, 50, 51, 52, 53, 54, 55, 56, 57, 58, 60,
-        61, 62, 63, 64]
+        15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+        36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 50, 51, 52, 53, 54, 55, 56, 57, 58, 60,
+        61, 62, 63, 64, 65, 66, 67, 68, 69]
     var ns: table<string> = ["add", "sub", "mul", "div", "mod", "neg",
         "and", "or", "xor", "not", "shl", "shr", "icmp", "fadd", "fsub",
-        "fmul", "fdiv", "fmod", "fcmp", "sext", "alloca", "load", "store", "gep",
+        "fmul", "fdiv", "fmod", "fcmp", "sext", "zext", "alloca", "load", "store", "gep",
         "ptrtoint", "inttoptr", "bitcast", "agg_gep", "sitofp", "br", "cond_br", "ret", "switch",
-        "unreachable", "phi", "select", "call", "call_vararg",
-        "extern_call", "printf", "println", "print", "table_new",
+        "unreachable", "phi", "select", "trunc", "fptosi", "fpext", "call", "call_vararg",
+        "extern_call", "printf", "println", "print", "udiv",
         "table_push", "table_at", "table_set", "table_len",
         "table_elem_ptr", "str_cat", "str_len", "table_copy", "const_i",
-        "const_f", "const_str", "const_null", "const_global"]
+        "const_f", "const_str", "const_null", "const_global", "inline_asm",
+        "atomic_load", "atomic_store", "atomicrmw", "cmpxchg"]
     var gs: table<i64> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
-        3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5]
+        0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 3, 3, 3, 3, 3,
+        3, 0, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 1, 1, 1, 1]
     var ds: table<string> = ["整数加，生成 add i64（ty 选宽度）",
         "整数减，生成 sub i64", "整数乘，生成 mul i64",
         "整数除，生成 sdiv i64", "整数模，生成 srem i64",
@@ -116,6 +117,7 @@ func ensure_opcodes() {
         "浮点乘，生成 fmul double", "浮点除，生成 fdiv double",
         "浮点模，生成 frem double", "浮点比较，生成 fcmp cc",
         "符号扩展，生成 sext 源→目标（trit/窄整数提升，源=操作数① IMM）",
+        "无符号扩展，生成 zext 源→目标（无符号窄整数提升，源=操作数① IMM）",
         "栈分配，生成 alloca Ty（入口块提升，F1 方案）",
         "读内存，生成 load Ty, ptr 操作数①",
         "写内存，生成 store Ty, ptr（无结果，ty=-1）",
@@ -132,12 +134,16 @@ func ensure_opcodes() {
         "不可达，生成 unreachable",
         "汇合，生成 phi Ty [值, 块]（预留，T2.3 后启用）",
         "三目，生成 select i1, Ty, Ty",
+        "整数截断，生成 trunc 源→目标（缩窄，源=操作数① IMM）",
+        "浮点转整数，生成 fptosi 源→目标（向零截断，源=操作数① IMM）",
+        "浮点扩展/截断，生成 fpext/fptrunc 源→目标（按目标宽度选，源=操作数① IMM）",
         "普通调用，生成 call Ty @f（结果=值 id）",
         "变参调用（printf 族），生成 call i32 (ptr, ...)，编号占 2 槽",
         "外部符号调用，生成 call Ty @ext（extern 已声明）",
         "printf 归约（gen_printf 同款）",
         "打印并换行，printf + 换行格式",
         "打印不换行，printf 原样输出（附 fflush）",
+        "无符号除，生成 udiv（checked_* 无符号反算检测）",
         "建表，生成 call ptr @tie_table_new(elem_size)（操作数①=元素大小）",
         "表追加，生成 call void @tie_table_push(ptr, val)",
         "表取元素，gep+load（越界走运行时错误）",
@@ -149,7 +155,12 @@ func ensure_opcodes() {
         "整数常量，内联常量操作数（无独立值编号）",
         "浮点常量，全局常量或内联",
         "字符串常量，生成字符串全局常量 + 地址值",
-        "空指针，生成 null", "全局符号地址，生成 @g（变量/函数名）"]
+        "空指针，生成 null", "全局符号地址，生成 @g（变量/函数名）",
+        "内联汇编，生成 call ... asm（模板=操作数①池 id，后续=方向IMM+值）",
+        "原子读，生成 load atomic（地址=操作数①，order=操作数② IMM）",
+        "原子写，生成 store atomic（地址=①，值=②，order=③ IMM）",
+        "读改写，生成 atomicrmw（地址=①，值=②，op=③ IMM，order=④ IMM）",
+        "比较交换，生成 cmpxchg（地址=①，期望=②，新值=③，succ=④，fail=⑤ IMM）"]
     op_keys = table_new_i64()
     op_names = table_new_string()
     op_groups = table_new_i64()

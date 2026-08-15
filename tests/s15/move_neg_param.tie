@@ -1,0 +1,25 @@
+type tie<logic>
+// tests/s15/move_neg_param.tie —— S1.5 移动语义负例：传参移动 + 返回移动
+// ============================================================
+// 覆盖两类 use-of-moved：
+//   a) 按值传参后源变量继续使用（所有权转移给被调函数）
+//   b) return 移动后源变量继续使用
+// 编译应报错。验证命令：TIE_MOVE_CHECK=1 tiec tests/s15/move_neg_param.tie --emit-ir
+
+func take_owned(s: string) -> string {
+    return s
+}
+
+func main() {
+    // a) 传参移动：s 所有权转给 take_owned
+    var s = "param"
+    var r = take_owned(s)
+    println(r)
+    println(s)      // ← 错误：s 已移动（按值传参）
+
+    // b) 返回移动（如果前面没报错，此处也应报）
+    var t = "ret"
+    var u = take_owned(t)
+    println(t)      // ← 错误：t 已移动（return 转出）
+    println(u)
+}

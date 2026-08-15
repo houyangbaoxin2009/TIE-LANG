@@ -1,0 +1,7 @@
+type tie<logic>
+// S1.2 负例 2：安全代码使用指针 = 编译错误
+func main() {
+    var v: i64 = 1
+    var p = addr_of(v)
+    println(to_string(deref(p)))
+}

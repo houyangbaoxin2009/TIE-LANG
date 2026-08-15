@@ -56,6 +56,9 @@ const lex_inc: i64 = 76; const lex_dec: i64 = 77;
 const lex_question: i64 = 78; const lex_eof: i64 = 79;
 const lex_ellipsis: i64 = 80;   // `...` 变参标记（func f(rest: ...i64)）
 const lex_enum: i64 = 81;       // enum 关键字（enum Color { ... }）
+const lex_unsafe: i64 = 82;     // unsafe 关键字（S1.2：unsafe fn / unsafe 块）
+const lex_repr: i64 = 83;       // repr 关键字（S1.2：repr(C) struct 标注）
+const lex_asm: i64 = 84;        // asm 关键字（S1.2：asm! 内联汇编宏）
 
 namespace lextok {
 
@@ -139,6 +142,10 @@ func is_decl_start(tag: i64) -> bool {
         return true
     }
     if tag == lex_struct || tag == lex_enum || tag == lex_namespace || tag == lex_import || tag == lex_using {
+        return true
+    }
+    // S1.2：unsafe fn / repr(C) struct 的 doc 附着
+    if tag == lex_unsafe || tag == lex_repr {
         return true
     }
     return false

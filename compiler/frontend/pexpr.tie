@@ -500,15 +500,28 @@ func parse_primary() -> i64 {
     var line = putil.peek_line()
     var col = putil.peek_col()
     var tag = putil.peek_tag()
+    if tag == lex_asm {
+        // S1.2 I1：`asm!("template", in(reg) expr, out(reg) expr)` 内联汇编
+        return parse_asm_expr(line, col)
+    }
     if tag == lex_int {
         var v = putil.parse_int_lit(putil.peek_lexeme())
+        // S1.3 L3：aux = 后缀类型 TyKw（-1 = 无后缀，默认 i64）
+        var sufx = putil.parse_lit_suffix(putil.peek_lexeme())
         putil.advance()
-        return ast.new_node(N_INT_LIT, -1, v, -1, line, col)
+        return ast.new_node(N_INT_LIT, -1, v, sufx, line, col)
     }
     if tag == lex_float {
-        var lid = interner.intern(putil.peek_lexeme())
+        // S1.3 L3：剥离 f32/f64 后缀存纯数字文本（llvmgen 输出用），
+        // aux = 后缀类型（无后缀 → f64，对齐现状 FloatLit 语义）
+        var lex = putil.peek_lexeme()
+        var lid = interner.intern(putil.strip_lit_suffix(lex))
+        var sufx = putil.parse_lit_suffix(lex)
+        if sufx < 0 {
+            sufx = 9   // TK_F64
+        }
         putil.advance()
-        return ast.new_node(N_FLOAT_LIT, lid, -1, -1, line, col)
+        return ast.new_node(N_FLOAT_LIT, lid, -1, sufx, line, col)
     }
     if tag == lex_str {
         var lid = interner.intern(putil.peek_lexeme())
@@ -795,6 +808,89 @@ func parse_table_lit(line: i64, col: i64) -> i64 {
         ast.set_children(t, cells)
     }
     return t
+}
+
+// S1.2 I1 内联汇编：`asm!("template", in(reg) expr, out(reg) expr, ...)`
+// 产出 N_ASM（name = 模板串池 id；children = 操作数节点——复用 N_PARAM：
+// val = 0=in 1=out 2=inout，children[0] = 表达式）。
+// 约束固定 "reg"（第一版；扩展约束语法后续）。
+func parse_asm_expr(line: i64, col: i64) -> i64 {
+    putil.advance()   // asm
+    if !putil.expect(lex_bang, "'!'") {
+        return -1
+    }
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    if putil.peek_tag() != lex_str {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "asm! 第一参数必须是模板字符串")
+        return -1
+    }
+    var tmpl = interner.intern(putil.peek_lexeme())
+    putil.advance()
+    var ops: table<i64> = table_new_i64()
+    if !putil.eat(lex_rparen) {
+        // 有操作数：模板后必须跟逗号
+        if !putil.expect(lex_comma, "','") {
+            return -1
+        }
+        var d = false
+        while !d {
+            // 操作数：`in` / `out` / `inout`（in 是关键字 lex_in，out/inout 是
+            // 标识符）+ `(` + `reg` + `)` + 表达式
+            var kind = ""
+            var kind_v: i64 = -1
+            if putil.peek_tag() == lex_in {
+                kind = "in"
+                kind_v = 0
+            } else if putil.peek_tag() == lex_ident {
+                kind = putil.peek_lexeme()
+                if kind == "out" {
+                    kind_v = 1
+                } else if kind == "inout" {
+                    kind_v = 2
+                } else {
+                    putil.set_err(putil.peek_line(), putil.peek_col(), "asm! 操作数方向必须是 in / out / inout，实际是 '" + kind + "'")
+                    return -1
+                }
+            } else {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "asm! 操作数必须形如 in(reg) 表达式 / out(reg) 表达式")
+                return -1
+            }
+            putil.advance()
+            if !putil.expect(lex_lparen, "'('") {
+                return -1
+            }
+            if putil.peek_tag() != lex_ident || putil.peek_lexeme() != "reg" {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "asm! 第一版只支持 reg 约束（in/out/inout(reg)）")
+                return -1
+            }
+            putil.advance()
+            if !putil.expect(lex_rparen, "')'") {
+                return -1
+            }
+            var e = parse_unary()
+            if e < 0 {
+                return -1
+            }
+            var p = ast.new_node(N_PARAM, -1, kind_v, -1, putil.peek_line(), putil.peek_col())
+            var pkids: table<i64> = table_new_i64()
+            table_push(pkids, e)
+            ast.set_children(p, pkids)
+            table_push(ops, p)
+            if putil.eat(lex_comma) {
+                // 继续
+            } else {
+                if !putil.expect(lex_rparen, "')'") {
+                    return -1
+                }
+                d = true
+            }
+        }
+    }
+    var n = ast.new_node(N_ASM, tmpl, -1, -1, line, col)
+    ast.set_children(n, ops)
+    return n
 }
 
 // 表单元格：`id:value`（id 为数字或字符串键）或普通 `value`

@@ -3,6 +3,8 @@
 > 状态：**规划**（2026-08-15 设计讨论定稿，未实现）
 > 本文档整合一次完整设计讨论的决策：UI 框架架构、unsafe 语法、内存模型、
 > 并发/并行模型、嵌入式子集。所有决策均为讨论产物，实现前可再调整。
+> 2026-08-15 更新：webui 部分经专项技术调研修订（JSPI 方案替代状态机变换、
+> M5 里程碑拆解），见 [webui-research.md](webui-research.md)。
 > 关联：rdu（嵌入式基础层，docs/plans/embedded-rdu.md）、tiec 自举编译器。
 
 ## 1. 目标与定位
@@ -367,11 +369,20 @@ UI 单线程模型（Flutter/浏览器同款）——组件树只被主线程触
 
 ### 5.9 wasm（webui）兼容策略
 
-- wasm 无原生协程：**tiec 的 wasm 后端把 async/await 编译为状态机变换**
-  （只在 wasm 目标启用）——成本集中在后端一处，原生目标继续用 stackful
+**2026-08-15 调研修订**（完整依据见 [webui-research.md](webui-research.md) §3）：
+
+- **阻塞式 IO 用 JSPI（首选）**：JavaScript Promise Integration 已 phase 4
+  标准化，Chrome 137+/Firefox 139+ 支持（Safari 未确认）。阻塞式 extern IO
+  的 JS import 用 `WebAssembly.Suspending` 包装，wasm 内保持同步风格调用，
+  **tie 代码与编译器零改动**。壳层探测 `WebAssembly.Suspending`，缺失时
+  （Safari）IO 降级为回调模式（tie 侧 poll 结果）。
+- **多协程（M:N）wasm 化后置**：stack switching 提案截至 2026-05 仍在设计
+  阶段、浏览器未落地 → webui 第一版单线程顺序执行（CLI 迁移应用天然顺序），
+  后续可选状态机变换或等 stack switching 落地。
 - `spawn` 编译为 **Web Worker**（消息传递天然映射 postMessage，
-  channel → Worker 消息）
-- 共享内存原语在 wasm 上不可用 → unsafe 共享路径在 webui 模式报编译错误
+  channel → Worker 消息；Worker 内独立 wasm 实例，无共享内存）
+- 共享内存原语在 wasm 上不可用（SAB 需 COOP/COEP 跨源隔离，浏览器仍非默认）
+  → unsafe 共享路径在 webui 模式报编译错误
 - 语义一致：主线程 UI + worker 计算，与 tieui 桌面模型同构
 
 ## 6. 嵌入式子集（tie:embedded）
@@ -449,7 +460,7 @@ tieui 嵌入式 = 帧缓冲直绘 + 嵌入式并发子集
 
 | 特性 | 桌面/服务器 | 嵌入式 | webui (wasm) |
 | --- | --- | --- | --- |
-| 协程 | 栈式，M:N 调度，工作窃取 | 栈式，协作式主循环 | async 编译为状态机 |
+| 协程 | 栈式，M:N 调度，工作窃取 | 栈式，协作式主循环 | 单线程顺序 + JSPI IO（多协程后置） |
 | channel | MPMC/SPSC 无锁 | SPSC 无锁（ISR 安全） | → Worker 消息 |
 | actor | 多 actor 并发 | 单 actor 状态机 | 协程池内调度 |
 | 原子/锁 | 真实原子 + memory_order | 关中断/普通读写 | 禁用（编译错误） |
@@ -469,12 +480,17 @@ tieui 嵌入式 = 帧缓冲直绘 + 嵌入式并发子集
 | M2 | tieui 框架：组件树、布局、事件分发 | M1 |
 | M3 | 内存模型：move 关键字 + arena（P1/P2） | M0 |
 | M4 | 并发：协程（stackful）+ actor + channel + concurrent | M3 |
-| M5 | webui 壳：wasm 后端 + 终端模拟/页面承载 | M0 + M4(wasm 态) |
+| M5.1 | webui 工具链：tiec `--target=wasm32`（link_exe wasm 分支 + wasm-ld + 显式导出清单 + wasm 版运行时重编译） | M0 |
+| M5.2 | libc 桩层（tie 写）：printf/puts→stdout 队列、malloc→arena 分配器、文件→内存桩、数学→LLVM 内建 | M5.1 |
+| M5.3 | webui 壳 v1：HTML + JS 桥 + `@xterm/xterm` 6 终端模拟 + 事件队列 + JSPI 包装 | M5.2 |
+| M5.4 | 页面化：Canvas 2D 桥 + trm.ui 绘制面 wasm 化（tieui 应用迁移） | M5.3 + M2 |
+| M5.5 | tieDB web 化：Worker + OPFS + zd 持久化 | M5.4 |
 | M6 | 跨平台：X11/Wayland 后端 | M1 |
 | M7 | 嵌入式：tie:embedded 子集 + 静态池 + 协作式调度 | M3 + M4 |
 | M8 | owned 模式落地：std/compiler 一次性迁移（无渐进） | M3 |
 
-> 注：M3/M4 与 M1/M2 可并行推进（不同语言面），M5 依赖 wasm 后端先行。
+> 注：M3/M4 与 M1/M2 可并行推进（不同语言面）；M5.x 依赖 wasm 后端先行，
+> M5.1-M5.3 串行推进（工具链 → 桩层 → 壳），M5.4/M5.5 可并行。
 
 ## 9. 待定决策与前置调查
 
@@ -483,7 +499,9 @@ tieui 嵌入式 = 帧缓冲直绘 + 嵌入式并发子集
    完整设计见 [closure-model.md](closure-model.md)。spawn(闭包) 直接用闭包式。
 2. **channel select 多路复用**：第一版只做阻塞 recv，select 后置。
 3. **actor pin 语法**：`actor Pin` 声明专用线程的形态待细化。
-4. **wasm 后端的 async 状态机变换**：tiec 后端一处实现，工作量需专项评估。
+4. ~~**wasm 后端的 async 状态机变换**~~ **取消**（2026-08-15 调研定案）：
+   JSPI 替代（webui-research.md §3.1），tiec 后端零改动；待定项改为
+   "JSPI 不可用浏览器（Safari）的 IO 降级模式设计"。
 5. **协程栈默认大小与增长策略**：固定 64KB 起步，动态增长留待第二版。
 6. **arena 逃逸检查的编译策略**：semantic 层静态检查 vs 运行时检查的取舍。
 7. **接口模型（port）** **已定案**（2026-08-15）：P1 显式 impl + D3 双形态分发

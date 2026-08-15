@@ -425,7 +425,6 @@ func digit_val(c: string) -> i64 {
     }
     return -1
 }
-
 // 整数字面量 lexeme → i64 值（支持十进制/0x/0b/0o/0t 前缀）
 pub func parse_int_lit(lex: string) -> i64 {
     var n = str_len(lex)
@@ -465,6 +464,94 @@ pub func parse_int_lit(lex: string) -> i64 {
         i = i + 1
     }
     return val
+}
+
+// ---------- S1.3 L3 字面量后缀 ----------
+// 字面量尾部类型后缀 → TyKw 索引（i8/i16/i32/i64/u8/u16/u32/u64/f32/f64；
+// 无后缀返回 -1）。仅匹配精确后缀串（数字后的字母序列）。
+pub func parse_lit_suffix(lex: string) -> i64 {
+    var n = str_len(lex)
+    if n < 2 {
+        return -1
+    }
+    var last2 = slice_str(lex, n - 2, n)
+    if last2 == "i8" {
+        return 0
+    }
+    if last2 == "u8" {
+        return 4
+    }
+    if n < 3 {
+        return -1
+    }
+    var last3 = slice_str(lex, n - 3, n)
+    if last3 == "i16" {
+        return 1
+    }
+    if last3 == "i32" {
+        return 2
+    }
+    if last3 == "i64" {
+        return 3
+    }
+    if last3 == "u16" {
+        return 5
+    }
+    if last3 == "u32" {
+        return 6
+    }
+    if last3 == "u64" {
+        return 7
+    }
+    if last3 == "f32" {
+        return 8
+    }
+    if last3 == "f64" {
+        return 9
+    }
+    return -1
+}
+
+// 剥离字面量尾部类型后缀，返回纯数字文本（无后缀原样返回）。
+// 浮点字面量 lexeme 带 f32/f64 后缀时 llvmgen 无法直接输出，须剥离。
+pub func strip_lit_suffix(lex: string) -> string {
+    var n = str_len(lex)
+    if parse_lit_suffix(lex) >= 0 {
+        if parse_lit_suffix(lex) == 0 || parse_lit_suffix(lex) == 4 {
+            return slice_str(lex, 0, n - 2)
+        }
+        return slice_str(lex, 0, n - 3)
+    }
+    return lex
+}
+
+// 子串辅助（码点级，越界裁剪）
+func slice_str(s: string, start: i64, end: i64) -> string {
+    var n = str_len(s)
+    var lo = start
+    if lo < 0 {
+        lo = 0
+    }
+    if lo > n {
+        lo = n
+    }
+    var hi = end
+    if hi < 0 {
+        hi = 0
+    }
+    if hi > n {
+        hi = n
+    }
+    if lo >= hi {
+        return ""
+    }
+    var out: string = ""
+    var i: i64 = lo
+    while i < hi {
+        out = out + str_char(s, i)
+        i = i + 1
+    }
+    return out
 }
 
 // 类型节点是否为表类型（table<T> 或裸 table；VarDecl 省略初始化器判定用）

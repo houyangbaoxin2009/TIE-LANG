@@ -1,0 +1,9 @@
+type tie<logic>
+// S1.2 负例 4：安全函数参数含指针 = 编译错误（S1）
+func bad(p: ptr<i64>) -> i64 {
+    return deref(p)
+}
+
+func main() {
+    println("no")
+}

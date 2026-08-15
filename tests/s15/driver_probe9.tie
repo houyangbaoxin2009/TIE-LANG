@@ -1,0 +1,20 @@
+type tie<logic>
+// S1.5 探针9：probe8 + import std/string（无裸函数定义）
+import "../../std/string.tie"
+func main() {
+    var i: i64 = 0
+    while i < 1 {
+        var flag = true
+        if flag {
+            var rest: string = "abc"
+            if str_len(rest) >= 3 && str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">" {
+                println("if-pass")
+            } else {
+                println("if-else")
+            }
+            var n = str_len(rest)
+            println(to_string(n))
+        }
+        i = i + 1
+    }
+}

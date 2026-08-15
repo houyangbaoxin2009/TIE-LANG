@@ -1,0 +1,5 @@
+type tie<db:vector, unsafe>
+// S1.4 验收：多角色 + 参数化 + 修饰角色
+func main() {
+    println("db-vector unsafe file")
+}

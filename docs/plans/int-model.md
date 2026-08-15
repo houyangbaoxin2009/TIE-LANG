@@ -1,6 +1,6 @@
 # 规划：tie 窄整数模型（i8/i16/i32/u8/u16/u32/u64/f32 完整落地）
 
-> 状态：**规划**（2026-08-15 设计讨论定稿，未实现）
+> 状态：**已实现**（2026-08-15，S1.3 落地；tiec 自举编译，0-Rust）
 > 本文档定义 tie 的窄整数模型——把"类型系统已有、IR 能发、语言层缺失"的
 > 窄整数补成完整语言特性，是 repr(C) 互操作与系统编程的前置（unsafe 模型
 > 未决问题 #1）。
@@ -10,6 +10,26 @@
 > + **B2**（明确移位语义无 UB）。
 > 关联：unsafe 模型（docs/plans/unsafe-model.md，repr(C)/extern 互操作）、
 > 类型系统（compiler/middle/types.tie，TyKw 已定义）。
+>
+> ## 实现记录（2026-08-15，S1.3）
+> - 后缀字面量：`42i32` / `7u8` / `0x80u16` / `1.5f32`（lexer 吞并 + parser 记
+>   aux = TyKw；浮点后缀剥离文本）
+> - C2 拓宽：同符号窄→宽 + u→i 无损拓宽（zext）；float→int 不隐式
+> - C3 常量范围检查：`var b: i8 = 200` 编译错误；表达式窄域回绕
+>   （`var c: i8 = 100 + 100` → -56）
+> - as_* 转换族：as_i8..as_u64/as_f32/as_f64（trunc/sext/zext/fptosi/sitofp/
+>   fpext/fptrunc 直接映射）
+> - checked_* 函数族：checked_add/sub/mul/div/neg/shl/shr → (值, 溢出标志)
+>   二元组（比较法检测 + select 防 poison；无符号用 ult/ugt + udiv 反算）
+> - A1 窄宽度算术：类型保持（add i8），混合宽度按宽者提升（字面量上下文
+>   适配），一元取负按操作数宽度
+> - B2 移位语义：无符号逻辑右移（lshr）/ 有符号算术右移（ashr）；移过量
+>   ≥ 位宽有定义（select 保护：左移 0、右移符号位）
+> - f32：常量/存储按 float；算术提升 f64
+> - 新增 tie-IR opcode：zext(29)/trunc(37)/fptosi(38)/fpext(39)/udiv(46) +
+>   icmp 无符号比较码 6-9
+> - 测试：tests/language/narrow_full（正例）+ narrow_neg_1..3（负例）+
+>   shift_neg_free（移位）
 
 ## 1. 现状（半支持状态）
 
