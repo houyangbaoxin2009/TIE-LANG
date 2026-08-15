@@ -1,12 +1,15 @@
-# 规划：tieuicore 架构（tucore 命名空间 + JVM/.NET 借鉴）
+# 规划：trm.ui 域架构（原 tieuicore/tucore，已并入 trm 运行时套件）
 
 > 状态：**规划**（2026-08-15 设计讨论定稿，未实现）
-> 本文档定义 tieuicore（tie UI 核心兼容层）的架构。
+> **2026-08-15 更新：本文件为 trm.ui 域的详细设计**——tieuicore 已并入
+> [trm-arch.md](trm-arch.md)（tie 运行时套件），原 tucore 即 trm 的 ui 域。
+> 命名空间：**trm.ui**（原 tucore/tcore 弃用）。本文档架构决策全部保留。
+>
+> 本文档定义 trm.ui（tie UI 核心，原 tieuicore）的架构。
 > 决策汇总：
 > **A4**（抽象 API + Win32 起步渐进）+ **H2**（类型化句柄）+ **E3**（事件+信号
 > 混合）+ **D2**（命令列表 Paint Commands）+ **F3**（系统字体+位图双轨）
 > + **P2**（平台目录分离）+ **L1**（显式生命周期）。
-> 命名空间：**tucore**（非 tcore）。
 > 设计借鉴：**JVM/.NET 设计思路**（P/Invoke 互操作、延迟绑定、元数据驱动、
 > 程序集部署单元、接口抽象）。
 > 关联：unsafe 模型（extern/repr(C)）、接口模型（port 抽象面）、包模型

@@ -18,12 +18,13 @@
 
 ### 1.2 设计原则（讨论定稿）
 
-1. **全 tie 技术栈**：tieuicore 兼容层用 tie 写（不用 Rust、不用 C），延续自举精神；
-   仅系统 API 互操作经 extern FFI（T0.7 已有先例：`std/process.tie` 调 libc system）。
+1. **全 tie 技术栈**：trm（运行时套件，原 trm）用 tie 写（不用 Rust、
+   不用 C），延续自举精神；仅系统 API 互操作经 extern FFI（T0.7 已有先例：
+   `std/process.tie` 调 libc system）。
 2. **webui 是"壳 + 桥"**：不是给新应用做浏览器 UI，而是让现有 tie 程序
    （CLI/脚本/tieDB 应用）编译为 wasm，经标准 Web 壳（HTML 页面 + JS 桥）在
    浏览器运行，输入输出经桥接呈现。
-3. **性能热点下沉**：绘制、调度、切换等性能关键路径由 tieuicore（tie 写但
+3. **性能热点下沉**：绘制、调度、切换等性能关键路径由 trm（tie 写但
    只做薄封装，直接透传系统调用）承载；tieui 框架层只做逻辑编排。
 4. **编译目标决定能力**：同一语言、同一套语义（协程/消息/所有权），
    桌面/服务器用完整模型，嵌入式用编译期裁剪子集（`tie:embedded` 角色）。
@@ -34,10 +35,10 @@ tie 的开发范式不是单一范式，而是四者各司其职的组合：
 
 | 范式 | tie 的定位 | 落地机制 |
 | --- | --- | --- |
-| **过程式** | 内核（语句/控制流/性能路径） | while/for/if、tucore、tiec 编译器自身 |
+| **过程式** | 内核（语句/控制流/性能路径） | while/for/if、trm、tiec 编译器自身 |
 | **函数式** | 抽象能力（组合与复用的武器） | 闭包 C2、高阶函数、enum ADT + switch 穷尽匹配 |
 | **面向接口** | 扩展点（多态，实现可替换） | port（P1 显式 impl + D3 双形态） |
-| **组合式** | 系统组织方式（粘合前三者） | 组件/行为/布局/模块四层组合（tucore-arch §9） |
+| **组合式** | 系统组织方式（粘合前三者） | 组件/行为/布局/模块四层组合（tucore-arch §9，已并入 trm.ui） |
 
 **一句话**：面向过程写内核，函数式写抽象，接口写扩展，组合写系统。
 
@@ -75,29 +76,33 @@ save/load 8 字节魔数 "TIEDBZD"。已在 compiler/driver、std/db、prep 使�
 **影响面**：
 - std/http、std/net 的载荷默认 zd（文本头保留：HTTP 头仍是文本协议，body 用 zd）
 - 未来协议设计（IPC/webui 桥/wasm 通信）默认 zd
-- tieui/tucore 的事件序列化（跨进程/跨线程传递事件）用 zd
+- tieui/trm.ui 的事件序列化（跨进程/跨线程传递事件）用 zd
 
 ## 2. 总体架构
 
 ```
 ┌─ tieui 框架层（tie 语言编写，平台无关）──────────────┐
 │  组件树 / 盒模型布局 / 事件分发 / 状态管理             │
-├─ tieuicore 兼容层（tie 编写，高性能薄封装）──────────┤
+├─ trm.ui 域（tie 编写，原 trm，高性能薄封装）───┤
 │  窗口封装 / 绘制封装 / 字体 / 事件轮询 / 协程调度     │
 │  ↓ extern（扩展后：ptr/结构体支持）                   │
 │  系统 API 直连：Win32 / X11 / Wayland / 帧缓冲        │
 ├─ webui 壳（HTML + JS + wasm）───────────────────────┤
-│  Canvas 桥（对应 tieuicore 绘制面）                  │
+│  Canvas 桥（对应 trm.ui 绘制面）                     │
 │  Worker 桥（对应协程/线程面）                        │
 └──────────────────────────────────────────────────────┘
 ```
 
+> 2026-08-15 更新：trm 已并入 **trm（tie 运行时套件）**，原 trm
+> 即 trm 的 ui 域（trm.ui）。详见 [trm-arch.md](trm-arch.md)。
+
 ### 2.1 分层职责
 
 - **tieui 框架层**：纯 tie，组件（Button/Text/Input/List/Scroll）、布局、事件、
-  状态。与平台无关，只调用 tieuicore 的标量 extern 接口。
-- **tieuicore 兼容层**：tie 写，但内部直接透传系统调用（窗口创建、GDI/Direct2D
-  绘制、字体加载、消息轮询）。是"系统 API 的标量化封装"，是性能关键路径。
+  状态。与平台无关，只调用 trm.ui 的标量 extern 接口。
+- **trm.ui 域（原 trm）**：tie 写，但内部直接透传系统调用（窗口创建、
+  GDI/Direct2D 绘制、字体加载、消息轮询）。是"系统 API 的标量化封装"，
+  是性能关键路径。
 - **webui 壳**：tie 编译为 wasm 后运行于浏览器；Canvas 2D 对应绘制面，
   Web Worker 对应并发面。迁移应用零改动（终端模拟路线）或页面化包装。
 
@@ -243,7 +248,7 @@ arena {
 ### 5.1 决策汇总
 
 **安全层（语言级）**：协程/异步（方案 4）+ Actor（方案 5）+ Channel（方案 1）
-**unsafe 层（tieuicore）**：无锁并发（方案 7）
+**unsafe 层（trm）**：无锁并发（方案 7）
 
 这是 Go 的执行模型 + Erlang 的 actor 语法 + Rust 的安全哲学。
 
@@ -254,7 +259,7 @@ arena {
   ├── actor = 协程 + 邮箱 + 状态隔离
   ├── channel = 协程间通信（无锁队列底层）
   ├── async IO = 协程挂起不阻塞线程
-  └── M:N 调度 = 协程池映射到 OS 线程池（tieuicore）
+  └── M:N 调度 = 协程池映射到 OS 线程池（trm）
 ```
 
 一个 OS 线程跑多个协程 → actor 变轻量，线程变资源池。
@@ -264,15 +269,15 @@ arena {
 | | stackful（Go/Java 虚拟线程） | stackless（Rust async） |
 | --- | --- | --- |
 | 实现 | 每协程独立栈 + 上下文切换（~50 行汇编） | await 编译成状态机 |
-| 编译器工作量 | **小**（tieuicore 提供切换原语，unsafe 调用） | **大**（全链路变换） |
+| 编译器工作量 | **小**（trm 提供切换原语，unsafe 调用） | **大**（全链路变换） |
 | 灵活度 | 任意函数可挂起，无需传染 | 挂起需 async 传染 |
 | 与 tie 现状 | 契合（arena 可复用区域分配） | Rust 都痛苦，tie 自写更甚 |
 
 **决策：stackful**。tiec 是自举编译器，状态机变换是编译器大手术；stackful
-只需 tieuicore 提供 `switch_context` 原语（汇编级，unsafe 内可写），编译器几乎不动。
+只需 trm 提供 `switch_context` 原语（汇编级，unsafe 内可写），编译器几乎不动。
 
 ```tie
-// 语言级语法（编译到 tieuicore 切换原语）
+// 语言级语法（编译到 trm 切换原语）
 async func fetch(url: string) -> string {
     var data = await http_get(url)    // 挂起协程，不阻塞线程
     return parse(data)
@@ -286,7 +291,7 @@ var result = await task               // 等待协程完成
 - 语法：**async/await**（显式挂起点，与 actor 的 on 消息处理兼容）
 - 栈管理：**固定栈 + 栈大小参数**（`spawn(f, stack_size)`，默认 64KB，
   热协程显式调大）——第一版够用
-- 调度器归属：**tieuicore 提供**（M:N 线程池 + 工作窃取），tie 经 unsafe 原语调用
+- 调度器归属：**trm 提供**（M:N 线程池 + 工作窃取），tie 经 unsafe 原语调用
 
 ### 5.4 Actor
 
@@ -358,7 +363,7 @@ unsafe {
 ```
 
 UI 单线程模型（Flutter/浏览器同款）——组件树只被主线程触碰，工作协程纯计算，
-无锁 UI。tieuicore 的事件轮询天然适配：`poll_event()` 主线程专用。
+无锁 UI。trm 的事件轮询天然适配：`poll_event()` 主线程专用。
 
 ### 5.9 wasm（webui）兼容策略
 
@@ -460,7 +465,7 @@ tieui 嵌入式 = 帧缓冲直绘 + 嵌入式并发子集
 | 阶段 | 内容 | 依赖 |
 | --- | --- | --- |
 | M0 | 编译器扩展：unsafe + ptr + repr(C) 结构体 + extern 扩展 | tiec 现有链路 |
-| M1 | tieuicore：窗口创建 + 绘制 + 事件轮询（tie 写，Win32 起步） | M0 |
+| M1 | trm：窗口创建 + 绘制 + 事件轮询（tie 写，Win32 起步） | M0 |
 | M2 | tieui 框架：组件树、布局、事件分发 | M1 |
 | M3 | 内存模型：move 关键字 + arena（P1/P2） | M0 |
 | M4 | 并发：协程（stackful）+ actor + channel + concurrent | M3 |
