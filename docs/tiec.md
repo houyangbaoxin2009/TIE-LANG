@@ -3,8 +3,8 @@
 > ⚠️ **早期开发阶段**：tiec 为自举 v2 的产物，随实现持续演进，功能与限制以本文件与源码为准。
 
 tiec 是 tie 语言 **100% 自写**的完整命令行编译器，是自举 v2 计划（`compiler/` 目录）的最终交付物。
-它由 tie 语言自身编写，经 Rust 种子编译器编译生成，随后可以编译自身，形成自举闭环。
-其命令行行为与消息格式对齐 Rust 老编译器 `crates/tie-llvm`，可作为其替代品使用。
+它由 tie 语言自身编写，经 stage0 入库二进制引导后可以编译自身，形成自举闭环（0-Rust）。
+其命令行行为与消息格式对齐 Rust 老编译器（已归档至 [tiec_rust](https://github.com/tie-lang/tiec_rust)），可作为其替代品使用。
 
 ## 1. tiec 是什么
 
@@ -17,7 +17,7 @@ tiec（tie compiler）是一套完整的前端到后端编译流水线，全部�
 | 中端 | tie-IR 中间表示（列式表）、AST 到 tie-IR 生成（irgen）、LLVM IR 文本生成（llvmgen） |
 | 后端 | 调用 LLVM 工具链（`opt` / `clang` / `llvm-ar` / `lld`）完成优化、汇编与链接 |
 | 附赠 | tie 自写解释器（`compiler/interp/`）与 REPL（`compiler/repl.tie`） |
-| 行为对齐 | 参数解析、角色分派、消息格式、退出码均对齐 Rust `crates/tie-llvm` |
+| 行为对齐 | 参数解析、角色分派、消息格式、退出码对齐 Rust 老编译器（tiec_rust 归档） |
 
 编译流水线：
 
@@ -37,33 +37,33 @@ tiec 把 `.tie` 源文件编译为原生可执行文件（`logic`/`script` 角�
 
 ## 2. 与老工具链的关系与自举链
 
-tie 语言目前有两代编译器并存：
+tie 语言现有编译器体系（Rust 参考编译器已归档至独立仓库
+[tiec_rust](https://github.com/tie-lang/tiec_rust)，2026-08-15 从主仓库剔除）：
 
 | 名称 | 实现语言 | 角色 |
 | --- | --- | --- |
-| `tie-llvm.exe` | Rust（`crates/tie-llvm`） | 老编译器，Rust 种子，自举链的起点 |
-| `tiec.exe` | tie（`compiler/driver.tie` 编译而来） | 新编译器，自举 v2 产物，替代 tie-llvm |
+| `tiec.exe` | tie（`compiler/driver.tie` 编译而来） | 当前编译器，自举 v2 产物（0-Rust） |
+| tiec_rust（归档） | Rust | 历史种子/参考编译器（bootstrap seed），已移至独立仓库 |
 
 自举链（bootstrap chain）如下：
 
 ```
-① Rust 种子 tie-llvm.exe 编译 compiler/driver.tie ──► tiec.exe   （bootstrap 界限）
-② tiec.exe 编译 compiler/driver.tie              ──► tiec2.exe   （二阶，自举闭环）
-③ tiec2.exe 编译 compiler/driver.tie             ──► tiec3.exe   （再自举验证）
+① tiec.exe（stage0 入库）编译 compiler/driver.tie  ──► tiec2.exe（二阶，自举闭环）
+② tiec2.exe 编译 compiler/driver.tie               ──► tiec3.exe（再自举验证）
 ```
 
 - **tiec.exe 已入库（阶段 A 升格）**：作为 stage0 引导二进制版本化随仓库分发
   （`.gitignore` 已豁免 `/compiler/tiec.exe`），clone 即用、无需先构建；此后 tiec
   始终由自身编译 driver.tie 产生（自举闭环），源码变更后重新自举并提交同步更新；
-- **第 ① 步是 bootstrap 界限**：首次产生 tiec.exe 需要 Rust 种子（历史性接触点）；
-  入库后普通构建与使用不再经过 Rust；
-- **第 ② 步**：tiec 编译自身成功，证明自举闭环；
-- **第 ③ 步**（T5.2 实测打通）：tiec2 再次编译自身并正确编译 `hello.tie`，二阶闭环验证通过；
+- **bootstrap 界限（历史）**：首次产生 tiec.exe 曾需要 Rust 种子（Rust 版
+  tie-llvm.exe 编译 driver.tie，历史性接触点）；2026-08-15 起 Rust 参考编译器
+  归档至 tiec_rust 独立仓库，主仓库 0-Rust；
+- **第 ① 步**：tiec 编译自身成功，证明自举闭环；
+- **第 ② 步**（T5.2 实测打通）：tiec2 再次编译自身并正确编译 `hello.tie`，二阶闭环验证通过；
 - **阶段 A 升格（2026-08-13）**：`repl.exe` / `pkg.exe` 自举已由 tiec 承担
   （`scripts/package.ps1` 第 2 步用 tiec 编译 `repl/repl.tie`；`pkg/main.tie` 用 tiec
-  编译），Rust 种子在编译链路上仅剩历史 bootstrap 角色。irgen 补全 map 下标
-  赋值/读取桥（`tie_map_set*` / `tie_map_get*`，E3 键值表）并修正 table 元素类型
-  完整推断链后，tiec 可完整编译 pkg 包管理器（行为与 Rust 种子产物字节等价）；
+  编译）。irgen 补全 map 下标赋值/读取桥（`tie_map_set*` / `tie_map_get*`，E3 键值表）
+  并修正 table 元素类型完整推断链后，tiec 可完整编译 pkg 包管理器；
 - **G3 闸门（0-Rust）验证 PASS**：种子界限之后，编译、运行、REPL 全链路不再依赖 Rust。
 
 ## 3. 快速开始
@@ -83,20 +83,18 @@ examples\hello.exe                  # 运行
 
 ### 从源码构建 tiec
 
-前置依赖：Rust（构建种子用）、LLVM 工具链（`opt`、`clang`、`llvm-ar`、`lld`）。
+前置依赖：LLVM 工具链（`opt`、`clang`、`llvm-ar`、`lld`）。无需 Rust（Rust 参考
+编译器已归档至独立仓库 [tiec_rust](https://github.com/tie-lang/tiec_rust)）。
 
 ```bash
-# ① 构建 Rust 种子
-cargo build --release
-
-# ② 用种子编译 tiec 自身
-target\release\tie-llvm.exe compiler\driver.tie -o compiler\tiec.exe
-
-# ③ 二阶自举：tiec 编译自身
+# ① 用已入库的 stage0 tiec.exe 编译自身（自举）
 compiler\tiec.exe compiler\driver.tie -o compiler\tiec2.exe
+
+# ② 二阶验证：tiec2 再编译自身
+compiler\tiec2.exe compiler\driver.tie -o compiler\tiec3.exe
 ```
 
-LLVM 工具发现顺序：`TIE_LLVM_HOME\bin` → tie.exe/tiec.exe 同目录 `llvm\bin`（Rust 侧）→ `PATH`
+LLVM 工具发现顺序：`TIE_LLVM_HOME\bin` → tiec.exe 同目录 `llvm\bin` → `PATH`
 → 固定目录（`D:\LLVM\bin`、`C:\Program Files\LLVM\bin`、`C:\LLVM\bin`）。
 发行版 zip 内置精简 LLVM（`bin/llvm/`），`TIE_LLVM_HOME` 指向它即开箱即用。
 链接时若缺少运行时静态库，需要先构建 `std/runtime.a`（见第 5 节）。
@@ -263,7 +261,7 @@ compiler/
 - **角色支持**：当前只编译 `logic`/`script`（可执行）与 `class`/`type`（静态库）、`ir`（直接产出 `.ll`）；`data` / `ui` / `db` / `port` 角色提示挂接点未实现；
 - **T5 后续进行中**：irgen 最小集扩展仍在推进；**enum 已实现（2026-08-15，无数据/带数据/泛型变体 + 构造/匹配全链路）**，函数指针方向的 C1 规划仍待覆盖；
 - **解释器桥限制**：需要指针类型的桥函数（如 file_read / str_char / rand_range / arg_*）无法 tie 化，仍走 Rust 底座转发；
-- **自举细节**：tiec 由 Rust 种子编译（唯一 Rust 接触点），此后 0-Rust；老编译器 tie-llvm.exe 仍保留作为种子与对照。
+- **自举细节**：tiec 由 stage0 入库二进制自举（曾由 Rust 种子编译，历史 bootstrap 界限），此后 0-Rust；Rust 参考编译器已归档至 tiec_rust 独立仓库。
 
 ---
 

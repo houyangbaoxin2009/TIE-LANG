@@ -1,18 +1,18 @@
-﻿# tie 正式发行版打包脚本（Windows）
+﻿# tie 正式发行版打包脚本（Windows，0-Rust）
 #
-# 职责：构建 release 工具链 → 组装发行目录 → 生成 zip 压缩包。
-# 产物：dist/tie-{发行版号}-win-x64.zip（如 tie-2026.1-win-x64.zip）
+# 职责：构建 release 工具链（自举）→ 组装发行目录 → 生成 zip 压缩包。
+# 产物：dist/tie-{发行版号}-win-x64.zip（如 tie-Harbor-2026.1-preview.2-win-x64.zip）
 #
 # 用法：
-#   .\scripts\package.ps1                     # 默认发行版号 2026.1
+#   .\scripts\package.ps1 -ReleaseVersion Harbor-2026.1-preview.2   # 默认 2026.1
 #   .\scripts\package.ps1 -ReleaseVersion 2026.2
 #   .\scripts\package.ps1 -SkipReplBuild      # 跳过 repl.exe 自举（用现有产物）
 #   .\scripts\package.ps1 -LlvmDir D:\LLVM    # 指定 LLVM 安装目录（默认 D:\LLVM）
 #   .\scripts\package.ps1 -SkipLlvm           # 跳过 LLVM 精简工具链捆绑
 #
-# 流程：
-#   1. cargo build --release（全 workspace，验证 0 错误）
-#   2. repl.exe 自举（tie-interp staticlib + tiec 编译 repl/repl.tie，自举升格）
+# 流程（0-Rust，Rust 参考编译器已归档 tiec_rust）：
+#   1. 自举验证：tiec.exe 编译 driver.tie → tiec2.exe（编译零错误）
+#   2. repl.exe 自举（tiec 编译 repl/repl.tie）
 #   3. 组装 dist/tie-{版本}/（bin/doc/examples/editor + bin/llvm/ 精简工具链）
 #   4. Compress-Archive 打包为 zip
 
@@ -40,26 +40,27 @@ $DistDir = Join-Path $Root "dist\$DistName"
 Write-Host "[package] 发行版号: $ReleaseVersion" -ForegroundColor Cyan
 Write-Host "[package] 仓库根目录: $Root" -ForegroundColor Cyan
 
-# ---- 第 1 步：release 构建（全 workspace）----
-Write-Host "`n[1/4] cargo build --release (全 workspace)..." -ForegroundColor Yellow
+# tiec（自举编译器，tie 语言自写，stage0 入库）：本脚本唯一编译器
+$TiecExe = Join-Path $Root "compiler\tiec.exe"
+
+# ---- 第 1 步：自举验证（tiec 编译自身 → tiec2.exe）----
+Write-Host "`n[1/4] 自举验证: tiec 编译 driver.tie → tiec2.exe..." -ForegroundColor Yellow
+$Tiec2Exe = Join-Path $Root "compiler\tiec2.exe"
 Push-Location $Root
 try {
-    cargo build --release --workspace
+    & $TiecExe "compiler\driver.tie" -o $Tiec2Exe
     if ($LASTEXITCODE -ne 0) {
-        throw "release 构建失败（退出码 $LASTEXITCODE）"
+        throw "自举编译失败（退出码 $LASTEXITCODE）"
     }
 }
 finally {
     Pop-Location
 }
-Write-Host "[1/4] release 构建完成" -ForegroundColor Green
+Write-Host "[1/4] 自举验证完成" -ForegroundColor Green
 
 # ---- 第 2 步：repl.exe 自举（可选）----
 Write-Host "`n[2/4] repl.exe 自举..." -ForegroundColor Yellow
 $ReplExe = Join-Path $Root "repl\repl.exe"
-# tiec：自举 v2 新编译器（tie 语言自写，compiler/driver.tie → tiec.exe）。
-# 自举升格后由它编译 repl/repl.tie（替代 Rust 种子 tie-llvm.exe）
-$TiecExe = Join-Path $Root "compiler\tiec.exe"
 if ($SkipReplBuild) {
     Write-Host "[2/4] 已跳过 repl 自举（-SkipReplBuild）" -ForegroundColor DarkYellow
 }
@@ -69,13 +70,8 @@ else {
     }
     Push-Location $Root
     try {
-        # 自举：先构建 tie-interp staticlib（tie_interp.lib），
-        # 再经 tiec 编译 repl/repl.tie 并链接生成 repl.exe（自举升格；
-        # tiec 默认输出 = 输入同目录同名 .exe，即 repl\repl.exe）
-        cargo build --release -p tie-interp
-        if ($LASTEXITCODE -ne 0) {
-            throw "tie-interp staticlib 构建失败（退出码 $LASTEXITCODE）"
-        }
+        # 自举：tiec 编译 repl/repl.tie 并链接生成 repl.exe（0-Rust，
+        # 运行时静态库 std/runtime.a 由 tiec 自动定位）
         & $TiecExe "repl\repl.tie"
         if ($LASTEXITCODE -ne 0) {
             throw "repl.exe 编译失败（退出码 $LASTEXITCODE）"
@@ -99,30 +95,10 @@ if (Test-Path $DistDir) {
 }
 New-Item -ItemType Directory -Path $DistDir -Force | Out-Null
 
-# bin/：7 个二进制（6 个工具 + repl 外壳）
-$BinDir = Join-Path $Root "target\release"
+# bin/：自举产物（tiec/tiec2 编译器 + repl 外壳 + pkg 包管理器；0-Rust）
 $BinTarget = Join-Path $DistDir "bin"
 New-Item -ItemType Directory -Path $BinTarget -Force | Out-Null
 
-# 工具链二进制清单（源文件名 → 是否必须）
-$Tools = @(
-    @{ Name = "tie.exe";          Required = $true },
-    @{ Name = "tie-prep.exe";     Required = $true },
-    @{ Name = "tie-frontend.exe"; Required = $true },
-    @{ Name = "tie-llvm.exe";     Required = $true },
-    @{ Name = "tie-lsp.exe";      Required = $true },
-    @{ Name = "tie-interp.exe";   Required = $true }  # 实际为库，无独立 exe 时跳过
-)
-foreach ($tool in $Tools) {
-    $src = Join-Path $BinDir $tool.Name
-    if (Test-Path $src) {
-        Copy-Item $src $BinTarget
-        Write-Host "  bin/$($tool.Name) ✔" -ForegroundColor DarkGray
-    }
-    elseif ($tool.Required) {
-        Write-Host "  警告: 缺失 $($tool.Name)（跳过）" -ForegroundColor DarkYellow
-    }
-}
 # repl.exe（自举外壳）
 if (Test-Path $ReplExe) {
     Copy-Item $ReplExe $BinTarget
@@ -133,11 +109,7 @@ else {
 }
 
 # pkg.exe（包管理器自举产物，tie.exe 子命令转发依赖；非必需，缺失仅警告）
-$PkgExe = Join-Path $Root "target\release\pkg.exe"
-if (-not (Test-Path $PkgExe)) {
-    # 回退：根目录 pkg/pkg.exe（构建产物习惯存放处）
-    $PkgExe = Join-Path $Root "pkg\pkg.exe"
-}
+$PkgExe = Join-Path $Root "pkg\pkg.exe"
 if (Test-Path $PkgExe) {
     Copy-Item $PkgExe $BinTarget
     Write-Host "  bin/pkg.exe ✔" -ForegroundColor DarkGray

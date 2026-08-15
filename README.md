@@ -32,20 +32,21 @@ tiec 实现）。
 
 ## 快速开始
 
-前置依赖：源码构建需要 Rust（edition 2024）与 LLVM 工具链（`opt`、`clang`、`lld`，编译链路的后端部分调用它们）；
+前置依赖：LLVM 工具链（`opt`、`clang`、`lld`，编译链路的后端部分调用它们）；
 **发行版 zip 已内置精简 LLVM 工具链（`bin/llvm/`），解压即用，无需单独安装 LLVM**。
-LLVM 工具发现顺序：`TIE_LLVM_HOME\bin` → tie.exe/tiec.exe 同目录 `llvm\bin`（Rust 侧）→ `PATH`
+LLVM 工具发现顺序：`TIE_LLVM_HOME\bin` → tie.exe/tiec.exe 同目录 `llvm\bin` → `PATH`
 → 常见安装目录（`D:\LLVM\bin`、`C:\Program Files\LLVM\bin`、`C:\LLVM\bin`）。
 
-```bash
-# 构建
-cargo build --workspace
+编译器为 tie 语言自写（tiec，见 `compiler/`），无需 Rust 工具链（Rust 参考编译器
+已归档至独立仓库 [tiec_rust](https://github.com/tie-lang/tiec_rust)）。
 
-# 编译并运行示例
-cargo run -p tie -- examples/hello.tie
+```bash
+# 编译并运行示例（tiec 自举编译器）
+compiler\tiec.exe examples\hello.tie
+examples\hello.exe
 
 # 无参数 → 进入 REPL
-cargo run -p tie
+compiler\tiec.exe repl\repl.tie
 ```
 
 `examples/hello.tie` 输出：
@@ -157,7 +158,7 @@ tie-llvm 编译链接 interp 库生成），完整 CLI 逻辑全部在 tie 侧�
 | `tie help` | 显示包管理器帮助 |
 
 端到端演示见 [examples/pkg_demo.md](examples/pkg_demo.md) 与 `examples/demo_pkg/`。
-构建 `pkg.exe`：`cargo build --release -p tie-interp && compiler/tiec.exe pkg/main.tie -o pkg/pkg.exe`（自举升格：tiec 编译，不再经 Rust 种子）。
+构建 `pkg.exe`：`compiler/tiec.exe pkg/main.tie -o pkg/pkg.exe`（自举：tiec 编译，0-Rust）。
 
 流程：`tie-prep` 预处理（清理代码 + 识别文件类型）→ 按角色自动转交工具链
 （`logic`/`script` → 编译为可执行文件；`class`/`type` → 编译为静态库 `.a`；`ir` → 直接生成 LLVM IR（.ll）；
@@ -196,19 +197,15 @@ tie examples/lib_math.tie -o lib_math.lib   # → MSVC 兼容静态库 .lib（CO
   （如 `mathlib$add`），C/其他语言可链接消费；
 - 动态库（`.dll` / `.so`）编译为 Harbor M5 内容（见 docs/plans/dynamic-library.md）。
 
-子工具可单独使用：
+子工具可单独使用（Rust 版子工具 tie-prep/tie-frontend/tie-lsp/tie-llvm/tie-interp 已随
+[tiec_rust](https://github.com/tie-lang/tiec_rust) 归档；tiec 内嵌等价前端/IR 能力）：
 
-- `tie-prep <file.tie>` —— 纯预处理
-- `tie-frontend <file.tie>` —— 前端三阶段（词法/语法/语义），带 `--tokens`/`--ast`/`--check` 调试视图
-- `tie-lsp` —— 语言服务器（LSP over stdio），向编辑器提供诊断 / hover / 跳转定义 / 补全，支持跨文件 import 语义（可与 VSCode 等配合，等价于 `tie --lsp`）
-- `tie-llvm <file.tie>` —— 直接编译（不经过角色分派）
-- `tie-interp <file.tie>` —— 直接解释执行
+- `compiler/tiec.exe <file.tie> [--emit-ir] [--keep-ir] [--prep-only]` —— 完整编译 / 只出 IR / 只预处理
 
 REPL 自举：REPL 外壳 `repl/repl.tie` 用 tie 语言自身编写（`print` + `read_line` + `eval`），
 经 tiec（自举 v2 编译器，自举升格）编译并链接 tie-interp 静态库（C ABI 桥）生成 `repl.exe`。构建：
 
 ```bash
-cargo build --release -p tie-interp          # 产出 target/release/tie_interp.lib
 compiler/tiec.exe repl/repl.tie             # 链接 interp 库生成 repl/repl.exe
 ```
 
@@ -219,15 +216,6 @@ LLVM 工具定位同「快速开始」的发现顺序；发行版自带 `bin/llv
 
 ```text
 tie/
-├── crates/
-│   ├── tie-prep/      预处理：清理代码、提取头、识别文件角色（type/script/data/ui/class/logic/port/db/ir）
-│   │                  Harbor M3 自举：核心逻辑由 tie 语言自写（prep/core.tie），Rust 壳解释执行
-│   ├── tie-frontend/  前端：词法（含 ASI）→ 语法 → 语义（符号表/类型检查）+ import 展开（imports 模块，tie-llvm/tie-lsp 共享），自研；独立 CLI 可调试
-│   ├── tie-llvm/      中端+后端驱动：AST → LLVM IR 文本生成；调用 opt/clang/lld
-│   ├── tie-lsp/       语言服务器：JSON-RPC 2.0 over stdio，复用前端三阶段 + import 展开提供诊断 / hover / 跳转定义 / 补全（支持跨文件语义）
-│   ├── tie-interp/    解释执行：树遍历求值 AST + C ABI 桥（staticlib），REPL 自举核心
-│   └── tie/           CLI 主入口：角色分派调度器 + REPL（启动 repl.exe）+ Harbor M3 协调统筹
-│                      （config 配置文件 / cache 缓存池 / pipeline 三阶段并行分片编译）
 ├── repl/repl.tie     REPL 外壳（tie 语言自写，自举；编译链接 tie-interp 静态库）
 ├── compiler/         自举 v2 编译器（tie 语言自写，T2–T5 阶段产物）：
 │                     - frontend/：词法/语法/语义分析器（T2.4–2.6，自举前端）
@@ -264,14 +252,15 @@ tie/
 │                     registry 三源安装 + 递归依赖解析 + 锁文件落地）+ fetch.tie（git
 │                     拉取 + registry 基址/版本选择/下载解压）+ lock.tie（tie.lock 生成/
 │                     解析/校验）+ publish.tie（打包 tar.gz + git tag/push）+ search.tie
-│                     （注册表搜索/信息查询），经 tie-llvm 编译链接 interp 库生成 pkg.exe，
-│                     Rust 侧只做子命令识别转发
+│                     （注册表搜索/信息查询），经 tiec 编译链接 interp 库生成 pkg.exe
 ├── docs/language.md   语法规范
 ├── docs/tie-script.md tie:script 模块协议（eval/eval_call 机制、模块约定、协议文本、三层调用入口）
 ├── docs/plans/        后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法 / 动态库编译 / 算法库分类 / 嵌入式基础层 rdu）
 ├── examples/          示例程序（hello / wide / table / tuple / oop / 负例 oop_neg_* 等）
-└── Cargo.toml         workspace（统一 edition/lints/release 配置）
+└── .tiec.md           tiec 自举编译器文档（docs/tiec.md）
 ```
+
+> Rust 参考编译器（种子）已归档至独立仓库 [tiec_rust](https://github.com/tie-lang/tiec_rust)（2026-08-15 剔除，主仓库 0-Rust）。
 
 ## 编译流水线（四段式）
 
@@ -330,7 +319,7 @@ tie/
 | M3 | 预处理器自举 + 协调统筹：完全用 tie 语言重写 `tie-prep`（编译器自举），并增强为多文件并行编译（配置文件 + 缓存池 + 三阶段并行分片） | ✅ 完成（阶段一：预处理器自举——核心逻辑 tie 语言化 `prep/core.tie`，Rust 壳仅解释执行；阶段二：协调统筹增强——`tie.config` 配置文件 + 缓存池 + 多线程并行分片编译） |
 | M4 | 标准库重构 + 扩展库分层：补全常用函数（str 大小写/join/repeat/trim_start/trim_end、math gcd/lcm/pow_i、format sprintf 占位符、csv_write、assert 浮点与字符串断言）+ 内部 using 简化 + **顶层持久变量**（var/const 全局，纯 tie 表达消息状态）+ log 增强（带参消息/级别/stderr/批量登记/多级回退，移入 **ext/** 扩展库）+ 修复 using 表元素解析/调用结果下标等编译器边界 | ✅ 完成 |
 | M5 | 动态库编译：`type tie<class>` 输出 `.dll`（win）/ `.so`（linux）——库公有函数 `dllexport` 导出、跨语言调用约定（标量直传/字符串 C ABI 桥）、C 程序 LoadLibrary/dlopen 消费示例（见 docs/plans/dynamic-library.md） | 📋 规划 |
-| M6 | 包管理器（E1/E2 ✅ + E3/E4 ✅）：tie 语言自写 CLI（`pkg/main.tie` → `pkg.exe`，自举）+ tie.pkg 清单解析（`manifest.tie`）+ 三源安装（path 复制 / git 浅克隆 / registry 下载解压，`deps.tie` + `fetch.tie`）+ tie.lock 锁文件幂等恢复（`lock.tie`）+ 递归依赖解析（去重/冲突检测）+ `tie update`/`publish`（打包 tar.gz + git tag/push，`publish.tie`）/`search`/`info`（注册表查询，`search.tie`）；Rust 入口 `crates/tie` 识别 11 个子命令并转发；`init → add（path/git/registry）→ install → build/run` 端到端跑通（见 examples/pkg_demo.md） | ✅ 完成（E1–E4） |
+| M6 | 包管理器（E1/E2 ✅ + E3/E4 ✅）：tie 语言自写 CLI（`pkg/main.tie` → `pkg.exe`，自举）+ tie.pkg 清单解析（`manifest.tie`）+ 三源安装（path 复制 / git 浅克隆 / registry 下载解压，`deps.tie` + `fetch.tie`）+ tie.lock 锁文件幂等恢复（`lock.tie`）+ 递归依赖解析（去重/冲突检测）+ `tie update`/`publish`（打包 tar.gz + git tag/push，`publish.tie`）/`search`/`info`（注册表查询，`search.tie`）；tiec 编译生成 pkg.exe（0-Rust 自举）；`init → add（path/git/registry）→ install → build/run` 端到端跑通（见 examples/pkg_demo.md） | ✅ 完成（E1–E4） |
 
 ### 自举（Self-hosting，进行中）
 
