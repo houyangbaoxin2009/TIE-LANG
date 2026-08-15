@@ -1,0 +1,27 @@
+// 短路求值行为验证（tie-llvm && / ||）
+// 预期输出：
+//   short_and=0      （false && 10/0：右侧除零不求值，不崩溃）
+//   short_or=1       （true || 10/0：右侧除零不求值，不崩溃）
+//   side_effect=0    （false && 副作用函数：不调用）
+//   nested=1         （true && (false || true)：嵌套短路）
+//   trit_and=1       （trit && 保持 Kleene：+1 && +1 = +1）
+var g: i64 = 0
+func bump() -> bool {
+    g = g + 1
+    return true
+}
+func main() {
+    var short_and: bool = false && 10 / 0 == 2
+    println(short_and)
+    var short_or: bool = true || 10 / 0 == 2
+    println(short_or)
+    var cond: bool = false
+    var side_effect: bool = cond && bump()
+    println(side_effect)
+    println(g)
+    var nested: bool = true && (false || true)
+    println(nested)
+    var t: trit = true
+    var trit_and: trit = t && zero
+    println(trit_and)
+}
