@@ -1,0 +1,251 @@
+type tie<logic>
+// tests/s31/config_smoke.tie —— S3.1 config 模块冒烟验证
+// ============================================================
+// 用途：验证 compiler/config.tie 的解析 / 访问器 / 合并 / profile 逻辑。
+// 输出协议：`OK: <描述>` 每行一个断言；失败输出 `FAIL: <描述> (期望 X 实际 Y)`。
+// 运行：compiler/tiec.exe tests/s31/config_smoke.tie -o .../config_smoke.exe && .../config_smoke.exe
+import "./../../compiler/config.tie"
+
+// ---------- 断言工具 ----------
+var g_fail: i64 = 0
+var g_pass: i64 = 0
+
+// 本地 find（测试文件不 import std，自备）
+func find(s: string, sub: string) -> i64 {
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(sub)
+    if m == 0 {
+        return 0
+    }
+    if m > n {
+        return -1
+    }
+    var i: i64 = 0
+    while i <= n - m {
+        var j: i64 = 0
+        var matched: bool = true
+        while j < m && matched {
+            if str_char(s, i + j) != str_char(sub, j) {
+                matched = false
+            }
+            j = j + 1
+        }
+        if matched {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+func check(cond: bool, msg: string) {
+    if cond {
+        g_pass = g_pass + 1
+        println("OK: " + msg)
+    } else {
+        g_fail = g_fail + 1
+        println("FAIL: " + msg)
+    }
+}
+
+func check_eq_str(actual: string, expected: string, msg: string) {
+    if actual == expected {
+        g_pass = g_pass + 1
+        println("OK: " + msg)
+    } else {
+        g_fail = g_fail + 1
+        println("FAIL: " + msg + " (期望 '" + expected + "' 实际 '" + actual + "')")
+    }
+}
+
+func check_eq_int(actual: i64, expected: i64, msg: string) {
+    if actual == expected {
+        g_pass = g_pass + 1
+        println("OK: " + msg)
+    } else {
+        g_fail = g_fail + 1
+        println("FAIL: " + msg + " (期望 " + to_string(expected) + " 实际 " + to_string(actual) + ")")
+    }
+}
+
+// ---------- 测试用例 ----------
+
+// 1) 解析：完整 config.data.tie 示例（build-config.md §2.1）
+func test_parse_full() {
+    var src = "[\n" +
+        "    \"target\": \"win-x64\",\n" +
+        "    \"opt\": 2,\n" +
+        "    \"debug\": true,\n" +
+        "    \"profile\": \"dev\",\n" +
+        "    \"tiec\": [\n" +
+        "        \"backend\": \"win32\",\n" +
+        "        \"features\": [\"async\", \"macro\", \"unsafe\"],\n" +
+        "        \"emit\": \"exe\",\n" +
+        "        \"link\": [\"user32\", \"gdi32\"],\n" +
+        "        \"bounds_check\": true,\n" +
+        "    ],\n" +
+        "    \"prep\": [\n" +
+        "        \"modules\": [\"migrate_str_v1.tie\"],\n" +
+        "        \"strict_roles\": true,\n" +
+        "    ],\n" +
+        "    \"pkg\": [\n" +
+        "        \"registry\": \"https://reg.tie-lang.org\",\n" +
+        "        \"cache_dir\": \".tie/deps\",\n" +
+        "        \"verify_signature\": true,\n" +
+        "    ],\n" +
+        "    \"roles\": [\n" +
+        "        \"test\": [\"tests/\"],\n" +
+        "        \"bench\": [\"bench/\"],\n" +
+        "    ],\n" +
+        "    \"advanced\": [ \"enabled\": true, \"threads\": 0 ],\n" +
+        "    \"cache\": [ \"size\": 268435456, \"storage\": \"memory\", \"path\": \".tie-cache\" ],\n" +
+        "]"
+    var root = config.parse(src)
+    check(root >= 0, "解析完整 config.data.tie 示例")
+    if root < 0 {
+        println("  解析错误: " + config.err_msg())
+        return
+    }
+    check_eq_str(config.get_str(root, "target"), "win-x64", "target=win-x64")
+    check_eq_int(config.get_int(root, "opt"), 2, "opt=2")
+    check(config.get_bool(root, "debug"), "debug=true")
+    check_eq_str(config.get_str(root, "profile"), "dev", "profile=dev")
+    check_eq_str(config.get_str(root, "tiec.backend"), "win32", "tiec.backend=win32")
+    check_eq_str(config.get_list(root, "tiec.features"), "async,macro,unsafe", "tiec.features 列表")
+    check_eq_str(config.get_list(root, "tiec.link"), "user32,gdi32", "tiec.link 列表")
+    check(config.get_bool(root, "tiec.bounds_check"), "tiec.bounds_check=true")
+    check_eq_str(config.get_list(root, "prep.modules"), "migrate_str_v1.tie", "prep.modules")
+    check(config.get_bool(root, "prep.strict_roles"), "prep.strict_roles=true")
+    check_eq_str(config.get_str(root, "pkg.registry"), "https://reg.tie-lang.org", "pkg.registry")
+    check(config.get_bool(root, "pkg.verify_signature"), "pkg.verify_signature=true")
+    check_eq_str(config.get_list(root, "roles.test"), "tests/", "roles.test")
+    check_eq_int(config.get_int(root, "advanced.threads"), 0, "advanced.threads=0")
+    check(config.get_bool(root, "advanced.enabled"), "advanced.enabled=true")
+    check_eq_int(config.get_int(root, "cache.size"), 268435456, "cache.size=268435456")
+}
+
+// 2) 解析：注释 / 空行 / 尾逗号容错
+func test_parse_robust() {
+    var src = "// 注释行\n" +
+        "\n" +
+        "[\n" +
+        "    // 行内注释\n" +
+        "    \"a\": \"x\",\n" +     // 尾逗号
+        "    \"b\": 42,\n" +
+        "    \"c\": [\"p\", \"q\",],\n" +  // 数组尾逗号
+        "]"
+    var root = config.parse(src)
+    check(root >= 0, "解析注释/空行/尾逗号")
+    if root < 0 {
+        println("  解析错误: " + config.err_msg())
+        return
+    }
+    check_eq_str(config.get_str(root, "a"), "x", "a=x")
+    check_eq_int(config.get_int(root, "b"), 42, "b=42")
+    check_eq_str(config.get_list(root, "c"), "p,q", "c=[p,q]")
+}
+
+// 3) 解析：错误处理（未闭合）
+func test_parse_error() {
+    var root = config.parse("[ \"a\": \"x\" ")
+    check(root < 0, "未闭合表 → 解析失败")
+    check(str_len(config.err_msg()) > 0, "错误消息非空")
+}
+
+// 4) 合并：深合并 + 数组追加 + 标量覆盖 + 独有键
+func test_merge() {
+    var base = config.parse("[\"opt\": 2, \"debug\": false, \"tiec\": [\"backend\": \"win32\", \"features\": [\"async\"], \"link\": [\"user32\"]]]")
+    // 第二次解析用 parse_append（不重置存储）——parse 会 reset_store 清空 base 节点
+    var layer = config.parse_append("[\"opt\": 0, \"tiec\": [\"backend\": \"wasm\", \"features\": [\"macro\"]]]")
+    check(base >= 0 && layer >= 0, "合并双方解析成功")
+    if base < 0 || layer < 0 {
+        return
+    }
+    var merged = config.merge(base, layer)
+    check(merged >= 0, "merge 成功")
+    if merged < 0 {
+        return
+    }
+    check_eq_int(config.get_int(merged, "opt"), 0, "合并: 标量 layer 覆盖 (opt=0)")
+    check(!config.get_bool(merged, "debug"), "合并: 独有键保留 (debug=false)")
+    check_eq_str(config.get_str(merged, "tiec.backend"), "wasm", "合并: 嵌套标量覆盖 (tiec.backend=wasm)")
+    check_eq_str(config.get_list(merged, "tiec.features"), "async,macro", "合并: 数组追加 (features=async,macro)")
+    check_eq_str(config.get_list(merged, "tiec.link"), "user32", "合并: base 独有数组保留 (link=user32)")
+}
+
+// 5) 合并：重置标记 "=" 清空父层列表
+func test_merge_reset() {
+    var base = config.parse("[\"tiec\": [\"features\": [\"async\", \"macro\"]]]")
+    var layer = config.parse_append("[\"tiec\": [\"features\": \"=\"]]")
+    var merged = config.merge(base, layer)
+    check(merged >= 0, "重置标记 merge 成功")
+    if merged < 0 {
+        return
+    }
+    check_eq_str(config.get_list(merged, "tiec.features"), "", "重置标记: features 清空")
+}
+
+// 6) 内置默认 + profile 激活（dev/release）
+func test_defaults_profile() {
+    // load_merge 不传项目路径（不存在 config.data.tie）→ 纯内置默认；
+    // 默认 profile=dev 会在 load_merge 末尾自动激活：debug=true, opt=0, bounds_check=true
+    var root = config.load_merge("", "")
+    check(root >= 0, "load_merge 内置默认加载")
+    if root < 0 {
+        return
+    }
+    check_eq_str(config.get_str(root, "tiec.backend"), "win32", "默认 backend=win32")
+    check_eq_str(config.get_str(root, "profile"), "dev", "默认 profile=dev")
+    check(config.get_bool(root, "debug"), "dev profile: debug=true")
+    check_eq_int(config.get_int(root, "opt"), 0, "dev profile: opt=0")
+    check(config.get_bool(root, "tiec.bounds_check"), "dev profile: bounds_check=true")
+    // CLI --profile=release → debug=false, opt=2, bounds_check=false
+    var rel = config.load_merge("", "release")
+    check(rel >= 0, "release profile 加载")
+    if rel < 0 {
+        return
+    }
+    check(!config.get_bool(rel, "debug"), "release profile: debug=false")
+    check_eq_int(config.get_int(rel, "opt"), 2, "release profile: opt=2")
+    check(!config.get_bool(rel, "tiec.bounds_check"), "release profile: bounds_check=false")
+}
+
+// 7) apply_cli 覆盖
+func test_apply_cli() {
+    var root = config.load_merge("", "")
+    check(root >= 0, "apply_cli 前置加载")
+    if root < 0 {
+        return
+    }
+    root = config.apply_cli(root, "target", "linux-arm64")
+    root = config.apply_cli(root, "tiec.backend", "wasm")
+    root = config.apply_cli(root, "opt", "3")
+    check_eq_str(config.get_str(root, "target"), "linux-arm64", "CLI: target=linux-arm64")
+    check_eq_str(config.get_str(root, "tiec.backend"), "wasm", "CLI: tiec.backend=wasm")
+    check_eq_int(config.get_int(root, "opt"), 3, "CLI: opt=3")
+}
+
+// 8) dump 摘要
+func test_dump() {
+    var root = config.load_merge("", "")
+    var out = config.dump(root)
+    check(str_len(out) > 0, "dump 非空")
+    var has_backend = find(out, "backend = win32")
+    check(has_backend >= 0, "dump 含 backend=win32")
+}
+
+func main() -> i64 {
+    test_parse_full()
+    test_parse_robust()
+    test_parse_error()
+    test_merge()
+    test_merge_reset()
+    test_defaults_profile()
+    test_apply_cli()
+    test_dump()
+    println("-- 结果: " + to_string(g_pass) + " 通过, " + to_string(g_fail) + " 失败 --")
+    if g_fail > 0 {
+        return 1
+    }
+    return 0
+}

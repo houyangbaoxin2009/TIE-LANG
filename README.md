@@ -21,6 +21,12 @@ tiec 实现）。阶段 1 语言地基（2026-08-15）新增三大系统能力�
 [docs/plans/int-model.md](docs/plans/int-model.md)）、**角色扩展**
 （多角色叠加 `type tie<db:vector, unsafe>` + 角色参数化 + 文件名一致性
 = 编译错误，见 [docs/plans/role-model.md](docs/plans/role-model.md)）。
+阶段 2 错误处理（2026-08-16）落地 **Result/Option + `?` 解包 + panic**：
+预置 `enum Result<T, E> { Ok(T) Err(E) }` 与 `enum Option<T> { Some(T) None }`
+（`std/result.tie`，import 即用，与用户自定义 enum 无差别）；`var v = expr ?`
+后缀解包——Err/None 提前返回、Ok/Some 解包 payload，仅限返回 Result/Option
+的函数内；`panic("msg")` 不可恢复错误（printf + exit(1)）；string payload
+跨函数解包值正确还原（见 [docs/plans/error-model.md](docs/plans/error-model.md)）。
 
 > 语法规范见 [docs/language.md](docs/language.md)；本文件是工程入口（用法、结构、流水线、路线图）。
 
@@ -147,7 +153,9 @@ tie init|add|remove|install|update|build|run|publish|search|info|help   # 包管
 | `--emit-ir` | 只生成 LLVM IR（.ll），不继续编译 |
 | `--keep-ir` | 保留中间 IR 文件 |
 | `--prep-only` | 只做预处理（tie-prep）并打印识别结果 |
-| `--config <file>` | 指定协调统筹配置文件（默认查当前目录 `tie.config`，无则全关闭） |
+| `--config <file>` | 指定构建配置文件（S3.1：默认查当前目录 `config.data.tie`，分层合并：CLI > 项目 config > 用户 `~/.config/tie/config.data.tie` > 内置默认） |
+| `--profile <p>` | 构建 profile（dev/release，覆盖配置顶层 `profile` 键；Cargo 风格，S3.1） |
+| `--backend <b>` | 后端实现选择（win32/LLVM 工具链；其余 port 尚未接入，S3.1） |
 | `--module <file.tie>` | tie-prep：挂载自定义 tie 转换器模块（顶层 `process(src)->string`），输出为模块转换结果（Harbor M3 可扩展性） |
 | `--lsp` | 以语言服务器模式运行（读 stdin 的 LSP 消息、写 stdout，等价于 `tie-lsp`） |
 | `-h, --help` | 显示帮助 |
