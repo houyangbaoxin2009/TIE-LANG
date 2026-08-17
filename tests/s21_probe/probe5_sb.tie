@@ -1,0 +1,45 @@
+type tie<logic>
+// S2.1 字符串探针 5：StringBuilder 拼接（原地追加 + 容量倍增 + 句柄复用）
+// 覆盖：多段追加（字符串 + to_string 数字混拼）、循环 1000 段增长路径、
+//       build 后句柄继续复用（不释放，可再 build）
+// 期望输出：
+//   PASS sb concat
+//   PASS sb loop len=1000
+//   PASS sb reuse
+func main() {
+    // 多段拼接（高效路径：原地追加，非 s = s + x 的 O(n²) 循环）
+    var sb = string_builder()
+    sb_append(sb, "hello, ")
+    sb_append(sb, to_string(42))
+    sb_append(sb, "!")
+    var s = sb_build(sb)
+    if s == "hello, 42!" {
+        println("PASS sb concat")
+    } else {
+        println("FAIL sb concat=" + s)
+        exit(1)
+    }
+    // 循环 1000 段：触发容量倍增重分配路径（1→2→4→...→1024）
+    var sb2 = string_builder()
+    var i: i64 = 0
+    while i < 1000 {
+        sb_append(sb2, "x")
+        i = i + 1
+    }
+    var t = sb_build(sb2)
+    if len(t) == 1000 {
+        println("PASS sb loop len=1000")
+    } else {
+        println("FAIL sb loop len=" + to_string(len(t)))
+        exit(1)
+    }
+    // 句柄复用：build 后继续追加再 build（句柄两级指针，地址稳定）
+    sb_append(sb, "!!")
+    var u = sb_build(sb)
+    if u == "hello, 42!!!" {
+        println("PASS sb reuse")
+    } else {
+        println("FAIL sb reuse=" + u)
+        exit(1)
+    }
+}

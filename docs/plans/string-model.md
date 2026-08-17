@@ -1,10 +1,18 @@
 # 规划：tie 字符串模型（学习 Rust：UTF-8 + {ptr,len} + 迭代器引导）
 
-> 状态：**规划**（2026-08-15 设计讨论定稿，未实现）
-> 本文档定义 tie 的字符串模型。决策汇总：
+> 状态：**已实现（S2.1 最小完整集，2026-08-17，分支 feat/s2.1-string）**；
+> 决策汇总：
 > **R1**（UTF-8 表示，现状保持）+ **O2**（移动语义 `{ptr, len}` 结构，二进制安全）
 > + **M1 不可变 + M2 StringBuilder** + **V2 拷贝切片 + SSO** + **F1 边界自动 NUL**
 > + **B1 bytes 独立** + **L1+L2 字面量静态 + intern 可选**。
+> **已落地**：O2 {ptr,len}（长度头 + 数据 + 边界 \0：字面量 .rodata 带头 /
+> str_cat malloc 带头 / tie 桥返回串自动补头）、F1 传方向自动 NUL（数据尾 \0
+> 保留，FFI 零拷贝）、M2 StringBuilder（句柄式 string_builder / sb_append /
+> sb_append_byte / sb_build，容量倍增）、码点迭代（utf8_seq_len / utf8_char_at
+> 函数式形态，见 §7.4）、len(s) 字节长度 O(1)（读长度头）。
+> **未落地（后续单元）**：SSO 短串优化、语法级 `for c in s.chars()` 迭代器
+> 协议、to_chars 表转换、FFI 接收方向自动扫描（extern 返回 char*）、
+> intern 驻留表。
 > **码点访问：学习 Rust**——不提供 O(1) 随机码点访问，用 API 设计引导
 > （迭代器 + 字节路径优先 + 显式 to_chars 转换）。
 > **迁移策略：不考虑**——目前无用户，未来有用户时发布附迁移预处理脚本
@@ -139,6 +147,28 @@ if s.is_ascii() {           // 全 ASCII：可安全按字节处理（常见：�
 - **零额外内存**：不缓存偏移表
 - **零复杂度**：无数据结构魔法，API 引导正确用法
 - **复杂度语义明确**：每个字符串 API 文档标注 O(1)/O(n)
+
+### 7.4 S2.1 实现形态（函数式迭代，语法级 for-in 后置）
+
+S2.1 最小完整集以**函数式原语**提供码点迭代（语法级 `for c in s.chars()`
+需语言迭代器协议，超本单元范围，见 §13 未决问题 1）：
+
+```tie
+// 码点迭代：while + 字节步进（一次扫描，等价 for-in）
+var pos: i64 = 0
+while pos < len(s) {
+    var l = utf8_seq_len(s, pos)     // 序列长度 1-4（按首字节，无分支）
+    var cp = utf8_char_at(s, pos)    // 解码码点（分支按长度读字节，不越界）
+    // ... 处理 cp ...
+    pos = pos + l
+}
+```
+
+- `utf8_seq_len(s, i)` / `utf8_char_at(s, i)`：语言底座原语（irgen 内联生成
+  普通 tie-IR 指令，零新 opcode 零新桥）；`str_byte(s, i)` 二进制安全取字节
+- `len(s)` = 字节长度 O(1)（读长度头）；`str_len(s)` 保持码点计数语义（O(n)）
+- to_chars 表转换未做（动态表布局为 tie-interp 桥内部，tie 侧无法构造；
+  后续由桥扩展或表布局 tie 化后补）
 
 ## 8. 字符串与字节（B1：独立）
 

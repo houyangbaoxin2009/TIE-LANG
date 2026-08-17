@@ -1,0 +1,74 @@
+type tie<logic>
+// S2.1 字符串探针 3：UTF-8 码点迭代（utf8_seq_len / utf8_char_at）
+// 覆盖：序列长度 1/2/3/4 字节判定、码点解码、混合串字节循环迭代、
+//       4 字节 emoji 码点（str_from_code 构造，绕开字面量 4 字节字符）
+// 期望输出：
+//   PASS seq lens 1 2 3 4
+//   PASS char at 0x4F60
+//   PASS iterate 3 cps
+//   PASS emoji cp
+func main() {
+    // 序列长度：ASCII(1) é(2) 你(3) 😀(4)
+    var s1 = "A"
+    var s2 = str_from_code(0xE9)      // é U+00E9 → UTF-8 2 字节
+    var s3 = str_from_code(0x4F60)    // 你 U+4F60 → UTF-8 3 字节
+    var s4 = str_from_code(0x1F600)   // 😀 U+1F600 → UTF-8 4 字节
+    if utf8_seq_len(s1, 0) == 1 {
+        if utf8_seq_len(s2, 0) == 2 {
+            if utf8_seq_len(s3, 0) == 3 {
+                if utf8_seq_len(s4, 0) == 4 {
+                    println("PASS seq lens 1 2 3 4")
+                } else {
+                    println("FAIL seq len4=" + to_string(utf8_seq_len(s4, 0)))
+                    exit(1)
+                }
+            } else {
+                println("FAIL seq len3=" + to_string(utf8_seq_len(s3, 0)))
+                exit(1)
+            }
+        } else {
+            println("FAIL seq len2=" + to_string(utf8_seq_len(s2, 0)))
+            exit(1)
+        }
+    } else {
+        println("FAIL seq len1=" + to_string(utf8_seq_len(s1, 0)))
+        exit(1)
+    }
+    // 码点解码：你 = U+4F60
+    if utf8_char_at(s3, 0) == 0x4F60 {
+        println("PASS char at 0x4F60")
+    } else {
+        println("FAIL char at=" + to_string(utf8_char_at(s3, 0)))
+        exit(1)
+    }
+    // 混合串迭代："A你é" = 1+3+2 = 6 字节、3 码点（while + seq_len 步进）
+    var m = "A" + s3 + s2
+    if len(m) == 6 {
+        var cps: i64 = 0
+        var pos: i64 = 0
+        while pos < len(m) {
+            var l = utf8_seq_len(m, pos)
+            var cp = utf8_char_at(m, pos)
+            if cp > 0 {
+                cps = cps + 1
+            }
+            pos = pos + l
+        }
+        if cps == 3 {
+            println("PASS iterate 3 cps")
+        } else {
+            println("FAIL iterate cps=" + to_string(cps))
+            exit(1)
+        }
+    } else {
+        println("FAIL mixed len=" + to_string(len(m)))
+        exit(1)
+    }
+    // 4 字节 emoji 码点解码
+    if utf8_char_at(s4, 0) == 0x1F600 {
+        println("PASS emoji cp")
+    } else {
+        println("FAIL emoji=" + to_string(utf8_char_at(s4, 0)))
+        exit(1)
+    }
+}

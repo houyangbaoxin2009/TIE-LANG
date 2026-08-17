@@ -1,0 +1,54 @@
+type tie<logic>
+// S2.1 字符串探针 1：二进制安全（含 \0 字符串往返）+ len(s) O(1) 长度头
+// 覆盖：sb_append_byte 构造含 \0 串 → sb_build → len 读头（≠ strlen 截断）→
+//       str_byte 逐字节读回 → StringBuilder 拼接仍二进制安全（不 NUL 截断）
+// 期望输出：
+//   PASS binary len=6
+//   PASS byte loop
+//   PASS sb binary len=7
+func main() {
+    // 构造含 \0 的串：'a' \0 'b' 'c' \0 'd'（6 字节；strlen 视角只有 1 字节）
+    var sb = string_builder()
+    sb_append_byte(sb, 97)   // 'a'
+    sb_append_byte(sb, 0)    // \0（二进制安全：长度头记录，不依赖 NUL 终止）
+    sb_append_byte(sb, 98)   // 'b'
+    sb_append_byte(sb, 99)   // 'c'
+    sb_append_byte(sb, 0)    // \0
+    sb_append_byte(sb, 100)  // 'd'
+    var s = sb_build(sb)
+    // len(s) O(1) 读长度头 = 6（若退化为 strlen 会截断为 1）
+    if len(s) == 6 {
+        println("PASS binary len=6")
+    } else {
+        println("FAIL binary len=" + to_string(len(s)))
+        exit(1)
+    }
+    // 逐字节读回（含两个 \0 位置）
+    var expect = [97, 0, 98, 99, 0, 100]
+    var ok: bool = true
+    var i: i64 = 0
+    while i < 6 {
+        if str_byte(s, i) != expect[i] {
+            ok = false
+        }
+        i = i + 1
+    }
+    if ok {
+        println("PASS byte loop")
+    } else {
+        println("FAIL byte loop")
+        exit(1)
+    }
+    // StringBuilder 拼接二进制安全（sb_append 读长度头 O(1)，不 NUL 截断；
+    // str_cat 保持旧 NUL 语义不变——二进制拼接走 StringBuilder）
+    var sb2 = string_builder()
+    sb_append(sb2, s)
+    sb_append(sb2, "!")
+    var t = sb_build(sb2)
+    if len(t) == 7 && str_byte(t, 1) == 0 && str_byte(t, 6) == 33 {
+        println("PASS sb binary len=7")
+    } else {
+        println("FAIL sb binary len=" + to_string(len(t)))
+        exit(1)
+    }
+}

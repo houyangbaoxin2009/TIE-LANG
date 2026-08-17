@@ -30,6 +30,14 @@ tiec 实现）。阶段 1 语言地基（2026-08-15）新增三大系统能力�
 变量）、命名函数提升（函数名直接作函数值）、高阶函数与间接调用
 （`{env, entry}` 闭包值 + call_indirect），探针全过，见
 [docs/plans/closure-model.md](docs/plans/closure-model.md)。
+阶段 2 字符串模型（2026-08-17，S2.1）升级**字符串内部表示**为
+`{ptr,len}` 二进制安全（长度头 8 字节 + UTF-8 数据 + 边界自动 NUL，FFI
+零拷贝）：`len(s)` 字节长度 O(1)、新原语 `str_byte(s,i)`（二进制安全取字节）、
+`utf8_seq_len(s,i)`/`utf8_char_at(s,i)`（码点迭代）、StringBuilder
+（`string_builder()` + `sb_append`/`sb_append_byte` + `sb_build`，原地
+追加 + 容量倍增）；tie 桥返回串自动补头统一布局，旧 API（str_len/str_cat/
+to_string）行为不变，探针全过 + 自举闭环 IR 逐字节一致，见
+[docs/plans/string-model.md](docs/plans/string-model.md)。
 
 
 我们的目标：全领域通用，Python的体验，Rust的性能与安全。

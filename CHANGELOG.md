@@ -1,3 +1,36 @@
+## [新增] 阶段 2 字符串模型（S2.1 {ptr,len} 二进制安全 + 迭代器 + StringBuilder）—— 2026-08-17
+
+字符串内部表示升级为 `{ptr,len}`（docs/plans/string-model.md 决策 O2+F1），
+tiec（tie 自写编译器）全链路落地，S2.1 探针 1-5 全过，自举闭环 IR 逐字节一致：
+
+- **表示层（llvmgen）**：字符串常量升级为带头布局
+  `{ i64 长度头, [N+1 x i8] 数据+\0 }`（.rodata）；新增 `str_data_ref` 内联
+  GEP 常量表达式统一数据指针引用（const_str/printf 格式串/全局串初始化/
+  typed_ref/to_ptr/ptr_arg_ref 全部改道）；str_cat(56) malloc 8 头+数据+\0，
+  返回数据指针（头部 i64 总长）——数据仍 NUL 结尾，旧 strlen/strcmp/printf
+  与 FFI 传方向零拷贝全兼容
+- **桥返回自动补头**：extern_call(36) 对 tie_ 桥返回字符串（ptr）自动补头
+  （strlen+malloc+memcpy+尾 \0）——所有字符串值统一"有头"不变量；表句柄桥
+  （tie_table_new/tie_list_dir/tie_walk_dir/tie_byte_read/tie_regex_find_all）
+  黑名单排除（irgen 标 TK_STR 复用 ptr 槽，补头会错乱句柄）
+- **原语层（irgen 新原语 + sbuitin 注册）**：`len(s)` 由 strlen 升级为读
+  长度头（O(1)，字节数语义不变）；新原语 `str_byte(s,i)`（二进制安全取字节）、
+  `utf8_seq_len(s,i)` / `utf8_char_at(s,i)`（UTF-8 码点解码，无分支序列长度
+  判定 + 分支解码）、StringBuilder 句柄族 `string_builder()` / `sb_append(h,s)`
+  / `sb_append_byte(h,b)` / `sb_build(h)`（两级指针 {cap,len,data}，容量倍增
+  重分配，memcpy 走 libc）——全部生成普通 tie-IR 指令，零新 opcode 零新桥
+- **验收**：tests/s21_probe/ 探针 1-5 全过（\0 字符串往返 + len O(1) 长度头
+  6/5/9/2、码点迭代 1/2/3/4 字节序列与 0x4F60/0x1F600 解码、FFI 中文输出 +
+  exec_code 传参、StringBuilder 拼接/1000 段倍增/句柄复用）；tests/language
+  30 正例全过（extern_decl/std_fs_path 为 stage0 同款基线问题）+ 负例全拒
+  （shift_neg_free 为 stage0 同款基线接受）；S2.2/S2.3 探针全过（try_probe
+  panic exit=1 预期）；自举链 tiec_new → tiec_v2 的 --emit-ir 逐字节一致
+- **已知差异（汇报）**：语法级 `for c in s.chars()` 迭代器与 to_chars 表
+  转换未做（需迭代器协议/表布局桥，超最小完整集，用 utf8_seq_len/utf8_char_at
+  组合等价）；str_cat 保持旧 NUL 语义（含 \0 串拼接走 StringBuilder）；
+  SSO 短串优化未做（表示升级后字符串值恒为堆/.rodata 指针）；FFI 接收方向
+  （extern 返回 char* 自动扫描）未做（探针仅覆盖传方向）
+
 ## [新增] 阶段 2 闭包后端全链路（S2.2 函数值/闭包 IR 生成 + 间接调用）—— 2026-08-17
 
 S2.2 闭包前端（5f0762d，N_FN_LIT/N_FN_TYPE + fn 类型系统 + 捕获分析）的

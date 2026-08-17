@@ -201,6 +201,48 @@ pub func builtin_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 
         }
         return types.named(TK_I64)
     }
+    // ---------- S2.1 字符串 {ptr,len} 原语 ----------
+    // 二进制安全字节访问 / UTF-8 码点解码 / StringBuilder 句柄。
+    // str_byte(s, i)：取第 i 字节（0 ≤ i < len(s)，越界未定义）；
+    // utf8_seq_len(s, i) / utf8_char_at(s, i)：字节 i 起码点序列长度/码点值；
+    // string_builder() → 句柄 i64；sb_append(h, s) / sb_append_byte(h, b) 原地
+    // 追加（返回 0）；sb_build(h) → 一次性产出 string（句柄仍有效可复用）。
+    if fn_name == "str_byte" || fn_name == "utf8_seq_len" || fn_name == "utf8_char_at" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 2 个参数（字符串, 字节下标），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+    }
+    if fn_name == "string_builder" {
+        if nargs != 0 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "string_builder() 期望 0 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+    }
+    if fn_name == "sb_append" || fn_name == "sb_append_byte" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = fn_name + "() 期望 2 个参数（句柄, 内容），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+    }
+    if fn_name == "sb_build" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "sb_build() 期望 1 个参数（句柄），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+    }
     if fn_name == "str_from_code" {
         // 码点 → 单字符字符串（与 char_code 对称）：1 参 i64 → string。
         // 非法码点（负值/超上限/代理区）运行时返回空串，编译期只查参数个数。

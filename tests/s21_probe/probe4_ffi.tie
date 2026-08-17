@@ -1,0 +1,20 @@
+type tie<logic>
+// S2.1 字符串探针 4：FFI 边界自动 NUL（{ptr,len} 内部表示，传 C 边界零拷贝）
+// 覆盖：println（printf %s）中文完整输出——数据末尾 \0 保留（边界自动 NUL）；
+//       exec_code（系统命令）字符串参数直传 C char*
+// 期望输出：
+//   你好，世界
+//   PASS system rc=0
+func main() {
+    // println 走 printf %s：串数据 NUL 结尾（FFI 边界自动 NUL），中文完整输出
+    var msg = "你好，世界"
+    println(msg)
+    // exec_code 传参：内部 {ptr,len} 串直接传 C 边界（char*，末尾 \0）
+    var r = exec_code("cmd /c echo s21-ffi-ok")
+    if r == 0 {
+        println("PASS system rc=0")
+    } else {
+        println("FAIL system rc=" + to_string(r))
+        exit(1)
+    }
+}

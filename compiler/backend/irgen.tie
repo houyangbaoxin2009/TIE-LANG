@@ -2069,6 +2069,14 @@ func is_builtin_name(nm: string) -> bool {
     if nm == "str_len" || nm == "char_code" || nm == "str_char" || nm == "str_from_code" {
         return true
     }
+    // ---------- S2.1 字符串 {ptr,len} 原语 ----------
+    // 二进制安全字节访问（str_byte）、UTF-8 码点解码（utf8_seq_len/utf8_char_at）、
+    // StringBuilder 句柄（string_builder/sb_append/sb_append_byte/sb_build）
+    if nm == "str_byte" || nm == "utf8_seq_len" || nm == "utf8_char_at" ||
+        nm == "string_builder" || nm == "sb_append" || nm == "sb_append_byte" ||
+        nm == "sb_build" {
+        return true
+    }
     // ---------- 网络原语（P0：std/net）----------
     if nm == "net_close" || nm == "net_tcp_accept" || nm == "net_tcp_connect" ||
         nm == "net_tcp_listen" || nm == "net_tcp_recv" || nm == "net_tcp_send" ||
@@ -2599,6 +2607,89 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         }
         return 0
     }
+    // ---------- S2.1 字符串 {ptr,len} 原语 ----------
+    // 二进制安全字节访问 / UTF-8 码点解码 / StringBuilder（实现见文件尾 s21_* 组）。
+    if nm == "str_byte" {
+        // str_byte(s, i)：取第 i 字节（0 ≤ i < len(s)；越界未定义——调用方保证）
+        var v = gen_expr(call_arg(id, 0))
+        if v < 0 {
+            return -1
+        }
+        var i = gen_expr(call_arg(id, 1))
+        if i < 0 {
+            return -1
+        }
+        g_builtin_res = s21_str_byte(v, i)
+        return 0
+    }
+    if nm == "utf8_seq_len" {
+        // utf8_seq_len(s, i)：字节 i 起的 UTF-8 序列长度（1-4，按首字节判定）
+        var v = gen_expr(call_arg(id, 0))
+        if v < 0 {
+            return -1
+        }
+        var i = gen_expr(call_arg(id, 1))
+        if i < 0 {
+            return -1
+        }
+        g_builtin_res = s21_utf8_seq_len(v, i)
+        return 0
+    }
+    if nm == "utf8_char_at" {
+        // utf8_char_at(s, i)：字节 i 起的 UTF-8 码点值（分支按序列长度解码）
+        var v = gen_expr(call_arg(id, 0))
+        if v < 0 {
+            return -1
+        }
+        var i = gen_expr(call_arg(id, 1))
+        if i < 0 {
+            return -1
+        }
+        g_builtin_res = s21_utf8_char_at(v, i)
+        return 0
+    }
+    if nm == "string_builder" {
+        // string_builder()：新建 StringBuilder 句柄（i64；两级指针 {cap,len,data}）
+        g_builtin_res = s21_sb_new()
+        return 0
+    }
+    if nm == "sb_append" {
+        // sb_append(h, s)：原地追加字符串（容量不足自动倍增重分配）；返回 0
+        var h = gen_expr(call_arg(id, 0))
+        if h < 0 {
+            return -1
+        }
+        var v = gen_expr(call_arg(id, 1))
+        if v < 0 {
+            return -1
+        }
+        s21_sb_append(h, v)
+        g_builtin_res = gen_int_lit(0)
+        return 0
+    }
+    if nm == "sb_append_byte" {
+        // sb_append_byte(h, b)：原地追加单字节（0-255，二进制安全含 \0）；返回 0
+        var h = gen_expr(call_arg(id, 0))
+        if h < 0 {
+            return -1
+        }
+        var b = gen_expr(call_arg(id, 1))
+        if b < 0 {
+            return -1
+        }
+        s21_sb_append_byte(h, b)
+        g_builtin_res = gen_int_lit(0)
+        return 0
+    }
+    if nm == "sb_build" {
+        // sb_build(h)：一次性产出 string（{头, 数据, \0}；句柄仍有效可复用）
+        var h = gen_expr(call_arg(id, 0))
+        if h < 0 {
+            return -1
+        }
+        g_builtin_res = s21_sb_build(h)
+        return 0
+    }
     // ---------- 网络原语（P0：std/net）----------
     // 参数签名：i=整数（窄整数 sext 到 i64）、s=字符串（ptr 直传）；桥符号 tie_<name>；
     // net_close 返回 i8→bool（icmp ne），两个 recv 返回堆串（gen_stmt 统一 free），其余 i64。
@@ -2743,16 +2834,18 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         return 0
     }
     if nm == "len" {
-        // len(表) → tie_table_len；len(字符串) → strlen
+        // S2.1：len(表) → tie_table_len；len(字符串) → 读 {ptr,len} 长度头（O(1)，
+        // 不再 strlen 扫描——字符串值统一带头部（字面量 .rodata 头 / str_cat 头 /
+        // 桥返回自动补头 / StringBuilder build 头）。行为与旧 strlen 一致（字节数）。
         var a = call_arg(id, 0)
         var at = node_types[a]
         if at == types.named(TK_STR) {
-            // 字符串：strlen（libc）
+            // 字符串：读 ptr-8 的 i64 长度头（S2.1）
             var v = gen_expr(a)
             if v < 0 {
                 return -1
             }
-            g_builtin_res = gen_ext_call1("strlen", v, types.named(TK_STR), types.named(TK_I64))
+            g_builtin_res = s21_str_head_len(v)
             return 0
         }
         g_used_interp = true
@@ -4624,6 +4717,10 @@ func is_libc_sym(sym: string) -> bool {
     if sym == "malloc" || sym == "free" || sym == "fopen" || sym == "fwrite" || sym == "fclose" || sym == "fflush" {
         return true
     }
+    // S2.1：libc memcpy（StringBuilder 数据拷贝；无需 tie_interp 链接）
+    if sym == "memcpy" {
+        return true
+    }
     if sym == "exit" || sym == "remove" {
         return true
     }
@@ -4700,6 +4797,284 @@ func gen_ext_call2(sym: string, v1: i64, ty1: i64, v2: i64, ty2: i64, ret_ty: i6
     table_push(ats, ty2)
     table_push(avs, v2)
     return gen_ext_call_typed(sym, ats, avs, ret_ty)
+}
+
+// ==================== S2.1 字符串 {ptr,len} 原语实现 ====================
+// 字符串运行时布局（S2.1 决策 O2 + F1）：
+//   ptr → [8 字节 i64 长度头][UTF-8 数据][\0 边界自动 NUL]
+// 长度头位于数据指针 -8 处（load i64, gep(i8, ptr, -8)）——len(s) O(1)；
+// 数据 NUL 结尾——旧 strlen/strcmp/printf 与 FFI 传方向零拷贝兼容。
+// 所有字符串值统一该布局：字面量 .rodata 带头（llvmgen emit_strings）、
+// str_cat malloc 带头（llvmgen op 56）、tie 桥返回自动补头（llvmgen op 36）、
+// sb_build 产出带头。以下辅助全部生成普通 tie-IR 指令（零新 opcode）。
+
+// getelementptr i8, ptr base, i64 off（字节步长；off 可为立即数或寄存器）
+func s21_gep(base: i64, off: i64, off_is_imm: bool) -> i64 {
+    var gp = ir.new_inst(g_cur_block, 23, types.named(TK_I8))  // gep 元素类型 i8
+    ir.add_operand(gp, base, 0)
+    if off_is_imm {
+        ir.add_operand(gp, off, 2)  // OK_IMM 立即数偏移
+    } else {
+        ir.add_operand(gp, off, 0)  // OK_VALUE 寄存器偏移
+    }
+    return ir.get_value(gp)
+}
+
+// load ty, ptr addr
+func s21_load(addr: i64, ty: i64) -> i64 {
+    var ld = ir.new_inst(g_cur_block, 21, ty)  // load
+    ir.add_operand(ld, addr, 0)
+    return ir.get_value(ld)
+}
+
+// store ty val, ptr addr（无结果）
+func s21_store(addr: i64, val: i64, ty: i64) {
+    var st = ir.new_inst(g_cur_block, 22, -1)  // store
+    ir.add_operand(st, ty, 2)
+    ir.add_operand(st, val, 0)
+    ir.add_operand(st, addr, 0)
+}
+
+// zext sty %v to i64（无符号扩展；字节 i8 / i1 布尔）
+func s21_zext(v: i64, sty: i64) -> i64 {
+    var z = ir.new_inst(g_cur_block, 29, types.named(TK_I64))  // zext
+    ir.add_operand(z, sty, 2)
+    ir.add_operand(z, v, 0)
+    return ir.get_value(z)
+}
+
+// trunc i64 %v to i8（单字节写入用）
+func s21_trunc_i8(v: i64) -> i64 {
+    var t = ir.new_inst(g_cur_block, 37, types.named(TK_I8))  // trunc
+    ir.add_operand(t, types.named(TK_I64), 2)
+    ir.add_operand(t, v, 0)
+    return ir.get_value(t)
+}
+
+// 整数二元运算快捷（add/sub/and/or/shl，i64）
+func s21_bin(op: i64, a: i64, b: i64) -> i64 {
+    var s = ir.new_inst(g_cur_block, op, types.named(TK_I64))
+    ir.add_operand(s, a, 0)
+    ir.add_operand(s, b, 0)
+    return ir.get_value(s)
+}
+
+// memcpy(dst, src, n)：libc memcpy（extern_call；llvmgen extern_decl 登记，
+// is_libc_sym 免 interp 链接；参数全为普通类型——LLVM 内建 memcpy 的 i1
+// immarg 参数不能用 SSA 寄存器，故走 libc 版本）
+func s21_memcpy(dst: i64, src: i64, n: i64) {
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, types.named(TK_STR))
+    table_push(avs, dst)
+    table_push(ats, types.named(TK_STR))
+    table_push(avs, src)
+    table_push(ats, types.named(TK_I64))
+    table_push(avs, n)
+    gen_ext_call_typed("memcpy", ats, avs, -1)
+}
+
+// if n > 0: memcpy(dst, src, n)——保护 src 为 null（空缓冲）的零长拷贝
+func s21_memcpy_if(dst: i64, src: i64, n: i64) {
+    var c = gen_icmp_c(n, gen_int_lit(0), 3)  // sgt
+    var t = ir.new_block(g_cur_func, interner.intern("s21.mt"))
+    var e = ir.new_block(g_cur_func, interner.intern("s21.me"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cb, c, 0)
+    ir.add_operand(cb, t, 1)
+    ir.add_operand(cb, e, 1)
+    g_cur_block = t
+    s21_memcpy(dst, src, n)
+    var br = ir.new_inst(g_cur_block, 30, -1)  // br e
+    ir.add_operand(br, e, 1)
+    g_cur_block = e
+}
+
+// 字符串长度头读取：len(s) = load i64, gep(i8, s, -8)——O(1)
+func s21_str_head_len(s: i64) -> i64 {
+    var hp = s21_gep(s, -8, true)
+    return s21_load(hp, types.named(TK_I64))
+}
+
+// 取第 i 字节（0 ≤ i < len(s)；越界未定义——调用方保证）
+func s21_str_byte(s: i64, i: i64) -> i64 {
+    var bp = s21_gep(s, i, false)
+    return s21_zext(s21_load(bp, types.named(TK_I8)), types.named(TK_I8))
+}
+
+// UTF-8 序列长度（按首字节判定，无分支算术）：
+//   l = 4 - (b<0x80) - (b<0xE0) - (b<0xF0)   （ult 无符号比较，字节值 0-255）
+func s21_utf8_seq_len(s: i64, i: i64) -> i64 {
+    var b = s21_str_byte(s, i)
+    var t1 = s21_zext(gen_icmp_c(b, gen_int_lit(128), 6), types.named(TK_BOOL))
+    var t2 = s21_zext(gen_icmp_c(b, gen_int_lit(224), 6), types.named(TK_BOOL))
+    var t3 = s21_zext(gen_icmp_c(b, gen_int_lit(240), 6), types.named(TK_BOOL))
+    var r = s21_bin(1, gen_int_lit(4), t1)  // sub
+    var r2 = s21_bin(1, r, t2)
+    return s21_bin(1, r2, t3)
+}
+
+// 解码字节 i 起的 UTF-8 码点（序列长度 l 由 utf8_seq_len 判定）。
+// 分支结构：默认 cp=b0；l==2 → 2 字节公式；l==3 → 3 字节；否则 4 字节。
+// 每分支独立 load 所需字节——l 保证不越界（短序列不读多余字节）。
+func s21_utf8_char_at(s: i64, i: i64) -> i64 {
+    var l = s21_utf8_seq_len(s, i)
+    var b0 = s21_str_byte(s, i)
+    // 结果槽（alloca 提升到 entry 由 llvmgen 统一处理）
+    var slot = ir.new_inst(g_cur_block, 20, types.named(TK_I64))  // alloca i64
+    ir.add_operand(slot, types.named(TK_I64), 2)
+    var sv = ir.get_value(slot)
+    s21_store(sv, b0, types.named(TK_I64))  // 默认 cp = b0（l==1）
+    // 子块：l==2 处理 / l==3 判定 / l==3 处理 / l==4 处理 / 汇合
+    var blk2 = ir.new_block(g_cur_func, interner.intern("s21.c2"))
+    var blk3c = ir.new_block(g_cur_func, interner.intern("s21.c3c"))
+    var blk3 = ir.new_block(g_cur_func, interner.intern("s21.c3"))
+    var blk4 = ir.new_block(g_cur_func, interner.intern("s21.c4"))
+    var merge = ir.new_block(g_cur_func, interner.intern("s21.cm"))
+    // if l == 2 → blk2，else → blk3c
+    var c2 = gen_cmp_const(l, 0, 2, types.named(TK_I64))  // eq 2
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cb2, c2, 0)
+    ir.add_operand(cb2, blk2, 1)
+    ir.add_operand(cb2, blk3c, 1)
+    // blk2：cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F)
+    g_cur_block = blk2
+    var bi1 = s21_bin(0, i, gen_int_lit(1))
+    var b1 = s21_str_byte(s, bi1)
+    var cp2 = s21_bin(7, s21_bin(10, s21_bin(6, b0, gen_int_lit(31)), gen_int_lit(6)), s21_bin(6, b1, gen_int_lit(63)))
+    s21_store(sv, cp2, types.named(TK_I64))
+    var br2 = ir.new_inst(g_cur_block, 30, -1)  // br merge
+    ir.add_operand(br2, merge, 1)
+    // blk3c：if l == 3 → blk3，else → blk4
+    g_cur_block = blk3c
+    var c3 = gen_cmp_const(l, 0, 3, types.named(TK_I64))  // eq 3
+    var cb3 = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cb3, c3, 0)
+    ir.add_operand(cb3, blk3, 1)
+    ir.add_operand(cb3, blk4, 1)
+    // blk3：cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
+    // 注意：偏移指令在块内重新生成（SSA：不能跨互斥块引用 blk2 的指令值）
+    g_cur_block = blk3
+    var bi1b = s21_bin(0, i, gen_int_lit(1))
+    var b1b = s21_str_byte(s, bi1b)
+    var bi2 = s21_bin(0, i, gen_int_lit(2))
+    var b2 = s21_str_byte(s, bi2)
+    var t3a = s21_bin(10, s21_bin(6, b0, gen_int_lit(15)), gen_int_lit(12))
+    var t3b = s21_bin(10, s21_bin(6, b1b, gen_int_lit(63)), gen_int_lit(6))
+    var t3c = s21_bin(6, b2, gen_int_lit(63))
+    var cp3 = s21_bin(7, s21_bin(7, t3a, t3b), t3c)
+    s21_store(sv, cp3, types.named(TK_I64))
+    var br3 = ir.new_inst(g_cur_block, 30, -1)  // br merge
+    ir.add_operand(br3, merge, 1)
+    // blk4：cp = ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)
+    g_cur_block = blk4
+    var bi1c = s21_bin(0, i, gen_int_lit(1))
+    var b1c = s21_str_byte(s, bi1c)
+    var bi2c = s21_bin(0, i, gen_int_lit(2))
+    var b2c = s21_str_byte(s, bi2c)
+    var bi3 = s21_bin(0, i, gen_int_lit(3))
+    var b3 = s21_str_byte(s, bi3)
+    var t4a = s21_bin(10, s21_bin(6, b0, gen_int_lit(7)), gen_int_lit(18))
+    var t4b = s21_bin(10, s21_bin(6, b1c, gen_int_lit(63)), gen_int_lit(12))
+    var t4c = s21_bin(10, s21_bin(6, b2c, gen_int_lit(63)), gen_int_lit(6))
+    var t4d = s21_bin(6, b3, gen_int_lit(63))
+    var cp4 = s21_bin(7, s21_bin(7, s21_bin(7, t4a, t4b), t4c), t4d)
+    s21_store(sv, cp4, types.named(TK_I64))
+    var br4 = ir.new_inst(g_cur_block, 30, -1)  // br merge
+    ir.add_operand(br4, merge, 1)
+    // merge：结果 = load 槽
+    g_cur_block = merge
+    return s21_load(sv, types.named(TK_I64))
+}
+
+// StringBuilder 句柄 = ptr → { i64 cap, i64 len, ptr data }（两级指针：
+// data 重分配可移动，句柄地址稳定）。string_builder() 返回 ptrtoint 句柄。
+func s21_sb_new() -> i64 {
+    var h = gen_ext_call1("malloc", gen_int_lit(24), types.named(TK_I64), types.named(TK_STR))
+    s21_store(s21_gep(h, 0, true), gen_int_lit(0), types.named(TK_I64))    // cap = 0
+    s21_store(s21_gep(h, 8, true), gen_int_lit(0), types.named(TK_I64))    // len = 0
+    s21_store(s21_gep(h, 16, true), gen_int_lit(0), types.named(TK_STR))   // data = null
+    var pi = ir.new_inst(g_cur_block, 24, types.named(TK_I64))  // ptrtoint
+    ir.add_operand(pi, h, 0)
+    return ir.get_value(pi)
+}
+
+// 句柄 i64 → 真 ptr（inttoptr）
+func s21_sb_ptr(hv: i64) -> i64 {
+    var ip = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr → ptr
+    ir.add_operand(ip, hv, 0)
+    return ir.get_value(ip)
+}
+
+// 若 need > cap：重新分配 data 缓冲（newcap = max(cap*2, need)），
+// 拷贝旧数据（len>0 时）、释放旧缓冲、更新句柄 cap/data 字段。
+// 生成 if 链后 g_cur_block 推进到汇合块（调用方继续生成追加逻辑）。
+func s21_sb_grow(h: i64, cap: i64, len: i64, data: i64, need: i64) {
+    var gc = gen_icmp_c(need, cap, 3)  // sgt
+    var gt = ir.new_block(g_cur_func, interner.intern("s21.gt"))
+    var ge = ir.new_block(g_cur_func, interner.intern("s21.ge"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cb, gc, 0)
+    ir.add_operand(cb, gt, 1)
+    ir.add_operand(cb, ge, 1)
+    // then：倍增容量（newcap = max(cap*2, need)）
+    g_cur_block = gt
+    var nc2 = s21_bin(2, cap, gen_int_lit(2))  // mul
+    var c_lt = gen_icmp_c(nc2, need, 2)  // slt
+    var newcap = gen_select_i(c_lt, need, nc2, types.named(TK_I64))
+    var nd = gen_ext_call1("malloc", newcap, types.named(TK_I64), types.named(TK_STR))
+    s21_memcpy_if(nd, data, len)
+    gen_ext_call1("free", data, types.named(TK_STR), -1)
+    s21_store(s21_gep(h, 16, true), nd, types.named(TK_STR))
+    s21_store(s21_gep(h, 0, true), newcap, types.named(TK_I64))
+    var brg = ir.new_inst(g_cur_block, 30, -1)  // br ge
+    ir.add_operand(brg, ge, 1)
+    g_cur_block = ge
+}
+
+// sb_append(h, s)：原地追加（读 s 长度头 O(1)；增长分支；memcpy 数据段）
+func s21_sb_append(hv: i64, s: i64) {
+    var h = s21_sb_ptr(hv)
+    var cap = s21_load(s21_gep(h, 0, true), types.named(TK_I64))
+    var len = s21_load(s21_gep(h, 8, true), types.named(TK_I64))
+    var data = s21_load(s21_gep(h, 16, true), types.named(TK_STR))
+    var slen = s21_str_head_len(s)
+    var need = s21_bin(0, len, slen)
+    s21_sb_grow(h, cap, len, data, need)
+    // 汇合后重新读 data（增长分支可能已更新）
+    var data2 = s21_load(s21_gep(h, 16, true), types.named(TK_STR))
+    var dst = s21_gep(data2, len, false)
+    s21_memcpy_if(dst, s, slen)
+    s21_store(s21_gep(h, 8, true), need, types.named(TK_I64))
+}
+
+// sb_append_byte(h, b)：原地追加单字节（trunc i64 → i8；二进制安全含 \0）
+func s21_sb_append_byte(hv: i64, b: i64) {
+    var h = s21_sb_ptr(hv)
+    var cap = s21_load(s21_gep(h, 0, true), types.named(TK_I64))
+    var len = s21_load(s21_gep(h, 8, true), types.named(TK_I64))
+    var data = s21_load(s21_gep(h, 16, true), types.named(TK_STR))
+    var need = s21_bin(0, len, gen_int_lit(1))
+    s21_sb_grow(h, cap, len, data, need)
+    var data2 = s21_load(s21_gep(h, 16, true), types.named(TK_STR))
+    var dst = s21_gep(data2, len, false)
+    s21_store(dst, s21_trunc_i8(b), types.named(TK_I8))
+    s21_store(s21_gep(h, 8, true), need, types.named(TK_I64))
+}
+
+// sb_build(h)：产出 {头, 数据, \0} 字符串（malloc len+9；写头；拷数据；尾 \0）。
+// 句柄不释放（探针/短期程序进程退出回收；文档注明可复用）。
+func s21_sb_build(hv: i64) -> i64 {
+    var h = s21_sb_ptr(hv)
+    var len = s21_load(s21_gep(h, 8, true), types.named(TK_I64))
+    var data = s21_load(s21_gep(h, 16, true), types.named(TK_STR))
+    var size = s21_bin(0, len, gen_int_lit(9))
+    var buf = gen_ext_call1("malloc", size, types.named(TK_I64), types.named(TK_STR))
+    s21_store(s21_gep(buf, 0, true), len, types.named(TK_I64))  // 长度头
+    var d0 = s21_gep(buf, 8, true)  // 数据起始
+    s21_memcpy_if(d0, data, len)
+    s21_store(s21_gep(d0, len, false), gen_int_lit_ty(0, types.named(TK_I8)), types.named(TK_I8))  // 尾 \0
+    return d0
 }
 
 // 便捷：双参数 void 桥

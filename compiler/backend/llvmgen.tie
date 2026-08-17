@@ -259,7 +259,7 @@ func emit_globals() {
                         var empty_id = interner.intern("")
                         eslot = str_slot(empty_id)
                     }
-                    line("@" + nm + " = global ptr @.str." + to_string(eslot))
+                    line("@" + nm + " = global ptr " + str_data_ref(eslot))
                     i = i + 1
                     continue
                 }
@@ -709,6 +709,30 @@ func asm_tmpl_convert(t: string) -> string {
     }
     return out
 }
+// S2.1：@.str.N 序号 → 该字符串常量字节长度（与 emit_strings 同款 utf.byte_len）。
+// 头部长度字段是 {ptr,len} 表示的编译期来源——字面量在 .rodata 带 8 字节 i64 头。
+func str_len_of_slot(slot: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(str_pool) {
+        if str_idx[i] == slot {
+            return utf.byte_len(intern.lookup(str_pool[i]))
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// S2.1：字符串常量**数据指针**引用（内联 GEP 常量表达式，可直用于实参/ret/
+// global 初始化——LLVM 常量表达式允许内联）。
+// 字面量布局升级：`{ i64 长度头, [N+1 x i8] 数据+\0 }`（{ptr,len} 表示 +
+// 边界自动 NUL：数据末尾保留 \0 供 FFI 零拷贝传递）。数据指针 = GEP 0,1。
+// 所有 "@.str.N" 直引点统一走本函数，保证引用指向数据而非头部。
+func str_data_ref(slot: i64) -> string {
+    var n = str_len_of_slot(slot)
+    return "getelementptr ({ i64, [" + to_string(n + 1) + " x i8] }, ptr @.str." +
+        to_string(slot) + ", i32 0, i32 1)"
+}
+
 // 查找/登记字符串池 id → @.str.N 序号
 func str_slot(name_id: i64) -> i64 {
     var i: i64 = 0
@@ -804,6 +828,10 @@ func collect_externs() {
 func extern_decl(sym: string) -> string {
     if sym == "tie_exec_code" {
         return "declare i64 @tie_exec_code(ptr)"
+    }
+    // S2.1：libc memcpy（StringBuilder 数据拷贝；clang 链接 CRT 提供）
+    if sym == "memcpy" {
+        return "declare void @memcpy(ptr, ptr, i64)"
     }
     if sym == "tie_get_env" {
         return "declare ptr @tie_get_env(ptr)"
@@ -1124,15 +1152,18 @@ func escape_str(s: string) -> string {
     return out
 }
 
-// 输出字符串常量节（模块末尾）
+// 输出字符串常量节（模块末尾）。S2.1：布局升级为带 8 字节 i64 长度头的
+// { ptr,len } 表示——`{ i64 N, [N+1 x i8] c"...\00" }`（N = UTF-8 字节数，
+// 末尾 \0 为边界自动 NUL 预留位）。数据指针由 str_data_ref 经 GEP 取。
 func emit_strings() {
     var i: i64 = 0
     while i < len(str_pool) {
         var txt = intern.lookup(str_pool[i])
         var byte_len = utf.byte_len(txt)
         var esc = escape_str(txt)
-        line("@.str." + to_string(str_idx[i]) + " = private unnamed_addr constant [" +
-            to_string(byte_len + 1) + " x i8] c\"" + esc + "\\00\"")
+        line("@.str." + to_string(str_idx[i]) + " = private unnamed_addr constant { i64, [" +
+            to_string(byte_len + 1) + " x i8] } { i64 " + to_string(byte_len) + ", [" +
+            to_string(byte_len + 1) + " x i8] c\"" + esc + "\\00\" }")
         i = i + 1
     }
 }
@@ -1277,7 +1308,7 @@ func arg_ref(inst_id: i64, k: i64) -> string {
     if def >= 0 {
         if ir.ins_op(def) == 62 {
             var slot = str_slot(ir.ins_opnd(def, 0))
-            return "ptr @.str." + to_string(slot)
+            return "ptr " + str_data_ref(slot)
         }
         var vt = ir.ins_ty(def)
         if vt == TK_STR {
@@ -1289,6 +1320,19 @@ func arg_ref(inst_id: i64, k: i64) -> string {
         }
     }
     return "i64 %" + to_string(v)
+}
+
+// S2.1：tie 桥返回 ptr 但**非字符串**（表/字节表句柄）——不得补头。
+// 这类桥在 irgen 用 TK_STR 标注返回值（ptr 槽复用），实际指向桥内表结构，
+// 补头会错乱句柄（tie_table_new 曾致表扩容 LayoutError 崩溃；tie_regex_find_all
+// 漏网曾致 lexer 码点表错乱、自举产物 tiec_v2 编译任何程序产出空 AST）。
+func is_table_bridge(sym: string) -> bool {
+    if sym == "tie_table_new" || sym == "tie_list_dir" ||
+        sym == "tie_walk_dir" || sym == "tie_byte_read" ||
+        sym == "tie_regex_find_all" {
+        return true
+    }
+    return false
 }
 
 // 单条指令 → .ll 文本（核心子集）
@@ -1344,11 +1388,12 @@ func gen_inst(inst_id: i64) {
         return
     }
     if op == 62 {
-        // const_str：字符串全局指针（ptr 类型结果）
+        // const_str：字符串全局指针（ptr 类型结果）。S2.1：数据指针经 GEP
+        // 跳过 8 字节长度头（{ptr,len} 表示），值仍是 i64 指针整数。
         var sid = ir.ins_opnd(inst_id, 0)
         var slot = str_slot(sid)
         // 返回全局字符串指针（作为 ptr 值）
-        line(reg + " = ptrtoint ptr @.str." + to_string(slot) + " to i64")
+        line(reg + " = ptrtoint ptr " + str_data_ref(slot) + " to i64")
         return
     }
     if op == 63 {
@@ -1604,8 +1649,10 @@ func gen_inst(inst_id: i64) {
         // gep（S1.2 ptr_add/slice_of 元素步长）：操作数 [0]=基址 VALUE,
         // [1]=下标 VALUE；ins_ty = **元素类型**（步长 = 元素大小）。
         // 生成 `getelementptr <elem>, ptr %base, i64 <idx>`（单索引元素步长）。
+        // S2.1：基址统一 to_ptr——字符串场景基址可为 const_str（i64 指针整数，
+        // 直引 @.str.N 常量表达式）或 str_cat 结果（i64，须 inttoptr 独立指令）
         var ety = llvm_ty(ir.ins_ty(inst_id))
-        line(reg + " = getelementptr " + ety + ", ptr " + opnd_ref(inst_id, 0) + ", i64 " + opnd_ref(inst_id, 1))
+        line(reg + " = getelementptr " + ety + ", ptr " + to_ptr(ir.ins_opnd(inst_id, 0)) + ", i64 " + opnd_ref(inst_id, 1))
         return
     }
     if op == 24 {
@@ -1779,26 +1826,34 @@ func gen_inst(inst_id: i64) {
     }
     if op == 56 {
         // str_cat（字符串拼接）：操作数 [lhs, rhs] → malloc+memcpy 序列。
-        // 对齐 Rust gen_binary_str 的 Add：strlen+strlen → malloc(len1+len2+1)
-        // → memcpy 两段 → 末尾 \0。
+        // S2.1：升级为 {ptr,len} 布局——malloc 8 头 + 数据 + \0：
+        //   buf[0..8)  = i64 总长（O(1) len 读取）；buf[8..] = UTF-8 数据；
+        //   数据末尾 \0（FFI 边界自动 NUL，旧 strlen/strcmp/printf 兼容）。
+        // 对齐 Rust gen_binary_str 的 Add：strlen+strlen → malloc(len1+len2+9)
+        // → 写头 → memcpy 两段 → 末尾 \0。
         var lv = ir.ins_opnd(inst_id, 0)
         var rv = ir.ins_opnd(inst_id, 1)
         // 注意：arg 传裸引用（gen_call_i64 内部会加 argty 前缀），
         // 曾误传 "ptr " + ref 导致 `strlen(ptr ptr @.str.N)` 重复前缀
         var n1 = gen_call_i64("strlen", "ptr", str_ptr_ref(lv))
         var n2 = gen_call_i64("strlen", "ptr", str_ptr_ref(rv))
-        // total = n1 + n2；size = total + 1
+        // total = n1 + n2；size = total + 9（8 字节头 + 数据 + \0）
         var total = reg_add(n1, n2)
-        var size = reg_add(total, "1")
+        var size = reg_add(total, "9")
         var buf = gen_call_ptr("malloc", "i64", size)
-        // memcpy(buf, lv, n1) + memcpy(buf+n1, rv, n2)
-        line("call void @llvm.memcpy.p0.p0.i64(ptr " + buf + ", ptr " + str_ptr_ref(lv) + ", i64 " + n1 + ", i1 false)")
-        var off = reg_gep(buf, n1)
+        // 写头部长度（S2.1 长度字段）
+        line("store i64 " + total + ", ptr " + buf)
+        // 数据起始 = buf + 8
+        var d0 = reg_gep(buf, "8")
+        // memcpy(d0, lv, n1) + memcpy(d0+n1, rv, n2)
+        line("call void @llvm.memcpy.p0.p0.i64(ptr " + d0 + ", ptr " + str_ptr_ref(lv) + ", i64 " + n1 + ", i1 false)")
+        var off = reg_gep(d0, n1)
         line("call void @llvm.memcpy.p0.p0.i64(ptr " + off + ", ptr " + str_ptr_ref(rv) + ", i64 " + n2 + ", i1 false)")
-        // buf[total] = 0
-        var endp = reg_gep(buf, total)
+        // d0[total] = 0（边界自动 NUL）
+        var endp = reg_gep(d0, total)
         line("store i8 0, ptr " + endp)
-        line(reg + " = ptrtoint ptr " + buf + " to i64")
+        // 返回数据指针（ptrtoint i64 指针整数，{ptr,len} 的 ptr 位）
+        line(reg + " = ptrtoint ptr " + d0 + " to i64")
         return
     }
     if op == 30 {
@@ -1905,12 +1960,17 @@ func gen_inst(inst_id: i64) {
         if args != "" {
             call_args = ", " + args
         }
-        line(reg + " = call i32 (ptr, ...) @printf(ptr @.str." + to_string(slot) + call_args + ")")
+        line(reg + " = call i32 (ptr, ...) @printf(ptr " + str_data_ref(slot) + call_args + ")")
         return
     }
     if op == 36 {
         // extern_call（阶段 A 新布局）：操作数 [0]=符号名池 id, [1]=返回类型IMM,
         // 然后每参数 [类型IMM, 值]。返回类型 = ins_ty（void → call void）。
+        // S2.1：tie 桥返回字符串（ptr）= 无头堆串（桥内 malloc，无长度头）→
+        // 调用后**补头**（strlen + malloc + memcpy），统一为 {ptr,len} 布局
+        // （头部 8 字节 i64 长度 + 数据 + \0），保证 len(s) O(1) 与二进制安全。
+        // 判据：ins_ty == TK_STR 且符号 tie_ 前缀（libc 的 malloc/strlen 等
+        // 不以 tie_ 开头，绝不误补头）。补头后 reg 仍为数据指针（值 id 不变）。
         var sid = ir.ins_opnd(inst_id, 0)
         var sym = intern.lookup(sid)
         var args = ""
@@ -1925,6 +1985,22 @@ func gen_inst(inst_id: i64) {
         }
         if ir.ins_ty(inst_id) < 0 || ir.ins_ty(inst_id) == TK_VOID {
             line("call void @" + sym + "(" + args + ")")
+        } else if ir.ins_ty(inst_id) == TK_STR && str_prefix(sym, "tie_") && !is_table_bridge(sym) {
+            // 桥返回堆串：先经临时寄存器 call，再补头，最后 reg = 数据指针
+            g_str_reg_cnt = g_str_reg_cnt + 1
+            var tmp = "%sc" + to_string(g_str_reg_cnt)
+            line(tmp + " = call " + llvm_ty(ir.ins_ty(inst_id)) + " @" + sym + "(" + args + ")")
+            // 补头序列：n = strlen(ret)；buf = malloc(n+9)；buf[0] = n；
+            // memcpy(buf+8, ret, n)；buf[8+n] = 0；reg = buf+8
+            var rn = gen_call_i64("strlen", "ptr", tmp)
+            var sz = reg_add(rn, "9")
+            var bf = gen_call_ptr("malloc", "i64", sz)
+            line("store i64 " + rn + ", ptr " + bf)
+            var dd = reg_gep(bf, "8")
+            line("call void @llvm.memcpy.p0.p0.i64(ptr " + dd + ", ptr " + tmp + ", i64 " + rn + ", i1 false)")
+            var ee = reg_gep(dd, rn)
+            line("store i8 0, ptr " + ee)
+            line(reg + " = getelementptr i8, ptr " + bf + ", i64 8")
         } else {
             line(reg + " = call " + llvm_ty(ir.ins_ty(inst_id)) + " @" + sym + "(" + args + ")")
         }
@@ -1947,7 +2023,7 @@ func typed_ref(inst_id: i64, k: i64) -> string {
     if def >= 0 {
         if ir.ins_op(def) == 62 {
             var slot = str_slot(ir.ins_opnd(def, 0))
-            return "@.str." + to_string(slot)
+            return str_data_ref(slot)
         }
         if ir.ins_op(def) == 56 {
             // str_cat 结果（i64 指针整数）→ inttoptr 转 ptr（extern_call 字符串参数）
@@ -1981,7 +2057,7 @@ func to_ptr(v: i64) -> string {
     if def >= 0 {
         if ir.ins_op(def) == 62 {
             var slot = str_slot(ir.ins_opnd(def, 0))
-            return "@.str." + to_string(slot)
+            return str_data_ref(slot)
         }
         if ir.ins_op(def) == 56 {
             // str_cat 结果（i64 指针整数）→ inttoptr 转 ptr
@@ -2046,7 +2122,7 @@ func ptr_arg_ref(inst_id: i64, k: i64) -> string {
     if def >= 0 {
         if ir.ins_op(def) == 62 {
             var slot = str_slot(ir.ins_opnd(def, 0))
-            return "ptr @.str." + to_string(slot)
+            return "ptr " + str_data_ref(slot)
         }
     }
     return "ptr " + to_ptr(v)

@@ -1,0 +1,49 @@
+type tie<logic>
+// S2.1 字符串探针 2：len(s) 字节长度 O(1)（长度头）——字面量/str_cat/桥返回/中文
+// 覆盖：字面量 len、中文 UTF-8 字节数（str_len 码点数兼容旧语义）、
+//       str_cat 结果带头、桥返回串（to_string）自动补头后 len 可读
+// 期望输出：
+//   PASS literal len=5
+//   PASS utf8 bytes=6
+//   PASS str_len cps=2
+//   PASS cat len=9
+//   PASS bridge len=2
+func main() {
+    // 字面量（.rodata 常量带头：{ i64 长度头, 数据+\0 }）
+    if len("hello") == 5 {
+        println("PASS literal len=5")
+    } else {
+        println("FAIL literal len=" + to_string(len("hello")))
+        exit(1)
+    }
+    // 中文串："你好" UTF-8 = 6 字节；码点数 2（str_len 保持码点计数语义）
+    var s = "你好"
+    if len(s) == 6 {
+        println("PASS utf8 bytes=6")
+    } else {
+        println("FAIL utf8 bytes=" + to_string(len(s)))
+        exit(1)
+    }
+    if str_len(s) == 2 {
+        println("PASS str_len cps=2")
+    } else {
+        println("FAIL str_len=" + to_string(str_len(s)))
+        exit(1)
+    }
+    // str_cat（malloc 带头：8 字节头 + 数据 + \0）
+    var t = "ab" + "cdefghi"
+    if len(t) == 9 {
+        println("PASS cat len=9")
+    } else {
+        println("FAIL cat len=" + to_string(len(t)))
+        exit(1)
+    }
+    // 桥返回串（tie_to_string_i64 堆串）→ llvmgen 自动补头 → len 可读
+    var n = to_string(42)
+    if len(n) == 2 {
+        println("PASS bridge len=2")
+    } else {
+        println("FAIL bridge len=" + to_string(len(n)))
+        exit(1)
+    }
+}

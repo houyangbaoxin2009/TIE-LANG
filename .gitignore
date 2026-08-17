@@ -53,6 +53,9 @@ opencode.json
 # 自举 v2 测试编译产物（tests/language/*.tie 经 tiec 编译生成）
 /tests/language/*.exe
 
+# S2.1 字符串模型探针编译产物（.tie 源文件入库，.exe 不入库）
+/tests/s21_probe/*.exe
+
 # 包管理器自举产物（pkg.exe，由 tie-llvm 编译 pkg/main.tie 生成）
 /pkg/pkg.exe
 
