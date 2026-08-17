@@ -1,0 +1,16 @@
+// tie.pkg —— S3.2 多文件包探针库清单（L1c）
+// 包 = 目录 + 清单：main 指向入口文件，exports 声明对外导出面；
+// 包内模块（src/calc.tie）互相 import 私有，对外只暴露入口声明面。
+// tie:data
+[
+    "name": "s32_math",
+    "version": "1.0.0",
+    "description": "S3.2 多文件包探针库",
+    "role": "class",
+    "main": "src/main.tie",
+    "exports": "src/main.tie",
+    "author": "s32-package",
+    "license": "MIT",
+    "dependencies": [
+    ],
+]

@@ -22,6 +22,8 @@ type tie<logic>
 import "./backend/irgen.tie"
 import "./backend/toolchain.tie"
 import "./config.tie"
+// S3.2：tieir 序列化（--tieir-out 输出分发单元 / --dump-irt 读回 dump）
+import "./middle/tieir_ser.tie"
 
 // ==================== 全局 ====================
 var g_input: string = "";
@@ -38,6 +40,9 @@ var g_config_path: string = "";   // --config <f> 指定（空 = 当前目录 co
 var g_cli_profile: string = "";   // --profile <p> 指定（空 = config 顶层 profile 键）
 var g_cfg_root: i64 = -1;         // 分层合并后的配置根节点（load_merge 结果）
 var g_backend_cli: string = "";   // --backend <b> 指定（空 = 配置 tiec.backend）
+// S3.2：tieir 分发（--tieir-out <f> 编译后序列化 .tieir；--dump-irt <f> 只读 dump）
+var g_tieir_out: string = "";     // --tieir-out 指定（空 = 不输出 .tieir）
+var g_dump_irt: string = "";      // --dump-irt <f> 指定（空 = 不 dump）
 
 // ==================== 参数解析 ====================
 
@@ -54,6 +59,8 @@ func usage() -> i64 {
     println("  --config <f>     构建配置文件（默认查当前目录 config.data.tie）")
     println("  --profile <p>    构建 profile（dev/release，覆盖配置顶层 profile 键）")
     println("  --backend <b>    后端实现选择（win32；其他 port 尚未接入）")
+    println("  --tieir-out <f>  编译后序列化 tieir 分发单元（S3.2；.tieir 二进制）")
+    println("  --dump-irt <f>   只读 .tieir 并输出可读摘要（S3.2；不编译）")
     println("  --help           显示本帮助")
     return 0
 }
@@ -115,6 +122,18 @@ func parse_args() -> i64 {
                 return -1
             }
             g_backend_cli = arg_string(i + 1)
+            i = i + 1
+        } else if a == "--tieir-out" {
+            if i + 1 >= n {
+                return -1
+            }
+            g_tieir_out = arg_string(i + 1)
+            i = i + 1
+        } else if a == "--dump-irt" {
+            if i + 1 >= n {
+                return -1
+            }
+            g_dump_irt = arg_string(i + 1)
             i = i + 1
         } else if str_len(a) > 1 && str_char(a, 0) == "-" {
             // 未知选项
@@ -428,6 +447,16 @@ func main() -> i64 {
         println("参数错误。输入 tiec --help 查看用法。")
         return 2
     }
+    // S3.2：--dump-irt 短路——只读 .tieir 输出可读摘要（不编译）
+    if str_len(g_dump_irt) > 0 {
+        var drc = tieir.read(g_dump_irt)
+        if drc != 0 {
+            println("tieir 读取失败: " + tieir.err_msg())
+            return 1
+        }
+        print(tieir.dump_text())
+        return 0
+    }
     // 读源码
     if !file_exists(g_input) {
         println("读取源码失败: " + g_input)
@@ -577,6 +606,15 @@ func compile_program(src: string) -> i64 {
         }
         println("IR 生成失败: " + msg)
         return 1
+    }
+    // S3.2：--tieir-out 序列化分发单元（IR 主体 + 元信息侧表；与 .ll 生成
+    // 并行路径，不影响既有编译流程）
+    if str_len(g_tieir_out) > 0 {
+        if !tieir.write(g_tieir_out) {
+            println("tieir 序列化失败: " + tieir.err_msg())
+            return 1
+        }
+        println("已生成 tieir: " + g_tieir_out)
     }
     var ll_text = llvmgen.emit()
     // IR 文件路径：--emit-ir → -o 或 输入.ll；否则中间文件（输出基准）

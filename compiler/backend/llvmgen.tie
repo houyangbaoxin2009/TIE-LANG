@@ -14,7 +14,11 @@ type tie<class>
 // 树式无环：irgen import 本文件（本文件不 import irgen）。
 // UTF-8 字节级能力复用 std/utf（hex_escape/utf8_bytes/byte_len），
 // 不再内联重复实现（编译器自举后亦可继续依赖 std——std 亦为 tie 自写）。
-import "./../middle/ir.tie"
+// S3.2：import 用 "../middle/ir.tie"（无 "./" 前缀）→ 展开路径归一化为
+// "compiler/middle/ir.tie"，与 tieir_ser 树的 ir 展开路径字符串一致，
+// import 去重生效（此前 "./../middle/ir.tie" 得 "compiler/backend/../middle/
+// ir.tie"，双入口时 ir 全局常量重复定义）
+import "../middle/ir.tie"
 import "../../std/utf.tie"
 
 // ==================== 输出缓冲 ====================
@@ -2014,6 +2018,17 @@ func gen_inst(inst_id: i64) {
 // 不经过寄存器）；否则 "%N"。
 func typed_ref(inst_id: i64, k: i64) -> string {
     var v = ir.ins_opnd(inst_id, k)
+    // S3.2：全局地址（kind 3）优先——ref 全局表实参（如 columnar.set_pair_i64
+    // 传 doc_keys）须输出 @sym 直引；此前漏处理输出 "%N"（N 为 "@name" 池 id，
+    // 非本函数定义的值）→ opt 报 use of undefined value
+    var kd = ir.ins_opnd_kind(inst_id, k)
+    if kd == 3 {
+        var gref = global_ref(v)
+        if str_len(gref) > 0 {
+            return gref
+        }
+        return "%" + to_string(v)  // 防御（理论上不达）
+    }
     // 形参优先（按形参位置 %N；类型由调用方 pty 决定）
     var pr = param_ref(v)
     if pr != "" {

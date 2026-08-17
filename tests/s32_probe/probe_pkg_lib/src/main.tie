@@ -1,0 +1,15 @@
+type tie<class>
+// 包入口（L1c：tie.pkg 的 main 字段指向；对外导出面 = 本文件的导出）
+// 包内模块经相对 import 引用（calc.tie 为私有模块）
+import "./calc.tie"
+
+namespace s32math {
+    // 对外 API：整数加法
+    pub func add(a: i64, b: i64) -> i64 {
+        return a + b
+    }
+    // 对外 API：内部模块联动（twice + 1）
+    pub func calc(x: i64) -> i64 {
+        return s32calc.twice(x) + 1
+    }
+}

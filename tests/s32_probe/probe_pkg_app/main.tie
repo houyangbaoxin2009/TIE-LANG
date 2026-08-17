@@ -1,0 +1,10 @@
+type tie<logic>
+// 消费方入口（S3.2 探针）：import 包入口文件（.tie/deps 安装后），
+// 包内模块经入口间接可达——验证「包打包 → 安装 → 消费方 import →
+// 编译链接 → 运行」全链路
+import "./.tie/deps/s32_math/src/main.tie"
+
+func main() {
+    println("add(2,3)=" + to_string(s32math.add(2, 3)))
+    println("calc(5)=" + to_string(s32math.calc(5)))
+}

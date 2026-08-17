@@ -38,6 +38,14 @@ tiec 实现）。阶段 1 语言地基（2026-08-15）新增三大系统能力�
 追加 + 容量倍增）；tie 桥返回串自动补头统一布局，旧 API（str_len/str_cat/
 to_string）行为不变，探针全过 + 自举闭环 IR 逐字节一致，见
 [docs/plans/string-model.md](docs/plans/string-model.md)。
+阶段 3 库/包模型（2026-08-17，S3.2）新增**库/包能力**：**tieir 二进制
+序列化**（IR 分发单元：`--tieir-out` / `--dump-irt`，`compiler/middle/
+tieir_ser.tie`）、**多文件包 L1c**（`tie pack`/`tie verify`：包 = 目录 +
+tie.pkg，入口声明导出面，包内模块私有）、**MVS 最小版本选择**（P2c：
+约束解析取最低满足版本，可复现）、**签名校验**（P5c：pack 生成 signature
+内容哈希，install/verify 校验防篡改），见
+[docs/plans/package-model.md](docs/plans/package-model.md) 与
+[docs/plans/tieir-format.md](docs/plans/tieir-format.md)。
 
 
 我们的目标：全领域通用，Python的体验，Rust的性能与安全。

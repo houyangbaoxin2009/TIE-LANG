@@ -70,8 +70,8 @@ var exp_sigs: table<i64>;         // 导出签名（池 id；-1 = 未提供）
 var exp_lines: table<i64>;        // 导出行（1-based）
 var exp_cols: table<i64>;         // 导出列（1-based）
 // doc_comment 表（columnar 排序对：符号/节点 id -> 文档池 id）
-var doc_keys: table<i64>;         // 关联 id（符号 id/节点 id，升序）
-var doc_vals: table<i64>;         // 文档字符串池 id
+var meta_doc_keys: table<i64>;         // 关联 id（符号 id/节点 id，升序）
+var meta_doc_vals: table<i64>;         // 文档字符串池 id
 // 模块头元数据（标量；0 = 未设置哨兵——全局初始化须为字面量，
 // -1 是表达式会被语义层拦截，实测 2026-08-11；dump 时按 0 判未设置）
 var meta_pkg_name: i64 = 0;        // 包名（池 id；0 = 未设置）
@@ -101,8 +101,8 @@ pub func reset_meta() {
     exp_sigs = table_new_i64()
     exp_lines = table_new_i64()
     exp_cols = table_new_i64()
-    doc_keys = table_new_i64()
-    doc_vals = table_new_i64()
+    meta_doc_keys = table_new_i64()
+    meta_doc_vals = table_new_i64()
     dep_keys = table_new_i64()
     dep_vals = table_new_i64()
     meta_pkg_name = 0
@@ -294,20 +294,20 @@ pub func exp_col(exp_id: i64) -> i64 {
 // 届时 lexer 把文档字符串登记进池，frontend 调 set_doc 关联到节点。
 
 pub func set_doc(key: i64, doc_id: i64) {
-    columnar.set_pair_i64(doc_keys, doc_vals, key, doc_id)
+    columnar.set_pair_i64(meta_doc_keys, meta_doc_vals, key, doc_id)
 }
 
 pub func get_doc(key: i64) -> i64 {
-    var idx = columnar.bs_find_i64(doc_keys, key)
+    var idx = columnar.bs_find_i64(meta_doc_keys, key)
     if idx < 0 {
         return -1
     }
-    return doc_vals[idx]
+    return meta_doc_vals[idx]
 }
 
 // 已登记文档条数。
 pub func doc_count() -> i64 {
-    return len(doc_keys)
+    return len(meta_doc_keys)
 }
 
 // ---------- 模块头元数据（.tieir 头节数据源）----------

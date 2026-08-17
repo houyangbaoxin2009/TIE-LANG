@@ -1,0 +1,9 @@
+type tie<class>
+// 包内私有模块（L1c：包内文件互相 import 私有，不对外暴露——消费方
+// 只 import 包入口 src/main.tie，本模块经入口间接可达）
+namespace s32calc {
+    // 内部工具：翻倍（仅供包内使用）
+    pub func twice(x: i64) -> i64 {
+        return x * 2
+    }
+}

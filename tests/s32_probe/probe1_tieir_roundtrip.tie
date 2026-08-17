@@ -1,0 +1,110 @@
+type tie<logic>
+// 临时验证：tieir 序列化 roundtrip（S3.2 探针雏形）
+import "./../../compiler/middle/tieir_ser.tie"
+import "./../../compiler/middle/types.tie"
+
+var g_fail: i64 = 0
+var g_pass: i64 = 0
+
+func check(ok: bool, msg: string) {
+    if ok {
+        g_pass = g_pass + 1
+        println("OK: " + msg)
+    } else {
+        g_fail = g_fail + 1
+        println("FAIL: " + msg)
+    }
+}
+
+func main() {
+    // 构造 IR（与 ir_test.tie 同构）
+    ir.new_module()
+    ir_meta.reset_meta()
+    ir_meta.set_pkg_name(interner.intern("demo_pkg"))
+    ir_meta.set_pkg_version(interner.intern("0.1.0"))
+    ir_meta.set_ir_version(1)
+    ir_meta.set_compiler_version(interner.intern("tiec-0.0.1"))
+    ir_meta.set_dep(interner.intern("std"), interner.intern("1.0.0"))
+    var nm_f = interner.intern("f")
+    var params: table<i64> = table_new_i64()
+    table_push(params, types.named(3))
+    table_push(params, types.named(3))
+    var f = ir.new_func(nm_f, types.named(3), params)
+    var blk_entry = ir.new_block(f, interner.intern("entry"))
+    var blk_then = ir.new_block(f, interner.intern("if.then"))
+    var i0 = ir.new_inst(blk_entry, 0, types.named(3))
+    ir.add_operand(i0, 0, 0)
+    ir.add_operand(i0, 1, 0)
+    var i1 = ir.new_inst(blk_entry, 12, types.named(10))
+    ir.add_operand(i1, 0, 0)
+    ir.add_operand(i1, 1, 0)
+    ir.add_operand(i1, 2, 2)
+    var i2 = ir.new_inst(blk_entry, 31, -1)
+    ir.add_operand(i2, ir.get_value(i1), 0)
+    ir.add_operand(i2, blk_then, 1)
+    ir.add_operand(i2, blk_entry, 1)
+    var i3 = ir.new_inst(blk_then, 32, -1)
+    ir.add_operand(i3, ir.get_value(i0), 0)
+    ir_meta.set_inst_span(i0, 10, 5)
+    ir_meta.set_inst_span(i2, 12, 3)
+    ir_meta.set_sym(nm_f, interner.intern("fn(a: i64, b: i64) -> i64"), 0, 1, 1, 1)
+    ir_meta.export_func(f, 1, 1)
+    ir_meta.set_doc(0, interner.intern("/// 计算 a+b"))
+    check(ir.func_count() == 1, "构造完成")
+    check(ir.value_count() == 4, "值编号 0..3")
+
+    // 序列化
+    var t = tieir.serialize()
+    check(len(t) > 50, "序列化字节表非空（len=" + to_string(len(t)) + "）")
+    var h1 = tieir.content_hash()
+    var h2 = tieir.content_hash()
+    check(h1 == h2, "内容哈希可复现（0x" + to_string(h1) + "）")
+
+    // 反序列化 roundtrip
+    var rc = tieir.deserialize(t)
+    check(rc == 0, "反序列化成功")
+    if rc == 0 {
+        check(ir.func_count() == 1, "roundtrip 函数数")
+        check(ir.inst_count() == 4, "roundtrip 指令数")
+        check(ir.value_count() == 4, "roundtrip 值编号")
+        check(ir_meta.sym_count() == 1, "roundtrip 符号数")
+        check(ir_meta.export_count() == 1, "roundtrip 导出数")
+        check(ir_meta.span_count() == 3, "roundtrip span 数")
+        check(ir_meta.inst_line(0) == 10, "roundtrip span 行")
+        check(ir_meta.get_pkg_name() == interner.intern("demo_pkg"), "roundtrip 包名")
+        check(ir_meta.dep_count() == 1, "roundtrip 依赖")
+        check(ir.ins_opnd(i0, 0) == 0 && ir.ins_opnd_kind(i0, 0) == 0, "roundtrip 操作数")
+        check(ir.ins_val(i1) == 3, "roundtrip 指令结果值")
+        var dump = tieir.dump_text()
+        check(len(dump) > 40, "dump 文本非空")
+        var found = tieir.hash_bytes(t, 13, len(t)) == h1
+        check(found, "hash_bytes 与 content_hash 一致")
+    }
+
+    // 文件往返
+    var path = "tmp_tieir_roundtrip.tieir"
+    check(tieir.write(path), "写入 tieir 文件")
+    ir.new_module()
+    ir_meta.reset_meta()
+    var rc2 = tieir.read(path)
+    check(rc2 == 0, "读取 tieir 文件")
+    if rc2 == 0 {
+        check(ir.func_count() == 1 && ir_meta.export_count() == 1, "文件读回结构一致")
+    }
+    file_delete(path)
+
+    // 损坏数据校验（防伪造）
+    var t2 = tieir.serialize()
+    t2[5] = 99   // 破坏版本字节
+    var rc3 = tieir.deserialize(t2)
+    check(rc3 != 0, "版本损坏 → 拒绝")
+    var t3 = tieir.serialize()
+    t3[0] = 65   // 破坏魔数
+    var rc4 = tieir.deserialize(t3)
+    check(rc4 != 0, "魔数损坏 → 拒绝")
+
+    println("-- 结果: " + to_string(g_pass) + " 通过, " + to_string(g_fail) + " 失败 --")
+    if g_fail > 0 {
+        exit(1)
+    }
+}

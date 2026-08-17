@@ -1,4 +1,5 @@
 ## [新增] 阶段 2 字符串模型（S2.1 {ptr,len} 二进制安全 + 迭代器 + StringBuilder）—— 2026-08-17
+## [新增] 阶段 2 字符串模型（S2.1 {ptr,len} 二进制安全 + 迭代器 + StringBuilder）—— 2026-08-17
 
 字符串内部表示升级为 `{ptr,len}`（docs/plans/string-model.md 决策 O2+F1），
 tiec（tie 自写编译器）全链路落地，S2.1 探针 1-5 全过，自举闭环 IR 逐字节一致：
@@ -30,6 +31,61 @@ tiec（tie 自写编译器）全链路落地，S2.1 探针 1-5 全过，自举�
   组合等价）；str_cat 保持旧 NUL 语义（含 \0 串拼接走 StringBuilder）；
   SSO 短串优化未做（表示升级后字符串值恒为堆/.rodata 指针）；FFI 接收方向
   （extern 返回 char* 自动扫描）未做（探针仅覆盖传方向）
+=======
+## [新增] 库/包模型（S3.2：tieir 序列化 + 多文件包 L1c + MVS + 签名 P5c）—— 2026-08-17
+
+S3.2 库/包模型落地（docs/plans/tieir-format.md S3 + package-model.md
+L1c/P2c/P5c/P4b 子集），tiec（tie 自写编译器）+ pkg（tie 自写包管理器）
+全链路实现，纯 tie 零 Rust：
+
+### tieir 序列化（compiler/middle/tieir_ser.tie，新模块）
+- **二进制 .tieir 分发格式（段 1-7）**：魔数 "TIEIR" + 版本 → 模块头（包名/
+  版本/IR 版本/编译器版本/依赖图）→ 字符串池（interner 全量，id 即下标，
+  重建后 id 一致）→ 符号表 → IR 主体（函数/块/指令/操作数列式直写，指令
+  显式携带所属块）→ 导出表（L4b 载体）→ span 段；i64 定宽 8 字节大端、
+  字符串码点序列（任意 Unicode，str_from_code 还原）
+- **反序列化 + 语法校验**：魔数/版本/段号/长度/列长/边界逐项校验，防损坏
+  防伪造（对齐 tieir-format.md §7）；块区间在指令重建后统一比对
+- **内容哈希（P5c 载体）**：FNV-1a 32 位字节版（段 2-7；与 std/crc.fnv1a
+  字符串版同算法，探针对照一致）
+- **CLI**：`--tieir-out <f>`（编译后序列化分发单元）+ `--dump-irt <f>`
+  （只读 .tieir 输出可读摘要，不编译）
+
+### 多文件包 L1c（pkg/ 扩展）
+- **`tie pack`**：打包分发单元 = 源码 + tie.pkg + .tieir + signature +
+  tar.gz（入口文件编译 tieir，exports 字段声明对外导出面）
+- **`tie verify <包名>`**：校验已安装包（signature 包名一致性 + tieir 哈希
+  比对）；**install/update 自动校验签名**（P5c 安全底线：校验失败 = 安装报错，
+  未签名旧包兼容跳过）
+- **包结构**：tie.pkg main/exports 指向入口，包内模块互相 import 私有，
+  消费方 import 包入口编译链接（探针全链路验证）
+
+### MVS P2c（pkg/fetch.tie）
+- 版本解析改为**最小版本选择**（Go 风格）：约束/多约束冲突重选取**最低**
+  满足版本（原取最高），可复现、幂等
+
+### P4b 接口依赖（标注待 S2.4）
+- tie.pkg 依赖 `port:` 前缀识别并跳过解析（提示待 S2.4 port 支持；
+  实现绑定走 --backend 构建参数）
+
+### 编译器修复（S3.2 引入 tieir_ser 树时暴露的既有缺陷）
+- **llvmgen.typed_ref**：call 实参补 OK_GLOBAL(kind 3) 处理（ref 全局表
+  实参此前输出未定义 %N → opt 报 use of undefined value）
+- **irgen by_ref 实参**：ref 全局实参操作数 kind 用 3（全局地址 @sym）
+- **semantic.resolve_import_path 归一化**：折叠 "段/../"，import 去重键
+  统一（多入口树正确去重；此前 "compiler/backend/../middle/x" 与
+  "compiler/middle/x" 字符串不同 → 同一文件二次内联 → 重复定义）
+- **ir_meta 命名冲突**：doc_keys/doc_vals 与 lex_state 同名 → 改名
+  meta_doc_keys/meta_doc_vals
+- **llvmgen import 归一**："./../middle/ir.tie" → "../middle/ir.tie"
+
+### 验收
+- tests/s32_probe/probe1_tieir_roundtrip.tie：23 项断言全过（序列化/反序列化/
+  文件往返/哈希/损坏拒绝）
+- tests/s32_probe/probe_pkg_lib + probe_pkg_app：包打包 → 安装（自动签名
+  校验）→ verify → 消费方 import 编译链接运行（add(2,3)=5、calc(5)=11）
+- 回归：tests/language 正例 + s22/s23 探针 13 项编译全过，probe1/probe2/
+  config_smoke 运行输出正确（42/21/48 通过）
 
 ## [新增] 阶段 2 闭包后端全链路（S2.2 函数值/闭包 IR 生成 + 间接调用）—— 2026-08-17
 

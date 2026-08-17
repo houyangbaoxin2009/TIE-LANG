@@ -1,0 +1,460 @@
+type tie<class>
+// pack.tie —— S3.2：打包模块（多文件包 L1c + tieir 分发 + 签名 P5c）
+//
+// 职责：`tie pack` 把当前项目打包为**分发单元**（源码 + tie.pkg + .tieir +
+// signature），供 path/git/registry 三种源安装消费：
+//   1. 读 tie.pkg（name/version/main/exports 由 main 传入，本模块不重复解析）；
+//   2. 校验清单字段（name/version/main 必备；exports 可选 = 附加导出入口）；
+//   3. 编译入口文件为 .tieir（调用 tiec --tieir-out，S3.2 新增编译器选项），
+//      多文件包（L1c）：包内模块互相 import 私有，对外只暴露入口声明面；
+//   4. 计算 .tieir 内容哈希（FNV-1a 32 位，与 tieir_ser.hash_bytes 同算法）
+//      + 生成 signature 文件（P5c：哈希 + 签名者信息；私钥签名/公钥验证的
+//      完整 RSA/ED25519 超出 tie 纯文本能力，第一版 = 内容哈希 + 签名者
+//      信息，安装时重算哈希比对防篡改——哈希即完整性底线）；
+//   5. 打 tar.gz 到 .tie/dist/<name>-<version>.tar.gz（首层为项目文件）。
+//
+// `tie verify <目录>`：校验已安装包（signature 存在 + .tieir 哈希匹配）。
+//
+// tie 约束处理（重要）：
+// - 本模块 import std/bytes.tie（读字节算哈希）；不 import 其它 pkg 模块
+//   （main 分派）；
+// - 表参数元素类型静态未知：跨模块只传字符串/标量；
+// - && 非短路：边界判断与下标分开；
+// - 无 continue/break/递归：迭代 + return 提前退出。
+
+import "../std/bytes.tie"
+
+namespace pack {
+    // ================= 通用字符串工具（自备） =================
+
+    func slice(s: string, start: i64, end: i64) -> string {
+        var n: i64 = len(s)
+        var lo: i64 = start
+        if lo < 0 {
+            lo = 0
+        }
+        if lo > n {
+            lo = n
+        }
+        var hi: i64 = end
+        if hi < 0 {
+            hi = 0
+        }
+        if hi > n {
+            hi = n
+        }
+        var result: string = ""
+        var i: i64 = lo
+        while i < hi {
+            result = result + str_char(s, i)
+            i = i + 1
+        }
+        return result
+    }
+
+    func find(s: string, sub: string) -> i64 {
+        var n: i64 = len(s)
+        var m: i64 = len(sub)
+        if m == 0 {
+            return 0
+        }
+        if m > n {
+            return -1
+        }
+        var i: i64 = 0
+        while i <= n - m {
+            var j: i64 = 0
+            var matched: bool = true
+            while j < m && matched {
+                if str_char(s, i + j) != str_char(sub, j) {
+                    matched = false
+                }
+                j = j + 1
+            }
+            if matched {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    func starts_with(s: string, prefix: string) -> bool {
+        var n: i64 = len(s)
+        var m: i64 = len(prefix)
+        if m > n {
+            return false
+        }
+        var i: i64 = 0
+        while i < m {
+            if str_char(s, i) != str_char(prefix, i) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+
+    func ends_with(s: string, suffix: string) -> bool {
+        var n: i64 = len(s)
+        var m: i64 = len(suffix)
+        if m > n {
+            return false
+        }
+        var i: i64 = 0
+        while i < m {
+            if str_char(s, n - m + i) != str_char(suffix, i) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+
+    // 是否合法的 x.y.z 版本串（纯数字与点、首尾数字、无连续点）。
+    func is_semver(s: string) -> bool {
+        var n: i64 = len(s)
+        if n == 0 {
+            return false
+        }
+        var digits = "0123456789"
+        if find(digits, str_char(s, 0)) < 0 {
+            return false
+        }
+        if find(digits, str_char(s, n - 1)) < 0 {
+            return false
+        }
+        var prev_dot: bool = false
+        var i: i64 = 0
+        while i < n {
+            var c = str_char(s, i)
+            if c == "." {
+                if prev_dot {
+                    return false
+                }
+                prev_dot = true
+            } else if find(digits, c) >= 0 {
+                prev_dot = false
+            } else {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+
+    // ================= FNV-1a 字节哈希（P5c 载体，与 tieir_ser 同算法） =================
+
+    // 对字节表 [from, to) 区间计算 FNV-1a 32 位哈希（越界字节按 0 处理）。
+    // 文件字节哈希：bytes.read 读文件 → 本函数（字节表直算，不经字符串，
+    // 非可打印字节不丢失——与 std/crypto.fnv1a 的字符串版互补）。
+    // 形参用 table<i64>（非裸 table）：下标元素类型静态可知，bytes.read
+    // 返回 table<i64> 可直接传入。
+    pub func hash_bytes(t: table<i64>, from: i64, to: i64) -> i64 {
+        var h: i64 = 2166136261
+        var i: i64 = from
+        var end = to
+        var n: i64 = len(t)
+        if end > n {
+            end = n
+        }
+        while i < end {
+            var b: i64 = t[i]
+            if b < 0 || b > 255 {
+                b = 0
+            }
+            h = (h ^ b) * 16777619
+            h = h & 4294967295
+            i = i + 1
+        }
+        return h
+    }
+
+    // 文件内容哈希（FNV-1a 32 位）；读文件失败返回 -1。
+    pub func file_hash(path: string) -> i64 {
+        var t = bytes.read(path)
+        if len(t) == 0 {
+            return -1
+        }
+        return hash_bytes(t, 0, len(t))
+    }
+
+    // i64 → 8 位大写十六进制字符串（0x 前缀省略；P5c 签名哈希文本）。
+    // 32 位哈希 → 4 字节 × 2 hex = 8 字符（i 取 24,16,8,0）。
+    pub func to_hex8(v: i64) -> string {
+        var hex = "0123456789ABCDEF"
+        var out: string = ""
+        var i: i64 = 24
+        while i >= 0 {
+            var b = (v >> i) & 255
+            var hi = b >> 4
+            var lo = b & 15
+            out = out + str_char(hex, hi) + str_char(hex, lo)
+            i = i - 8
+        }
+        return out
+    }
+
+    // ================= signature（P5c） =================
+
+    // 生成 signature 文本：包名/版本/内容哈希/签名者（TIE_SIGNER 环境变量，
+    // 缺省 anonymous）。签名者信息为明文——第一版以哈希为完整性底线，
+    // 公钥验签（注册表持公钥）标注后续（见 package-model.md §7 未决 3）。
+    pub func signature_text(name: string, version: string, hash: i64) -> string {
+        var signer = get_env("TIE_SIGNER")
+        if signer == "" {
+            signer = "anonymous"
+        }
+        return "[tie-signature]\n" +
+               "package: " + name + "\n" +
+               "version: " + version + "\n" +
+               "hash: " + to_hex8(hash) + "\n" +
+               "signer: " + signer + "\n"
+    }
+
+    // 解析 signature 文本的 hash 字段（十六进制 → i64）；未找到/非法返回 -1。
+    pub func signature_hash(sig: string) -> i64 {
+        var marker = "hash: "
+        var q = find(sig, marker)
+        if q < 0 {
+            return -1
+        }
+        var h = slice(sig, q + len(marker), q + len(marker) + 8)
+        var v: i64 = 0
+        var i: i64 = 0
+        while i < 8 {
+            var c = str_char(h, i)
+            var d: i64 = -1
+            if c >= "0" && c <= "9" {
+                d = char_code(c) - 48
+            } else if c >= "A" && c <= "F" {
+                d = char_code(c) - 55
+            } else if c >= "a" && c <= "f" {
+                d = char_code(c) - 87
+            }
+            if d < 0 {
+                return -1
+            }
+            v = (v << 4) | d
+            i = i + 1
+        }
+        return v
+    }
+
+    // 解析 signature 文本的 package 字段；未找到返回空串。
+    pub func signature_pkg(sig: string) -> string {
+        var marker = "package: "
+        var q = find(sig, marker)
+        if q < 0 {
+            return ""
+        }
+        var nl = find(slice(sig, q, len(sig)), "\n")
+        if nl < 0 {
+            return slice(sig, q + len(marker), len(sig))
+        }
+        return slice(sig, q + len(marker), q + nl)
+    }
+
+    // ================= tie pack 主流程 =================
+
+    // 打包：编译 tieir + 签名 + tar.gz。name/version/main 由 main 从 tie.pkg
+    // 读出传入；exports 为附加导出入口（逗号分隔，可为空串）。
+    pub func pack(name: string, version: string, main_file: string, exports: string) -> i64 {
+        // 1) 校验清单字段
+        if name == "" {
+            print_err("[pkg] tie.pkg 缺少 name 字段\n")
+            return 1
+        }
+        if version == "" {
+            print_err("[pkg] tie.pkg 缺少 version 字段\n")
+            return 1
+        }
+        if main_file == "" {
+            print_err("[pkg] tie.pkg 缺少 main 字段\n")
+            return 1
+        }
+        if !is_semver(version) {
+            print_err("[pkg] 版本必须是 x.y.z 形式（当前: " + version + "）\n")
+            return 1
+        }
+        if !file_exists(main_file) {
+            print_err("[pkg] 入口文件不存在: " + main_file + "\n")
+            return 1
+        }
+        // 2) 校验附加导出入口（L1c 多文件包：exports 字段 = 对外导出面声明）
+        var ex_ok: bool = true
+        var ex_seq = exports
+        while ex_seq != "" {
+            var comma = find(ex_seq, ",")
+            var one = ex_seq
+            if comma >= 0 {
+                one = slice(ex_seq, 0, comma)
+                ex_seq = slice(ex_seq, comma + 1, len(ex_seq))
+            } else {
+                ex_seq = ""
+            }
+            if one != "" {
+                if !file_exists(one) {
+                    print_err("[pkg] exports 入口不存在: " + one + "\n")
+                    ex_ok = false
+                }
+            }
+        }
+        if !ex_ok {
+            return 1
+        }
+        // 3) 编译入口 → .tieir（分发单元；tiec --tieir-out 见 driver.tie S3.2）
+        var tieir_name = name + "-" + version + ".tieir"
+        var rc = exec_code("tiec " + main_file + " --tieir-out " + tieir_name)
+        if rc != 0 {
+            print_err("[pkg] tieir 编译失败（可手动执行: tiec " + main_file + " --tieir-out " + tieir_name + "）\n")
+            return 1
+        }
+        if !file_exists(tieir_name) {
+            print_err("[pkg] tieir 产物缺失: " + tieir_name + "\n")
+            return 1
+        }
+        // 4) 计算内容哈希 + 生成 signature（P5c）
+        var h = file_hash(tieir_name)
+        if h < 0 {
+            print_err("[pkg] 计算 tieir 哈希失败\n")
+            return 1
+        }
+        var sig = signature_text(name, version, h)
+        if !file_write("signature", sig) {
+            print_err("[pkg] 写入 signature 失败\n")
+            return 1
+        }
+        println("[pkg] 已生成 " + tieir_name + "（哈希 0x" + to_hex8(h) + "）")
+        println("[pkg] 已生成 signature（签名者: " + get_env("TIE_SIGNER") + "）")
+        // 5) 重建 staging 目录（无条件清旧）
+        var staging = ".tie/dist-stage"
+        remove_dir_all(staging)
+        if !mkdir_all(staging) {
+            print_err("[pkg] 创建 staging 失败: " + staging + "\n")
+            return 1
+        }
+        // 6) 收集项目文件并复制（排除 .tie/.git/target/pkg/dist 与产物）
+        var files = walk_dir(".")
+        var fi: i64 = 0
+        var copied: i64 = 0
+        while fi < len(files) {
+            var rel = files[fi]
+            if keep_for_pack(rel) {
+                var dest = path_join(staging, rel)
+                var parent = path_dirname(dest)
+                if parent == "" {
+                    parent = staging
+                }
+                if !mkdir_all(parent) {
+                    print_err("[pkg] 创建目录失败: " + parent + "\n")
+                    return 1
+                }
+                if !file_copy(rel, dest) {
+                    print_err("[pkg] 复制失败: " + rel + "\n")
+                    return 1
+                }
+                copied = copied + 1
+            }
+            fi = fi + 1
+        }
+        println("[pkg] 收集文件 " + to_string(copied) + " 个")
+        // 7) 打 tar.gz（首层为项目文件；安装解压后直落 .tie/deps/<name>/）
+        if !mkdir_all(".tie/dist") {
+            print_err("[pkg] 创建 .tie/dist 失败\n")
+            return 1
+        }
+        var out = ".tie/dist/" + name + "-" + version + ".tar.gz"
+        if file_exists(out) {
+            file_delete(out)
+        }
+        var trc = exec_code("tar -czf " + out + " -C " + staging + " .")
+        remove_dir_all(staging)
+        if trc != 0 {
+            print_err("[pkg] tar 打包失败（退出码 " + to_string(trc) + "，请确认系统 tar 可用）\n")
+            return 1
+        }
+        println("[pkg] 已打包: " + out)
+        println("[pkg] 分发单元 = tieir + 源码 + signature（P5c 安装时校验哈希）")
+        return 0
+    }
+
+    // 文件是否纳入发布包（与 publish.keep_for_publish 同规则，排除产物目录）。
+    func keep_for_pack(rel: string) -> bool {
+        if starts_with(rel, ".tie") {
+            return false
+        }
+        if starts_with(rel, ".git") {
+            return false
+        }
+        if starts_with(rel, "target") {
+            return false
+        }
+        if starts_with(rel, "pkg") {
+            return false
+        }
+        if starts_with(rel, "dist") {
+            return false
+        }
+        if ends_with(rel, ".exe") {
+            return false
+        }
+        if ends_with(rel, ".tar.gz") {
+            return false
+        }
+        return true
+    }
+
+    // ================= tie verify 主流程（P5c 安装校验） =================
+
+    // 校验已安装包目录：signature 存在 + .tieir 哈希匹配 + 包名一致。
+    // dir 为包目录（如 .tie/deps/my_pkg）；name 为期望包名。
+    // 返回 0 通过 / 1 失败（已打印原因）。
+    pub func verify(dir: string, name: string) -> i64 {
+        var sig_path = path_join(dir, "signature")
+        if !file_exists(sig_path) {
+            print_err("[pkg] 校验失败: 缺少 signature（包未签名或已损坏）\n")
+            return 1
+        }
+        var sig = file_read(sig_path)
+        // 包名一致性（防错装/目录混淆）
+        var sp = signature_pkg(sig)
+        if sp != name {
+            print_err("[pkg] 校验失败: signature 包名 '" + sp + "' ≠ 期望 '" + name + "'\n")
+            return 1
+        }
+        // 找 .tieir（目录内唯一：name-version.tieir；扫描首层）
+        var tieir_file = ""
+        var files = walk_dir(dir)
+        var fi2: i64 = 0
+        while fi2 < len(files) {
+            var rel = files[fi2]
+            if ends_with(rel, ".tieir") {
+                tieir_file = rel
+            }
+            fi2 = fi2 + 1
+        }
+        if tieir_file == "" {
+            print_err("[pkg] 校验失败: 包内无 .tieir 分发单元\n")
+            return 1
+        }
+        // 哈希比对（完整性底线；防篡改/防损坏）。
+        // 注：walk_dir 返回相对 dir 的路径，读取须拼回 dir（path_join）
+        var h = file_hash(path_join(dir, tieir_file))
+        if h < 0 {
+            print_err("[pkg] 校验失败: 读取 tieir 失败\n")
+            return 1
+        }
+        var sh = signature_hash(sig)
+        if sh < 0 {
+            print_err("[pkg] 校验失败: signature 哈希字段非法\n")
+            return 1
+        }
+        if h != sh {
+            print_err("[pkg] 校验失败: 哈希不匹配（0x" + to_hex8(h) + " ≠ signature 0x" + to_hex8(sh) + "）——包已被篡改\n")
+            return 1
+        }
+        println("[pkg] 校验通过: " + name + "（" + tieir_file + " 哈希 0x" + to_hex8(h) + " 匹配）")
+        return 0
+    }
+}

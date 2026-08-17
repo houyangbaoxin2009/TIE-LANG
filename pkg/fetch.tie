@@ -368,17 +368,20 @@ namespace fetch {
         return ver.satisfies(v, constraint)
     }
 
-    // 解析注册表版本：spec 为精确版本 → 原样返回；为约束 → 拉 index 选最高满足。
+    // 解析注册表版本：spec 为精确版本 → 原样返回；为约束 → 拉 index 选最低满足。
+    // S3.2（P2c MVS 最小版本选择）：约束解析改为**最低满足版本**（Go 风格
+    // MVS）——全依赖图取最小满足所有约束的版本，可复现、幂等；与规划
+    // docs/plans/package-model.md §3.2 一致（^1.2 下取 1.2.x 最低满足者）。
     // 返回空串 = 无满足版本（调用方报错）。
     pub func resolve_registry_version(name: string, spec: string) -> string {
         if !is_constraint(spec) {
             return spec
         }
-        return highest_matching(name, spec)
+        return lowest_matching(name, spec)
     }
 
-    // 从 index.tie 选满足**单个约束**的最高版本。
-    func highest_matching(name: string, spec: string) -> string {
+    // 从 index.tie 选满足**单个约束**的最低版本（MVS）。
+    func lowest_matching(name: string, spec: string) -> string {
         var best: string = ""
         var index = http_get(index_url())
         var lines = split(index, "\n")
@@ -390,7 +393,7 @@ namespace fetch {
                 if parts[0] == name {
                     var v = parts[1]
                     if ver.satisfies(v, spec) {
-                        if best == "" || ver.compare(v, best) > 0 {
+                        if best == "" || ver.compare(v, best) < 0 {
                             best = v
                         }
                     }
@@ -401,7 +404,7 @@ namespace fetch {
         return best
     }
 
-    // 从 index.tie 选满足**全部约束**（逗号分隔序列）的最高版本。
+    // 从 index.tie 选满足**全部约束**（逗号分隔序列）的最低版本（MVS）。
     // 用于同名依赖多约束冲突时的重新解析；返回空串 = 无满足版本。
     pub func resolve_from_constraints(name: string, specs_seq: string) -> string {
         var best: string = ""
@@ -424,6 +427,31 @@ namespace fetch {
                         k = k + 1
                     }
                     if all {
+                        if best == "" || ver.compare(v, best) < 0 {
+                            best = v
+                        }
+                    }
+                }
+            }
+            i = i + 1
+        }
+        return best
+    }
+
+    // 从 index.tie 选满足**单个约束**的最高版本（最高版本选择，保留供
+    // 需要"最新版"语义的调用方使用；MVS 解析不再走本函数）。
+    func highest_matching(name: string, spec: string) -> string {
+        var best: string = ""
+        var index = http_get(index_url())
+        var lines = split(index, "\n")
+        var i: i64 = 0
+        while i < len(lines) {
+            // index.tie 行格式：包名|版本|描述
+            var parts = split(lines[i], "|")
+            if len(parts) >= 2 {
+                if parts[0] == name {
+                    var v = parts[1]
+                    if ver.satisfies(v, spec) {
                         if best == "" || ver.compare(v, best) > 0 {
                             best = v
                         }
