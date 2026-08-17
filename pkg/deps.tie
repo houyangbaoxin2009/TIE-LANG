@@ -210,6 +210,11 @@ namespace deps {
         return lk.valid(lock_text, pkg_src)
     }
 
+    // 锁文件依赖名序列（S3.2 P5c 安装后签名校验用；透传 lk.names）。
+    pub func lock_names(lock_text: string) -> string {
+        return lk.names(lock_text)
+    }
+
     // ================= 读取依赖的 tie.pkg（自备轻量扫描，不重复 import manifest） =================
 
     // 扫描依赖包 tie.pkg 的 dependencies 数组：want_name=true 取包名序列，
@@ -368,12 +373,19 @@ namespace deps {
         var t: i64 = 0
         while t < tn {
             if top_names[t] != "" {
-                table_push(q_names, top_names[t])
-                table_push(q_specs, top_specs[t])
-                table_push(q_deps, 0)
-                table_push(q_base, "")
-                table_push(eq_names, top_names[t])
-                table_push(eq_specs, top_specs[t])
+                // S3.2（P4b 接口依赖）：`port:` 前缀 = 接口依赖（依赖 port 而非
+                // 具体实现，如 port:window），实现由构建参数（--backend）绑定；
+                // 完整支持待 S2.4 port 分支合入——当前版本识别并跳过解析。
+                if starts_with(top_specs[t], "port:") {
+                    println("[pkg]  接口依赖 " + top_names[t] + "（port: 前缀）待 S2.4 port 支持，跳过解析")
+                } else {
+                    table_push(q_names, top_names[t])
+                    table_push(q_specs, top_specs[t])
+                    table_push(q_deps, 0)
+                    table_push(q_base, "")
+                    table_push(eq_names, top_names[t])
+                    table_push(eq_specs, top_specs[t])
+                }
             }
             t = t + 1
         }
@@ -535,24 +547,29 @@ namespace deps {
                             if cn[ci] != "" {
                                 var cname = cn[ci]
                                 var cspec = cs[ci]
-                                // 同名同 spec 已入队 → 跳过（防重复处理/防环）
-                                var dup: bool = false
-                                var k: i64 = 0
-                                while k < len(eq_names) {
-                                    if eq_names[k] == cname {
-                                        if eq_specs[k] == cspec {
-                                            dup = true
+                                // S3.2（P4b 接口依赖）：port: 前缀跳过递归解析
+                                if starts_with(cspec, "port:") {
+                                    println("[pkg]  接口依赖 " + cname + "（port: 前缀）待 S2.4 port 支持，跳过解析")
+                                } else {
+                                    // 同名同 spec 已入队 → 跳过（防重复处理/防环）
+                                    var dup: bool = false
+                                    var k: i64 = 0
+                                    while k < len(eq_names) {
+                                        if eq_names[k] == cname {
+                                            if eq_specs[k] == cspec {
+                                                dup = true
+                                            }
                                         }
+                                        k = k + 1
                                     }
-                                    k = k + 1
-                                }
-                                if !dup {
-                                    table_push(q_names, cname)
-                                    table_push(q_specs, cspec)
-                                    table_push(q_deps, depth + 1)
-                                    table_push(q_base, pkg_dir)
-                                    table_push(eq_names, cname)
-                                    table_push(eq_specs, cspec)
+                                    if !dup {
+                                        table_push(q_names, cname)
+                                        table_push(q_specs, cspec)
+                                        table_push(q_deps, depth + 1)
+                                        table_push(q_base, pkg_dir)
+                                        table_push(eq_names, cname)
+                                        table_push(eq_specs, cspec)
+                                    }
                                 }
                             }
                             ci = ci + 1

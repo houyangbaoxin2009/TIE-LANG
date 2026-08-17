@@ -1,0 +1,15 @@
+// tie.pkg —— S3.2 消费方项目清单
+// 依赖 s32_math（path 源指向探针库目录）；install 解析 + 安装 + 签名校验
+// tie:data
+[
+    "name": "s32_app",
+    "version": "0.1.0",
+    "description": "S3.2 多文件包消费方探针",
+    "role": "logic",
+    "main": "main.tie",
+    "author": "s32-package",
+    "license": "MIT",
+    "dependencies": [
+        "s32_math": "path:../probe_pkg_lib",
+    ],
+]

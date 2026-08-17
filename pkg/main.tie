@@ -41,6 +41,7 @@ type tie<logic>
 import "./manifest.tie" as mf
 import "./deps.tie" as dp
 import "./publish.tie" as pb
+import "./pack.tie" as pk
 import "./search.tie" as sr
 
 // ================= 入口：子命令分派 =================
@@ -81,6 +82,12 @@ func main() -> i64 {
     if cmd == "publish" {
         return cmd_publish()
     }
+    if cmd == "pack" {
+        return cmd_pack()
+    }
+    if cmd == "verify" {
+        return cmd_verify()
+    }
     if cmd == "search" {
         return cmd_search()
     }
@@ -113,6 +120,8 @@ func help_text() -> string {
            "  tie build              编译项目（调用 tie 编译器）\n" +
            "  tie run                运行项目（tie <main 文件>）\n" +
            "  tie publish            打包发布（tar.gz + git tag/push）\n" +
+           "  tie pack               打包分发单元（S3.2：tieir + signature + tar.gz）\n" +
+           "  tie verify <包名>      校验已安装包（S3.2：signature 哈希比对）\n" +
            "  tie search <关键字>    搜索注册表（TIE_REGISTRY 可指定基址）\n" +
            "  tie info <包名>        查询注册表包信息\n" +
            "  tie help               显示本帮助\n" +
@@ -397,8 +406,42 @@ func cmd_install() -> i64 {
         print_err("[pkg] 安装完成，失败 " + to_string(failed) + " 项\n")
         return 1
     }
+    // S3.2（P5c）：安装后自动校验签名——包内含 signature + .tieir 的依赖
+    // 逐一校验哈希（防篡改/防损坏，安全底线：校验失败 = 安装报错）
+    var vfailed = verify_installed(lock_text)
+    if vfailed > 0 {
+        print_err("[pkg] 签名校验失败 " + to_string(vfailed) + " 项——校验失败 = 安装报错（P5c 安全底线）\n")
+        return 1
+    }
     println("[pkg] 全部依赖安装完成")
     return 0
+}
+
+// S3.2（P5c）：按锁文件遍历已安装依赖，逐个签名校验（无 signature 的包跳过
+// ——旧包/未签名包兼容；有 signature 必须哈希匹配）。返回失败个数。
+func verify_installed(lock_text: string) -> i64 {
+    var names_seq = dp.lock_names(lock_text)
+    if names_seq == "" {
+        return 0
+    }
+    var vf: i64 = 0
+    var i: i64 = 0
+    var n = len(names_seq)
+    while i < n {
+        var name = mf.segment(names_seq, i)
+        if name != "" {
+            var dir = ".tie/deps/" + name
+            // 无 signature = 未签名包，跳过（兼容既有 path/git 源）
+            if file_exists(dir + "/signature") {
+                var rc = pk.verify(dir, name)
+                if rc != 0 {
+                    vf = vf + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return vf
 }
 
 // ================= tie update：重新解析依赖并更新 tie.lock =================
@@ -462,6 +505,35 @@ func cmd_publish() -> i64 {
         main_file = "main.tie"
     }
     return pb.publish(name, version, main_file)
+}
+
+// S3.2：tie pack —— 打包分发单元（tieir + signature + tar.gz）。
+// 多文件包（L1c）：tie.pkg 的 exports 字段声明附加导出入口（逗号分隔），
+// 包内模块互相 import 私有，对外只暴露入口声明面。
+func cmd_pack() -> i64 {
+    if !file_exists("tie.pkg") {
+        print_err("[pkg] 未找到 tie.pkg（请先 tie init <项目名>）\n")
+        return 1
+    }
+    var src = file_read("tie.pkg")
+    var name = mf.field(src, "name")
+    var version = mf.field(src, "version")
+    var main_file = mf.field(src, "main")
+    if main_file == "" {
+        main_file = "main.tie"
+    }
+    var exports = mf.field(src, "exports")
+    return pk.pack(name, version, main_file, exports)
+}
+
+// S3.2：tie verify <包名> —— 校验已安装包（signature + tieir 哈希比对，P5c）。
+func cmd_verify() -> i64 {
+    var pkg_name = arg_string(1)
+    if pkg_name == "" {
+        print_err("[pkg] 用法: tie verify <包名>\n")
+        return 1
+    }
+    return pk.verify(".tie/deps/" + pkg_name, pkg_name)
 }
 
 func cmd_search() -> i64 {

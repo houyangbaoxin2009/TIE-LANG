@@ -3442,12 +3442,14 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
     var nc = sstate.nchild(id)
     var argvals: table<i64> = table_new_i64()
     var argisref: table<i64> = table_new_i64()  // 并行：ref 实参标志（类型 → ptr）
+    var argkinds: table<i64> = table_new_i64()  // 并行：操作数 kind（S3.2：ref 全局 → 3）
     var extra_nodes: table<i64> = table_new_i64()  // 变参多余实参（稍后打包）
     var k: i64 = arg_start
     while k < nc {
         var arg_node = sstate.child(id, k)
         var av: i64 = -1
         var is_ref_arg: i64 = 0
+        var arg_kind: i64 = 0
         var arg_idx = k - arg_start  // 实参序号（aoff=1 时 children[0] 是路径节点）
         if has_var && arg_idx >= fixed_n {
             // 变参多余实参：收集节点，最后统一打包成表实参（不单独求值/压参）
@@ -3466,6 +3468,13 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
                 if scope_get_global(anm) >= 0 {
                     av = g_lookup_alloca
                     is_ref_arg = 1
+                    // S3.2：ref 全局实参（标量/表）操作数 kind 用 3（全局地址
+                    // @sym，llvmgen typed_ref/opnd_ref 直引）——kind 0 会把
+                    // "@name" 池 id 当 SSA 值输出 "%N"（N 是池 id 非本函数
+                    // 定义的值）→ opt 报 use of undefined value
+                    if g_lookup_is_global >= 1 {
+                        arg_kind = 3
+                    }
                 }
             }
         }
@@ -3474,6 +3483,7 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
         }
         table_push(argvals, av)
         table_push(argisref, is_ref_arg)
+        table_push(argkinds, arg_kind)
         k = k + 1
     }
     // 变参打包：多余实参 → 动态表（无多余实参也要传空表）
@@ -3484,6 +3494,7 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
         }
         table_push(argvals, tbl)
         table_push(argisref, 0)
+        table_push(argkinds, 0)
     }
     var ty35: i64 = -1
     if ret_ty != types.named(TK_VOID) {
@@ -3517,7 +3528,7 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
             }
         }
         ir.add_operand(inst, pty, 2)
-        ir.add_operand(inst, argvals[k], 0)
+        ir.add_operand(inst, argvals[k], argkinds[k])
         k = k + 1
     }
     if ret_ty == types.named(TK_VOID) {
