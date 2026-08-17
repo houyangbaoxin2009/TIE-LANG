@@ -1,0 +1,35 @@
+# ── 文本与行尾规范化 ────────────────────────────────────────────
+# 仓库 blob 统一以 LF 存储；Windows 检出时按 core.autocrlf=true 转 CRLF
+* text=auto
+
+# ── 二进制文件（禁止文本转换/差异比较）─────────────────────────
+*.exe  binary
+*.png  binary
+
+# ── tie 语言（主语言，376+ 个源文件）────────────────────────────
+# GitHub Linguist 尚未收录 tie 语言（github-linguist/linguist#languages.yml 无 .tie）。
+# 用 linguist-language 映射到关键字体系最接近的语言：
+#   tie 的 func/var/const/if/else/for/return/import/struct/switch/case/default/type
+#   与 Go 关键字完全同源，语法高亮覆盖率最高。
+# 备选方案：linguist-language=Rust（i32/u64/f64 类型名、泛型 <T>、->、0..10 range 更贴切，
+#   但 func/var/const 不会被高亮）。若后续 Linguist 正式收录 tie，删去本行即可。
+*.tie linguist-language=Go
+
+# ── tie:data 清单/配置（类 JSON 结构，按 JSON 高亮展示）────────
+# 例：examples/demo_pkg/tie.pkg（tie:data 格式，含 // 注释与尾逗号）、tie.config
+*.pkg    linguist-language=JSON
+*.config linguist-language=JSON
+
+# ── 测试 golden 输出（生成产物，不参与语言统计）────────────────
+# tests/errors/golden/*.tie.stderr（编译器错误期望输出）、tests/repl/golden_*.txt
+*.stderr                 linguist-generated
+tests/repl/golden_*.txt  linguist-generated
+
+# ── 第三方与归档（不参与语言统计，GitHub 默认折叠）─────────────
+# third_party/llvm/（LLVM 精简工具链 LICENSE）、archive/compiler-v1/（旧编译器归档）
+/third_party/**  linguist-vendored
+/archive/**      linguist-vendored
+
+# ── VSCode 扩展代码片段（JSON 格式）────────────────────────────
+# editor/vscode-tie/snippets/tie.code-snippets
+*.code-snippets linguist-language=JSON
