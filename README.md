@@ -25,6 +25,11 @@ tiec 实现）。阶段 1 语言地基（2026-08-15）新增三大系统能力�
 `enum Result<T, E>` / `enum Option<T>`（`std/result.tie`，import 即用）、
 `?` 解包后缀（Err/None 提前返回 + Ok/Some 解包 payload）、`panic("msg")`
 致命错误语句，见 [docs/plans/error-model.md](docs/plans/error-model.md)。
+阶段 2 闭包/函数值（2026-08-17，S2.2）新增**一等函数值**：`func` 字面量
+（闭包，捕获变量 move 进环境）、`fn(A) -> R` 函数类型（作参数/返回/
+变量）、命名函数提升（函数名直接作函数值）、高阶函数与间接调用
+（`{env, entry}` 闭包值 + call_indirect），探针全过，见
+[docs/plans/closure-model.md](docs/plans/closure-model.md)。
 
 
 我们的目标：全领域通用，Python的体验，Rust的性能与安全。
