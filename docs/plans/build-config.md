@@ -1,6 +1,6 @@
 # 规划：tie 构建配置模型（config.data.tie 统一配置文件 + 分层合并 + profile）
 
-> 状态：**规划**（2026-08-15 设计讨论定稿，未实现）
+> 状态：**已实现**（2026-08-16，S3.1 落地，commit 见 CHANGELOG）
 > 本文档定义 tie 的构建配置模型。决策汇总：
 > **L2**（三层：CLI > 项目 config > 用户全局配置）+ **统一 config.data.tie 文件**
 > （type tie<data> 角色，分节配置 tiec/prep/pkg 等子工具）
@@ -8,6 +8,22 @@
 > + **P3 分层合并 + profile**（dev/release，Cargo 风格）。
 > 关联：包模型（backend 实现选择 P4b）、角色模型（roles 目录）、
 > 宏模型（modules 预处理链）、库/包模型（tie.pkg 与 config 的关系）。
+>
+> 实现记录：
+> - **配置模块** `compiler/config.tie`（type tie<class> 独立库）：解析（parse/
+>   parse_append/parse_file）、访问器（get_str/get_int/get_bool/get_list/type_of）、
+>   分层合并（load_merge：内置默认 < 用户 < 项目 < profile < CLI）、合并引擎
+>   （merge/merge_value：标量覆盖/列表追加/`"="` 重置/独有键保留）、profile 激活
+>   （顶层 `profile` 键或 CLI `--profile`）、apply_cli（CLI 显式覆盖，map_set
+>   原地改槽位）、dump 摘要。
+> - **driver 集成**（compiler/driver.tie）：`--config <f>` / `--profile <p>` /
+>   `--backend <b>` 三个新参数；opt/target 优先级 CLI 显式 > 配置（含 profile
+>   激活）> 默认；backend 实现选择（win32/LLVM 为当前唯一后端，其余 port 明确
+>   报错）。
+> - **验收**：tests/s31/config_smoke.tie 48 断言全绿；配置驱动 backend 选择
+>   端到端验证（config 写 wasm → 报错，写 win32 → 正常编译）；自举回归全绿。
+> - **关键修复**：全局扁平键值表布局纪律——所有构造路径先收集后统一登记，
+>   杜绝嵌套子表交错 push 破坏父表键区间连续性的 bug。
 
 ## 1. 现状盘点
 

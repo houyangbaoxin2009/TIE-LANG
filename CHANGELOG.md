@@ -49,6 +49,77 @@ tie 语言阶段 2 错误处理模型（docs/plans/error-model.md）全链路落
   tmp_t8 Option 解包、tmp_t9 string payload 判别、tmp_t10 解包值还原）；
   回归 12/13 PASS；自举链 tiec_verify → tiec_verify2 行为一致
 
+## [新增] S3.1 构建配置系统——统一 config.data.tie + 分层合并 + profile + backend 选择 —— 2026-08-16
+
+tie 构建配置模型落地（docs/plans/build-config.md 实现记录）：统一 `config.data.tie`
+配置文件（type tie<data> 角色，分节配置 tiec/prep/pkg 等子工具）+ L2 三层分层合并
+（CLI > 项目 config > 用户全局 config > 内置默认）+ P3 profile（dev/release，
+Cargo 风格）+ D1-D7 全 7 域 + --backend 实现选择。tiec（tie 自写编译器，
+compiler/）全链路实现，纯 tie 零 Rust：
+
+### 配置模块 compiler/config.tie（type tie<class> 独立库）
+- **统一文件**：`config.data.tie`（type tie<data>），分节：通用节（target/opt/debug/
+  profile）+ tiec 节（backend/features/emit/link/bounds_check）+ prep 节（modules/
+  strict_roles）+ pkg 节（registry/cache_dir/verify_signature）+ roles 节（test/bench）
+  + advanced/cache 节（现状兼容）+ profiles 节（dev/release）
+- **L2 分层合并**：`load_merge` = 内置默认 < 用户 `~/.config/tie/config.data.tie`
+  < 项目 config.data.tie < profile 覆盖 < CLI 显式覆盖；`apply_cli` 用 map_set
+  原地改槽位（不 push 全局扁平表）
+- **P3 profile**：profiles 节解析 + 激活（顶层 `profile` 键或 CLI `--profile`）；
+  dev = debug:true/opt:0/bounds_check:true，release = debug:false/opt:2/bounds_check:false
+- **D1-D7 全覆盖**：target/backend/opt/features/roles/link/modules 七大域
+- **合并规则**：同键标量覆盖、列表追加（除非 `"="` 重置标记）、独有键保留、
+  数组/表嵌套深合并
+- **关键修复**：全局扁平键值表布局纪律——所有构造路径（parse_map_body /
+  merge_maps / build_defaults / parse_array_body）改为「先收集到局部表、
+  完成后统一登记」，杜绝嵌套子表交错 push 破坏父表键区间连续性的 bug
+  （此前 root 键区间混入 tiec 子表键导致 map_get 错位）
+- **访问器**：get_str / get_int / get_bool / get_list / type_of / dump / err_msg
+
+### driver.tie 集成（tiec CLI）
+- **--config <f>**：指定构建配置文件（默认查当前目录 config.data.tie；原
+  「协调统筹配置文件（单文件编译暂忽略）」升级为真实构建配置加载）
+- **--profile <p>**：构建 profile（覆盖配置顶层 profile 键）
+- **--backend <b>**：后端实现选择（win32/LLVM 工具链为当前唯一后端，其余
+  port 明确报错提示未接入）
+- **opt/target 优先级**：CLI 显式 > 配置（含 profile 激活）> 默认 O2 / 本机
+
+### 验收
+- `tests/s31/config_smoke.tie`：48 断言全绿（解析完整示例/注释尾逗号容错/
+  错误处理/深合并/重置标记/内置默认+profile 激活/apply_cli/dump）
+- 配置驱动 backend 选择端到端：config.data.tie 写 `tiec.backend: wasm` →
+  driver 报「尚未接入」；写 win32 → 正常编译
+- 自举回归：新 tiec 编译自身成功；语言测试套件全绿（负例失败为预期）
+
+## [新增] 阶段 2 错误处理（S2.3 Result/Option + `?` 解包 + panic）—— 2026-08-16
+
+tie 语言阶段 2 错误处理模型落地（docs/plans/error-model.md），tiec（tie 自写
+编译器）全链路实现，完全不用 Rust：
+
+### S2.3 错误处理（docs/plans/error-model.md 实现记录）
+- **预置枚举**：`std/result.tie`（type tie<class>）预置 `enum Result<T, E> { Ok(T) Err(E) }`
+  与 `enum Option<T> { Some(T) None }`——与用户自定义 enum 无差别，生态统一；
+  `import` 后即可用（双类型参数 + 泛型变体 + 跨文件枚举单态化）
+- **`?` 解包后缀**：`var v = expr ?`（lex_question 关键字 + parse_postfix 后缀解析 +
+  sinfer.infer_try_unwrap 语义推断）——Expr 为 Err/None 时函数提前 return
+  Err/None（提前 return 路径发射 `%ret = load 聚合 → ret`），Ok/Some 时解包
+  payload 继续；**仅限返回 Result/Option 的函数内**（main 返回 void 报语义错误）
+- **panic**：`panic("msg")` 语句（N_PANIC）→ 运行时 `printf` + `exit(1)`
+  （"致命错误：" 前缀），不可恢复错误
+- **gen_try**（irgen）：解包路径展开（tag 槽比较 + 分支 + 提前 return + payload
+  读取）；**gen_enum_construct string payload**：槽统一 i64，string 字面量
+  （const_str 已按 ptrtoint 发射）与 string 拼接（str_cat 输出同为 i64）直接
+  存储，变量/调用返回值 ptrtoint 转 i64；读取侧由消费方按需 inttoptr 还原
+- **ASI 修复**：`is_bin_op` 排除 `lex_question`（frontend + proto 两处）——
+  `?` 行尾不再被识别为二元运算符而漏补分号（修复前 `var v = expr ?` 换行后
+  会与下一行粘连），单行三目 `?:` 不受影响
+- **验收**：tests/s23_probe/ 探针（try_probe/result_probe/result_import_probe/
+  opt_none_arg_probe/try_mini + tmp_t7 三目 + tmp_t8 Option 解包 + tmp_t9
+  string payload 判别 + tmp_t10 string payload 解包值内容）——`?` 链式传播
+  （两层嵌套 Option/Result）、Err 提前 return、panic 致命错误、string payload
+  跨函数解包值正确还原（"直接解包: hello cfg"）全对；自举链 tiec_verify2
+  编译探针行为一致；回归 12/13 PASS（extern_decl 为 S1.2 unsafe 旧规则问题）
+
 ## [新增] 阶段 1 语言地基三件套（S1.2 unsafe + S1.3 窄整数 + S1.4 角色扩展）—— 2026-08-15
 
 tie 语言阶段 1 语言地基（M0 级）三任务全部落地，tiec（tie 自写编译器，
