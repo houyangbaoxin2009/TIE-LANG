@@ -1,0 +1,52 @@
+type tie<logic>
+// tests/s23_probe/tmp_t9.tie —— S2.3 探针：string payload 解包（inttoptr 还原路径）
+// 覆盖：
+//   1. Result<string, string> 的 Ok(payload) `?` 解包 → 还原 string 指针
+//   2. 解包后的 string 可正常参与字符串操作（长度/拼接/打印）
+//   3. `?` 作为实参表达式参与调用（解包结果直接传参）
+import "../../std/result.tie"
+
+// 返回 Result<string, string> 的基础函数
+func read_cfg(ok: bool) -> Result<string, string> {
+    if !ok {
+        return Result.Err("配置不存在")
+    }
+    return Result.Ok("hello cfg")
+}
+
+// 用 `?` 解包 string payload
+func load(ok: bool) -> Result<string, string> {
+    var s = read_cfg(ok) ?
+    return Result.Ok(s + "!")
+}
+
+// 二次解包链：从 load(ok) 再解包一次拿 string（string 指针逐层还原）
+func load_again(ok: bool) -> Result<string, string> {
+    var s = load(ok) ?
+    return Result.Ok(s + "?")
+}
+
+func main() {
+    var r1 = load(true)
+    switch r1 {
+        case Result.Ok:
+            println("ok1")
+        default:
+            println("unexpected")
+    }
+    var r2 = load(false)
+    switch r2 {
+        case Result.Ok:
+            println("unexpected")
+        default:
+            println("err2")
+    }
+    // 二次解包链：从 load(true) 再解包一次拿 string（在返回 Result 的函数内）
+    var r3 = load_again(true)
+    switch r3 {
+        case Result.Ok:
+            println("ok3")
+        default:
+            println("unexpected")
+    }
+}

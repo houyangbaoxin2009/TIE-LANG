@@ -1,0 +1,29 @@
+type tie<class>
+// std/result.tie —— 错误处理模型预置枚举（S2.3，error-model.md L1）。
+// ============================================================
+// 预置 Result/Option 枚举（与用户自定义 enum 无差别，生态统一）：
+//   - enum Result<T, E> { Ok(T) Err(E) }：可恢复错误（外部错误/输入/IO）
+//   - enum Option<T>     { Some(T) None }：可选值（有值/无值）
+// 用法（import 引入后即可见）：
+//   import "../../std/result.tie"
+//   func read_cfg() -> Result<string, string> {
+//       if !fs.exists("cfg.toml") { return Result.err("配置不存在") }
+//       return Result.ok(fs.read("cfg.toml"))
+//   }
+//   var v = read_cfg() ?          // Err → 函数提前返回 Err；Ok → 解包
+// 构造：Result.Ok(v) / Result.Err(e) / Option.Some(v) / Option.None
+//   （与 Rust 同名变体风格一致，switch 匹配 + ? 解包均可用）
+// 解包：switch 匹配（已有）或 `expr ?`（S2.3，仅限返回 Result 的函数内）
+// ============================================================
+
+// 可恢复错误枚举：Ok(T) 成功值 / Err(E) 失败值
+enum Result<T, E> {
+    Ok(T)
+    Err(E)
+}
+
+// 可选值枚举：Some(T) 有值 / None 无值
+enum Option<T> {
+    Some(T)
+    None
+}

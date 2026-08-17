@@ -30,6 +30,26 @@ var g_save_err_line: i64 = 0;     // 语法错误槽行号快照
 var g_save_err_col: i64 = 0;      // 语法错误槽列号快照
 var g_save_err_msg: string = "";  // 语法错误槽消息快照
 
+// ---------- 延迟闭包函数体快照（S2.2）----------
+// 闭包字面量 `func(x: i64) -> i64 { ... }` 是表达式，由 pexpr.parse_primary
+// 解析头部（参数+返回类型）；函数体是语句块，需要 pstmt_flow 的语句解析，
+// 但 pexpr 在 import 树底层无法调用 pstmt_flow（成环：pstmt_flow → pstmt →
+// pexpr）。方案：parse_primary 遇 func 字面量时只解析头部并「配平跳过」
+// 函数体 token（不建 AST），同时登记函数体起始处的完整 token 流快照
+// （与 save_pos 同构但**多槽**——闭包可嵌套/多个，见 putil.defer_closure_*）；
+// 整份文件解析完后由 pstmt_flow.parse_deferred_closures 逐闭包恢复快照、
+// parse_block 解析函数体、回填到 N_FN_LIT。
+var g_defer_nodes: table<i64>;       // 待回填的 N_FN_LIT 节点 id（一一对应快照）
+var g_defer_pos: table<i64>;         // 快照：真实 token 流游标 g_pos
+var g_defer_idx: table<i64>;         // 快照：pending 队列游标 g_pending_idx
+var g_defer_pending: table<table<i64>>;      // 快照：pending 队列 tag（嵌套表 E1）
+var g_defer_pending_lines: table<table<i64>>;   // 快照：行号
+var g_defer_pending_cols: table<table<i64>>;    // 快照：列号
+var g_defer_pending_lexemes: table<table<i64>>; // 快照：lexeme 池 id
+var g_defer_err_line: table<i64>;    // 快照：语法错误槽行号
+var g_defer_err_col: table<i64>;     // 快照：语法错误槽列号
+var g_defer_err_msg: table<string>;  // 快照：语法错误槽消息
+
 // ---------- 语法错误槽位（parse 返回 ERR: 协议）----------
 var p_err_line: i64 = 0;
 var p_err_col: i64 = 0;

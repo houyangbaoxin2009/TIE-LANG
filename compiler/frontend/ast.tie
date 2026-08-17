@@ -147,6 +147,14 @@ const N_UNSAFE_BLOCK: i64 = 130; // unsafe 块（S1.2 U3）：UnsafeBlock[childr
 const N_ASM: i64 = 131;          // asm! 内联汇编（S1.2 I1）：Asm[name=模板串池 id,
                                  //   children=[操作数...]；操作数 Param 复用：val=0=in
                                  //   1=out 2=inout，children=[表达式]]
+const N_FN_LIT: i64 = 132;       // func 字面量（S2.2 闭包）：FnLit[name=-1, aux=nparams,
+                                 //   children=[泛型槽(-1), 返回类型或 -1, 参数..., 函数体]]
+                                 //   布局与 N_FN_DEF 一致（解析复用 parse_fn_def 主体），
+                                 //   仅无函数名（name=-1）。
+const N_TRY: i64 = 133;          // ? 后缀解包（S2.3）：Try[children=[操作数表达式]]
+                                 //   expr ? —— expr 为 Result/Option：Ok 解包 / Err 提前返回
+const N_PANIC: i64 = 134;        // panic 语句（S2.3）：Panic[children=[消息表达式]]
+                                 //   panic("消息") 不可恢复错误（可配置目标行为）
 // 类型段（val=TyKw 索引，name=类型关键字文本池 id）
 //   StructType[name=结构名, children=[类型实参槽]]——`Box<i64>` 引用含 N_TYPE_ARGS
 //   子节点；`Box` 裸引用 children[0] = -1（兼容现有）。
@@ -155,6 +163,10 @@ const N_TUPLE_TYPE: i64 = 201;
 const N_STRUCT_TYPE: i64 = 202;
 const N_TABLE_TYPE: i64 = 203;
 const N_MAP_TYPE: i64 = 204;
+const N_FN_TYPE: i64 = 205;      // 函数值类型（S2.2）：FnType[children=[返回类型]+参数类型...]
+                                 //   `fn(A, B) -> R` 类型节点，children[0]=返回类型，
+                                 //   children[1..]=参数类型。与 N_FN_DEF 的返回类型+
+                                 //   参数布局呼应，语义解析按 children 顺序读取。
 
 // ---------- 二元/一元 op 码（对齐 Rust BinaryOp/UnaryOp 顺序，T2.5 补）----------
 // 二元：0=Add 1=Sub 2=Mul 3=Div 4=Mod 5=Eq 6=NotEq 7=Lt 8=Gt 9=Le 10=Ge

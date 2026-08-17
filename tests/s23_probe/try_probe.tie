@@ -1,0 +1,50 @@
+type tie<logic>
+
+// S2.3 探针：`expr ?` 解包 + panic 语句功能验证。
+// 覆盖：
+//   1. `?` 跨函数传播：Err 提前 return，Ok 解包 payload
+//   2. `?` 解包类型引导（node_types[id] = Ok payload 类型）
+//   3. panic("消息") 语句：打印消息并退出
+//   4. string payload 解包（inttoptr 还原）
+import "../../std/result.tie"
+
+func desc(r: Result<i64, string>) -> string {
+    switch r {
+        case Result.Ok:
+            return "ok"
+        default:
+            return "err"
+    }
+}
+
+// 返回 Result<i64, string> 的基础函数
+func div(a: i64, b: i64) -> Result<i64, string> {
+    if b == 0 {
+        return Result.Err("div by zero")
+    }
+    return Result.Ok(a / b)
+}
+
+// 用 `?` 解包：Err 提前返回（返回类型与操作数同枚举实例）
+func safe_div(a: i64, b: i64) -> Result<i64, string> {
+    var v = div(a, b) ?
+    return Result.Ok(v * 2)
+}
+
+// 链式传播：两层 `?` 嵌套
+func chain(a: i64, b: i64) -> Result<i64, string> {
+    var v = safe_div(a, b) ?
+    return Result.Ok(v + 1)
+}
+
+func main() {
+    // Ok 路径：10/2=5，*2=10，+1=11
+    var r1 = chain(10, 2)
+    println(desc(r1))
+    // Err 路径：div 返回 Err，safe_div 提前返回 Err，chain 提前返回 Err
+    var r2 = chain(10, 0)
+    println(desc(r2))
+    // panic：打印消息并退出（exit 1）
+    panic("致命错误：除数不能为零")
+    println("这行不应被执行")
+}

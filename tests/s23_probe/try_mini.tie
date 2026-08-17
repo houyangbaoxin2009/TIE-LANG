@@ -1,0 +1,20 @@
+type tie<logic>
+
+import "../../std/result.tie"
+
+func div(a: i64, b: i64) -> Result<i64, string> {
+    if b == 0 {
+        return Result.Err("div by zero")
+    }
+    return Result.Ok(a / b)
+}
+
+func safe_div(a: i64, b: i64) -> Result<i64, string> {
+    var v = div(a, b) ?
+    return Result.Ok(v * 2)
+}
+
+func main() {
+    var r1 = safe_div(10, 2)
+    println("done")
+}

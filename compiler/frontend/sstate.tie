@@ -156,6 +156,39 @@ var garg_vals: table<i64>;     // 类型实参 id 扁平段
 // 实例化递归深度计数（防无限递归，上限 64）
 var g_inst_depth: i64 = 0;
 
+// ==================== 闭包语义状态表（S2.2，2026-08-16）====================
+// 闭包（N_FN_LIT func 字面量）延迟检查队列 + 捕获分析。
+// infer_expr 遇 N_FN_LIT 时：① 解析返回/参数类型 → types.fn_of 登记 fn 类型；
+// ② 保存「登记时 lv 快照」（捕获基准：闭包体检查重建作用域用）；③ 入队
+// g_clo_pending（FIFO）。闭包体（语句块）检查延迟到语义主流程末尾由
+// scheck.check_pending_closures() 统一处理（sinfer 无 check_block 能力，且
+// import 树禁止 sinfer → scheck）。捕获判定在 sinfer S_N_VAR 分支（命中
+// lv 且非闭包参数/局部 → 登记 cl_capkeys/cl_capvals）。所有表在
+// semantic.check_impl / check_ast 状态重置时清零。
+var g_clo_pending: table<i64>;  // 待检查闭包 N_FN_LIT 节点 id（FIFO 登记顺序）
+var cl_ret: table<i64>;         // 闭包索引 -> 返回类型 id
+var cl_nparams: table<i64>;     // 闭包索引 -> 参数个数
+var cl_paroff: table<i64>;      // 闭包索引 -> 参数类型段偏移（cl_ptys）
+var cl_ptys: table<i64>;        // 参数类型 id 扁平段
+var cl_off: table<i64>;         // 闭包索引 -> lv 快照段偏移（cl_okeys 等）
+var cl_nouter: table<i64>;      // 闭包索引 -> 快照条数（登记时 lv_keys 长度）
+var cl_okeys: table<i64>;       // 快照变量名 id（扁平段）
+var cl_ovals: table<i64>;       // 快照类型 id
+var cl_oconst: table<i64>;      // 快照 const 标志
+var cl_otelem: table<i64>;      // 快照表元素类型 id
+var cl_odyn: table<i64>;        // 快照动态标志
+var cl_paramoff: table<i64>;    // 闭包索引 -> 参数名段偏移（cl_params）
+var cl_params: table<i64>;      // 闭包参数名 id（扁平段；捕获遮蔽判定）
+var cl_locloff: table<i64>;     // 闭包索引 -> 局部名段偏移（cl_locals）
+var cl_locals: table<i64>;      // 闭包内声明局部名 id（扁平段；捕获遮蔽判定）
+var cl_capoff: table<i64>;      // 闭包索引 -> 捕获段偏移（cl_capkeys/cl_capvals）
+var cl_capkeys: table<i64>;     // 捕获变量名 id（扁平段）
+var cl_capvals: table<i64>;     // 捕获变量类型 id（扁平段）
+var g_clo_depth: i64 = 0;       // 闭包体检查深度（>0 = 在闭包体内）
+var g_clo_cur: i64 = -1;        // 当前闭包索引（捕获登记目标；-1 = 无）
+var g_clo_ret_stack: table<i64>;// 闭包返回类型栈（S_N_RETURN / ? 解包用）
+var g_clo_ret_top: i64 = 0;     // 返回类型栈逻辑栈顶游标（tie 表无法截断）
+
 // 顶层 StmtList 根（parse_program 创建的最后节点 id）
 var g_root: i64 = 0;
 
@@ -226,6 +259,10 @@ const S_N_ENUM: i64 = 128;
 const S_N_ENUM_VARIANT: i64 = 129;
 const S_N_UNSAFE_BLOCK: i64 = 130;  // unsafe 块（S1.2 U3）
 const S_N_ASM: i64 = 131;           // asm! 内联汇编（S1.2 I1）
+const S_N_TRY: i64 = 133;           // ? 后缀解包（S2.3，与 ast.tie N_TRY 同号）
+const S_N_PANIC: i64 = 134;         // panic 语句（S2.3，与 ast.tie N_PANIC 同号）
+const S_N_FN_LIT: i64 = 132;        // func 字面量（S2.2 闭包，与 ast.tie N_FN_LIT 同号）
+const S_N_FN_TYPE: i64 = 205;       // 函数值类型（S2.2，与 ast.tie N_FN_TYPE 同号）
 namespace sstate {
 
 // ==================== 工具：协议解析 ====================
@@ -690,6 +727,22 @@ pub func bs_find(keys: table<i64>, k: i64) -> i64 {
         }
     }
     return -1
+}
+
+// ==================== S2.2 闭包：扁平段内线性查找 ====================
+// 闭包语义状态表的参数名段/局部名段/捕获名段都是「声明/登记顺序」扁平段
+// （非升序，不能用 bs_find）。段内成员判定用线性扫（段通常很小：闭包参数
+// 数、局部数、捕获数都有限）。off = 段起始下标，n = 段长度，k = 目标名 id。
+// 返回 1 = 在段内，0 = 不在。
+pub func seg_has(seg: table<i64>, off: i64, n: i64, k: i64) -> i64 {
+    var i: i64 = 0
+    while i < n {
+        if seg[off + i] == k {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
 }
 
 // ==================== S1.5 移动语义：变量 live/moved 状态 ====================

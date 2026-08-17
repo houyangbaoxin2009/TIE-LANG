@@ -1,3 +1,23 @@
+## [新增] 阶段 2 错误处理（S2.3 Result/Option + `?` 解包 + panic）—— 2026-08-16
+
+tie 语言阶段 2 错误处理模型（docs/plans/error-model.md）全链路落地，tiec
+（tie 自写编译器，compiler/）实现，完全不用 Rust：
+
+- **预置枚举**：`std/result.tie`（type tie<class>）预置
+  `enum Result<T, E> { Ok(T) Err(E) }` 与 `enum Option<T> { Some(T) None }`，
+  import 即用，与用户自定义 enum 无差别
+- **`?` 解包后缀**：lex_question 关键字 + parse_postfix 后缀解析 +
+  sinfer.infer_try_unwrap 语义推断——Err/None 提前 return、Ok/Some 解包
+  payload；仅限返回 Result/Option 的函数内使用（main 返回 void 报语义错误）
+- **panic("msg")**：语句级，运行时 printf + exit(1)（"致命错误：" 前缀）
+- **gen_try 解包路径**：irgen 生成展开；gen_enum_construct string payload
+  槽统一 i64（字符串字面量与 str_cat 拼接已是 i64 指针值，双重 ptrtoint 修复）
+- **ASI 修复**：`?` 不再被误判为二元运算符（is_bin_op 排除 lex_question，
+  frontend + proto 同步），行尾 `?` 正确补分号；单行三目 `?:` 不受影响
+- **验收**：tests/s23_probe/ 探针全过（try_probe ok/err/panic + EXIT=1、
+  result_probe、result_import_probe、opt_none_arg_probe、tmp_t7 三目、
+  tmp_t8 Option 解包、tmp_t9 string payload 判别、tmp_t10 解包值还原）；
+  回归 12/13 PASS；自举链 tiec_verify → tiec_verify2 行为一致
 
 ## [新增] 阶段 1 语言地基三件套（S1.2 unsafe + S1.3 窄整数 + S1.4 角色扩展）—— 2026-08-15
 

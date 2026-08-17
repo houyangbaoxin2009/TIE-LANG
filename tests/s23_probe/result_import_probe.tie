@@ -1,0 +1,36 @@
+type tie<logic>
+
+// S2.3 探针：std 预置 Result/Option 枚举跨文件可见性验证。
+// 覆盖：
+//   1. import std/result.tie 后 Result<T,E> 类型注解可用
+//   2. Result.Ok(42) / Result.Err("bad") 构造（string payload）
+//   3. Option.Some(1) / Option.None 构造
+//   4. 跨文件泛型 enum 单态化（Result<i64,string> 双参数）
+import "../../std/result.tie"
+
+func desc(r: Result<i64, string>) -> string {
+    switch r {
+        case Result.Ok:
+            return "ok"
+        default:
+            return "err"
+    }
+}
+
+func opt_desc(o: Option<i64>) -> string {
+    switch o {
+        case Option.Some:
+            return "some"
+        default:
+            return "none"
+    }
+}
+
+func main() {
+    var a: Result<i64, string> = Result.Ok(42)
+    var b: Result<i64, string> = Result.Err("bad")
+    println(desc(a))
+    println(desc(b))
+    println(opt_desc(Option.Some(1)))
+    println(opt_desc(Option.None))
+}

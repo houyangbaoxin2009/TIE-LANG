@@ -59,6 +59,9 @@ const lex_enum: i64 = 81;       // enum 关键字（enum Color { ... }）
 const lex_unsafe: i64 = 82;     // unsafe 关键字（S1.2：unsafe fn / unsafe 块）
 const lex_repr: i64 = 83;       // repr 关键字（S1.2：repr(C) struct 标注）
 const lex_asm: i64 = 84;        // asm 关键字（S1.2：asm! 内联汇编宏）
+const lex_panic: i64 = 85;      // panic 关键字（S2.3：panic("消息") 不可恢复错误）
+const lex_port: i64 = 86;       // port 关键字（S2.4：接口声明 port Drawable { ... }）
+const lex_impl: i64 = 87;       // impl 关键字（S2.4：实现块 impl Drawable for Button { ... }）
 
 namespace lextok {
 
@@ -115,10 +118,14 @@ pub func col_of(pos: i64) -> i64 {
 
 // ---------- ASI 判定 ----------
 // 是否二元运算符（区间 [lex_plus..lex_question] 内除 Bang/Inc/Dec 外全部是，
-// 与 Rust is_bin_op 对齐；++/-- 特意不算——后缀 i++\n 应补分号）
+// 与 Rust is_bin_op 对齐；++/-- 特意不算——后缀 i++\n 应补分号）。
+// S2.3 起 '?'（lex_question）也不算：它作为后缀解包符（expr ?）时是语句
+// 结束符，行尾应补分号（`var v = f() ?\nreturn ...` 才能正确断句）；
+// 三目 `cond ? a : b` 在同一行书写，不触发 ASI，不受影响。
 func is_bin_op(tag: i64) -> bool {
     return tag >= lex_plus && tag <= lex_question &&
-        tag != lex_bang && tag != lex_inc && tag != lex_dec
+        tag != lex_bang && tag != lex_inc && tag != lex_dec &&
+        tag != lex_question
 }
 
 // 是否「行尾不可结束语句」集合（Rust finish_line 排除表；RBracket 不在其中）

@@ -286,15 +286,19 @@ func col_of(pos: i64) -> i64 {
 
 // 是否二元运算符（行尾是运算符则语句未结束，不补分号）。
 // 注意 M4：++/--（Inc/Dec）与 !（Bang）特意不算——后缀 i++\n 应结束语句。
+// S2.3：'?'（Question）也不算——后缀解包符（expr ?）行尾应补分号，
+// 三目 `cond ? a : b` 同一行书写不受 ASI 影响。
 // tag 区间 [T_PLUS(46) .. T_QUESTION(78)] 内的运算符除 Bang(60)/Inc(76)/Dec(77)
-// 外全部是二元运算符（与 Rust is_bin_op 的 matches! 列表逐一对应）。
+// /Question(78) 外全部是二元运算符（与 Rust is_bin_op 的 matches! 列表逐一对应）。
 func is_bin_op(tag: i64) -> bool {
     if tag >= T_PLUS {
         if tag <= T_QUESTION {
             if tag != T_BANG {
                 if tag != T_INC {
                     if tag != T_DEC {
-                        return true
+                        if tag != T_QUESTION {
+                            return true
+                        }
                     }
                 }
             }

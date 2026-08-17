@@ -355,6 +355,30 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     gin_nargs = table_new_i64()
     gin_is_struct = table_new_i64()
     garg_vals = table_new_i64()
+    // S2.2 闭包语义全局重置（每次编译清零）
+    g_clo_pending = table_new_i64()
+    cl_ret = table_new_i64()
+    cl_nparams = table_new_i64()
+    cl_paroff = table_new_i64()
+    cl_ptys = table_new_i64()
+    cl_off = table_new_i64()
+    cl_nouter = table_new_i64()
+    cl_okeys = table_new_i64()
+    cl_ovals = table_new_i64()
+    cl_oconst = table_new_i64()
+    cl_otelem = table_new_i64()
+    cl_odyn = table_new_i64()
+    cl_paramoff = table_new_i64()
+    cl_params = table_new_i64()
+    cl_locloff = table_new_i64()
+    cl_locals = table_new_i64()
+    cl_capoff = table_new_i64()
+    cl_capkeys = table_new_i64()
+    cl_capvals = table_new_i64()
+    g_clo_ret_stack = table_new_i64()
+    g_clo_depth = 0
+    g_clo_cur = -1
+    g_clo_ret_top = 0
     g_inst_depth = 0
     if len(tre_bi_keys) == 0 {
         scollect.tre_bi_init()
@@ -447,6 +471,12 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
             }
             i = i + 1
         }
+    }
+    // S2.2 闭包体延迟检查：所有函数检查完后 FIFO 处理 g_clo_pending
+    // （闭包体用登记时 lv 快照重建独立作用域，不影响外层函数）
+    var rc = scheck.check_pending_closures()
+    if rc < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
     return "OK:" + to_string(g_typed)
 }
@@ -543,6 +573,30 @@ pub func check_ast(base_dir: string) -> string {
     gin_nargs = table_new_i64()
     gin_is_struct = table_new_i64()
     garg_vals = table_new_i64()
+    // S2.2 闭包语义全局重置（每次编译清零）
+    g_clo_pending = table_new_i64()
+    cl_ret = table_new_i64()
+    cl_nparams = table_new_i64()
+    cl_paroff = table_new_i64()
+    cl_ptys = table_new_i64()
+    cl_off = table_new_i64()
+    cl_nouter = table_new_i64()
+    cl_okeys = table_new_i64()
+    cl_ovals = table_new_i64()
+    cl_oconst = table_new_i64()
+    cl_otelem = table_new_i64()
+    cl_odyn = table_new_i64()
+    cl_paramoff = table_new_i64()
+    cl_params = table_new_i64()
+    cl_locloff = table_new_i64()
+    cl_locals = table_new_i64()
+    cl_capoff = table_new_i64()
+    cl_capkeys = table_new_i64()
+    cl_capvals = table_new_i64()
+    g_clo_ret_stack = table_new_i64()
+    g_clo_depth = 0
+    g_clo_cur = -1
+    g_clo_ret_top = 0
     g_inst_depth = 0
     if len(tre_bi_keys) == 0 {
         scollect.tre_bi_init()
@@ -626,6 +680,12 @@ pub func check_ast(base_dir: string) -> string {
             }
             i = i + 1
         }
+    }
+    // S2.2 闭包体延迟检查：所有函数检查完后 FIFO 处理 g_clo_pending
+    // （闭包体用登记时 lv 快照重建独立作用域，不影响外层函数）
+    var rc = scheck.check_pending_closures()
+    if rc < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
     return "OK:" + to_string(g_typed)
 }

@@ -1,0 +1,8 @@
+type tie<logic>
+
+func main() {
+    var x = 1 > 0 ? 10 : 20
+    println(x)
+    var y = 2 > 1 ? 5 : 6
+    println(y)
+}

@@ -21,7 +21,8 @@ type tie<class>
 //   doc_keys/doc_vals）；EOF 未 flush 丢弃；/**/ 空闭合按普通块注释；
 //   doc 不产 token、不影响 ASI 与错误。
 // # ASI：行尾自动补分号；行尾二元运算符/逗号/冒号/点/开括号/大括号/分号/
-//   else/in 不补（++/-- 不算二元运算符，后缀 i++ 行尾应补）。
+//   else/in 不补（++/-- 不算二元运算符，后缀 i++ 行尾应补；S2.3 起 '?' 后缀
+//   解包符同样不算，行尾 `expr ?` 应补分号断句）。
 import "./lex_scan.tie"
 
 namespace lexer {

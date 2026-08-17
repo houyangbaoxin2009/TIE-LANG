@@ -39,6 +39,17 @@ pub func fill_pending() {
     g_pending_lexemes = table_new_i64()
     g_pos = 0
     g_pending_idx = 0
+    // S2.2：清空延迟闭包登记（闭包函数体快照，见 defer_closure_*）
+    g_defer_nodes = table_new_i64()
+    g_defer_pos = table_new_i64()
+    g_defer_idx = table_new_i64()
+    g_defer_pending = table_new_i64()
+    g_defer_pending_lines = table_new_i64()
+    g_defer_pending_cols = table_new_i64()
+    g_defer_pending_lexemes = table_new_i64()
+    g_defer_err_line = table_new_i64()
+    g_defer_err_col = table_new_i64()
+    g_defer_err_msg = table_new_i64()
     var n = lexer.token_count()
     var i: i64 = 0
     while i < n {
@@ -259,6 +270,72 @@ pub func restore_pos() {
     p_err_line = g_save_err_line
     p_err_col = g_save_err_col
     p_err_msg = g_save_err_msg
+}
+
+// ---------- 延迟闭包函数体快照（S2.2）----------
+// 闭包字面量 `func(x: i64) -> i64 { ... }` 由 pexpr.parse_primary 解析头部，
+// 但函数体是语句块，需要 pstmt_flow 的语句解析——pexpr 在 import 树底层
+// 无法调用 pstmt_flow（成环：pstmt_flow → pstmt → pexpr）。方案：parse_primary
+// 遇 func 时登记「函数体起始处完整 token 流快照」（多槽，闭包可嵌套/多个），
+// 配平跳过函数体 token；整份文件解析完后由 pstmt_flow.parse_deferred_closures
+// 逐闭包恢复快照、parse_block 解析函数体、回填到 N_FN_LIT 的 children。
+// 与 save_pos/restore_pos 不同：那对是单槽、探测用、立即成对；这里是多槽表。
+
+// 登记当前 token 流快照 + 待回填节点（节点一一对应快照）
+pub func defer_closure_push(node: i64) {
+    table_push(g_defer_nodes, node)
+    table_push(g_defer_pos, g_pos)
+    table_push(g_defer_idx, g_pending_idx)
+    var snap: table<i64> = table_new_i64()
+    var snap_lines: table<i64> = table_new_i64()
+    var snap_cols: table<i64> = table_new_i64()
+    var snap_lexemes: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < len(g_pending) {
+        table_push(snap, g_pending[i])
+        table_push(snap_lines, g_pending_lines[i])
+        table_push(snap_cols, g_pending_cols[i])
+        table_push(snap_lexemes, g_pending_lexemes[i])
+        i = i + 1
+    }
+    table_push(g_defer_pending, snap)
+    table_push(g_defer_pending_lines, snap_lines)
+    table_push(g_defer_pending_cols, snap_cols)
+    table_push(g_defer_pending_lexemes, snap_lexemes)
+    table_push(g_defer_err_line, p_err_line)
+    table_push(g_defer_err_col, p_err_col)
+    table_push(g_defer_err_msg, p_err_msg)
+}
+
+// 已登记的延迟闭包个数
+pub func defer_closure_count() -> i64 {
+    return len(g_defer_nodes)
+}
+
+// 第 i 个待回填节点 id
+pub func defer_closure_node_at(i: i64) -> i64 {
+    return g_defer_nodes[i]
+}
+
+// 恢复第 i 个闭包登记时的 token 流快照（游标回到函数体起始 '{' 处）
+pub func defer_closure_restore(i: i64) {
+    g_pos = g_defer_pos[i]
+    g_pending_idx = g_defer_idx[i]
+    g_pending = table_new_i64()
+    g_pending_lines = table_new_i64()
+    g_pending_cols = table_new_i64()
+    g_pending_lexemes = table_new_i64()
+    var k: i64 = 0
+    while k < len(g_defer_pending[i]) {
+        table_push(g_pending, g_defer_pending[i][k])
+        table_push(g_pending_lines, g_defer_pending_lines[i][k])
+        table_push(g_pending_cols, g_defer_pending_cols[i][k])
+        table_push(g_pending_lexemes, g_defer_pending_lexemes[i][k])
+        k = k + 1
+    }
+    p_err_line = g_defer_err_line[i]
+    p_err_col = g_defer_err_col[i]
+    p_err_msg = g_defer_err_msg[i]
 }
 
 // ---------- 泛型调用点 '<' 歧义探测（token 层，无副作用，2026-08-14）----------

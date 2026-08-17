@@ -464,6 +464,28 @@ pub func parse_unary() -> i64 {
         } else if t == lex_dec {
             putil.advance()
             expr = mk_unary(U_POST_DEC, expr, ast.line(expr), ast.col(expr))
+        } else if t == lex_question {
+            // S2.3：`?` 后缀解包（expr ?）与三目（cond ? then : else）共用同一
+            // token，此处用 save/restore 探测区分：吃 `?` 后若能解析出一个
+            // 完整表达式且其后紧跟 ':'，则是三目形态 → 还原让 parse_ternary
+            // 处理；否则是后缀解包 → 构造 N_TRY 节点。
+            putil.save_pos()
+            putil.advance()   // 吃 '?'
+            var then = parse_expr()
+            if then >= 0 && putil.peek_tag() == lex_colon {
+                // 三目形态：还原，'?' 留给外层 parse_ternary
+                putil.restore_pos()
+                d = true
+            } else {
+                // 后缀解包：还原后按后缀消费 '?'，构造 N_TRY
+                putil.restore_pos()
+                putil.advance()
+                var tn = ast.new_node(N_TRY, -1, -1, -1, ast.line(expr), ast.col(expr))
+                var tkids: table<i64> = table_new_i64()
+                table_push(tkids, expr)
+                ast.set_children(tn, tkids)
+                expr = tn
+            }
         } else {
             d = true
         }
@@ -503,6 +525,13 @@ func parse_primary() -> i64 {
     if tag == lex_asm {
         // S1.2 I1：`asm!("template", in(reg) expr, out(reg) expr)` 内联汇编
         return parse_asm_expr(line, col)
+    }
+    // S2.2 闭包字面量 `func(x: i64) -> i64 { ... }`：解析函数头（参数/返回
+    // 类型）+ 配平跳过函数体 + 延迟快照登记，函数体由 pstmt_flow.
+    // parse_deferred_closures 在 parse_program 末尾恢复解析（语义层 N_FN_LIT
+    // 推断已同步实现）。
+    if tag == lex_func {
+        return parse_fn_lit(line, col)
     }
     if tag == lex_int {
         var v = putil.parse_int_lit(putil.peek_lexeme())
@@ -923,6 +952,139 @@ func parse_table_cell(row: i64) -> i64 {
     table_push(kids, value)
     ast.set_children(c, kids)
     return c
+}
+
+// ---------- S2.2 闭包字面量 ----------
+
+// 闭包字面量：`func(x: i64, y: i64) -> i64 { ... }`。
+// 只解析「头部」（参数列表 + 返回类型），函数体 token 流配平跳过并登记
+// 快照（putil.defer_closure_push）；整份文件解析完后由
+// pstmt_flow.parse_deferred_closures 恢复快照、parse_block 解析函数体并
+// 回填到 N_FN_LIT 的 children 末尾。
+// 为何延迟：函数体是语句块，需要 pstmt_flow 的语句解析能力，但本模块
+// （pexpr）在 import 树底层无法调用 pstmt_flow（成环：pstmt_flow → pstmt
+// → pexpr → pstmt_flow）。延迟解析让 pexpr 只产出「头部完整、函数体待填」
+// 的节点，由 import 树高层的 pstmt_top/pstmt_flow 回填。
+func parse_fn_lit(line: i64, col: i64) -> i64 {
+    putil.advance()   // func
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var params: table<i64> = table_new_i64()
+    if !putil.eat(lex_rparen) {
+        var d = false
+        while !d {
+            var pname = putil.expect_ident()
+            if pname < 0 {
+                return -1
+            }
+            if !putil.expect(lex_colon, "':'") {
+                return -1
+            }
+            var is_var: i64 = 0
+            if putil.eat(lex_ellipsis) {
+                is_var = 1   // 变参：`name: ...T`（必须是最后一个参数）
+            }
+            var by_ref: i64 = 0
+            if putil.eat(lex_ref) {
+                by_ref = 1
+            }
+            if is_var == 1 && by_ref == 1 {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "变参参数不能同时使用 ref 修饰")
+                return -1
+            }
+            var pty = pexpr_type.parse_type()
+            if pty < 0 {
+                return -1
+            }
+            var pdef = -1
+            if putil.eat(lex_eq) {
+                if is_var == 1 {
+                    putil.set_err(putil.peek_line(), putil.peek_col(), "变参参数不能有默认值")
+                    return -1
+                }
+                pdef = parse_expr()
+                if pdef < 0 {
+                    return -1
+                }
+            }
+            if is_var == 1 && putil.peek_tag() == lex_comma {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "变参参数必须是最后一个参数")
+                return -1
+            }
+            var p = ast.new_node(N_PARAM, pname, by_ref, is_var, putil.peek_line(), putil.peek_col())
+            var pkids: table<i64> = table_new_i64()
+            table_push(pkids, pty)
+            table_push(pkids, pdef)
+            ast.set_children(p, pkids)
+            table_push(params, p)
+            if putil.eat(lex_comma) {
+                // 继续
+            } else {
+                if !putil.expect(lex_rparen, "')'") {
+                    return -1
+                }
+                d = true
+            }
+        }
+    }
+    var ret_ty = -1
+    if putil.eat(lex_arrow) {
+        ret_ty = pexpr_type.parse_type()
+        if ret_ty < 0 {
+            return -1
+        }
+    } else {
+        ret_ty = ast.new_node(N_NAMED_TYPE, interner.intern("void"), 14, -1, line, col)
+    }
+    if putil.peek_tag() != lex_lbrace {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "闭包函数体必须是以 '{' 开始的代码块")
+        return -1
+    }
+    // 创建节点：先设头部 children（泛型槽、返回类型、参数...），函数体
+    // 由延迟回填追加到 children 末尾。布局与 N_FN_DEF 一致。
+    var f = ast.new_node(N_FN_LIT, -1, -1, len(params), line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, -1)   // 泛型槽（闭包暂不支持显式类型参数）
+    table_push(kids, ret_ty)
+    var i: i64 = 0
+    while i < len(params) {
+        table_push(kids, params[i])
+        i = i + 1
+    }
+    ast.set_children(f, kids)
+    // 登记函数体起始快照（游标此刻停在 '{' 上），随后配平跳过函数体 token
+    putil.defer_closure_push(f)
+    if !skip_closure_body() {
+        return -1
+    }
+    return f
+}
+
+// 配平跳过闭包函数体 `{ ... }`（不建 AST，只消费 token 流到匹配的 '}'）。
+// 函数体由 pstmt_flow.parse_deferred_closures 在 parse_program 末尾恢复
+// 快照后重新解析（本模块无法调用 pstmt_flow——import 树成环）。
+// 注意：字符串/字符字面量是单 token（lex_str），其内部花括号不会干扰
+// 配平；嵌套闭包/普通块的花括号正常计数。
+func skip_closure_body() -> bool {
+    if !putil.expect(lex_lbrace, "'{'") {
+        return false
+    }
+    var depth: i64 = 1   // 已消费起始 '{'，depth=1 表示进入一层
+    while depth > 0 {
+        var tag = putil.peek_tag()
+        if tag == lex_eof {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "闭包函数体未闭合：期望 '}'")
+            return false
+        }
+        if tag == lex_lbrace {
+            depth = depth + 1
+        } else if tag == lex_rbrace {
+            depth = depth - 1
+        }
+        putil.advance()
+    }
+    return true
 }
 
 }

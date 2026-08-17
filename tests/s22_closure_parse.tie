@@ -1,0 +1,18 @@
+type tie<logic>
+// 测试：S2.2 闭包字面量解析（todo 4 验证）
+// 预期：解析成功，语义层（sinfer 对 N_FN_LIT 的推断）尚未实现，
+// 所以编译会停在语义错误——但错误信息必须是「语义/类型」层面，
+// 而不是「语法/解析」层面（那样说明 parse_fn_lit 有 bug）。
+
+func make_adder(x: i64) -> i64 {
+    // 闭包字面量：捕获外层变量 x
+    var f = func(a: i64) -> i64 {
+        return a + x
+    };
+    return f(10)
+}
+
+func main() {
+    var r = make_adder(5)
+    print(r)
+}

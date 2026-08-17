@@ -147,6 +147,27 @@ pub func parse_type_node(tid: i64) -> i64 {
         }
         return types.tuple_of(idx)
     }
+    if tag == S_N_FN_TYPE {
+        // S2.2 函数值类型 `fn(A,B)->R`（N_FN_TYPE 布局：children=[返回类型]+参数类型...）。
+        // 返回类型 = child(0)，参数 = child(1..n-1)。查重/登记走
+        // types.fn_of（按返回类型+参数列表逐一比对，命中复用既有签名）。
+        var nf = sstate.nchild(tid)
+        var ret = parse_type_node(sstate.child(tid, 0))
+        if ret < 0 {
+            return -1
+        }
+        var ptys: table<i64> = table_new_i64()
+        var k: i64 = 1
+        while k < nf {
+            var pt = parse_type_node(sstate.child(tid, k))
+            if pt < 0 {
+                return -1
+            }
+            table_push(ptys, pt)
+            k = k + 1
+        }
+        return types.fn_of(ret, ptys)
+    }
     sm_err_line = s_lines[tid]
     sm_err_col = s_cols[tid]
     sm_err_msg = "期望类型，实际是未知节点"

@@ -55,6 +55,7 @@ const K_ENUM: i64 = 6;
 const K_PTR: i64 = 7;        // ptr<T> 类型化指针（S1.2）
 const K_SLICE: i64 = 8;      // slice<T> 切片（指针+长度，S1.2）
 const K_ATOMIC: i64 = 9;     // atomic<T> 原子类型（S1.2）
+const K_FN: i64 = 10;        // fn 函数值类型（S2.2，闭包/函数指针）
 const K_SHIFT: i64 = 40;           // 高位分离位移量（负载 < 2^40）
 
 // ---------- TyKw 索引常量（0..20，对齐 Rust TyKw 变体顺序）----------
@@ -93,6 +94,10 @@ const BASE_ENUM: i64 = 6597069766656;
 const BASE_PTR: i64 = 7696581394432;
 const BASE_SLICE: i64 = 8796093022208;
 const BASE_ATOMIC: i64 = 9895604649984;
+// S2.2 fn 函数值类型段：id = 10<<40 | fn 签名索引（签名表行号）。
+// 签名 = 返回类型 + 参数类型列表，查 fn 签名表编码（低负载为索引）。
+// 10<<40 = 10995116277760，i64 有符号下远小于 2^63 无溢出。
+const BASE_FN: i64 = 10995116277760;
 
 // ---------- 全局状态（懒构建）----------
 var tykw_names: table<string>;   // TyKw 索引 -> 类型名（错误消息用）
@@ -107,6 +112,14 @@ var nest_map_vals: table<i64>;   // 嵌套 map 值段（序号 → 值类型 id�
 var nest_ptr_elems: table<i64>;    // 嵌套 ptr 元素段
 var nest_slice_elems: table<i64>;  // 嵌套 slice 元素段
 var nest_atomic_elems: table<i64>; // 嵌套 atomic 元素段
+// S2.2 fn 函数值类型签名表（段式，索引即 fn 类型低负载）：
+// fn_ret    签名索引 -> 返回类型 id
+// fn_nparams 签名索引 -> 参数个数
+// fn_params 参数类型扁平段（前缀和由 fn_paroff 记录偏移）
+var fn_ret: table<i64>;      // fn 签名索引 -> 返回类型 id
+var fn_nparams: table<i64>;  // fn 签名索引 -> 参数个数
+var fn_paroff: table<i64>;   // fn 签名索引 -> fn_params 段起始偏移
+var fn_params: table<i64>;   // 参数类型扁平段（前缀和式）
 
 // 嵌套负载序号偏移（避开 named 负载段 0..99；named 仅 0..20 安全余量）
 const NEST_SLOT_OFF: i64 = 100;
@@ -232,17 +245,88 @@ pub func atomic_of(elem: i64) -> i64 {
     return BASE_ATOMIC + NEST_SLOT_OFF + n
 }
 
+// ---------- S2.2 fn 函数值类型构造 ----------
+// fn(A, B) -> R：id = 10<<40 | 签名索引。签名 = 返回类型 + 参数类型列表，
+// 查 fn 签名表编码（低负载为签名表行号）。参数可含任意类型 id（含嵌套聚合、
+// 另一个 fn 类型——函数值作参数天然合法）。
+// fn_of 查重/登记：按返回类型 + 参数列表逐一比对，命中返回既有索引；
+// 未命中追加登记并返回新索引。参数类型存扁平段（fn_params），
+// 每个签名记录参数个数与段偏移（fn_nparams / fn_paroff）。
+pub func fn_of(ret: i64, params: table<i64>) -> i64 {
+    var n = len(fn_ret)
+    var i: i64 = 0
+    while i < n {
+        if fn_ret[i] == ret && fn_nparams[i] == len(params) {
+            var off = fn_paroff[i]
+            var ok: bool = true
+            var j: i64 = 0
+            while j < len(params) {
+                if fn_params[off + j] != params[j] {
+                    ok = false
+                    break
+                }
+                j = j + 1
+            }
+            if ok {
+                return BASE_FN + i
+            }
+        }
+        i = i + 1
+    }
+    table_push(fn_ret, ret)
+    table_push(fn_nparams, len(params))
+    table_push(fn_paroff, len(fn_params))
+    var k: i64 = 0
+    while k < len(params) {
+        table_push(fn_params, params[k])
+        k = k + 1
+    }
+    return BASE_FN + n
+}
+
+// fn 返回类型：fn 类型 -> 返回类型 id；非 fn 类型返回 -1。
+pub func fn_ret_ty(t: i64) -> i64 {
+    var idx = low(t)
+    if idx >= 0 && idx < len(fn_ret) {
+        return fn_ret[idx]
+    }
+    return -1
+}
+
+// fn 参数个数：fn 类型 -> 参数个数；非 fn 类型返回 -1。
+pub func fn_nparams_of(t: i64) -> i64 {
+    var idx = low(t)
+    if idx >= 0 && idx < len(fn_nparams) {
+        return fn_nparams[idx]
+    }
+    return -1
+}
+
+// fn 第 k 个参数类型：fn 类型 -> 参数类型 id；越界/非 fn 返回 -1。
+pub func fn_param_of(t: i64, k: i64) -> i64 {
+    var idx = low(t)
+    if idx >= 0 && idx < len(fn_nparams) {
+        if k >= 0 && k < fn_nparams[idx] {
+            return fn_params[fn_paroff[idx] + k]
+        }
+    }
+    return -1
+}
+
 // ---------- 类型 id 解码 ----------
 
 // 类型类别：0=Named 1=Table 2=Map 3=Struct 4=Tuple 5=TypeVar 6=Enum
-// 7=Ptr 8=Slice 9=Atomic。
+// 7=Ptr 8=Slice 9=Atomic 10=Fn。
 // Named 判定用 id < 100（TyKw 索引 0..20，留余量）；
-// 其余按高位阈值顺序判别（Atomic 段 9<<40 最高必须最先判；之后
-// Slice 8<<40、Ptr 7<<40、Enum 6<<40、TypeVar、Tuple、Struct、Map，
-// 其余为 Table——与 semantic ty_kind 一致）。
+// 其余按高位阈值顺序判别（Fn 段 10<<40 最高必须最先判；之后
+// Atomic 9<<40、Slice 8<<40、Ptr 7<<40、Enum 6<<40、TypeVar、Tuple、
+// Struct、Map，其余为 Table——与 semantic ty_kind 一致）。
 pub func kind(id: i64) -> i64 {
     if id < 100 {
         return K_NAMED
+    }
+    if id >= BASE_FN {
+        return K_FN
     }
     if id >= BASE_ATOMIC {
         return K_ATOMIC
@@ -274,6 +358,9 @@ pub func kind(id: i64) -> i64 {
 // 类型负载：Table/Map/Ptr/Slice/Atomic 的元素类型 id、Struct/Tuple/Enum 的
 // 索引、TypeVar 的 intern 池 id；Named 类型无意义（调用方先判 kind）。
 pub func low(id: i64) -> i64 {
+    if id >= BASE_FN {
+        return id - BASE_FN
+    }
     if id >= BASE_ATOMIC {
         return id - BASE_ATOMIC
     }
@@ -589,7 +676,30 @@ pub func type_name(t: i64) -> string {
         }
         return "?"   // intern 池 id 越界兜底（理论不发生，防御性）
     }
+    if k == K_FN {
+        var s: string = "fn("
+        var np = fn_nparams_of(t)
+        var i: i64 = 0
+        while i < np {
+            if i > 0 {
+                s = s + ", "
+            }
+            s = s + type_name(fn_param_of(t, i))
+            i = i + 1
+        }
+        s = s + ") -> " + type_name(fn_ret_ty(t))
+        return s
+    }
     return "tuple"
+}
+
+// fn 类型判据：kind == K_FN（10<<40 段）。供语义层识别函数值类型
+// （变量/参数/字段声明与调用检查按 kind 分派）。
+pub func is_fn(t: i64) -> bool {
+    if kind(t) == K_FN {
+        return true
+    }
+    return false
 }
 
 }   // namespace types

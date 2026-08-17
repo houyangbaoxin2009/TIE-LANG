@@ -57,7 +57,37 @@ pub func parse_stmt() -> i64 {
         // S1.2 U3：`unsafe { ... }` 局部逃逸块（块内可触底）
         return parse_unsafe_block()
     }
+    if tag == lex_panic {
+        // S2.3：`panic(expr)` 不可恢复错误语句
+        return parse_panic()
+    }
     return pstmt.parse_expr_or_assign()
+}
+
+// `panic(expr)`：S2.3 不可恢复错误（消息为 string 表达式；可配置目标行为——
+// 桌面打印+退出 / 嵌入式 halt / wasm trap，语义层校验）。
+func parse_panic() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // panic
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var msg = pexpr.parse_expr()
+    if msg < 0 {
+        return -1
+    }
+    if !putil.expect(lex_rparen, "')'") {
+        return -1
+    }
+    if !putil.expect(lex_semi, "语句结束符") {
+        return -1
+    }
+    var n = ast.new_node(N_PANIC, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, msg)
+    ast.set_children(n, kids)
+    return n
 }
 
 // unsafe 块：`unsafe { stmts }` → N_UNSAFE_BLOCK（children=[StmtList 或直接语句]）。
@@ -127,6 +157,40 @@ pub func parse_block() -> i64 {
     var list = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
     ast.set_children(list, stmts)
     return list
+}
+
+// ---------- S2.2 延迟闭包函数体回填 ----------
+
+// 回填延迟闭包函数体：parse_primary 解析闭包字面量（func(x: i64) -> i64 {
+// ... }）时只解析头部，函数体 token 流被配平跳过并登记快照（pexpr 在
+// import 树底层无法调用本模块的语句解析——成环）。整份文件解析完后
+// （parse_program 末尾）调用本函数：逐闭包恢复快照 → parse_block 解析
+// 函数体 → 追加到 N_FN_LIT 的 children 末尾（布局与 N_FN_DEF 一致）。
+// 嵌套闭包：外层闭包函数体内若再有闭包字面量，parse_block 解析时会再次
+// 登记到延迟表队尾——循环条件用动态 defer_closure_count()，外层回填后
+// 内层自动继续处理。
+pub func parse_deferred_closures() -> i64 {
+    var i: i64 = 0
+    while i < putil.defer_closure_count() {
+        var node = putil.defer_closure_node_at(i)
+        putil.defer_closure_restore(i)
+        var body = parse_block()
+        if body < 0 {
+            return -1
+        }
+        // 追加函数体：读旧 children（泛型槽、返回类型、参数...）重建
+        var n = ast.child_count(node)
+        var kids: table<i64> = table_new_i64()
+        var k: i64 = 0
+        while k < n {
+            table_push(kids, ast.child_at(node, k))
+            k = k + 1
+        }
+        table_push(kids, body)
+        ast.set_children(node, kids)
+        i = i + 1
+    }
+    return 0
 }
 
 // `if cond { } else { }` / else if 链

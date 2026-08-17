@@ -1,0 +1,23 @@
+type tie<logic>
+
+// 双类型参数泛型 enum（Result<T, E> 前置验证）
+enum Result<T, E> {
+    Ok(T)
+    Err(E)
+}
+
+func desc(r: Result<i64, string>) -> string {
+    switch r {
+        case Result.Ok:
+            return "ok"
+        default:
+            return "err"
+    }
+}
+
+func main() {
+    var a: Result<i64, string> = Result.Ok(42)
+    var b: Result<i64, string> = Result.Err("bad")
+    println(desc(a))
+    println(desc(b))
+}

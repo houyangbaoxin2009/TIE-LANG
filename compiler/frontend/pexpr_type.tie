@@ -67,6 +67,12 @@ pub func parse_type() -> i64 {
         return parse_tuple_type(line, col)
     }
     if tag == lex_ident {
+        // S2.2 函数值类型：`fn(参数类型...) -> 返回类型`。
+        // 'fn' 是标识符 token（非关键字，unsafe fn 语法兼容），此处特判：
+        // 标识符文本 == "fn" 且后随 '(' → 函数类型；否则按结构类型引用解析。
+        if putil.peek_lexeme() == "fn" && putil.peek_n(1) == lex_lparen {
+            return parse_fn_type(line, col)
+        }
         // 结构类型引用：`Box` 或 `Box<i64>`（2026-08-14 泛型类型实参）。
         // N_STRUCT_TYPE children = [类型实参槽]：`Box<i64>` → N_TYPE_ARGS 子节点；
         // `Box` 裸引用 → children[0] = -1（兼容现有布局）。
@@ -88,6 +94,55 @@ pub func parse_type() -> i64 {
     }
     putil.set_err(line, col, "期望类型，实际是 " + putil.describe(tag))
     return -1
+}
+
+// 函数值类型：`fn(参数类型...) -> 返回类型`（S2.2，闭包/函数指针）。
+// 前提：当前 peek 为标识符 "fn"（'fn' 是标识符 token，此处特判消费）。
+// 产出 N_FN_TYPE 节点：children = [返回类型, 参数类型...]（返回类型在前，
+// 与 N_FN_DEF 的 children 布局呼应）。返回类型可省略（缺省 void）。
+func parse_fn_type(line: i64, col: i64) -> i64 {
+    putil.advance()   // 消费 "fn"
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var params: table<i64> = table_new_i64()
+    if !putil.eat(lex_rparen) {
+        var d = false
+        while !d {
+            var pty = parse_type()
+            if pty < 0 {
+                return -1
+            }
+            table_push(params, pty)
+            if putil.eat(lex_comma) {
+                // 继续
+            } else {
+                if !putil.expect(lex_rparen, "')'") {
+                    return -1
+                }
+                d = true
+            }
+        }
+    }
+    var ret = -1
+    if putil.eat(lex_arrow) {
+        ret = parse_type()
+        if ret < 0 {
+            return -1
+        }
+    } else {
+        ret = ast.new_node(N_NAMED_TYPE, interner.intern("void"), 14, -1, line, col)
+    }
+    var t = ast.new_node(N_FN_TYPE, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, ret)
+    var i: i64 = 0
+    while i < len(params) {
+        table_push(kids, params[i])
+        i = i + 1
+    }
+    ast.set_children(t, kids)
+    return t
 }
 
 // 类型实参列表：`<T1, T2, ...>`（使用点，如 `Box<i64>` / `max<i64>(...)`）。

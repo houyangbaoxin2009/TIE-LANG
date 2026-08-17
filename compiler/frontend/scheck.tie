@@ -353,6 +353,22 @@ pub func check_stmt(s: i64) -> i64 {
         g_unsafe_depth = saved2
         return r2
     }
+    if tag == S_N_PANIC {
+        // S2.3：panic("消息") —— 消息必须是 string 表达式（可配置目标行为：
+        // 桌面打印+退出 / 嵌入式 halt / wasm trap，irgen 按 target 发射）
+        var msg = sstate.child(s, 0)
+        var mt = sinfer.infer_expr(msg)
+        if mt < 0 {
+            return -1
+        }
+        if !stype.types_match(types.named(TK_STR), mt, msg) {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "panic 消息必须是 string，实际是 " + types.type_name(mt)
+            return -1
+        }
+        return 0
+    }
     if tag == S_N_VAR_DECL {
         return check_var_decl(s)
     }
@@ -396,7 +412,26 @@ pub func check_stmt(s: i64) -> i64 {
         }
         var vt = sinfer.infer_expr(sstate.child(s, 0))
         if vt < 0 {
-            return -1
+            // S2.3 目标类型引导：泛型 enum 构造（Result.Err("x")）类型参数推断不全
+            // 时（Err 不含 T，T 无法从实参推出），用赋值目标类型补全
+            var sv_l = sm_err_line
+            var sv_c = sm_err_col
+            var sv_m = sm_err_msg
+            var hv = sinfer.try_enum_construct_hinted(sstate.child(s, 0), target_ty)
+            if hv >= 0 {
+                sm_err_line = 0
+                sm_err_col = 0
+                sm_err_msg = ""
+                vt = hv
+            } else {
+                if sm_err_msg == sv_m {
+                    // 引导未命中（非泛型 enum 构造）：恢复原错误
+                    sm_err_line = sv_l
+                    sm_err_col = sv_c
+                    sm_err_msg = sv_m
+                }
+                return -1
+            }
         }
         // 复合赋值校验（对齐 Rust check_compound_assign，M4）：op >= 0 为复合
         var op = s_vals[s]
@@ -473,9 +508,36 @@ pub func check_stmt(s: i64) -> i64 {
         if v >= 0 {
             var vt = sinfer.infer_expr(v)
             if vt < 0 {
-                return -1
+// S2.3 目标类型引导：return 泛型 enum 构造时类型参数推断不全，
+            // 用函数返回类型补全（如 return Result.Err("bad") 于 Result<i64,string>）
+            // S2.2 闭包：闭包体内用闭包返回类型（g_clo_ret_stack 栈顶）替代
+            var h_ret = sg_ret[g_curfn]
+            if g_clo_ret_top > 0 {
+                h_ret = g_clo_ret_stack[g_clo_ret_top - 1]
+            }
+            var rv_l = sm_err_line
+            var rv_c = sm_err_col
+            var rv_m = sm_err_msg
+            var hv = sinfer.try_enum_construct_hinted(v, h_ret)
+                if hv >= 0 {
+                    sm_err_line = 0
+                    sm_err_col = 0
+                    sm_err_msg = ""
+                    vt = hv
+                } else {
+                    if sm_err_msg == rv_m {
+                        sm_err_line = rv_l
+                        sm_err_col = rv_c
+                        sm_err_msg = rv_m
+                    }
+                    return -1
+                }
             }
             var ret_ty = sg_ret[g_curfn]
+            // S2.2 闭包：闭包体内 return 类型基准用闭包返回类型（栈顶）
+            if g_clo_ret_top > 0 {
+                ret_ty = g_clo_ret_stack[g_clo_ret_top - 1]
+            }
             if !stype.types_compatible(ret_ty, vt) && !stype.types_match(ret_ty, vt, v) {
                 sm_err_line = s_lines[s]
                 sm_err_col = s_cols[s]
@@ -771,7 +833,25 @@ pub func check_var_decl(s: i64) -> i64 {
         if init >= 0 {
             it = sinfer.infer_expr(init)
             if it < 0 {
-                return -1
+                // S2.3 目标类型引导：`var b: Result<i64, string> = Result.Err("bad")`
+                // 泛型 enum 构造类型参数推断不全时，用标注类型补全
+                var d_l = sm_err_line
+                var d_c = sm_err_col
+                var d_m = sm_err_msg
+                var hv = sinfer.try_enum_construct_hinted(init, ty)
+                if hv >= 0 {
+                    sm_err_line = 0
+                    sm_err_col = 0
+                    sm_err_msg = ""
+                    it = hv
+                } else {
+                    if sm_err_msg == d_m {
+                        sm_err_line = d_l
+                        sm_err_col = d_c
+                        sm_err_msg = d_m
+                    }
+                    return -1
+                }
             }
         }
         var telem: i64 = -1
@@ -830,6 +910,10 @@ pub func check_var_decl(s: i64) -> i64 {
             }
         }
         sinfer.lv_insert(nid, ty, is_const, telem, dyn)
+        // S2.2 闭包：闭包体内声明的局部登记到当前闭包局部段（捕获遮蔽判定用）
+        if g_clo_depth > 0 && g_clo_cur >= 0 {
+            table_push(cl_locals, nid)
+        }
         return 0
     }
     if init < 0 {
@@ -895,6 +979,10 @@ pub func check_var_decl(s: i64) -> i64 {
         }
     }
     sinfer.lv_insert(nid, it2, is_const, telem2, dyn2)
+    // S2.2 闭包：闭包体内声明的局部登记到当前闭包局部段（捕获遮蔽判定用）
+    if g_clo_depth > 0 && g_clo_cur >= 0 {
+        table_push(cl_locals, nid)
+    }
     return 0
 }
 
@@ -1033,6 +1121,106 @@ func check_fn_walk_in_ns(blk: i64, full: string) -> i64 {
             }
         }
         i = i + 1
+    }
+    return 0
+}
+
+// ==================== S2.2 闭包：延迟闭包体检查 ====================
+// 语义主流程末尾调用。FIFO 处理 g_clo_pending（登记顺序 = 检查顺序；
+// 嵌套闭包在外层闭包体检查期间登记，仍按 FIFO 排在外层之后）。
+// 每个闭包体用「登记时 lv 快照 + 闭包参数 + 闭包局部」重建独立作用域
+// 检查，结束后恢复外层作用域（函数检查残留的 lv 表）。
+pub func check_pending_closures() -> i64 {
+    var n = len(g_clo_pending)
+    var i: i64 = 0
+    while i < n {
+        var r = check_closure_body(i)
+        if r < 0 {
+            return -1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 检查单个闭包体：重建独立 lv 作用域 + 闭包返回类型栈 + 检查后恢复
+func check_closure_body(ci: i64) -> i64 {
+    var fn_node = g_clo_pending[ci]
+    // 保存外层 lv 五表与 loop 栈（函数检查残留，闭包体检查后恢复）
+    var s_keys = lv_keys
+    var s_vals = lv_vals
+    var s_const = lv_const
+    var s_telem = lv_telem
+    var s_dyn = lv_dyn
+    var s_lp = lp_stack
+    var s_lpt = lp_top
+    // 重建 lv = 登记时快照段（cl_o* 五表并行段，登记时已排序，直拷保持序）
+    lv_keys = table_new_i64()
+    lv_vals = table_new_i64()
+    lv_const = table_new_i64()
+    lv_telem = table_new_i64()
+    lv_dyn = table_new_i64()
+    lp_stack = table_new_i64()
+    lp_top = 0
+    var ooff = cl_off[ci]
+    var nouter = cl_nouter[ci]
+    var j: i64 = 0
+    while j < nouter {
+        table_push(lv_keys, cl_okeys[ooff + j])
+        table_push(lv_vals, cl_ovals[ooff + j])
+        table_push(lv_const, cl_oconst[ooff + j])
+        table_push(lv_telem, cl_otelem[ooff + j])
+        table_push(lv_dyn, cl_odyn[ooff + j])
+        j = j + 1
+    }
+    // 闭包参数插入 lv（telem/dyn 表类型处理同 check_fn 参数模板）
+    var nparams = cl_nparams[ci]
+    var poff = cl_paramoff[ci]
+    var tyoff = cl_paroff[ci]
+    var k: i64 = 0
+    while k < nparams {
+        var pnid = cl_params[poff + k]
+        var pty = cl_ptys[tyoff + k]
+        var telem: i64 = -1
+        var dyn: i64 = 0
+        if types.is_table(pty) {
+            telem = types.table_elem(pty)
+            if telem < 0 {
+                telem = types.named(TK_STR)
+            }
+            dyn = 1
+        }
+        sinfer.lv_insert(pnid, pty, 0, telem, dyn)
+        k = k + 1
+    }
+    // 闭包局部/捕获段起点：检查开始时定位（覆盖登记时占位值，避免
+    // 嵌套闭包登记后外层闭包继续追加局部/捕获造成的段污染）
+    cl_locloff[ci] = len(cl_locals)
+    cl_capoff[ci] = len(cl_capkeys)
+    // 压闭包返回类型（S_N_RETURN 检查优先取栈顶而非 sg_ret[g_curfn]）
+    table_push(g_clo_ret_stack, cl_ret[ci])
+    g_clo_ret_top = g_clo_ret_top + 1
+    // 进入闭包体上下文（S_N_VAR 捕获登记 / check_var_decl 局部登记）
+    g_clo_cur = ci
+    g_clo_depth = g_clo_depth + 1
+    // 闭包体：children[slot+1+nparams]（泛型槽0、返回类型1、参数2..、体末尾）
+    var slot = sstate.slot_off(fn_node)
+    var body = sstate.child(fn_node, slot + 1 + nparams)
+    var r = check_block(body)
+    // 退出闭包体上下文
+    g_clo_depth = g_clo_depth - 1
+    g_clo_cur = -1
+    g_clo_ret_top = g_clo_ret_top - 1
+    // 恢复外层 lv 五表与 loop 栈
+    lv_keys = s_keys
+    lv_vals = s_vals
+    lv_const = s_const
+    lv_telem = s_telem
+    lv_dyn = s_dyn
+    lp_stack = s_lp
+    lp_top = s_lpt
+    if r < 0 {
+        return -1
     }
     return 0
 }

@@ -1103,6 +1103,39 @@ pub func match_type_node(tnode: i64, arg_ty: i64, tp_names: table<i64>, bk: ref 
         }
         return match_type_node(sstate.child(tnode, 0), ety, tp_names, bk, bv, call_id)
     }
+    if tag == S_N_FN_TYPE {
+        // S2.2 函数值类型模板匹配：`fn(T)->R` 实参必须是 K_FN，且返回类型
+        // 与各参数类型逐项 match（返回类型/参数类型可为类型参数引用 → 绑定）。
+        // 支撑泛型高阶函数：`func apply<T>(f: fn(T)->T, x: T) -> T`。
+        if types.kind(arg_ty) != K_FN {
+            return -1
+        }
+        var nc = sstate.nchild(tnode)
+        if nc < 1 {
+            return -1
+        }
+        // 返回类型匹配（children[0]）
+        var wr = types.fn_ret_ty(arg_ty)
+        var mr = match_type_node(sstate.child(tnode, 0), wr, tp_names, bk, bv, call_id)
+        if mr != 0 {
+            return mr
+        }
+        // 参数个数必须一致
+        var n_params = types.fn_nparams_of(arg_ty)
+        if n_params != nc - 1 {
+            return -1
+        }
+        var k: i64 = 1
+        while k < nc {
+            var wp = types.fn_param_of(arg_ty, k - 1)
+            var mr2 = match_type_node(sstate.child(tnode, k), wp, tp_names, bk, bv, call_id)
+            if mr2 != 0 {
+                return mr2
+            }
+            k = k + 1
+        }
+        return 0
+    }
     return -1
 }
 

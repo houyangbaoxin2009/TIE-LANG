@@ -2007,6 +2007,11 @@ func gen_expr(id: i64) -> i64 {
         }
         return gen_int_lit(0)  // 哑值（asm 表达式无值）
     }
+    if tag == 133 {
+        // S2.3：`expr ?` 解包（N_TRY）：Result/Option 枚举——Err/None 提前
+        // return，Ok/Some 解包 payload。语义由 sinfer.infer_try_unwrap 校验。
+        return gen_try(id)
+    }
     // 其他表达式后续扩展
     sm_err_line = s_lines[id]
     sm_err_col = s_cols[id]
@@ -4172,34 +4177,49 @@ func gen_enum_construct(eidx: i64, vname: string, id: i64, arg_start: i64) -> i6
         var v: i64 = -1
         if i < nfld {
             fty = en_ftys[foff + i]
-            // string payload 一期暂不支持（槽是 i64，string 值是指针，
-            // 需 ptrtoint/inttoptr 桥；llvmgen 无现成内联桥）
-            if fty == types.named(TK_STR) {
-                sm_err_line = s_lines[id]
-                sm_err_col = s_cols[id]
-                sm_err_msg = "枚举变体 string payload 暂不支持（一期仅支持整数系 payload）"
-                return -1
-            }
             var arg = sstate.child(id, arg_start + i)
-            // 窄整数字段 + 整数字面量：按字段类型生成常量（i32 槽 i32 值）——
-            // 否则字面量走 gen_expr 恒 i64，sext i32 %i64 类型不匹配。
-            // 非字面量（变量/表达式）gen_expr 产出天然窄类型（i32 变量 load i32、
-            // 字符/布尔字面量 i32/i1），sext 源类型与 fty 一致。
-            if fty != types.named(TK_I64) && fty != types.named(TK_U64) && s_tags[arg] == 0 {
-                v = gen_int_lit_ty(s_vals[arg], fty)
-            } else {
+            if fty == types.named(TK_STR) {
+                // string payload（S2.3）：槽是 i64，已按 i64 指针值发射的 string
+                // 表达式可直接存储——两类：字符串字面量（const_str 发射为
+                // ptrtoint i64）与字符串拼接（str_cat 输出同为 ptrtoint i64，
+                // 见 llvmgen op==56）；其余 string 变量/调用返回值是 ptr 值，
+                // 需 ptrtoint 转 i64 后存储。读取侧（switch case 绑定 / ? 解包）
+                // 由消费方按需 inttoptr 还原 ptr。
                 v = gen_expr(arg)
-            }
-            if v < 0 {
-                return -1
-            }
-            // 窄整数/字符/布尔/trit → sext 升宽到 i64（槽统一 i64；u 类型
-            // 升宽用 sext——一期仅 i64 payload 参与验收，符号扩展边界已注释）
-            if fty != types.named(TK_I64) && fty != types.named(TK_U64) {
-                var se = ir.new_inst(g_cur_block, 19, types.named(TK_I64))  // sext
-                ir.add_operand(se, fty, 2)
-                ir.add_operand(se, v, 0)
-                v = ir.get_value(se)
+                if v < 0 {
+                    return -1
+                }
+                // 跳过转换：字面量（S_N_STR_LIT=2）或字符串拼接（S_N_BINARY=9
+                // 且语义类型为 string——比较类二元返回 bool 不会命中）
+                var is_i64_ptrval = s_tags[arg] == 2 ||
+                    (s_tags[arg] == 9 && node_types[arg] == types.named(TK_STR))
+                if !is_i64_ptrval {
+                    var pi = ir.new_inst(g_cur_block, 24, types.named(TK_I64))  // ptrtoint
+                    ir.add_operand(pi, v, 0)
+                    v = ir.get_value(pi)
+                }
+            } else {
+                // 窄整数字段 + 整数字面量：按字段类型生成常量（i32 槽 i32 值）——
+                // 否则字面量走 gen_expr 恒 i64，sext i32 %i64 类型不匹配。
+                // 非字面量（变量/表达式）gen_expr 产出天然窄类型（i32 变量 load i32、
+                // 字符/布尔字面量 i32/i1），sext 源类型与 fty 一致。
+                if fty != types.named(TK_I64) && fty != types.named(TK_U64) && s_tags[arg] == 0 {
+                    v = gen_int_lit_ty(s_vals[arg], fty)
+                } else {
+                    v = gen_expr(arg)
+                }
+                if v < 0 {
+                    return -1
+                }
+                // 窄整数/字符/布尔/trit → sext 升宽到 i64（槽统一 i64；u 类型
+                // 升宽用 sext——一期仅 i64 payload 参与验收，符号扩展边界已注释；
+                // string 已是 i64 指针值，不参与升宽）
+                if fty != types.named(TK_I64) && fty != types.named(TK_U64) {
+                    var se = ir.new_inst(g_cur_block, 19, types.named(TK_I64))  // sext
+                    ir.add_operand(se, fty, 2)
+                    ir.add_operand(se, v, 0)
+                    v = ir.get_value(se)
+                }
             }
         } else {
             // 无 payload 变体 / 超出实参的槽：零值（聚合不含未定义位）
@@ -4218,6 +4238,121 @@ func gen_enum_construct(eidx: i64, vname: string, id: i64, arg_start: i64) -> i6
     var ld = ir.new_inst(g_cur_block, 21, agg)  // load 聚合值
     ir.add_operand(ld, ap, 0)
     return ir.get_value(ld)
+}
+
+// S2.3：`expr ?` 解包展开（N_TRY=133）。语义已由 sinfer.infer_try_unwrap
+// 校验：操作数必须是 Result/Option 形态枚举（含 Ok/Some 与 Err/None 变体），
+// 当前函数返回类型必须是同一枚举实例；解包类型 = Ok/Some 的 payload 类型
+// （node_types[id] 已登记）。IR 布局：gen_agg_addr 落内存 → 槽 0 读 tag →
+// icmp eq err_tag → cond_br；err 分支 ret 操作数聚合值本身（返回类型与
+// 操作数同实例，Err 值原样返回）；ok 分支解包槽 1（string 槽存 i64 指针值
+// → inttoptr 还原 ptr；窄整数槽存 sext 后 i64 → trunc 还原；i64/u64 直用）。
+func gen_try(id: i64) -> i64 {
+    var operand = sstate.child(id, 0)
+    var oty = node_types[operand]
+    if oty < 0 || types.kind(oty) != K_ENUM {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "内部错误：'?' 解包操作数缺少枚举类型（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var ei = types.low(oty)
+    // 找 Err/None 变体 tag（提前返回分支的判定值）
+    var err_tag = enum_variant_tag(ei, "Err")
+    if err_tag < 0 {
+        err_tag = enum_variant_tag(ei, "None")
+    }
+    if err_tag < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "内部错误：'?' 解包枚举缺少 Err/None 变体（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    // 1. 操作数落内存（gen_agg_addr 取聚合地址：变量直接槽，表达式 store 到 alloca）
+    var eaddr = gen_agg_addr(operand, oty)
+    if eaddr < 0 {
+        return -1
+    }
+    // 2. 读 tag（槽 0）：agg_gep 0 → load i64
+    var g0 = ir.new_inst(g_cur_block, 27, oty)  // agg_gep
+    ir.add_operand(g0, eaddr, 0)
+    ir.add_operand(g0, 0, 2)
+    var g0p = ir.get_value(g0)
+    var ld0 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))  // load i64
+    ir.add_operand(ld0, g0p, 0)
+    var tag_v = ir.get_value(ld0)
+    // 3. icmp eq tag_v, err_tag
+    var err_c = gen_int_lit_ty(err_tag, types.named(TK_I64))
+    var ic = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp eq
+    ir.add_operand(ic, tag_v, 0)
+    ir.add_operand(ic, err_c, 0)
+    ir.add_operand(ic, 0, 2)  // eq
+    var icv = ir.get_value(ic)
+    // 4. cond_br → err_blk（提前 return）/ ok_blk（解包）
+    var err_blk = ir.new_block(g_cur_func, interner.intern("try.err"))
+    var ok_blk = ir.new_block(g_cur_func, interner.intern("try.ok"))
+    var cbr = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cbr, icv, 0)
+    ir.add_operand(cbr, err_blk, 1)
+    ir.add_operand(cbr, ok_blk, 1)
+    // 5. err_blk：ret 操作数聚合值（返回类型 == 操作数枚举实例，Err 原样返回）
+    g_cur_block = err_blk
+    var ld_a = ir.new_inst(g_cur_block, 21, oty)  // load 聚合值
+    ir.add_operand(ld_a, eaddr, 0)
+    var agg_v = ir.get_value(ld_a)
+    var ret_e = ir.new_inst(g_cur_block, 32, oty)  // ret 聚合
+    ir.add_operand(ret_e, agg_v, 0)
+    // 6. ok_blk：解包 payload（槽 1）
+    g_cur_block = ok_blk
+    var g1 = ir.new_inst(g_cur_block, 27, oty)  // agg_gep 下标 1
+    ir.add_operand(g1, eaddr, 0)
+    ir.add_operand(g1, 1, 2)
+    var g1p = ir.get_value(g1)
+    var uty = node_types[id]  // 解包类型（infer_try_unwrap 已登记）
+    if uty < 0 {
+        uty = types.named(TK_I64)
+    }
+    // string payload：槽存 i64 指针值 → load i64 → inttoptr 还原 ptr
+    if uty == types.named(TK_STR) {
+        var ld1 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+        ir.add_operand(ld1, g1p, 0)
+        var pv1 = ir.get_value(ld1)
+        var ip = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr
+        ir.add_operand(ip, pv1, 0)
+        return ir.get_value(ip)
+    }
+    // 窄整数 payload：槽存 sext 后 i64 → load i64 → trunc 还原（gen_coerce）
+    if types.is_int(uty) && uty != types.named(TK_I64) && uty != types.named(TK_U64) {
+        var ld2 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+        ir.add_operand(ld2, g1p, 0)
+        var pv2 = ir.get_value(ld2)
+        return gen_coerce(pv2, types.named(TK_I64), uty)  // trunc opcode 37
+    }
+    // 其他（i64/u64）：槽统一 i64，load 直用
+    var ld3 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+    ir.add_operand(ld3, g1p, 0)
+    return ir.get_value(ld3)
+}
+
+// S2.3：`panic("消息")` 不可恢复错误语句（N_PANIC=134）→ 打印消息 + 退出。
+// 参考 gen_println（call_vararg + 格式串池 id + 消息）与 exit() 先例
+// （gen_ext_call1("exit", ...)，C 运行时 exit() 自带 stdio flush）。
+// 可配置目标行为（嵌入式 halt / wasm trap）由语义层校验，一期桌面打印+退出。
+func gen_panic(id: i64) -> i64 {
+    var msg = sstate.child(id, 0)
+    var mv = gen_expr(msg)
+    if mv < 0 {
+        return -1
+    }
+    // printf 消息：call_vararg + 格式串 "%s\n" + 消息 ptr
+    var fmt = interner.intern("%s\n")
+    var inst = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
+    ir.add_operand(inst, fmt, 0)
+    ir.add_operand(inst, mv, 0)
+    // exit(1)
+    var one = gen_int_lit_ty(1, types.named(TK_I64))
+    gen_ext_call1("exit", one, types.named(TK_I64), -1)
+    return 0
 }
 
 // struct 构造调用：StructName(args...) → 聚合值。
@@ -5707,6 +5842,10 @@ func gen_stmt(id: i64) -> i64 {
     if tag == 115 {
         // FieldAssign：obj.field = v（元组/struct 字段赋值；复合赋值 op ≥ 0）
         return gen_field_assign(id)
+    }
+    if tag == 134 {
+        // S2.3：`panic("消息")` 不可恢复错误语句（N_PANIC）→ printf + exit(1)
+        return gen_panic(id)
     }
     sm_err_line = s_lines[id]
     sm_err_col = s_cols[id]

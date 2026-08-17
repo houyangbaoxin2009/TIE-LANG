@@ -1,0 +1,31 @@
+type tie<logic>
+// tests/s23_probe/tmp_t10.tie —— S2.3 探针：string payload `?` 解包值内容验证
+// 覆盖：
+//   1. Result<string, string> Ok(payload) `?` 解包 → 打印解包后的 string 内容
+//   2. 解包后的 string 参与拼接后打印（验证值真实还原，非仅判别）
+import "../../std/result.tie"
+
+// 返回 Result<string, string> 的基础函数
+func read_cfg(ok: bool) -> Result<string, string> {
+    if !ok {
+        return Result.Err("配置不存在")
+    }
+    return Result.Ok("hello cfg")
+}
+
+// 解包并直接打印 string payload 内容
+func load_print(ok: bool) -> Result<string, string> {
+    var s = read_cfg(ok) ?
+    println("直接解包: " + s)
+    return Result.Ok(s + "!")
+}
+
+func main() {
+    var r1 = load_print(true)
+    switch r1 {
+        case Result.Ok:
+            println("ok1")
+        default:
+            println("unexpected")
+    }
+}

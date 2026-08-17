@@ -1,0 +1,47 @@
+type tie<logic>
+// tests/s23_probe/tmp_t8.tie —— S2.3 探针：Option `?` 解包（Some 解包 / None 提前 return）
+// 覆盖：
+//   1. Option.Some(v) 的 `?` 解包 → 拿到 payload
+//   2. Option.None 的 `?` 解包 → 提前 return（返回类型为 Option<T> 的函数）
+//   3. 混合使用：Result 与 Option 各自独立解包链
+import "../../std/result.tie"
+
+func desc(r: Option<i64>) -> string {
+    switch r {
+        case Option.Some:
+            return "some"
+        default:
+            return "none"
+    }
+}
+
+// 返回 Option<i64> 的基础函数
+func find(a: i64) -> Option<i64> {
+    if a < 0 {
+        return Option.None
+    }
+    return Option.Some(a * 2)
+}
+
+// 用 `?` 解包：None 提前返回，Some 解包 payload
+func safe_find(a: i64) -> Option<i64> {
+    var v = find(a) ?
+    return Option.Some(v + 1)
+}
+
+// 链式传播：两层 `?` 嵌套（Option）
+func chain2(a: i64) -> Option<i64> {
+    var v = safe_find(a) ?
+    return Option.Some(v + 1)
+}
+
+func main() {
+    // Some 路径：find(5)=Some(10)，safe_find 解包 10 再 +1=Some(11)，chain2 解包 11 再 +1=Some(12)
+    var r1 = chain2(5)
+    println(desc(r1))
+    // None 路径：find(-1)=None，safe_find 提前返回 None，chain2 提前返回 None
+    var r2 = chain2(-1)
+    println(desc(r2))
+    // 混合：Result 与 Option 各自独立
+    println("done")
+}

@@ -109,6 +109,14 @@ pub func parse_program() -> i64 {
             return -1
         }
     }
+    // S2.2：回填延迟闭包函数体。parse_primary 解析闭包字面量时只解析头部
+    // （pexpr 在 import 树底层无法调用 pstmt_flow 的语句解析——成环），
+    // 函数体 token 流被配平跳过并登记快照；这里在整份文件解析完后统一
+    // 恢复快照、parse_block 解析函数体、回填到 N_FN_LIT（见
+    // pstmt_flow.parse_deferred_closures）。
+    if pstmt_flow.parse_deferred_closures() < 0 {
+        return -1
+    }
     var root = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
     ast.set_children(root, stmts)
     return root

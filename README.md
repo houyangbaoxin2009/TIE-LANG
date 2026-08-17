@@ -21,6 +21,10 @@ tiec 实现）。阶段 1 语言地基（2026-08-15）新增三大系统能力�
 [docs/plans/int-model.md](docs/plans/int-model.md)）、**角色扩展**
 （多角色叠加 `type tie<db:vector, unsafe>` + 角色参数化 + 文件名一致性
 = 编译错误，见 [docs/plans/role-model.md](docs/plans/role-model.md)）。
+阶段 2 错误处理（2026-08-16，S2.3）新增**错误处理模型**：预置
+`enum Result<T, E>` / `enum Option<T>`（`std/result.tie`，import 即用）、
+`?` 解包后缀（Err/None 提前返回 + Ok/Some 解包 payload）、`panic("msg")`
+致命错误语句，见 [docs/plans/error-model.md](docs/plans/error-model.md)。
 
 > 语法规范见 [docs/language.md](docs/language.md)；本文件是工程入口（用法、结构、流水线、路线图）。
 

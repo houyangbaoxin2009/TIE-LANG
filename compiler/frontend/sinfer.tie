@@ -318,6 +318,24 @@ pub func infer_expr(id: i64) -> i64 {
         var nid = intern.intern(nm)
         var lt = lv_find(nid)
         if lt >= 0 {
+            // S2.2 闭包捕获分析：闭包体检查期间（g_clo_depth > 0）引用变量，
+            // 且该变量既非闭包参数（cl_params 段）、也非闭包体内局部（cl_locals
+            // 段）→ 属于登记时快照中的外层变量 → 捕获。登记 (名 id, 类型 id)
+            // 到 cl_capkeys/cl_capvals（当前闭包段内查重，重复引用只登记一次）。
+            if g_clo_depth > 0 && g_clo_cur >= 0 {
+                var ci = g_clo_cur
+                var is_param = sstate.seg_has(cl_params, cl_paramoff[ci], cl_nparams[ci], nid)
+                if is_param == 0 {
+                    var is_local = sstate.seg_has(cl_locals, cl_locloff[ci], len(cl_locals) - cl_locloff[ci], nid)
+                    if is_local == 0 {
+                        var is_cap = sstate.seg_has(cl_capkeys, cl_capoff[ci], len(cl_capkeys) - cl_capoff[ci], nid)
+                        if is_cap == 0 {
+                            table_push(cl_capkeys, nid)
+                            table_push(cl_capvals, lt)
+                        }
+                    }
+                }
+            }
             node_types[id] = lt
             g_typed = g_typed + 1
             return lt
@@ -951,6 +969,77 @@ pub func infer_expr(id: i64) -> i64 {
         g_typed = g_typed + 1
         return rt
     }
+    // S2.2 闭包字面量（N_FN_LIT）：构造 fn 类型 + 登记延迟检查队列。
+    // 布局（parse_fn_lit）：children = [泛型槽(-1), ret_ty, params..., body]，
+    // aux = nparams。ret_ty 无 -> 时解析器已生成 void 节点（N_NAMED_TYPE）。
+    // 闭包体（语句块）检查延迟到语义主流程末尾的 scheck.check_pending_closures()
+    // （sinfer 无法调用 scheck——import 树反向）。此处只做：
+    // ① 解析返回/参数类型 → types.fn_of 登记 fn 签名（含函数值作参数/返回）；
+    // ② 保存登记时 lv 快照（捕获基准：闭包体检查重建独立作用域用）；
+    // ③ 入队 g_clo_pending（FIFO）。捕获分析在 S_N_VAR 分支完成。
+    if tag == S_N_FN_LIT {
+        var slot = sstate.slot_off(id)
+        var nparams = s_aux[id]
+        // 返回类型节点：children[slot]（N_FN_LIT 布局 = 泛型槽(0)、返回类型(1)、
+        // 参数(2..)、函数体(末尾)；slot_off 返回 1 = 有泛型槽）
+        var ret_node = sstate.child(id, slot)
+        var ret_ty = sgen.parse_generic_type_node(ret_node)
+        if ret_ty < 0 {
+            return -1
+        }
+        // 参数类型收集：children[slot+1 .. slot+1+nparams)，N_PARAM child(0)=pty
+        var ptys: table<i64> = table_new_i64()
+        var k: i64 = 0
+        while k < nparams {
+            var pnode = sstate.child(id, slot + 1 + k)
+            var pty_node = sstate.child(pnode, 0)
+            var pty = sgen.parse_generic_type_node(pty_node)
+            if pty < 0 {
+                return -1
+            }
+            table_push(ptys, pty)
+            k = k + 1
+        }
+        var fnty = types.fn_of(ret_ty, ptys)
+        node_types[id] = fnty
+        g_typed = g_typed + 1
+        // 登记闭包：入队 + 签名段 + 登记时 lv 快照
+        var ci = len(g_clo_pending)
+        table_push(g_clo_pending, id)
+        table_push(cl_ret, ret_ty)
+        table_push(cl_nparams, nparams)
+        table_push(cl_paroff, len(cl_ptys))
+        var k2: i64 = 0
+        while k2 < nparams {
+            table_push(cl_ptys, ptys[k2])
+            k2 = k2 + 1
+        }
+        // 参数名段（捕获遮蔽判定：闭包参数遮蔽外层同名变量）
+        table_push(cl_paramoff, len(cl_params))
+        var k3: i64 = 0
+        while k3 < nparams {
+            var pnode2 = sstate.child(id, slot + 1 + k3)
+            table_push(cl_params, s_names[pnode2])
+            k3 = k3 + 1
+        }
+        // 登记时 lv 快照（捕获基准：五表拍平进 cl_o* 段）
+        table_push(cl_off, len(cl_okeys))
+        var ni: i64 = 0
+        while ni < len(lv_keys) {
+            table_push(cl_okeys, lv_keys[ni])
+            table_push(cl_ovals, lv_vals[ni])
+            table_push(cl_oconst, lv_const[ni])
+            table_push(cl_otelem, lv_telem[ni])
+            table_push(cl_odyn, lv_dyn[ni])
+            ni = ni + 1
+        }
+        table_push(cl_nouter, len(lv_keys))
+        // 闭包局部段起点（检查闭包体时 check_var_decl 动态追加）
+        table_push(cl_locloff, len(cl_locals))
+        // 捕获段起点（S_N_VAR 捕获登记时动态追加）
+        table_push(cl_capoff, len(cl_capkeys))
+        return fnty
+    }
     // Call
     if tag == S_N_CALL {
         return infer_call(id)
@@ -959,10 +1048,94 @@ pub func infer_expr(id: i64) -> i64 {
     if tag == S_N_METHOD_CALL {
         return infer_method_call(id)
     }
+    // S2.3：`expr ?` 后缀解包（Result/Option）
+    if tag == S_N_TRY {
+        return infer_try_unwrap(id)
+    }
     sm_err_line = s_lines[id]
     sm_err_col = s_cols[id]
     sm_err_msg = "无法推断表达式（节点 " + to_string(tag) + "）"
     return -1
+}
+
+// ==================== S2.3 ? 后缀解包 ====================
+// `expr ?`：expr 必须是 Result/Option 类枚举（含 Ok/Err 或 Some/None 变体）。
+// 语义：
+//   - 解包类型 = Ok/Some 变体的 payload 类型（解包后表达式的类型）
+//   - 当前函数返回类型必须是「同一枚举实例」（Result/Option），
+//     否则 `?` 无法提前返回 Err/None（编译错误）
+// 返回解包类型；失败 -1（错误已置 sm_err_*）。
+func infer_try_unwrap(id: i64) -> i64 {
+    var operand = sstate.child(id, 0)
+    var ot = infer_expr(operand)
+    if ot < 0 {
+        return -1
+    }
+    if types.kind(ot) != K_ENUM {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "'?' 解包的操作数必须是 Result/Option 枚举，实际是 " + types.type_name(ot)
+        return -1
+    }
+    var ei = types.low(ot)
+    var varoff = en_varoff[ei]
+    var nvar = en_nvar[ei]
+    // 找 Ok/Some 变体（payload 解包）与 Err/None 变体（提前返回标记）
+    var ok_i: i64 = -1
+    var err_i: i64 = -1
+    var k: i64 = 0
+    while k < nvar {
+        var vn = intern.lookup(en_vnames[varoff + k])
+        if vn == "Ok" || vn == "Some" {
+            ok_i = k
+        } else if vn == "Err" || vn == "None" {
+            err_i = k
+        }
+        k = k + 1
+    }
+    if ok_i < 0 || err_i < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "'?' 解包要求枚举 '" + types.type_name(ot) + "' 具有 Ok/Some 与 Err/None 变体（Result/Option 形态）"
+        return -1
+    }
+    // 当前函数返回类型必须是同一枚举实例（Err/None 提前返回的落点）
+    // S2.2 闭包：闭包体内的 ? 解包以闭包返回类型（g_clo_ret_stack 栈顶）为基准
+    var ret_ty = sg_ret[g_curfn]
+    if g_clo_ret_top > 0 {
+        ret_ty = g_clo_ret_stack[g_clo_ret_top - 1]
+    }
+    if ret_ty < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "'?' 解包只能用于返回 Result/Option 的函数内（当前函数无返回类型）"
+        return -1
+    }
+    if types.kind(ret_ty) != K_ENUM {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "'?' 解包只能用于返回 Result/Option 的函数内，当前函数返回 " + types.type_name(ret_ty)
+        return -1
+    }
+    var rei = types.low(ret_ty)
+    if rei != ei {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "'?' 解包错误类型不匹配：函数返回 " + types.type_name(ret_ty) + "，操作数是 " + types.type_name(ot)
+        return -1
+    }
+    // 解包类型 = Ok/Some 变体的 payload 类型（单字段）
+    var foff = en_vfldoff[varoff + ok_i]
+    if en_vnfld[varoff + ok_i] != 1 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "内部错误：'?' 解包的 Ok/Some 变体应恰有一个 payload 字段"
+        return -1
+    }
+    var unwrap = en_ftys[foff]
+    node_types[id] = unwrap
+    g_typed = g_typed + 1
+    return unwrap
 }
 
 // 变参元素类型（`...T` → T；非变参 -1）。签名存的是 table<T>。
@@ -1336,6 +1509,42 @@ pub func infer_call(id: i64) -> i64 {
     // 用户函数（裸调用解析：顶层 / 当前命名空间补全 / using 前缀补全）
     var sig = sstate.fn_sig(full_name)
     if sig < 0 {
+        // S2.2 闭包函数值调用：函数签名未命中时，若调用名是 fn 类型变量
+        // （闭包字面量 / 函数值参数），按函数值调用检查：参数个数、参数
+        // 类型逐个匹配，返回类型 = fn 返回类型。
+        var fv_nid = intern.intern(fnm)
+        var fv_ty = lv_find(fv_nid)
+        if fv_ty < 0 {
+            fv_ty = gb_find(fv_nid)
+        }
+        if fv_ty >= 0 && types.is_fn(fv_ty) {
+            var fn_np = types.fn_nparams_of(fv_ty)
+            if nc != fn_np {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "函数值调用 '" + fnm + "' 期望 " + to_string(fn_np) + " 个参数，实际 " + to_string(nc) + " 个"
+                return -1
+            }
+            var kf: i64 = 0
+            while kf < nc {
+                var want = types.fn_param_of(fv_ty, kf)
+                var at = infer_expr(args[kf])
+                if at < 0 {
+                    return -1
+                }
+                if !stype.types_compatible(want, at) && !stype.types_match(want, at, args[kf]) {
+                    sm_err_line = s_lines[id]
+                    sm_err_col = s_cols[id]
+                    sm_err_msg = "函数值调用 '" + fnm + "' 参数类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(at)
+                    return -1
+                }
+                kf = kf + 1
+            }
+            var frt = types.fn_ret_ty(fv_ty)
+            node_types[id] = frt
+            g_typed = g_typed + 1
+            return frt
+        }
         sm_err_line = s_lines[id]
         sm_err_col = s_cols[id]
         sm_err_msg = "未定义的函数 '" + fnm + "'"
@@ -1374,10 +1583,6 @@ pub func infer_call(id: i64) -> i64 {
     var off = sg_off[sig]
     var j2: i64 = 0
     while j2 < nc {
-        var at = infer_expr(args[j2])
-        if at < 0 {
-            return -1
-        }
         var want = sp_tys[off + j2]
         // 变参：超过固定形参数（total-1）的实参与变参元素类型 T 匹配
         var want_fixed: bool = true
@@ -1385,6 +1590,34 @@ pub func infer_call(id: i64) -> i64 {
             if j2 >= total - 1 {
                 want = sstate_fn_variadic_elem(sig)
                 want_fixed = false
+            }
+        }
+        var at = infer_expr(args[j2])
+        if at < 0 {
+            // S2.3 目标类型引导：泛型 enum 构造实参（Result.Err("x") / Option.None）
+            // 类型参数推断不全时（Err 不含 T / None 无 payload），用形参类型补全。
+            // 与 scheck 赋值/return/var 声明三处引导同模式：保存-恢复错误三件套。
+            if want_fixed {
+                var sv_l = sm_err_line
+                var sv_c = sm_err_col
+                var sv_m = sm_err_msg
+                var hv = try_enum_construct_hinted(args[j2], want)
+                if hv >= 0 {
+                    sm_err_line = 0
+                    sm_err_col = 0
+                    sm_err_msg = ""
+                    at = hv
+                } else {
+                    if sm_err_msg == sv_m {
+                        // 引导未命中（非泛型 enum 构造）：恢复原错误
+                        sm_err_line = sv_l
+                        sm_err_col = sv_c
+                        sm_err_msg = sv_m
+                    }
+                    return -1
+                }
+            } else {
+                return -1
             }
         }
         // 表形参（table<T>）的元素不匹配留给 A1 专用检查；非表类型 mismatch 报通用消息
@@ -2052,6 +2285,125 @@ func infer_generic_enum_construct(gti: i64, vname: string, args: table<i64>, id:
     node_types[id] = rt
     g_typed = g_typed + 1
     return rt
+}
+
+// ==================== S2.3 目标类型引导的泛型 enum 构造 ====================
+// `var b: Result<i64, string> = Result.Err("bad")`：Result.Err 的 payload 是 E
+// （string 可推断），但 T 无信息（Err 不含 T）→ infer_generic_enum_construct
+// 报"无法推断类型参数 T"。目标类型引导：用赋值/return 目标类型（hint_ty，
+// 如 Result<i64,string> 的实例化 enum id）反查 gin 记录提取完整类型实参
+// [i64, string]，重新实例化并校验 payload 匹配。
+// 探测入口：右侧表达式是 MethodCall（接收者 = 泛型 enum 模板名）时调用。
+// 返回推断类型；-1 表示"不是可引导的泛型 enum 构造"（不设错误，调用方回退）。
+pub func try_enum_construct_hinted(expr: i64, hint_ty: i64) -> i64 {
+    // 支持两种形态（S2.3 扩展）：
+    //   - MethodCall：EnumName.Variant(args)（带 payload 构造）
+    //   - FieldAccess：EnumName.Variant（无 payload 变体裸引用，如 Option.None）
+    // 无 payload 变体裸引用在 infer_expr 的 FieldAccess 分支会报"无法推断类型
+    // 参数"，此处用 hint 的目标类型实参补全实例化。
+    var is_fa: bool = false
+    if s_tags[expr] == S_N_METHOD_CALL {
+        is_fa = false
+    } else if s_tags[expr] == S_N_FIELD_ACCESS {
+        is_fa = true
+    } else {
+        return -1
+    }
+    var recv: i64 = -1
+    if is_fa {
+        // FieldAccess(children=[base])：接收者在 children[0]
+        recv = sstate.child(expr, 0)
+    } else {
+        recv = sstate.child(expr, sstate.slot_off(expr))
+    }
+    if s_tags[recv] != S_N_VAR {
+        return -1
+    }
+    var rname = sstate.name_str(recv)
+    var gidx = sstate.gt_find(rname)
+    if gidx < 0 || gty_is_struct[gidx] != 2 {
+        return -1  // 不是泛型 enum 模板
+    }
+    // hint 必须是同模板的实例化 enum
+    if types.kind(hint_ty) != K_ENUM {
+        return -1
+    }
+    var hei = types.low(hint_ty)
+    var hmangled = sstate.enum_name_of(hei)
+    var rec = sstate.gin_find(hmangled)
+    if rec < 0 || gin_tmpl[rec] != gidx {
+        return -1  // hint 不是该模板的实例化
+    }
+    var args_t = sstate.gin_args(rec)
+    if len(args_t) == 0 {
+        return -1
+    }
+    // 变体定位（同 infer_generic_enum_construct）
+    var vname = sstate.name_str(expr)
+    var tmpl_node = gty_node[gidx]
+    var soff = sstate.slot_off(tmpl_node)
+    var nv = sstate.nchild(tmpl_node) - soff
+    var vi: i64 = -1
+    var k: i64 = 0
+    while k < nv {
+        if sstate.name_str(sstate.child(tmpl_node, soff + k)) == vname {
+            vi = k
+            break
+        }
+        k = k + 1
+    }
+    if vi < 0 {
+        return -1
+    }
+    // 实例化（幂等）
+    var ei = sgen.instantiate_enum(gidx, args_t)
+    if ei < 0 {
+        return -1
+    }
+    var full = intern.lookup(gty_keys[gidx])
+    var mangled = sgen.mangle(full, args_t)
+    s_names[recv] = intern.intern(mangled)
+    // payload 实参校验（实例化后字段类型已具体化）
+    var args: table<i64> = table_new_i64()
+    if !is_fa {
+        // MethodCall：实参从 slot_off+1 起收集
+        var nc = sstate.nchild(expr)
+        var off2 = sstate.slot_off(expr)
+        var j: i64 = off2 + 1
+        while j < nc {
+            table_push(args, sstate.child(expr, j))
+            j = j + 1
+        }
+    }
+    // FieldAccess（无 payload 裸引用）：args 保持空表，np 必须为 0
+    var varoff = en_varoff[ei]
+    var np = en_vnfld[varoff + vi]
+    if len(args) != np {
+        sm_err_line = s_lines[expr]
+        sm_err_col = s_cols[expr]
+        sm_err_msg = "构造 '" + mangled + "." + vname + "' 期望 " + to_string(np) + " 个参数，实际 " + to_string(len(args)) + " 个"
+        return -1
+    }
+    var foff = en_vfldoff[varoff + vi]
+    var jj: i64 = 0
+    while jj < len(args) {
+        var at = infer_expr(args[jj])
+        if at < 0 {
+            return -1
+        }
+        at = refine_arg_ty(args[jj], at)
+        var want = en_ftys[foff + jj]
+        if !stype.types_match(want, at, args[jj]) {
+            sm_err_line = s_lines[expr]
+            sm_err_col = s_cols[expr]
+            sm_err_msg = "构造 '" + mangled + "." + vname + "' 参数类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(at)
+            return -1
+        }
+        jj = jj + 1
+    }
+    node_types[expr] = types.enum_of(ei)
+    g_typed = g_typed + 1
+    return types.enum_of(ei)
 }
 
 // 接收者路径名拼接（Segment 链 / FieldAccess 链 / Var / Path 统一递归）
