@@ -1,0 +1,25 @@
+type tie<logic>
+// S2.4 探针 3（负例）：impl 漏方法 = 编译错误（完整性检查，port-model.md §2.2）
+// 期望：编译失败，错误消息含「缺少方法 'bounds'」
+//（impl Drawable for Button 只实现 draw，漏 bounds → 编译错误）
+
+port Drawable {
+    pub func draw(self, ctx: i64) -> string
+    pub func bounds(self) -> i64
+}
+
+struct Button {
+    var label: string
+}
+
+impl Drawable for Button {
+    pub func draw(self, ctx: i64) -> string {
+        return "Button(" + self.label + ")"
+    }
+    // 漏：pub func bounds(self) -> i64 { ... }
+}
+
+func main() {
+    var b: Button = Button("x")
+    println(b.draw(0))
+}

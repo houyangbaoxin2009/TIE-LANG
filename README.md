@@ -46,6 +46,13 @@ tie.pkg，入口声明导出面，包内模块私有）、**MVS 最小版本选�
 内容哈希，install/verify 校验防篡改），见
 [docs/plans/package-model.md](docs/plans/package-model.md) 与
 [docs/plans/tieir-format.md](docs/plans/tieir-format.md)。
+阶段 2 接口模型（2026-08-17，S2.4）新增 **port 接口**（tie 的 interface）：
+`port Drawable { pub func draw(self, ctx: ptr) -> i64 }` 声明方法签名集合、
+`impl Drawable for Button { ... }` 显式实现（漏方法 = 编译错误）、
+泛型约束 `<T: Drawable>` 静态分发（单态化零开销）、port 对象动态分发
+（`var d: Drawable = button` 提升 + `table<Drawable>` 异构容器，编译器
+隐式生成 vtable 全局常量 + 间接调用），提升归 unsafe（借用语义），见
+[docs/plans/port-model.md](docs/plans/port-model.md)。
 
 
 我们的目标：全领域通用，Python的体验，Rust的性能与安全。

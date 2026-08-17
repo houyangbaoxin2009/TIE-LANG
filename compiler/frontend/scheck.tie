@@ -822,6 +822,55 @@ pub func check_var_decl(s: i64) -> i64 {
         if ty < 0 {
             return -1
         }
+        // S2.4 port 对象变量：`var d: Drawable = button`（提升）或
+        // `var d2: Drawable = d`（port 拷贝）。提升 = 取 data 地址 + 打包
+        // vtable（借用语义归 unsafe，docs/plans/port-model.md §4.5）：
+        //   - 提升（struct → port）必须在 unsafe 上下文
+        //   - port → port 拷贝无新借用，安全代码允许
+        if types.kind(ty) == K_PORT {
+            if init < 0 {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "port 对象变量 '" + nm + "' 必须初始化（如 unsafe { var " + nm + ": " + types.type_name(ty) + " = 具体实例 }）"
+                return -1
+            }
+            var it_p = sinfer.infer_expr(init)
+            if it_p < 0 {
+                return -1
+            }
+            if types.kind(it_p) == K_STRUCT {
+                // 提升：必须在 unsafe 上下文（借用语义归 unsafe）
+                if g_unsafe_depth == 0 {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    sm_err_msg = "提升 '" + types.type_name(it_p) + "' 到 port '" + types.type_name(ty) + "' 必须在 unsafe 块或 unsafe 函数中（接口对象借用具体对象，指针操作归 unsafe）"
+                    return -1
+                }
+                var pi_l = types.low(ty)
+                if !stype.impl_has_ty(pi_l, it_p) {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    sm_err_msg = "类型 '" + types.type_name(it_p) + "' 未实现 port '" + types.type_name(ty) + "'，不能提升（请先写 impl " + types.type_name(ty) + " for " + types.type_name(it_p) + "）"
+                    return -1
+                }
+            } else if types.kind(it_p) == K_PORT {
+                // port → port 拷贝（指针拷贝，无新借用）
+                if it_p != ty {
+                    sm_err_line = s_lines[s]
+                    sm_err_col = s_cols[s]
+                    sm_err_msg = "port 对象变量 '" + nm + "' 类型不匹配：标注 " + types.type_name(ty) + "，表达式推导为 " + types.type_name(it_p)
+                    return -1
+                }
+            } else {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "port 对象变量 '" + nm + "' 的初始化必须是实现了该 port 的具体类型实例（提升）或同 port 对象，实际是 " + types.type_name(it_p)
+                return -1
+            }
+            // 登记局部变量（port 对象 = ptr 槽）
+            sinfer.lv_insert(nid, ty, is_const, -1, 0)
+            return 0
+        }
         // S1.2 S1 指针全归 unsafe：安全代码不能声明指针/切片/原子类型变量
         if types.is_unsafe_ty(ty) && g_unsafe_depth == 0 {
             sm_err_line = s_lines[s]

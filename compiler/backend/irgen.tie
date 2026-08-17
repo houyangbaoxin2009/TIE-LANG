@@ -3697,7 +3697,17 @@ func gen_method_call(id: i64) -> i64 {
                     return gen_struct_method_call(full, id, recv, g_lookup_ty)
                 }
             }
+            if types.kind(g_lookup_ty) == K_PORT {
+                // S2.4：port 对象方法调用（动态分发，vtable 间接调用）
+                return gen_port_method_call(id, recv, g_lookup_ty, mname)
+            }
         }
+    }
+    // S2.4：表达式接收者（list[0] / 函数返回值 / 字段访问）——port 对象
+    // 动态分发（vtable 间接调用）。node_types[recv] 由语义层登记。
+    var rt4 = node_types[recv]
+    if rt4 >= 0 && types.kind(rt4) == K_PORT {
+        return gen_port_method_call(id, recv, rt4, mname)
     }
     var prefix = sinfer.recv_path_name(recv)
     if prefix == "" {
@@ -4671,14 +4681,16 @@ func gen_table_lit(id: i64) -> i64 {
         // table<i64>，若按 elem 选桥会 push_i64(ptr) 类型错（LLVM 拒收）；
         // 且空内层表 `[]` 的 node_types 落 i64 兜底——只要 elem 本身是表，
         // 全部元素一律 push_string（元素全是 ptr）。
+        // S2.4：port 对象元素（table<Drawable>）同样走 push_string——port
+        // 对象 LLVM 表示 = ptr（指向堆打包 {data,vtable}）。
         var suffix = bridge_suffix(elem)
         var pty = types.named(TK_I64)
-        if types.is_table(elem) || types.is_map(elem) {
+        if types.is_table(elem) || types.is_map(elem) || types.kind(elem) == K_PORT {
             suffix = "string"
             pty = types.named(TK_STR)
         } else {
             var vt = node_types[val]
-            if vt >= 0 && (types.is_table(vt) || types.is_map(vt) || vt == types.named(TK_STR)) {
+            if vt >= 0 && (types.is_table(vt) || types.is_map(vt) || vt == types.named(TK_STR) || types.kind(vt) == K_PORT) {
                 suffix = "string"
                 pty = types.named(TK_STR)
             } else if vt >= 0 && (vt == types.named(TK_F64) || vt == types.named(TK_F32)) {
@@ -5250,7 +5262,8 @@ func gen_index_read(id: i64) -> i64 {
     // at_string 桥（返回 ptr）——曾按 bridge_suffix 落 at_i64，返回 i64 与
     // 嵌套表变量的 ptr 槽不符（`var sub = t[i]` → `store ptr %r, ptr %slot`
     // 但 %r 是 i64，LLVM 拒收）。对齐 gen_table_lit 的按值类型选桥。
-    if types.is_table(elem) || types.is_map(elem) {
+    // S2.4：port 对象元素（table<Drawable>）同样存 ptr，走 string 桥。
+    if types.is_table(elem) || types.is_map(elem) || types.kind(elem) == K_PORT {
         suffix = "string"
         ret_ty = types.named(TK_STR)
     } else if suffix == "string" {
@@ -5432,7 +5445,11 @@ func gen_index_assign(id: i64) -> i64 {
     }
     var suffix = bridge_suffix(elem)
     var pty = types.named(TK_I64)
-    if suffix == "string" {
+    // S2.4：port 对象元素（table<Drawable>）存 ptr → set_string 桥
+    if types.kind(elem) == K_PORT {
+        suffix = "string"
+        pty = types.named(TK_STR)
+    } else if suffix == "string" {
         pty = types.named(TK_STR)
     } else if suffix == "f64" {
         // f64 表元素：set 桥值参数 double（曾落默认 i64 →
@@ -5824,11 +5841,12 @@ func gen_stmt(id: i64) -> i64 {
                 // S1.2：指针/切片/原子类型推断（`var p = addr_of(x)`）→
                 // 对应槽（alloca ptr / alloca {ptr,i64} / alloca 元素型）
                 ty = it
-            } else if it >= 0 && (types.kind(it) == K_TUPLE || types.kind(it) == K_STRUCT || types.kind(it) == K_ENUM || types.kind(it) == K_FN) {
+            } else if it >= 0 && (types.kind(it) == K_TUPLE || types.kind(it) == K_STRUCT || types.kind(it) == K_ENUM || types.kind(it) == K_FN || types.kind(it) == K_PORT) {
                 // 聚合变量：alloca 聚合槽，init（构造调用/元组字面量/返回）求聚合值
                 // （K_ENUM 2026-08-15：枚举变量同 struct——alloca %enum.X 槽，
                 // init 的 FieldAccess/MethodCall 构造求聚合值，store 类型匹配；
-                // K_FN S2.2：闭包字面量/函数值参数 → alloca %fn.X 槽）
+                // K_FN S2.2：闭包字面量/函数值参数 → alloca %fn.X 槽；
+                // K_PORT S2.4：port 对象（ptr 表示）→ alloca ptr 槽）
                 ty = it
             }
         }
@@ -5837,6 +5855,26 @@ func gen_stmt(id: i64) -> i64 {
         ir.add_operand(alloca, ty, 2)  // 类型立即数（占位）
         var av = ir.get_value(alloca)
         if init >= 0 {
+            // S2.4：port 对象变量初始化——提升（struct → port 打包）或
+            // port 拷贝（ptr 复制）。见 gen_port_coerce 注释。
+            if types.kind(ty) == K_PORT {
+                var it4 = node_types[init]
+                var pv: i64 = -1
+                if it4 >= 0 && types.kind(it4) == K_STRUCT {
+                    pv = gen_port_coerce(init, ty)
+                } else {
+                    pv = gen_expr(init)
+                }
+                if pv < 0 {
+                    return -1
+                }
+                var store = ir.new_inst(g_cur_block, 22, -1)  // store
+                ir.add_operand(store, ty, 2)
+                ir.add_operand(store, pv, 0)
+                ir.add_operand(store, av, 0)
+                scope_put(nm, av, ty)
+                return 0
+            }
             // DEBUG 临时
             // IntLit 初始化：按声明类型生成常量（i32 变量存 i32 值，否则
             // llvmgen 的 store i32 %N 会因 %N 是 i64 const_i 而类型不匹配）；
@@ -6517,6 +6555,9 @@ pub func gen_ast() -> i64 {
     g_used_runtime = false
     g_used_interp = false
     ir.new_module()
+    // S2.4 vtable 全局常量登记（每个 impl 一个：方法函数指针按 port 方法
+    // 声明序；llvmgen 在 emit_globals 后输出 @vt.<port>.<struct> 常量）
+    reg_all_vtables()
     // 全局变量登记（表全局 → llvmgen 输出 @g = global ptr null，main 入口初始化）
     var n = len(g_extra_tops)
     var i: i64 = 0
@@ -6583,6 +6624,9 @@ pub func gen_src(src: string, base_dir: string) -> i64 {
     g_used_runtime = false
     g_used_interp = false
     ir.new_module()
+    // S2.4 vtable 全局常量登记（每个 impl 一个：方法函数指针按 port 方法
+    // 声明序；llvmgen 在 emit_globals 后输出 @vt.<port>.<struct> 常量）
+    reg_all_vtables()
     // 全局变量登记（表全局 → llvmgen 输出 @g = global ptr null，main 入口初始化）
     var n = len(g_extra_tops)
     var i: i64 = 0
@@ -6619,6 +6663,177 @@ pub func gen_src(src: string, base_dir: string) -> i64 {
         i = i + 1
     }
     return 0
+}
+
+// ==================== S2.4 vtable / port 对象后端 ====================
+// port 对象 LLVM 表示 = 单个 ptr（指向堆上打包对象 {data, vtable}）：
+//   提升（struct → port）：malloc(16) → [0]=struct 槽地址（data，self 按引用）
+//                            → [1]=@vt.<port>.<struct> 全局常量（vtable）
+//   动态调用（port 方法）：data = gep(obj,0)；vtable = gep(obj,1) →
+//                           entry = vtable[方法序号] → call_indirect(70)
+// vtable 全局常量：每个 impl 一个，字段 = 方法实现函数指针（按 port 方法
+// 声明序），llvmgen emit_vtables 输出。与闭包 C2（call_indirect 70）同构：
+// 方法入口签名 fn(ptr self, args...) -> R，env = data 即 self 槽地址。
+
+// 遍历 impl 记录 → llvmgen.vtable_reg（vt.<port>.<struct> + 方法全名表）
+func reg_all_vtables() {
+    var n = len(im_keys)
+    var i: i64 = 0
+    while i < n {
+        var ii = im_vals[i]
+        var pi = im_port[ii]
+        var si = im_struct[ii]
+        var vt = "vt." + types.type_name(types.port_of(pi)) + "." + sstate.struct_name_of(si)
+        var mnames: table<string> = table_new_string()
+        var nm = im_n[ii]
+        var off = im_poff[ii]
+        var j: i64 = 0
+        while j < nm {
+            table_push(mnames, intern.lookup(im_mnames[off + j]))
+            j = j + 1
+        }
+        llvmgen.vtable_reg(vt, mnames)
+        i = i + 1
+    }
+}
+
+// N 字段全 ptr 聚合类型（打包对象 {ptr,ptr} / vtable {ptr×N}）：
+// 复用 sstate tuple 登记（tup_* 表），字段类型全 TK_STR（LLVM ptr）。
+// 查重复用 gen_tuple_ty（布局相同即同 id）。
+func gen_ptr_tuple_ty(n: i64) -> i64 {
+    var ftys: table<i64> = table_new_i64()
+    var k: i64 = 0
+    while k < n {
+        table_push(ftys, types.named(TK_STR))
+        k = k + 1
+    }
+    return gen_tuple_ty(ftys)
+}
+
+// 提升代码生成：具体类型值（struct）→ port 对象（打包 {data, vtable}）。
+// 语义（docs/plans/port-model.md §4.1/4.2，I1 隐式 vtable）：
+//   data = struct 实例槽地址（方法 self 按引用接收，与 M2.1.8 一致）
+//   vtable = 全局常量 @vt.<port>.<struct>（llvmgen 已登记）
+//   打包 = malloc(16) + 两字段 store；返回打包对象指针（port 对象 = ptr）。
+// 生命周期归 arena/unsafe（调用方保证：被提升对象存活 ≥ 接口对象使用时间）。
+// init 为 struct 类型表达式（node_types[init] = K_STRUCT，语义层已校验 impl）。
+func gen_port_coerce(init: i64, port_ty: i64) -> i64 {
+    var s_ty = node_types[init]
+    if s_ty < 0 {
+        sm_err_msg = "提升操作数类型缺失（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var vt_name = "vt." + types.type_name(port_ty) + "." + types.type_name(s_ty)
+    // struct 槽地址（self 按引用 = 传地址；Var → 槽地址，表达式落内存）
+    var addr = gen_agg_addr(init, s_ty)
+    if addr < 0 {
+        return -1
+    }
+    // malloc(16)：打包对象 {ptr, ptr}
+    var size = gen_int_lit_ty(16, types.named(TK_I64))
+    var obj = gen_ext_call1("malloc", size, types.named(TK_I64), types.named(TK_STR))
+    if obj < 0 {
+        return -1
+    }
+    var tup2 = gen_ptr_tuple_ty(2)
+    // [0] = data（struct 槽地址）
+    var g0 = ir.new_inst(g_cur_block, 27, tup2)  // agg_gep
+    ir.add_operand(g0, obj, 0)
+    ir.add_operand(g0, 0, 2)
+    var st0 = ir.new_inst(g_cur_block, 22, -1)  // store ptr
+    ir.add_operand(st0, types.named(TK_STR), 2)
+    ir.add_operand(st0, addr, 0)
+    ir.add_operand(st0, ir.get_value(g0), 0)
+    // [1] = vtable 全局常量地址（const_global 63；store 时 llvmgen to_ptr
+    // 直引 @vt.xxx —— 与闭包 entry 字段同模式）
+    var g1 = ir.new_inst(g_cur_block, 27, tup2)  // agg_gep
+    ir.add_operand(g1, obj, 0)
+    ir.add_operand(g1, 1, 2)
+    var vt = ir.new_inst(g_cur_block, 63, types.named(TK_STR))  // const_global
+    ir.add_operand(vt, interner.intern(vt_name), 0)
+    var st1 = ir.new_inst(g_cur_block, 22, -1)  // store ptr
+    ir.add_operand(st1, types.named(TK_STR), 2)
+    ir.add_operand(st1, ir.get_value(vt), 0)
+    ir.add_operand(st1, ir.get_value(g1), 0)
+    return obj
+}
+
+// port 对象方法调用（动态分发）：vtable 间接调用（call_indirect 70）。
+//   data = gep(obj, 0) → load（env，方法 self 首参）
+//   vtable = gep(obj, 1) → load → entry = vtable[方法序号] → load 函数指针
+//   指令：call_indirect [entry, ret_ty IMM, env=data, (ty, val)...]
+// 注意：**先求值全部实参收集到表，再 new_inst + add_operand**——实参求值
+// （gen_expr）会生成新指令并 push 操作数，若穿插在 call 指令的 add_operand
+// 之间会导致操作数段交错（const_i 的字面量被算进 call 段，实参错位）。
+// 与闭包 gen_call_indirect 同模式。
+func gen_port_method_call(id: i64, recv: i64, pty: i64, mname: string) -> i64 {
+    var pi = types.low(pty)
+    var mi = sstate.port_method_idx(pi, mname)
+    if mi < 0 {
+        sm_err_msg = "port '" + types.type_name(pty) + "' 没有方法 '" + mname + "'（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var ret_ty = sstate.port_method_ret(pi, mi)
+    // 接收者值：port 对象（ptr）
+    var recv_v = gen_expr(recv)
+    if recv_v < 0 {
+        return -1
+    }
+    var tup2 = gen_ptr_tuple_ty(2)
+    // data = gep(obj, 0) → load ptr
+    var g0 = ir.new_inst(g_cur_block, 27, tup2)  // agg_gep
+    ir.add_operand(g0, recv_v, 0)
+    ir.add_operand(g0, 0, 2)
+    var ld0 = ir.new_inst(g_cur_block, 21, types.named(TK_STR))  // load ptr
+    ir.add_operand(ld0, ir.get_value(g0), 0)
+    // vtable = gep(obj, 1) → load ptr（vtable 聚合地址）
+    var g1 = ir.new_inst(g_cur_block, 27, tup2)  // agg_gep
+    ir.add_operand(g1, recv_v, 0)
+    ir.add_operand(g1, 1, 2)
+    var ld1 = ir.new_inst(g_cur_block, 21, types.named(TK_STR))  // load ptr
+    ir.add_operand(ld1, ir.get_value(g1), 0)
+    // entry = vtable[方法序号]：vtable 聚合类型 = {ptr × port 方法数}
+    var vt_ty = gen_ptr_tuple_ty(pm_n[pi])
+    var g2 = ir.new_inst(g_cur_block, 27, vt_ty)  // agg_gep
+    ir.add_operand(g2, ir.get_value(ld1), 0)
+    ir.add_operand(g2, mi, 2)
+    var ld2 = ir.new_inst(g_cur_block, 21, types.named(TK_STR))  // load ptr
+    ir.add_operand(ld2, ir.get_value(g2), 0)
+    // 先求值全部实参（收集到表；求值可能生成指令，须在 call 指令创建前）
+    var soff2 = sstate.slot_off(id)
+    var nc = sstate.nchild(id)
+    var argvals: table<i64> = table_new_i64()
+    var j: i64 = 1 + soff2
+    while j < nc {
+        var av = gen_expr(sstate.child(id, j))
+        if av < 0 {
+            return -1
+        }
+        table_push(argvals, av)
+        j = j + 1
+    }
+    // call_indirect(70)：[entry, ret_ty IMM, env=data, (ty, val)...]
+    var ty70: i64 = -1
+    if ret_ty != types.named(TK_VOID) {
+        ty70 = ret_ty
+    }
+    var inst = ir.new_inst(g_cur_block, 70, ty70)
+    ir.add_operand(inst, ir.get_value(ld2), 0)
+    ir.add_operand(inst, ret_ty, 2)
+    ir.add_operand(inst, ir.get_value(ld0), 0)
+    j = 0
+    while j < len(argvals) {
+        // 实参类型：port 方法签名去 self——第 (j+1) 个显式实参即签名第 (j+1)
+        // 个参数（签名下标 0 = self 槽，1 起为显式参数）
+        var aty = sstate.port_method_param(pi, mi, j + 1)
+        ir.add_operand(inst, aty, 2)
+        ir.add_operand(inst, argvals[j], 0)
+        j = j + 1
+    }
+    if ret_ty == types.named(TK_VOID) {
+        return gen_int_lit(0)  // void 结果：哑值（调用方丢弃）
+    }
+    return ir.get_value(inst)
 }
 
 // 顶层全局变量声明（tag 100）：登记到 llvmgen 全局段。

@@ -155,6 +155,10 @@ func is_decl_start(tag: i64) -> bool {
     if tag == lex_unsafe || tag == lex_repr {
         return true
     }
+    // S2.4：port 声明 / impl 块的 doc 附着
+    if tag == lex_port || tag == lex_impl {
+        return true
+    }
     return false
 }
 

@@ -80,6 +80,20 @@ pub func parse_program() -> i64 {
                 return -1
             }
             ast.collect_stmt(stmts, s)
+        } else if tag == lex_port {
+            // S2.4：port 接口声明
+            var s = parse_port()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
+        } else if tag == lex_impl {
+            // S2.4：impl 实现块（impl Drawable for Button { ... }）
+            var s = parse_impl()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
         } else if tag == lex_namespace {
             var s = parse_namespace()
             if s < 0 {
@@ -279,6 +293,20 @@ func parse_namespace() -> i64 {
                     return -1
                 }
                 table_push(body_stmts, st)
+            } else if tag == lex_port {
+                // S2.4：命名空间内 port 声明
+                var st = parse_port()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_impl {
+                // S2.4：命名空间内 impl 块
+                var st = parse_impl()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
             } else if tag == lex_namespace {
                 var st = parse_namespace()
                 if st < 0 {
@@ -346,6 +374,20 @@ func parse_namespace() -> i64 {
                 table_push(body_stmts, st)
             } else if tag == lex_enum {
                 var st = parse_enum()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_port {
+                // S2.4：命名空间内 port 声明
+                var st = parse_port()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_impl {
+                // S2.4：命名空间内 impl 块
+                var st = parse_impl()
                 if st < 0 {
                     return -1
                 }
@@ -482,6 +524,10 @@ func parse_extern() -> i64 {
 
 // 类型参数列表（声明点）：`<T1, T2, ...>` → N_TYPE_PARAMS 节点
 // （children = N_TYPE_PARAM 序列，每个 name 字段 = 类型参数名）。
+// S2.4 泛型约束：`<T: Drawable>` —— N_TYPE_PARAM 增加 children：
+// [约束类型节点或 -1]（第一版单约束：`T: Port`；多约束后置，见
+// port-model.md §2.3）。约束类型节点 = pexpr_type.parse_type 产出的
+// N_STRUCT_TYPE（语义层校验必须是已登记的 port）。
 // 前提：当前 peek 为 '<'（函数名/struct 名后）。函数/struct 名后的 '<'
 // 一定是类型参数列表（非泛型场景不存在），解析失败直接报错，不做 try 回退。
 func parse_type_params() -> i64 {
@@ -495,13 +541,13 @@ func parse_type_params() -> i64 {
     if p < 0 {
         return -1
     }
-    table_push(ps, ast.new_node(N_TYPE_PARAM, p, -1, -1, putil.peek_line(), putil.peek_col()))
+    table_push(ps, parse_type_param_one(p, line, col))
     while putil.eat(lex_comma) {
         p = putil.expect_ident()
         if p < 0 {
             return -1
         }
-        table_push(ps, ast.new_node(N_TYPE_PARAM, p, -1, -1, putil.peek_line(), putil.peek_col()))
+        table_push(ps, parse_type_param_one(p, line, col))
     }
     if !putil.expect_type_gt("类型参数列表后需 '>'") {
         return -1
@@ -511,10 +557,30 @@ func parse_type_params() -> i64 {
     return n
 }
 
+// 单个类型参数节点：`T` 或 `T: Drawable`（S2.4 约束）。
+// 产出 N_TYPE_PARAM[name=参数名, children=[约束类型节点或 -1]]。
+func parse_type_param_one(p: i64, line: i64, col: i64) -> i64 {
+    var cons: table<i64> = table_new_i64()
+    if putil.eat(lex_colon) {
+        // `T: Drawable`：冒号后必须是 port 类型引用（语义层校验）
+        var cty = pexpr_type.parse_type()
+        if cty < 0 {
+            return -1
+        }
+        table_push(cons, cty)
+    } else {
+        table_push(cons, -1)
+    }
+    var n = ast.new_node(N_TYPE_PARAM, p, -1, -1, line, col)
+    ast.set_children(n, cons)
+    return n
+}
+
 // `[pub] [unsafe] func name [<T1, T2>] (params) -> Ty { stmts }`
 // 泛型（2026-08-14）：名字后紧跟类型参数列表 `<T1, T2>`；产出 N_FN_DEF
 // children = [泛型槽(-1或N_TYPE_PARAMS), 返回类型, 参数..., 函数体]。
 // S1.2：val 复用为标志位（bit0=is_pub, bit1=is_unsafe）。
+// S2.4：port 方法签名（无体）由 parse_port_method 单独解析（见下）。
 func parse_fn_def() -> i64 {
     var line = putil.peek_line()
     var col = putil.peek_col()
@@ -559,7 +625,20 @@ func parse_fn_def() -> i64 {
             if pname < 0 {
                 return -1
             }
-            if !putil.expect(lex_colon, "':'") {
+            // S2.4：self 接收者可省略类型标注（`pub func draw(self, ctx: ptr)`）——
+            // port/impl 方法的第一参数统一为 self。类型节点用占位
+            // N_NAMED_TYPE(name="self", val=-1)，语义层（collect_impl）改写为
+            // 实现 struct 类型；普通函数参数名 self 无标注时占位类型会在
+            // 语义层报「类型 'self' 未定义」（自然拦截）。
+            // 注意顺序：`name: ...T` 变参与 `name: ref T` 修饰在 ':' 之后、
+            // 类型解析之前（原版顺序），self 无标注时跳过类型解析。
+            var pty: i64 = -1
+            if putil.peek_tag() == lex_colon {
+                putil.advance()
+            } else if interner.lookup(pname) == "self" {
+                pty = ast.new_node(N_NAMED_TYPE, interner.intern("self"), -1, -1, putil.peek_line(), putil.peek_col())
+            } else {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "参数必须标注类型（': 类型'），实际是 " + putil.describe(putil.peek_tag()))
                 return -1
             }
             var is_var: i64 = 0
@@ -574,9 +653,11 @@ func parse_fn_def() -> i64 {
                 putil.set_err(putil.peek_line(), putil.peek_col(), "变参参数不能同时使用 ref 修饰")
                 return -1
             }
-            var pty = pexpr_type.parse_type()
             if pty < 0 {
-                return -1
+                pty = pexpr_type.parse_type()
+                if pty < 0 {
+                    return -1
+                }
             }
             var pdef = -1
             if putil.eat(lex_eq) {
@@ -634,6 +715,212 @@ func parse_fn_def() -> i64 {
     table_push(kids, body)
     ast.set_children(f, kids)
     return f
+}
+
+// `[pub] func name (params) -> Ty`（S2.4 port 方法签名；无函数体 = 签名声明）
+// 与 parse_fn_def 的差异：函数体**可省略**（port 声明 = 方法签名集合；
+// 带体 = 默认实现，语义层暂不支持报错）。参数支持 self 无类型标注
+// （`pub func draw(self, ctx: ptr)`）。产出 N_FN_DEF（body 槽 = -1 或无体）。
+func parse_port_method() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    var is_pub: i64 = 0
+    if putil.eat(lex_pub) {
+        is_pub = 1
+    }
+    if !putil.expect(lex_func, "'func'") {
+        return -1
+    }
+    var name = putil.expect_ident()
+    if name < 0 {
+        return -1
+    }
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var params: table<i64> = table_new_i64()
+    if !putil.eat(lex_rparen) {
+        var d = false
+        while !d {
+            var pname = putil.expect_ident()
+            if pname < 0 {
+                return -1
+            }
+            // self 接收者可省略类型标注（`pub func draw(self, ctx: ptr)`）；
+            // 类型节点用占位 N_NAMED_TYPE(name="self", val=-1)，语义层
+            // （scollect.collect_impl_one）改写为实现 struct 类型
+            var pty: i64 = -1
+            if putil.peek_tag() == lex_colon {
+                putil.advance()
+                pty = pexpr_type.parse_type()
+                if pty < 0 {
+                    return -1
+                }
+            } else if interner.lookup(pname) == "self" {
+                pty = ast.new_node(N_NAMED_TYPE, interner.intern("self"), -1, -1, putil.peek_line(), putil.peek_col())
+            } else {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "参数必须标注类型（': 类型'），实际是 " + putil.describe(putil.peek_tag()))
+                return -1
+            }
+            var p = ast.new_node(N_PARAM, pname, 0, 0, putil.peek_line(), putil.peek_col())
+            var pkids: table<i64> = table_new_i64()
+            table_push(pkids, pty)
+            table_push(pkids, -1)
+            ast.set_children(p, pkids)
+            table_push(params, p)
+            if putil.eat(lex_comma) {
+                // 继续
+            } else {
+                if !putil.expect(lex_rparen, "')'") {
+                    return -1
+                }
+                d = true
+            }
+        }
+    }
+    var ret_ty = -1
+    if putil.eat(lex_arrow) {
+        ret_ty = pexpr_type.parse_type()
+        if ret_ty < 0 {
+            return -1
+        }
+    } else {
+        ret_ty = ast.new_node(N_NAMED_TYPE, interner.intern("void"), 14, -1, line, col)
+    }
+    // 函数体可选：`{` 开头才解析（默认实现）；否则 body = -1（签名声明）
+    var body: i64 = -1
+    if putil.peek_tag() == lex_lbrace {
+        body = pstmt_flow.parse_block()
+        if body < 0 {
+            return -1
+        }
+    }
+    var f = ast.new_node(N_FN_DEF, name, is_pub, len(params), line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, -1)   // 泛型槽（port 方法不支持泛型，恒 -1）
+    table_push(kids, ret_ty)
+    var i: i64 = 0
+    while i < len(params) {
+        table_push(kids, params[i])
+        i = i + 1
+    }
+    table_push(kids, body)
+    ast.set_children(f, kids)
+    return f
+}
+
+// `port Name { [pub] func 方法签名... }`（S2.4，docs/plans/port-model.md §2.1）
+// port = 接口，声明方法签名集合（不包含实现）；方法接收者统一为 self。
+// 产出 N_PORT[name=port 名, children=[泛型槽(-1), 方法 FnDef...]]。
+// 方法体可选（无体 = 签名声明；默认实现暂不支持，语义层报错）。
+func parse_port() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // port
+    var name = putil.expect_ident()
+    if name < 0 {
+        return -1
+    }
+    if !putil.expect(lex_lbrace, "'{'") {
+        return -1
+    }
+    var methods: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        var tag = putil.peek_tag()
+        if tag == lex_rbrace {
+            putil.advance()
+            done = true
+        } else if tag == lex_eof {
+            if !putil.expect(lex_rbrace, "'}'") {
+                return -1
+            }
+            done = true
+        } else if tag == lex_semi {
+            putil.advance()   // ASI 补的分号（方法签名行尾）
+        } else if tag == lex_func || tag == lex_pub {
+            // 方法签名（无体或带体；port 方法必须是 pub func）
+            var m = parse_port_method()
+            if m < 0 {
+                return -1
+            }
+            table_push(methods, m)
+        } else {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "port 体内只允许方法定义（pub func 签名），实际是 " + putil.describe(tag))
+            return -1
+        }
+    }
+    var p = ast.new_node(N_PORT, name, -1, -1, line, col)
+    var pkids: table<i64> = table_new_i64()
+    table_push(pkids, -1)   // 泛型槽（第一版 port 不支持泛型，恒 -1）
+    var i: i64 = 0
+    while i < len(methods) {
+        table_push(pkids, methods[i])
+        i = i + 1
+    }
+    ast.set_children(p, pkids)
+    return p
+}
+
+// `impl Port for Struct { [pub] func 方法... }`（S2.4，port-model.md §2.2）
+// impl 块 = 声明"该 struct 的这些命名空间函数满足 port 签名"。
+// 产出 N_IMPL[children=[port 类型节点, struct 类型节点, 方法 FnDef...]]。
+// 方法必须有函数体（实现）；语义层以 <struct 名>::<方法名> 全名登记。
+func parse_impl() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // impl
+    var pty = pexpr_type.parse_type()
+    if pty < 0 {
+        return -1
+    }
+    if !putil.expect(lex_for, "'for'") {
+        return -1
+    }
+    var sty = pexpr_type.parse_type()
+    if sty < 0 {
+        return -1
+    }
+    if !putil.expect(lex_lbrace, "'{'") {
+        return -1
+    }
+    var methods: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        var tag = putil.peek_tag()
+        if tag == lex_rbrace {
+            putil.advance()
+            done = true
+        } else if tag == lex_eof {
+            if !putil.expect(lex_rbrace, "'}'") {
+                return -1
+            }
+            done = true
+        } else if tag == lex_semi {
+            putil.advance()   // ASI 补的分号（方法实现块后）
+        } else if tag == lex_func || tag == lex_pub {
+            // 方法实现（必须有函数体）
+            var m = parse_fn_def()
+            if m < 0 {
+                return -1
+            }
+            table_push(methods, m)
+        } else {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "impl 体内只允许方法定义（pub func 实现），实际是 " + putil.describe(tag))
+            return -1
+        }
+    }
+    var im = ast.new_node(N_IMPL, -1, -1, -1, line, col)
+    var ikids: table<i64> = table_new_i64()
+    table_push(ikids, pty)
+    table_push(ikids, sty)
+    var i: i64 = 0
+    while i < len(methods) {
+        table_push(ikids, methods[i])
+        i = i + 1
+    }
+    ast.set_children(im, ikids)
+    return im
 }
 
 // `struct Name [<T1, T2>] [extends Parent] { 字段 }`（纯数据）

@@ -403,6 +403,28 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     gtyp_names = table_new_i64()
     gty_node = table_new_i64()
     gty_is_struct = table_new_i64()
+    // S2.4：泛型约束段 + port/impl 状态表重置（每次编译清零）
+    gtyp_conoff = table_new_i64()
+    gtyp_cons = table_new_i64()
+    pt_keys = table_new_i64()
+    pt_vals = table_new_i64()
+    pm_off = table_new_i64()
+    pm_n = table_new_i64()
+    pm_npar = table_new_i64()
+    pm_paroff = table_new_i64()
+    pm_ret = table_new_i64()
+    pm_names = table_new_i64()
+    pm_npars = table_new_i64()
+    pm_ptys = table_new_i64()
+    pm_rets = table_new_i64()
+    im_keys = table_new_i64()
+    im_vals = table_new_i64()
+    im_port = table_new_i64()
+    im_struct = table_new_i64()
+    im_poff = table_new_i64()
+    im_n = table_new_i64()
+    im_mnames = table_new_i64()
+    g_impl_pending = table_new_i64()
     // 实例化记录表重置（gin_*，T3b 单态化展开器；每次编译清零）
     gin_keys = table_new_i64()
     gin_vals = table_new_i64()
@@ -450,6 +472,13 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     }
     var r = scollect.collect_top()
     if r < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
+    // S2.4 impl 块统一处理（struct/port 全部登记后：方法改名 + 签名登记 +
+    // 完整性/签名检查 + impl 记录）。须在 expand_generics 之前——泛型约束
+    // 校验（instantiate_fn/struct）依赖 impl 表就绪。
+    var ifr = scollect.collect_impl_fns()
+    if ifr < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
     // 泛型单态化预扫描展开（T3b）：遍历模板 → 扫描调用点 → 展开 → 去重 →
@@ -621,6 +650,28 @@ pub func check_ast(base_dir: string) -> string {
     gtyp_names = table_new_i64()
     gty_node = table_new_i64()
     gty_is_struct = table_new_i64()
+    // S2.4：泛型约束段 + port/impl 状态表重置（每次编译清零）
+    gtyp_conoff = table_new_i64()
+    gtyp_cons = table_new_i64()
+    pt_keys = table_new_i64()
+    pt_vals = table_new_i64()
+    pm_off = table_new_i64()
+    pm_n = table_new_i64()
+    pm_npar = table_new_i64()
+    pm_paroff = table_new_i64()
+    pm_ret = table_new_i64()
+    pm_names = table_new_i64()
+    pm_npars = table_new_i64()
+    pm_ptys = table_new_i64()
+    pm_rets = table_new_i64()
+    im_keys = table_new_i64()
+    im_vals = table_new_i64()
+    im_port = table_new_i64()
+    im_struct = table_new_i64()
+    im_poff = table_new_i64()
+    im_n = table_new_i64()
+    im_mnames = table_new_i64()
+    g_impl_pending = table_new_i64()
     // 实例化记录表重置（gin_*，T3b 单态化展开器；每次编译清零）
     gin_keys = table_new_i64()
     gin_vals = table_new_i64()
@@ -669,6 +720,13 @@ pub func check_ast(base_dir: string) -> string {
     }
     var r = scollect.collect_top()
     if r < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
+    // S2.4 impl 块统一处理（同 check_impl：方法改名 + 签名登记 + 完整性/
+    // 签名检查 + impl 记录；须在 expand_generics 之前——泛型约束校验依赖
+    // impl 表就绪）
+    var ifr = scollect.collect_impl_fns()
+    if ifr < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
     // 泛型单态化预扫描展开（T3b）：同 check_impl（见其注释）

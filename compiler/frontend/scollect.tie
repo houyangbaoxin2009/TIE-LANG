@@ -13,6 +13,13 @@ type tie<class>
 // + resolve_call_name + table_ret_elem）。树式无环：由 scheck.tie import。
 import "./sinfer.tie"
 
+// S2.4：impl 块暂存队列（N_IMPL 节点 id）。collect_top 遇到 N_IMPL 时只登记
+// 队列（struct 声明可能在其后，须等全部 struct 登记完再解析）；
+// collect_top 之后由 semantic 主流程调用 collect_impl_fns() 统一处理：
+// 方法节点改名 <struct 名>::<方法名> → g_extra_tops → collect_fn → reg_impl。
+// 注：tie 全局变量必须放文件顶层（namespace 外）。
+var g_impl_pending: table<i64>;
+
 namespace scollect {
 
 // 内置函数返回表预登记（语言底座）
@@ -318,6 +325,297 @@ pub func find_struct_node(name: string) -> i64 {
         i = i + 1
     }
     return -1
+}
+
+// ==================== S2.4 port / impl 收集（接口模型）====================
+// port 声明收集：登记 port + 方法签名（方法必须 pub func、第一参数 self、
+// 无函数体——默认实现暂不支持，port-model.md §10 未决问题 1 后置）。
+// 方法签名 = 参数类型表（self 槽占位 TK_VOID，签名匹配时跳过）+ 返回类型。
+func collect_port(s: i64) -> i64 {
+    var nm = sstate.name_str(s)
+    // 冲突检查：port 名不能与 struct/enum/函数/泛型模板同名（类型解析歧义）
+    var nid = intern.intern(nm)
+    if sstate.bs_find(st_keys, nid) >= 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        sm_err_msg = "port 名 '" + nm + "' 与 struct 名冲突"
+        return -1
+    }
+    if sstate.bs_find(en_keys, nid) >= 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        sm_err_msg = "port 名 '" + nm + "' 与枚举名冲突"
+        return -1
+    }
+    if sstate.bs_find(fn_keys, nid) >= 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        sm_err_msg = "port 名 '" + nm + "' 与函数名冲突"
+        return -1
+    }
+    if sstate.gt_find(nm) >= 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        sm_err_msg = "port 名 '" + nm + "' 与泛型模板名冲突"
+        return -1
+    }
+    var pi = sstate.reg_port(nm)
+    if pi < 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        return -1
+    }
+    // 方法：children[slot_off ..]（泛型槽 -1 → slot_off = 1）
+    var soff = sstate.slot_off(s)
+    var nmeth = sstate.nchild(s) - soff
+    var k: i64 = 0
+    while k < nmeth {
+        var m = sstate.child(s, soff + k)
+        var mname = sstate.name_str(m)
+        // 方法必须 pub（port 方法对外可见）
+        if (s_vals[m] & 1) == 0 {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            sm_err_msg = "port 方法 '" + mname + "' 必须标注 pub（`pub func " + mname + "`）"
+            return -1
+        }
+        var nparams = s_aux[m]
+        // 第一参数必须是 self（接口是对象行为的抽象，接收者统一 self）
+        if nparams < 1 {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            sm_err_msg = "port 方法 '" + mname + "' 必须有 self 接收者（第一参数）"
+            return -1
+        }
+        var p0 = sstate.child(m, sstate.slot_off(m) + 1)
+        if sstate.name_str(p0) != "self" {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            sm_err_msg = "port 方法 '" + mname + "' 的第一参数必须是 self"
+            return -1
+        }
+        // 无函数体（默认实现暂不支持，第一版 port 只声明签名）
+        var body: i64 = -1
+        if sstate.nchild(m) > 2 + nparams {
+            body = sstate.child(m, 2 + nparams)
+        }
+        if body >= 0 {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            sm_err_msg = "port 默认实现暂不支持（第一版：port 方法只声明签名，请用 impl 块提供实现）"
+            return -1
+        }
+        // 参数类型解析（self 槽占位；其余类型必须可解析——port 不支持泛型，
+        // TypeVar 引用自然报「类型未定义」）
+        var ptys: table<i64> = table_new_i64()
+        var j: i64 = 0
+        while j < nparams {
+            var p = sstate.child(m, sstate.slot_off(m) + 1 + j)
+            if j == 0 {
+                table_push(ptys, types.named(TK_VOID))  // self 槽占位
+            } else {
+                var pt = sgen.parse_generic_type_node(sstate.child(p, 0))
+                if pt < 0 {
+                    sm_err_line = s_lines[p]
+                    sm_err_col = s_cols[p]
+                    return -1
+                }
+                table_push(ptys, pt)
+            }
+            j = j + 1
+        }
+        var ret_ty = sgen.parse_generic_type_node(sstate.child(m, sstate.slot_off(m)))
+        if ret_ty < 0 {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            return -1
+        }
+        if sstate.reg_port_method(pi, mname, ptys, ret_ty) < 0 {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            return -1
+        }
+        k = k + 1
+    }
+    return 0
+}
+
+// impl 块统一处理（collect_top 之后、expand_generics 之前调用）：
+// 此时全部 struct/port 已登记。对每个暂存 N_IMPL：
+//   1. 校验 port/struct 存在
+//   2. 方法 self 参数类型节点改写为 struct 类型（触发 M2.1.8 自动 ref）
+//   3. 方法改名 <struct 名>::<方法名> → g_extra_tops → collect_fn 登记签名
+//   4. 完整性检查（port 方法全部实现 + 签名匹配）+ reg_impl 登记
+pub func collect_impl_fns() -> i64 {
+    var n = len(g_impl_pending)
+    var i: i64 = 0
+    while i < n {
+        var r = collect_impl_one(g_impl_pending[i])
+        if r < 0 {
+            return -1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 单个 impl 块处理（collect_impl_fns 内部）
+func collect_impl_one(im: i64) -> i64 {
+    // N_IMPL children = [port 类型节点, struct 类型节点, 方法 FnDef...]
+    var pnode = sstate.child(im, 0)
+    var snode = sstate.child(im, 1)
+    var pname = sstate.name_str(pnode)
+    var sname = sstate.name_str(snode)
+    var pi = sstate.port_find(pname)
+    if pi < 0 {
+        sm_err_line = s_lines[im]
+        sm_err_col = s_cols[im]
+        sm_err_msg = "impl 引用的 port '" + pname + "' 未定义"
+        return -1
+    }
+    var sidx = sstate.bs_find(st_keys, intern.intern(sname))
+    if sidx < 0 {
+        sm_err_line = s_lines[im]
+        sm_err_col = s_cols[im]
+        sm_err_msg = "impl 引用的 struct '" + sname + "' 未定义"
+        return -1
+    }
+    var si = st_vals[sidx]
+    // 方法全名表（按 port 方法声明序；-1 = 缺实现）
+    var nport_m = pm_n[pi]
+    var mnames: table<i64> = table_new_i64()
+    var mi: i64 = 0
+    while mi < nport_m {
+        table_push(mnames, -1)
+        mi = mi + 1
+    }
+    var nc = sstate.nchild(im)
+    var k: i64 = 2
+    while k < nc {
+        var m = sstate.child(im, k)
+        var mname = sstate.name_str(m)
+        var nparams = s_aux[m]
+        // 方法必须有函数体（实现）
+        var body: i64 = -1
+        if sstate.nchild(m) > 2 + nparams {
+            body = sstate.child(m, 2 + nparams)
+        }
+        if body < 0 {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            sm_err_msg = "impl 方法 '" + mname + "' 必须有函数体（impl 块 = 实现，不能只声明签名）"
+            return -1
+        }
+        // 第一参数必须是 self
+        if nparams < 1 {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            sm_err_msg = "impl 方法 '" + mname + "' 必须有 self 接收者（第一参数）"
+            return -1
+        }
+        var p0 = sstate.child(m, sstate.slot_off(m) + 1)
+        if sstate.name_str(p0) != "self" {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            sm_err_msg = "impl 方法 '" + mname + "' 的第一参数必须是 self"
+            return -1
+        }
+        // self 参数类型节点改写：占位（name="self"）→ struct 类型节点。
+        // collect_fn 按 <struct>::<方法> 全名登记时 M2.1.8 检查首参类型 ==
+        // struct 类型 → 自动按引用传递（与手写 namespace 方法一致）。
+        var pty_node = sstate.child(p0, 0)
+        s_tags[pty_node] = S_N_STRUCT_TYPE
+        s_names[pty_node] = intern.intern(sname)
+        s_vals[pty_node] = -1
+        // 方法改名 <struct 名>::<方法名>，push g_extra_tops 供 check_fn_walk /
+        // irgen gen_ast / find_fn_node 按全名查找，collect_fn 登记签名
+        var full = sname + "::" + mname
+        s_names[m] = intern.intern(full)
+        table_push(g_extra_tops, m)
+        var r = collect_fn(m, full)
+        if r < 0 {
+            sm_err_line = s_lines[m]
+            sm_err_col = s_cols[m]
+            return -1
+        }
+        // 匹配 port 方法序号（额外方法允许，不参与该 port）
+        var pmi = sstate.port_method_idx(pi, mname)
+        if pmi >= 0 {
+            if mnames[pmi] < 0 {
+                mnames[pmi] = intern.intern(full)
+            } else {
+                sm_err_line = s_lines[m]
+                sm_err_col = s_cols[m]
+                sm_err_msg = "impl '" + pname + " for " + sname + "' 的方法 '" + mname + "' 重复定义"
+                return -1
+            }
+        }
+        k = k + 1
+    }
+    // 完整性检查：port 每个方法都有实现（漏方法 = 编译错误）
+    var mi2: i64 = 0
+    while mi2 < nport_m {
+        if mnames[mi2] < 0 {
+            sm_err_line = s_lines[im]
+            sm_err_col = s_cols[im]
+            sm_err_msg = "impl '" + pname + " for " + sname + "' 缺少方法 '" + sstate.port_method_name(pi, mi2) + "'（port 方法必须全部实现）"
+            return -1
+        }
+        mi2 = mi2 + 1
+    }
+    // 签名匹配检查（去 self）：impl 方法签名 vs port 方法签名
+    var mi3: i64 = 0
+    while mi3 < nport_m {
+        var full2 = intern.lookup(mnames[mi3])
+        var sig = sstate.fn_sig(full2)
+        if sig < 0 {
+            sm_err_line = s_lines[im]
+            sm_err_col = s_cols[im]
+            sm_err_msg = "内部错误：impl 方法 '" + full2 + "' 无签名"
+            return -1
+        }
+        var pnp = sstate.port_method_nparams(pi, mi3)  // 含 self
+        var fnp = sg_nparams[sig]
+        if fnp != pnp {
+            sm_err_line = s_lines[im]
+            sm_err_col = s_cols[im]
+            sm_err_msg = "impl 方法 '" + sstate.port_method_name(pi, mi3) + "' 参数个数与 port 签名不匹配：期望 " + to_string(pnp) + "，实际 " + to_string(fnp)
+            return -1
+        }
+        // 参数类型逐项匹配（self 槽跳过；其余精确相等——第一版不做隐式转换）
+        var j: i64 = 1
+        var sig_ok: bool = true
+        while j < pnp {
+            var want = sstate.port_method_param(pi, mi3, j)
+            var got = sp_tys[sg_off[sig] + j]
+            if want != got {
+                sig_ok = false
+                break
+            }
+            j = j + 1
+        }
+        if !sig_ok {
+            sm_err_line = s_lines[im]
+            sm_err_col = s_cols[im]
+            sm_err_msg = "impl 方法 '" + sstate.port_method_name(pi, mi3) + "' 参数类型与 port 签名不匹配（port 方法参数必须类型一致）"
+            return -1
+        }
+        var want_ret = sstate.port_method_ret(pi, mi3)
+        if sg_ret[sig] != want_ret {
+            sm_err_line = s_lines[im]
+            sm_err_col = s_cols[im]
+            sm_err_msg = "impl 方法 '" + sstate.port_method_name(pi, mi3) + "' 返回类型与 port 签名不匹配：期望 " + types.type_name(want_ret) + "，实际 " + types.type_name(sg_ret[sig])
+            return -1
+        }
+        mi3 = mi3 + 1
+    }
+    // 登记 impl 记录（vtable 生成 / 约束校验 / 提升判定共用）
+    if sstate.reg_impl(pi, si, mnames) < 0 {
+        sm_err_line = s_lines[im]
+        sm_err_col = s_cols[im]
+        return -1
+    }
+    return 0
 }
 
 // 顶层 enum 声明登记分派（泛型语法 2026-08-15，对齐 collect_struct_decl）：
@@ -915,6 +1213,16 @@ pub func collect_ns(ns_node: i64) -> i64 {
             if re < 0 {
                 return -1
             }
+        } else if tag == S_N_PORT {
+            // S2.4：port 声明收集（方法签名登记）
+            var rp = collect_port(s)
+            if rp < 0 {
+                return -1
+            }
+        } else if tag == S_N_IMPL {
+            // S2.4：impl 块暂存（struct 可能声明在后，统一处理在
+            // collect_top 之后由 semantic 主流程调 collect_impl_fns）
+            table_push(g_impl_pending, s)
         }
         j = j + 1
     }
@@ -942,6 +1250,14 @@ pub func collect_global_var(v: i64) -> i64 {
     }
     var ty = sgen.parse_generic_type_node(ty_node)
     if ty < 0 {
+        return -1
+    }
+    // S2.4：全局 port 对象变量暂不支持（提升需要 unsafe 上下文 + 生命周期
+    // 责任在程序员；全局提升的初始化时机/生命周期难以自证，第一版拒绝）
+    if types.kind(ty) == K_PORT {
+        sm_err_line = s_lines[v]
+        sm_err_col = s_cols[v]
+        sm_err_msg = "全局 port 对象变量暂不支持（第一版请用局部变量提升：unsafe { var d: " + types.type_name(ty) + " = 具体实例 }）"
         return -1
     }
     var nid = intern.intern(nm)
@@ -1038,6 +1354,16 @@ pub func collect_top() -> i64 {
             if re < 0 {
                 return -1
             }
+        } else if tag == S_N_PORT {
+            // S2.4：port 声明收集（方法签名登记）
+            var rp = collect_port(s)
+            if rp < 0 {
+                return -1
+            }
+        } else if tag == S_N_IMPL {
+            // S2.4：impl 块暂存（struct 可能声明在后，统一处理在
+            // collect_top 之后由 semantic 主流程调 collect_impl_fns）
+            table_push(g_impl_pending, s)
         } else if tag == S_N_VAR_DECL {
             var r = collect_global_var(s)
             if r < 0 {

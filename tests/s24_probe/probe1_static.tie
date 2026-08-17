@@ -1,0 +1,63 @@
+type tie<logic>
+// S2.4 探针 1：静态分发——泛型约束 <T: Drawable>（docs/plans/port-model.md §2.3/§3.1）
+// 验收点：
+//   1. port 声明语法（方法签名集合，self 接收者）
+//   2. impl 块语法（impl Drawable for Button { ... }）+ 完整性检查
+//   3. 泛型约束 <T: Drawable>：T 实参化时校验 impl（违反 = 编译错误）
+//   4. 静态分发：d.draw(ctx) 编译期绑定具体实现（单态化零开销）
+// 说明：table<T> 元素限标量是既有语言限制（LLVM 表槽 8 字节，聚合元素
+// 不支持），故遍历用 table<i64> 下标表 + 泛型实例参数——约束校验与
+// 单态化方法绑定完整覆盖；异构容器（table<Drawable>）见 probe2_dynamic。
+
+port Drawable {
+    pub func draw(self, ctx: i64) -> string
+    pub func bounds(self) -> i64
+}
+
+struct Button {
+    var label: string
+    var w: i64
+    var h: i64
+}
+
+impl Drawable for Button {
+    pub func draw(self, ctx: i64) -> string {
+        return "Button(" + self.label + ")"
+    }
+    pub func bounds(self) -> i64 {
+        return self.w * self.h
+    }
+}
+
+struct Text {
+    var msg: string
+}
+
+impl Drawable for Text {
+    pub func draw(self, ctx: i64) -> string {
+        return "Text(" + self.msg + ")"
+    }
+    pub func bounds(self) -> i64 {
+        return 100
+    }
+}
+
+// 泛型约束静态分发：T 实参化时校验「T 必须 impl Drawable」；
+// d.draw(ctx) 编译期绑定具体实现（单态化 → Button::draw / Text::draw）
+func render_all<T: Drawable>(idx: table<i64>, d: T, ctx: i64) {
+    var i: i64 = 0
+    while i < len(idx) {
+        println(d.draw(ctx))
+        i = i + 1
+    }
+}
+
+func main() {
+    var b: Button = Button("ok", 10, 20)
+    var t: Text = Text("hi")
+    var idx: table<i64> = [1, 2, 3]
+    render_all(idx, b, 0)   // 单态化 render_all$Button（编译期绑定 Button::draw）
+    render_all(idx, t, 0)   // 单态化 render_all$Text（编译期绑定 Text::draw）
+    println("bounds=" + to_string(b.bounds()))
+    println("t.bounds=" + to_string(t.bounds()))
+}

@@ -56,6 +56,7 @@ const K_PTR: i64 = 7;        // ptr<T> 类型化指针（S1.2）
 const K_SLICE: i64 = 8;      // slice<T> 切片（指针+长度，S1.2）
 const K_ATOMIC: i64 = 9;     // atomic<T> 原子类型（S1.2）
 const K_FN: i64 = 10;        // fn 函数值类型（S2.2，闭包/函数指针）
+const K_PORT: i64 = 11;      // port 对象类型（S2.4：接口对象，LLVM 表示 = ptr 指向堆打包 {data,vtable}）
 const K_SHIFT: i64 = 40;           // 高位分离位移量（负载 < 2^40）
 
 // ---------- TyKw 索引常量（0..20，对齐 Rust TyKw 变体顺序）----------
@@ -98,6 +99,12 @@ const BASE_ATOMIC: i64 = 9895604649984;
 // 签名 = 返回类型 + 参数类型列表，查 fn 签名表编码（低负载为索引）。
 // 10<<40 = 10995116277760，i64 有符号下远小于 2^63 无溢出。
 const BASE_FN: i64 = 10995116277760;
+// S2.4 port 对象类型段：id = 11<<40 | port 索引（port 表行号）。
+// 11<<40 = 12094627905536，i64 有符号下远小于 2^63 无溢出。
+// port 对象语义 = {data: ptr, vtable: ptr}（docs/plans/port-model.md §4.1），
+// LLVM 表示 = 单个 ptr（指向堆上打包对象 {data,vtable}）——表/传参/字段
+// 天然支持（探针异构 table<Drawable> 依赖此表示，见 S2.4 注释）。
+const BASE_PORT: i64 = 12094627905536;
 
 // ---------- 全局状态（懒构建）----------
 var tykw_names: table<string>;   // TyKw 索引 -> 类型名（错误消息用）
@@ -120,6 +127,8 @@ var fn_ret: table<i64>;      // fn 签名索引 -> 返回类型 id
 var fn_nparams: table<i64>;  // fn 签名索引 -> 参数个数
 var fn_paroff: table<i64>;   // fn 签名索引 -> fn_params 段起始偏移
 var fn_params: table<i64>;   // 参数类型扁平段（前缀和式）
+// S2.4 port 名表（索引 -> 名字；type_name 还原用，由语义层 set_port_name 登记）
+var pt_names: table<string>;
 
 // 嵌套负载序号偏移（避开 named 负载段 0..99；named 仅 0..20 安全余量）
 const NEST_SLOT_OFF: i64 = 100;
@@ -313,6 +322,29 @@ pub func fn_param_of(t: i64, k: i64) -> i64 {
     return -1
 }
 
+// ---------- S2.4 port 对象类型构造 ----------
+// port P：id = 11<<40 | port 索引（port 表行号，语义层登记顺序）。
+pub func port_of(idx: i64) -> i64 {
+    return BASE_PORT + idx
+}
+
+// port 类型判据：kind == K_PORT（11<<40 段）。
+pub func is_port(t: i64) -> bool {
+    if kind(t) == K_PORT {
+        return true
+    }
+    return false
+}
+
+// 登记 port 索引 -> 名字（语义层收集 port 时调用；追加式，
+// 索引 = 登记顺序，与语义 port 表行号对应）。
+pub func set_port_name(idx: i64, nm: string) {
+    while len(pt_names) < idx {
+        table_push(pt_names, "")
+    }
+    table_push(pt_names, nm)
+}
+
 // ---------- 类型 id 解码 ----------
 
 // 类型类别：0=Named 1=Table 2=Map 3=Struct 4=Tuple 5=TypeVar 6=Enum
@@ -324,6 +356,9 @@ pub func fn_param_of(t: i64, k: i64) -> i64 {
 pub func kind(id: i64) -> i64 {
     if id < 100 {
         return K_NAMED
+    }
+    if id >= BASE_PORT {
+        return K_PORT
     }
     if id >= BASE_FN {
         return K_FN
@@ -355,9 +390,12 @@ pub func kind(id: i64) -> i64 {
     return K_TABLE
 }
 
-// 类型负载：Table/Map/Ptr/Slice/Atomic 的元素类型 id、Struct/Tuple/Enum 的
+// 类型负载：Table/Map/Ptr/Slice/Atomic 的元素类型 id、Struct/Tuple/Enum/Port 的
 // 索引、TypeVar 的 intern 池 id；Named 类型无意义（调用方先判 kind）。
 pub func low(id: i64) -> i64 {
+    if id >= BASE_PORT {
+        return id - BASE_PORT
+    }
     if id >= BASE_FN {
         return id - BASE_FN
     }
@@ -675,6 +713,13 @@ pub func type_name(t: i64) -> string {
             return interner.lookup(iv)
         }
         return "?"   // intern 池 id 越界兜底（理论不发生，防御性）
+    }
+    if k == K_PORT {
+        var pidx = low(t)
+        if pidx >= 0 && pidx < len(pt_names) {
+            return pt_names[pidx]
+        }
+        return "port"   // 未登记兜底（理论不发生，防御性）
     }
     if k == K_FN {
         var s: string = "fn("
