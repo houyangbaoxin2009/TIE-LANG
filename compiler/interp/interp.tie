@@ -41,10 +41,10 @@ type tie<class>
 //   eval_expr/eval_binary/call_fn 共 1653+ 行），按职责拆分为大量小函数
 //   （每个控制流语句/表达式类别一个函数），任务规格固定为三模块布局。
 
-import "./session.tie"   // session → value（树式单路径，避免 value 重复内联）
-import "./../frontend/parser.tie"
-import "./../frontend/sstate.tie"
-import "./../middle/types.tie"   // S3.3：TK_TRIT 等类型关键字常量（树合并后
+import "./session.tie"
+import "../frontend/parser.tie"
+import "../frontend/sstate.tie"
+import "../middle/types.tie"   // S3.3：TK_TRIT 等类型关键字常量（树合并后
 // 与 semantic 树共享 types——若本模块自持同名常量会重复定义）
 
 // ==================== 模块级求值上下文 ====================
@@ -1533,15 +1533,90 @@ func gen_code_lit(id: i64) -> i64 {
     if new_root < 0 {
         return -1
     }
+    // 2.5 协议 id 映射：sstate_subtree_protocol 按 BFS 重编号（池 id → 新 id
+    // 0..n-1），splice_proto 须用**协议新 id** 而非池 id 匹配。此处用与
+    // sstate_subtree_protocol 完全相同的 BFS 遍历计算映射（g_interp_pids
+    // 与 g_interp_nodes 平行：池 id → 协议 id）。
+    var g_interp_pids: table<i64> = table_new_i64()
+    var mo: table<i64> = table_new_i64()
+    var mn: table<i64> = table_new_i64()
+    var od: table<i64> = table_new_i64()
+    table_push(od, new_root)
+    table_push(mo, new_root)
+    table_push(mn, 0)
+    var qi: i64 = 0
+    while qi < len(od) {
+        var cur = od[qi]
+        var kk: i64 = 0
+        while kk < s_nchild[cur] {
+            var cc = s_children[s_coff[cur] + kk]
+            if cc >= 0 {
+                var seen2 = false
+                var m2: i64 = 0
+                while m2 < len(mo) {
+                    if mo[m2] == cc {
+                        seen2 = true
+                        break
+                    }
+                    m2 = m2 + 1
+                }
+                if !seen2 {
+                    table_push(od, cc)
+                    table_push(mo, cc)
+                    table_push(mn, len(od) - 1)
+                }
+            }
+            kk = kk + 1
+        }
+        qi = qi + 1
+    }
+    var mi: i64 = 0
+    while mi < len(g_interp_nodes) {
+        var pid2: i64 = -1
+        var mj: i64 = 0
+        while mj < len(mo) {
+            if mo[mj] == g_interp_nodes[mi] {
+                pid2 = mn[mj]
+                break
+            }
+            mj = mj + 1
+        }
+        table_push(g_interp_pids, pid2)
+        mi = mi + 1
+    }
+    // 2.6 按协议 id 降序排序（g_interp_nodes/g_interp_pids 平行）：splice_proto
+    // 每次嵌入会把插入点之后的节点 id 重编号（+qn-1）——从大到小处理保证
+    // 后续（更小 id）的插值节点不受之前嵌入影响，id 恒为原始映射值。
+    var si: i64 = 0
+    while si < len(g_interp_pids) - 1 {
+        var sj: i64 = si + 1
+        while sj < len(g_interp_pids) {
+            if g_interp_pids[sj] > g_interp_pids[si] {
+                var tp = g_interp_pids[si]
+                g_interp_pids[si] = g_interp_pids[sj]
+                g_interp_pids[sj] = tp
+                var tn = g_interp_nodes[si]
+                g_interp_nodes[si] = g_interp_nodes[sj]
+                g_interp_nodes[sj] = tn
+            }
+            sj = sj + 1
+        }
+        si = si + 1
+    }
     // 3. 序列化克隆子树 → 协议文本（根 id = 0）
     var p = sstate_subtree_protocol(new_root)
     if g_err != "" {
         return -1
     }
-    // 4. 逐个 N_CODE_INTERP 嵌入
+    // 4. 逐个 N_CODE_INTERP 嵌入（splice_proto 用协议新 id——g_interp_pids）
     var k: i64 = 0
     while k < len(g_interp_nodes) {
         var inode = g_interp_nodes[k]
+        var ipid = g_interp_pids[k]
+        if ipid < 0 {
+            g_err = "内部错误: 插值节点协议 id 映射缺失"
+            return -1
+        }
         var iname = s_names[inode]
         var ivar = ""
         var ivar_node: i64 = -1
@@ -1555,12 +1630,12 @@ func gen_code_lit(id: i64) -> i64 {
                 return -1
             }
             if ivalue.type_of(ev) == T_CODE {
-                p = splice_proto(p, inode, ivalue.code_str(ev))
+                p = splice_proto(p, ipid, ivalue.code_str(ev))
                 k = k + 1
                 continue
             }
             if ivalue.type_of(ev) == T_STR {
-                p = replace_interp_node_with_var(p, inode, ivalue.str_val(ev))
+                p = replace_interp_node_with_var(p, ipid, ivalue.str_val(ev))
                 k = k + 1
                 continue
             }
@@ -1573,9 +1648,9 @@ func gen_code_lit(id: i64) -> i64 {
             return -1
         }
         if ivalue.type_of(v) == T_CODE {
-            p = splice_proto(p, inode, ivalue.code_str(v))
+            p = splice_proto(p, ipid, ivalue.code_str(v))
         } else if ivalue.type_of(v) == T_STR {
-            p = replace_interp_node_with_var(p, inode, ivalue.str_val(v))
+            p = replace_interp_node_with_var(p, ipid, ivalue.str_val(v))
         } else {
             g_err = "插值变量 '" + ivar + "' 必须是 code 或字符串，实际是 " + ivalue.type_name(v)
             return -1
@@ -1668,16 +1743,24 @@ func clone_node(old: i64, interp_out: ref table<i64>) -> i64 {
     // 登记映射（递归前登记防环）
     table_push(g_clone_old, old)
     table_push(g_clone_new, new_id)
-    // 子节点递归克隆（-1 哨兵保持）
-    s_coff[new_id] = len(s_children)
+    // 子节点段：**先占位再原位覆盖**（父段 [seg, seg+nchild) 固定，子段在
+    // 父段之后——直接"子克隆前取 len(s_children)"会与第一个子的段重叠，
+    // 导致父 children 读取错位（准引用块结构断裂的根因））
+    var seg_start = len(s_children)
+    var nkid: i64 = 0
+    while nkid < isess.nchild(old) {
+        table_push(s_children, -1)
+        nkid = nkid + 1
+    }
+    s_coff[new_id] = seg_start
     var k: i64 = 0
     while k < isess.nchild(old) {
         var c = isess.nchild_at(old, k)
         if c < 0 {
-            table_push(s_children, -1)
+            s_children[seg_start + k] = -1
         } else {
             var nc = clone_node(c, interp_out)
-            table_push(s_children, nc)
+            s_children[seg_start + k] = nc
         }
         k = k + 1
     }
@@ -1774,6 +1857,7 @@ func splice_proto(p: string, interp_id: i64, q: string) -> string {
     }
     var pn = len(p_lines) - 1        // 首行是 "N:"，其余是节点行
     var qn = len(q_lines) - 1
+    var qbase = pn - 1               // q 根新 id：p 删除 interp_id 行后剩 pn-1 个
     var out: string = to_string(pn - 1 + qn) + ":\n"
     var i: i64 = 1
     while i < len(p_lines) {
@@ -1783,14 +1867,56 @@ func splice_proto(p: string, interp_id: i64, q: string) -> string {
             i = i + 1
             continue
         }
-        out = out + row_replace_child(row, interp_id, pn) + "\n"
+        // p 保留行：id > interp_id 减 1（删除补偿）；子引用 > interp_id 减 1，
+        // == interp_id → qbase（q 根）
+        out = out + row_splice_shift(row, interp_id, qbase) + "\n"
         i = i + 1
     }
-    // 追加 q 的节点行（id 重映射 +pn；q 根 id=0 → pn）
+    // 追加 q 的节点行（id 重映射 +qbase；q 根 id=0 → qbase）
     var j: i64 = 1
     while j < len(q_lines) {
-        out = out + row_shift_ids(q_lines[j], pn) + "\n"
+        out = out + row_shift_ids(q_lines[j], qbase) + "\n"
         j = j + 1
+    }
+    return out
+}
+
+// 拼接保留行重映射：首字段（节点 id）> cut 时 -1；子引用（第 9 字段起）
+// == cut → repl；> cut → -1；-1 哨兵与其余字段不变。id <= cut 不变
+//（插值节点按 id 降序处理，剩余插值 id 均 < cut，不受删除影响）。
+func row_splice_shift(row: string, cut: i64, repl: i64) -> string {
+    var parts = split_by_space(row)
+    if len(parts) < 8 {
+        return row
+    }
+    var out: string = ""
+    var i: i64 = 0
+    while i < len(parts) {
+        if i > 0 {
+            out = out + " "
+        }
+        if i == 0 {
+            var v0 = sstate.parse_dec(parts[i])
+            if v0 > cut {
+                out = out + to_string(v0 - 1)
+            } else {
+                out = out + parts[i]
+            }
+        } else if i >= 8 {
+            var v = sstate.parse_dec(parts[i])
+            if v < 0 {
+                out = out + "-1"
+            } else if v == cut {
+                out = out + to_string(repl)
+            } else if v > cut {
+                out = out + to_string(v - 1)
+            } else {
+                out = out + parts[i]
+            }
+        } else {
+            out = out + parts[i]
+        }
+        i = i + 1
     }
     return out
 }

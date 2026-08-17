@@ -1,3 +1,28 @@
+## [新增] 阶段 3 宏/元编程（S3.3 code 三形态 + 函数式宏 + 卫生）—— 2026-08-17
+
+S3.3 宏/元编程（docs/plans/macro-model.md：M3 函数式宏 + C1+C2+C3 code
+三形态 + H2+H3 卫生）首版落地（主控接管续作）：
+
+- **前端**：`macro name(x: code) -> code { 体 }` 宏定义（N_MACRO_DEF=135）、
+  准引用字面量 `` `(expr) ``（N_CODE_LIT=136，表达式形式立即解析）与
+  `` `{ stmts } ``（块形式，延迟解析回填）、插值 `$x` / `$(expr)`
+  （N_CODE_INTERP=137）、gensym("前缀") 内置
+- **宏展开 pass**（compiler/frontend/mexpand.tie）：顶层宏收集移除 →
+  宏体协议序列化注册进 interp（eval_proto）→ 调用点递归展开（轮次上限 64，
+  孤儿节点跳过防死循环）；展开期间 s_* 池快照保存/恢复（10 表 + s_n）
+- **interp 准引用求值**（gen_code_lit）：绑定名收集 + H2 词法卫生改名
+  （__hygN_）+ 子树克隆 + 插值嵌入（splice_proto 协议拼接：id 连续重编号、
+  按 id 降序处理多插值）+ H3 gensym（__tie_gensymN_）
+- **修复（自举链阻塞）**：interp import 路径写法（`./../X` → `../X`，旧编译器
+  去重失效 g_pos 双定义）；clone_node 段布局（父段与子段重叠 → 先占位再
+  原位覆盖，准引用块结构断裂根因）
+- **验收**：表达式宏全链路通过（tests/s33_probe/probe0：`double(3+4)` →
+  `(3+4)*2` 输出 14）；自举链 tiec_B2 → tiec_C --emit-ir 逐字节一致；
+  language 30 正例全过（extern_decl/std_fs_path 为基线已知）
+- **已知限制（遗留）**：语句级宏（块形式准引用展开为多条语句）在
+  splice_call 段重建处存在父引用丢失（s_children 扁平段一致性深水区），
+  第一版宏调用点限表达式位置；跨文件宏不支持；过程宏 M4 后置
+
 ## [新增] 阶段 2 闭包后端全链路（S2.2 函数值/闭包 IR 生成 + 间接调用）—— 2026-08-17
 
 S2.2 闭包前端（5f0762d，N_FN_LIT/N_FN_TYPE + fn 类型系统 + 捕获分析）的

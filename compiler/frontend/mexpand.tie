@@ -52,10 +52,11 @@ var g_pool_children: table<i64>;
 var g_pool_lines: table<i64>;
 var g_pool_cols: table<i64>;
 var g_pool_types: table<i64>;
+var g_pool_sn: i64 = 0;        // 池快照节点总数（宏执行重建 s_* 池后恢复）
 
 namespace mexpand {
 
-// 池快照：s_* 池 9 列 + node_types 深拷贝到 g_pool_*。
+// 池快照：s_* 池 9 列 + node_types + s_n（节点总数）深拷贝到 g_pool_*。
 func pool_save() {
     g_pool_tags = copy_i64(s_tags)
     g_pool_names = copy_i64(s_names)
@@ -67,9 +68,12 @@ func pool_save() {
     g_pool_lines = copy_i64(s_lines)
     g_pool_cols = copy_i64(s_cols)
     g_pool_types = copy_i64(node_types)
+    g_pool_sn = s_n
 }
 
-// 池恢复：重新绑定全局表（宏执行后调用；s_n 由 len 推导）。
+// 池恢复：重新绑定全局表（宏执行后调用；s_n 用快照值而非 len 推导——
+// append_ast 只追加不更新 s_n，且 restore 后 len(s_tags) 是快照引用长度，
+// 与展开循环期望的 s_n 语义一致，显式恢复更稳）。
 func pool_restore() {
     s_tags = g_pool_tags
     s_names = g_pool_names
@@ -81,7 +85,7 @@ func pool_restore() {
     s_lines = g_pool_lines
     s_cols = g_pool_cols
     node_types = g_pool_types
-    s_n = len(s_tags)
+    s_n = g_pool_sn
 }
 
 // i64 表深拷贝。
@@ -154,8 +158,10 @@ pub func expand_sstate() -> i64 {
                         if rc < 0 {
                             return -1
                         }
-                        expanded = true
-                        break   // 展开后池变化：重扫
+                        if rc == 1 {
+                            expanded = true
+                            break   // 展开后池变化：重扫
+                        }
                     }
                 }
             }
@@ -298,30 +304,17 @@ func expand_one(call_id: i64) -> i64 {
     var out: table<i64> = table_new_i64()
     table_push(out, -1)
     table_push(out, -1)
-    var dbg: string = "DBG expand call_id=" + to_string(call_id) + " s_n=" + to_string(s_n) + " name=" + name +
-        " tag37=" + to_string(s_tags[call_id]) + " nchild_root=" + to_string(s_nchild[g_root]) +
-        " child0_root=" + to_string(s_children[s_coff[g_root]]) + " len_child=" + to_string(len(s_children))
-    var dk: i64 = 0
-    while dk < s_n {
-        var dn = s_nchild[dk]
-        var dj: i64 = 0
-        while dj < dn {
-            if s_children[s_coff[dk] + dj] == call_id {
-                dbg = dbg + " PARENT=" + to_string(dk) + " idx=" + to_string(dj)
-            }
-            dj = dj + 1
-        }
-        dk = dk + 1
-    }
-    file_write("F:\\tie_s33_dbg.txt", dbg)
     if find_parent(call_id, out) < 0 {
-        sm_err_line = s_lines[call_id]
-        sm_err_col = s_cols[call_id]
-        sm_err_msg = "内部错误: 宏调用节点找不到父节点"
-        return -1
+        // 孤儿节点（宏定义被 collect_macros 移除后子树残留的 N_CALL）：
+        // 跳过不展开（返回 0 = 无变化，不触发重扫；其父已不在活树中）。
+        return 0
     }
     // 替换
-    return splice_call(out[0], out[1], call_id, new_root)
+    var rc2 = splice_call(out[0], out[1], call_id, new_root)
+    if rc2 < 0 {
+        return -1
+    }
+    return 1
 }
 
 // 找 child_id 的父节点与子下标（全池扫描）。out 表输出：out[0]=父节点 id，
