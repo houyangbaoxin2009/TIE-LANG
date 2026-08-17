@@ -1,0 +1,8 @@
+type tie<logic>
+// S2.2 闭包探针 3：命名函数提升（函数名用作函数值）
+func add1(x: i64) -> i64 { return x + 1; }
+
+func main() {
+    var g: fn(i64) -> i64 = add1
+    println(g(41))
+}

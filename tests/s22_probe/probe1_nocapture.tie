@@ -1,0 +1,6 @@
+type tie<logic>
+// S2.2 闭包探针 1：无捕获闭包 + 函数值变量
+func main() {
+    var d = func(x: i64) -> i64 { return x * 2; };
+    println(d(21))
+}

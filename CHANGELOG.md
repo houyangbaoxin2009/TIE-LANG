@@ -1,3 +1,33 @@
+## [新增] 阶段 2 闭包后端全链路（S2.2 函数值/闭包 IR 生成 + 间接调用）—— 2026-08-17
+
+S2.2 闭包前端（5f0762d，N_FN_LIT/N_FN_TYPE + fn 类型系统 + 捕获分析）的
+后端补齐，tiec（tie 自写编译器）全链路落地，闭包探针 1-5 全过：
+
+- **irgen 闭包生成**：gen_closure_lit（闭包值 {env, entry} 构造：捕获 env
+  malloc + 逐字段 store）、gen_closure_entry_fn（入口函数 `clos_<id>`，
+  统一签名 `fn(ptr env, A...) -> R`，捕获绑定 = env 字段地址入作用域）、
+  gen_named_fn_value（命名函数提升：适配器 `adapt_<id>` 包 @my_func）、
+  gen_call_indirect（fn 值调用：GEP 取 env/entry 字段 + call_indirect(70)）
+- **llvmgen**：`%fn.N = type { ptr, ptr }` 聚合类型输出、llvm_ty 的 K_FN
+  映射、const_global(63) 函数地址（ptrtoint @sym）、call_indirect(70)
+  发射（entry 为 ptr 值直接作被调函数）、to_ptr 对 const_global 直引
+  @sym / const_i 0 → null（闭包 env=null 的 store 路径）
+- **ir 新 opcode**：call_indirect(70)（操作数 [entry, ret_ty IMM, env,
+  (ty IMM, val)...]）
+- **sinfer 命名函数提升**：S_N_VAR 查找失败后查函数签名（裸名 + 命名空间
+  补全），命中 → types.fn_of 构造 fn 类型（`var f: fn(A)->R = my_func`）
+- **修复 1（语义）**：scheck 闭包返回类型栈 g_clo_ret_stack 的 push 漏用
+  「复用槽位」模式（lp_stack/ns_push 同款）——直接 table_push 导致旧值
+  残留错位，第二个闭包起 return 类型基准错乱（多闭包探针编译报错根因）
+- **修复 2（后端）**：gen_call_indirect 在实参求值后读取 g_lookup_alloca
+  （全局副作用被实参 scope_get_global 覆盖）→ 实参求值后重新查找调用名，
+  否则 fn 值地址错取实参槽（probe2/probe5 运行崩溃 0xC0000005 根因）
+- **验收**：tests/s22_probe/ 探针 1-5 全过（无捕获闭包 42 / 高阶函数+捕获
+  实参 21 / 命名函数提升 42 / 闭包返回 102 / 链式 compose+string 捕获
+  16+val=7）；S2.3 探针 9 个全过（panic exit=1 预期）；tests/language
+  30 正例全过（extern_decl/std_fs_path 为 stage0 同款基线问题）；
+  自举链 tiec_new → tiec_v2 行为一致（--emit-ir 逐字节相同）
+
 ## [新增] 阶段 2 错误处理（S2.3 Result/Option + `?` 解包 + panic）—— 2026-08-16
 
 tie 语言阶段 2 错误处理模型（docs/plans/error-model.md）全链路落地，tiec

@@ -346,6 +346,26 @@ pub func infer_expr(id: i64) -> i64 {
             g_typed = g_typed + 1
             return gt
         }
+        // S2.2 命名函数提升：变量查找失败后查函数签名（裸名 + 命名空间补全），
+        // 命中 → 构造 fn 类型（命名函数名可直接用作函数值，如 `var f: fn(A)->R
+        // = my_func`）。泛型模板（gt_find）暂不提升（单态化后函数值未定义）。
+        var full_f = resolve_call_name(nm)
+        var fsig = sstate.fn_sig(full_f)
+        if fsig >= 0 {
+            var fret = sg_ret[fsig]
+            var fnp = sg_nparams[fsig]
+            var foff = sg_off[fsig]
+            var fpts: table<i64> = table_new_i64()
+            var k2: i64 = 0
+            while k2 < fnp {
+                table_push(fpts, sp_tys[foff + k2])
+                k2 = k2 + 1
+            }
+            var fnty = types.fn_of(fret, fpts)
+            node_types[id] = fnty
+            g_typed = g_typed + 1
+            return fnty
+        }
         sm_err_line = s_lines[id]
         sm_err_col = s_cols[id]
         sm_err_msg = "未声明的变量 '" + nm + "'"

@@ -1197,8 +1197,14 @@ func check_closure_body(ci: i64) -> i64 {
     // 嵌套闭包登记后外层闭包继续追加局部/捕获造成的段污染）
     cl_locloff[ci] = len(cl_locals)
     cl_capoff[ci] = len(cl_capkeys)
-    // 压闭包返回类型（S_N_RETURN 检查优先取栈顶而非 sg_ret[g_curfn]）
-    table_push(g_clo_ret_stack, cl_ret[ci])
+    // 压闭包返回类型（S_N_RETURN 检查优先取栈顶而非 sg_ret[g_curfn]）。
+    // 复用槽位模式（同 lp_stack/ns_push）：表不截断、top 游标定位——
+    // 直接 table_push 会让旧值残留错位（第二次 push 后栈顶索引指到残留值）。
+    if g_clo_ret_top < len(g_clo_ret_stack) {
+        g_clo_ret_stack[g_clo_ret_top] = cl_ret[ci]
+    } else {
+        table_push(g_clo_ret_stack, cl_ret[ci])
+    }
     g_clo_ret_top = g_clo_ret_top + 1
     // 进入闭包体上下文（S_N_VAR 捕获登记 / check_var_decl 局部登记）
     g_clo_cur = ci

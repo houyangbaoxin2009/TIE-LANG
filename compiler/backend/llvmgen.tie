@@ -218,7 +218,16 @@ func emit_agg_types() {
         line(eout)
         ei2 = ei2 + 1
     }
-    if len(st_vals) > 0 || len(en_vals) > 0 {
+    // fn 函数值类型输出（S2.2）：`%fn.<签名索引> = type { ptr, ptr }`——
+    // 闭包值 = { env 指针, entry 函数指针 }（见 closure-model.md C2）。
+    // fn_ret 是 types 命名空间外的全局签名表（fn 类型低负载 = 签名表行号）。
+    var nfn = len(fn_ret)
+    var fi: i64 = 0
+    while fi < nfn {
+        line("%fn." + to_string(fi) + " = type { ptr, ptr }")
+        fi = fi + 1
+    }
+    if len(st_vals) > 0 || len(en_vals) > 0 || len(fn_ret) > 0 {
         line("")
     }
 }
@@ -598,6 +607,12 @@ func llvm_ty(t: i64) -> string {
     //   struct → 命名结构体 %struct.<名字>（emit_agg_types 输出 type 定义）。
     // 对齐 Rust llvm_ty 的 Tuple/Struct 映射（元组内联、类命名）。
     var agg_k = types.kind(t)
+    if agg_k == K_FN {
+        // S2.2 fn 函数值类型：命名结构体 %fn.<签名索引> = { ptr, ptr }
+        //（字段 0 = 环境指针，字段 1 = 入口函数指针；emit_agg_types 输出定义）。
+        // 签名索引 = t - BASE_FN（types.fn 类型低负载）
+        return "%fn." + to_string(t - BASE_FN)
+    }
     if agg_k == K_TUPLE {
         var tidx = t - BASE_TUPLE
         var toff = tup_offs[tidx]
@@ -1336,6 +1351,15 @@ func gen_inst(inst_id: i64) {
         line(reg + " = ptrtoint ptr @.str." + to_string(slot) + " to i64")
         return
     }
+    if op == 63 {
+        // const_global（S2.2 函数地址）：函数符号地址 → i64 指针整数。
+        // 作为值 id 使用（闭包 entry 字段）；store/参数等需真 ptr 处由
+        // to_ptr 直引 @sym（与 const_str 同模式）。命名空间函数用 $
+        // 分隔（ns_replace），对齐 call_sym_reg 的符号命名。
+        var gid = ir.ins_opnd(inst_id, 0)
+        line(reg + " = ptrtoint ptr @" + ns_replace(intern.lookup(gid)) + " to i64")
+        return
+    }
     if op == 0 || op == 1 || op == 2 || op == 3 || op == 4 {
         // add/sub/mul/div/mod
         var opname = ""
@@ -1731,6 +1755,28 @@ func gen_inst(inst_id: i64) {
         }
         return
     }
+    if op == 70 {
+        // call_indirect（S2.2 函数值调用）：操作数 [0]=entry 函数指针 VALUE,
+        // [1]=返回类型 id IMM, [2]=env VALUE, 然后每参数 [类型 id IMM, 值]。
+        // 统一入口签名 fn(ptr env, A...) -> R（无捕获闭包 env = null）。
+        // 发射 `call [Ty] %entry(ptr %env, args...)`——entry 是 ptr 值（聚合
+        // 字段 load），LLVM 允许以 ptr 值作为被调函数。
+        var entry_ref = opnd_ref(inst_id, 0)
+        var env_ref = opnd_ref(inst_id, 2)
+        var args2 = "ptr " + env_ref
+        var k2: i64 = 3
+        while k2 + 1 < cnt {
+            var pty2 = llvm_ty(ir.ins_opnd(inst_id, k2))
+            args2 = args2 + ", " + pty2 + " " + typed_ref(inst_id, k2 + 1)
+            k2 = k2 + 2
+        }
+        if ir.ins_ty(inst_id) < 0 || ir.ins_ty(inst_id) == TK_VOID {
+            line("call void " + entry_ref + "(" + args2 + ")")
+        } else {
+            line(reg + " = call " + llvm_ty(ir.ins_ty(inst_id)) + " " + entry_ref + "(" + args2 + ")")
+        }
+        return
+    }
     if op == 56 {
         // str_cat（字符串拼接）：操作数 [lhs, rhs] → malloc+memcpy 序列。
         // 对齐 Rust gen_binary_str 的 Add：strlen+strlen → malloc(len1+len2+1)
@@ -1923,6 +1969,7 @@ func str_ptr_ref(v: i64) -> string {
 //   const_str(62)  → "@.str.N"（直接引用常量）
 //   str_cat(56)    → inttoptr 新寄存器（str_cat 结果是 i64 指针整数，
 //                    LLVM 不支持内联 inttoptr 表达式实参，须独立指令）
+//   const_global(63) → "@sym"（S2.2 函数地址直引）
 //   其余（string 变量 load / extern 返回）→ "%N"（本身已是 ptr）
 func to_ptr(v: i64) -> string {
     // 形参优先（参数值 id 无定义指令，value_def 返回 -1 会误判）
@@ -1942,6 +1989,18 @@ func to_ptr(v: i64) -> string {
             var r = "%sc" + to_string(g_str_reg_cnt)
             line(r + " = inttoptr i64 %" + to_string(v) + " to ptr")
             return r
+        }
+        if ir.ins_op(def) == 63 {
+            // const_global（S2.2 函数地址）→ 直引 @sym（ptr 类型）
+            var gsym = intern.lookup(ir.ins_opnd(def, 0))
+            return "@" + ns_replace(gsym)
+        }
+        if ir.ins_op(def) == 60 {
+            // const_i：值 0 → null（ptr 上下文；闭包 env=null 的 make_tuple2
+            // 字段 store 走 to_ptr，须输出 null 而非 %N——%N 是 i64 类型错）
+            if ir.ins_opnd(def, 0) == 0 {
+                return "null"
+            }
         }
     }
     return "%" + to_string(v)

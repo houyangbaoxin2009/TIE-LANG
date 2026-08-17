@@ -1,0 +1,11 @@
+type tie<logic>
+// S2.2 闭包探针 2：高阶函数（fn 类型参数）+ 捕获闭包作实参
+func apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    return f(x)
+}
+
+func main() {
+    var factor: i64 = 3
+    var mul = func(a: i64) -> i64 { return a * factor; };
+    println(apply(mul, 7))
+}

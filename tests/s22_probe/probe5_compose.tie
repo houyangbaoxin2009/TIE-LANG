@@ -1,0 +1,16 @@
+type tie<logic>
+// S2.2 闭包探针 5：闭包链式应用 + 多个捕获变量 + 字符串捕获
+func compose(f: fn(i64) -> i64, g: fn(i64) -> i64, x: i64) -> i64 {
+    return f(g(x))
+}
+
+func main() {
+    var base: i64 = 10
+    var step: i64 = 5
+    var add_base = func(a: i64) -> i64 { return a + base; };
+    var add_step = func(b: i64) -> i64 { return b + step; };
+    println(compose(add_base, add_step, 1))
+    var prefix: string = "val="
+    var show = func(v: i64) -> string { return prefix + to_string(v); };
+    println(show(7))
+}
