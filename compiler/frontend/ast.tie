@@ -155,6 +155,19 @@ const N_TRY: i64 = 133;          // ? 后缀解包（S2.3）：Try[children=[操
                                  //   expr ? —— expr 为 Result/Option：Ok 解包 / Err 提前返回
 const N_PANIC: i64 = 134;        // panic 语句（S2.3）：Panic[children=[消息表达式]]
                                  //   panic("消息") 不可恢复错误（可配置目标行为）
+// S3.3 宏/元编程（三节点，布局约定见 mexpand.tie 头注释）：
+//   MacroDef[name=宏名, val=0, aux=nparams, children=[返回类型, 参数..., 函数体]]
+//     —— 布局与 FnDef 一致但**无泛型槽**（children[0] 即返回类型；形参从 1 起，
+//     函数体在末尾）。宏 = 编译期函数：参数/返回类型必须 code（解析层校验）。
+//   CodeLit[name=-1, val=0=表达式准引用 1=块准引用, children=[子 AST]]
+//     —— `` `(expr) `` 子 AST = 单个表达式节点；`` `{ stmts } `` 子 AST =
+//     StmtList。准引用 = code 字面量（编译期 AST 片段值，C1）。
+//   CodeInterp[name=变量名池 id（`$x` 简单形式）或 -1, children=[表达式或 -1]]
+//     —— `$x` / `$(expr)` 插值：仅准引用内合法；求值时把变量（code/字符串）
+//     的值嵌入准引用 AST（宏参数嵌入 / gensym 标识符插值）。
+const N_MACRO_DEF: i64 = 135;
+const N_CODE_LIT: i64 = 136;
+const N_CODE_INTERP: i64 = 137;
 // 类型段（val=TyKw 索引，name=类型关键字文本池 id）
 //   StructType[name=结构名, children=[类型实参槽]]——`Box<i64>` 引用含 N_TYPE_ARGS
 //   子节点；`Box` 裸引用 children[0] = -1（兼容现有）。

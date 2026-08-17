@@ -8,6 +8,10 @@ type tie<class>
 //
 // # 类型码（对齐 Rust Value 变体顺序）
 //   0=Int 1=Float 2=Bool 3=Trit 4=Char 5=Str 6=Range 7=Table 8=Map 9=Void
+//   S3.3 新增：10=Code（宏/元编程：编译期 AST 片段值）。code 值 = AST 协议
+//   文本（字符串，存 v_svals 槽）——准引用/宏参数/宏返回值的载体（C1），
+//   eval_code 生成的 code（C3）与 thunk 块（C2）同构。code 只存在于编译期
+//   （宏体执行环境），运行期无此值。
 //
 // # 节点布局（节点 id 为平行表下标；只增不减——globals 可能跨 eval 持有旧 id）
 //   v_types : 类型码（判别键）
@@ -53,6 +57,7 @@ const T_RANGE: i64 = 6;
 const T_TABLE: i64 = 7;
 const T_MAP: i64 = 8;
 const T_VOID: i64 = 9;
+const T_CODE: i64 = 10;   // S3.3：code 值（AST 协议文本，v_svals 槽）
 
 // ==================== 值节点池（模块级全局，跨函数共享） ====================
 var v_types: table<i64>;
@@ -170,6 +175,21 @@ pub func new_void() -> i64 {
     return new_node(T_VOID)
 }
 
+// S3.3 code 值：AST 协议文本（准引用/宏参数/宏返回值载体）。
+pub func new_code(proto: string) -> i64 {
+    var n = new_node(T_CODE)
+    v_svals[n] = proto
+    return n
+}
+
+// code 值文本（AST 协议文本；非 code 值返回空串）。
+pub func code_str(id: i64) -> string {
+    if v_types[id] == T_CODE {
+        return v_svals[id]
+    }
+    return ""
+}
+
 // ==================== 值访问 ====================
 
 // 类型码（T_* 常量）。
@@ -206,6 +226,9 @@ pub func type_name(id: i64) -> string {
     }
     if t == T_MAP {
         return "键值表"
+    }
+    if t == T_CODE {
+        return "code"
     }
     return "void"
 }
@@ -444,6 +467,10 @@ pub func to_print_string(id: i64) -> string {
     }
     if t == T_MAP {
         return map_print(id)
+    }
+    if t == T_CODE {
+        // S3.3：code 值打印 = 其 AST 协议文本（编译期调试用）
+        return "<code: " + v_svals[id] + ">"
     }
     return ""
 }

@@ -44,10 +44,12 @@ type tie<class>
 import "./session.tie"   // session → value（树式单路径，避免 value 重复内联）
 import "./../frontend/parser.tie"
 import "./../frontend/sstate.tie"
+import "./../middle/types.tie"   // S3.3：TK_TRIT 等类型关键字常量（树合并后
+// 与 semantic 树共享 types——若本模块自持同名常量会重复定义）
 
 // ==================== 模块级求值上下文 ====================
-// trit 类型关键字索引（TyKw 顺序，types.tie 权威；本模块不 import 中端）
-const TK_TRIT: i64 = 11;
+// trit 类型关键字索引（TyKw 顺序，types.tie 权威；经 ../middle/types.tie
+// import 传递可达，TK_TRIT 常量来自 types）
 // 循环 flow 消费的上下文（while/for 共享 consume_flow；标签判定用）
 var g_loop_label: string = "";          // 当前循环标签（空串 = 无标签）
 var g_consume_outer: i64 = 0;           // 需上抛的 flow（FL_NORMAL；仅字面量可初始化）
@@ -56,6 +58,20 @@ var g_consume_outer_val: i64 = 0;       // 需上抛的 return 值 id（reset �
 var g_ns_segs: table<string>;
 // switch 模式辅助输出槽
 var g_subj_ok: bool = false;
+
+// ==================== S3.3 宏执行环境状态 ====================
+// H2 词法卫生（默认）：宏体准引用内的绑定（var/func 声明名）克隆时改名
+// "__hyg<计数>_<原名>"——每次准引用求值计数递增，展开多次不冲突；调用方
+// 插值嵌入的代码保持原名（不捕获、不被捕获）。
+var g_hyg_counter: i64 = 0;    // 卫生改名计数器
+// H3 显式 gensym：gensym("前缀") → "__tie_gensym<计数>_<前缀>"（唯一标识符，
+// 跨卫生边界共享/导出的名字由用户显式 gen 并插值使用）。
+var g_gensym_n: i64 = 0;       // gensym 计数器
+var g_macro_depth: i64 = 0;    // 宏调用嵌套深度（上限防无限递归）
+var g_clone_old: table<i64>;   // 克隆 id 映射（归档池旧 id）
+var g_clone_new: table<i64>;   // 克隆 id 映射（s_* 池新 id）
+var g_hyg_old: table<i64>;     // 卫生改名映射（旧 name 池 id）
+var g_hyg_new: table<i64>;     // 卫生改名映射（新 name 池 id）
 
 namespace interp {
 
@@ -67,6 +83,14 @@ pub func reset() {
     g_loop_label = ""
     g_consume_outer = 0
     g_consume_outer_val = -1
+    // S3.3：宏执行环境计数清零（卫生/gensym/克隆映射/嵌套深度）
+    g_hyg_counter = 0
+    g_gensym_n = 0
+    g_macro_depth = 0
+    g_clone_old = table_new_i64()
+    g_clone_new = table_new_i64()
+    g_hyg_old = table_new_i64()
+    g_hyg_new = table_new_i64()
 }
 
 // 求值一段代码：顶层定义注册，否则包装为 main 体执行，返回格式化结果或错误。
@@ -250,6 +274,151 @@ pub func eval_call(name: string, arg: string) -> string {
     return ""
 }
 
+// ==================== S3.3 宏展开执行入口 ====================
+
+// 注册宏定义（mexpand 用）：AST 协议文本（根 = 单个声明节点）→ load_ast +
+// 归档 + 顶层注册。成功返回 ""；失败返回错误文本（g_err 同步置位）。
+// 与 eval 的"源码第一趟注册"路径等价，但输入是协议文本（宏定义来自
+// 编译器 AST 池序列化，非源码），跳过 lexer/parser。
+pub func eval_proto(proto: string) -> string {
+    g_err = ""
+    if sstate.load_ast(proto) < 0 {
+        g_err = "内部错误: AST 协议加载失败（宏定义注册）"
+        return g_err
+    }
+    var base = isess.archive_add()
+    // 根 = 协议根（id 0 → 归档 id = base，**不是 a_n-1**：协议节点按 id
+    // 追加，根不一定是最后创建的节点）：声明节点直接注册；StmtList 走
+    // register_top_level
+    var root = base
+    var t = isess.ntag(root)
+    if t == N_MACRO_DEF || t == N_FN_DEF {
+        isess.f_put(isess.nname_str(root), root)
+        if t == N_MACRO_DEF {
+            isess.m_put(isess.nname_str(root))
+        }
+        return ""
+    }
+    if t == N_STMTLIST {
+        if isess.nchild(root) > 0 {
+            var r = register_top_level()
+            if has_str_prefix(r, "已定义") {
+                return ""
+            }
+            return r
+        }
+    }
+    g_err = "宏定义注册失败: 协议根既不是声明节点也不是语句列表"
+    return g_err
+}
+
+// 执行宏函数（mexpand 调用）：name = 宏名，args = 实参 code 文本表
+// （AST 协议文本，调用点实参子树序列化）。执行宏体：形参绑定为 code 值，
+// return 的 code 值文本原样返回。成功返回协议文本（g_err 为空）；失败返回
+// 错误文本（g_err 同步置位）。
+pub func eval_macro(name: string, args: table<string>) -> string {
+    g_err = ""
+    var f = isess.f_get(name)
+    if f < 0 {
+        g_err = "宏 '" + name + "' 未定义"
+        return g_err
+    }
+    if !isess.m_has(name) {
+        g_err = "'" + name + "' 不是宏（未以 macro 声明）"
+        return g_err
+    }
+    // 递归深度限制（宏调用宏 / 展开递归）
+    g_macro_depth = g_macro_depth + 1
+    if g_macro_depth > 64 {
+        g_macro_depth = g_macro_depth - 1
+        g_err = "宏展开嵌套过深（超过 64 层，疑似无限递归）：" + name
+        return g_err
+    }
+    // 参数个数检查（宏参数全部必选、无默认值）
+    var total = isess.naux(f)
+    if len(args) != total {
+        g_macro_depth = g_macro_depth - 1
+        g_err = "宏 '" + name + "' 期望 " + to_string(total) + " 个 code 参数，实际 " + to_string(len(args)) + " 个"
+        return g_err
+    }
+    var saved_ns = isess.ns_save()
+    var saved_base = env_base
+    isess.scope_push()
+    var i: i64 = 0
+    while i < total {
+        var p = isess.nchild_at(f, 1 + i)
+        var pname = isess.nname_str(p)
+        isess.var_declare(pname, ivalue.new_code(args[i]))
+        i = i + 1
+    }
+    env_base = isess.scope_top()
+    var body = isess.nchild_at(f, isess.nchild(f) - 1)
+    exec_block(body)
+    isess.scope_pop()
+    env_base = saved_base
+    isess.ns_restore(saved_ns)
+    g_macro_depth = g_macro_depth - 1
+    if g_err != "" {
+        return g_err
+    }
+    if g_flow == FL_RETURN {
+        var val = g_flow_val
+        g_flow = FL_NORMAL
+        if ivalue.type_of(val) == T_CODE {
+            return ivalue.code_str(val)
+        }
+        g_err = "宏 '" + name + "' 必须返回 code 值（return 了一个 " +
+            ivalue.type_name(val) + "）"
+        return g_err
+    }
+    g_err = "宏 '" + name + "' 未返回 code 值（函数体缺少 return code 语句）"
+    return g_err
+}
+
+// 执行 code 值文本（C2 thunk `.call()` / 编译期执行）：协议文本 → 归档 →
+// 根 StmtList 逐语句执行 / 单表达式求值。返回最后值 id（void → Void 值）。
+// 失败置 g_err 返回 -1。
+func exec_code_proto(proto: string) -> i64 {
+    g_err = ""
+    if sstate.load_ast(proto) < 0 {
+        g_err = "内部错误: AST 协议加载失败（code 执行）"
+        return -1
+    }
+    var base = isess.archive_add()
+    var root = base
+    var last: i64 = -1
+    if isess.ntag(root) == N_STMTLIST {
+        var i: i64 = 0
+        while i < isess.nchild(root) {
+            exec_stmt(isess.nchild_at(root, i))
+            if g_err != "" {
+                return -1
+            }
+            if g_flow != FL_NORMAL {
+                break
+            }
+            if g_lastval >= 0 {
+                last = g_lastval
+            }
+            i = i + 1
+        }
+        if g_flow == FL_RETURN {
+            g_flow = FL_NORMAL
+            return g_flow_val
+        }
+    } else {
+        var v = gen_expr(root)
+        if g_err != "" {
+            return -1
+        }
+        return v
+    }
+    if last >= 0 {
+        return last
+    }
+    return ivalue.new_void()
+}
+
 // ==================== 顶层注册 ====================
 
 // 注册顶层定义（func → funcs；顶层持久变量 → globals；命名空间递归注册）。
@@ -262,6 +431,12 @@ func register_top_level() -> string {
         var t = isess.ntag(s)
         if t == N_FN_DEF {
             isess.f_put(isess.nname_str(s), s)
+            count = count + 1
+        } else if t == N_MACRO_DEF {
+            // S3.3：宏定义注册——宏 = 编译期函数（布局同 FnDef 无泛型槽）：
+            // 进 funcs（可被宏体互调/展开调用）+ 宏名单（调用点宏展开分派）。
+            isess.f_put(isess.nname_str(s), s)
+            isess.m_put(isess.nname_str(s))
             count = count + 1
         } else if t == N_NAMESPACE {
             var prefix = ns_segs_of_node(s)
@@ -1187,6 +1362,20 @@ func gen_expr(id: i64) -> i64 {
     if t == N_CALL {
         return gen_call(id)
     }
+    if t == N_CODE_LIT {
+        // S3.3：准引用求值 → code 值（AST 协议文本）
+        return gen_code_lit(id)
+    }
+    if t == N_CODE_INTERP {
+        // S3.3：插值表达式求值（准引用外的 `$x` = 读取变量 x 的 code/字符串值）
+        var nm = isess.nname_str(id)
+        var v = isess.lookup(nm)
+        if v < 0 {
+            g_err = "变量 '" + nm + "' 未声明"
+            return -1
+        }
+        return v
+    }
     if t == N_INDEX {
         var b = gen_expr(isess.nchild_at(id, 0))
         if g_err != "" {
@@ -1310,6 +1499,535 @@ func eval_inc_dec(op: i64, operand: i64) -> i64 {
     return cur
 }
 
+// ==================== S3.3 准引用求值（code 值构造） ====================
+
+// 准引用求值：N_CODE_LIT（归档池）→ code 值（AST 协议文本，T_CODE）。
+// 流程（H2 词法卫生 + 插值替换都在构造期完成，展开结果即最终代码）：
+//   1. 收集子树绑定名（N_VAR_DECL/N_FN_DEF 的 name，非 $ 前缀）→ 卫生改名
+//      映射（__hyg<计数>_<原名>，计数全局递增——多次展开互不冲突）；
+//   2. 克隆子树到 s_* 池末尾（克隆时按映射改名：宏体绑定的名字连同其
+//      引用一起唯一化；调用方插值代码此时尚未嵌入，保持原名不捕获）；
+//   3. 克隆子树序列化为协议文本 P（根 id = 0 约定）；
+//   4. 逐个 N_CODE_INTERP（克隆后节点）按值分派嵌入：
+//        code 值 → splice_proto（AST 片段拼接进 P）；
+//        字符串值 → 替换为 N_VAR（标识符引用，如 gensym 名作变量用）；
+//   5. 名字插值（$ 前缀 name 字段）：字符串 → 名字；code 值（根 N_VAR）
+//      → 其变量名（插值赋值目标 `$a = ...`）；
+//   6. 返回 code 值（T_CODE，文本 = P）。
+func gen_code_lit(id: i64) -> i64 {
+    var root = isess.nchild_at(id, 0)
+    if root < 0 {
+        g_err = "内部错误: 准引用节点缺少子 AST"
+        return -1
+    }
+    // 清克隆/卫生映射（模块级表复用；每次准引用求值独立命名空间）
+    g_clone_old = table_new_i64()
+    g_clone_new = table_new_i64()
+    g_hyg_old = table_new_i64()
+    g_hyg_new = table_new_i64()
+    var g_interp_nodes: table<i64> = table_new_i64()
+    // 1. 收集绑定名 + 生成卫生映射
+    collect_bindings(root)
+    // 2. 克隆子树（含卫生改名 + 登记 N_CODE_INTERP 新 id）
+    var new_root = clone_node(root, g_interp_nodes)
+    if new_root < 0 {
+        return -1
+    }
+    // 3. 序列化克隆子树 → 协议文本（根 id = 0）
+    var p = sstate_subtree_protocol(new_root)
+    if g_err != "" {
+        return -1
+    }
+    // 4. 逐个 N_CODE_INTERP 嵌入
+    var k: i64 = 0
+    while k < len(g_interp_nodes) {
+        var inode = g_interp_nodes[k]
+        var iname = s_names[inode]
+        var ivar = ""
+        var ivar_node: i64 = -1
+        if iname >= 0 {
+            ivar = interner.lookup(iname)
+        } else {
+            // $(expr) 复杂形式：先求值表达式（宏体环境）
+            var ex = s_children[s_coff[inode]]
+            var ev = gen_expr(ex)
+            if g_err != "" {
+                return -1
+            }
+            if ivalue.type_of(ev) == T_CODE {
+                p = splice_proto(p, inode, ivalue.code_str(ev))
+                k = k + 1
+                continue
+            }
+            if ivalue.type_of(ev) == T_STR {
+                p = replace_interp_node_with_var(p, inode, ivalue.str_val(ev))
+                k = k + 1
+                continue
+            }
+            g_err = "插值 $(表达式) 必须是 code 或字符串，实际是 " + ivalue.type_name(ev)
+            return -1
+        }
+        var v = isess.lookup(ivar)
+        if v < 0 {
+            g_err = "插值变量 '" + ivar + "' 未声明"
+            return -1
+        }
+        if ivalue.type_of(v) == T_CODE {
+            p = splice_proto(p, inode, ivalue.code_str(v))
+        } else if ivalue.type_of(v) == T_STR {
+            p = replace_interp_node_with_var(p, inode, ivalue.str_val(v))
+        } else {
+            g_err = "插值变量 '" + ivar + "' 必须是 code 或字符串，实际是 " + ivalue.type_name(v)
+            return -1
+        }
+        k = k + 1
+    }
+    // 5. 名字插值（$ 前缀 name 字段 → 值）
+    p = replace_name_interps(p)
+    if g_err != "" {
+        return -1
+    }
+    // 6. code 值
+    return ivalue.new_code(p)
+}
+
+// 收集子树（归档池）绑定名：N_VAR_DECL / N_FN_DEF 的 name（非 $ 前缀、
+// 非空）→ g_hyg_old + 卫生新名 g_hyg_new（__hyg<计数>_<原名>）。
+// 递归遍历（含嵌套块/函数体）。N_PARAM 不收集（宏参数/块内函数参数保留
+// 原名——插值 `$x` 引用宏参数名，改名会破坏插值）。
+func collect_bindings(id: i64) {
+    var t = isess.ntag(id)
+    if t == N_VAR_DECL || t == N_FN_DEF {
+        var nid = isess.nname(id)
+        if nid >= 0 {
+            var nm = interner.lookup(nid)
+            var nml = str_len(nm)
+            if nml > 0 {
+                if str_char(nm, 0) != "$" {
+                    // 已在映射中（同名重复声明）跳过
+                    var dup = false
+                    var i: i64 = 0
+                    while i < len(g_hyg_old) {
+                        if g_hyg_old[i] == nid {
+                            dup = true
+                            break
+                        }
+                        i = i + 1
+                    }
+                    if !dup {
+                        g_hyg_counter = g_hyg_counter + 1
+                        table_push(g_hyg_old, nid)
+                        table_push(g_hyg_new, interner.intern("__hyg" + to_string(g_hyg_counter) + "_" + nm))
+                    }
+                }
+            }
+        }
+    }
+    var k: i64 = 0
+    while k < isess.nchild(id) {
+        var c = isess.nchild_at(id, k)
+        if c >= 0 {
+            collect_bindings(c)
+        }
+        k = k + 1
+    }
+}
+
+// 克隆归档池节点到 s_* 池末尾（递归；含卫生改名与 N_CODE_INTERP 登记）。
+// 返回新节点 id。
+func clone_node(old: i64, interp_out: ref table<i64>) -> i64 {
+    // 已克隆（共享子节点/环防御）：返回既有映射
+    var i: i64 = 0
+    while i < len(g_clone_old) {
+        if g_clone_old[i] == old {
+            return g_clone_new[i]
+        }
+        i = i + 1
+    }
+    var t = isess.ntag(old)
+    var name_id = isess.nname(old)
+    // 卫生改名：name ∈ g_hyg_old → g_hyg_new（宏体绑定名唯一化）
+    var j: i64 = 0
+    while j < len(g_hyg_old) {
+        if g_hyg_old[j] == name_id {
+            name_id = g_hyg_new[j]
+            break
+        }
+        j = j + 1
+    }
+    // 追加到 s_* 池
+    var new_id = len(s_tags)
+    table_push(s_tags, t)
+    table_push(s_names, name_id)
+    table_push(s_vals, isess.nval(old))
+    table_push(s_aux, isess.naux(old))
+    table_push(s_coff, 0)
+    table_push(s_nchild, isess.nchild(old))
+    table_push(s_lines, isess.nline(old))
+    table_push(s_cols, isess.ncol(old))
+    // 登记映射（递归前登记防环）
+    table_push(g_clone_old, old)
+    table_push(g_clone_new, new_id)
+    // 子节点递归克隆（-1 哨兵保持）
+    s_coff[new_id] = len(s_children)
+    var k: i64 = 0
+    while k < isess.nchild(old) {
+        var c = isess.nchild_at(old, k)
+        if c < 0 {
+            table_push(s_children, -1)
+        } else {
+            var nc = clone_node(c, interp_out)
+            table_push(s_children, nc)
+        }
+        k = k + 1
+    }
+    s_n = len(s_tags)
+    // 登记 N_CODE_INTERP（插值嵌入用）
+    if t == N_CODE_INTERP {
+        table_push(interp_out, new_id)
+    }
+    return new_id
+}
+
+// 序列化 s_* 池子树为协议文本（根 id 重映射为 0，其余 BFS 顺序 1..n-1；
+// 行格式与 sstate.load_ast 完全兼容）。pub：mexpand（宏定义注册/实参
+// 序列化）与 gen_code_lit 共用。
+pub func sstate_subtree_protocol(root: i64) -> string {
+    // BFS 收集（map_old/map_new 兼作访问标记）
+    var map_old: table<i64> = table_new_i64()
+    var map_new: table<i64> = table_new_i64()
+    var order: table<i64> = table_new_i64()
+    table_push(order, root)
+    table_push(map_old, root)
+    table_push(map_new, 0)
+    var qi: i64 = 0
+    while qi < len(order) {
+        var cur = order[qi]
+        var k: i64 = 0
+        while k < s_nchild[cur] {
+            var c = s_children[s_coff[cur] + k]
+            if c >= 0 {
+                var seen = false
+                var m: i64 = 0
+                while m < len(map_old) {
+                    if map_old[m] == c {
+                        seen = true
+                        break
+                    }
+                    m = m + 1
+                }
+                if !seen {
+                    table_push(order, c)
+                    table_push(map_old, c)
+                    table_push(map_new, len(order) - 1)
+                }
+            }
+            k = k + 1
+        }
+        qi = qi + 1
+    }
+    // 输出协议文本（行格式与 sstate.load_ast 兼容）
+    var out: string = to_string(len(order)) + ":\n"
+    var n: i64 = 0
+    while n < len(order) {
+        var oid = order[n]
+        var line: string = to_string(map_new[n]) + " " + to_string(s_tags[oid]) + " " +
+            to_string(s_names[oid]) + " " + to_string(s_vals[oid]) + " " +
+            to_string(s_aux[oid]) + " " + to_string(s_lines[oid]) + " " +
+            to_string(s_cols[oid]) + " " + to_string(s_nchild[oid])
+        var k: i64 = 0
+        while k < s_nchild[oid] {
+            var c = s_children[s_coff[oid] + k]
+            if c < 0 {
+                line = line + " -1"
+            } else {
+                // 查新 id（线性；子树规模小）
+                var mid: i64 = -1
+                var m: i64 = 0
+                while m < len(map_old) {
+                    if map_old[m] == c {
+                        mid = map_new[m]
+                        break
+                    }
+                    m = m + 1
+                }
+                line = line + " " + to_string(mid)
+            }
+            k = k + 1
+        }
+        out = out + line + "\n"
+        n = n + 1
+    }
+    return out
+}
+
+// 协议文本拼接：把 q（子树协议，根 id=0）嵌入 p（协议，节点 id 连续
+// 0..pn-1）替换 interp_id 节点。q 的新 id = 原 id + pn；p 中所有子节点
+// 引用 == interp_id 的位置替换为 q 根新 id（= pn）；interp_id 行删除。
+// 返回拼接后的协议文本（节点 id 连续）。
+func splice_proto(p: string, interp_id: i64, q: string) -> string {
+    var p_lines = split_proto_lines(p)
+    var q_lines = split_proto_lines(q)
+    if len(p_lines) < 1 || len(q_lines) < 1 {
+        g_err = "内部错误: 协议文本拼接失败（空协议）"
+        return p
+    }
+    var pn = len(p_lines) - 1        // 首行是 "N:"，其余是节点行
+    var qn = len(q_lines) - 1
+    var out: string = to_string(pn - 1 + qn) + ":\n"
+    var i: i64 = 1
+    while i < len(p_lines) {
+        var row = p_lines[i]
+        // 跳过被替换的插值节点行
+        if row_has_id(row, interp_id) {
+            i = i + 1
+            continue
+        }
+        out = out + row_replace_child(row, interp_id, pn) + "\n"
+        i = i + 1
+    }
+    // 追加 q 的节点行（id 重映射 +pn；q 根 id=0 → pn）
+    var j: i64 = 1
+    while j < len(q_lines) {
+        out = out + row_shift_ids(q_lines[j], pn) + "\n"
+        j = j + 1
+    }
+    return out
+}
+
+// 解析协议文本为行表（含首行 "N:"）。
+func split_proto_lines(proto: string) -> table<string> {
+    var rows = table_new_string()
+    var n = str_len(proto)
+    var start: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        if str_char(proto, i) == "\n" {
+            table_push(rows, str.slice(proto, start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n {
+        table_push(rows, str.slice(proto, start, n))
+    }
+    return rows
+}
+
+// 行首 id 是否 == target（节点行首字段）。
+func row_has_id(row: string, target: i64) -> bool {
+    var sp = find_char_str(row, " ")
+    if sp < 0 {
+        return false
+    }
+    var idstr = str.slice(row, 0, sp)
+    return sstate.parse_dec(idstr) == target
+}
+
+// 行内子节点字段（第 9 个字段起，下标 8）引用 == target → 替换为 repl。
+func row_replace_child(row: string, target: i64, repl: i64) -> string {
+    var parts = split_by_space(row)
+    if len(parts) < 9 {
+        return row
+    }
+    var out: string = ""
+    var i: i64 = 0
+    while i < len(parts) {
+        if i > 0 {
+            out = out + " "
+        }
+        if i >= 8 {
+            if sstate.parse_dec(parts[i]) == target {
+                out = out + to_string(repl)
+                i = i + 1
+                continue
+            }
+        }
+        out = out + parts[i]
+        i = i + 1
+    }
+    return out
+}
+
+// 行内 id 字段偏移 +off（追加段重映射）：首字段（节点 id）与第 9 字段起
+// （子节点引用）偏移；name/val/aux/line/col 与 -1 哨兵不变。
+func row_shift_ids(row: string, off: i64) -> string {
+    var parts = split_by_space(row)
+    if len(parts) < 8 {
+        return row
+    }
+    var out: string = ""
+    var i: i64 = 0
+    while i < len(parts) {
+        if i > 0 {
+            out = out + " "
+        }
+        if i == 0 {
+            var v0 = sstate.parse_dec(parts[i])
+            out = out + to_string(v0 + off)
+        } else if i >= 8 {
+            var v = sstate.parse_dec(parts[i])
+            if v < 0 {
+                out = out + "-1"
+            } else {
+                out = out + to_string(v + off)
+            }
+        } else {
+            out = out + parts[i]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 按空格拆行（协议行字段；单空格分隔）。
+func split_by_space(row: string) -> table<string> {
+    var parts = table_new_string()
+    var n = str_len(row)
+    var start: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        if str_char(row, i) == " " {
+            table_push(parts, str.slice(row, start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    table_push(parts, str.slice(row, start, n))
+    return parts
+}
+
+// 查找字符串中首个 ch 的位置（协议行辅助）。
+func find_char_str(s: string, ch: string) -> i64 {
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == ch {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 把协议 P 中的 N_CODE_INTERP 节点行替换为 N_VAR 节点行（标识符引用，
+// 名字 = s；`$x` 的值是 gensym 字符串时的表达式插值语义）。
+func replace_interp_node_with_var(p: string, interp_id: i64, s: string) -> string {
+    var p_lines = split_proto_lines(p)
+    if len(p_lines) < 1 {
+        return p
+    }
+    var pn = len(p_lines) - 1
+    var out: string = to_string(pn) + ":\n"
+    var name_id = interner.intern(s)
+    var i: i64 = 1
+    while i < len(p_lines) {
+        var row = p_lines[i]
+        if row_has_id(row, interp_id) {
+            // 替换为该 N_VAR 节点行（行号/列号沿用插值节点）
+            var parts = split_by_space(row)
+            var l = "0"
+            var c = "0"
+            if len(parts) >= 7 {
+                l = parts[5]
+                c = parts[6]
+            }
+            out = out + to_string(interp_id) + " 6 " + to_string(name_id) +
+                " -1 -1 " + l + " " + c + " 0\n"
+        } else {
+            out = out + row + "\n"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 名字插值：协议 P 中 name 字段（第 3 个字段，下标 2）以 "$" 开头的节点行
+// → 按值分派替换：字符串 → 该字符串；code 值（根 N_VAR）→ 其变量名。
+// 覆盖 N_ASSIGN 目标（`$a = ...`）、N_FN_DEF/N_VAR_DECL 名（`func $nm()`）、
+// N_FIELD_ACCESS 字段（`self.$field`）、N_PARAM 名。失败置 g_err。
+func replace_name_interps(p: string) -> string {
+    var p_lines = split_proto_lines(p)
+    if len(p_lines) < 1 {
+        return p
+    }
+    var out: string = p_lines[0] + "\n"
+    var i: i64 = 1
+    while i < len(p_lines) {
+        var row = p_lines[i]
+        var parts = split_by_space(row)
+        if len(parts) >= 3 {
+            var nid = sstate.parse_dec(parts[2])
+            if nid >= 0 {
+                var nm = interner.lookup(nid)
+                var nml = str_len(nm)
+                if nml > 1 {
+                    if str_char(nm, 0) == "$" {
+                        var vname = str.slice(nm, 1, nml)
+                        var v = isess.lookup(vname)
+                        if v < 0 {
+                            g_err = "插值名变量 '" + vname + "' 未声明"
+                            return p
+                        }
+                        var new_id: i64 = -1
+                        if ivalue.type_of(v) == T_STR {
+                            new_id = interner.intern(ivalue.str_val(v))
+                        } else if ivalue.type_of(v) == T_CODE {
+                            // 赋值目标插值：code 值根必须是 N_VAR → 取其变量名
+                            new_id = code_root_var_name(ivalue.code_str(v))
+                            if new_id < 0 {
+                                return p
+                            }
+                        } else {
+                            g_err = "插值名变量 '" + vname + "' 必须是字符串或 code（实际 " +
+                                ivalue.type_name(v) + "）"
+                            return p
+                        }
+                        parts[2] = to_string(new_id)
+                        row = join_parts(parts)
+                    }
+                }
+            }
+        }
+        out = out + row + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+// code 值（协议文本）的根节点变量名：解析协议 → 根（id 0）必须是 N_VAR
+// → 返回其 name 池 id；否则置 g_err 返回 -1。注意：解析会重建 s_* 池
+//（协议文本已独立，无副作用影响调用方）。
+func code_root_var_name(proto: string) -> i64 {
+    if sstate.load_ast(proto) < 0 {
+        g_err = "内部错误: 插值 code 值解析失败"
+        return -1
+    }
+    if s_n < 1 {
+        g_err = "插值 code 值缺少节点"
+        return -1
+    }
+    if s_tags[0] != N_VAR {
+        g_err = "插值赋值目标必须是变量（code 值根不是变量节点）"
+        return -1
+    }
+    return s_names[0]
+}
+
+// 字段拼接（split_by_space 的逆操作）。
+func join_parts(parts: table<string>) -> string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < len(parts) {
+        if i > 0 {
+            out = out + " "
+        }
+        out = out + parts[i]
+        i = i + 1
+    }
+    return out
+}
+
 // 函数调用（Call 节点）：name=函数名，children=实参...
 func gen_call(id: i64) -> i64 {
     var nm = isess.nname_str(id)
@@ -1360,6 +2078,27 @@ func gen_call(id: i64) -> i64 {
         g_err = "REPL 不支持调用 extern 函数 '" + resolved +
             "'（仅编译路径可用，请用 tie-llvm 编译运行）"
         return -1
+    }
+    // S3.3 宏调用（宏体内调用宏 / 展开调用）：实参必须已是 code 值——
+    // 实参表达式先求值（`$x` 插值 = 读取 x 的 code 值；准引用 = code 值；
+    // 其他表达式 → 报错），再执行宏函数，结果 code 文本还原为值。
+    if isess.m_has(resolved) {
+        var macro_args: table<string> = table_new_string()
+        var ai: i64 = 0
+        while ai < len(args) {
+            if ivalue.type_of(args[ai]) != T_CODE {
+                g_err = "宏 '" + resolved + "' 的实参必须是 code 值（准引用或插值），实际是 " +
+                    ivalue.type_name(args[ai])
+                return -1
+            }
+            table_push(macro_args, ivalue.code_str(args[ai]))
+            ai = ai + 1
+        }
+        var r = eval_macro(resolved, macro_args)
+        if g_err != "" {
+            return -1
+        }
+        return ivalue.new_code(r)
     }
     return call_fn(resolved, args, arg_nodes)
 }
@@ -1417,6 +2156,32 @@ func gen_method_call(id: i64) -> i64 {
     }
     var receiver = isess.nchild_at(id, soff)
     var method = isess.nname_str(id)
+    // S3.3 C2 thunk：code 值 `.call()` —— 编译期执行该代码块（惰性 thunk，
+    // 宏体内用；运行期无 code 值）。接收者先求值，code 值 → exec_code_proto。
+    if method == "call" {
+        var rv = gen_expr(receiver)
+        if g_err != "" {
+            return -1
+        }
+        if ivalue.type_of(rv) == T_CODE {
+            // 实参必须为空（call() 无参；第一版）
+            var ai: i64 = soff + 1
+            while ai < isess.nchild(id) {
+                ai = ai + 1
+            }
+            if isess.nchild(id) != soff + 1 {
+                g_err = "code 值 .call() 不接受参数（第一版）"
+                return -1
+            }
+            var r = exec_code_proto(ivalue.code_str(rv))
+            if g_err != "" {
+                return -1
+            }
+            return r
+        }
+        g_err = ".call() 只能作用于 code 值（实际是 " + ivalue.type_name(rv) + "）"
+        return -1
+    }
     var prefix = ns_prefix_of_receiver(receiver)
     if prefix == "" {
         g_err = "REPL v1 暂不支持 struct 方法调用"
@@ -2197,6 +2962,8 @@ func call_fn(name: string, args: table<i64>, arg_nodes: table<i64>) -> i64 {
 }
 
 // 内置函数名单（对齐 Rust call_fn 的内置分支；T4.1 核心子集）。
+// S3.3 新增：gensym（H3 显式卫生唯一标识符）、eval_code（C3 编译期
+// 代码生成——仅宏体环境可用，运行期语义层拦截）。
 func is_builtin(name: string) -> bool {
     if name == "println" || name == "print" || name == "len" || name == "str_len" ||
         name == "str_char" || name == "char_code" || name == "to_string" ||
@@ -2206,6 +2973,9 @@ func is_builtin(name: string) -> bool {
         name == "table_at" || name == "eval" || name == "eval_call" {
         return true
     }
+    if name == "gensym" || name == "eval_code" {
+        return true
+    }
     return false
 }
 
@@ -2213,6 +2983,40 @@ func is_builtin(name: string) -> bool {
 // 值传递类（str_char/char_code/to_string/parse_float 等）直接转发语言底座
 // 原语（两路径共用同一份 Rust 桥实现，行为一致）。
 func call_builtin(name: string, args: table<i64>) -> i64 {
+    if name == "gensym" {
+        // S3.3 H3 显式卫生：gensym("前缀") → 唯一标识符（intern 池 + 计数器）。
+        // 宏体内生成导出/共享名，经插值（$name / $nm 名字位置）使用。
+        if len(args) != 1 {
+            g_err = "gensym 需要一个字符串前缀参数"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_STR {
+            g_err = "gensym 需要一个字符串前缀参数"
+            return -1
+        }
+        g_gensym_n = g_gensym_n + 1
+        return ivalue.new_str("__tie_gensym" + to_string(g_gensym_n) + "_" +
+            ivalue.str_val(args[0]))
+    }
+    if name == "eval_code" {
+        // S3.3 C3 编译期 eval：eval_code("源码") → code 值（AST 协议文本）。
+        // 编译期代码生成（宏体内用）；源码必须语法合法（解析即校验）。
+        if len(args) != 1 {
+            g_err = "eval_code 需要一个字符串源码参数"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_STR {
+            g_err = "eval_code 需要一个字符串源码参数"
+            return -1
+        }
+        var src = ivalue.str_val(args[0])
+        var proto = parser.parse_src(src)
+        if has_str_prefix(proto, "ERR:") {
+            g_err = "eval_code 源码语法错误: " + proto
+            return -1
+        }
+        return ivalue.new_code(proto)
+    }
     if name == "println" {
         var line = join_print(args)
         println(line)
@@ -2624,3 +3428,4 @@ func is_float_text(s: string) -> bool {
 }
 
 }   // namespace interp
+

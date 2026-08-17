@@ -1,0 +1,32 @@
+type tie<logic>
+// S3.3 语法解析自检（t4 开发用）：宏定义 + 准引用 + 插值 + gensym
+macro double(x: code) -> code {
+    return `( ($x) * 2 )
+}
+
+macro make_getter(field: code) -> code {
+    var nm = gensym("get")
+    // 生成函数定义须用块形式准引用（块内 `func name()` = 函数定义；
+    // 表达式形式里 func 是闭包字面量，不能有名字）。块形式准引用以 } 结尾
+    // 不触发 ASI 补分号，须显式写分号。
+    return `{
+        func $nm() -> i64 {
+            return self.$field
+        }
+    };
+}
+
+macro swap(a: code, b: code) -> code {
+    var tmp = gensym("tmp")
+    return `{
+        var $tmp = $a
+        $a = $b
+        $b = $tmp
+    };
+}
+
+func main() -> i64 {
+    var v = double(3 + 4)
+    println(v)
+    return 0
+}

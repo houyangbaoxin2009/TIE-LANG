@@ -17,10 +17,13 @@ type tie<class>
 // import 树：本文件同时 import parser 树（展开 import 用）与 scheck 链
 // （语义检查）；两树文件无重叠（parser 树 = pst/ast/lexer/putil/pexpr/...，
 // semantic 树 = sstate/stype/sbuiltin/sinfer/scollect/scheck），无环无重复。
+// S3.3：mexpand（宏展开 pass）import interp 树（interp → session/value +
+// parser 树 + sstate）——与上述两树按「解析后路径」去重，无环。
 import "./parser.tie"
 import "./scheck.tie"
 import "./sgen.tie"
 import "./smove.tie"
+import "./mexpand.tie"
 
 // ==================== import 展开状态 ====================
 // 当前文件目录（相对 import 解析基准）
@@ -50,12 +53,16 @@ func path_dir(path: string) -> string {
     return str.slice(path, 0, last + 1)
 }
 
-// 解析 import 路径：相对当前文件目录（处理 "./" 与 "../"）
+// 解析 import 路径：相对当前文件目录（处理 "./" 与 "../"）+ `..` 段归一化
+//（S3.3 修复：mexpand 引入 interp 树后，同一文件可能经不同相对写法到达
+// （"./parser.tie" vs "./../frontend/parser.tie"）——imported_has 按解析后
+// 路径字符串去重，未归一化会重复展开导致全局变量重复定义。归一化后两种
+// 写法得到同一路径，去重可靠。）
 pub func resolve_import_path(path: string) -> string {
+    var full = path
     if sstate.has_prefix_str(path, "./") {
-        return g_cur_dir + str.slice(path, 2, str_len(path))
-    }
-    if sstate.has_prefix_str(path, "../") {
+        full = g_cur_dir + str.slice(path, 2, str_len(path))
+    } else if sstate.has_prefix_str(path, "../") {
         // g_cur_dir 形如 "examples/"：去掉最后一个非空目录段得 "…/"，
         // 再拼去掉 ../ 的剩余路径（../ext/x → ext/x）
         var d = g_cur_dir
@@ -82,9 +89,70 @@ pub func resolve_import_path(path: string) -> string {
         if cut >= 0 {
             parent = str.slice(d, 0, cut)
         }
-        return parent + str.slice(path, 3, str_len(path))
+        full = parent + str.slice(path, 3, str_len(path))
     }
-    return path
+    return normalize_path(full)
+}
+
+// 路径归一化：按 / 分段消解 "." 与 ".."（"a/./b" → "a/b"；"a/../b" → "b"；
+// ".." 越顶（无段可弹）时丢弃——相对仓库根的有效路径）。表无 pop 原语，
+// 用「复用槽位模式」模拟栈：push 时若 nkeep < len(keep) 则原位覆盖（".."
+// 弹出的旧段被新段覆盖），否则 table_push；重建只取 [0, nkeep)。
+// 注意：**不用 str.split**（其返回裸 table，元素类型推断为 text，运行期
+// 表操作崩溃——实测 0xC0000005）；手写码点切分返回 table<string>。
+func normalize_path(p: string) -> string {
+    var segs = table_new_string()
+    var n = str_len(p)
+    var start: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        if str_char(p, i) == "/" {
+            table_push(segs, str.slice(p, start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    table_push(segs, str.slice(p, start, n))
+    var keep: table<string> = table_new_string()
+    var nkeep: i64 = 0
+    var k: i64 = 0
+    while k < len(segs) {
+        var s = segs[k]
+        if str_len(s) == 0 {
+            k = k + 1
+            continue
+        }
+        if s == "." {
+            k = k + 1
+            continue
+        }
+        if s == ".." {
+            if nkeep > 0 {
+                nkeep = nkeep - 1
+            }
+            k = k + 1
+            continue
+        }
+        // 复用槽位：nkeep < len(keep) 说明此前有 ".." 弹出过（旧段残留），
+        // 原位覆盖；否则追加
+        if nkeep < len(keep) {
+            keep[nkeep] = s
+        } else {
+            table_push(keep, s)
+        }
+        nkeep = nkeep + 1
+        k = k + 1
+    }
+    var out: string = ""
+    var j: i64 = 0
+    while j < nkeep {
+        if j > 0 {
+            out = out + "/"
+        }
+        out = out + keep[j]
+        j = j + 1
+    }
+    return out
 }
 
 // 已导入集合线性查找（文件少，线性足够）
@@ -606,6 +674,11 @@ pub func check_ast(base_dir: string) -> string {
         return "ERR:0 0 AST 协议解析失败"
     }
     g_root = s_n - 1
+    // S3.3 宏展开 pass（在 import 展开之前：宏定义与使用限主文件；展开结果
+    // 参与类型检查）。失败返回与后续同格式的 ERR 协议文本。
+    if mexpand.expand_sstate() < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
     // import 展开（主文件顶层进 g_extra_tops，import 文件递归合并）
     var er = expand_imports()
     if er < 0 {

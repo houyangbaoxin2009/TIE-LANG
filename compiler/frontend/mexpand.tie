@@ -1,0 +1,434 @@
+type tie<class>
+// compiler/frontend/mexpand.tie —— S3.3 宏/元编程：编译期宏展开 pass
+// ============================================================
+// 里程碑：S3.3（docs/plans/macro-model.md：M3 函数式宏 + C1+C2+C3 code
+// 三形态 + H2+H3 卫生）。宏展开在语义检查之前完成（展开结果参与类型
+// 检查），位置：semantic.check_ast 在 copy_ast_tables 之后、expand_imports
+// 之前调用本模块（sstate 池上操作，与语义共享同一 AST 表示）。
+//
+// # 展开模型（tie 写宏，编译期执行）
+//   - 宏定义（N_MACRO_DEF）：顶层 `macro name(x: code) -> code { 体 }`。
+//     本 pass 收集宏定义、从顶层移除（不参与语义/IR）、序列化为 AST 协议
+//     文本注册进 interp（eval_proto，宏体由解释器编译期执行）。
+//   - 宏调用（N_CALL，name ∈ 宏表）：实参子树序列化为协议文本（code 值）
+//     → interp.eval_macro 执行宏体 → 返回 code 值（协议文本）→ 追加加载
+//     进 s_* 池 → 替换调用点（表达式位置替换节点；语句位置可展开为多条
+//     语句/函数定义）。
+//   - 递归展开：展开结果可再含宏调用——循环扫描全池直到无展开（轮次上限
+//     64 防无限递归）；宏体内调用宏由 interp 的 gen_call 宏分派处理。
+//   - 卫生：H2 词法卫生在准引用求值（gen_code_lit）时完成（宏体绑定改名
+//     __hygN_）；H3 gensym 由宏体显式调用（__tie_gensymN_ 前缀）。
+//
+// # 限制（第一版）
+//   - 宏定义与使用必须在同一文件（跨文件宏未支持：import 文件的宏定义由
+//     scollect 报错，宏调用按未定义函数报错）；
+//   - 宏调用点实参必须是表达式（调用点 AST 快照 = code 值，不惰性求值）；
+//   - 展开轮次上限 64。
+//
+// # 依赖与 import 树
+//   import "../interp/interp.tie"（interp → session → value + parser 树 +
+//   sstate 树；无环）。本模块由 semantic 树 import（semantic import
+//   "./mexpand.tie"），与语义链共享 s_* 池与 sm_err_* 错误槽。
+
+import "../interp/interp.tie"
+
+// ==================== 宏表 ====================
+var g_macro_keys: table<i64>;   // 宏名池 id（升序语义：线性查找即可）
+var g_macro_nodes: table<i64>;  // 宏定义节点 id（与 keys 平行）
+
+// ==================== s_* 池快照（宏执行隔离） ====================
+// 宏执行（interp.eval_proto / eval_macro / eval_code / .call()）内部会
+// sstate.load_ast **重建** s_* 池（宏定义/宏体是独立协议文本）——mexpand
+// 的工作池（主文件 AST + 已展开追加）会被破坏。方案：每次宏执行前后
+// 保存/恢复池快照（10 张表深拷贝；展开次数少，代价可接受）。
+// 注意：表赋值是句柄共享，快照必须逐元素拷贝；恢复 = 重新绑定全局表。
+var g_pool_tags: table<i64>;
+var g_pool_names: table<i64>;
+var g_pool_vals: table<i64>;
+var g_pool_aux: table<i64>;
+var g_pool_coff: table<i64>;
+var g_pool_nchild: table<i64>;
+var g_pool_children: table<i64>;
+var g_pool_lines: table<i64>;
+var g_pool_cols: table<i64>;
+var g_pool_types: table<i64>;
+
+namespace mexpand {
+
+// 池快照：s_* 池 9 列 + node_types 深拷贝到 g_pool_*。
+func pool_save() {
+    g_pool_tags = copy_i64(s_tags)
+    g_pool_names = copy_i64(s_names)
+    g_pool_vals = copy_i64(s_vals)
+    g_pool_aux = copy_i64(s_aux)
+    g_pool_coff = copy_i64(s_coff)
+    g_pool_nchild = copy_i64(s_nchild)
+    g_pool_children = copy_i64(s_children)
+    g_pool_lines = copy_i64(s_lines)
+    g_pool_cols = copy_i64(s_cols)
+    g_pool_types = copy_i64(node_types)
+}
+
+// 池恢复：重新绑定全局表（宏执行后调用；s_n 由 len 推导）。
+func pool_restore() {
+    s_tags = g_pool_tags
+    s_names = g_pool_names
+    s_vals = g_pool_vals
+    s_aux = g_pool_aux
+    s_coff = g_pool_coff
+    s_nchild = g_pool_nchild
+    s_children = g_pool_children
+    s_lines = g_pool_lines
+    s_cols = g_pool_cols
+    node_types = g_pool_types
+    s_n = len(s_tags)
+}
+
+// i64 表深拷贝。
+func copy_i64(src: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    var i: i64 = 0
+    while i < len(src) {
+        table_push(out, src[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ---------- 宏表操作 ----------
+
+// 宏名查找：命中返回下标，未命中 -1。
+func macro_find(name_id: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_macro_keys) {
+        if g_macro_keys[i] == name_id {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 登记宏（name 池 id + 定义节点 id；重复登记覆盖——后定义优先）。
+func macro_put(name_id: i64, node: i64) {
+    var i = macro_find(name_id)
+    if i >= 0 {
+        g_macro_nodes[i] = node
+        return
+    }
+    table_push(g_macro_keys, name_id)
+    table_push(g_macro_nodes, node)
+}
+
+// ==================== 主入口 ====================
+
+// 宏展开主入口（semantic.check_ast 调用；前置：copy_ast_tables 已完成，
+// s_* 池 = 主文件 AST，g_root = 顶层 StmtList）。返回 0 成功；-1 失败
+//（错误写入 sm_err_line/sm_err_col/sm_err_msg）。
+pub func expand_sstate() -> i64 {
+    interp.reset()
+    g_macro_keys = table_new_i64()
+    g_macro_nodes = table_new_i64()
+    // 1. 收集顶层宏定义并从顶层移除
+    if collect_macros() < 0 {
+        return -1
+    }
+    // 1.5 保存主文件 AST 池快照（宏执行会重建 s_* 池，见 pool_save/restore）
+    pool_save()
+    // 2. 注册宏到 interp（宏体编译期执行环境）
+    if register_macros() < 0 {
+        return -1
+    }
+    // 3. 展开循环（递归展开：结果可再含宏调用）
+    var rounds: i64 = 0
+    var done = false
+    while !done {
+        var expanded = false
+        var i: i64 = 0
+        while i < s_n {
+            if s_tags[i] == N_CALL {
+                var nm_id = s_names[i]
+                if nm_id >= 0 {
+                    if macro_find(nm_id) >= 0 {
+                        var rc = expand_one(i)
+                        if rc < 0 {
+                            return -1
+                        }
+                        expanded = true
+                        break   // 展开后池变化：重扫
+                    }
+                }
+            }
+            i = i + 1
+        }
+        if !expanded {
+            done = true
+        } else {
+            rounds = rounds + 1
+            if rounds > 64 {
+                sm_err_line = s_lines[0]
+                sm_err_col = s_cols[0]
+                sm_err_msg = "宏展开轮次超过 64 次上限（疑似展开结果无限产生宏调用）"
+                return -1
+            }
+        }
+    }
+    return 0
+}
+
+// 收集顶层宏定义（g_root children 中的 N_MACRO_DEF）→ 宏表；同时重建
+// g_root children 剔除宏定义（宏不参与语义/IR）。
+func collect_macros() -> i64 {
+    var kept: table<i64> = table_new_i64()
+    var n = s_nchild[g_root]
+    var i: i64 = 0
+    while i < n {
+        var s = s_children[s_coff[g_root] + i]
+        if s_tags[s] == N_MACRO_DEF {
+            var nm_id = s_names[s]
+            if nm_id < 0 {
+                sm_err_line = s_lines[s]
+                sm_err_col = s_cols[s]
+                sm_err_msg = "宏定义缺少名字"
+                return -1
+            }
+            macro_put(nm_id, s)
+        } else {
+            table_push(kept, s)
+        }
+        i = i + 1
+    }
+    // 重建 g_root children 段（旧段孤儿化；g_root 是主文件顶层 StmtList）
+    s_coff[g_root] = len(s_children)
+    s_nchild[g_root] = len(kept)
+    var k: i64 = 0
+    while k < len(kept) {
+        table_push(s_children, kept[k])
+        k = k + 1
+    }
+    return 0
+}
+
+// 注册全部宏到 interp：每个宏定义子树序列化为协议文本（根 = 宏定义
+// 节点 id 0）→ eval_proto（load_ast + 归档 + 顶层注册）。
+// 每轮注册前恢复池快照（上一轮 eval_proto 已重建 s_* 池）。
+func register_macros() -> i64 {
+    var i: i64 = 0
+    while i < len(g_macro_keys) {
+        pool_restore()
+        var node = g_macro_nodes[i]
+        var proto = interp.sstate_subtree_protocol(node)
+        if g_err != "" {
+            sm_err_line = s_lines[node]
+            sm_err_col = s_cols[node]
+            sm_err_msg = "宏定义序列化失败: " + g_err
+            return -1
+        }
+        var r = interp.eval_proto(proto)
+        if g_err != "" {
+            sm_err_line = s_lines[node]
+            sm_err_col = s_cols[node]
+            sm_err_msg = "宏 '" + interner.lookup(g_macro_keys[i]) + "' 注册失败: " + r
+            return -1
+        }
+        i = i + 1
+    }
+    pool_restore()
+    return 0
+}
+
+// 展开单个宏调用（call_id 是 s_* 池 N_CALL 节点）：
+//   实参序列化 → eval_macro → 结果加载 → 替换调用点。
+// eval_macro 会重建 s_* 池（宏体执行环境），故执行前恢复池快照（池 =
+// 主文件 AST + 已展开追加），执行后再恢复并追加结果。
+func expand_one(call_id: i64) -> i64 {
+    pool_restore()
+    var nm_id = s_names[call_id]
+    var name = interner.lookup(nm_id)
+    // 实参序列化（跳过类型实参槽——宏不支持泛型，槽恒为 -1 或 N_TYPE_ARGS）
+    var soff: i64 = 0
+    if s_nchild[call_id] > 0 {
+        var c0 = s_children[s_coff[call_id]]
+        if c0 < 0 {
+            soff = 1
+        } else if s_tags[c0] == N_TYPE_ARGS || s_tags[c0] == N_TYPE_PARAMS {
+            soff = 1
+        }
+    }
+    var args: table<string> = table_new_string()
+    var k: i64 = soff
+    while k < s_nchild[call_id] {
+        var a = s_children[s_coff[call_id] + k]
+        if a < 0 {
+            sm_err_line = s_lines[call_id]
+            sm_err_col = s_cols[call_id]
+            sm_err_msg = "宏 '" + name + "' 的实参缺失"
+            return -1
+        }
+        var aproto = interp.sstate_subtree_protocol(a)
+        if g_err != "" {
+            sm_err_line = s_lines[call_id]
+            sm_err_col = s_cols[call_id]
+            sm_err_msg = "宏实参序列化失败: " + g_err
+            return -1
+        }
+        table_push(args, aproto)
+        k = k + 1
+    }
+    // 执行宏（编译期；宏体错误在此暴露）
+    var result = interp.eval_macro(name, args)
+    if g_err != "" {
+        sm_err_line = s_lines[call_id]
+        sm_err_col = s_cols[call_id]
+        sm_err_msg = "宏 '" + name + "' 展开失败: " + result
+        return -1
+    }
+    // 宏执行已重建 s_* 池：恢复工作池（主文件 AST + 已展开追加）后追加结果
+    pool_restore()
+    // 结果追加加载进 s_* 池（根 = base）
+    var base = sstate.append_ast(result)
+    if base < 0 {
+        sm_err_line = s_lines[call_id]
+        sm_err_col = s_cols[call_id]
+        sm_err_msg = "宏展开结果加载失败（AST 协议解析错误）"
+        return -1
+    }
+    var new_root = base
+    // 找父节点与子下标（out 表输出：out[0]=父节点 id，out[1]=子下标）
+    var out: table<i64> = table_new_i64()
+    table_push(out, -1)
+    table_push(out, -1)
+    var dbg: string = "DBG expand call_id=" + to_string(call_id) + " s_n=" + to_string(s_n) + " name=" + name +
+        " tag37=" + to_string(s_tags[call_id]) + " nchild_root=" + to_string(s_nchild[g_root]) +
+        " child0_root=" + to_string(s_children[s_coff[g_root]]) + " len_child=" + to_string(len(s_children))
+    var dk: i64 = 0
+    while dk < s_n {
+        var dn = s_nchild[dk]
+        var dj: i64 = 0
+        while dj < dn {
+            if s_children[s_coff[dk] + dj] == call_id {
+                dbg = dbg + " PARENT=" + to_string(dk) + " idx=" + to_string(dj)
+            }
+            dj = dj + 1
+        }
+        dk = dk + 1
+    }
+    file_write("F:\\tie_s33_dbg.txt", dbg)
+    if find_parent(call_id, out) < 0 {
+        sm_err_line = s_lines[call_id]
+        sm_err_col = s_cols[call_id]
+        sm_err_msg = "内部错误: 宏调用节点找不到父节点"
+        return -1
+    }
+    // 替换
+    return splice_call(out[0], out[1], call_id, new_root)
+}
+
+// 找 child_id 的父节点与子下标（全池扫描）。out 表输出：out[0]=父节点 id，
+// out[1]=子下标。返回 0 找到；-1 未找到。
+func find_parent(child_id: i64, out: ref table<i64>) -> i64 {
+    var i: i64 = 0
+    while i < s_n {
+        var n = s_nchild[i]
+        var k: i64 = 0
+        while k < n {
+            if s_children[s_coff[i] + k] == child_id {
+                out[0] = i
+                out[1] = k
+                return 0
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 替换宏调用点：
+//   - 父是 N_EXPR_STMT（语句位置）：结果 StmtList → 父节点替换为多条语句
+//     （在祖父 children 中插入）；结果单节点 → 重建 N_EXPR_STMT。
+//   - 表达式位置：结果必须是表达式（非 StmtList）→ 直接替换子 id。
+// 返回 0 成功；-1 失败（错误置 sm_err_*）。
+func splice_call(parent: i64, pidx: i64, call_id: i64, new_root: i64) -> i64 {
+    var ptag = s_tags[parent]
+    var rtag = s_tags[new_root]
+    if ptag == N_EXPR_STMT {
+        // 语句位置：祖父是 StmtList（或块体 StmtList）
+        var gout: table<i64> = table_new_i64()
+        table_push(gout, -1)
+        table_push(gout, -1)
+        if find_parent(parent, gout) < 0 {
+            sm_err_line = s_lines[call_id]
+            sm_err_col = s_cols[call_id]
+            sm_err_msg = "内部错误: 表达式语句节点找不到父节点"
+            return -1
+        }
+        var grand = gout[0]
+        var gidx = gout[1]
+        if rtag == N_STMTLIST {
+            // 结果多语句：收集结果子语句，替换祖父 children 中 [parent] 位置
+            var stmts: table<i64> = table_new_i64()
+            var k: i64 = 0
+            while k < s_nchild[new_root] {
+                table_push(stmts, s_children[s_coff[new_root] + k])
+                k = k + 1
+            }
+            return replace_range(grand, gidx, stmts)
+        }
+        // 结果单语句/表达式：重建 N_EXPR_STMT 包装（保持语句形态）
+        var line = s_lines[parent]
+        var col = s_cols[parent]
+        var ne = len(s_tags)
+        table_push(s_tags, N_EXPR_STMT)
+        table_push(s_names, -1)
+        table_push(s_vals, -1)
+        table_push(s_aux, -1)
+        table_push(s_coff, len(s_children))
+        table_push(s_nchild, 1)
+        table_push(s_lines, line)
+        table_push(s_cols, col)
+        table_push(node_types, -1)
+        table_push(s_children, new_root)
+        s_n = len(s_tags)
+        var one: table<i64> = table_new_i64()
+        table_push(one, ne)
+        return replace_range(grand, gidx, one)
+    }
+    // 表达式位置：结果必须是表达式（不能是语句块/语句）
+    if rtag == N_STMTLIST || rtag == N_VAR_DECL || rtag == N_FN_DEF || rtag == N_MACRO_DEF {
+        sm_err_line = s_lines[call_id]
+        sm_err_col = s_cols[call_id]
+        sm_err_msg = "宏展开返回语句块，但调用点在表达式位置（宏须返回表达式）"
+        return -1
+    }
+    // 直接替换子 id（含父是 N_EXPR_STMT 之外的一切表达式容器）
+    s_children[s_coff[parent] + pidx] = new_root
+    return 0
+}
+
+// 替换节点 children 段中 [idx] 位置的单个子节点为多个节点（重建段：
+// 旧段孤儿化，新段追加到 s_children 末尾——避免段内移动的 O(n) 拷贝与
+// 越界风险）。s_nchild 同步更新。
+func replace_range(node: i64, idx: i64, new_ids: table<i64>) -> i64 {
+    var old_cnt = s_nchild[node]
+    var old_off = s_coff[node]
+    var new_cnt = old_cnt - 1 + len(new_ids)
+    s_coff[node] = len(s_children)
+    s_nchild[node] = new_cnt
+    var i: i64 = 0
+    while i < old_cnt {
+        if i == idx {
+            var k: i64 = 0
+            while k < len(new_ids) {
+                table_push(s_children, new_ids[k])
+                k = k + 1
+            }
+        } else {
+            table_push(s_children, s_children[old_off + i])
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+}   // namespace mexpand

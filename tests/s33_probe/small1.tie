@@ -1,0 +1,6 @@
+type tie<class>
+// 小测试
+pub func add(a: i64, b: i64) -> i64 {
+    return a + b
+}
+

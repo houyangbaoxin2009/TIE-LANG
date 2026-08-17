@@ -50,6 +50,17 @@ pub func fill_pending() {
     g_defer_err_line = table_new_i64()
     g_defer_err_col = table_new_i64()
     g_defer_err_msg = table_new_i64()
+    // S3.3：清空延迟准引用块登记（块体快照，见 defer_code_*）
+    g_defer_code_nodes = table_new_i64()
+    g_defer_code_pos = table_new_i64()
+    g_defer_code_idx = table_new_i64()
+    g_defer_code_pending = table_new_i64()
+    g_defer_code_pending_lines = table_new_i64()
+    g_defer_code_pending_cols = table_new_i64()
+    g_defer_code_pending_lexemes = table_new_i64()
+    g_defer_code_err_line = table_new_i64()
+    g_defer_code_err_col = table_new_i64()
+    g_defer_code_err_msg = table_new_i64()
     var n = lexer.token_count()
     var i: i64 = 0
     while i < n {
@@ -336,6 +347,110 @@ pub func defer_closure_restore(i: i64) {
     p_err_line = g_defer_err_line[i]
     p_err_col = g_defer_err_col[i]
     p_err_msg = g_defer_err_msg[i]
+}
+
+// ---------- S3.3 延迟准引用块快照（`` `{ stmts } `` 的块体）----------
+// 与 defer_closure_* 同构：parse_primary 解析准引用块字面量时只登记
+// N_CODE_LIT 节点 + 块体起始 token 流快照，配平跳过块体；整份文件解析完后
+// 由 pstmt_flow.parse_deferred_code_blocks 恢复快照、parse_block 解析块体、
+// 回填到 N_CODE_LIT 的 children[0]（块形式子 AST = StmtList）。
+
+// 登记当前 token 流快照 + 待回填节点（节点一一对应快照）
+pub func defer_code_push(node: i64) {
+    table_push(g_defer_code_nodes, node)
+    table_push(g_defer_code_pos, g_pos)
+    table_push(g_defer_code_idx, g_pending_idx)
+    var snap: table<i64> = table_new_i64()
+    var snap_lines: table<i64> = table_new_i64()
+    var snap_cols: table<i64> = table_new_i64()
+    var snap_lexemes: table<i64> = table_new_i64()
+    var i: i64 = 0
+    while i < len(g_pending) {
+        table_push(snap, g_pending[i])
+        table_push(snap_lines, g_pending_lines[i])
+        table_push(snap_cols, g_pending_cols[i])
+        table_push(snap_lexemes, g_pending_lexemes[i])
+        i = i + 1
+    }
+    table_push(g_defer_code_pending, snap)
+    table_push(g_defer_code_pending_lines, snap_lines)
+    table_push(g_defer_code_pending_cols, snap_cols)
+    table_push(g_defer_code_pending_lexemes, snap_lexemes)
+    table_push(g_defer_code_err_line, p_err_line)
+    table_push(g_defer_code_err_col, p_err_col)
+    table_push(g_defer_code_err_msg, p_err_msg)
+}
+
+// 已登记的延迟准引用块个数
+pub func defer_code_count() -> i64 {
+    return len(g_defer_code_nodes)
+}
+
+// 第 i 个待回填节点 id
+pub func defer_code_node_at(i: i64) -> i64 {
+    return g_defer_code_nodes[i]
+}
+
+// 恢复第 i 个准引用块登记时的 token 流快照（游标回到块体起始 '{' 处）
+pub func defer_code_restore(i: i64) {
+    g_pos = g_defer_code_pos[i]
+    g_pending_idx = g_defer_code_idx[i]
+    g_pending = table_new_i64()
+    g_pending_lines = table_new_i64()
+    g_pending_cols = table_new_i64()
+    g_pending_lexemes = table_new_i64()
+    var k: i64 = 0
+    while k < len(g_defer_code_pending[i]) {
+        table_push(g_pending, g_defer_code_pending[i][k])
+        table_push(g_pending_lines, g_defer_code_pending_lines[i][k])
+        table_push(g_pending_cols, g_defer_code_pending_cols[i][k])
+        table_push(g_pending_lexemes, g_defer_code_pending_lexemes[i][k])
+        k = k + 1
+    }
+    p_err_line = g_defer_code_err_line[i]
+    p_err_col = g_defer_code_err_col[i]
+    p_err_msg = g_defer_code_err_msg[i]
+    // S3.3：进入准引用块体解析上下文（块内 `func name()` 按函数定义解析；
+    // 块体解析完成后由 parse_deferred_code_blocks 复位）
+    g_in_quasi_block = 1
+}
+
+// 准引用上下文中的「名字或插值名」：普通标识符 → 池 id；
+// `$name`（S3.3 标识符插值）→ 返回 "$name" 文本的池 id（构造 code 值时
+// 把 `$` 前缀名替换为变量的字符串值——gensym 结果作函数/变量名）。
+// 只在准引用块（`` `{ ... } `` 延迟解析）与宏体内需要；普通代码里出现
+// `$name` 也解析为插值名，语义层对非宏上下文报错。
+pub func expect_ident_quasi() -> i64 {
+    if peek_tag() == lex_ident {
+        var id = interner.intern(peek_lexeme())
+        advance()
+        return id
+    }
+    if peek_tag() == lex_dollar {
+        if peek_n(1) == lex_ident {
+            var nm = "$" + peek_lexeme_n(1)
+            var id = interner.intern(nm)
+            advance()
+            advance()
+            return id
+        }
+    }
+    set_err(peek_line(), peek_col(), errors.syn_expect_ident(describe(peek_tag())))
+    return -1
+}
+
+// 第 n 个后续 token 的 lexeme（n=0 当前，1 下一…；expect_ident_quasi 用）
+pub func peek_lexeme_n(n: i64) -> string {
+    var pn = pending_n()
+    if n < pn {
+        return interner.lookup(g_pending_lexemes[g_pending_idx + n])
+    }
+    var k = g_pos + (n - pn)
+    var total = lexer.token_count()
+    if k >= total {
+        k = total - 1
+    }
+    return lexer.token_lexeme(k)
 }
 
 // ---------- 泛型调用点 '<' 歧义探测（token 层，无副作用，2026-08-14）----------

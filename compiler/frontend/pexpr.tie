@@ -418,6 +418,17 @@ pub func parse_unary() -> i64 {
             } else if putil.peek_tag() == lex_int {
                 field = interner.intern(putil.peek_lexeme())
                 putil.advance()
+            } else if putil.peek_tag() == lex_dollar {
+                // S3.3：准引用内字段名插值 `self.$field`（宏生成字段访问；
+                // 构造 code 值时 `$field` 嵌入为字段名）
+                if putil.peek_n(1) == lex_ident {
+                    field = interner.intern("$" + putil.peek_lexeme_n(1))
+                    putil.advance()
+                    putil.advance()
+                } else {
+                    putil.set_err(putil.peek_line(), putil.peek_col(), "字段访问 '.' 后必须是字段名/方法名/数字下标/插值名，实际是 " + putil.describe(putil.peek_tag()))
+                    return -1
+                }
             } else {
                 putil.set_err(putil.peek_line(), putil.peek_col(), "字段访问 '.' 后必须是字段名/方法名/数字下标，实际是 " + putil.describe(putil.peek_tag()))
                 return -1
@@ -525,6 +536,16 @@ func parse_primary() -> i64 {
     if tag == lex_asm {
         // S1.2 I1：`asm!("template", in(reg) expr, out(reg) expr)` 内联汇编
         return parse_asm_expr(line, col)
+    }
+    // S3.3 准引用字面量：`` `(expr) ``（表达式形式，立即解析）或
+    // `` `{ stmts } ``（块形式，块体延迟解析——与 S2.2 闭包体同机制）。
+    if tag == lex_backtick {
+        return parse_quasi(line, col)
+    }
+    // S3.3 插值表达式：`$x`（宏参数/变量嵌入）或 `$(expr)`（复杂表达式嵌入）。
+    // 仅准引用内合法；普通代码出现由语义层对非宏上下文报错。
+    if tag == lex_dollar {
+        return parse_interp(line, col)
     }
     // S2.2 闭包字面量 `func(x: i64) -> i64 { ... }`：解析函数头（参数/返回
     // 类型）+ 配平跳过函数体 + 延迟快照登记，函数体由 pstmt_flow.
@@ -1085,6 +1106,103 @@ func skip_closure_body() -> bool {
         putil.advance()
     }
     return true
+}
+
+// ---------- S3.3 准引用 / 插值 ----------
+
+// 准引用字面量：`` ` `` 已消费。两形态：
+//   `` `(expr) ``  表达式形式：立即用 parse_expr 解析（内部可含 $ 插值与
+//                  嵌套准引用），产出 N_CODE_LIT(val=0, children=[expr])。
+//   `` `{ stmts } `` 块形式：登记 N_CODE_LIT(val=1) + 块体 token 流快照
+//                  （putil.defer_code_push），配平跳过块体；块体由
+//                  pstmt_flow.parse_deferred_code_blocks 在 parse_program
+//                  末尾恢复快照、parse_block 解析、回填 children[0]（StmtList）。
+// 准引用内容必须是语法合法的表达式/语句块（宏 model §3.4：构造期检查）。
+func parse_quasi(line: i64, col: i64) -> i64 {
+    putil.advance()   // 反引号
+    var tag = putil.peek_tag()
+    if tag == lex_lparen {
+        putil.advance()
+        var expr = parse_expr()
+        if expr < 0 {
+            return -1
+        }
+        if !putil.expect(lex_rparen, "')'") {
+            return -1
+        }
+        var n = ast.new_node(N_CODE_LIT, -1, 0, -1, line, col)
+        var kids: table<i64> = table_new_i64()
+        table_push(kids, expr)
+        ast.set_children(n, kids)
+        return n
+    }
+    if tag == lex_lbrace {
+        var n = ast.new_node(N_CODE_LIT, -1, 1, -1, line, col)
+        var kids: table<i64> = table_new_i64()
+        table_push(kids, -1)   // 块体待回填（parse_deferred_code_blocks 填入）
+        ast.set_children(n, kids)
+        putil.defer_code_push(n)
+        if !skip_quasi_body() {
+            return -1
+        }
+        return n
+    }
+    putil.set_err(line, col, "准引用必须是 `(表达式)` 或 `{语句块}`，实际是 " + putil.describe(tag))
+    return -1
+}
+
+// 配平跳过准引用块体 `{ ... }`（与 skip_closure_body 同款；块体由
+// pstmt_flow.parse_deferred_code_blocks 恢复快照后重新解析）。
+func skip_quasi_body() -> bool {
+    if !putil.expect(lex_lbrace, "'{'") {
+        return false
+    }
+    var depth: i64 = 1
+    while depth > 0 {
+        var tag = putil.peek_tag()
+        if tag == lex_eof {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "准引用块未闭合：期望 '}'")
+            return false
+        }
+        if tag == lex_lbrace {
+            depth = depth + 1
+        } else if tag == lex_rbrace {
+            depth = depth - 1
+        }
+        putil.advance()
+    }
+    return true
+}
+
+// 插值表达式：`$` 已消费。两形态：
+//   `$ident`  简单形式：N_CODE_INTERP(name=变量名池 id)——宏参数（code）
+//             嵌入其 AST；gensym 字符串嵌入为标识符引用。
+//   `$(expr)` 复杂形式：N_CODE_INTERP(children=[表达式])——表达式求值为
+//             code/字符串后嵌入。
+func parse_interp(line: i64, col: i64) -> i64 {
+    putil.advance()   // $
+    if putil.peek_tag() == lex_ident {
+        var nm = interner.intern(putil.peek_lexeme())
+        putil.advance()
+        return ast.new_node(N_CODE_INTERP, nm, -1, -1, line, col)
+    }
+    if putil.peek_tag() == lex_lparen {
+        putil.advance()
+        var expr = parse_expr()
+        if expr < 0 {
+            return -1
+        }
+        if !putil.expect(lex_rparen, "')'") {
+            return -1
+        }
+        var n = ast.new_node(N_CODE_INTERP, -1, -1, -1, line, col)
+        var kids: table<i64> = table_new_i64()
+        table_push(kids, expr)
+        ast.set_children(n, kids)
+        return n
+    }
+    putil.set_err(line, col, "插值必须是 $标识符 或 $(表达式)，实际是 " + putil.describe(putil.peek_tag()))
+    return -1
 }
 
 }

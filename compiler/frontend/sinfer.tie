@@ -312,6 +312,19 @@ pub func infer_expr(id: i64) -> i64 {
         g_typed = g_typed + 1
         return types.named(TK_TRIT)
     }
+    // S3.3 准引用/插值表达式：code 类型（编译期 AST 片段值）。宏体不经过
+    // 语义检查（编译期由 interp 执行）；普通代码里 code 值被 scheck 的
+    // 变量类型检查/参数类型匹配拦截（code 只能在宏中使用）。
+    if tag == 136 {   // N_CODE_LIT（准引用字面量）
+        node_types[id] = types.named(TK_CODE)
+        g_typed = g_typed + 1
+        return types.named(TK_CODE)
+    }
+    if tag == 137 {   // N_CODE_INTERP（插值表达式）
+        node_types[id] = types.named(TK_CODE)
+        g_typed = g_typed + 1
+        return types.named(TK_CODE)
+    }
     // Var
     if tag == S_N_VAR {
         var nm = sstate.name_str(id)

@@ -263,6 +263,10 @@ const S_N_TRY: i64 = 133;           // ? 后缀解包（S2.3，与 ast.tie N_TRY
 const S_N_PANIC: i64 = 134;         // panic 语句（S2.3，与 ast.tie N_PANIC 同号）
 const S_N_FN_LIT: i64 = 132;        // func 字面量（S2.2 闭包，与 ast.tie N_FN_LIT 同号）
 const S_N_FN_TYPE: i64 = 205;       // 函数值类型（S2.2，与 ast.tie N_FN_TYPE 同号）
+// S3.3 宏/元编程（与 ast.tie 同号）：
+const S_N_MACRO_DEF: i64 = 135;     // 宏定义（M3）
+const S_N_CODE_LIT: i64 = 136;      // 准引用字面量（C1）
+const S_N_CODE_INTERP: i64 = 137;   // 插值表达式（$x / $(expr)）
 namespace sstate {
 
 // ==================== 工具：协议解析 ====================

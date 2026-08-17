@@ -62,6 +62,12 @@ const lex_asm: i64 = 84;        // asm 关键字（S1.2：asm! 内联汇编宏�
 const lex_panic: i64 = 85;      // panic 关键字（S2.3：panic("消息") 不可恢复错误）
 const lex_port: i64 = 86;       // port 关键字（S2.4：接口声明 port Drawable { ... }）
 const lex_impl: i64 = 87;       // impl 关键字（S2.4：实现块 impl Drawable for Button { ... }）
+// S3.3 宏/元编程：macro 关键字 + 反引号（准引用）+ $（插值）。
+// 说明：S3.3 与 S2.4 并行开发，tag 编号取 88-90 不冲突；若合并时 S2.4 已占用
+// 88/89，以本文件（后合并者）为准调整（保留 lex_port/lex_impl 不变）。
+const lex_macro: i64 = 88;      // macro 关键字（S3.3：宏定义 macro name(...) -> code { ... }）
+const lex_backtick: i64 = 89;   // ` 反引号（S3.3：准引用 `(expr) / `{ stmts } 构造 code 值）
+const lex_dollar: i64 = 90;     // $ 插值符（S3.3：$x 嵌入 / $name 标识符插值，仅准引用内合法）
 
 namespace lextok {
 
@@ -153,6 +159,10 @@ func is_decl_start(tag: i64) -> bool {
     }
     // S1.2：unsafe fn / repr(C) struct 的 doc 附着
     if tag == lex_unsafe || tag == lex_repr {
+        return true
+    }
+    // S3.3：macro 定义（doc 附着到宏定义声明）
+    if tag == lex_macro {
         return true
     }
     return false
