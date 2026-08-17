@@ -1,3 +1,31 @@
+## [新增] 阶段 2 接口模型（S2.4 port 全链路：显式 impl + 双形态分发 + 隐式 vtable）—— 2026-08-17
+
+S2.4 接口模型（docs/plans/port-model.md，语法 P1 + 分发 D3 + 实现 I1）全链路
+落地，tiec（tie 自写编译器）实现，完全不用 Rust：
+
+- **前端**：`port` 声明语法（N_PORT=135，方法签名集合，self 接收者可省略
+  类型标注）、`impl X for Y` 块（N_IMPL=136）、泛型约束 `<T: Port>`
+  （N_TYPE_PARAM children 挂约束类型节点）；port/impl 体内 ASI 分号吞并
+- **语义**：port 方法集收集（pub + self 首参 + 无函数体校验）、impl 完整性
+  检查（漏方法 = 编译错误「impl 'P for S' 缺少方法 'M'」+ 签名逐项匹配）、
+  泛型约束校验（`render_all<T: Drawable>` 实参化时查 impl，违反报「类型 X
+  未实现 port Y」）；impl 方法以 `<struct 名>::<方法名>` 全名登记（复用
+  namespace 方法机制 + M2.1.8 自动 ref，self 参数类型节点改写为 struct 类型）
+- **类型系统**：port 对象类型段（11<<40，K_PORT）；LLVM 表示 = 单个 ptr
+  （指向堆上打包对象 {data, vtable}）——表/传参/字段/返回天然支持
+- **后端**：vtable 全局常量（`@vt.<port>.<struct> = global {ptr,...}`，
+  方法指针按 port 声明序）；提升代码（unsafe 上下文内，malloc(16) 打包
+  data + vtable 地址）；动态分发 = vtable[方法序号] → call_indirect(70)
+  （entry(data, args...)，复用闭包 C2 机制）；table<Drawable> 异构容器
+  （push/at 走 string 桥存 ptr）
+- **安全边界**：提升（struct → port）必须在 unsafe 块/函数（借用语义归
+  unsafe，port-model.md §4.5）；port → port 拷贝安全；全局 port 变量暂
+  不支持（生命周期自证，第一版拒绝）
+- **验收**：tests/s24_probe/ 探针 3 个——probe1 静态分发（泛型约束 +
+  单态化 render_all$Button/$Text）、probe2 动态分发（提升 + 异构
+  table<Drawable> + vtable 间接调用，输出全对）、probe3 负例（impl 漏
+  方法报错）；自举链 tiec → tiec_v2 编译零错误
+
 ## [新增] 阶段 2 闭包后端全链路（S2.2 函数值/闭包 IR 生成 + 间接调用）—— 2026-08-17
 
 S2.2 闭包前端（5f0762d，N_FN_LIT/N_FN_TYPE + fn 类型系统 + 捕获分析）的

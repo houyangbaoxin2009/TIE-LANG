@@ -379,6 +379,10 @@ pub func parse_generic_type_node(tid: i64) -> i64 {
         var sidx = sstate.bs_find(st_keys, nid)
         var eidx = sstate.bs_find(en_keys, nid)
         var gidx = sstate.gt_find(nm)
+        // S2.4 port 类型引用：st/en/gt 均未命中时查 port 表（port 名 -> 索引）。
+        // port 对象类型（11<<40 | port 索引）可作变量/参数/返回/字段/表元素
+        // 类型标注——LLVM 表示 = ptr（指向堆打包 {data,vtable}）。
+        var pidx = sstate.port_find(nm)
         // 带类型实参槽（N_TYPE_ARGS）
         if sstate.nchild(tid) > 0 {
             var slot = sstate.child(tid, 0)
@@ -418,6 +422,13 @@ pub func parse_generic_type_node(tid: i64) -> i64 {
                     sm_err_msg = "枚举 '" + nm + "' 不接受类型参数（非泛型 enum）"
                     return -1
                 }
+                if pidx >= 0 {
+                    // S2.4：port 不接受类型参数（第一版 port 不支持泛型）
+                    sm_err_line = s_lines[tid]
+                    sm_err_col = s_cols[tid]
+                    sm_err_msg = "port '" + nm + "' 不接受类型参数（第一版 port 不支持泛型）"
+                    return -1
+                }
                 sm_err_line = s_lines[tid]
                 sm_err_col = s_cols[tid]
                 sm_err_msg = "类型 '" + nm + "' 未定义"
@@ -430,6 +441,19 @@ pub func parse_generic_type_node(tid: i64) -> i64 {
         }
         if eidx >= 0 {
             return types.enum_of(en_vals[eidx])
+        }
+        if pidx >= 0 {
+            // S2.4：port 对象类型引用（`var d: Drawable`）
+            if sstate.nchild(tid) > 0 {
+                var pslot = sstate.child(tid, 0)
+                if pslot >= 0 && s_tags[pslot] == S_N_TYPE_ARGS {
+                    sm_err_line = s_lines[tid]
+                    sm_err_col = s_cols[tid]
+                    sm_err_msg = "port '" + nm + "' 不接受类型参数（第一版 port 不支持泛型）"
+                    return -1
+                }
+            }
+            return types.port_of(pidx)
         }
         if gidx >= 0 && gty_is_struct[gidx] == 1 {
             sm_err_line = s_lines[tid]
@@ -454,6 +478,43 @@ pub func parse_generic_type_node(tid: i64) -> i64 {
 
 // ==================== 模板实例化（展开器核心）====================
 
+// S2.4 泛型约束校验（静态分发，port-model.md §2.3）：模板 gti 的第 k 个类型
+// 参数带 port 约束（gtyp_cons 槽），实参 args[k]（K_STRUCT）必须已 impl 该
+// port——违反 = 编译错误「类型 X 未实现 port Y」。TypeVar 实参（嵌套泛型，
+// 如 Box<T> 里 T 未具体化）跳过——外层实例化时递归校验。约束引用的 port
+// 未登记（如 `<T: NotPort>`）同样报错。返回 0 通过 / -1 报错。
+pub func check_generic_constraints(gti: i64, args: table<i64>, line: i64, col: i64) -> i64 {
+    var n = gtyp_nparams[gti]
+    var off = gtyp_conoff[gti]
+    var k: i64 = 0
+    while k < n {
+        var cons = gtyp_cons[off + k]
+        if cons >= 0 {
+            var pname = intern.lookup(cons)
+            var pi = sstate.port_find(pname)
+            if pi < 0 {
+                sm_err_line = line
+                sm_err_col = col
+                sm_err_msg = "泛型约束引用的 port '" + pname + "' 未定义"
+                return -1
+            }
+            var at = args[k]
+            if types.is_typevar(at) {
+                k = k + 1
+                continue  // 嵌套泛型：外层实例化时校验
+            }
+            if !stype.impl_has_ty(pi, at) {
+                sm_err_line = line
+                sm_err_col = col
+                sm_err_msg = "类型 '" + types.type_name(at) + "' 未实现 port '" + pname + "'（泛型约束不满足）"
+                return -1
+            }
+        }
+        k = k + 1
+    }
+    return 0
+}
+
 // 实例化函数模板 → 签名 id。幂等（fn_sig 已命中直接返回）。
 // args：类型实参 id 表（按模板类型参数顺序，调用方已推断/显式确定）。
 pub func instantiate_fn(gti: i64, args: table<i64>, line: i64, col: i64) -> i64 {
@@ -462,6 +523,11 @@ pub func instantiate_fn(gti: i64, args: table<i64>, line: i64, col: i64) -> i64 
     var sig0 = sstate.fn_sig(mangled)
     if sig0 >= 0 {
         return sig0  // 已实例化（幂等）
+    }
+    // S2.4 泛型约束校验（静态分发）：实参化时检查 T 的实参类型 impl 约束 port
+    //（漏 impl 的实参化 = 编译错误）。须在深度防御之前（校验不占递归深度）。
+    if check_generic_constraints(gti, args, line, col) < 0 {
+        return -1
     }
     // 递归深度防御（类型嵌套实例化链）
     g_inst_depth = g_inst_depth + 1
@@ -600,6 +666,10 @@ pub func instantiate_struct(gti: i64, args: table<i64>) -> i64 {
         sm_err_line = 1
         sm_err_col = 1
         sm_err_msg = "泛型 struct '" + full + "' 需要 " + to_string(n_tp) + " 个类型参数，实际 " + to_string(len(args)) + " 个"
+        return -1
+    }
+    // S2.4 泛型约束校验（静态分发）：struct 模板的约束实参化时同样检查
+    if check_generic_constraints(gti, args, 1, 1) < 0 {
         return -1
     }
     g_inst_depth = g_inst_depth + 1

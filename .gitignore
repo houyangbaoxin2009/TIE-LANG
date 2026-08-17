@@ -80,5 +80,8 @@ opencode.json
 /assets/preview/.render/
 # S2.3 错误处理探针编译产物（tests/s23_probe/*.tie 由 tiec 编译生成）
 /tests/s23_probe/*.exe
+# S2.4 接口 port 探针编译产物（tests/s24_probe/*.tie 由 tiec 编译生成）
+/tests/s24_probe/*.exe
+/tests/s24_probe/*.ll
 # 文件系统层损坏的 tiec.exe 备份（无法删除，git 读取即崩溃 0xC0000006，忽略）
 /compiler/tiec.exe.corrupt

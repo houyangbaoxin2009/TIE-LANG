@@ -1,0 +1,63 @@
+type tie<logic>
+// S2.4 探针 2：动态分发——port 对象（data+vtable 打包）+ 异构 table<Drawable>
+//（docs/plans/port-model.md §3.2/§4.1：I1 编译器隐式生成 vtable）
+// 验收点：
+//   1. 提升：unsafe { var d: Drawable = button }——struct → port 对象
+//      （借用语义归 unsafe，§4.5；编译器生成打包代码 data+vtable）
+//   2. 异构容器：table<Drawable> = [d, d2]（Button + Text 混排）
+//   3. 动态分发：d.draw(ctx) / list[0].draw(ctx) —— vtable 间接调用
+//      （call_indirect(70)：entry = vtable[方法序号]，env = data）
+//   4. 全局静态 vtable 常量：@vt.Drawable.Button / @vt.Drawable.Text
+
+port Drawable {
+    pub func draw(self, ctx: i64) -> string
+    pub func bounds(self) -> i64
+}
+
+struct Button {
+    var label: string
+    var w: i64
+    var h: i64
+}
+
+impl Drawable for Button {
+    pub func draw(self, ctx: i64) -> string {
+        return "Button(" + self.label + ")"
+    }
+    pub func bounds(self) -> i64 {
+        return self.w * self.h
+    }
+}
+
+struct Text {
+    var msg: string
+}
+
+impl Drawable for Text {
+    pub func draw(self, ctx: i64) -> string {
+        return "Text(" + self.msg + ")"
+    }
+    pub func bounds(self) -> i64 {
+        return 100
+    }
+}
+
+func main() {
+    var b: Button = Button("ok", 10, 20)
+    var t: Text = Text("hi")
+    // 提升（借用语义归 unsafe：接口对象借用具体对象，生命周期责任在程序员）
+    unsafe {
+        var d: Drawable = b
+        var d2: Drawable = t
+        // 异构容器：port 对象 = ptr（指向堆打包 {data, vtable}），表存指针
+        var list: table<Drawable> = [d, d2]
+        // 动态分发：vtable 间接调用
+        println(d.draw(0))
+        println(d2.draw(0))
+        println("bounds=" + to_string(d.bounds()))
+        // 异构表内取回再调用（表达式接收者）
+        println(list[0].draw(0))
+        println(list[1].draw(0))
+        println("list[0].bounds=" + to_string(list[0].bounds()))
+    }
+}

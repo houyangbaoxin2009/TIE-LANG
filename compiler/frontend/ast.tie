@@ -155,6 +155,16 @@ const N_TRY: i64 = 133;          // ? 后缀解包（S2.3）：Try[children=[操
                                  //   expr ? —— expr 为 Result/Option：Ok 解包 / Err 提前返回
 const N_PANIC: i64 = 134;        // panic 语句（S2.3）：Panic[children=[消息表达式]]
                                  //   panic("消息") 不可恢复错误（可配置目标行为）
+// S2.4 port 接口模型（docs/plans/port-model.md）：
+//   Port[name=port 名, children=[泛型槽(-1), 方法 FnDef...]]——port 声明 =
+//   方法签名集合（方法无函数体 = 签名声明；体 = -1 占位。默认实现暂不支持，
+//   有体报错，见 S2.4 语义层）。泛型槽恒 -1（第一版 port 不支持泛型）。
+const N_PORT: i64 = 135;
+//   Impl[children=[port 类型节点(N_STRUCT_TYPE), struct 类型节点, 方法 FnDef...]]
+//   ——impl 块 = 把命名空间函数注册为 port 方法（`impl Drawable for Button`）。
+//   方法必须有函数体；语义层以 <struct 名>::<方法名> 全名登记（复用现有
+//   namespace 方法机制与 M2.1.8 自动 ref），vtable 隐式生成（I1）。
+const N_IMPL: i64 = 136;
 // 类型段（val=TyKw 索引，name=类型关键字文本池 id）
 //   StructType[name=结构名, children=[类型实参槽]]——`Box<i64>` 引用含 N_TYPE_ARGS
 //   子节点；`Box` 裸引用 children[0] = -1（兼容现有）。

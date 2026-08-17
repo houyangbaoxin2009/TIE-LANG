@@ -57,6 +57,14 @@ var g_global_strs: table<i64>;    // 顶层字符串 const 初始值（字符串
 // 阶段 A：用户函数调用（call 35）的符号名池 id（去重，与 ext_syms 平行收集；
 // 命名空间函数全名经 ns_symbol 转 $，无需 declare）
 var call_syms: table<i64>;
+// S2.4：vtable 全局常量登记（每个 impl 一个：方法函数指针按 port 方法声明序）。
+// 符号名 = "vt.<port名>.<struct名>"；类型 = 内联聚合文本 "{ ptr, ... }"
+//（函数指针数组）；方法符号 = 实现函数全名（LLVM 符号经 ns_replace 转 $）。
+var g_vt_names: table<i64>;   // vtable 符号名池 id（登记序）
+var g_vt_tys: table<i64>;     // vtable 聚合类型文本池 id（"{ ptr, ptr }" 等）
+var g_vt_n: table<i64>;       // 字段数（= port 方法数）
+var g_vt_off: table<i64>;     // 方法符号段偏移（g_vt_syms 扁平段）
+var g_vt_syms: table<i64>;    // 方法函数全名池 id（扁平段）
 // 阶段 A：str_cat 内联序列的临时寄存器计数（与 printf sext 同款独立命名空间，
 // 避免与 %N 值编号冲突）
 var g_str_reg_cnt: i64 = 0;
@@ -293,6 +301,69 @@ pub func call_sym_reg(sid: i64) {
     }
     if !dup {
         table_push(call_syms, sid)
+    }
+}
+
+// S2.4 vtable 登记：vt_name = "vt.<port名>.<struct名>"；mnames = 方法实现函数
+// 全名表（按 port 方法声明序，如 ["Button::draw", "Button::bounds"]）。
+// 类型文本 = 内联聚合 "{ ptr, ... }"（字段数 = 方法数）。幂等（同名跳过）。
+// irgen.gen_ast 阶段对每个 impl 记录调用一次；emit_vtables 统一输出。
+pub func vtable_reg(vt_name: string, mnames: table<string>) {
+    var i: i64 = 0
+    while i < len(g_vt_names) {
+        if interner.lookup(g_vt_names[i]) == vt_name {
+            return  // 已登记（幂等）
+        }
+        i = i + 1
+    }
+    table_push(g_vt_names, interner.intern(vt_name))
+    // 聚合类型文本：{ ptr, ptr, ... }（n 个 ptr）
+    var ty: string = "{"
+    var j: i64 = 0
+    while j < len(mnames) {
+        if j > 0 {
+            ty = ty + ", "
+        }
+        ty = ty + "ptr"
+        j = j + 1
+    }
+    ty = ty + " }"
+    table_push(g_vt_tys, interner.intern(ty))
+    table_push(g_vt_n, len(mnames))
+    table_push(g_vt_off, len(g_vt_syms))
+    var k: i64 = 0
+    while k < len(mnames) {
+        table_push(g_vt_syms, interner.intern(mnames[k]))
+        k = k + 1
+    }
+}
+
+// 输出 vtable 全局常量段（emit_globals 之后）：方法函数指针按 port 方法序。
+// LLVM：`@vt.Drawable.Button = global { ptr, ptr } { ptr @Button$draw, ... }`
+//（函数前向引用合法；方法函数同模块 define，无需 declare）
+func emit_vtables() {
+    var i: i64 = 0
+    while i < len(g_vt_names) {
+        var nm = interner.lookup(g_vt_names[i])
+        var ty = interner.lookup(g_vt_tys[i])
+        var out = "@" + nm + " = global " + ty + " {"
+        var off = g_vt_off[i]
+        var n = g_vt_n[i]
+        var j: i64 = 0
+        while j < n {
+            if j > 0 {
+                out = out + ","
+            }
+            var sym = interner.lookup(g_vt_syms[off + j])
+            out = out + " ptr @" + ns_replace(sym)
+            j = j + 1
+        }
+        out = out + " }"
+        line(out)
+        i = i + 1
+    }
+    if len(g_vt_names) > 0 {
+        line("")
     }
 }
 
@@ -612,6 +683,12 @@ func llvm_ty(t: i64) -> string {
         //（字段 0 = 环境指针，字段 1 = 入口函数指针；emit_agg_types 输出定义）。
         // 签名索引 = t - BASE_FN（types.fn 类型低负载）
         return "%fn." + to_string(t - BASE_FN)
+    }
+    if agg_k == K_PORT {
+        // S2.4 port 对象类型：LLVM 表示 = 单个 ptr（指向堆上打包对象
+        // {data, vtable}）——表/传参/字段/返回天然支持（探针异构
+        // table<Drawable> 依赖此表示；vtable 本身是全局静态常量）。
+        return "ptr"
     }
     if agg_k == K_TUPLE {
         var tidx = t - BASE_TUPLE
@@ -2097,6 +2174,8 @@ pub func emit() -> string {
     emit_agg_types()
     // 阶段 A：全局变量段（表 → ptr null；标量 → 零值）
     emit_globals()
+    // S2.4：vtable 全局常量段（方法函数指针表，每个 impl 一个）
+    emit_vtables()
     // 各函数
     var nf = ir.func_count()
     var i: i64 = 0

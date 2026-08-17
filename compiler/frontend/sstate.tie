@@ -138,6 +138,12 @@ var gtyp_off: table<i64>;      // 模板索引 -> 类型参数名段偏移（gty
 var gtyp_names: table<i64>;    // 类型参数名 id（intern，扁平段；取自 N_TYPE_PARAM.name）
 var gty_node: table<i64>;      // 模板索引 -> 定义 AST 节点 id（FnDef / Struct）
 var gty_is_struct: table<i64>; // 模板索引 -> 0=函数模板 1=struct 模板
+// S2.4 泛型约束段（port 约束，port-model.md §2.3）：gtyp_conoff[模板索引] ->
+// gtyp_cons 段偏移；段长 = gtyp_nparams（每类型参数 1 槽，-1 = 无约束）。
+// 槽值 = 约束 port 名 id（intern；语义层校验是已登记 port）。
+// 实例化（sgen.instantiate_fn/struct）实参化时校验：实参类型必须 impl 该 port。
+var gtyp_conoff: table<i64>;  // 模板索引 -> 约束段偏移（gtyp_cons）
+var gtyp_cons: table<i64>;    // 约束 port 名 id 扁平段（-1 = 无约束）
 
 // 实例化记录表（gin_*，T3b 单态化展开器 2026-08-14）：
 // 同（模板名, 类型实参组合）只展开一次——mangled 名即去重键。
@@ -191,6 +197,42 @@ var g_clo_ret_top: i64 = 0;     // 返回类型栈逻辑栈顶游标（tie 表�
 
 // 顶层 StmtList 根（parse_program 创建的最后节点 id）
 var g_root: i64 = 0;
+
+// ==================== S2.4 port / impl 状态表（接口模型）====================
+// port 表：pt_keys（port 名 id，升序）→ pt_vals（port 索引）。
+// port 方法签名表（行 = port 索引）：
+//   pm_off[port]  -> pm_names 段偏移（方法名 id，声明顺序 = vtable 字段序）
+//   pm_n[port]    -> 方法个数
+//   pm_npar[port] -> 方法参数个数表段偏移（pm_npars 扁平段，含 self）
+//   pm_paroff[port] -> 参数类型段偏移（pm_ptys 扁平段）
+//   pm_ret[port]  -> 返回类型表段偏移（pm_rets 扁平段）
+// 方法 m 的签名：参数个数 = pm_npars[pm_npar + m]，参数段 =
+// pm_ptys[pm_paroff + m .. +个数]，返回 = pm_rets[pm_ret + m]。
+// 参数 0 恒为 self（接收者，类型 = 实现 struct 的占位——签名匹配时跳过）。
+var pt_keys: table<i64>;      // port 名 id（升序，二分）
+var pt_vals: table<i64>;      // port 索引
+var pm_off: table<i64>;       // port 索引 -> 方法名段偏移（pm_names）
+var pm_n: table<i64>;         // port 索引 -> 方法个数
+var pm_npar: table<i64>;      // port 索引 -> 参数个数表段偏移（pm_npars）
+var pm_paroff: table<i64>;    // port 索引 -> 参数类型段偏移（pm_ptys）
+var pm_ret: table<i64>;       // port 索引 -> 返回类型表段偏移（pm_rets）
+var pm_names: table<i64>;     // 方法名 id 扁平段（声明顺序 = vtable 字段序）
+var pm_npars: table<i64>;     // 每方法参数个数（含 self）扁平段
+var pm_ptys: table<i64>;      // 每方法参数类型扁平段（含 self 槽位，签名匹配跳过）
+var pm_rets: table<i64>;      // 每方法返回类型扁平段
+// impl 表：im_keys（升序键 = intern(port名 + "::" + struct名)）→ im_vals（impl 索引）。
+// impl 记录（行 = impl 索引）：
+//   im_port[impl]  -> port 索引
+//   im_struct[impl] -> struct 索引
+//   im_poff[impl]  -> im_mnames 段偏移（按 port 方法声明顺序的实现函数全名 id）
+//   im_n[impl]     -> 方法个数（= port 方法数，完整性检查后恒等）
+var im_keys: table<i64>;      // impl 键 id（升序，二分）
+var im_vals: table<i64>;      // impl 索引
+var im_port: table<i64>;      // impl 索引 -> port 索引
+var im_struct: table<i64>;    // impl 索引 -> struct 索引
+var im_poff: table<i64>;      // impl 索引 -> 方法实现全名段偏移（im_mnames）
+var im_n: table<i64>;         // impl 索引 -> 方法个数
+var im_mnames: table<i64>;    // 方法实现函数全名 id 扁平段（"Struct::method"）
 
 // ==================== import 展开状态（semantic 主入口驱动）====================
 var g_imported: table<string>;   // 已导入文件路径集合（去重/防环）
@@ -263,6 +305,9 @@ const S_N_TRY: i64 = 133;           // ? 后缀解包（S2.3，与 ast.tie N_TRY
 const S_N_PANIC: i64 = 134;         // panic 语句（S2.3，与 ast.tie N_PANIC 同号）
 const S_N_FN_LIT: i64 = 132;        // func 字面量（S2.2 闭包，与 ast.tie N_FN_LIT 同号）
 const S_N_FN_TYPE: i64 = 205;       // 函数值类型（S2.2，与 ast.tie N_FN_TYPE 同号）
+// S2.4 port 接口模型（与 ast.tie N_PORT/N_IMPL 同号权威）：
+const S_N_PORT: i64 = 135;          // port 声明：Port[name=port 名, children=[泛型槽(-1), 方法 FnDef...]]
+const S_N_IMPL: i64 = 136;          // impl 块：Impl[children=[port 类型, struct 类型, 方法 FnDef...]]
 namespace sstate {
 
 // ==================== 工具：协议解析 ====================
@@ -1050,17 +1095,186 @@ pub func reg_generic(full_name: string, node: i64, is_struct: i64) -> i64 {
     var npar = s_nchild[tp]
     var idx = len(gtyp_nparams)
     var off = len(gtyp_names)
+    // S2.4 泛型约束：每个类型参数 1 槽（约束 port 名 id，-1 = 无约束）。
+    // 约束来源：N_TYPE_PARAM.children[0]（parse_type_params 产出：约束类型
+    // 节点 N_STRUCT_TYPE 的 name 字段，或 -1 哨兵）。合法性（必须是已登记
+    // port）由 sgen.check_generic_constraints 在实例化时校验。
+    var con_off = len(gtyp_cons)
     var i: i64 = 0
     while i < npar {
         var p = child(tp, i)  // N_TYPE_PARAM 节点（name = 类型参数名 id）
         table_push(gtyp_names, s_names[p])
+        var cons: i64 = -1
+        if s_nchild[p] > 0 {
+            var cnode = child(p, 0)
+            if cnode >= 0 {
+                // 约束节点必须是标识符类型引用（N_STRUCT_TYPE，name = port 名）；
+                // 其余类型（table<T> 等）不是合法 port 约束
+                if s_tags[cnode] != S_N_STRUCT_TYPE {
+                    sm_err_line = s_lines[p]
+                    sm_err_col = s_cols[p]
+                    sm_err_msg = "泛型约束必须是 port 类型（如 <T: Drawable>），实际是其他类型表达式"
+                    return -1
+                }
+                cons = s_names[cnode]
+            }
+        }
+        table_push(gtyp_cons, cons)
         i = i + 1
     }
     table_push(gtyp_nparams, npar)
     table_push(gtyp_off, off)
+    table_push(gtyp_conoff, con_off)
     table_push(gty_node, node)
     table_push(gty_is_struct, is_struct)
     sorted_insert(gty_keys, gty_vals, intern.intern(full_name), idx)
+    return idx
+}
+
+// ==================== S2.4 port / impl 登记辅助 ====================
+
+// port 索引查询（port 名 -> 索引；-1 = 未登记）。
+pub func port_find(name: string) -> i64 {
+    var nid = intern.intern(name)
+    var idx = bs_find(pt_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return pt_vals[idx]
+}
+
+// port 登记（重名检查，返回 port 索引或 -1）。
+// 同时登记 types 侧 port 名表（type_name 还原用；追加式与索引顺序一致）。
+pub func reg_port(name: string) -> i64 {
+    if port_find(name) >= 0 {
+        sm_err_msg = "port '" + name + "' 重复定义"
+        return -1
+    }
+    var idx = len(pm_off)
+    table_push(pm_off, len(pm_names))
+    table_push(pm_n, 0)
+    table_push(pm_npar, len(pm_npars))
+    table_push(pm_paroff, len(pm_ptys))
+    table_push(pm_ret, len(pm_rets))
+    sorted_insert(pt_keys, pt_vals, intern.intern(name), idx)
+    types.set_port_name(idx, name)
+    return idx
+}
+
+// port 方法登记（collect_port 用）：方法名 + 参数类型表（含 self 槽）+ 返回类型。
+// 返回方法索引（声明顺序，vtable 字段序）；-1 错误（sm_err_* 已置）。
+pub func reg_port_method(pi: i64, mname: string, ptys: table<i64>, ret: i64) -> i64 {
+    var nid = intern.intern(mname)
+    // 重名检查（port 内方法名唯一）
+    var off = pm_off[pi]
+    var n = pm_n[pi]
+    var k: i64 = 0
+    while k < n {
+        if pm_names[off + k] == nid {
+            sm_err_msg = "port '" + intern.lookup(pt_keys[pi]) + "' 的方法 '" + mname + "' 重复定义"
+            return -1
+        }
+        k = k + 1
+    }
+    var mi = n
+    table_push(pm_names, nid)
+    table_push(pm_npars, len(ptys))
+    var j: i64 = 0
+    while j < len(ptys) {
+        table_push(pm_ptys, ptys[j])
+        j = j + 1
+    }
+    table_push(pm_rets, ret)
+    pm_n[pi] = n + 1
+    return mi
+}
+
+// port 方法索引查询（方法名 -> 声明序号；-1 = 无）
+pub func port_method_idx(pi: i64, mname: string) -> i64 {
+    var nid = intern.intern(mname)
+    var off = pm_off[pi]
+    var n = pm_n[pi]
+    var k: i64 = 0
+    while k < n {
+        if pm_names[off + k] == nid {
+            return k
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// port 方法名（第 mi 个；-1 越界兜底）
+pub func port_method_name(pi: i64, mi: i64) -> string {
+    if mi < 0 || mi >= pm_n[pi] {
+        return ""
+    }
+    return intern.lookup(pm_names[pm_off[pi] + mi])
+}
+
+// port 方法参数个数（含 self）
+pub func port_method_nparams(pi: i64, mi: i64) -> i64 {
+    if mi < 0 || mi >= pm_n[pi] {
+        return -1
+    }
+    return pm_npars[pm_npar[pi] + mi]
+}
+
+// port 方法第 k 个参数类型（k 从 0 = self；越界返回 -1）
+pub func port_method_param(pi: i64, mi: i64, k: i64) -> i64 {
+    var np = port_method_nparams(pi, mi)
+    if k < 0 || k >= np {
+        return -1
+    }
+    return pm_ptys[pm_paroff[pi] + mi * np + k]
+}
+
+// port 方法返回类型
+pub func port_method_ret(pi: i64, mi: i64) -> i64 {
+    if mi < 0 || mi >= pm_n[pi] {
+        return -1
+    }
+    return pm_rets[pm_ret[pi] + mi]
+}
+
+// impl 键（port 名 + struct 名 -> 升序键）
+pub func impl_key(port_name: string, struct_name: string) -> string {
+    return port_name + "::" + struct_name
+}
+
+// impl 记录查询（port 索引 + struct 索引 -> impl 索引；-1 = 未实现）
+pub func impl_find(pi: i64, si: i64) -> i64 {
+    var pname = intern.lookup(pt_keys[pi])
+    var sname = sstate.struct_name_of(si)
+    var nid = intern.intern(impl_key(pname, sname))
+    var idx = bs_find(im_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return im_vals[idx]
+}
+
+// impl 登记（collect_impl 用）：port 索引 + struct 索引 + 方法实现全名表
+// （按 port 方法声明顺序）。返回 impl 索引；-1 错误（sm_err_* 已置）。
+pub func reg_impl(pi: i64, si: i64, mnames: table<i64>) -> i64 {
+    var pname = intern.lookup(pt_keys[pi])
+    var sname = sstate.struct_name_of(si)
+    var key = intern.intern(impl_key(pname, sname))
+    if bs_find(im_keys, key) >= 0 {
+        sm_err_msg = "port '" + pname + "' 对 struct '" + sname + "' 的 impl 重复定义"
+        return -1
+    }
+    var idx = len(im_port)
+    table_push(im_port, pi)
+    table_push(im_struct, si)
+    table_push(im_poff, len(im_mnames))
+    table_push(im_n, len(mnames))
+    var k: i64 = 0
+    while k < len(mnames) {
+        table_push(im_mnames, mnames[k])
+        k = k + 1
+    }
+    sorted_insert(im_keys, im_vals, key, idx)
     return idx
 }
 
