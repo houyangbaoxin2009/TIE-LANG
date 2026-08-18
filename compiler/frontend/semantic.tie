@@ -112,7 +112,6 @@ func normalize_path(p: string) -> string {
 // 解析 import 路径：相对当前文件目录（处理 "./" 与 "../"）；
 // 结果统一经 normalize_path 归一化（去重键一致，见 normalize_path 注释）。
 pub func resolve_import_path(path: string) -> string {
-    var full = path
     if sstate.has_prefix_str(path, "./") {
         return normalize_path(g_cur_dir + str.slice(path, 2, str_len(path)))
     }

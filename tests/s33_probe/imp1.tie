@@ -1,6 +1,6 @@
 type tie<class>
 // import 测试
-import "./../std/string.tie"
+import "./../../std/string.tie"
 
 namespace ns1 {
 func f() -> i64 {

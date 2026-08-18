@@ -158,8 +158,10 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
         tc_err_msg = "未找到 clang，请确认 LLVM 已安装并在 PATH 中"
         return -1
     }
-    // /STACK:16777216（16MB）：自举链编译器（tiec 编译的 driver）处理大文件
-    // （编译 driver 自身）时递归/嵌套调用栈深，默认 1MB 栈会 0xC00000FD 溢出
+    // /STACK:134217728（128MB）：自举链编译器（tiec 编译的 driver）处理大文件
+    // （编译 driver 自身）时递归/嵌套调用栈深，默认 1MB 栈会 0xC00000FD 溢出；
+    // S3.3 整合后 interp 深递归使大树检查深度超过 16MB，提至 128MB（命令行
+    // 工具虚拟内存充裕，无副作用）。
     // -fuse-ld=lld 仅对「vendored LLVM」生效：clang 必须来自 TIE_LLVM_HOME
     // 指定的目录（发布包场景，用户无 MSVC → 用随包 lld-link）。
     var lld_flag = ""
@@ -178,7 +180,7 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
         // 会破坏 interp 桥程序（repl/pkg/interp 测试）的链接。
         lld_flag = " -fuse-ld=link"
     }
-    var cmd = tool + lld_flag + " " + input_opt + " -o " + output_exe + " -Wl,/Brepro -Wl,/STACK:16777216"
+    var cmd = tool + lld_flag + " " + input_opt + " -o " + output_exe + " -Wl,/Brepro -Wl,/STACK:134217728"
     if str_len(target) > 0 {
         cmd = cmd + " --target=" + target
     }

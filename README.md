@@ -53,7 +53,12 @@ tie.pkg，入口声明导出面，包内模块私有）、**MVS 最小版本选�
 （`var d: Drawable = button` 提升 + `table<Drawable>` 异构容器，编译器
 隐式生成 vtable 全局常量 + 间接调用），提升归 unsafe（借用语义），见
 [docs/plans/port-model.md](docs/plans/port-model.md)。
-
+阶段 3 宏/元编程（2026-08-18，S3.3）新增**宏**（编译期 AST→AST 函数）：
+`macro name(x: code) -> code { 体 }` 定义、准引用字面量 `` `(expr) `` /
+`` `{ stmts } ``（code 类型）、插值 `$x` / `$(expr)`、`gensym("前缀")`
+内置（词法卫生），编译期由 interp 执行（函数式宏展开 pass mexpand），
+表达式宏全链路验证（`double(3+4)` → `(3+4)*2` 输出 14），见
+[docs/plans/macro-model.md](docs/plans/macro-model.md)。
 
 我们的目标：全领域通用，Python的体验，Rust的性能与安全。
 

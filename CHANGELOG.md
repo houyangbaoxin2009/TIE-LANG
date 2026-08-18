@@ -1,3 +1,29 @@
+## [已完成] 阶段 3 宏/元编程整合（S3.3 合入 main + 自举链稳定 + 工具链 lld 化）—— 2026-08-18
+
+S3.3 宏分支（feat/s3.3-macro）合入 main，五单元并行整合收官（分支 s2.3-s2.4
+主线已完成，main 现为「含宏」可自举状态）：
+
+- **合入**：merge feat/s3.3-macro（35fb36e）；宏节点 135-137 与 port/impl
+  错开（N_PORT=138/N_IMPL=139）；lex_tokdefs is_decl_start 合并宏/port/impl；
+  semantic 采用 main 循环折叠版 normalize_path + 删 merge 残留 `var full`
+- **自举链修复（鸡生蛋）**：mexpand→interp 深递归使大树编译递归深度超过
+  16MB 栈（0xC00000FD）；两步自举（禁 mexpand 编译 tiec_A → 恢复后 tiec_B
+  → tiec_C）破局后治本——toolchain 链接参数 `/STACK` 提至 128MB
+  （134217728，命令行工具虚拟内存充裕无副作用）+ 设置 TIE_LLVM_HOME=D:\LLVM
+  （22.1.8 项目配套 LLVM，链接走 lld-link 替代 MSVC link.exe）→
+  tiec_F/G/H 稳定自举无 editbin 依赖，PE 栈天然 128MB
+- **验收**：二阶自举 IR 逐字节一致（SHA256 同）；表达式宏 probe0 输出 14
+  （double(3+4)=(3+4)*2）；s21/s22/s23/s24/s32 探针全过（含此前遗留的
+  probe2_hof 段错误、probe5_compose 编译失败——现已修复）；tests/language
+  49 无新增回归（extern_decl/std_fs_path/shift_neg_free 为 stage0 同款
+  基线）；tiec.exe stage0 升级为 128MB 栈 + lld 链接版
+- **测试修正**：s33_probe imp1/imp2/imp5 的 import 路径上溯差一级
+  （`./../` 应为 `./../../`、`../` 应为 `../../`，对齐 imp4 正确写法），
+  修正后全绿
+- **已知问题（遗留）**：import 文件不存在 → tiec 段错误（0xC0000005，既有
+  bug，非本批引入，需 import 打开失败优雅报错）；语句级宏/跨文件宏/过程宏
+  为 S3.3 声明遗留
+
 ## [新增] 阶段 2 字符串模型（S2.1 {ptr,len} 二进制安全 + 迭代器 + StringBuilder）—— 2026-08-17
 
 字符串内部表示升级为 `{ptr,len}`（docs/plans/string-model.md 决策 O2+F1），
