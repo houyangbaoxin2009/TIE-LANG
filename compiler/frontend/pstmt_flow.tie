@@ -61,7 +61,90 @@ pub func parse_stmt() -> i64 {
         // S2.3：`panic(expr)` 不可恢复错误语句
         return parse_panic()
     }
+    if tag == lex_func {
+        // S3.3：准引用块内语句起始位置的 `func name() {...}` 按函数定义
+        // 解析（宏生成函数，见 parse_fn_def_in_block）；普通函数体内 func
+        // 保持闭包字面量语义（走 parse_expr_or_assign → 闭包）。
+        if g_in_quasi_block != 0 {
+            return parse_fn_def_in_block()
+        }
+        return pstmt.parse_expr_or_assign()
+    }
     return pstmt.parse_expr_or_assign()
+}
+
+// S3.3 准引用块内函数定义：`func name(params) -> ret { body }`（宏生成函数）。
+// 与顶层 parse_fn_def 同构的简化版（无 pub/unsafe/泛型/默认值参数）：
+// name/参数名支持 `$` 插值名（expect_ident_quasi——gensym 结果作函数名），
+// 产出 N_FN_DEF（name, val=0, aux=nparams, children=[泛型槽-1, 返回类型,
+// 参数..., 函数体]——与顶层函数定义布局完全一致，展开后走正常语义检查）。
+func parse_fn_def_in_block() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // func
+    var name = putil.expect_ident_quasi()
+    if name < 0 {
+        return -1
+    }
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var params: table<i64> = table_new_i64()
+    if !putil.eat(lex_rparen) {
+        var d = false
+        while !d {
+            var pname = putil.expect_ident_quasi()
+            if pname < 0 {
+                return -1
+            }
+            if !putil.expect(lex_colon, "':'") {
+                return -1
+            }
+            var pty = pexpr_type.parse_type()
+            if pty < 0 {
+                return -1
+            }
+            var p = ast.new_node(N_PARAM, pname, 0, 0, putil.peek_line(), putil.peek_col())
+            var pkids: table<i64> = table_new_i64()
+            table_push(pkids, pty)
+            table_push(pkids, -1)
+            ast.set_children(p, pkids)
+            table_push(params, p)
+            if putil.eat(lex_comma) {
+                // 继续
+            } else {
+                if !putil.expect(lex_rparen, "')'") {
+                    return -1
+                }
+                d = true
+            }
+        }
+    }
+    var ret_ty = -1
+    if putil.eat(lex_arrow) {
+        ret_ty = pexpr_type.parse_type()
+        if ret_ty < 0 {
+            return -1
+        }
+    } else {
+        ret_ty = ast.new_node(N_NAMED_TYPE, interner.intern("void"), 14, -1, line, col)
+    }
+    var body = parse_block()
+    if body < 0 {
+        return -1
+    }
+    var f = ast.new_node(N_FN_DEF, name, 0, len(params), line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, -1)   // 泛型槽（块内函数定义暂不支持泛型）
+    table_push(kids, ret_ty)
+    var i: i64 = 0
+    while i < len(params) {
+        table_push(kids, params[i])
+        i = i + 1
+    }
+    table_push(kids, body)
+    ast.set_children(f, kids)
+    return f
 }
 
 // `panic(expr)`：S2.3 不可恢复错误（消息为 string 表达式；可配置目标行为——
@@ -186,6 +269,35 @@ pub func parse_deferred_closures() -> i64 {
             table_push(kids, ast.child_at(node, k))
             k = k + 1
         }
+        table_push(kids, body)
+        ast.set_children(node, kids)
+        i = i + 1
+    }
+    return 0
+}
+
+// ---------- S3.3 延迟准引用块体回填 ----------
+
+// 回填延迟准引用块体：parse_primary 解析 `` `{ stmts } `` 时只登记
+// N_CODE_LIT 节点 + 块体 token 流快照（pexpr 在 import 树底层无法调用
+// 本模块的语句解析——成环，与 S2.2 闭包同款）。整份文件解析完后由
+// pstmt_top.parse_deferred_all 调用本函数：逐块恢复快照 → parse_block
+// 解析块体 → 回填到 N_CODE_LIT 的 children[0]（块形式子 AST = StmtList）。
+// 嵌套：外层准引用块体内若再有准引用块，parse_block 解析时会再次登记到
+// 延迟表队尾——循环条件用动态 defer_code_count()，外层回填后内层自动继续。
+pub func parse_deferred_code_blocks() -> i64 {
+    var i: i64 = 0
+    while i < putil.defer_code_count() {
+        var node = putil.defer_code_node_at(i)
+        putil.defer_code_restore(i)
+        var body = parse_block()
+        if body < 0 {
+            return -1
+        }
+        // 块体解析完成：退出准引用块上下文（函数定义解析仅块内生效）
+        g_in_quasi_block = 0
+        // 回填块体：N_CODE_LIT 块形式 children = [StmtList]（占位 -1 被替换）
+        var kids: table<i64> = table_new_i64()
         table_push(kids, body)
         ast.set_children(node, kids)
         i = i + 1

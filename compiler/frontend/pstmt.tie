@@ -19,7 +19,9 @@ pub func parse_var_decl(is_const: i64) -> i64 {
     if putil.peek_tag() == lex_lparen {
         return parse_tuple_destructure(line, col, is_const)
     }
-    var name = putil.expect_ident()
+    // S3.3：宏体内 `var $tmp = ...`（准引用块里声明插值名变量）——
+    // expect_ident_quasi 支持 $ 前缀插值名（构造 code 值时替换为 gensym 结果）
+    var name = putil.expect_ident_quasi()
     if name < 0 {
         return -1
     }
@@ -157,6 +159,37 @@ pub func parse_expr_or_assign() -> i64 {
             return a
         }
     }
+    // S3.3 快速路径 2：插值名后紧跟赋值运算符 → Assign（宏体内 `$a = $b`，
+    // 目标名存 "$a" 池 id；构造 code 值时替换为参数 AST 的变量名）
+    if putil.peek_tag() == lex_dollar {
+        if putil.peek_n(1) == lex_ident {
+            var n1 = putil.peek_n(2)
+            if putil.is_assign_op_tag(n1) {
+                var line = putil.peek_line()
+                var col = putil.peek_col()
+                var name = interner.intern("$" + putil.peek_lexeme_n(1))
+                putil.advance()   // $
+                putil.advance()   // 插值名
+                var op = putil.eat_assign_op()
+                if op == -2 {
+                    putil.set_err(putil.peek_line(), putil.peek_col(), "期望赋值运算符")
+                    return -1
+                }
+                var value = pexpr.parse_expr()
+                if value < 0 {
+                    return -1
+                }
+                if !putil.expect(lex_semi, "语句结束符") {
+                    return -1
+                }
+                var a = ast.new_node(N_ASSIGN, name, op, -1, line, col)
+                var kids: table<i64> = table_new_i64()
+                table_push(kids, value)
+                ast.set_children(a, kids)
+                return a
+            }
+        }
+    }
     var line = putil.peek_line()
     var col = putil.peek_col()
     var expr = pexpr.parse_expr()
@@ -166,6 +199,23 @@ pub func parse_expr_or_assign() -> i64 {
     var op = putil.eat_assign_op()
     if op != -2 {
         var tag = ast.tag(expr)
+        if tag == N_CODE_INTERP {
+            // S3.3 兜底：简单插值目标 `$a op= v`（快速路径 2 未命中时的防御）
+            if ast.name(expr) >= 0 {
+                var value = pexpr.parse_expr()
+                if value < 0 {
+                    return -1
+                }
+                if !putil.expect(lex_semi, "语句结束符") {
+                    return -1
+                }
+                var a = ast.new_node(N_ASSIGN, ast.name(expr), op, -1, line, col)
+                var kids: table<i64> = table_new_i64()
+                table_push(kids, value)
+                ast.set_children(a, kids)
+                return a
+            }
+        }
         if tag == N_INDEX {
             // 表下标赋值：t[i] op= v / t[i][j] op= v
             var value = pexpr.parse_expr()

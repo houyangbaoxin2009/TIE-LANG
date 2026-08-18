@@ -17,10 +17,13 @@ type tie<class>
 // import 树：本文件同时 import parser 树（展开 import 用）与 scheck 链
 // （语义检查）；两树文件无重叠（parser 树 = pst/ast/lexer/putil/pexpr/...，
 // semantic 树 = sstate/stype/sbuiltin/sinfer/scollect/scheck），无环无重复。
+// S3.3：mexpand（宏展开 pass）import interp 树（interp → session/value +
+// parser 树 + sstate）——与上述两树按「解析后路径」去重，无环。
 import "./parser.tie"
 import "./scheck.tie"
 import "./sgen.tie"
 import "./smove.tie"
+import "./mexpand.tie"
 
 // ==================== import 展开状态 ====================
 // 当前文件目录（相对 import 解析基准）
@@ -58,6 +61,7 @@ func path_dir(path: string) -> string {
 // 归一化后，多入口（driver 树 + tieir_ser 树）正确去重。
 // 边界：开头 "../"（相对路径上溯到根外）保留不折叠；"./" 前缀不产生
 // 折叠段（"." 段不删）。
+// 整合说明：s33 分支另有分段栈实现（功能等价），取本循环折叠版。
 func normalize_path(p: string) -> string {
     var out = p
     var changed: bool = true
@@ -108,6 +112,7 @@ func normalize_path(p: string) -> string {
 // 解析 import 路径：相对当前文件目录（处理 "./" 与 "../"）；
 // 结果统一经 normalize_path 归一化（去重键一致，见 normalize_path 注释）。
 pub func resolve_import_path(path: string) -> string {
+    var full = path
     if sstate.has_prefix_str(path, "./") {
         return normalize_path(g_cur_dir + str.slice(path, 2, str_len(path)))
     }
@@ -713,6 +718,11 @@ pub func check_ast(base_dir: string) -> string {
         return "ERR:0 0 AST 协议解析失败"
     }
     g_root = s_n - 1
+    // S3.3 宏展开 pass（在 import 展开之前：宏定义与使用限主文件；展开结果
+    // 参与类型检查）。失败返回与后续同格式的 ERR 协议文本。
+    if mexpand.expand_sstate() < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
     // import 展开（主文件顶层进 g_extra_tops，import 文件递归合并）
     var er = expand_imports()
     if er < 0 {

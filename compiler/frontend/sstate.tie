@@ -310,8 +310,13 @@ const S_N_PANIC: i64 = 134;         // panic 语句（S2.3，与 ast.tie N_PANIC
 const S_N_FN_LIT: i64 = 132;        // func 字面量（S2.2 闭包，与 ast.tie N_FN_LIT 同号）
 const S_N_FN_TYPE: i64 = 205;       // 函数值类型（S2.2，与 ast.tie N_FN_TYPE 同号）
 // S2.4 port 接口模型（与 ast.tie N_PORT/N_IMPL 同号权威）：
-const S_N_PORT: i64 = 135;          // port 声明：Port[name=port 名, children=[泛型槽(-1), 方法 FnDef...]]
-const S_N_IMPL: i64 = 136;          // impl 块：Impl[children=[port 类型, struct 类型, 方法 FnDef...]]
+//   编号 138/139：与 S3.3 宏节点（135-137）错开（整合时统一，见 ast.tie）。
+const S_N_PORT: i64 = 138;          // port 声明：Port[name=port 名, children=[泛型槽(-1), 方法 FnDef...]]
+const S_N_IMPL: i64 = 139;          // impl 块：Impl[children=[port 类型, struct 类型, 方法 FnDef...]]
+// S3.3 宏/元编程（与 ast.tie 同号）：
+const S_N_MACRO_DEF: i64 = 135;     // 宏定义（M3）
+const S_N_CODE_LIT: i64 = 136;      // 准引用字面量（C1）
+const S_N_CODE_INTERP: i64 = 137;   // 插值表达式（$x / $(expr)）
 namespace sstate {
 
 // ==================== 工具：协议解析 ====================

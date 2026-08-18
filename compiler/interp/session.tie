@@ -56,6 +56,11 @@ var g_vals: table<i64>;
 var f_keys: table<string>;
 var f_nodes: table<i64>;
 
+// ==================== macros（S3.3 宏注册表：宏名名单） ====================
+// 宏 = 编译期函数（N_MACRO_DEF，布局同 FnDef 但无泛型槽）。宏定义经
+// register_top_level 注册进 funcs（可调用）+ 本表标记（调用点分派宏展开）。
+var m_keys: table<string>;
+
 // ==================== externs（extern 声明名单；调用报明确错误） ====================
 var e_keys: table<string>;
 
@@ -105,6 +110,7 @@ pub func reset() {
     g_vals = table_new_i64()
     f_keys = table_new_string()
     f_nodes = table_new_i64()
+    m_keys = table_new_string()
     e_keys = table_new_string()
     env_keys = table_new_string()
     env_vals = table_new_i64()
@@ -190,6 +196,14 @@ pub func nname_str(id: i64) -> string {
         return ""
     }
     return interner.lookup(nid)
+}
+
+// 节点起始行/列（1 起；S3.3 克隆准引用子树保留 span 用）。
+pub func nline(id: i64) -> i64 {
+    return a_lines[id]
+}
+pub func ncol(id: i64) -> i64 {
+    return a_cols[id]
 }
 
 // 节点辅助整数槽 → 标签文本（For 的 aux=循环标签；-1 无标签 → 空串）。
@@ -278,6 +292,32 @@ pub func f_get(name: string) -> i64 {
         return -1
     }
     return f_nodes[i]
+}
+
+// ==================== macros（S3.3） ====================
+
+// 宏名登记（register_top_level 注册 N_MACRO_DEF 时调用；线性去重）。
+pub func m_put(name: string) {
+    var i: i64 = 0
+    while i < len(m_keys) {
+        if m_keys[i] == name {
+            return
+        }
+        i = i + 1
+    }
+    table_push(m_keys, name)
+}
+
+// 名字是否已注册宏（调用点宏展开分派用）。
+pub func m_has(name: string) -> bool {
+    var i: i64 = 0
+    while i < len(m_keys) {
+        if m_keys[i] == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
 }
 
 // extern 声明登记（解释路径不可调用，仅记录名字）。

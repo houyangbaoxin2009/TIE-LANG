@@ -878,6 +878,15 @@ pub func check_var_decl(s: i64) -> i64 {
             sm_err_msg = "变量 '" + nm + "' 的指针/切片/原子类型 '" + types.type_name(ty) + "' 只能在 unsafe 代码中使用"
             return -1
         }
+        // S3.3：code 类型只能在宏函数体内使用（编译期值，运行期无表示）。
+        // 宏体不经过语义检查（interp 编译期执行），此检查拦截普通函数里的
+        // code 变量/参数（含展开残留的准引用）。
+        if ty == types.named(TK_CODE) {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "code 类型值只能在宏函数体内使用（宏 = 编译期 AST→AST 函数；准引用/插值/宏参数都是编译期构造）"
+            return -1
+        }
         var it: i64 = -1
         if init >= 0 {
             it = sinfer.infer_expr(init)

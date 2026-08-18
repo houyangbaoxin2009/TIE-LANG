@@ -118,8 +118,15 @@ pub func parse_program() -> i64 {
                 return -1
             }
             ast.collect_stmt(stmts, s)
+        } else if tag == lex_macro {
+            // S3.3：宏定义 `macro name(...) -> code { ... }`（编译期函数）
+            var s = parse_macro_def()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
         } else {
-            putil.set_err(putil.peek_line(), putil.peek_col(), "顶层只允许函数定义、import、using、struct、enum、命名空间声明、extern 声明或全局变量，实际是 " + putil.describe(tag))
+            putil.set_err(putil.peek_line(), putil.peek_col(), "顶层只允许函数定义、import、using、struct、enum、命名空间声明、extern 声明、全局变量或宏定义，实际是 " + putil.describe(tag))
             return -1
         }
     }
@@ -128,12 +135,131 @@ pub func parse_program() -> i64 {
     // 函数体 token 流被配平跳过并登记快照；这里在整份文件解析完后统一
     // 恢复快照、parse_block 解析函数体、回填到 N_FN_LIT（见
     // pstmt_flow.parse_deferred_closures）。
-    if pstmt_flow.parse_deferred_closures() < 0 {
+    // S3.3：准引用块 `` `{ stmts } `` 同款延迟——parse_deferred_all 交替
+    // 处理闭包表与准引用块表直到两者都稳定（嵌套/交错均可）。
+    if parse_deferred_all() < 0 {
         return -1
     }
     var root = ast.new_node(N_STMTLIST, -1, -1, -1, line, col)
     ast.set_children(root, stmts)
     return root
+}
+
+// S3.3：交替处理延迟闭包与延迟准引用块（parse_program 末尾调用）。
+// 闭包体里可含准引用块、准引用块里可含闭包——两张延迟表互相登记，
+// 单遍处理会漏：交替扫描直到两表长度都稳定（新增登记在解析过程中追加
+// 到表尾，动态 count 循环处理到队尾；外层再检查另一张表是否有新增）。
+func parse_deferred_all() -> i64 {
+    var done = false
+    while !done {
+        var c1 = putil.defer_closure_count()
+        var c2 = putil.defer_code_count()
+        if pstmt_flow.parse_deferred_closures() < 0 {
+            return -1
+        }
+        if pstmt_flow.parse_deferred_code_blocks() < 0 {
+            return -1
+        }
+        if putil.defer_closure_count() == c1 {
+            if putil.defer_code_count() == c2 {
+                done = true
+            }
+        }
+    }
+    return 0
+}
+
+// S3.3 宏定义：`macro name(p1: code, ...) -> code { 函数体 }`。
+// 布局与 N_FN_DEF 一致但**无泛型槽**：children = [返回类型, 参数..., 函数体]；
+// name = 宏名，aux = 参数个数，val = 0。
+// 参数/返回类型必须是 code（准引用/插值载体）；宏体是普通 tie 语句
+// （编译期由 interp 执行，宏体错误在展开时报"宏执行错误"）。
+func parse_macro_def() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // macro
+    var name = putil.expect_ident()
+    if name < 0 {
+        return -1
+    }
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var params: table<i64> = table_new_i64()
+    if !putil.eat(lex_rparen) {
+        var d = false
+        while !d {
+            var pname = putil.expect_ident()
+            if pname < 0 {
+                return -1
+            }
+            if !putil.expect(lex_colon, "':'") {
+                return -1
+            }
+            var pty = pexpr_type.parse_type()
+            if pty < 0 {
+                return -1
+            }
+            // 宏参数必须显式标注 code 类型（宏 = 编译期 AST → AST 函数）
+            if !is_code_type_node(pty) {
+                putil.set_err(putil.peek_line(), putil.peek_col(), "宏参数 '" + interner.lookup(pname) + "' 必须是 code 类型（宏 = 编译期 AST→AST 函数）")
+                return -1
+            }
+            var p = ast.new_node(N_PARAM, pname, 0, 0, putil.peek_line(), putil.peek_col())
+            var pkids: table<i64> = table_new_i64()
+            table_push(pkids, pty)
+            table_push(pkids, -1)
+            ast.set_children(p, pkids)
+            table_push(params, p)
+            if putil.eat(lex_comma) {
+                // 继续
+            } else {
+                if !putil.expect(lex_rparen, "')'") {
+                    return -1
+                }
+                d = true
+            }
+        }
+    }
+    if !putil.expect(lex_arrow, "'->'") {
+        return -1
+    }
+    var ret_ty = pexpr_type.parse_type()
+    if ret_ty < 0 {
+        return -1
+    }
+    if !is_code_type_node(ret_ty) {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "宏 '" + interner.lookup(name) + "' 的返回类型必须是 code（宏 = 编译期 AST→AST 函数）")
+        return -1
+    }
+    var body = pstmt_flow.parse_block()
+    if body < 0 {
+        return -1
+    }
+    var f = ast.new_node(N_MACRO_DEF, name, 0, len(params), line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, ret_ty)
+    var i: i64 = 0
+    while i < len(params) {
+        table_push(kids, params[i])
+        i = i + 1
+    }
+    table_push(kids, body)
+    ast.set_children(f, kids)
+    return f
+}
+
+// 类型节点是否为 code 类型（N_NAMED_TYPE 且 TyKw 索引 == TK_CODE=15）。
+func is_code_type_node(ty: i64) -> bool {
+    if ty < 0 {
+        return false
+    }
+    if ast.tag(ty) == N_NAMED_TYPE {
+        if ast.val(ty) == 15 {
+            return true
+        }
+    }
+    return false
 }
 
 // ---------- 语句分派 ----------
@@ -603,7 +729,7 @@ func parse_fn_def() -> i64 {
     } else if !putil.expect(lex_func, "'func'") {
         return -1
     }
-    var name = putil.expect_ident()
+    var name = putil.expect_ident_quasi()
     if name < 0 {
         return -1
     }
@@ -621,7 +747,7 @@ func parse_fn_def() -> i64 {
     if !putil.eat(lex_rparen) {
         var d = false
         while !d {
-            var pname = putil.expect_ident()
+            var pname = putil.expect_ident_quasi()
             if pname < 0 {
                 return -1
             }

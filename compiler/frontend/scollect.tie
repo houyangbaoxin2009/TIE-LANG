@@ -1437,6 +1437,13 @@ pub func collect_top() -> i64 {
             sstate.sorted_insert(ext_keys, ext_keys, intern.intern(full), 0)
         } else if tag == S_N_IMPORT {
             // import 展开在 semantic 主入口处理（读文件 + 递归）
+        } else if tag == S_N_MACRO_DEF {
+            // S3.3：跨文件宏未支持——主文件宏定义已在 mexpand 展开 pass 中
+            // 收集并从顶层移除；此处残留说明宏定义来自被导入文件。
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "宏定义 '" + sstate.name_str(s) + "' 只能出现在主文件中（跨文件宏暂不支持，S3.3 第一版限制）"
+            return -1
         } else if tag == S_N_USING {
             // 收集 using 引入的命名空间段（裸调用补全候选）
             var nsegs = s_aux[s]

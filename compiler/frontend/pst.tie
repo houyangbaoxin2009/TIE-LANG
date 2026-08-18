@@ -50,6 +50,30 @@ var g_defer_err_line: table<i64>;    // 快照：语法错误槽行号
 var g_defer_err_col: table<i64>;     // 快照：语法错误槽列号
 var g_defer_err_msg: table<string>;  // 快照：语法错误槽消息
 
+// ---------- 延迟准引用块快照（S3.3）----------
+// 准引用块字面量 `` `{ stmts } `` 是表达式，由 pexpr.parse_primary 解析反引号
+// 头（登记 N_CODE_LIT 节点 + 配平跳过块体 token）；块体是语句块，需要
+// pstmt_flow 的语句解析（同 S2.2 闭包的同款成环约束）。方案与闭包完全同构：
+// 登记「块体起始处完整 token 流快照」到 g_defer_code_* 多槽表，整份文件解析
+// 完后由 pstmt_flow.parse_deferred_code_blocks 逐块恢复快照、parse_block 解析
+// 块体、回填到 N_CODE_LIT 的 children[0]（块形式子 AST = StmtList）。
+// 嵌套/交错：闭包体里可有准引用块、准引用块里可有闭包——parse_program 末尾
+// 用 parse_deferred_all 交替处理两张延迟表直到两者都稳定（见 pstmt_top）。
+var g_defer_code_nodes: table<i64>;  // 待回填的 N_CODE_LIT 节点 id（一一对应快照）
+var g_defer_code_pos: table<i64>;    // 快照：真实 token 流游标 g_pos
+var g_defer_code_idx: table<i64>;    // 快照：pending 队列游标 g_pending_idx
+var g_defer_code_pending: table<table<i64>>;       // 快照：pending 队列 tag
+var g_defer_code_pending_lines: table<table<i64>>; // 快照：行号
+var g_defer_code_pending_cols: table<table<i64>>;  // 快照：列号
+var g_defer_code_pending_lexemes: table<table<i64>>; // 快照：lexeme 池 id
+var g_defer_code_err_line: table<i64>;  // 快照：语法错误槽行号
+var g_defer_code_err_col: table<i64>;   // 快照：语法错误槽列号
+var g_defer_code_err_msg: table<string>;// 快照：语法错误槽消息
+// 当前是否在解析准引用块体（`` `{ ... } `` 延迟回填期间置位）。
+// 用途（S3.3）：准引用块内语句起始位置的 `func name() {...}` 按**函数定义**
+// 解析（宏生成函数）；普通函数体内 `func` 保持闭包字面量语义不变。
+var g_in_quasi_block: i64 = 0;
+
 // ---------- 语法错误槽位（parse 返回 ERR: 协议）----------
 var p_err_line: i64 = 0;
 var p_err_col: i64 = 0;
