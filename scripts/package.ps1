@@ -263,6 +263,21 @@ foreach ($lib in @("std", "ext", "rdu")) {
     }
 }
 
+# skills/tie-dev/：tie 开发技能（SKILL.md，面向「用 tie 写软件」的开发者与 AI 助手；
+# 随发行版分发，用户可复制到自己的 AI 技能目录——如 ~/.dsh/skills/、.opencode/skills/）
+$SkillSrc = Join-Path $Root "skills"
+if (Test-Path $SkillSrc) {
+    $SkillTarget = Join-Path $DistDir "skills"
+    New-Item -ItemType Directory -Path $SkillTarget -Force | Out-Null
+    Get-ChildItem $SkillSrc -Recurse -File | ForEach-Object {
+        $rel = $_.FullName.Substring($SkillSrc.Length).TrimStart("\")
+        $dest = Join-Path $SkillTarget $rel
+        New-Item -ItemType Directory -Path (Split-Path $dest) -Force | Out-Null
+        Copy-Item $_.FullName $dest
+    }
+    Write-Host "  skills/ ✔（tie-dev 技能）" -ForegroundColor DarkGray
+}
+
 # editor/vscode-tie/：VSCode 扩展（净化复制——排除 node_modules/ 与 out/ 构建产物，
 # 源码分发：用户 npm install + npm run compile 或 vsce package 后安装）
 $EditorSrc = Join-Path $Root "editor\vscode-tie"
