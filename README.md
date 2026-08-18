@@ -73,6 +73,7 @@ tie.pkg，入口声明导出面，包内模块私有）、**MVS 最小版本选�
 | [docs/tie-script.md](docs/tie-script.md)                   | tie:script 模块协议：tie 脚本的注册/调用机制、模块约定、协议文本格式、三层调用入口（Rust/CLI/tie 程序内）                               |
 | [docs/ai-guide.md](docs/ai-guide.md)                       | AI 教学指南：语言用法 + 负例 + 编译器架构（教 AI 用/开发 tie）                                                          |
 | [docs/prompt-pack.md](docs/prompt-pack.md)                 | 可粘贴 Prompt 包：自包含简介，直接发给任何 AI                                                                      |
+| [NEW.md](NEW.md)                                           | 发行版新鲜事：本发行版的新功能与特色速览                                                                               |
 | [docs/plans/](docs/plans/)                                 | 后续里程碑设计规划（switch 模式匹配 / 单文件命名空间 / 统一 func 写法 / 动态库编译 / 包管理器 / 算法库分类 / 嵌入式基础层 rdu / **泛型系统（已实现**）） |
 | [CHANGELOG.md](CHANGELOG.md)                               | 版本变更记录（按里程碑）                                                                                      |
 
