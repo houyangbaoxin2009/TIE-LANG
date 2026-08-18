@@ -4681,8 +4681,10 @@ func gen_table_lit(id: i64) -> i64 {
         // table<i64>，若按 elem 选桥会 push_i64(ptr) 类型错（LLVM 拒收）；
         // 且空内层表 `[]` 的 node_types 落 i64 兜底——只要 elem 本身是表，
         // 全部元素一律 push_string（元素全是 ptr）。
-        // S2.4：port 对象元素（table<Drawable>）同样走 push_string——port
-        // 对象 LLVM 表示 = ptr（指向堆打包 {data,vtable}）。
+        // S2.4：port 对象元素（table<Drawable>）LLVM 表示 = ptr（堆打包
+        // {data,vtable}）——走 string 桥（参数类型 TK_STR = ptr，类型匹配）；
+        // 返回场景（at）由调用处把返回类型标为 K_PORT 本身，避开 S2.1 的
+        // TK_STR 补头逻辑（补头会对 port 对象 ptr 做 strlen → 崩溃）。
         var suffix = bridge_suffix(elem)
         var pty = types.named(TK_I64)
         if types.is_table(elem) || types.is_map(elem) || types.kind(elem) == K_PORT {
@@ -5262,10 +5264,14 @@ func gen_index_read(id: i64) -> i64 {
     // at_string 桥（返回 ptr）——曾按 bridge_suffix 落 at_i64，返回 i64 与
     // 嵌套表变量的 ptr 槽不符（`var sub = t[i]` → `store ptr %r, ptr %slot`
     // 但 %r 是 i64，LLVM 拒收）。对齐 gen_table_lit 的按值类型选桥。
-    // S2.4：port 对象元素（table<Drawable>）同样存 ptr，走 string 桥。
+    // S2.4：port 对象元素（table<Drawable>）同样存 ptr，走 string 桥；但
+    // 返回类型标为 K_PORT 本身（= ptr）而非 TK_STR——S2.1 补头逻辑按
+    // ins_ty==TK_STR 判补头，port 对象 ptr 被误补头（strlen 扫描打包对象
+    // {data,vtable} → 崩溃）。嵌套表/映射句柄同理（elem 类型本身 = ptr，
+    // 不补头——补头只服务于真字符串元素）。
     if types.is_table(elem) || types.is_map(elem) || types.kind(elem) == K_PORT {
         suffix = "string"
-        ret_ty = types.named(TK_STR)
+        ret_ty = elem
     } else if suffix == "string" {
         ret_ty = types.named(TK_STR)
     } else if suffix == "f64" {
@@ -6388,9 +6394,12 @@ func gen_for_table(id: i64, iter: i64, body: i64) -> i64 {
     // bridge_suffix 落 at_i64，返回 i64 与循环变量 ptr 槽不符（`store ptr %r,
     // ptr %slot` 但 %r 是 i64，LLVM 拒收），导致 tie_table_len 收到 i64。对齐
     // gen_table_at 3228 行的既有修复（同一约定：表/映射元素 → string 桥）。
-    if types.is_table(elem) || types.is_map(elem) {
+    // 嵌套表/映射/port 元素 → string 桥（存 ptr）；但返回类型用 elem 本身
+    //（= ptr）而非 TK_STR——S2.1 补头按 ins_ty==TK_STR 判补头，句柄/port
+    // 对象被误补头（strlen 扫描 → 崩溃）。真字符串元素保持 TK_STR（需补头）。
+    if types.is_table(elem) || types.is_map(elem) || types.kind(elem) == K_PORT {
         suffix = "string"
-        elem_llvm_ty = types.named(TK_STR)
+        elem_llvm_ty = elem
     } else if suffix == "string" {
         elem_llvm_ty = types.named(TK_STR)
     } else if suffix == "bool" {

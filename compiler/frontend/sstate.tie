@@ -8,6 +8,10 @@ type tie<class>
 // （节点访问/可寻址/可见性）+ 642-755（bs_find/sorted_insert/reg_fn/
 // reg_struct/fn_sig）+ 1250-1264（ns_push/ns_pop）逻辑搬移。
 // 依赖：无（intern/str 原语直接可用，与 T2.4/T2.5 一致不显式 import）。
+// S2.4：port 登记调用 types.set_port_name（port 名表还原）——types 在
+// middle（../middle/types.tie），须显式 import（interp_eval 等独立场景
+// 的 import 链不保证传递可见；s24 分支曾因缺 import 报未定义）。
+import "../middle/types.tie"
 // 由 stype.tie import（传递可达上层全部）。
 
 // ==================== AST 全局列式表（协议解析结果）====================
