@@ -118,16 +118,15 @@ else {
     Write-Host "  警告: 缺失 pkg.exe（跳过）" -ForegroundColor DarkYellow
 }
 
-# 自举 v2 新编译器 tiec.exe / tiec2.exe（compiler/ 编译产物，不随 compiler/ 源码进发行版，单列 bin/）
-foreach ($tiec in @("tiec.exe", "tiec2.exe")) {
-    $src = Join-Path $Root "compiler\$tiec"
-    if (Test-Path $src) {
-        Copy-Item $src $BinTarget
-        Write-Host "  bin/$tiec ✔" -ForegroundColor DarkGray
-    }
-    else {
-        Write-Host "  警告: 缺失 $tiec（跳过）" -ForegroundColor DarkYellow
-    }
+# 自举 v2 新编译器 tiec.exe（compiler/ 编译产物，不随 compiler/ 源码进发行版，单列 bin/；
+# tiec2.exe 是自举验证的临时产物，与 tiec.exe 同源码同尺寸，不进发行版）
+$TiecSrc = Join-Path $Root "compiler\tiec.exe"
+if (Test-Path $TiecSrc) {
+    Copy-Item $TiecSrc $BinTarget
+    Write-Host "  bin/tiec.exe ✔" -ForegroundColor DarkGray
+}
+else {
+    Write-Host "  警告: 缺失 tiec.exe（跳过）" -ForegroundColor DarkYellow
 }
 
 # ---- LLVM 精简工具链（bin/llvm/，[3/4] 步骤的子步骤）----
