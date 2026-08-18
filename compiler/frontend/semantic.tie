@@ -210,6 +210,17 @@ func expand_one_import(imp_node: i64) -> i64 {
         return 0
     }
     table_push(g_imported, full)
+    // 批次1-任务1（import 段错误修复）：file_read 原语对不存在的文件会触发
+    // 运行时段错误（0xC0000005——运行时 tie_file_read 对缺失文件返回无效指针，
+    // 运行时在独立仓库 tiec_rust，主仓库 0-Rust 铁律无法修改）。故必须在调用
+    // file_read 之前用 file_exists 拦截，输出带文件路径与 import 语句位置的
+    // 明确错误（语义错误 @行:列: 无法读取导入文件 '...'），而非崩溃。
+    if !file_exists(full) {
+        sm_err_line = s_lines[imp_node]
+        sm_err_col = s_cols[imp_node]
+        sm_err_msg = "无法读取导入文件 '" + full + "'（文件不存在）"
+        return -1
+    }
     var src = file_read(full)
     if src == "" {
         sm_err_line = s_lines[imp_node]
