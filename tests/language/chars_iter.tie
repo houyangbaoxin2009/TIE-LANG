@@ -1,0 +1,99 @@
+type tie<logic>
+// 字符串码点迭代器探针（dev33 批次4）：`for c in s.chars()` 逐码点遍历
+// 覆盖：ASCII / 中文 / emoji / 空串 / 截断（码点索引与字节索引分离）
+// 期望输出（每行 PASS）：
+//   PASS ascii
+//   PASS cjk
+//   PASS emoji
+//   PASS empty
+//   PASS count
+//   PASS to_chars
+import "../../std/utf.tie" as utf
+using utf;
+func main() {
+    // ASCII：5 个码点
+    var s1 = "hello"
+    var n1: i64 = 0
+    var acc1: string = ""
+    for c in s1.chars() {
+        n1 = n1 + 1
+        acc1 = acc1 + c
+    }
+    if n1 == 5 && acc1 == "hello" {
+        println("PASS ascii")
+    } else {
+        println("FAIL ascii n=" + to_string(n1) + " acc=" + acc1)
+        exit(1)
+    }
+    // 中文：3 个汉字 = 9 字节，但码点迭代得 3 个字符（码点索引 ≠ 字节索引）
+    var s2 = "你好吗"
+    var n2: i64 = 0
+    var acc2: string = ""
+    for c in s2.chars() {
+        n2 = n2 + 1
+        acc2 = acc2 + c
+    }
+    if n2 == 3 && acc2 == "你好吗" && len(s2) == 9 {
+        println("PASS cjk")
+    } else {
+        println("FAIL cjk n=" + to_string(n2) + " acc=" + acc2 + " bytes=" + to_string(len(s2)))
+        exit(1)
+    }
+    // emoji：str_from_code 构造 4 字节码点，与 ASCII 混合
+    var s3 = "A" + str_from_code(0x1F600) + "B"
+    var n3: i64 = 0
+    var acc3: string = ""
+    for c in s3.chars() {
+        n3 = n3 + 1
+        acc3 = acc3 + c
+    }
+    if n3 == 3 && acc3 == s3 {
+        println("PASS emoji")
+    } else {
+        println("FAIL emoji n=" + to_string(n3) + " acc=" + acc3)
+        exit(1)
+    }
+    // 空串：0 次迭代
+    var s4 = ""
+    var n4: i64 = 0
+    for c in s4.chars() {
+        n4 = n4 + 1
+    }
+    if n4 == 0 {
+        println("PASS empty")
+    } else {
+        println("FAIL empty n=" + to_string(n4))
+        exit(1)
+    }
+    // 截断：混合串码点计数（等价手写 while + utf8_seq_len 步进）
+    var s5 = "A你é" + str_from_code(0x1F600)
+    var cnt: i64 = 0
+    for c in s5.chars() {
+        cnt = cnt + 1
+    }
+    var pos: i64 = 0
+    var expect: i64 = 0
+    while pos < len(s5) {
+        pos = pos + utf8_seq_len(s5, pos)
+        expect = expect + 1
+    }
+    if cnt == expect && cnt == 4 {
+        println("PASS count")
+    } else {
+        println("FAIL count cnt=" + to_string(cnt) + " expect=" + to_string(expect))
+        exit(1)
+    }
+    // 标准库 to_chars：码点表随机索引与字节索引分离
+    var t = utf.to_chars(s2)
+    if len(t) == 3 {
+        if t[0] == "你" && t[1] == "好" && t[2] == "吗" {
+            println("PASS to_chars")
+        } else {
+            println("FAIL to_chars content")
+            exit(1)
+        }
+    } else {
+        println("FAIL to_chars len=" + to_string(len(t)))
+        exit(1)
+    }
+}

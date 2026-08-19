@@ -14,6 +14,29 @@ var g_case_seen: table<string>;
 
 namespace scheck {
 
+// 判定 for 迭代对象是否为字符串码点迭代器调用 `s.chars()`（dev33 批次4）。
+// 结构：MethodCall，方法名 == "chars"，接收者（child[slot_off]）类型为 string
+// 且无实参。用于 S_N_FOR 分支把循环变量登记为单字符 string。
+func is_chars_iter(iter: i64) -> bool {
+    if s_tags[iter] != S_N_METHOD_CALL {
+        return false
+    }
+    if sstate.name_str(iter) != "chars" {
+        return false
+    }
+    // 接收者类型须为 string（全局/局部变量或表达式均可，.chars() 语义上
+    // 恒作用于字符串）；实参个数须为 0。
+    var recv = sstate.child(iter, sstate.slot_off(iter))
+    var rt = sinfer.infer_expr(recv)
+    if rt < 0 || rt != types.named(TK_STR) {
+        return false
+    }
+    if sstate.nchild(iter) > sstate.slot_off(iter) + 1 {
+        return false
+    }
+    return true
+}
+
 // 语句块检查（StmtList）
 pub func check_block(blk: i64) -> i64 {
     var n = sstate.nchild(blk)
@@ -606,7 +629,12 @@ pub func check_stmt(s: i64) -> i64 {
             return -1
         }
         var elem_ty: i64 = types.named(TK_I64)
-        if types.is_table(it) {
+        // 字符串码点迭代器：`for c in s.chars()`（dev33 批次4 语法糖）。
+        // 循环变量元素类型 = 单字符 string；须先于 is_table 分支（iter 的
+        // 推断类型也是 string，但 is_table(string)=false 不影响）。
+        if it == types.named(TK_STR) && is_chars_iter(iter) {
+            elem_ty = types.named(TK_STR)
+        } else if types.is_table(it) {
             var te = types.table_elem(it)
             if te >= 0 {
                 elem_ty = te

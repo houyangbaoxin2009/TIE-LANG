@@ -1,3 +1,27 @@
+## [新增] 字符串码点迭代器（s.chars()）—— 2026-08-20
+
+dev33 计划批次 4（任务 10-12）：`for c in s.chars()` 语法糖（Unicode 码点
+逐字符遍历），替代手写 while + utf8_seq_len/utf8_char_at 组合：
+
+- **语法/语义（sinfer/scheck）**：`string.chars()` 无参方法调用识别（返回
+  string，非法实参报错）；`for c in s.chars()` 循环变量登记为单字符 string
+  （码点级，与字节索引分离）；
+- **后端（irgen）**：新增 `gen_for_chars` 码点步进循环——字节位置计数器
+  + `s21_utf8_seq_len` 步进 + `s21_utf8_char_at` 解码 + `tie_str_from_code`
+  得单字符；continue/break/标签语义与表迭代一致；
+- **REPL/interp**：`exec_stmt_for` 增 T_STR 分支（str_len/str_char 码点
+  遍历）+ `gen_method_call` 支持 `.chars()`；
+- **标准库（utf.tie）**：新增 `to_chars(s)`（字符串 → 单字符码点表
+  table<string>，随机码点索引 O(1)）与 `codepoint_count(s)`（码点数，
+  与字节数 byte_len 分离）；
+- **修复既有 bug**：`s21_utf8_char_at` 对 1 字节（ASCII）序列解码错误
+  （原 l==1 落入 4 字节分支，用后续字节算出错码点，如 'h'=0x68 得
+  0x25B2C）——补 l==1 直返分支，ASCII 码点正确；
+- **验收**：tests/language/chars_iter.tie 全绿（ASCII/中文/emoji/空串/
+  截断/to_chars）；全量回归 PASS=66（较批次 2 的 65 多 1 = 新增探针），
+  FAIL 仅 try_probe（panic exit=1 预期）与 shift_neg_free（stage0 同款
+  基线接受），均非本批引入；S2.1 探针 probe1-5 全过。
+
 ## [新增] 128 位整数（i128/u128）—— 2026-08-19
 
 dev33 计划批次 2（任务 3-6）：tiec 全链路支持 128 位有/无符号整数，前端

@@ -37,6 +37,28 @@ pub func from_code(n: i64) -> string {
     return str_from_code(n)
 }
 
+// 字符串 → 单字符码点表（table<string>）：逐码点取出，可作随机码点索引
+// （cs[i] O(1)）——与逐码点线性遍历的 s.chars() 互补。码点数 = len(result)
+// = codepoint_count(s)。空串返回空表。
+// 码点索引与字节索引分离：本函数按**码点**（字符）切分，不依赖 UTF-8 字节数。
+pub func to_chars(s: string) -> table {
+    var t = table_new_string()
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        table_push(t, str_char(s, i))
+        i = i + 1
+    }
+    return t
+}
+
+// 字符串码点（字符）总数 ≈ str_len 的显式包装（码点索引边界用）。
+// 与 byte_len 对称：byte_len 是 UTF-8 字节数（中文一字 3 字节），
+// codepoint_count 是字符数（中文一字 1）。码点索引与字节索引分离的正确依据。
+pub func codepoint_count(s: string) -> i64 {
+    return str_len(s)
+}
+
 // 码点 → UTF-8 字节数：≤0x7F 1 字节；≤0x7FF 2 字节；≤0xFFFF 3 字节；≤0x10FFFF 4 字节；
 // 越界（负值或超过 Unicode 上限 0x10FFFF）返回 0。
 pub func utf8_bytes(cp: i64) -> i64 {

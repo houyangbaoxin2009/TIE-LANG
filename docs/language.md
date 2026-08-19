@@ -561,10 +561,29 @@ if cond { } else if cond2 { } else { }     // 条件分支
 while cond { }                              // 循环
 for i in 0..10 { }                          // 范围循环
 for item in arr { }                         // 集合循环
+for c in s.chars() { }                      // 字符串码点迭代（逐字符，Unicode 安全）
 return expr                                 // 返回值（可省略分号）
 break                                       // 退出最近循环（E1）
 continue                                    // 跳最近循环的下一次迭代（E1）
 ```
+
+**字符串码点迭代** `for c in s.chars()`：按 Unicode 码点逐字符遍历（s 为
+string），循环变量 c 是单字符 string。与字节索引分离——中文等多字节字符
+（UTF-8 一个汉字 3 字节）每次迭代得一个完整字符，无需手动 utf8_seq_len
+步进。等价手写：
+
+```c
+var pos: i64 = 0
+while pos < len(s) {
+    var l = utf8_seq_len(s, pos)
+    var cp = utf8_char_at(s, pos)
+    // ... 处理单字符 str_from_code(cp) ...
+    pos = pos + l
+}
+```
+
+随机码点索引（O(1)）：先 `utf.to_chars(s)` 转码点表再下标访问；码点数用
+`utf.codepoint_count(s)`（与字节数 `utf.byte_len(s)` 分离）。
 
 ### 5.1 break / continue 与循环标签（E1+E5）
 

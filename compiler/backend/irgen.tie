@@ -4978,18 +4978,19 @@ func s21_utf8_char_at(s: i64, i: i64) -> i64 {
     ir.add_operand(slot, types.named(TK_I64), 2)
     var sv = ir.get_value(slot)
     s21_store(sv, b0, types.named(TK_I64))  // 默认 cp = b0（l==1）
-    // 子块：l==2 处理 / l==3 判定 / l==3 处理 / l==4 处理 / 汇合
+    // 子块：l==2 处理 / l==1 判定 / l==3 判定 / l==3 处理 / l==4 处理 / 汇合
     var blk2 = ir.new_block(g_cur_func, interner.intern("s21.c2"))
+    var blk1c = ir.new_block(g_cur_func, interner.intern("s21.c1c"))
     var blk3c = ir.new_block(g_cur_func, interner.intern("s21.c3c"))
     var blk3 = ir.new_block(g_cur_func, interner.intern("s21.c3"))
     var blk4 = ir.new_block(g_cur_func, interner.intern("s21.c4"))
     var merge = ir.new_block(g_cur_func, interner.intern("s21.cm"))
-    // if l == 2 → blk2，else → blk3c
+    // if l == 2 → blk2，else → blk1c
     var c2 = gen_cmp_const(l, 0, 2, types.named(TK_I64))  // eq 2
     var cb2 = ir.new_inst(g_cur_block, 31, -1)  // cond_br
     ir.add_operand(cb2, c2, 0)
     ir.add_operand(cb2, blk2, 1)
-    ir.add_operand(cb2, blk3c, 1)
+    ir.add_operand(cb2, blk1c, 1)
     // blk2：cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F)
     g_cur_block = blk2
     var bi1 = s21_bin(0, i, gen_int_lit(1))
@@ -4998,6 +4999,15 @@ func s21_utf8_char_at(s: i64, i: i64) -> i64 {
     s21_store(sv, cp2, types.named(TK_I64))
     var br2 = ir.new_inst(g_cur_block, 30, -1)  // br merge
     ir.add_operand(br2, merge, 1)
+    // blk1c：l==1（ASCII）→ 直返 merge（slot 已存 b0 默认值）；否则 → blk3c
+    // 修复（dev33 批次4）：原实现 l==1 落入 blk4 用 4 字节公式算错码点
+    // （如 'h'=0x68 被后续字节算出 0x25B2C）——1 字节序列从未正确解码。
+    g_cur_block = blk1c
+    var c1 = gen_cmp_const(l, 0, 1, types.named(TK_I64))  // eq 1
+    var cb1 = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cb1, c1, 0)
+    ir.add_operand(cb1, merge, 1)
+    ir.add_operand(cb1, blk3c, 1)
     // blk3c：if l == 3 → blk3，else → blk4
     g_cur_block = blk3c
     var c3 = gen_cmp_const(l, 0, 3, types.named(TK_I64))  // eq 3
@@ -6253,10 +6263,21 @@ func gen_stmt(id: i64) -> i64 {
     }
     if tag == 107 {
         // For：name=迭代变量, children=[iter, body]
-        // 范围 0..N 最小集；表遍历 `for item in arr`（iter 为 Var 表变量）
+        // 范围 0..N 最小集；表遍历 `for item in arr`（iter 为 Var 表变量）；
+        // 字符串码点迭代 `for c in s.chars()`（dev33 批次4，iter 为 MethodCall）。
         var iter = sstate.child(id, 0)
         var body = sstate.child(id, 1)
         var iter_tag = s_tags[iter]
+        if iter_tag == 18 {
+            // 字符串码点迭代器 `.chars()`：走 UTF-8 码点步进循环
+            if is_chars_method(iter) {
+                var fc = gen_for_chars(id, iter, body)
+                if fc < 0 {
+                    return -1
+                }
+                return 0
+            }
+        }
         if iter_tag != 11 {
             // for-in 表迭代（动态表）：计数器 0..len(t) + tie_table_at 读取
             var fr = gen_for_table(id, iter, body)
@@ -6479,6 +6500,120 @@ func gen_stmt(id: i64) -> i64 {
     sm_err_col = s_cols[id]
     sm_err_msg = "irgen 未支持的语句（tag=" + to_string(tag) + "，函数 " + g_cur_fn_name + "）"
     return -1  // 其他语句后续扩展
+}
+
+// 判定 for 迭代对象是否为字符串码点迭代器调用 `s.chars()`（MethodCall）。
+// 结构：方法名 == "chars"，接收者（child[slot_off]）为 string 值。仅 for-in
+// 路径识别（gen_stmt tag==107 在进 gen_for_table 前探测），与 --prep 探针协调。
+func is_chars_method(iter: i64) -> bool {
+    if s_tags[iter] != 18 {
+        return false
+    }
+    if sstate.name_str(iter) != "chars" {
+        return false
+    }
+    var recv = sstate.child(iter, sstate.slot_off(iter))
+    var rt = node_types[recv]
+    if rt < 0 || rt != types.named(TK_STR) {
+        return false
+    }
+    return true
+}
+
+// for-in 字符串码点迭代：`for c in s.chars()`（dev33 批次4 语法糖）。
+// 布局：循环变量 alloca（TK_STR，单字符）+ 字节位置计数器 alloca（i64）；
+// cond 块：字节位置 < str_len(s) 终结（s21_str_head_len O(1)）；body 块每次
+// 迭代 s21_utf8_char_at 解码码点 → str_from_code 得单字符字符串 → store 到
+// 循环变量；step 块：位置 += s21_utf8_seq_len（字节步进）。continue → step，
+// break → exit。等价手写 while + utf8_seq_len/utf8_char_at 组合。
+func gen_for_chars(id: i64, iter: i64, body: i64) -> i64 {
+    g_used_interp = true
+    // 接收者字符串值（s.chars() 的 s）
+    var recv = sstate.child(iter, sstate.slot_off(iter))
+    var s = gen_expr(recv)
+    if s < 0 {
+        return -1
+    }
+    // 记录当前块（gen_expr 可能切块），循环开始处用。
+    // 循环变量 alloca（TK_STR）+ 字节位置计数器 alloca（i64）
+    var item_a = ir.new_inst(g_cur_block, 20, types.named(TK_STR))  // alloca string
+    ir.add_operand(item_a, types.named(TK_STR), 2)
+    var item_ptr = ir.get_value(item_a)
+    var pos_a = ir.new_inst(g_cur_block, 20, types.named(TK_I64))  // alloca i64
+    ir.add_operand(pos_a, types.named(TK_I64), 2)
+    var pos_ptr = ir.get_value(pos_a)
+    var pos_zero = gen_int_lit_ty(0, types.named(TK_I64))
+    var st0 = ir.new_inst(g_cur_block, 22, -1)  // store 0 → pos
+    ir.add_operand(st0, types.named(TK_I64), 2)
+    ir.add_operand(st0, pos_zero, 0)
+    ir.add_operand(st0, pos_ptr, 0)
+    // 四块：cond / body / step / exit
+    var cond_blk = ir.new_block(g_cur_func, interner.intern("for.cond"))
+    var body_blk = ir.new_block(g_cur_func, interner.intern("for.body"))
+    var step_blk = ir.new_block(g_cur_func, interner.intern("for.step"))
+    var exit_blk = ir.new_block(g_cur_func, interner.intern("for.exit"))
+    loop_push(s_aux[id], exit_blk, step_blk)
+    var b0 = ir.new_inst(g_cur_block, 30, -1)  // br cond
+    ir.add_operand(b0, cond_blk, 1)
+    // cond 块：pos < byte_len(s) → body，否则 exit
+    g_cur_block = cond_blk
+    var cur = ir.new_inst(g_cur_block, 21, types.named(TK_I64))  // load pos
+    ir.add_operand(cur, pos_ptr, 0)
+    var cur_v = ir.get_value(cur)
+    var blen = s21_str_head_len(s)
+    var ol = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp ult
+    ir.add_operand(ol, cur_v, 0)
+    ir.add_operand(ol, blen, 0)
+    ir.add_operand(ol, 6, 2)  // ult
+    var ol_v = ir.get_value(ol)
+    var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cb, ol_v, 0)
+    ir.add_operand(cb, body_blk, 1)
+    ir.add_operand(cb, exit_blk, 1)
+    // body 块：cp = utf8_char_at(s, pos) → 单字符 = str_from_code(cp) → store
+    g_cur_block = body_blk
+    // 重新 load pos（body 块内 SSA）
+    var cur2 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+    ir.add_operand(cur2, pos_ptr, 0)
+    var cur2_v = ir.get_value(cur2)
+    var cp = s21_utf8_char_at(s, cur2_v)
+    // 码点 → 单字符字符串（桥 tie_str_from_code(i64) -> string）
+    g_used_interp = true
+    var ch = gen_ext_call1("tie_str_from_code", cp, types.named(TK_I64), types.named(TK_STR))
+    if ch < 0 {
+        return -1
+    }
+    var ist = ir.new_inst(g_cur_block, 22, -1)  // store 单字符 → 循环变量
+    ir.add_operand(ist, types.named(TK_STR), 2)
+    ir.add_operand(ist, ch, 0)
+    ir.add_operand(ist, item_ptr, 0)
+    scope_put(s_names[id], item_ptr, types.named(TK_STR))
+    var bb = gen_block_stmts(body)
+    if bb < 0 {
+        return -1
+    }
+    scope_pop()
+    if !block_terminated() {
+        var bb2 = ir.new_inst(g_cur_block, 30, -1)  // br step
+        ir.add_operand(bb2, step_blk, 1)
+    }
+    // step 块：pos += utf8_seq_len(s, pos) → store → br cond
+    g_cur_block = step_blk
+    var cur3 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+    ir.add_operand(cur3, pos_ptr, 0)
+    var cur3_v = ir.get_value(cur3)
+    var slen = s21_utf8_seq_len(s, cur3_v)
+    var np = s21_bin(0, cur3_v, slen)  // add
+    var st2 = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(st2, types.named(TK_I64), 2)
+    ir.add_operand(st2, np, 0)
+    ir.add_operand(st2, pos_ptr, 0)
+    var sb = ir.new_inst(g_cur_block, 30, -1)  // br cond
+    ir.add_operand(sb, cond_blk, 1)
+    // exit 块
+    g_cur_block = exit_blk
+    loop_pop()
+    return 0
 }
 
 // for-in 表迭代：`for item in t`（t 为动态表变量/表达式）。

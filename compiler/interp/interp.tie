@@ -881,8 +881,29 @@ func exec_stmt_for(id: i64) {
                 i = i + 1
             }
         }
+    } else if it == T_STR {
+        // 字符串码点迭代（`.chars()`，dev33 批次4）：str_len 码点数，str_char 逐码点取单字符
+        var s = ivalue.str_val(iter)
+        var n = str_len(s)
+        var i: i64 = 0
+        while i < n {
+            var rc = for_iterate(body, var_name, ivalue.new_str(str_char(s, i)))
+            if g_err != "" {
+                g_flow = FL_NORMAL
+                g_lastval = -1
+                return
+            }
+            if rc == 0 {
+                i = n
+            } else {
+                if rc == 1 && g_lastval >= 0 {
+                    last = g_lastval
+                }
+                i = i + 1
+            }
+        }
     } else {
-        g_err = "for 的迭代对象必须是范围（0..10）"
+        g_err = "for 的迭代对象必须是范围（0..10）、表或字符串迭代器"
         g_flow = FL_NORMAL
         g_lastval = -1
         return
@@ -2282,6 +2303,24 @@ func gen_method_call(id: i64) -> i64 {
     }
     var receiver = isess.nchild_at(id, soff)
     var method = isess.nname_str(id)
+    // 字符串码点迭代器 `s.chars()`（dev33 批次4）：REPL 求值为接收者字符串
+    // 自身（for-in 场景由 exec_stmt_for 的 T_STR 分支按码点遍历；非 for 场景
+    // 表达式求值为原串亦可）。无实参校验。
+    if method == "chars" {
+        var rv = gen_expr(receiver)
+        if g_err != "" {
+            return -1
+        }
+        if ivalue.type_of(rv) != T_STR {
+            g_err = ".chars() 只能作用于字符串（实际是 " + ivalue.type_name(rv) + "）"
+            return -1
+        }
+        if isess.nchild(id) != soff + 1 {
+            g_err = "字符串迭代器 s.chars() 不接受实参"
+            return -1
+        }
+        return rv
+    }
     // S3.3 C2 thunk：code 值 `.call()` —— 编译期执行该代码块（惰性 thunk，
     // 宏体内用；运行期无 code 值）。接收者先求值，code 值 → exec_code_proto。
     if method == "call" {
