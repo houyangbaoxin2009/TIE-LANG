@@ -45,7 +45,7 @@ compiler\tiec.exe repl\repl.tie          # 构建 REPL 外壳
 
 ## 3. 类型系统
 
-基本类型：`i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool trit char string void`。
+基本类型：`i8 i16 i32 i64 i128 u8 u16 u32 u64 f32 f64 bool trit char string void`。
 复合类型：`table<T>`（动态数组）、`map`（键值表）、元组 `(T1, T2)`、struct、enum、`fn(A)->R`（函数类型）、`code`（编译期代码片段，宏用）。
 
 ```tie
