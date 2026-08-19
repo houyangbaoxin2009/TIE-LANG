@@ -1,0 +1,2 @@
+import "./imp_bad_syntax.tie";
+func main() { print("ok"); }

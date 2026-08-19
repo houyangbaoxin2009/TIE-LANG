@@ -1,0 +1,1 @@
+语义错误 @1:1: 导入文件 'tests/errors/golden/imp_bad_syntax.tie' 解析失败: ERR:1 12 期望标识符，实际是 LBrace

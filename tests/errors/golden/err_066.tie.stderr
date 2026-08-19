@@ -1,0 +1,1 @@
+语义错误 @1:1: 无法读取导入文件 'tests/errors/golden/no_such_import_file.tie'（文件不存在）

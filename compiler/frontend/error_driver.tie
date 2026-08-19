@@ -8,8 +8,11 @@ type tie<logic>
 import "./semantic.tie"
 
 // 从 "ERR:line col msg" 提取 line/col/msg，并根据消息内容判断错误类型前缀：
-// 词法错误（lexer 消息特征）/ 语法错误（parser 消息特征）/ 语义错误（其余）
-func fmt_err(r: string) -> string {
+// 词法错误（lexer 消息特征）/ 语法错误（parser 消息特征）/ 语义错误（其余）。
+// 命名 fmt_err_msg：避免与 interp/interp.tie 的 fmt_err（2 参数）同名冲突——
+// error_driver import semantic → mexpand → interp，同名顶层函数合并后
+// 语义检查会把 interp 的 2 参数调用误解析到本 1 参数函数（批次1-任务2 修复）。
+func fmt_err_msg(r: string) -> string {
     // ERR:line col msg
     var rest = str.slice(r, 4, str_len(r))
     var n = str_len(rest)
@@ -73,7 +76,12 @@ func main() {
         "tests/errors/golden/err_058.tie", "tests/errors/golden/err_059.tie",
         "tests/errors/golden/err_060.tie", "tests/errors/golden/err_061.tie",
         "tests/errors/golden/err_062.tie", "tests/errors/golden/err_063.tie",
-        "tests/errors/golden/err_064.tie", "tests/errors/golden/err_065.tie"
+        "tests/errors/golden/err_064.tie", "tests/errors/golden/err_065.tie",
+        // 批次1（import 段错误修复）回归用例：
+        // err_066 = import 不存在的文件（任务1）；err_067 = import 语法错误文件；
+        // err_068 = import 语义错误文件（任务2 两类坏输入）
+        "tests/errors/golden/err_066.tie", "tests/errors/golden/err_067.tie",
+        "tests/errors/golden/err_068.tie"
     ]
     var i: i64 = 0
     while i < len(files) {
@@ -82,7 +90,7 @@ func main() {
         var out = ""
         if str_len(r) >= 3 {
             if str_char(r, 0) == "E" {
-                out = fmt_err(r)
+                out = fmt_err_msg(r)
             }
         }
         if out == "" {
