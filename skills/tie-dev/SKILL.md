@@ -67,6 +67,7 @@ if x > 3 { } else if x > 1 { } else { }
 while i < 10 { i = i + 1 }
 for i in 0..10 { }                       // 范围：含 0 不含 10
 for item in arr { }                      // 遍历表
+for c in s.chars() { }                   // 字符串码点迭代：逐字符（Unicode 安全）
 switch n {
     case 1, 2:                           // 多值：任一相等即命中（逗号分隔）
         println("one or two")
@@ -85,6 +86,9 @@ switch n {
 - **无 break、无 fallthrough**：一个 case 执行完自动跳出；守卫不满足落入下一个 case；
 - 浮点区间不支持；普通静态类型变量上做类型匹配 → 语义层报错（恒真/恒假无意义）；
 - `&&` / `||` 短路求值：条件里带副作用的调用须嵌套 if（避免被多读）。
+- **字符串码点迭代** `for c in s.chars()`：按 Unicode 码点逐字符遍历，c 是单字符
+  string，中文/emoji 多字节字符一次迭代得完整字符（与字节索引分离）；随机码点
+  索引用 `utf.to_chars(s)` 转码点表，码点数用 `utf.codepoint_count(s)`。
 
 ## 5. 函数
 
