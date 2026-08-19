@@ -661,6 +661,11 @@ func llvm_ty(t: i64) -> string {
     if t == TK_I64 || t == TK_U64 {
         return "i64"
     }
+    if t == TK_I128 || t == TK_U128 {
+        // 批次 2（i128/u128）：LLVM 原生 i128 类型（add/sub/mul/sdiv/srem/
+        // udiv/icmp 均类型参数化，llvm_ty 映射后自动支持）
+        return "i128"
+    }
     if t == TK_F32 {
         return "float"
     }
@@ -1508,6 +1513,12 @@ func gen_inst(inst_id: i64) {
         // udiv：无符号除（S1.3 checked_* 无符号反算检测用）
         var ty = llvm_ty(ir.ins_ty(inst_id))
         line(reg + " = udiv " + ty + " " + opnd_ref(inst_id, 0) + ", " + opnd_ref(inst_id, 1))
+        return
+    }
+    if op == 47 {
+        // urem：无符号模（批次 2：i128/u128 十进制打印取余）
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = urem " + ty + " " + opnd_ref(inst_id, 0) + ", " + opnd_ref(inst_id, 1))
         return
     }
     if op == 65 {

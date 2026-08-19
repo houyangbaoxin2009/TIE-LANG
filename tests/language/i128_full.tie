@@ -1,0 +1,54 @@
+type tie<logic>
+// 批次 2 验收：i128/u128 加减乘除/比较/位运算/边界值（任务 6）
+func main() {
+    // 加减乘除（i128）
+    var a: i128 = 1000000000000000000i128
+    var b: i128 = 3i128
+    println(a + b)
+    println(a - b)
+    println(a * b)
+    println(a / b)
+    println(a % b)
+    // 负数
+    var n: i128 = -5i128
+    println(n)
+    println(n * n)
+    // 比较
+    if a > b {
+        println("a > b")
+    }
+    if b < a {
+        println("b < a")
+    }
+    if a == a {
+        println("eq")
+    }
+    if a != b {
+        println("ne")
+    }
+    // 位运算：左移 100 位（i128 才能容纳）
+    var sh: i128 = 1i128 << 100
+    println(sh)
+    var and: i128 = sh & 0xFFi128
+    println(and)
+    var or: i128 = sh | 1i128
+    println(or)
+    var xor: i128 = sh ^ sh
+    println(xor)
+    // 边界值：2^127-1（i128 最大值）
+    var max_i128: i128 = (1i128 << 127) - 1i128
+    println(max_i128)
+    // 2^127（i128 最小值 -2^127 的绝对值）
+    var min_abs: i128 = 1i128 << 127
+    println(min_abs)
+    // u128 边界：2^128-1（最大值）
+    var max_u128: u128 = (1u128 << 127) + (1u128 << 127) - 1u128
+    println(max_u128)
+    // 混合宽度：i64 + i128 → i128
+    var small: i64 = 42
+    var big: i128 = a + small
+    println(big)
+    // to_string 内建
+    println(to_string(a))
+    println("done")
+}

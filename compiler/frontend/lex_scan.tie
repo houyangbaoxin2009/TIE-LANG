@@ -311,7 +311,8 @@ pub func scan_number(pos: i64) -> i64 {
                 }
             }
             if suf == "i8" || suf == "i16" || suf == "i32" || suf == "i64" ||
-                suf == "u8" || suf == "u16" || suf == "u32" || suf == "u64" {
+                suf == "u8" || suf == "u16" || suf == "u32" || suf == "u64" ||
+                suf == "i128" || suf == "u128" {
                 pos = j
             } else if suf == "f32" || suf == "f64" {
                 tag = lex_float

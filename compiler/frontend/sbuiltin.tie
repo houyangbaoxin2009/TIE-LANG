@@ -125,7 +125,8 @@ pub func builtin_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 
     // 1 参数字 → 目标类型。参数必须是数字由调用点（infer_call）检查。
     if fn_name == "as_i8" || fn_name == "as_i16" || fn_name == "as_i32" || fn_name == "as_i64" ||
         fn_name == "as_u8" || fn_name == "as_u16" || fn_name == "as_u32" || fn_name == "as_u64" ||
-        fn_name == "as_f32" || fn_name == "as_f64" {
+        fn_name == "as_f32" || fn_name == "as_f64" ||
+        fn_name == "as_i128" || fn_name == "as_u128" {
         if nargs != 1 {
             sm_err_line = s_lines[call_node]
             sm_err_col = s_cols[call_node]
@@ -158,6 +159,12 @@ pub func builtin_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 
         }
         if fn_name == "as_f32" {
             return types.named(TK_F32)
+        }
+        if fn_name == "as_i128" {
+            return types.named(TK_I128)
+        }
+        if fn_name == "as_u128" {
+            return types.named(TK_U128)
         }
         return types.named(TK_F64)
     }

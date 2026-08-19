@@ -593,6 +593,8 @@ pub func typekw_index(s: string) -> i64 {
         case "misc": return 18
         case "table": return 19
         case "map": return 20
+        case "i128": return 21
+        case "u128": return 22
         default: return -1
     }
 }
@@ -658,9 +660,57 @@ pub func parse_int_lit(lex: string) -> i64 {
     return val
 }
 
+// 批次 2：整数字面量溢出检测——parse_int_lit 返回 i64，超范围静默回绕；
+// i128/u128 常量经 `add i128 0, i64值` 构造，回绕值符号扩展会得错误高位。
+// 返回 true = 字面量超出 i64 可表示范围（与 parse_int_lit 同款进制/截断逻辑）。
+pub func int_lit_overflow(lex: string) -> bool {
+    var n = str_len(lex)
+    var base: i64 = 10
+    var start: i64 = 0
+    if n >= 2 {
+        var c0 = str_char(lex, 0)
+        var c1 = str_char(lex, 1)
+        if c0 == "0" {
+            if c1 == "x" || c1 == "X" {
+                base = 16
+                start = 2
+            } else if c1 == "b" || c1 == "B" {
+                base = 2
+                start = 2
+            } else if c1 == "o" || c1 == "O" {
+                base = 8
+                start = 2
+            } else if c1 == "t" || c1 == "T" {
+                base = 3
+                start = 2
+            }
+        }
+    }
+    var val: i64 = 0
+    var i = start
+    while i < n {
+        var c = str_char(lex, i)
+        var d = digit_val(c)
+        if d < 0 {
+            break
+        }
+        if d >= base {
+            break
+        }
+        // 溢出检测：val * base + d > I64_MAX（9223372036854775807）
+        if val > (9223372036854775807 - d) / base {
+            return true
+        }
+        val = val * base + d
+        i = i + 1
+    }
+    return false
+}
+
 // ---------- S1.3 L3 字面量后缀 ----------
-// 字面量尾部类型后缀 → TyKw 索引（i8/i16/i32/i64/u8/u16/u32/u64/f32/f64；
-// 无后缀返回 -1）。仅匹配精确后缀串（数字后的字母序列）。
+// 字面量尾部类型后缀 → TyKw 索引（i8/i16/i32/i64/i128/u8/u16/u32/u64/u128/
+// f32/f64；无后缀返回 -1）。仅匹配精确后缀串（数字后的字母序列）。
+// 批次 2：i128/u128 为 4 字符后缀（123i128 / 7u128）。
 pub func parse_lit_suffix(lex: string) -> i64 {
     var n = str_len(lex)
     if n < 2 {
@@ -701,16 +751,31 @@ pub func parse_lit_suffix(lex: string) -> i64 {
     if last3 == "f64" {
         return 9
     }
+    if n < 4 {
+        return -1
+    }
+    var last4 = slice_str(lex, n - 4, n)
+    if last4 == "i128" {
+        return 21
+    }
+    if last4 == "u128" {
+        return 22
+    }
     return -1
 }
 
 // 剥离字面量尾部类型后缀，返回纯数字文本（无后缀原样返回）。
 // 浮点字面量 lexeme 带 f32/f64 后缀时 llvmgen 无法直接输出，须剥离。
+// 批次 2：i128/u128 为 4 字符后缀（剥离 4 字符）。
 pub func strip_lit_suffix(lex: string) -> string {
     var n = str_len(lex)
-    if parse_lit_suffix(lex) >= 0 {
-        if parse_lit_suffix(lex) == 0 || parse_lit_suffix(lex) == 4 {
+    var sfx = parse_lit_suffix(lex)
+    if sfx >= 0 {
+        if sfx == 0 || sfx == 4 {
             return slice_str(lex, 0, n - 2)
+        }
+        if sfx == 21 || sfx == 22 {
+            return slice_str(lex, 0, n - 4)
         }
         return slice_str(lex, 0, n - 3)
     }

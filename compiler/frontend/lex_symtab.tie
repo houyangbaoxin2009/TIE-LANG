@@ -20,23 +20,24 @@ var sym_vals: table<i64>;
 namespace lexsym {
 
 // ---------- 关键字表构建与二分 ----------
-// 49+6 项 ASCII/strcmp 升序（TypeKw 值=32，具体类型由 lexeme 区分——同 Rust
+// 51+6 项 ASCII/strcmp 升序（TypeKw 值=32，具体类型由 lexeme 区分——同 Rust
 // 单变体）。S1.2 新增：asm（as 后 bool 前）、repr（ref 后 return 前）、
 // unsafe（u8 后 using 前）。S2.3/S2.4 新增：impl（if 后 import 前——'l'<'o'）、
 // panic/port（num 后 pub 前——'a'<'o'<'u'）。S3.3 新增：macro（in 后 map 前）。
+// 批次 2（i128/u128）：i128 在 i16 前（'2'<'6'）、u128 在 u16 前——严格升序。
 // 顺序必须严格升序否则二分错乱。
 func build_kw() {
     var k: table<string> = ["as", "asm", "bool", "break", "case", "char", "code",
         "const", "continue", "default", "else", "enum", "extends", "extern",
-        "f32", "f64", "false", "for", "func", "i16", "i32", "i64", "i8", "if",
+        "f32", "f64", "false", "for", "func", "i128", "i16", "i32", "i64", "i8", "if",
         "impl", "import", "in", "macro", "map", "misc", "namespace", "num",
         "panic", "port", "pub", "ref", "repr", "return", "string", "struct",
-        "switch", "table", "text", "trit", "true", "u16", "u32", "u64", "u8",
+        "switch", "table", "text", "trit", "true", "u128", "u16", "u32", "u64", "u8",
         "unsafe", "using", "var", "void", "when", "while", "zero"]
     var v: table<i64> = [21, 84, 32, 14, 17, 32, 32, 7, 15, 18, 9, 81, 23, 27, 32,
-        32, 29, 11, 5, 32, 32, 32, 32, 8, 87, 20, 12, 88, 32, 32, 24, 32, 85,
-        86, 25, 31, 83, 13, 32, 22, 16, 32, 32, 32, 28, 32, 32, 32, 32, 82,
-        26, 6, 32, 19, 10, 30]
+        32, 29, 11, 5, 32, 32, 32, 32, 32, 8, 87, 20, 12, 88, 32,
+        32, 24, 32, 85, 86, 25, 31, 83, 13, 32, 22, 16, 32, 32, 32,
+        28, 32, 32, 32, 32, 32, 82, 26, 6, 32, 19, 10, 30]
     kw_keys = table_new_string()
     kw_vals = table_new_i64()
     var i: i64 = 0

@@ -270,8 +270,10 @@ pub func infer_expr(id: i64) -> i64 {
     // 字面量
     if tag == 0 {
         // S1.3 L3 后缀字面量：aux = 后缀类型 TyKw（-1 = 无后缀 → i64）
+        // 批次 2（i128/u128）：后缀类型含 TK_I128(21)/TK_U128(22)——
+        // 原 `sfx <= 9` 只覆盖 i8..f64，i128/u128 会落默认 i64 槽。
         var sfx = s_aux[id]
-        if sfx >= 0 && sfx <= 9 {
+        if (sfx >= 0 && sfx <= 9) || sfx == TK_I128 || sfx == TK_U128 {
             node_types[id] = types.named(sfx)
             g_typed = g_typed + 1
             return types.named(sfx)
@@ -1407,7 +1409,8 @@ pub func infer_call(id: i64) -> i64 {
         // as_* 特殊检查（S1.3）：参数必须是数字（整数/浮点），转换才有意义
         if fnm == "as_i8" || fnm == "as_i16" || fnm == "as_i32" || fnm == "as_i64" ||
             fnm == "as_u8" || fnm == "as_u16" || fnm == "as_u32" || fnm == "as_u64" ||
-            fnm == "as_f32" || fnm == "as_f64" {
+            fnm == "as_f32" || fnm == "as_f64" ||
+            fnm == "as_i128" || fnm == "as_u128" {
             var a_ty = infer_expr(args[0])
             if a_ty < 0 {
                 return -1

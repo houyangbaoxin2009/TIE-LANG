@@ -208,6 +208,11 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
             }
         }
     }
+    // 批次 2：i128/u128 除法/取余生成 __divti3/__umodti3 等 compiler-rt 辅助
+    // 调用——clang 默认不链接 builtins，缺符号（undefined symbol: __divti3）。
+    // -rtlib=compiler-rt 让 clang 在资源目录自动定位 builtins 库
+    // （clang 22 对 -lclang_rt.builtins-x86_64 带点参数解析错误，弃用）。
+    cmd = cmd + " -rtlib=compiler-rt"
     return run(cmd)
 }
 

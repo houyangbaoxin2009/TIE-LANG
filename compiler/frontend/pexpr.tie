@@ -555,9 +555,16 @@ func parse_primary() -> i64 {
         return parse_fn_lit(line, col)
     }
     if tag == lex_int {
-        var v = putil.parse_int_lit(putil.peek_lexeme())
+        var lex = putil.peek_lexeme()
+        // 批次 2：字面量值域限于 i64 可表示范围（parse_int_lit 返回 i64，
+        // i128/u128 常量经 add i128 0, i64 构造，超范围回绕符号扩展错误）
+        if putil.int_lit_overflow(lex) {
+            putil.set_err(line, col, "整数字面量超出 i64 可表示范围")
+            return -1
+        }
+        var v = putil.parse_int_lit(lex)
         // S1.3 L3：aux = 后缀类型 TyKw（-1 = 无后缀，默认 i64）
-        var sufx = putil.parse_lit_suffix(putil.peek_lexeme())
+        var sufx = putil.parse_lit_suffix(lex)
         putil.advance()
         return ast.new_node(N_INT_LIT, -1, v, sufx, line, col)
     }

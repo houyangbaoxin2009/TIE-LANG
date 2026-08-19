@@ -192,7 +192,8 @@ pub func impl_has_ty(pi: i64, struct_ty: i64) -> bool {
 }
 
 // ---------- S1.3 窄整数辅助（位宽/符号性） ----------
-// 整数位宽：i8/u8=8 ... i64/u64=64；非整数返回 0。
+// 整数位宽：i8/u8=8 ... i64/u64=64、i128/u128=128；非整数返回 0。
+// 批次 2：i128/u128 → 128（LLVM i128 原生，拓宽/缩窄判定自动覆盖）。
 // pub：sinfer/irgen 在命名空间外调用（窄整数拓宽/缩窄判定）。
 pub func int_width(t: i64) -> i64 {
     if t == TK_I8 || t == TK_U8 {
@@ -207,13 +208,16 @@ pub func int_width(t: i64) -> i64 {
     if t == TK_I64 || t == TK_U64 {
         return 64
     }
+    if t == TK_I128 || t == TK_U128 {
+        return 128
+    }
     return 0
 }
 
 // 有符号判定：i 族（u 族 false；非整数 false）
 // pub：sinfer/irgen 在命名空间外调用（窄整数拓宽/缩窄判定）。
 pub func is_signed(t: i64) -> bool {
-    if t == TK_I8 || t == TK_I16 || t == TK_I32 || t == TK_I64 {
+    if t == TK_I8 || t == TK_I16 || t == TK_I32 || t == TK_I64 || t == TK_I128 {
         return true
     }
     return false

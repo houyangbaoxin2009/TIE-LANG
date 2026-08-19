@@ -59,7 +59,7 @@ const K_FN: i64 = 10;        // fn 函数值类型（S2.2，闭包/函数指针�
 const K_PORT: i64 = 11;      // port 对象类型（S2.4：接口对象，LLVM 表示 = ptr 指向堆打包 {data,vtable}）
 const K_SHIFT: i64 = 40;           // 高位分离位移量（负载 < 2^40）
 
-// ---------- TyKw 索引常量（0..20，对齐 Rust TyKw 变体顺序）----------
+// ---------- TyKw 索引常量（0..22，对齐 Rust TyKw 变体顺序）----------
 const TK_I8: i64 = 0;
 const TK_I16: i64 = 1;
 const TK_I32: i64 = 2;
@@ -81,6 +81,11 @@ const TK_TEXT: i64 = 17;
 const TK_MISC: i64 = 18;
 const TK_TABLE: i64 = 19;
 const TK_MAP: i64 = 20;
+// 批次 2（i128/u128）：128 位整数（2026-08-19，dev33 计划任务 3-6）。
+// 注：Named 类型 id = TyKw 索引（0..22），kind(id) 用 id < 100 判 Named，
+// 新类型索引 < 100 不破坏编码；tykw_names 按索引对齐（见 ensure_tykw_names）。
+const TK_I128: i64 = 21;
+const TK_U128: i64 = 22;
 
 // 高位基数常量（= 1<<40 / 2<<40 / 3<<40 / 4<<40 / 5<<40 / 6<<40，
 // 写死字面量避免运行期位移）
@@ -428,15 +433,15 @@ pub func low(id: i64) -> i64 {
 
 // ---------- 判据族（语义检查/IR 生成共用）----------
 
-// 整数类型：i8/i16/i32/i64/u8/u16/u32/u64（Named 且 TyKw 在整数区间）。
+// 整数类型：i8/i16/i32/i64/i128/u8/u16/u32/u64/u128（Named 且 TyKw 在整数区间）。
 pub func is_int(t: i64) -> bool {
     if t >= 100 {
         return false
     }
-    if t == TK_I8 || t == TK_I16 || t == TK_I32 || t == TK_I64 {
+    if t == TK_I8 || t == TK_I16 || t == TK_I32 || t == TK_I64 || t == TK_I128 {
         return true
     }
-    if t == TK_U8 || t == TK_U16 || t == TK_U32 || t == TK_U64 {
+    if t == TK_U8 || t == TK_U16 || t == TK_U32 || t == TK_U64 || t == TK_U128 {
         return true
     }
     return false
@@ -663,6 +668,9 @@ func ensure_tykw_names() {
     table_push(tykw_names, "misc")
     table_push(tykw_names, "table")
     table_push(tykw_names, "map")
+    // 批次 2（i128/u128）：索引 21/22 对齐 TK_I128/TK_U128
+    table_push(tykw_names, "i128")
+    table_push(tykw_names, "u128")
 }
 
 // 类型 id -> 名字（递归）：Named 查 tykw_names；Table/Map 递归

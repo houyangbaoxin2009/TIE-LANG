@@ -88,3 +88,9 @@ opencode.json
 /tests/s24_probe/*.ll
 # 文件系统层损坏的 tiec.exe 备份（无法删除，git 读取即崩溃 0xC0000006，忽略）
 /compiler/tiec.exe.corrupt
+tiec3.exe
+.gitignore
+probe1.exe
+i128_full.exe
+tiec2.exe
+hello_b2.exe

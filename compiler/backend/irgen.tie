@@ -734,7 +734,16 @@ func gen_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
                 common = rhs_t
             }
         } else {
-            common = types.named(TK_I64)  // 两侧字面量：默认 i64
+            // 两侧字面量：默认 i64——但后缀字面量（i128/u128 等）按宽者
+            // （`1i128 << 64`：lhs 明确 i128，common 须 i128，否则 trunc 到
+            // i64 类型错；批次 2 修复）
+            if stype.int_width(rhs_t) > stype.int_width(lhs_t) {
+                common = rhs_t
+            } else if stype.int_width(lhs_t) > stype.int_width(rhs_t) {
+                common = lhs_t
+            } else {
+                common = types.named(TK_I64)
+            }
         }
         return gen_narrow_bin(op, iop, lv, rv, lhs_t, rhs_t, common)
     }
@@ -772,6 +781,11 @@ func gen_widen(v: i64, src_ty: i64, dst_ty: i64) -> i64 {
     }
     var sw = stype.int_width(src_ty)
     var dw = stype.int_width(dst_ty)
+    if sw == dw {
+        // 同宽不同符号（u128→i128 等）：位模式一致，直传——LLVM 不允许
+        // 同宽 sext/zext（曾生成 zext i128 to i128 类型错；批次 2 修复）
+        return v
+    }
     if sw > dw {
         // 缩窄：trunc（opcode 37）
         var tr = ir.new_inst(g_cur_block, 37, dst_ty)
@@ -1776,7 +1790,13 @@ func gen_bool_lit(v: i64) -> i64 {
 func gen_expr(id: i64) -> i64 {
     var tag = s_tags[id]
     if tag == 0 {
-        // IntLit
+        // IntLit：按推断类型生成常量（后缀字面量 i128/u128/窄整数 → 对应
+        // 类型；默认 i64）。曾固定 gen_int_lit(i64)——`1i128 << 64` 左操作数
+        // 落 i64，移位生成 trunc i128 %i64 类型错（批次 2 修复）。
+        var lt = node_types[id]
+        if lt >= 0 && lt != types.named(TK_I64) && types.is_int(lt) {
+            return gen_int_lit_ty(s_vals[id], lt)
+        }
         return gen_int_lit(s_vals[id])
     }
     if tag == 1 {
@@ -2054,7 +2074,8 @@ func is_builtin_name(nm: string) -> bool {
     // ---------- S1.3 as_* 显式数值转换族 ----------
     if nm == "as_i8" || nm == "as_i16" || nm == "as_i32" || nm == "as_i64" ||
         nm == "as_u8" || nm == "as_u16" || nm == "as_u32" || nm == "as_u64" ||
-        nm == "as_f32" || nm == "as_f64" {
+        nm == "as_f32" || nm == "as_f64" ||
+        nm == "as_i128" || nm == "as_u128" {
         return true
     }
     // ---------- S1.3 checked_* 溢出检测族 ----------
@@ -2521,6 +2542,10 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         as_dst = types.named(TK_F32)
     } else if nm == "as_f64" {
         as_dst = types.named(TK_F64)
+    } else if nm == "as_i128" {
+        as_dst = types.named(TK_I128)
+    } else if nm == "as_u128" {
+        as_dst = types.named(TK_U128)
     }
     if as_dst >= 0 {
         var av = gen_expr(call_arg(id, 0))
@@ -2780,6 +2805,9 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         var vt = node_types[call_arg(id, 0)]
         if vt == types.named(TK_F64) || vt == types.named(TK_F32) {
             g_builtin_res = gen_ext_call1("tie_to_string_f64", v, types.named(TK_F64), types.named(TK_STR))
+        } else if vt == types.named(TK_I128) || vt == types.named(TK_U128) {
+            // 批次 2（i128/u128）：Rust 桥只收 i64，内联除法循环生成十进制串
+            g_builtin_res = gen_i128_to_str(v, vt == types.named(TK_I128))
         } else if vt == types.named(TK_I64) || vt == types.named(TK_U64) || vt < 0 {
             g_builtin_res = gen_ext_call1("tie_to_string_i64", v, types.named(TK_I64), types.named(TK_STR))
         } else {
@@ -5102,6 +5130,139 @@ func s21_sb_build(hv: i64) -> i64 {
     return d0
 }
 
+// i128/u128 → 十进制字符串（批次 2，内联除法循环）。
+// 输入：v = i128 值寄存器；is_signed = 有符号（i128）或无符号（u128）。
+// 输出：带头字符串数据指针（{len 头, 数据, NUL}）。
+// 算法（无符号位模式视角，2026-08-19 重写）：
+//   1. neg = is_signed && (v slt 0)（icmp slt——2^127 位模式判负正确）；
+//   2. v_abs = neg ? (0 - v) : v——sub i128 按位模式减法，无符号视角
+//      0 - v = 2^128 + v = |v|，i128 最小值 -2^127 也正确（2^127，不溢出）；
+//   3. 除法循环：v_abs != 0 → r = urem v_abs 10; q = udiv v_abs 10；
+//      buf[idx] = '0' + trunc(r)；idx--（udiv/urem 按位模式无符号除，
+//      负数/最小值天然正确，无需 sdiv/srem 的符号修正）；
+//   4. 0 值：循环未执行（idx 仍 39）→ buf[39] = '0'，idx = 38；
+//   5. 符号位：if neg: buf[idx] = '-'；idx--；
+//   6. 构造带头字符串：len = 39 - idx；malloc(len+9)；写头；拷数据；NUL。
+func gen_i128_to_str(v: i64, is_signed: bool) -> i64 {
+    var T128 = types.named(TK_I128)
+    var T64 = types.named(TK_I64)
+    var T8 = types.named(TK_I8)
+    var z128 = gen_int_lit_ty(0, T128)
+    var ten = gen_int_lit_ty(10, T128)
+    // 1. 符号判定（signed only）：neg = v < 0（icmp slt）
+    var neg: i64 = -1
+    var v_abs: i64 = v
+    if is_signed {
+        var negc = gen_icmp_c(v, z128, 2)  // slt
+        // 2. 取补码绝对值：v_abs = neg ? (0 - v) : v（位模式减法，最小值不溢出）
+        var sub = ir.new_inst(g_cur_block, 1, T128)  // sub i128
+        ir.add_operand(sub, z128, 0)
+        ir.add_operand(sub, v, 0)
+        v_abs = gen_select_i(negc, ir.get_value(sub), v, T128)
+        neg = negc
+    }
+    // 3. 缓冲区：malloc(40)（i128 十进制最多 39 位 + 符号位）
+    var buf = gen_ext_call1("malloc", gen_int_lit(40), T64, types.named(TK_STR))
+    // idx 槽（i64）：从 39 开始（缓冲区末尾，从后往前填）
+    var idx_slot = ir.new_inst(g_cur_block, 20, T64)  // alloca i64
+    ir.add_operand(idx_slot, T64, 2)
+    var idx_v = ir.get_value(idx_slot)
+    s21_store(idx_v, gen_int_lit(39), T64)
+    // v_abs 槽（i128）：循环内反复读写
+    var v_slot = ir.new_inst(g_cur_block, 20, T128)  // alloca i128
+    ir.add_operand(v_slot, T128, 2)
+    var vs_v = ir.get_value(v_slot)
+    s21_store(vs_v, v_abs, T128)
+    // 4. 除法循环：v_abs != 0 → 取余填缓冲、整除、idx-1
+    var cond_blk = ir.new_block(g_cur_func, interner.intern("i128.cond"))
+    var body_blk = ir.new_block(g_cur_func, interner.intern("i128.body"))
+    var exit_blk = ir.new_block(g_cur_func, interner.intern("i128.exit"))
+    var b0 = ir.new_inst(g_cur_block, 30, -1)  // br cond
+    ir.add_operand(b0, cond_blk, 1)
+    g_cur_block = cond_blk
+    var cur_v = s21_load(vs_v, T128)
+    var cne = gen_icmp_c(cur_v, z128, 1)  // ne
+    var cb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb, cne, 0)
+    ir.add_operand(cb, body_blk, 1)
+    ir.add_operand(cb, exit_blk, 1)
+    g_cur_block = body_blk
+    var cv2 = s21_load(vs_v, T128)
+    var d = ir.new_inst(g_cur_block, 47, T128)  // urem i128
+    ir.add_operand(d, cv2, 0)
+    ir.add_operand(d, ten, 0)
+    var dv = ir.get_value(d)
+    var q = ir.new_inst(g_cur_block, 46, T128)  // udiv i128
+    ir.add_operand(q, cv2, 0)
+    ir.add_operand(q, ten, 0)
+    var qv = ir.get_value(q)
+    s21_store(vs_v, qv, T128)
+    // buf[idx] = '0' + trunc(d)（i128 → i8）
+    var idx1 = s21_load(idx_v, T64)
+    var bp = s21_gep(buf, idx1, false)
+    var d8 = ir.new_inst(g_cur_block, 37, T8)  // trunc
+    ir.add_operand(d8, T128, 2)
+    ir.add_operand(d8, dv, 0)
+    var ch = ir.new_inst(g_cur_block, 0, T8)  // add i8
+    ir.add_operand(ch, ir.get_value(d8), 0)
+    ir.add_operand(ch, 48, 2)  // '0'
+    s21_store(bp, ir.get_value(ch), T8)
+    // idx -= 1
+    s21_store(idx_v, s21_bin(1, idx1, gen_int_lit(1)), T64)
+    var bb2 = ir.new_inst(g_cur_block, 30, -1)  // br cond
+    ir.add_operand(bb2, cond_blk, 1)
+    g_cur_block = exit_blk
+    // 5. 0 值：循环未执行（idx 仍 39）→ 填 '0'，idx = 38
+    var z0_blk = ir.new_block(g_cur_func, interner.intern("i128.zero"))
+    var z1_blk = ir.new_block(g_cur_func, interner.intern("i128.ze"))
+    var idx4 = s21_load(idx_v, T64)
+    var isz = gen_icmp_c(idx4, gen_int_lit(39), 0)  // eq
+    var cbz = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbz, isz, 0)
+    ir.add_operand(cbz, z0_blk, 1)
+    ir.add_operand(cbz, z1_blk, 1)
+    g_cur_block = z0_blk
+    s21_store(s21_gep(buf, gen_int_lit(39), false), gen_int_lit_ty(48, T8), T8)  // '0'
+    s21_store(idx_v, gen_int_lit(38), T64)
+    var brz = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brz, z1_blk, 1)
+    g_cur_block = z1_blk
+    // 6. 符号位（signed）：if neg: buf[idx] = '-'; idx -= 1
+    if is_signed {
+        var st = ir.new_block(g_cur_func, interner.intern("i128.sgn"))
+        var se = ir.new_block(g_cur_func, interner.intern("i128.sge"))
+        var cb2 = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb2, neg, 0)
+        ir.add_operand(cb2, st, 1)
+        ir.add_operand(cb2, se, 1)
+        g_cur_block = st
+        var idx3 = s21_load(idx_v, T64)
+        s21_store(s21_gep(buf, idx3, false), gen_int_lit_ty(45, T8), T8)  // '-'
+        s21_store(idx_v, s21_bin(1, idx3, gen_int_lit(1)), T64)
+        var brs = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(brs, se, 1)
+        g_cur_block = se
+    }
+    // 7. 构造带头字符串：len = 39 - idx；malloc(len+9)；写头；拷数据；NUL
+    var idx5 = s21_load(idx_v, T64)
+    var len = s21_bin(1, gen_int_lit(39), idx5)  // sub
+    var size = s21_bin(0, len, gen_int_lit(9))  // add
+    var out = gen_ext_call1("malloc", size, T64, types.named(TK_STR))
+    s21_store(s21_gep(out, 0, true), len, T64)  // 长度头
+    var d0 = s21_gep(out, 8, true)  // 数据起始
+    var src = s21_gep(buf, s21_bin(0, idx5, gen_int_lit(1)), false)  // buf + idx + 1
+    s21_memcpy_if(d0, src, len)
+    s21_store(s21_gep(d0, len, false), gen_int_lit_ty(0, T8), T8)  // 尾 \0
+    // 包装为 TK_STR 类型：d0 是 gep 结果（ins_ty=TK_I8 元素类型），arg_ref 按
+    // ins_ty 判 ptr 会落兜底 i64——ptrtoint+inttoptr 后 ins_ty=TK_STR，
+    // printf 实参/str_cat 拼接等消费方按 ptr 处理。
+    var pi = ir.new_inst(g_cur_block, 24, T64)  // ptrtoint
+    ir.add_operand(pi, d0, 0)
+    var ip = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr → ptr
+    ir.add_operand(ip, ir.get_value(pi), 0)
+    return ir.get_value(ip)
+}
+
 // 便捷：双参数 void 桥
 func gen_ext_call2v(sym: string, v1: i64, ty1: i64, v2: i64, ty2: i64) {
     var ats: table<i64> = table_new_i64()
@@ -5777,6 +5938,20 @@ func gen_println(id: i64, newline: bool) -> i64 {
         ir.add_operand(sext, tv, 0)
         var sv = ir.get_value(sext)
         var fmt = interner.intern("%d" + nl)
+        var inst = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
+        ir.add_operand(inst, fmt, 0)
+        ir.add_operand(inst, sv, 0)
+        return ir.get_value(inst)
+    }
+    // i128/u128 参数（批次 2）：内联除法循环生成十进制字符串 → "%s\n" + ptr。
+    // 不能直传 printf（变参 i128 与 %lld 类型不匹配，opt 报类型错）。
+    if node_types[arg] == types.named(TK_I128) || node_types[arg] == types.named(TK_U128) {
+        var av = gen_expr(arg)
+        if av < 0 {
+            return -1
+        }
+        var sv = gen_i128_to_str(av, node_types[arg] == types.named(TK_I128))
+        var fmt = interner.intern("%s" + nl)
         var inst = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
         ir.add_operand(inst, fmt, 0)
         ir.add_operand(inst, sv, 0)
