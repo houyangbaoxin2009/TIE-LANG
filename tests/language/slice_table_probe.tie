@@ -1,0 +1,41 @@
+type tie<logic>
+// 任务16 探针：slice_of 动态表桥（表 → 连续内存切片）。
+// 表 [10,20,30,40] → slice_of(t, 1, 3) 应得连续内存切片 [20,30,40]：
+//   - slice_len = 3（长度正确）
+//   - slice_index(0/1/2) = 20/30/40（内容与表一致、内存布局连续按序）
+//   - f64 表 → slice<f64>（非 i64 元素桥：slice_of/at_f64）
+// 预期输出：3 / 20 / 30 / 40 / PASS batch6-slice-table
+func main() {
+    var t = table_new_i64()
+    table_push(t, 10)
+    table_push(t, 20)
+    table_push(t, 30)
+    table_push(t, 40)
+    var slen: i64 = 0
+    var s0: i64 = 0
+    var s1: i64 = 0
+    var s2: i64 = 0
+    var fd: f64 = 0.0
+    unsafe {
+        var s = slice_of(t, 1, 3)
+        slen = slice_len(s)
+        s0 = slice_index(s, 0)
+        s1 = slice_index(s, 1)
+        s2 = slice_index(s, 2)
+        // f64 表 → slice<f64>：元素类型桥 at_f64
+        var tf = table_new_f64()
+        table_push(tf, 1.5)
+        table_push(tf, 2.5)
+        var sf = slice_of(tf, 0, 2)
+        fd = slice_index(sf, 1)
+    }
+    println(to_string(slen))
+    println(to_string(s0))
+    println(to_string(s1))
+    println(to_string(s2))
+    if slen == 3 && s0 == 20 && s1 == 30 && s2 == 40 && fd == 2.5 {
+        println("PASS batch6-slice-table")
+    } else {
+        println("FAIL batch6-slice-table")
+    }
+}

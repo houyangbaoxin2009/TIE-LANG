@@ -2496,12 +2496,140 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         return 0
     }
     if nm == "slice_of" {
-        // slice_of(s, start, len) → slice<u8> 聚合：字符串数据指针 + 长度。
-        // 第一版只支持字符串（表数据指针桥后置，语义层已拦截表）。
+        // slice_of(obj, start, len) → slice<元素类型> 聚合：指针 + 长度。
+        // 字符串路径：数据指针直接 + len（第一版）。
+        // 动态表路径（任务16）：表 → 连续内存切片——alloc 连续缓冲 + 逐元素
+        // tie_table_at_* 拷贝（全 .tie，无新增 Rust 桥；运行时表数据区在桥内）。
         var arr = call_arg(id, 0)
         var at2 = node_types[arr]
+        if types.is_table(at2) {
+            // ---------- 动态表 → 连续内存切片（任务16）----------
+            // 元素类型：table_elem（typed table<T>）→ var_table_elem（table_new_i64
+            // 等语义登记，裸 table 无元素信息）→ i64 兜底。
+            var etab: i64 = types.named(TK_I64)
+            var te2 = types.table_elem(at2)
+            if te2 >= 0 {
+                etab = te2
+            } else if s_tags[arr] == 6 {
+                var te3 = sinfer.var_table_elem(intern.intern(sstate.name_str(arr)))
+                if te3 >= 0 {
+                    etab = te3
+                }
+            }
+            var tb = gen_expr(arr)
+            if tb < 0 {
+                return -1
+            }
+            var start = gen_expr(call_arg(id, 1))
+            if start < 0 {
+                return -1
+            }
+            var cnt = gen_expr(call_arg(id, 2))
+            if cnt < 0 {
+                return -1
+            }
+            // 分配连续缓冲：cnt * elem_size 字节（malloc 返回 ptr<u8>）
+            var esz = elem_size(etab)
+            var esz_v = gen_int_lit_ty(esz, types.named(TK_I64))
+            var m = ir.new_inst(g_cur_block, 2, types.named(TK_I64))  // mul
+            ir.add_operand(m, esz_v, 0)
+            ir.add_operand(m, cnt, 0)
+            var buf = gen_ext_call1("malloc", ir.get_value(m), types.named(TK_I64), types.named(TK_STR))
+            // LLVM opaque ptr：malloc 结果 ptr 直接用于 gep（元素类型 = ins_ty，
+            // 步长按 etab）；无需 bitcast。
+            var bp = buf
+            var suffix = bridge_suffix(etab)
+            var ret_ty: i64 = types.named(TK_I64)
+            if suffix == "string" {
+                ret_ty = types.named(TK_STR)
+            } else if suffix == "f64" {
+                ret_ty = types.named(TK_F64)
+            } else if suffix == "bool" {
+                ret_ty = types.named(TK_BOOL)
+            }
+            // 运行时循环（cnt/start 是运行期值，不能用编译期展开）：计数器 i
+            // alloca 0..cnt，body 每次迭代 tie_table_at 读 + 写连续缓冲。
+            var i_a = ir.new_inst(g_cur_block, 20, types.named(TK_I64))  // alloca i64
+            ir.add_operand(i_a, types.named(TK_I64), 2)
+            var i_ptr = ir.get_value(i_a)
+            var i_zero = gen_int_lit_ty(0, types.named(TK_I64))
+            var st0 = ir.new_inst(g_cur_block, 22, -1)  // store 0 → i
+            ir.add_operand(st0, types.named(TK_I64), 2)
+            ir.add_operand(st0, i_zero, 0)
+            ir.add_operand(st0, i_ptr, 0)
+            var cond_blk = ir.new_block(g_cur_func, interner.intern("slc.cond"))
+            var body_blk = ir.new_block(g_cur_func, interner.intern("slc.body"))
+            var step_blk = ir.new_block(g_cur_func, interner.intern("slc.step"))
+            var exit_blk = ir.new_block(g_cur_func, interner.intern("slc.exit"))
+            var b0 = ir.new_inst(g_cur_block, 30, -1)  // br cond
+            ir.add_operand(b0, cond_blk, 1)
+            // cond 块：i < cnt → body，否则 exit
+            g_cur_block = cond_blk
+            var cur = ir.new_inst(g_cur_block, 21, types.named(TK_I64))  // load i
+            ir.add_operand(cur, i_ptr, 0)
+            var cur_v = ir.get_value(cur)
+            var cnd = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp slt
+            ir.add_operand(cnd, cur_v, 0)
+            ir.add_operand(cnd, cnt, 0)
+            ir.add_operand(cnd, 2, 2)  // slt
+            var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+            ir.add_operand(cb, ir.get_value(cnd), 0)
+            ir.add_operand(cb, body_blk, 1)
+            ir.add_operand(cb, exit_blk, 1)
+            // body 块：idx = start + i；读表元素；写缓冲 buf + i 元素步长
+            g_cur_block = body_blk
+            var cur2 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))  // load i
+            ir.add_operand(cur2, i_ptr, 0)
+            var i_v = ir.get_value(cur2)
+            var idx = ir.new_inst(g_cur_block, 0, types.named(TK_I64))  // add start + i
+            ir.add_operand(idx, start, 0)
+            ir.add_operand(idx, i_v, 0)
+            var ok_slot = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
+            ir.add_operand(ok_slot, types.named(TK_I8), 2)
+            var ats: table<i64> = table_new_i64()
+            var avs: table<i64> = table_new_i64()
+            table_push(ats, types.named(TK_STR))
+            table_push(avs, tb)
+            table_push(ats, types.named(TK_I64))
+            table_push(avs, ir.get_value(idx))
+            table_push(ats, types.named(TK_STR))
+            table_push(avs, ir.get_value(ok_slot))
+            var val = gen_ext_call_typed("tie_table_at_" + suffix, ats, avs, ret_ty)
+            if val < 0 {
+                return -1
+            }
+            // 写缓冲：buf + i 元素步长（gep 单索引，i 为运行期值）
+            var gp = ir.new_inst(g_cur_block, 23, etab)
+            ir.add_operand(gp, bp, 0)
+            ir.add_operand(gp, i_v, 0)
+            var st = ir.new_inst(g_cur_block, 22, -1)  // store
+            ir.add_operand(st, etab, 2)
+            ir.add_operand(st, val, 0)
+            ir.add_operand(st, ir.get_value(gp), 0)
+            var bb = ir.new_inst(g_cur_block, 30, -1)  // br step
+            ir.add_operand(bb, step_blk, 1)
+            // step 块：i += 1
+            g_cur_block = step_blk
+            var cur3 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))  // load i
+            ir.add_operand(cur3, i_ptr, 0)
+            var i3 = ir.get_value(cur3)
+            var one = gen_int_lit_ty(1, types.named(TK_I64))
+            var inc = ir.new_inst(g_cur_block, 0, types.named(TK_I64))  // add i + 1
+            ir.add_operand(inc, i3, 0)
+            ir.add_operand(inc, one, 0)
+            var st2 = ir.new_inst(g_cur_block, 22, -1)  // store i+1 → i
+            ir.add_operand(st2, types.named(TK_I64), 2)
+            ir.add_operand(st2, ir.get_value(inc), 0)
+            ir.add_operand(st2, i_ptr, 0)
+            var sb = ir.new_inst(g_cur_block, 30, -1)  // br cond
+            ir.add_operand(sb, cond_blk, 1)
+            // exit 块
+            g_cur_block = exit_blk
+            g_builtin_res = make_slice2(buf, cnt, etab)
+            return 0
+        }
         if at2 != TK_STR {
-            sm_err_msg = "slice_of() 第一版只支持字符串（函数 " + g_cur_fn_name + "）"
+            sm_err_msg = "slice_of() 第一版只支持字符串或动态表（函数 " + g_cur_fn_name + "）"
             return -1
         }
         var et: i64 = types.named(TK_U8)

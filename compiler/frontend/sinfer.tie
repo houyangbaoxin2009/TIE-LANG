@@ -1380,13 +1380,28 @@ pub func infer_call(id: i64) -> i64 {
             if a1 < 0 {
                 return -1
             }
-            // S1.2：第一版 slice_of 只支持字符串（ptr 即数据指针）；
-            // 动态表数据区在运行时桥内无数据指针桥（后置）。
+            // S1.2：字符串 → slice<u8>（ptr 即数据指针）；
+            // 任务16：动态表 → slice<元素类型>（irgen 桥：连续缓冲 + 逐元素拷贝）。
+            // 表元素类型：table_elem（typed table<T>）→ var_table_elem（table_new_i64
+            // 等语义登记，裸 table 无元素信息）→ u8 兜底。
             var et1: i64 = types.named(TK_U8)
-            if a1 != TK_STR {
+            if types.is_table(a1) {
+                var te1 = types.table_elem(a1)
+                if te1 >= 0 {
+                    et1 = te1
+                } else {
+                    var tn1 = args[0]
+                    if s_tags[tn1] == 6 {
+                        var te2 = var_table_elem(intern.intern(sstate.name_str(tn1)))
+                        if te2 >= 0 {
+                            et1 = te2
+                        }
+                    }
+                }
+            } else if a1 != TK_STR {
                 sm_err_line = s_lines[id]
                 sm_err_col = s_cols[id]
-                sm_err_msg = "slice_of() 第一版只支持字符串（表的数据指针桥后置），实际是 " + types.type_name(a1)
+                sm_err_msg = "slice_of() 只支持字符串或动态表，实际是 " + types.type_name(a1)
                 return -1
             }
             node_types[id] = types.slice_of(et1)
