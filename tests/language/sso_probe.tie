@@ -1,0 +1,72 @@
+// SSO 短串池验收探针（dev33 批次 3，任务 7/9）
+// 背景：字符串运行时构造点（str_cat 拼接 / 数字转串 / sb_build / 码点转串 /
+// FFI 扫描）对短串（≤31 字节 UTF-8 数据）从静态线性池 bump 分配（零 malloc），
+// 长串（32+ 字节）回退 malloc（@s21_sso_malloc_cnt 计数）。
+// 断言：
+//   1. 短串构造后 sso_malloc_count() == 0（核心验收：短串无堆分配）
+//   2. 32 字节长串 → 回退计数 ≥ 1（长串边界正确）
+//   3. 短/长串拼接、比较、码点遍历行为与手工期望一致
+func assert_eq(a: string, b: string, tag: string) {
+    if a != b {
+        println("FAIL " + tag + ": got=[" + a + "] want=[" + b + "]")
+        panic("断言失败: " + tag)
+    }
+}
+func main() {
+    // ---- 1. 短串拼接（≤31 字节）----
+    var s1 = "hello"
+    var s2 = " world"
+    var sc = s1 + s2                     // 11 字节短串 → 池分配
+    assert_eq(sc, "hello world", "concat-short")
+    // ---- 2. 数字转串（短）----
+    assert_eq(to_string(42), "42", "i64-to-str")
+    assert_eq(to_string(-7), "-7", "i64-to-str-neg")
+    assert_eq(to_string(123456), "123456", "i64-to-str-6")
+    // ---- 3. StringBuilder（短）----
+    var sb = string_builder()
+    sb_append(sb, "ab")
+    sb_append(sb, "cd")
+    var sbc = sb_build(sb)
+    assert_eq(sbc, "abcd", "sb-short")
+    // ---- 4. 码点转串（短，恒 ≤4 字节）----
+    assert_eq(str_from_code(0x4F60), "你", "codepoint-short")
+    // ---- 5. 短串分配次数 = 0（关键验收）----
+    var cnt0 = sso_malloc_count()
+    if cnt0 != 0 {
+        println("FAIL: sso_malloc_count=" + to_string(cnt0))
+        panic("短串不应触发 malloc")
+    }
+    println("OK 短串零 malloc（count=0）")
+    // ---- 6. 长串边界（32 字节分界）----
+    var long31 = "1234567890123456789012345678901"     // 31 字节（短串上限）
+    var short31 = long31 + ""                          // 31 字节拼接 → 池（零 malloc）
+    assert_eq(short31, long31, "long31")
+    var long32 = long31 + "x"                          // 32 字节 → 长串 → malloc 回退
+    assert_eq(long32, "1234567890123456789012345678901x", "long32")
+    var cnt1 = sso_malloc_count()
+    if cnt1 < 1 {
+        println("FAIL: 32 字节长串应触发回退 malloc（count=" + to_string(cnt1) + "）")
+        panic("长串未回退")
+    }
+    println("OK 长串回退计数=" + to_string(cnt1))
+    // ---- 7. 中文/emoji 短串拼接 + 码点遍历 ----
+    var cn = "中文" + "串"
+    assert_eq(cn, "中文串", "cn-concat")
+    var cntc: i64 = 0
+    for c in cn.chars() {
+        cntc = cntc + 1
+    }
+    if cntc != 3 {
+        println("FAIL: chars 计数 " + to_string(cntc))
+        panic("码点遍历错误")
+    }
+    // ---- 8. 循环短串构造（池空间复用正确性）----
+    var acc: string = ""
+    var k: i64 = 0
+    while k < 5 {
+        acc = acc + "x"
+        k = k + 1
+    }
+    assert_eq(acc, "xxxxx", "loop-concat")
+    println("OK sso 探针全过")
+}

@@ -69,6 +69,10 @@ var g_vt_tys: table<i64>;     // vtable 聚合类型文本池 id（"{ ptr, ptr }
 var g_vt_n: table<i64>;       // 字段数（= port 方法数）
 var g_vt_off: table<i64>;     // 方法符号段偏移（g_vt_syms 扁平段）
 var g_vt_syms: table<i64>;    // 方法函数全名池 id（扁平段）
+// SSO 短串池（dev33 批次 3）：启用标记。irgen 首次调用 s21_sso_alloc 置位，
+// emit 主流程据此刻意输出 @s21_sso_pool / @s21_sso_off / @s21_sso_malloc_cnt。
+// 仅用到短串池的程序才带 256KB .bss，纯字面量程序不引入。
+var g_sso_enabled: i64 = 0;
 // 阶段 A：str_cat 内联序列的临时寄存器计数（与 printf sext 同款独立命名空间，
 // 避免与 %N 值编号冲突）
 var g_str_reg_cnt: i64 = 0;
@@ -290,6 +294,53 @@ func emit_globals() {
     if len(g_global_names) > 0 {
         line("")
     }
+}
+
+// SSO 短串池启用标记（irgen s21_sso_alloc 首次调用置位；幂等）。
+pub func sso_enable() {
+    g_sso_enabled = 1
+}
+
+// 输出 SSO 短串池全局段（emit_globals 之后）：仅 g_sso_enabled 时输出。
+//   @s21_sso_pool      = 256KB 静态线性池（.bss，零运行时初始化）
+//   @s21_sso_off       = 当前 bump 偏移
+//   @s21_sso_malloc_cnt = 池满回退 malloc 的累计次数（验收探针断言 = 0）
+// 并定义短串池分配 helper @tie_sso_alloc(i64 %n) -> ptr：
+//   参数 n = 数据长度（UTF-8 字节）；返回块基址（头位置，调用方写头后取数据）。
+//   块 = n + 41（8 头 + 数据 + \0 + 32 尾部填充，漏洞 B 安全余量不变）。
+//   短串（n ≤ 31 且池剩余 ≥ n+41）→ 池 bump（零 malloc）；否则回退 malloc 计数。
+//   供 llvmgen op56（str_cat）与 gen_ext_str_scan（FFI 收方向）内联调用——
+//   与 irgen s21_sso_alloc 逻辑同构（共用 @s21_sso_off / @s21_sso_malloc_cnt）。
+func emit_sso_globals() {
+    if g_sso_enabled == 0 {
+        return
+    }
+    line("@s21_sso_pool = private global [262144 x i8] zeroinitializer")
+    line("@s21_sso_off = private global i64 0")
+    line("@s21_sso_malloc_cnt = private global i64 0")
+    line("define private ptr @tie_sso_alloc(i64 %n) {")
+    line("  %short = icmp sle i64 %n, 31")
+    line("  %need = add i64 %n, 41")
+    line("  %off = load i64, ptr @s21_sso_off")
+    line("  %remain = sub i64 262144, %off")
+    line("  %space = icmp sle i64 %need, %remain")
+    line("  %ok = and i1 %short, %space")
+    line("  br i1 %ok, label %sso.pool, label %sso.heap")
+    line("sso.pool:")
+    line("  %pb = ptrtoint ptr @s21_sso_pool to i64")
+    line("  %p = add i64 %pb, %off")
+    line("  %noff = add i64 %off, %need")
+    line("  store i64 %noff, ptr @s21_sso_off")
+    line("  %pp = inttoptr i64 %p to ptr")
+    line("  ret ptr %pp")
+    line("sso.heap:")
+    line("  %cnt = load i64, ptr @s21_sso_malloc_cnt")
+    line("  %ncnt = add i64 %cnt, 1")
+    line("  store i64 %ncnt, ptr @s21_sso_malloc_cnt")
+    line("  %m = call ptr @malloc(i64 %need)")
+    line("  ret ptr %m")
+    line("}")
+    line("")
 }
 
 // 用户函数调用（call 35）符号登记（去重；命名空间函数全名 → $）
@@ -1386,6 +1437,11 @@ func global_ref(v: i64) -> string {
     if str_len(nm) > 0 && str_char(nm, 0) == "@" {
         nm = l_slice(nm, 1, str_len(nm))
     }
+    // SSO 短串池内部符号白名单（dev33 批次 3）：不登记进 g_global_names
+    //（避免影响普通全局），仅 s21_sso_alloc 内联生成时按名直引。
+    if nm == "s21_sso_pool" || nm == "s21_sso_off" || nm == "s21_sso_malloc_cnt" {
+        return "@" + nm
+    }
     var nid = interner.intern(nm)
     var i: i64 = 0
     while i < len(g_global_names) {
@@ -2014,8 +2070,11 @@ func gen_inst(inst_id: i64) {
         // 良性越读（自举产物 tiec2b 曾因 1 字节余量撞未映射页 0xC0000005，
         // 漏洞 B 根因）。填充只影响分配大小，{ptr,len} 语义不变。
         var total = reg_add(n1, n2)
-        var size = reg_add(total, "41")
-        var buf = gen_call_ptr("malloc", "i64", size)
+        // SSO（dev33 批次3）：块分配走 @tie_sso_alloc——短串（≤31 字节）从
+        // 静态池 bump（零 malloc），长串回退 malloc（helper 内部 +41：8 头 +
+        // 1 \0 + 32 尾部填充，容纳向量化宽读，漏洞 B 修复）。返回块基址。
+        sso_enable()
+        var buf = gen_call_ptr("tie_sso_alloc", "i64", total)
         // 写头部长度（S2.1 长度字段）
         line("store i64 " + total + ", ptr " + buf)
         // 数据起始 = buf + 8
@@ -2308,13 +2367,14 @@ func gen_ext_str_scan(reg: string, sym: string, args: string) {
     var src = "%sc" + to_string(g_str_reg_cnt)
     line(src + " = select i1 " + irn + ", ptr " +
         str_data_ref(str_slot(interner.intern(""))) + ", ptr " + tmp)
-    // 统一扫描：n = strlen(src)；buf = malloc(n+41)；buf[0]=n；
+    // 统一扫描：n = strlen(src)；buf = @tie_sso_alloc(n)（短串走静态池零
+    // malloc / 长串回退 malloc，块含 8 头 + 1 \0 + 32 尾部填充）；buf[0]=n；
     // memcpy(buf+8, src, n)；buf[8+n]=0；reg = 数据指针 buf+8。
-    // （+41 = 8 头 + 1 \0 + 32 尾部填充，容纳向量化宽读，漏洞 B 修复）
+    //（SSO 短串池 dev33 批次3；+41 尾部填充容纳向量化宽读，漏洞 B 修复）
     // NULL 时 src=空串数据 len 0 → 产出空串；其余为真实 char* 扫描。
     var rn = gen_call_i64("strlen", "ptr", src)
-    var sz = reg_add(rn, "41")
-    var bf = gen_call_ptr("malloc", "i64", sz)
+    sso_enable()
+    var bf = gen_call_ptr("tie_sso_alloc", "i64", rn)
     line("store i64 " + rn + ", ptr " + bf)
     var dd = reg_gep(bf, "8")
     line("call void @llvm.memcpy.p0.p0.i64(ptr " + dd + ", ptr " + src + ", i64 " + rn + ", i1 false)")
@@ -2394,6 +2454,9 @@ pub func emit() -> string {
     // 字符串常量节
     line("")
     emit_strings()
+    // SSO 短串池全局段 + @tie_sso_alloc helper：**必须在函数遍历之后**输出——
+    // op56（str_cat）在 gen_func 时才调 sso_enable()，提前输出会漏 helper。
+    emit_sso_globals()
     return join_lines()
 }
 

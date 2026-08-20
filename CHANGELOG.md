@@ -1,3 +1,24 @@
+## [新增] SSO 短串池（字符串短串优化）—— 2026-08-21
+
+dev33 计划批次 3（任务 7-9）：短串（≤31 字节 UTF-8 数据）运行时构造改为从
+**静态线性池** bump 分配（零 malloc），长串照旧 malloc——保留 {ptr,len} 值
+语义与字符串 ABI 不动（IR/容器/FFI/去 Rust 桥成果零改动），短串零堆分配：
+
+- **短串池**：`@s21_sso_pool` 256KB 静态线性池（.bss）+ `@s21_sso_off` bump
+  偏移；块 = 8 长度头 + 数据 + `\0` + 32 字节尾部填充（漏洞 B 安全余量不变）。
+  池满自动回退 malloc（`@s21_sso_malloc_cnt` 计数，探针断言 = 0）；
+- **构造点接入**（全部短串运行时构造）：`str_cat` 拼接（llvmgen op56）、
+  StringBuilder `sb_build`、`to_string`（i64/i128→十进制）、`str_from_code`
+  （码点→单字符）、FFI 接收方向自动扫描——5 处统一走 `s21_sso_alloc`
+  （irgen 内联生成）或 `@tie_sso_alloc` helper（llvmgen 侧）；
+- **字面量**天然零分配（.rodata 不变）；长串（32+ 字节）malloc 照旧；
+- **验收**：`tests/language/sso_probe.tie` 全绿——短串（拼接/数字转串/sb/
+  码点转串）`sso_malloc_count()==0`、31 字节短串走池、32 字节长串回退、
+  中文/emoji 拼接与码点遍历正确、循环拼接正确；
+- **回归**：全量 PASS=62 + sso_probe（既有 11 个 import 大库失败为既有
+  漏洞 B——HEAD 对照确认非本批引入；try_probe/shift_neg_free 为已知基线）；
+- **内建**：新增 `sso_malloc_count()`（回退 malloc 累计次数，诊断/验收用）。
+
 ## [新增] 字符串码点迭代器（s.chars()）—— 2026-08-20
 
 dev33 计划批次 4（任务 10-12）：`for c in s.chars()` 语法糖（Unicode 码点

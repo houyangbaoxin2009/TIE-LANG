@@ -2143,7 +2143,7 @@ func is_builtin_name(nm: string) -> bool {
     // StringBuilder 句柄（string_builder/sb_append/sb_append_byte/sb_build）
     if nm == "str_byte" || nm == "utf8_seq_len" || nm == "utf8_char_at" ||
         nm == "string_builder" || nm == "sb_append" || nm == "sb_append_byte" ||
-        nm == "sb_build" {
+        nm == "sb_build" || nm == "sso_malloc_count" {
         return true
     }
     // ---------- 网络原语（P0：std/net）----------
@@ -3032,6 +3032,15 @@ func builtin_expr(nm: string, id: i64) -> i64 {
             return -1
         }
         g_builtin_res = s21_utf8_char_at(v, i)
+        return 0
+    }
+    // SSO 短串池回退 malloc 累计次数（dev33 批次3 验收探针用：断言 = 0）
+    if nm == "sso_malloc_count" {
+        llvmgen.sso_enable()
+        var cnt_id = interner.intern("@s21_sso_malloc_cnt")
+        var ldc = ir.new_inst(g_cur_block, 21, types.named(TK_I64))  // load
+        ir.add_operand(ldc, cnt_id, 3)  // OK_GLOBAL → @s21_sso_malloc_cnt
+        g_builtin_res = ir.get_value(ldc)
         return 0
     }
     if nm == "string_builder" {
@@ -5357,6 +5366,83 @@ func s21_raw_alloc_str(n: i64) -> i64 {
     return ir.get_value(ip)
 }
 
+// ==================== SSO 短串池（dev33 批次 3，任务 7） ====================
+// 短串池分配：n = 数据长度（UTF-8 字节数）。块 = n + 41（8 字节长度头 + 数据 +
+// \0 + 32 字节尾部填充——容纳向量化宽读，漏洞 B 安全余量不变）。返回**块基址**
+//（头位置，与 s21_raw_alloc_str 语义一致：调用方写头后返回数据指针）。
+// 短串（n ≤ 31 且池剩余 ≥ n+41）→ 静态线性池 bump 分配（零 malloc）；
+// 否则回退 malloc（s21_raw_alloc_str）并累计回退计数（验收探针断言 = 0）。
+// 池不回收（单线程递增分配；进程退出回收——与字符串不可变共享语义一致）。
+func s21_sso_alloc(n: i64) -> i64 {
+    llvmgen.sso_enable()  // 置位：llvmgen 据此输出池全局
+    var T64 = types.named(TK_I64)
+    var CAP = gen_int_lit(262144)  // 256KB 静态池
+    // 结果槽（alloca 提升到 entry 由 llvmgen 统一处理）
+    var slot = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(slot, T64, 2)
+    var sv = ir.get_value(slot)
+    // need = n + 41（块总大小）；off = load @s21_sso_off
+    var need = s21_bin(0, n, gen_int_lit(41))  // add
+    var off_id = interner.intern("@s21_sso_off")
+    var ldo = ir.new_inst(g_cur_block, 21, T64)  // load
+    ir.add_operand(ldo, off_id, 3)  // OK_GLOBAL → @s21_sso_off
+    var off = ir.get_value(ldo)
+    // remain = CAP - off；short_c = n ≤ 31；space_c = need ≤ remain
+    var remain = s21_bin(1, CAP, off)  // sub
+    var short_c = gen_icmp_c(n, gen_int_lit(31), 4)  // sle
+    var space_c = gen_icmp_c(need, remain, 4)  // sle
+    var cond = gen_and_i1(short_c, space_c)
+    // 分支：then（池路径）/ else（malloc 回退）/ merge
+    var bt = ir.new_block(g_cur_func, interner.intern("sso.t"))
+    var be = ir.new_block(g_cur_func, interner.intern("sso.e"))
+    var merge = ir.new_block(g_cur_func, interner.intern("sso.m"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cb, cond, 0)
+    ir.add_operand(cb, bt, 1)
+    ir.add_operand(cb, be, 1)
+    // then：p = pool_base + off；store @s21_sso_off = off + need
+    g_cur_block = bt
+    var pool_id = interner.intern("@s21_sso_pool")
+    var pi = ir.new_inst(g_cur_block, 24, T64)  // ptrtoint @s21_sso_pool → i64
+    ir.add_operand(pi, pool_id, 3)
+    var pbase = ir.get_value(pi)
+    var p = s21_bin(0, pbase, off)  // add：池块基址
+    s21_store(sv, p, T64)
+    var noff = s21_bin(0, off, need)  // add：新偏移
+    var st1 = ir.new_inst(g_cur_block, 22, -1)  // store
+    ir.add_operand(st1, T64, 2)
+    ir.add_operand(st1, noff, 0)
+    ir.add_operand(st1, off_id, 3)  // OK_GLOBAL → @s21_sso_off
+    var br1 = ir.new_inst(g_cur_block, 30, -1)  // br merge
+    ir.add_operand(br1, merge, 1)
+    // else：回退计数 +1；m = s21_raw_alloc_str(need)（malloc need 字节）
+    g_cur_block = be
+    var cnt_id = interner.intern("@s21_sso_malloc_cnt")
+    var ldc = ir.new_inst(g_cur_block, 21, T64)  // load
+    ir.add_operand(ldc, cnt_id, 3)  // OK_GLOBAL → @s21_sso_malloc_cnt
+    var cnt = ir.get_value(ldc)
+    var ncnt = s21_bin(0, cnt, gen_int_lit(1))  // add
+    var st2 = ir.new_inst(g_cur_block, 22, -1)  // store
+    ir.add_operand(st2, T64, 2)
+    ir.add_operand(st2, ncnt, 0)
+    ir.add_operand(st2, cnt_id, 3)  // OK_GLOBAL → @s21_sso_malloc_cnt
+    var m = s21_raw_alloc_str(need)
+    // m 是 TK_STR（ptr）值；槽存 i64 块基址整数——先 ptrtoint
+    var mi = ir.new_inst(g_cur_block, 24, T64)  // ptrtoint m → i64
+    ir.add_operand(mi, m, 0)
+    s21_store(sv, ir.get_value(mi), T64)
+    var br2 = ir.new_inst(g_cur_block, 30, -1)  // br merge
+    ir.add_operand(br2, merge, 1)
+    // merge：结果 = load 槽（i64 块基址整数）→ inttoptr 包成 TK_STR 返回
+    //（与 s21_raw_alloc_str 语义一致：返回 ptr 值 = 块基址/头位置，消费方
+    //  to_ptr 按 ptr 处理——不能直接返回 i64，否则 gep 地址类型错）
+    g_cur_block = merge
+    var rv = s21_load(sv, T64)
+    var rip = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr → TK_STR
+    ir.add_operand(rip, rv, 0)
+    return ir.get_value(rip)
+}
+
 // 字符串长度头读取：len(s) = load i64, gep(i8, s, -8)——O(1)
 func s21_str_head_len(s: i64) -> i64 {
     var hp = s21_gep(s, -8, true)
@@ -5544,15 +5630,14 @@ func s21_sb_append_byte(hv: i64, b: i64) {
     s21_store(s21_gep(h, 8, true), need, types.named(TK_I64))
 }
 
-// sb_build(h)：产出 {头, 数据, \0} 字符串（malloc len+41；写头；拷数据；尾 \0）。
-// +41 = 8 头 + 1 \0 + 32 尾部填充（容纳向量化宽读，漏洞 B 修复）。
-// 句柄不释放（探针/短期程序进程退出回收；文档注明可复用）。
+// sb_build(h)：产出 {头, 数据, \0} 字符串（短串走 SSO 静态池零分配 /
+// 长串 malloc len+41；写头；拷数据；尾 \0）。+41 = 8 头 + 1 \0 + 32 尾部填充
+//（容纳向量化宽读，漏洞 B 修复）。句柄不释放（探针/短期程序进程退出回收）。
 func s21_sb_build(hv: i64) -> i64 {
     var h = s21_sb_ptr(hv)
     var len = s21_load(s21_gep(h, 8, true), types.named(TK_I64))
     var data = s21_load(s21_gep(h, 16, true), types.named(TK_STR))
-    var size = s21_bin(0, len, gen_int_lit(41))
-    var buf = s21_raw_alloc_str(size)
+    var buf = s21_sso_alloc(len)
     s21_store(s21_gep(buf, 0, true), len, types.named(TK_I64))  // 长度头
     var d0 = s21_gep(buf, 8, true)  // 数据起始
     s21_memcpy_if(d0, data, len)
@@ -5673,11 +5758,11 @@ func gen_i128_to_str(v: i64, is_signed: bool) -> i64 {
         ir.add_operand(brs, se, 1)
         g_cur_block = se
     }
-    // 7. 构造带头字符串：len = 39 - idx；malloc(len+41)；写头；拷数据；NUL
+    // 7. 构造带头字符串：len = 39 - idx；SSO 分配（短串走池 / 长串 malloc
+    //    len+41：8 头 + 1 \0 + 32 填充）；写头；拷数据；NUL
     var idx5 = s21_load(idx_v, T64)
     var len = s21_bin(1, gen_int_lit(39), idx5)  // sub
-    var size = s21_bin(0, len, gen_int_lit(41))  // add（41 = 8 头 + 1 \0 + 32 填充）
-    var out = s21_raw_alloc_str(size)
+    var out = s21_sso_alloc(len)
     s21_store(s21_gep(out, 0, true), len, T64)  // 长度头
     var d0 = s21_gep(out, 8, true)  // 数据起始
     var src = s21_gep(buf, s21_bin(0, idx5, gen_int_lit(1)), false)  // buf + idx + 1
@@ -5794,11 +5879,11 @@ func gen_i64_to_str(v: i64, is_signed: bool) -> i64 {
         ir.add_operand(brs, se, 1)
         g_cur_block = se
     }
-    // 7. 构造带头字符串：len = 23 - idx；malloc(len+41)；写头；拷数据；NUL
+    // 7. 构造带头字符串：len = 23 - idx；SSO 分配（短串走池 / 长串 malloc
+    //    len+41：8 头 + 1 \0 + 32 填充）；写头；拷数据；NUL
     var idx5 = s21_load(idx_v, T64)
     var len = s21_bin(1, gen_int_lit(23), idx5)  // sub
-    var size = s21_bin(0, len, gen_int_lit(41))  // add（41 = 8 头 + 1 \0 + 32 填充）
-    var out = s21_raw_alloc_str(size)
+    var out = s21_sso_alloc(len)
     s21_store(s21_gep(out, 0, true), len, T64)  // 长度头
     var d0 = s21_gep(out, 8, true)  // 数据起始
     var src = s21_gep(buf, s21_bin(0, idx5, gen_int_lit(1)), false)  // buf + idx + 1
@@ -5828,10 +5913,11 @@ func s21_codepoint_to_str(cp: i64) -> i64 {
     var len_a = ir.new_inst(g_cur_block, 20, T64)
     ir.add_operand(len_a, T64, 2)
     var len_ptr = ir.get_value(len_a)
-    // 缓冲：4 数据 + 8 头 + \0 + 32 尾部填充 → malloc(45)；data = 数据起始（buf+8）。
-    // 用 s21_raw_alloc_str：曾用 TK_STR malloc 触发 op36 对未初始化缓冲的垃圾
-    // strlen 扫描（漏洞 A 类隐患）；raw_alloc 绕开扫描 + 填充容纳向量化宽读。
-    var buf = s21_raw_alloc_str(gen_int_lit(45))
+    // 缓冲：4 数据 + 8 头 + \0 + 32 尾部填充 → 走 SSO 池分配（短串 ≤31，
+    // 码点最多 4 字节恒短串 → 恒零 malloc）；data = 数据起始（buf+8）。
+    // 用 s21_sso_alloc：曾用 TK_STR malloc 触发 op36 对未初始化缓冲的垃圾
+    // strlen 扫描（漏洞 A 类隐患）；池/raw_alloc 绕开扫描 + 填充容纳向量化宽读。
+    var buf = s21_sso_alloc(gen_int_lit(4))
     var data = s21_gep(buf, 8, true)
     // 非法判定：cp<0 || cp>0x10FFFF || (cp>=0xD800 && cp<=0xDFFF)
     var is_neg = gen_cmp_const(cp, 2, 0, T64)              // slt 0

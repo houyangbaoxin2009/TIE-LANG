@@ -241,6 +241,16 @@ pub func builtin_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 
         }
         return types.named(TK_I64)
     }
+    // SSO 短串池（dev33 批次3）：回退 malloc 累计次数（无参数，返回 i64）
+    if fn_name == "sso_malloc_count" {
+        if nargs != 0 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "sso_malloc_count() 期望 0 个参数，实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+    }
     if fn_name == "sb_append" || fn_name == "sb_append_byte" {
         if nargs != 2 {
             sm_err_line = s_lines[call_node]
