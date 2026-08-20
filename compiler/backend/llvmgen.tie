@@ -2008,9 +2008,13 @@ func gen_inst(inst_id: i64) {
         // 曾误传 "ptr " + ref 导致 `strlen(ptr ptr @.str.N)` 重复前缀
         var n1 = gen_call_i64("strlen", "ptr", str_ptr_ref(lv))
         var n2 = gen_call_i64("strlen", "ptr", str_ptr_ref(rv))
-        // total = n1 + n2；size = total + 9（8 字节头 + 数据 + \0）
+        // total = n1 + n2；size = total + 41（8 字节头 + 数据 + \0 + 32 字节
+        // 尾部填充）。32 字节保留区：CRT 向量化 strlen/strcmp/memcmp 按
+        // 16B/32B 宽读可能越 NUL 读到分配末尾之后——缓冲必须能容纳这类
+        // 良性越读（自举产物 tiec2b 曾因 1 字节余量撞未映射页 0xC0000005，
+        // 漏洞 B 根因）。填充只影响分配大小，{ptr,len} 语义不变。
         var total = reg_add(n1, n2)
-        var size = reg_add(total, "9")
+        var size = reg_add(total, "41")
         var buf = gen_call_ptr("malloc", "i64", size)
         // 写头部长度（S2.1 长度字段）
         line("store i64 " + total + ", ptr " + buf)
@@ -2304,11 +2308,12 @@ func gen_ext_str_scan(reg: string, sym: string, args: string) {
     var src = "%sc" + to_string(g_str_reg_cnt)
     line(src + " = select i1 " + irn + ", ptr " +
         str_data_ref(str_slot(interner.intern(""))) + ", ptr " + tmp)
-    // 统一扫描：n = strlen(src)；buf = malloc(n+9)；buf[0]=n；
+    // 统一扫描：n = strlen(src)；buf = malloc(n+41)；buf[0]=n；
     // memcpy(buf+8, src, n)；buf[8+n]=0；reg = 数据指针 buf+8。
+    // （+41 = 8 头 + 1 \0 + 32 尾部填充，容纳向量化宽读，漏洞 B 修复）
     // NULL 时 src=空串数据 len 0 → 产出空串；其余为真实 char* 扫描。
     var rn = gen_call_i64("strlen", "ptr", src)
-    var sz = reg_add(rn, "9")
+    var sz = reg_add(rn, "41")
     var bf = gen_call_ptr("malloc", "i64", sz)
     line("store i64 " + rn + ", ptr " + bf)
     var dd = reg_gep(bf, "8")

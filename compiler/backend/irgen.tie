@@ -5467,7 +5467,10 @@ func s21_utf8_char_at(s: i64, i: i64) -> i64 {
 // StringBuilder 句柄 = ptr → { i64 cap, i64 len, ptr data }（两级指针：
 // data 重分配可移动，句柄地址稳定）。string_builder() 返回 ptrtoint 句柄。
 func s21_sb_new() -> i64 {
-    var h = gen_ext_call1("malloc", gen_int_lit(24), types.named(TK_I64), types.named(TK_STR))
+    // 句柄 = 原始字节缓冲 {cap, len, data}，用 s21_raw_alloc_str（K_PTR 返回，
+    // 绕开 op36 对 TK_STR 返回的 strlen+memcpy 扫描——曾用 TK_STR malloc 触发
+    // 对未初始化句柄做垃圾 strlen 扫描，属漏洞 A 类隐患）
+    var h = s21_raw_alloc_str(gen_int_lit(24))
     s21_store(s21_gep(h, 0, true), gen_int_lit(0), types.named(TK_I64))    // cap = 0
     s21_store(s21_gep(h, 8, true), gen_int_lit(0), types.named(TK_I64))    // len = 0
     s21_store(s21_gep(h, 16, true), gen_int_lit(0), types.named(TK_STR))   // data = null
@@ -5499,7 +5502,9 @@ func s21_sb_grow(h: i64, cap: i64, len: i64, data: i64, need: i64) {
     var nc2 = s21_bin(2, cap, gen_int_lit(2))  // mul
     var c_lt = gen_icmp_c(nc2, need, 2)  // slt
     var newcap = gen_select_i(c_lt, need, nc2, types.named(TK_I64))
-    var nd = gen_ext_call1("malloc", newcap, types.named(TK_I64), types.named(TK_STR))
+    // 数据缓冲 = 原始字节区（非 {头,数据,\0} 布局），用 s21_raw_alloc_str 绕开
+    // TK_STR 扫描（漏洞 A 类隐患同 s21_sb_new）
+    var nd = s21_raw_alloc_str(newcap)
     s21_memcpy_if(nd, data, len)
     gen_ext_call1("free", data, types.named(TK_STR), -1)
     s21_store(s21_gep(h, 16, true), nd, types.named(TK_STR))
@@ -5539,14 +5544,15 @@ func s21_sb_append_byte(hv: i64, b: i64) {
     s21_store(s21_gep(h, 8, true), need, types.named(TK_I64))
 }
 
-// sb_build(h)：产出 {头, 数据, \0} 字符串（malloc len+9；写头；拷数据；尾 \0）。
+// sb_build(h)：产出 {头, 数据, \0} 字符串（malloc len+41；写头；拷数据；尾 \0）。
+// +41 = 8 头 + 1 \0 + 32 尾部填充（容纳向量化宽读，漏洞 B 修复）。
 // 句柄不释放（探针/短期程序进程退出回收；文档注明可复用）。
 func s21_sb_build(hv: i64) -> i64 {
     var h = s21_sb_ptr(hv)
     var len = s21_load(s21_gep(h, 8, true), types.named(TK_I64))
     var data = s21_load(s21_gep(h, 16, true), types.named(TK_STR))
-    var size = s21_bin(0, len, gen_int_lit(9))
-    var buf = gen_ext_call1("malloc", size, types.named(TK_I64), types.named(TK_STR))
+    var size = s21_bin(0, len, gen_int_lit(41))
+    var buf = s21_raw_alloc_str(size)
     s21_store(s21_gep(buf, 0, true), len, types.named(TK_I64))  // 长度头
     var d0 = s21_gep(buf, 8, true)  // 数据起始
     s21_memcpy_if(d0, data, len)
@@ -5667,10 +5673,10 @@ func gen_i128_to_str(v: i64, is_signed: bool) -> i64 {
         ir.add_operand(brs, se, 1)
         g_cur_block = se
     }
-    // 7. 构造带头字符串：len = 39 - idx；malloc(len+9)；写头；拷数据；NUL
+    // 7. 构造带头字符串：len = 39 - idx；malloc(len+41)；写头；拷数据；NUL
     var idx5 = s21_load(idx_v, T64)
     var len = s21_bin(1, gen_int_lit(39), idx5)  // sub
-    var size = s21_bin(0, len, gen_int_lit(9))  // add
+    var size = s21_bin(0, len, gen_int_lit(41))  // add（41 = 8 头 + 1 \0 + 32 填充）
     var out = s21_raw_alloc_str(size)
     s21_store(s21_gep(out, 0, true), len, T64)  // 长度头
     var d0 = s21_gep(out, 8, true)  // 数据起始
@@ -5788,10 +5794,10 @@ func gen_i64_to_str(v: i64, is_signed: bool) -> i64 {
         ir.add_operand(brs, se, 1)
         g_cur_block = se
     }
-    // 7. 构造带头字符串：len = 23 - idx；malloc(len+9)；写头；拷数据；NUL
+    // 7. 构造带头字符串：len = 23 - idx；malloc(len+41)；写头；拷数据；NUL
     var idx5 = s21_load(idx_v, T64)
     var len = s21_bin(1, gen_int_lit(23), idx5)  // sub
-    var size = s21_bin(0, len, gen_int_lit(9))  // add
+    var size = s21_bin(0, len, gen_int_lit(41))  // add（41 = 8 头 + 1 \0 + 32 填充）
     var out = s21_raw_alloc_str(size)
     s21_store(s21_gep(out, 0, true), len, T64)  // 长度头
     var d0 = s21_gep(out, 8, true)  // 数据起始
@@ -5822,8 +5828,10 @@ func s21_codepoint_to_str(cp: i64) -> i64 {
     var len_a = ir.new_inst(g_cur_block, 20, T64)
     ir.add_operand(len_a, T64, 2)
     var len_ptr = ir.get_value(len_a)
-    // 缓冲：4 数据 + 8 头 + \0 → malloc(13)；data = 数据起始（buf+8）
-    var buf = gen_ext_call1("malloc", gen_int_lit(13), T64, types.named(TK_STR))
+    // 缓冲：4 数据 + 8 头 + \0 + 32 尾部填充 → malloc(45)；data = 数据起始（buf+8）。
+    // 用 s21_raw_alloc_str：曾用 TK_STR malloc 触发 op36 对未初始化缓冲的垃圾
+    // strlen 扫描（漏洞 A 类隐患）；raw_alloc 绕开扫描 + 填充容纳向量化宽读。
+    var buf = s21_raw_alloc_str(gen_int_lit(45))
     var data = s21_gep(buf, 8, true)
     // 非法判定：cp<0 || cp>0x10FFFF || (cp>=0xD800 && cp<=0xDFFF)
     var is_neg = gen_cmp_const(cp, 2, 0, T64)              // slt 0
