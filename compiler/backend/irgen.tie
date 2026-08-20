@@ -2073,7 +2073,8 @@ func is_builtin_name(nm: string) -> bool {
     if nm == "addr_of" || nm == "addr_of_field" || nm == "deref" || nm == "deref_write" ||
         nm == "is_null" || nm == "ptr_add" || nm == "ptr_to_int" || nm == "int_to_ptr" ||
         nm == "alloc" || nm == "free" || nm == "memcpy" || nm == "memset" ||
-        nm == "slice_of" || nm == "slice_len" || nm == "slice_index" {
+        nm == "slice_of" || nm == "slice_len" || nm == "slice_index" ||
+        nm == "volatile_load" || nm == "volatile_store" {
         return true
     }
     // ---------- S1.3 as_* 显式数值转换族 ----------
@@ -2302,6 +2303,56 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         ir.add_operand(st, et, 2)
         ir.add_operand(st, v, 0)
         ir.add_operand(st, p, 0)
+        g_builtin_res = gen_int_lit(0)
+        return 0
+    }
+    if nm == "volatile_load" {
+        // volatile_load(p) → load volatile 元素类型（任务15：MMIO/硬件寄存器读，
+        // 发射 volatile 标志——LLVM 保证不被优化删除/合并/重排）。
+        var p = gen_expr(call_arg(id, 0))
+        if p < 0 {
+            return -1
+        }
+        var pt = node_types[call_arg(id, 0)]
+        var et = types.table_elem(pt)
+        if et < 0 {
+            sm_err_msg = "volatile_load() 实参必须是指针类型（函数 " + g_cur_fn_name + "）"
+            return -1
+        }
+        var vl = ir.new_inst(g_cur_block, 71, et)  // volatile_load（op 71）
+        ir.add_operand(vl, p, 0)
+        g_builtin_res = ir.get_value(vl)
+        return 0
+    }
+    if nm == "volatile_store" {
+        // volatile_store(p, v) → store volatile 元素类型（任务15：MMIO/硬件寄存器写，
+        // volatile 标志禁止优化删除/重排/合并）。
+        var p = gen_expr(call_arg(id, 0))
+        if p < 0 {
+            return -1
+        }
+        var pt = node_types[call_arg(id, 0)]
+        var et = types.table_elem(pt)
+        if et < 0 {
+            sm_err_msg = "volatile_store() 第 1 实参必须是指针类型（函数 " + g_cur_fn_name + "）"
+            return -1
+        }
+        var v = gen_expr(call_arg(id, 1))
+        if v < 0 {
+            return -1
+        }
+        var vt = node_types[call_arg(id, 1)]
+        if vt >= 0 && vt != et && (types.is_int(vt) || types.is_float(vt)) {
+            var cv = gen_coerce(v, vt, et)
+            if cv < 0 {
+                return -1
+            }
+            v = cv
+        }
+        var vs = ir.new_inst(g_cur_block, 72, -1)  // volatile_store（op 72）
+        ir.add_operand(vs, et, 2)  // 值类型 IMM
+        ir.add_operand(vs, v, 0)   // 值
+        ir.add_operand(vs, p, 0)   // 地址
         g_builtin_res = gen_int_lit(0)
         return 0
     }

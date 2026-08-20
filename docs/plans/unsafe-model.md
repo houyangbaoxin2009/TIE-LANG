@@ -30,6 +30,18 @@
 > - 测试：tests/language/unsafe_full/atomic_asm/reprc_probe + 4 负例
 > - 后置：slice_of 对动态表的数据指针桥（运行时表结构在桥内）；asm! 平台
 >   条件编译（#[target(arch)]）；volatile 读写
+>
+> ## 实现记录（2026-08-20，批次6）
+> - **volatile 读写落地**：新增内置 `volatile_load(p)` / `volatile_store(p, v)`
+>   （扩展集 O3，MMIO/硬件寄存器语义）。IR opcode 71/72 → LLVM `load volatile`
+>   / `store volatile`（不可优化删除/合并/重排）；语义层挂 unsafe 边界，安全
+>   代码调用报错；探针 tests/language/volatile_probe.tie 验证 -O2 下 volatile
+>   访存全保留（含结果未使用的 volatile 读）。
+> - **slice_of 动态表桥落地**（任务16）：`slice_of(table, start, len)` → 运行时
+>   桥 `tie_table_len` + 逐元素 `tie_table_at_*` 拷贝到 `alloc` 连续缓冲，返回
+>   `slice<元素类型>`（全 .tie，无新增 Rust 桥）。
+> - **asm! 平台条件编译落地**（任务17）：`asm!(..., target="x86_64"|"aarch64"...)`
+>   按目标平台分支；无目标平台 → 明确编译错误。
 
 ## 1. 目标与原则
 

@@ -74,6 +74,15 @@ pub func builtin_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 
         }
         return types.named(TK_VOID)
     }
+    if fn_name == "volatile_store" {
+        if nargs != 2 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "volatile_store() 期望 2 个参数（指针, 值），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_VOID)
+    }
     if fn_name == "addr_of_field" {
         if nargs != 2 {
             sm_err_line = s_lines[call_node]
@@ -93,7 +102,7 @@ pub func builtin_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 
         return types.named(TK_VOID)
     }
     // 动态返回类型 unsafe 内置（个数检查；类型由调用点 infer 特判）
-    if fn_name == "addr_of" || fn_name == "deref" {
+    if fn_name == "addr_of" || fn_name == "deref" || fn_name == "volatile_load" {
         if nargs != 1 {
             sm_err_line = s_lines[call_node]
             sm_err_col = s_cols[call_node]

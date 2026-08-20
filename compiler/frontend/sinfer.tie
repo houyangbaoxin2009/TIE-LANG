@@ -1310,7 +1310,8 @@ pub func infer_call(id: i64) -> i64 {
             if fnm == "addr_of" || fnm == "addr_of_field" || fnm == "deref" || fnm == "deref_write" ||
                 fnm == "is_null" || fnm == "ptr_add" || fnm == "ptr_to_int" || fnm == "int_to_ptr" ||
                 fnm == "alloc" || fnm == "free" || fnm == "memcpy" || fnm == "memset" ||
-                fnm == "slice_of" || fnm == "slice_len" || fnm == "slice_index" {
+                fnm == "slice_of" || fnm == "slice_len" || fnm == "slice_index" ||
+                fnm == "volatile_load" || fnm == "volatile_store" {
                 sm_err_line = s_lines[id]
                 sm_err_col = s_cols[id]
                 sm_err_msg = "调用 unsafe 内置 '" + fnm + "' 必须在 unsafe 块或 unsafe 函数中（安全代码禁止触底）"
@@ -1355,6 +1356,22 @@ pub func infer_call(id: i64) -> i64 {
             } else {
                 node_types[id] = types.ptr_of(e0)
             }
+            g_typed = g_typed + 1
+            return node_types[id]
+        }
+        if fnm == "volatile_load" {
+            // volatile_load(p) → 指针元素类型（任务15：MMIO/硬件寄存器读）
+            var p0 = infer_expr(args[0])
+            if p0 < 0 {
+                return -1
+            }
+            if !types.is_ptr(p0) {
+                sm_err_line = s_lines[id]
+                sm_err_col = s_cols[id]
+                sm_err_msg = "volatile_load() 第 1 个参数必须是指针类型，实际是 " + types.type_name(p0)
+                return -1
+            }
+            node_types[id] = types.table_elem(p0)
             g_typed = g_typed + 1
             return node_types[id]
         }

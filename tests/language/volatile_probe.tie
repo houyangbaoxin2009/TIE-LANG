@@ -1,0 +1,22 @@
+type tie<logic>
+// 任务15 探针：volatile 读写（MMIO/硬件寄存器语义——禁止优化删除/合并/重排）。
+// 用法：tiec volatile_probe.tie 编译运行输出 "PASS batch6-volatile"；
+//       tiec volatile_probe.tie --emit-ir 检查 IR 含 load volatile / store volatile
+//       （-O2 下 volatile 访存仍保留，不被优化删除）。
+func main() {
+    var x: i64 = 42
+    var y: i64 = 0
+    unsafe {
+        var p = addr_of(x)
+        volatile_store(p, 7)
+        y = volatile_load(p)
+        // 二次 volatile 读：结果即使不使用，volatile 语义也保证不被优化删除
+        var z = volatile_load(p)
+    }
+    println(to_string(y))
+    if y == 7 {
+        println("PASS batch6-volatile")
+    } else {
+        println("FAIL batch6-volatile")
+    }
+}

@@ -1,0 +1,9 @@
+type tie<logic>
+// 任务15 负例：安全代码（非 unsafe 上下文）调用 volatile_load / volatile_store
+// = 编译错误（sinfer 安全边界清单拦截；期望报 "调用 unsafe 内置 'volatile_load'
+// 必须在 unsafe 块或 unsafe 函数中"）。
+func main() {
+    var s: string = "abc"
+    var y = volatile_load(s)   // 期望编译错误：unsafe 边界拦截
+    println(to_string(y))
+}

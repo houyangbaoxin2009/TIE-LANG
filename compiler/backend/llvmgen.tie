@@ -1526,6 +1526,23 @@ func gen_inst(inst_id: i64) {
         line("store " + vty + " " + vr + ", ptr " + opnd_ref(inst_id, 2))
         return
     }
+    if op == 71 {
+        // volatile_load（任务15）：`load volatile Ty, ptr %p`（MMIO/硬件寄存器读，
+        // volatile 标志保证 LLVM 优化不删除/合并/重排该访存）。
+        var ty = llvm_ty(ir.ins_ty(inst_id))
+        line(reg + " = load volatile " + ty + ", ptr " + opnd_ref(inst_id, 0))
+        return
+    }
+    if op == 72 {
+        // volatile_store（任务15）：`store volatile Ty %v, ptr %p`（MMIO/硬件寄存器写）
+        var vty = llvm_ty(ir.ins_opnd(inst_id, 0))
+        var vr = opnd_ref(inst_id, 1)
+        if vty == "ptr" {
+            vr = to_ptr(ir.ins_opnd(inst_id, 1))
+        }
+        line("store volatile " + vty + " " + vr + ", ptr " + opnd_ref(inst_id, 2))
+        return
+    }
     if op == 60 {
         // const_i：立即数常量 → add 0, val（结果寄存器 = 值）。
         // 类型按指令 ins_ty（i32 变量初始化是 i32 常量；i64 默认）——
