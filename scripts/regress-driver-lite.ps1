@@ -1,4 +1,4 @@
-﻿# scripts/regress-driver-lite.ps1 —— 自举 v2 T2.9 行为等价回归脚本
+# scripts/regress-driver-lite.ps1 —— 自举 v2 T2.9 行为等价回归脚本
 # ============================================================
 # 用法：pwsh ./scripts/regress-driver-lite.ps1 [-Detail]
 #   -Detail   逐文件打印状态行（默认只打印汇总与差异清单）
@@ -74,11 +74,12 @@ foreach ($rel in $files) {
     $base = "{0:D3}_{1}" -f $idx, ([IO.Path]::GetFileNameWithoutExtension($rel))
     $stats.Total++
 
-    # 库文件跳过（头部 tie:library，driver-lite 暂不做库角色）
+    # 库文件跳过（旧式头部 tie:library 或新式 type tie<class>/<type>——库/ir 角色
+    # 产出静态库或 .ll，不产出可执行文件，driver-lite 暂不做库角色）
     $head = Get-Content $full -TotalCount 8 -ErrorAction SilentlyContinue
-    if ($head -match 'tie:library') {
+    if ($head -match 'tie:library' -or $head -match 'type tie<class>' -or $head -match 'type tie<type>') {
         $stats.LibSkip++
-        $results.Add("SKIP  $rel  (库文件 tie:library，driver-lite 不做库角色)")
+        $results.Add("SKIP  $rel  (库文件角色，driver-lite 不做库角色)")
         continue
     }
 
