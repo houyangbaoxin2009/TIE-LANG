@@ -251,6 +251,17 @@ pub func builtin_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 
         }
         return types.named(TK_I64)
     }
+    // 可捕获 panic（dev33 批次7 任务18）：catch_panic(f) -> bool
+    //（f 为 fn() -> T 闭包；f 内 panic 被捕获 → true，消息已打印；否则 false）
+    if fn_name == "catch_panic" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "catch_panic() 期望 1 个参数（函数值），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_BOOL)
+    }
     if fn_name == "sb_append" || fn_name == "sb_append_byte" {
         if nargs != 2 {
             sm_err_line = s_lines[call_node]

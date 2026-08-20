@@ -1,3 +1,26 @@
+## [新增] 错误处理 C2：switch 解构 + 可捕获 panic + 组合子机制（dev33 批次 7）
+
+dev33 计划批次 7（任务 18-20）：错误处理 C2 落地——
+
+- **switch 枚举变体解构 `case Ok(v)`**：`case Ok(v):` / `case Err(e):`（也支持
+  裸变体名 `case Ok(v)`）——命中变体后把 payload 绑定到变量（string → inttoptr、
+  窄整数 → trunc 还原），case 体可直接使用；泛型 enum（Result/Option）与裸
+  `Enum.Variant(v)` 均支持（parser + semantic + irgen 三层）；
+- **可捕获 panic `catch_panic(f) -> bool`**：f（fn() -> T 闭包）内 panic 在捕获域
+  中打印消息 + longjmp 回跳（不 exit），宿主判定捕获（true）后继续运行；未处于
+  捕获域的 panic 保持 printf + exit(1)。对齐 MSVC setjmp 生成（`_setjmp(env,
+  frameaddr)` returns_twice + `llvm.frameaddress.p0` + `longjmp` noreturn；
+  jmp_buf 256B align16）；深层调用链内 panic 亦可捕获；
+- **Result/Option 组合子机制验证**：非泛型演示探针全绿（switch 解构 payload 绑定
+  + fn 类型参数 + Result 构造/透传全链路：map/map_err/unwrap/unwrap_or/is_ok 等）。
+  **泛型组合子（result_fmap 等）受语言限制后置**：泛型函数 enum 模板形参
+  （`r: Result<T,E>`）解析缺失（struct 模板 `Box<T>` 形参可用、enum 模板不可用，
+  语义层 stype/sgen 类型解析 + 单态化缺口），已记入 error-model.md §10；
+- **验收探针**：`catch_panic_probe.tie`（直接/正常/状态保持/深层 4 场景全过）、
+  `result_combinator_probe.tie`（组合子机制全过）、`sso_probe.tie` 无回归；
+- **回归**：全量 PASS 提升（新增 2 探针全过；既有 11 个 import 大库失败为既有
+  漏洞 B——HEAD 对照确认非本批引入；try_probe/shift_neg_free 为已知基线）。
+
 ## [新增] SSO 短串池（字符串短串优化）—— 2026-08-21
 
 dev33 计划批次 3（任务 7-9）：短串（≤31 字节 UTF-8 数据）运行时构造改为从

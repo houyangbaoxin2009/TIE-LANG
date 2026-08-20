@@ -1104,14 +1104,19 @@ pub func match_type_node(tnode: i64, arg_ty: i64, tp_names: table<i64>, bk: ref 
             // bind_tp 按「名字 id」登记（finish_args 用 tp_names[k] 查找）
             return bind_tp(tp_names[tpi], arg_ty, bk, bv, call_id)
         }
-        // 具体 struct 引用
+        // 具体 struct/enum 引用
         var nid = intern.intern(nm)
         var sidx = sstate.bs_find(st_keys, nid)
         var gidx = sstate.gt_find(nm)
-        if types.kind(arg_ty) != K_STRUCT {
+        if types.kind(arg_ty) != K_STRUCT && types.kind(arg_ty) != K_ENUM {
             return -1
         }
-        var sname = sstate.struct_name_of(types.low(arg_ty))
+        var sname = ""
+        if types.kind(arg_ty) == K_STRUCT {
+            sname = sstate.struct_name_of(types.low(arg_ty))
+        } else {
+            sname = sstate.enum_name_of(types.low(arg_ty))
+        }
         if sidx >= 0 && gidx < 0 {
             // 普通 struct：精确名匹配
             if sname == nm {
@@ -1119,8 +1124,8 @@ pub func match_type_node(tnode: i64, arg_ty: i64, tp_names: table<i64>, bk: ref 
             }
             return -1
         }
-        // 模板 struct 引用（Box<T>）：arg 必须是该模板的实例化
-        if gidx < 0 || gty_is_struct[gidx] != 1 {
+        // 模板 struct/enum 引用（Box<T> / MyResult<T,E>）：arg 必须是该模板的实例化
+        if gidx < 0 || (gty_is_struct[gidx] != 1 && gty_is_struct[gidx] != 2) {
             return -1
         }
         var rec = sstate.gin_find(sname)

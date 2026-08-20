@@ -1,12 +1,23 @@
 # 规划：tie 错误处理模型（Result/Option + ?传播 + 可配置 panic）
 
-> 状态：**规划**（2026-08-15 设计讨论定稿，未实现）
+> 状态：**S2.3 + 批次 7 已落地**（2026-08-15 设计定稿；S2.3 实现 Result/Option
+> 预置 + `?` 解包 + panic 语句；dev33 批次 7 实现 switch 解构、组合子、可捕获 panic）
 > 本文档定义 tie 的错误处理模型。决策汇总：
 > **E2**（Result/Option 枚举，Rust 风格）+ **P1**（`?` 传播运算符）
 > + **F3**（可配置 panic：桌面打印退出 / 嵌入式 halt / wasm trap）
 > + **R2**（内外分明：内部错误 panic，外部错误 Result）
 > + **C1**（协程错误随 Result 跨 channel 传回）
 > + **L1**（std 预置 Result/Option）。
+> **已落地（S2.3）**：std/result.tie 预置 Result/Option、`?` 解包（Ok 解包 /
+> Err/None 提前返回，仅限返回 Result/Option 的函数内）、panic("消息") 语句
+>（桌面 printf + exit(1)）。
+> **已落地（dev33 批次 7）**：switch 枚举变体解构 `case Ok(v)`（payload 绑定，
+> 用户代码可用）；可捕获 panic `catch_panic(f) -> bool`（f 内 panic 打印消息 +
+> longjmp 回跳，不 exit，宿主继续运行；对齐 MSVC setjmp）；Result/Option 组合子
+> 机制验证（非泛型演示探针：switch 解构 + fn 参数 + Result 构造/透传全链路）。
+> **泛型组合子（result_fmap/option_fmap 等）后置**：受语言限制——泛型函数
+> enum 模板形参（`r: Result<T,E>`）解析缺失（struct 模板形参可用、enum 模板
+> 不可用，见 §10），需语义层扩展。
 > 明确排除：异常（E3，栈展开成本 + 嵌入式/wasm 不支持 + 哲学冲突）。
 > 关联：enum/泛型/switch（已有基础设施）、并发模型（协程/actor/channel）、
 > 嵌入式子集（tie:embedded）。
@@ -138,8 +149,10 @@ switch res {
 
 - 协程/actor 的错误是**值**（Result），随 channel/await 传回——无跨协程异常
 - actor 消息处理器返回 Result，错误经 reply channel 传回调用方
-- **C2（actor panic 隔离）后置**：第一版 actor panic 即进程终止，
-  监督树/隔离留待第二版（容错系统）
+- **C2（panic 捕获）批次 7 已实现**：`catch_panic(f) -> bool`——f（fn() -> T
+  闭包）内 panic 打印消息 + longjmp 回跳（不 exit），宿主判定捕获（true）后
+  继续运行；未处于捕获域的 panic 仍为桌面 printf + exit(1)。**actor 监督树/
+  隔离留待第二版**（需 actor 运行时，与协程/actor 机制（M4）同批）。
 
 ## 7. 与闭包/接口的咬合
 
@@ -190,9 +203,13 @@ port FileReader {
 
 ## 10. 未决问题
 
-1. **错误类型转换**：`?` 传播时 Err 类型不一致的转换（`map_err` 函数形态）
+1. **错误类型转换**：`?` 传播时 Err 类型不一致的转换（`map_err` 函数形态——
+   批次 7 机制验证（非泛型演示探针），泛型版同 §10-2 后置；`?` 内联转换仍后置）
 2. **Option 与 Result 互转**：`ok_or` / `and_then` / `unwrap` 等组合子函数族
-   （第一版只做 `?` + switch，组合子后置）
+   （**批次 7 机制已验证**：switch 解构 + fn 参数 + Result 构造/透传的非泛型演示
+   探针全绿；**泛型版后置**——泛型函数 enum 模板形参（`r: Result<T,E>`）解析
+   缺失，struct 模板（`Box<T>`）形参可用而 enum 模板不可用（语义层
+   stype/sgen 类型解析 + 单态化），需扩展后落地 std/result.tie 泛型组合子）
 3. **panic 消息格式**：是否带位置信息（文件:行）——建议带（调试价值高）
 4. **断言与 panic 分工**：assert（测试期）+ panic（运行期）的边界文档化
 5. **actor 监督（C2）**：panic 隔离/监督树——第二版设计，需 actor 运行时支持

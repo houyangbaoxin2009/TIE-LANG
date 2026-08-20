@@ -166,6 +166,11 @@ const N_PORT: i64 = 138;
 //   方法必须有函数体；语义层以 <struct 名>::<方法名> 全名登记（复用现有
 //   namespace 方法机制与 M2.1.8 自动 ref），vtable 隐式生成（I1）。
 const N_IMPL: i64 = 139;
+// 批次 7（dev33 错误处理 C2）：switch case 枚举变体 payload 解构
+//   CaseBind[children=[变体引用（N_VAR 或 N_FIELD_ACCESS）, 绑定变量名池 id]]
+//     —— `case Ok(v):` / `case Result.Ok(v):` —— 命中变体后把 payload 绑定到 v。
+//     仅出现在 SwitchCase 的 PatternList 内。
+const N_CASE_BIND: i64 = 140;
 // S3.3 宏/元编程（三节点，布局约定见 mexpand.tie 头注释）：
 //   MacroDef[name=宏名, val=0, aux=nparams, children=[返回类型, 参数..., 函数体]]
 //     —— 布局与 FnDef 一致但**无泛型槽**（children[0] 即返回类型；形参从 1 起，

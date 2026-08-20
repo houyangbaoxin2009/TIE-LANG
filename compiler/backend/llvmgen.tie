@@ -73,6 +73,9 @@ var g_vt_syms: table<i64>;    // 方法函数全名池 id（扁平段）
 // emit 主流程据此刻意输出 @s21_sso_pool / @s21_sso_off / @s21_sso_malloc_cnt。
 // 仅用到短串池的程序才带 256KB .bss，纯字面量程序不引入。
 var g_sso_enabled: i64 = 0;
+// 可捕获 panic（dev33 批次 7）：启用标记。irgen 首次生成 catch_panic/受捕
+// panic 置位，emit 据此输出 @tie_panic_jb / @tie_panic_msg / @tie_panic_active。
+var g_catch_enabled: i64 = 0;
 // 阶段 A：str_cat 内联序列的临时寄存器计数（与 printf sext 同款独立命名空间，
 // 避免与 %N 值编号冲突）
 var g_str_reg_cnt: i64 = 0;
@@ -301,6 +304,11 @@ pub func sso_enable() {
     g_sso_enabled = 1
 }
 
+// 可捕获 panic 启用标记（irgen 首次生成 catch_panic / 受捕 panic 置位；幂等）。
+pub func catch_enable() {
+    g_catch_enabled = 1
+}
+
 // 输出 SSO 短串池全局段（emit_globals 之后）：仅 g_sso_enabled 时输出。
 //   @s21_sso_pool      = 256KB 静态线性池（.bss，零运行时初始化）
 //   @s21_sso_off       = 当前 bump 偏移
@@ -312,35 +320,43 @@ pub func sso_enable() {
 //   供 llvmgen op56（str_cat）与 gen_ext_str_scan（FFI 收方向）内联调用——
 //   与 irgen s21_sso_alloc 逻辑同构（共用 @s21_sso_off / @s21_sso_malloc_cnt）。
 func emit_sso_globals() {
-    if g_sso_enabled == 0 {
-        return
+    // SSO 短串池段（仅 g_sso_enabled）
+    if g_sso_enabled == 1 {
+        line("@s21_sso_pool = private global [262144 x i8] zeroinitializer")
+        line("@s21_sso_off = private global i64 0")
+        line("@s21_sso_malloc_cnt = private global i64 0")
+        line("define private ptr @tie_sso_alloc(i64 %n) {")
+        line("  %short = icmp sle i64 %n, 31")
+        line("  %need = add i64 %n, 41")
+        line("  %off = load i64, ptr @s21_sso_off")
+        line("  %remain = sub i64 262144, %off")
+        line("  %space = icmp sle i64 %need, %remain")
+        line("  %ok = and i1 %short, %space")
+        line("  br i1 %ok, label %sso.pool, label %sso.heap")
+        line("sso.pool:")
+        line("  %pb = ptrtoint ptr @s21_sso_pool to i64")
+        line("  %p = add i64 %pb, %off")
+        line("  %noff = add i64 %off, %need")
+        line("  store i64 %noff, ptr @s21_sso_off")
+        line("  %pp = inttoptr i64 %p to ptr")
+        line("  ret ptr %pp")
+        line("sso.heap:")
+        line("  %cnt = load i64, ptr @s21_sso_malloc_cnt")
+        line("  %ncnt = add i64 %cnt, 1")
+        line("  store i64 %ncnt, ptr @s21_sso_malloc_cnt")
+        line("  %m = call ptr @malloc(i64 %need)")
+        line("  ret ptr %m")
+        line("}")
+        line("")
     }
-    line("@s21_sso_pool = private global [262144 x i8] zeroinitializer")
-    line("@s21_sso_off = private global i64 0")
-    line("@s21_sso_malloc_cnt = private global i64 0")
-    line("define private ptr @tie_sso_alloc(i64 %n) {")
-    line("  %short = icmp sle i64 %n, 31")
-    line("  %need = add i64 %n, 41")
-    line("  %off = load i64, ptr @s21_sso_off")
-    line("  %remain = sub i64 262144, %off")
-    line("  %space = icmp sle i64 %need, %remain")
-    line("  %ok = and i1 %short, %space")
-    line("  br i1 %ok, label %sso.pool, label %sso.heap")
-    line("sso.pool:")
-    line("  %pb = ptrtoint ptr @s21_sso_pool to i64")
-    line("  %p = add i64 %pb, %off")
-    line("  %noff = add i64 %off, %need")
-    line("  store i64 %noff, ptr @s21_sso_off")
-    line("  %pp = inttoptr i64 %p to ptr")
-    line("  ret ptr %pp")
-    line("sso.heap:")
-    line("  %cnt = load i64, ptr @s21_sso_malloc_cnt")
-    line("  %ncnt = add i64 %cnt, 1")
-    line("  store i64 %ncnt, ptr @s21_sso_malloc_cnt")
-    line("  %m = call ptr @malloc(i64 %need)")
-    line("  ret ptr %m")
-    line("}")
-    line("")
+    // 可捕获 panic 全局（仅 g_catch_enabled）：jmp_buf（256B，对齐 clang
+    // [16 x _SETJMP_FLOAT128]）/ 捕获激活标记（i1）。捕获的 panic 消息由
+    // 受捕路径直接 printf 打印（宿主以 catch_panic 返回值判定捕获与否）。
+    if g_catch_enabled == 1 {
+        line("@tie_panic_jb = private global [256 x i8] zeroinitializer, align 16")
+        line("@tie_panic_active = private global i1 false")
+        line("")
+    }
 }
 
 // 用户函数调用（call 35）符号登记（去重；命名空间函数全名 → $）
@@ -970,6 +986,11 @@ func extern_decl(sym: string) -> string {
     if sym == "memcpy" {
         return "declare void @memcpy(ptr, ptr, i64)"
     }
+    // 批次 7 catch_panic：无条件 declare（emit 头部，带 returns_twice/noreturn
+    // 属性），此处不重复 declare（LLVM 拒绝重复定义）。
+    if sym == "longjmp" || sym == "_setjmp" || sym == "llvm.frameaddress.p0" {
+        return ""
+    }
     if sym == "tie_get_env" {
         return "declare ptr @tie_get_env(ptr)"
     }
@@ -1306,10 +1327,17 @@ func user_extern_decl(sym: string) -> string {
 func emit_extern_decls() {
     var i: i64 = 0
     while i < len(ext_syms) {
-        var d = extern_decl(intern.lookup(ext_syms[i]))
+        var nm = intern.lookup(ext_syms[i])
+        // 批次 7 catch_panic：longjmp/_setjmp/llvm.frameaddress 已在模块头
+        // 无条件 declare（带 returns_twice/noreturn 属性），跳过二次 declare。
+        if nm == "longjmp" || nm == "_setjmp" || nm == "llvm.frameaddress.p0" {
+            i = i + 1
+            continue
+        }
+        var d = extern_decl(nm)
         if d == "" {
             // 未登记的 libc extern（用户顶层声明）→ 从调用签名推导
-            d = user_extern_decl(intern.lookup(ext_syms[i]))
+            d = user_extern_decl(nm)
         }
         if d != "" {
             line(d)
@@ -1437,9 +1465,11 @@ func global_ref(v: i64) -> string {
     if str_len(nm) > 0 && str_char(nm, 0) == "@" {
         nm = l_slice(nm, 1, str_len(nm))
     }
-    // SSO 短串池内部符号白名单（dev33 批次 3）：不登记进 g_global_names
-    //（避免影响普通全局），仅 s21_sso_alloc 内联生成时按名直引。
-    if nm == "s21_sso_pool" || nm == "s21_sso_off" || nm == "s21_sso_malloc_cnt" {
+    // SSO 短串池 + 可捕获 panic 内部符号白名单（dev33 批次 3/7）：不登记进
+    // g_global_names（避免影响普通全局），仅 s21_sso_alloc / catch_panic 内联
+    // 生成时按名直引。
+    if nm == "s21_sso_pool" || nm == "s21_sso_off" || nm == "s21_sso_malloc_cnt" ||
+        nm == "tie_panic_jb" || nm == "tie_panic_active" {
         return "@" + nm
     }
     var nid = interner.intern(nm)
@@ -2239,6 +2269,11 @@ func gen_inst(inst_id: i64) {
 // 不经过寄存器）；否则 "%N"。
 func typed_ref(inst_id: i64, k: i64) -> string {
     var v = ir.ins_opnd(inst_id, k)
+    // IMM 立即数（kind 2）：直出字面量（extern_call 的 immarg 参数，如
+    // llvm.frameaddress.p0(i32 0)；批次 7 catch_panic 用）
+    if ir.ins_opnd_kind(inst_id, k) == 2 {
+        return to_string(v)
+    }
     // S3.2：全局地址（kind 3）优先——ref 全局表实参（如 columnar.set_pair_i64
     // 传 doc_keys）须输出 @sym 直引；此前漏处理输出 "%N"（N 为 "@name" 池 id，
     // 非本函数定义的值）→ opt 报 use of undefined value
@@ -2425,6 +2460,12 @@ pub func emit() -> string {
     line("declare i32 @fflush(ptr)")
     line("declare void @exit(i32)")
     line("declare i32 @remove(ptr)")
+    // 批次 7：可捕获 panic（catch_panic）——对齐 clang 对 MSVC setjmp 的生成：
+    // `_setjmp(env, frameaddr)` 带 returns_twice（LLVM 据其做栈帧/寄存器保存）；
+    // `longjmp(env, val)` noreturn；frameaddr 传当前帧地址（longjmp 回跳锚点）。
+    line("declare i32 @_setjmp(ptr, ptr) returns_twice")
+    line("declare void @longjmp(ptr, i32) noreturn")
+    line("declare ptr @llvm.frameaddress.p0(i32 immarg)")
     line("declare double @sqrt(double)")
     line("declare double @sin(double)")
     line("declare double @cos(double)")

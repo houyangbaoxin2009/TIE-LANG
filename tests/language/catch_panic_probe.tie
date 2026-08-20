@@ -1,0 +1,45 @@
+type tie<logic>
+// 可捕获 panic 验收探针（dev33 批次 7，任务 18）
+// catch_panic(f) -> bool：f（fn() -> T 闭包）内 panic 被捕获
+//（受捕路径打印消息 + longjmp 回跳，不 exit）→ 返回 true，宿主继续运行；
+// f 正常返回 → false。
+func boom() -> i64 {
+    panic("boom 内部错误");
+    return 1;
+}
+func inner() -> i64 {
+    var x = boom();
+    return x;
+}
+func main() {
+    // 1. 直接 panic 被捕获 → true，程序继续运行
+    var f1 = func() -> i64 { panic("捕获的 panic"); return 1; };
+    var c1 = catch_panic(f1)
+    if !c1 {
+        panic("应当捕获到 panic");
+    }
+    println("捕获成功")
+    // 2. 正常闭包 → false
+    var f2 = func() -> i64 { return 42; };
+    var c2 = catch_panic(f2)
+    if c2 {
+        panic("正常闭包不应捕获");
+    }
+    println("正常闭包返回 false")
+    // 3. 捕获后状态保持 + 继续运行
+    var f3 = func() -> i64 { panic("内层 panic"); return 7; };
+    var c3 = catch_panic(f3)
+    if !c3 {
+        panic("第三段应捕获");
+    }
+    var after: i64 = 100
+    println("继续运行: after=" + to_string(after))
+    // 4. 深层调用链内的 panic 也能捕获
+    var f4 = func() -> i64 { var y = inner(); return y; };
+    var c4 = catch_panic(f4)
+    if !c4 {
+        panic("深层 panic 应捕获");
+    }
+    println("深层 panic 捕获成功")
+    println("catch_panic 探针全过")
+}

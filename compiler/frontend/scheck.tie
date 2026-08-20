@@ -263,21 +263,37 @@ func check_enum_switch_case(c: i64, subj_ty: i64) -> i64 {
     var i: i64 = 0
     while i < np {
         var p = sstate.child(plist, i)
-        // 变体引用解析（FieldAccess：base = Var 枚举名，name = 变体名）
-        if s_tags[p] != S_N_FIELD_ACCESS {
+        // 批次 7：N_CASE_BIND（`Ok(v)` 解构）→ 变体引用 + 绑定变量名池 id
+        var bind_id: i64 = -1
+        var vr = p
+        if s_tags[p] == N_CASE_BIND {
+            vr = sstate.child(p, 0)
+            bind_id = sstate.child(p, 1)
+        }
+        // 变体引用解析：FieldAccess（Enum.Variant）或裸 Var（Variant，枚举名取 subject）
+        if s_tags[vr] != S_N_FIELD_ACCESS && s_tags[vr] != S_N_VAR {
             sm_err_line = s_lines[c]
             sm_err_col = s_cols[c]
-            sm_err_msg = "case 值必须是枚举变体引用（如 " + ename + ".Variant）"
+            sm_err_msg = "case 值必须是枚举变体引用（如 " + ename + ".Variant / " + ename + ".Variant(v)）"
             return -1
         }
-        var base = sstate.child(p, 0)
-        if s_tags[base] != S_N_VAR {
-            sm_err_line = s_lines[c]
-            sm_err_col = s_cols[c]
-            sm_err_msg = "case 值必须是枚举变体引用（如 " + ename + ".Variant）"
-            return -1
+        var bname = ""
+        var vname = ""
+        if s_tags[vr] == S_N_FIELD_ACCESS {
+            var base = sstate.child(vr, 0)
+            if s_tags[base] != S_N_VAR {
+                sm_err_line = s_lines[c]
+                sm_err_col = s_cols[c]
+                sm_err_msg = "case 值必须是枚举变体引用（如 " + ename + ".Variant）"
+                return -1
+            }
+            bname = sstate.name_str(base)
+            vname = sstate.name_str(vr)
+        } else {
+            // 裸变体名（`case Ok(v)`）：枚举名取 switch 对象类型
+            bname = sstate.enum_name_of(ei)
+            vname = sstate.name_str(vr)
         }
-        var bname = sstate.name_str(base)
         var eidx = sstate.bs_find(en_keys, intern.intern(bname))
         if eidx < 0 {
             // 泛型 enum 模板：switch 对象必须是对应模板的实例化
@@ -303,7 +319,6 @@ func check_enum_switch_case(c: i64, subj_ty: i64) -> i64 {
             sm_err_msg = "case 值 '" + bname + "' 与 switch 对象枚举类型 " + types.type_name(subj_ty) + " 不匹配"
             return -1
         }
-        var vname = sstate.name_str(p)
         // 在变体段中找该变体（返回 tag 值 0..nvar-1）
         var varoff = en_varoff[ei]
         var nvar = en_nvar[ei]
@@ -321,6 +336,18 @@ func check_enum_switch_case(c: i64, subj_ty: i64) -> i64 {
             sm_err_col = s_cols[c]
             sm_err_msg = "枚举 '" + ename + "' 没有变体 '" + vname + "'"
             return -1
+        }
+        // 批次 7：绑定变量登记（校验变体恰有 1 个 payload 字段）
+        if bind_id >= 0 {
+            var foff = en_vfldoff[varoff + tag]
+            var nfld = en_vnfld[varoff + tag]
+            if nfld != 1 {
+                sm_err_line = s_lines[c]
+                sm_err_col = s_cols[c]
+                sm_err_msg = "case 解构要求变体 '" + vname + "' 恰有 1 个 payload 字段，实际 " + to_string(nfld) + " 个"
+                return -1
+            }
+            sinfer.lv_insert(bind_id, en_ftys[foff], 0, -1, 0)
         }
         // 重复 case 检测（tag 为去重键，对齐字面量 key 风格）
         var key = "e:" + ename + ":" + vname

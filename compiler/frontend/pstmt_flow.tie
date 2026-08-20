@@ -584,7 +584,8 @@ func parse_switch_body() -> i64 {
     return list
 }
 
-// case 匹配模式：类型匹配（case string:）或值/区间表达式
+// case 匹配模式：类型匹配（case string:）或值/区间表达式；
+// 批次 7：枚举变体 payload 解构 `[Ident | A.B] "(" Ident ")"` → N_CASE_BIND
 func parse_case_pattern() -> i64 {
     if putil.peek_tag() == lex_typekw {
         var line = putil.peek_line()
@@ -599,7 +600,55 @@ func parse_case_pattern() -> i64 {
         ast.set_children(tl, kids)
         return tl
     }
+    // 枚举变体绑定模式（仅 Ident 起始才尝试；save/restore 支持回退到普通表达式）
+    if putil.peek_tag() == lex_ident {
+        var line = putil.peek_line()
+        var col = putil.peek_col()
+        putil.save_pos()
+        var vr = parse_case_variant_ref(line, col)
+        if vr >= 0 && putil.peek_tag() == lex_lparen {
+            putil.advance()  // '('
+            if putil.peek_tag() == lex_ident {
+                var bind_name = interner.intern(putil.peek_lexeme())
+                putil.advance()
+                if putil.expect(lex_rparen, "')'") {
+                    var n = ast.new_node(N_CASE_BIND, -1, -1, -1, line, col)
+                    var kids: table<i64> = table_new_i64()
+                    table_push(kids, vr)
+                    table_push(kids, bind_name)
+                    ast.set_children(n, kids)
+                    return n
+                }
+            }
+        }
+        putil.restore_pos()
+    }
     return pexpr.parse_expr()
+}
+
+// 枚举变体引用链：Ident(.Ident)* → N_VAR / N_FIELD_ACCESS（case pattern 专用；
+// 解析失败不消费（调用方 restore_pos 回退））
+func parse_case_variant_ref(line: i64, col: i64) -> i64 {
+    if putil.peek_tag() != lex_ident {
+        return -1
+    }
+    var nm = interner.intern(putil.peek_lexeme())
+    putil.advance()
+    var expr = ast.new_node(N_VAR, nm, -1, -1, line, col)
+    while putil.peek_tag() == lex_dot {
+        putil.advance()
+        if putil.peek_tag() != lex_ident {
+            return -1
+        }
+        var field = interner.intern(putil.peek_lexeme())
+        putil.advance()
+        var fa = ast.new_node(N_FIELD_ACCESS, field, -1, -1, line, col)
+        var fkids: table<i64> = table_new_i64()
+        table_push(fkids, expr)
+        ast.set_children(fa, fkids)
+        expr = fa
+    }
+    return expr
 }
 
 // `return [expr]`

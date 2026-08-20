@@ -1,0 +1,85 @@
+type tie<logic>
+// Result 组合子机制验收探针（dev33 批次 7，任务 19）
+// 依赖：switch 枚举变体解构 `case Ok(v)`（dev33 批次 7 新语法）
+// 说明：泛型组合子（result_fmap 等）需要「泛型函数 enum 模板形参」语言支持
+//（当前缺失：泛型函数形参 `r: Result<T,E>` 解析报「类型未定义」，struct 模板
+// 参数可用、enum 模板参数不可用——语义层缺口，见 error-model.md §10）。本探针
+// 用非泛型组合子（具体 Result<i64,string>）验证组合子机制全链路：
+// switch 解构 payload 绑定 + fn 类型参数 + Result 构造/透传。
+import "../../std/result.tie"
+import "../../std/assert.tie"
+using assert;
+
+// 非泛型组合子：map（Ok 转换 / Err 透传）
+func r_map(r: Result<i64, string>, f: fn(i64) -> i64) -> Result<i64, string> {
+    switch r {
+        case Ok(v): return Result.Ok(f(v));
+        case Err(e): return Result.Err(e);
+    }
+}
+// unwrap
+func r_unwrap(r: Result<i64, string>) -> i64 {
+    switch r {
+        case Ok(v): return v;
+        case Err(e): panic("unwrap on Err");
+    }
+}
+// unwrap_or
+func r_unwrap_or(r: Result<i64, string>, def: i64) -> i64 {
+    switch r {
+        case Ok(v): return v;
+        case Err(e): return def;
+    }
+}
+// is_ok / is_err
+func r_is_ok(r: Result<i64, string>) -> bool {
+    switch r {
+        case Ok(v): return true;
+        case Err(e): return false;
+    }
+}
+func r_is_err(r: Result<i64, string>) -> bool {
+    switch r {
+        case Ok(v): return false;
+        case Err(e): return true;
+    }
+}
+// map_err（Err 转换）
+func r_map_err(r: Result<i64, string>, f: fn(string) -> string) -> Result<i64, string> {
+    switch r {
+        case Ok(v): return Result.Ok(v);
+        case Err(e): return Result.Err(f(e));
+    }
+}
+
+func main() {
+    var r1: Result<i64, string> = Result.Ok(42)
+    var r2: Result<i64, string> = Result.Err("bad")
+    // map：Ok 转换
+    var f1 = func(x: i64) -> i64 { return x * 2; };
+    var m1 = r_map(r1, f1)
+    assert.assert_eq(r_unwrap(m1), 84)
+    // map：Err 透传
+    var m2 = r_map(r2, f1)
+    assert.assert(!r_is_ok(m2))
+    assert.assert(r_is_err(m2))
+    // map_err：Err 转换
+    var f2 = func(e: string) -> string { return "pre:" + e; };
+    var m5 = r_map_err(r2, f2)
+    switch m5 {
+        case Err(e): assert.assert_eq_str(e, "pre:bad")
+        case Ok(v): panic("map_err 不应 Ok")
+    }
+    // unwrap_or
+    assert.assert_eq(r_unwrap_or(r2, 99), 99)
+    // switch 解构（payload 绑定）
+    switch r1 {
+        case Ok(v): assert.assert_eq(v, 42)
+        case Err(e): panic("r1 不应 Err")
+    }
+    switch r2 {
+        case Ok(v): panic("r2 不应 Ok")
+        case Err(e): assert.assert_eq_str(e, "bad")
+    }
+    println("组合子机制探针全过")
+}
