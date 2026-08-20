@@ -2896,7 +2896,9 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         return 0
     }
     if nm == "str_char" {
-        g_used_interp = true
+        // 去 Rust 桥：取第 i 个码点字符，irgen 内联生成——字节位置循环跳过
+        // i 个码点（s21_utf8_seq_len 步进）→ s21_utf8_char_at 解码码点 →
+        // s21_codepoint_to_str 得单字符。不链接 tie_interp.lib。
         var v = gen_expr(call_arg(id, 0))
         if v < 0 {
             return -1
@@ -2905,7 +2907,70 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         if i < 0 {
             return -1
         }
-        g_builtin_res = gen_ext_call2("tie_str_char", v, types.named(TK_STR), i, types.named(TK_I64), types.named(TK_STR))
+        // 位置槽（字节 pos）与步进计数器槽（已跳码点数）
+        var pos_a = ir.new_inst(g_cur_block, 20, types.named(TK_I64))
+        ir.add_operand(pos_a, types.named(TK_I64), 2)
+        var pos_ptr = ir.get_value(pos_a)
+        var k_a = ir.new_inst(g_cur_block, 20, types.named(TK_I64))
+        ir.add_operand(k_a, types.named(TK_I64), 2)
+        var k_ptr = ir.get_value(k_a)
+        var zlit = gen_int_lit_ty(0, types.named(TK_I64))
+        var stp = ir.new_inst(g_cur_block, 22, -1)
+        ir.add_operand(stp, types.named(TK_I64), 2)
+        ir.add_operand(stp, zlit, 0)
+        ir.add_operand(stp, pos_ptr, 0)
+        var stk = ir.new_inst(g_cur_block, 22, -1)
+        ir.add_operand(stk, types.named(TK_I64), 2)
+        ir.add_operand(stk, zlit, 0)
+        ir.add_operand(stk, k_ptr, 0)
+        // 三块：cond / body / exit（字节定位循环）
+        var cond_blk = ir.new_block(g_cur_func, interner.intern("sc.cond"))
+        var body_blk = ir.new_block(g_cur_func, interner.intern("sc.body"))
+        var exit_blk = ir.new_block(g_cur_func, interner.intern("sc.exit"))
+        var b0 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(b0, cond_blk, 1)
+        // cond：k < i → body，否则 exit
+        g_cur_block = cond_blk
+        var ku = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+        ir.add_operand(ku, k_ptr, 0)
+        var ku_v = ir.get_value(ku)
+        var ol = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp
+        ir.add_operand(ol, ku_v, 0)
+        ir.add_operand(ol, i, 0)
+        ir.add_operand(ol, 2, 2)  // slt
+        var ol_v = ir.get_value(ol)
+        var cb = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb, ol_v, 0)
+        ir.add_operand(cb, body_blk, 1)
+        ir.add_operand(cb, exit_blk, 1)
+        // body：pos += utf8_seq_len(s, pos)；k += 1
+        g_cur_block = body_blk
+        var pu = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+        ir.add_operand(pu, pos_ptr, 0)
+        var pu_v = ir.get_value(pu)
+        var sl = s21_utf8_seq_len(v, pu_v)
+        var np = s21_bin(0, pu_v, sl)  // add
+        var stp2 = ir.new_inst(g_cur_block, 22, -1)
+        ir.add_operand(stp2, types.named(TK_I64), 2)
+        ir.add_operand(stp2, np, 0)
+        ir.add_operand(stp2, pos_ptr, 0)
+        var ku2 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+        ir.add_operand(ku2, k_ptr, 0)
+        var ku2_v = ir.get_value(ku2)
+        var nk = s21_bin(0, ku2_v, gen_int_lit(1))
+        var stk2 = ir.new_inst(g_cur_block, 22, -1)
+        ir.add_operand(stk2, types.named(TK_I64), 2)
+        ir.add_operand(stk2, nk, 0)
+        ir.add_operand(stk2, k_ptr, 0)
+        var bbr = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(bbr, cond_blk, 1)
+        // exit：解码 pos 处码点 → 单字符字符串
+        g_cur_block = exit_blk
+        var pz = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+        ir.add_operand(pz, pos_ptr, 0)
+        var pz_v = ir.get_value(pz)
+        var cp = s21_utf8_char_at(v, pz_v)
+        g_builtin_res = s21_codepoint_to_str(cp)
         return 0
     }
     if nm == "str_from_code" {
