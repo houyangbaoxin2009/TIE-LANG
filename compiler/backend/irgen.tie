@@ -2806,21 +2806,93 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         return 0
     }
     if nm == "str_len" {
-        g_used_interp = true
+        // 去 Rust 桥（dev33 批次3 关联）：码点计数改为纯 tie 内联——
+        // 复用 s21_utf8_seq_len 步进循环累加（等价 tie_str_len），不再链接
+        // tie_interp.lib。返回码点数。
         var v = gen_expr(call_arg(id, 0))
         if v < 0 {
             return -1
         }
-        g_builtin_res = gen_ext_call1("tie_str_len", v, types.named(TK_STR), types.named(TK_I64))
+        // 计数槽（i64）：初值 0；字节位置槽：初值 0
+        var cnt_a = ir.new_inst(g_cur_block, 20, types.named(TK_I64))
+        ir.add_operand(cnt_a, types.named(TK_I64), 2)
+        var cnt_ptr = ir.get_value(cnt_a)
+        var pos_a = ir.new_inst(g_cur_block, 20, types.named(TK_I64))
+        ir.add_operand(pos_a, types.named(TK_I64), 2)
+        var pos_ptr = ir.get_value(pos_a)
+        var zlit = gen_int_lit_ty(0, types.named(TK_I64))
+        var st0 = ir.new_inst(g_cur_block, 22, -1)
+        ir.add_operand(st0, types.named(TK_I64), 2)
+        ir.add_operand(st0, zlit, 0)
+        ir.add_operand(st0, cnt_ptr, 0)
+        var st0b = ir.new_inst(g_cur_block, 22, -1)
+        ir.add_operand(st0b, types.named(TK_I64), 2)
+        ir.add_operand(st0b, zlit, 0)
+        ir.add_operand(st0b, pos_ptr, 0)
+        // 四块：cond / body / step / exit
+        var cond_blk = ir.new_block(g_cur_func, interner.intern("sl.cond"))
+        var body_blk = ir.new_block(g_cur_func, interner.intern("sl.body"))
+        var step_blk = ir.new_block(g_cur_func, interner.intern("sl.step"))
+        var exit_blk = ir.new_block(g_cur_func, interner.intern("sl.exit"))
+        var b0 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(b0, cond_blk, 1)
+        // cond：pos < byte_len(s) → body，否则 exit
+        g_cur_block = cond_blk
+        var cur = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+        ir.add_operand(cur, pos_ptr, 0)
+        var cur_v = ir.get_value(cur)
+        var blen = s21_str_head_len(v)
+        var ol = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+        ir.add_operand(ol, cur_v, 0)
+        ir.add_operand(ol, blen, 0)
+        ir.add_operand(ol, 6, 2)  // ult
+        var ol_v = ir.get_value(ol)
+        var cb = ir.new_inst(g_cur_block, 31, -1)
+        ir.add_operand(cb, ol_v, 0)
+        ir.add_operand(cb, body_blk, 1)
+        ir.add_operand(cb, exit_blk, 1)
+        // body：cnt = cnt + 1；pos += utf8_seq_len(s, pos)
+        g_cur_block = body_blk
+        var curc = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+        ir.add_operand(curc, cnt_ptr, 0)
+        var curc_v = ir.get_value(curc)
+        var inc = s21_bin(0, curc_v, gen_int_lit(1))
+        var stc = ir.new_inst(g_cur_block, 22, -1)
+        ir.add_operand(stc, types.named(TK_I64), 2)
+        ir.add_operand(stc, inc, 0)
+        ir.add_operand(stc, cnt_ptr, 0)
+        var cur2 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+        ir.add_operand(cur2, pos_ptr, 0)
+        var cur2_v = ir.get_value(cur2)
+        var sl = s21_utf8_seq_len(v, cur2_v)
+        var np = s21_bin(0, cur2_v, sl)
+        var stp = ir.new_inst(g_cur_block, 22, -1)
+        ir.add_operand(stp, types.named(TK_I64), 2)
+        ir.add_operand(stp, np, 0)
+        ir.add_operand(stp, pos_ptr, 0)
+        var bbr = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(bbr, step_blk, 1)
+        // step → cond（空 step，跳回 cond 即可；此处直接 br cond）
+        g_cur_block = step_blk
+        var sb2 = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(sb2, cond_blk, 1)
+        // exit：结果 = cnt
+        g_cur_block = exit_blk
+        var ld = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+        ir.add_operand(ld, cnt_ptr, 0)
+        g_builtin_res = ir.get_value(ld)
         return 0
     }
     if nm == "char_code" {
-        g_used_interp = true
+        // 去 Rust 桥（dev33 批次3 关联）：单字符 → 码点，用已内联的
+        // s21_utf8_char_at(字符, 0)（等价 tie_char_code，纯 tie 生成，不再
+        // 链接 tie_interp.lib）。语义：UTF-8 解码单字符首码点 = 该码点。
         var v = gen_expr(call_arg(id, 0))
         if v < 0 {
             return -1
         }
-        g_builtin_res = gen_ext_call1("tie_char_code", v, types.named(TK_STR), types.named(TK_I64))
+        var zlit = gen_int_lit_ty(0, types.named(TK_I64))
+        g_builtin_res = s21_utf8_char_at(v, zlit)
         return 0
     }
     if nm == "str_char" {
@@ -3182,7 +3254,9 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         return 0
     }
     if nm == "exit" {
-        g_used_interp = true
+        // 去 Rust 桥（dev33 批次3 关联）：exit 是 libc 符号（gen_ext_call1 经
+        // is_libc 不置 interp），原误置 g_used_interp 把纯 libc 程序也拉进
+        // tie_interp.lib。移除——link_exe 的 prefer_interp=false 时仅链 runtime.a。
         var v = gen_expr(call_arg(id, 0))
         if v < 0 {
             return -1
