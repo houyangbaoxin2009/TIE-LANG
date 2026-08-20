@@ -685,6 +685,11 @@ pub func infer_expr(id: i64) -> i64 {
         var k: i64 = 0
         while k < nc {
             var op = sstate.child(id, k)
+            if s_vals[op] == 3 {
+                // target("arch") 平台条件编译标注（任务17）：非表达式操作数，跳过
+                k = k + 1
+                continue
+            }
             var e = sstate.child(op, 0)
             var ot = infer_expr(e)
             if ot < 0 {

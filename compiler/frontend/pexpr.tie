@@ -894,7 +894,8 @@ func parse_asm_expr(line: i64, col: i64) -> i64 {
         var d = false
         while !d {
             // 操作数：`in` / `out` / `inout`（in 是关键字 lex_in，out/inout 是
-            // 标识符）+ `(` + `reg` + `)` + 表达式
+            // 标识符）+ `(` + `reg` + `)` + 表达式；或平台条件编译标注
+            // `target("arch")`（任务17：按目标平台分支编译）。
             var kind = ""
             var kind_v: i64 = -1
             if putil.peek_tag() == lex_in {
@@ -906,35 +907,58 @@ func parse_asm_expr(line: i64, col: i64) -> i64 {
                     kind_v = 1
                 } else if kind == "inout" {
                     kind_v = 2
+                } else if kind == "target" {
+                    kind_v = 3
                 } else {
-                    putil.set_err(putil.peek_line(), putil.peek_col(), "asm! 操作数方向必须是 in / out / inout，实际是 '" + kind + "'")
+                    putil.set_err(putil.peek_line(), putil.peek_col(), "asm! 操作数方向必须是 in / out / inout / target，实际是 '" + kind + "'")
                     return -1
                 }
             } else {
-                putil.set_err(putil.peek_line(), putil.peek_col(), "asm! 操作数必须形如 in(reg) 表达式 / out(reg) 表达式")
+                putil.set_err(putil.peek_line(), putil.peek_col(), "asm! 操作数必须形如 in(reg) 表达式 / out(reg) 表达式 / target(\"arch\")")
                 return -1
             }
             putil.advance()
-            if !putil.expect(lex_lparen, "'('") {
-                return -1
+            if kind_v == 3 {
+                // target("arch")：平台条件编译标注（N_PARAM name = 平台字符串池 id，
+                // val = 3；children 空）。irgen 按当前编译目标匹配，不匹配 → 报错。
+                if !putil.expect(lex_lparen, "'('") {
+                    return -1
+                }
+                if putil.peek_tag() != lex_str {
+                    putil.set_err(putil.peek_line(), putil.peek_col(), "asm! target() 参数必须是平台字符串字面量（如 target(\"x86_64\")）")
+                    return -1
+                }
+                var arch = putil.peek_lexeme()
+                putil.advance()
+                if !putil.expect(lex_rparen, "')'") {
+                    return -1
+                }
+                var p = ast.new_node(N_PARAM, interner.intern(arch), 3, -1, putil.peek_line(), putil.peek_col())
+                var pk0: table<i64> = table_new_i64()
+                ast.set_children(p, pk0)
+                table_push(ops, p)
+            } else {
+                if !putil.expect(lex_lparen, "'('") {
+                    return -1
+                }
+                if putil.peek_tag() != lex_ident || putil.peek_lexeme() != "reg" {
+                    putil.set_err(putil.peek_line(), putil.peek_col(), "asm! 第一版只支持 reg 约束（in/out/inout(reg)）")
+                    return -1
+                }
+                putil.advance()
+                if !putil.expect(lex_rparen, "')'") {
+                    return -1
+                }
+                var e = parse_unary()
+                if e < 0 {
+                    return -1
+                }
+                var p = ast.new_node(N_PARAM, -1, kind_v, -1, putil.peek_line(), putil.peek_col())
+                var pkids: table<i64> = table_new_i64()
+                table_push(pkids, e)
+                ast.set_children(p, pkids)
+                table_push(ops, p)
             }
-            if putil.peek_tag() != lex_ident || putil.peek_lexeme() != "reg" {
-                putil.set_err(putil.peek_line(), putil.peek_col(), "asm! 第一版只支持 reg 约束（in/out/inout(reg)）")
-                return -1
-            }
-            putil.advance()
-            if !putil.expect(lex_rparen, "')'") {
-                return -1
-            }
-            var e = parse_unary()
-            if e < 0 {
-                return -1
-            }
-            var p = ast.new_node(N_PARAM, -1, kind_v, -1, putil.peek_line(), putil.peek_col())
-            var pkids: table<i64> = table_new_i64()
-            table_push(pkids, e)
-            ast.set_children(p, pkids)
-            table_push(ops, p)
             if putil.eat(lex_comma) {
                 // 继续
             } else {

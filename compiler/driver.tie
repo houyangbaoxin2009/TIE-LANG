@@ -598,6 +598,19 @@ func compile_program(src: string) -> i64 {
     // frontend() 已执行完整前端（parse_ast + check_ast），sstate 全局表/
     // g_extra_tops/node_types 均已就绪——直接 gen_ast() 复用，避免前端重复
     // 执行（gen_src 内部会再 parse + check_impl 一遍，行为等价但浪费一倍）
+    // 任务17：asm! 平台条件编译注入编译目标（CLI --target > 配置 target >
+    // 本机默认 x86_64-pc-windows-msvc）。
+    var asm_target = normalize_target(g_target)
+    if str_len(asm_target) == 0 && g_cfg_root >= 0 {
+        var cfg_target = config.get_str(g_cfg_root, "target")
+        if str_len(cfg_target) > 0 {
+            asm_target = normalize_target(cfg_target)
+        }
+    }
+    if str_len(asm_target) == 0 {
+        asm_target = "x86_64-pc-windows-msvc"  // 本机默认（Windows x64 开发机）
+    }
+    irgen.set_target(asm_target)
     var rc = irgen.gen_ast()
     if rc < 0 {
         var msg = sm_err_msg

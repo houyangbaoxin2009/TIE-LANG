@@ -1,0 +1,9 @@
+type tie<logic>
+// 任务17 负例：asm! 指定 target("aarch64")，当前编译目标 x86_64 不匹配
+// → 明确编译错误（无目标平台分支可编译）。期望报错信息含
+// "asm! 平台 target(aarch64) 与当前编译目标 x86_64-pc-windows-msvc 不匹配"。
+func main() {
+    unsafe {
+        asm!("nop", target("aarch64"))
+    }
+}

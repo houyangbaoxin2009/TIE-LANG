@@ -1,0 +1,11 @@
+type tie<logic>
+// 任务17 正例探针：asm! 平台条件编译 target("arch")。
+// 当前编译目标 x86_64（本机）：target("x86_64") 分支匹配发射——模板 nop 编译
+// 为 x86 nop 指令，编译 + 运行正确 = 平台分支选择正确。
+// 交叉目标场景（如 --target win-arm64）下该分支应明确报错（见 asm_target_neg.tie）。
+func main() {
+    unsafe {
+        asm!("nop", target("x86_64"))
+    }
+    println("PASS batch6-asm-target")
+}

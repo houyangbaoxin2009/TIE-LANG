@@ -42,6 +42,9 @@ var g_used_runtime: bool = false;
 // 置位后 driver 链接 tie_interp.lib（Rust 桥，覆盖全部 tie_* 符号；
 // 与 runtime.a 二选一——interp.lib 覆盖 runtime.a 的三个符号）。
 var g_used_interp: bool = false;
+// 当前编译目标三元组（driver 在 gen_ast 前经 set_target 注入；空 = 未设置）。
+// 任务17 asm! 平台条件编译：target("arch") 按此目标匹配。
+var g_asm_target: string = "";
 // 当前函数的**全名**（命名空间函数含 "::"，如 sstate::child）——调用名解析
 // 需要当前命名空间前缀补全（对齐 sinfer.resolve_call_name 的候选 2）。
 var g_cur_fn_name: string = "";
@@ -1993,7 +1996,41 @@ func gen_expr(id: i64) -> i64 {
     if tag == 131 {
         // S1.2 I1 asm!：生成 inline_asm 指令（模板池 id + 操作数方向/值对）。
         // 第一个 out 操作数 → 结果类型（call 返回值）；其余 out 第一版忽略。
+        // 任务17：平台条件编译——target("arch") 标注按当前编译目标分支：
+        //   无 target 标注 → 始终发射（向后兼容）；
+        //   有 target 标注 → 当前目标匹配任一 → 发射；全不匹配 → 明确报错。
         var nc = sstate.nchild(id)
+        // ---------- 平台条件编译判定（任务17）----------
+        var has_target: bool = false
+        var matched: bool = false
+        var listed = ""
+        var kt: i64 = 0
+        while kt < nc {
+            var opx = sstate.child(id, kt)
+            if s_vals[opx] == 3 {
+                has_target = true
+                // 平台名（带引号 lexeme 池 id）→ 去引号纯文本
+                var arch = interner.lookup(str_unescape_quoted(s_names[opx]))
+                if str_len(listed) > 0 {
+                    listed = listed + "/"
+                }
+                listed = listed + arch
+                if asm_target_matches(arch) {
+                    matched = true
+                }
+            }
+            kt = kt + 1
+        }
+        if has_target && !matched {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            var cur_t = g_asm_target
+            if str_len(cur_t) == 0 {
+                cur_t = "（未设置）"
+            }
+            sm_err_msg = "asm! 平台 target(" + listed + ") 与当前编译目标 " + cur_t + " 不匹配（无目标平台分支可编译）"
+            return -1
+        }
         var tmpl = s_names[id]
         var out_slot: i64 = -1
         var out_ty: i64 = -1
@@ -2019,6 +2056,11 @@ func gen_expr(id: i64) -> i64 {
         while k < nc {
             var op = sstate.child(id, k)
             var dir = s_vals[op]
+            if dir == 3 {
+                // target("arch") 平台标注（任务17）：不占 asm 操作数，跳过
+                k = k + 1
+                continue
+            }
             var e = sstate.child(op, 0)
             if dir != 1 {
                 // in/inout：求值入参（类型 IMM + 值）
@@ -7103,6 +7145,23 @@ func is_extern_fn_id(fid: i64) -> bool {
         gi2 = gi2 + 1
     }
     return false
+}
+
+// 注入编译目标（driver 调用：normalize_target(g_target)，空则本机默认）。
+pub func set_target(t: string) {
+    g_asm_target = t
+}
+
+// 平台名匹配：全等（三元组直写）或架构前缀（"x86_64" 匹配 "x86_64-*"）。
+// 任务17 asm! 平台条件编译：target("arch") 按 g_asm_target 匹配。
+func asm_target_matches(arch: string) -> bool {
+    if str_len(g_asm_target) == 0 {
+        return false
+    }
+    if g_asm_target == arch {
+        return true
+    }
+    return has_prefix(g_asm_target, arch + "-")
 }
 
 pub func gen_ast() -> i64 {
