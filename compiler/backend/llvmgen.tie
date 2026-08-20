@@ -1193,11 +1193,73 @@ func extern_decl(sym: string) -> string {
     return ""
 }
 
+// 未登记符号（用户 libc extern，如 getenv/rand）声明推导：
+// 从 extern_call(36) 指令签名重构 `declare T @sym(T0, T1, ...)`。
+// op36 操作数：[0]=符号池id, [1]=返回类型IMM, 其后 [类型IMM, 值] 成对。
+// 批次5 任务13：用户 `unsafe extern fn getenv(name) -> string`（返回 char*）
+// 必须在模块头声明 `declare ptr @getenv(ptr)`，否则 opt 报 use of undefined value。
+// 返回 ""（符号未被调用 / 已在模块头无条件 declare，无需再声明）。
+func user_extern_decl(sym: string) -> string {
+    // 模块头已无条件 declare 的 libc 符号（emit() 头部段）——若再从调用签名
+    // 重复声明，会因签名不一致（如 exit 头为 i32、调用处推导为 i64）报
+    // redefinition；这些符号声明固定，绝不在此推导。
+    if sym == "printf" || sym == "strlen" || sym == "strcmp" ||
+        sym == "malloc" || sym == "free" || sym == "memcpy" ||
+        sym == "fopen" || sym == "fwrite" || sym == "fclose" || sym == "fflush" ||
+        sym == "exit" || sym == "remove" {
+        return ""
+    }
+    if sym == "sqrt" || sym == "sin" || sym == "cos" || sym == "tan" ||
+        sym == "exp" || sym == "log" || sym == "pow" ||
+        sym == "floor" || sym == "ceil" || sym == "round" {
+        return ""
+    }
+    var ni = ir.inst_count()
+    var i: i64 = 0
+    while i < ni {
+        var op = ir.ins_op(i)
+        // 用户 extern：既可能走 op36（tie_ 桥调用），也可能走 op35（用户顶层
+        // `unsafe extern fn` 调用，如 getenv）——两种指令操作数布局一致。
+        if (op == 36 || op == 35) && ir.ins_ops_cnt(i) >= 2 {
+            if intern.lookup(ir.ins_opnd(i, 0)) != sym {
+                i = i + 1
+                continue
+            }
+            // 返回类型：ins_ty <0 或 TK_VOID → void
+            var ret = "void"
+            var rty = ir.ins_ty(i)
+            if rty >= 0 && rty != TK_VOID {
+                ret = llvm_ty(rty)
+            }
+            // 参数类型表（操作数 2,4,6... 的 IMM 类型 id → LLVM 类型）
+            var args = ""
+            var first = true
+            var cnt = ir.ins_ops_cnt(i)
+            var k: i64 = 2
+            while k + 1 < cnt {
+                if !first {
+                    args = args + ", "
+                }
+                args = args + llvm_ty(ir.ins_opnd(i, k))
+                first = false
+                k = k + 2
+            }
+            return "declare " + ret + " @" + sym + "(" + args + ")"
+        }
+        i = i + 1
+    }
+    return ""
+}
+
 // 输出 extern_call 收集到的 declare（模块头，无条件 declare 之后）。
 func emit_extern_decls() {
     var i: i64 = 0
     while i < len(ext_syms) {
         var d = extern_decl(intern.lookup(ext_syms[i]))
+        if d == "" {
+            // 未登记的 libc extern（用户顶层声明）→ 从调用签名推导
+            d = user_extern_decl(intern.lookup(ext_syms[i]))
+        }
         if d != "" {
             line(d)
         }
@@ -2077,22 +2139,13 @@ func gen_inst(inst_id: i64) {
         }
         if ir.ins_ty(inst_id) < 0 || ir.ins_ty(inst_id) == TK_VOID {
             line("call void @" + sym + "(" + args + ")")
-        } else if ir.ins_ty(inst_id) == TK_STR && str_prefix(sym, "tie_") && !is_table_bridge(sym) {
-            // 桥返回堆串：先经临时寄存器 call，再补头，最后 reg = 数据指针
-            g_str_reg_cnt = g_str_reg_cnt + 1
-            var tmp = "%sc" + to_string(g_str_reg_cnt)
-            line(tmp + " = call " + llvm_ty(ir.ins_ty(inst_id)) + " @" + sym + "(" + args + ")")
-            // 补头序列：n = strlen(ret)；buf = malloc(n+9)；buf[0] = n；
-            // memcpy(buf+8, ret, n)；buf[8+n] = 0；reg = buf+8
-            var rn = gen_call_i64("strlen", "ptr", tmp)
-            var sz = reg_add(rn, "9")
-            var bf = gen_call_ptr("malloc", "i64", sz)
-            line("store i64 " + rn + ", ptr " + bf)
-            var dd = reg_gep(bf, "8")
-            line("call void @llvm.memcpy.p0.p0.i64(ptr " + dd + ", ptr " + tmp + ", i64 " + rn + ", i1 false)")
-            var ee = reg_gep(dd, rn)
-            line("store i8 0, ptr " + ee)
-            line(reg + " = getelementptr i8, ptr " + bf + ", i64 8")
+        } else if ir.ins_ty(inst_id) == TK_STR && !is_table_bridge(sym) {
+            // FFI 接收方向自动扫描（批次5 任务13/14）：extern 返回 string =
+            // C `char*`（NUL 结尾，无 {ptr,len} 头），调用后统一补头
+            // （strlen + malloc + memcpy + 尾 \0）。语义推广到**所有**符号——
+            // tie_ 桥与用户 extern（如 getenv）一致；表句柄桥经 is_table_bridge
+            // 黑名单排除（复用 ptr 槽，补头会错乱句柄）。
+            gen_ext_str_scan(reg, sym, args)
         } else {
             line(reg + " = call " + llvm_ty(ir.ins_ty(inst_id)) + " @" + sym + "(" + args + ")")
         }
@@ -2215,6 +2268,37 @@ func reg_gep(base: string, off: string) -> string {
     var r = "%sc" + to_string(g_str_reg_cnt)
     line(r + " = getelementptr i8, ptr " + base + ", i64 " + off)
     return r
+}
+
+// 批次5 任务13/14：extern 返回 char* → 自动扫描。无分支方案：NULL 校验后
+// select 一个安全源指针（NULL → 静态空串数据指针，头长 0 → 空串），再统一
+// strlen + malloc + memcpy + 尾 \0，产出 {ptr,len} 布局；reg 为数据指针。
+// 避免注入分支块/phi 带来的 LLVM 指令编号顺序问题（保持直线化、易 opt）。
+// 供 op36（tie 桥跟用户 extern）与非模块 extern 的 op35（用户 extern 调用）复用。
+func gen_ext_str_scan(reg: string, sym: string, args: string) {
+    // 先经临时寄存器 call，再补头，最后 reg = 数据指针（值 id 不变）
+    g_str_reg_cnt = g_str_reg_cnt + 1
+    var tmp = "%sc" + to_string(g_str_reg_cnt)
+    line(tmp + " = call ptr @" + sym + "(" + args + ")")
+    g_str_reg_cnt = g_str_reg_cnt + 1
+    var irn = "%sc" + to_string(g_str_reg_cnt)
+    line(irn + " = icmp eq ptr " + tmp + ", null")
+    g_str_reg_cnt = g_str_reg_cnt + 1
+    var src = "%sc" + to_string(g_str_reg_cnt)
+    line(src + " = select i1 " + irn + ", ptr " +
+        str_data_ref(str_slot(interner.intern(""))) + ", ptr " + tmp)
+    // 统一扫描：n = strlen(src)；buf = malloc(n+9)；buf[0]=n；
+    // memcpy(buf+8, src, n)；buf[8+n]=0；reg = 数据指针 buf+8。
+    // NULL 时 src=空串数据 len 0 → 产出空串；其余为真实 char* 扫描。
+    var rn = gen_call_i64("strlen", "ptr", src)
+    var sz = reg_add(rn, "9")
+    var bf = gen_call_ptr("malloc", "i64", sz)
+    line("store i64 " + rn + ", ptr " + bf)
+    var dd = reg_gep(bf, "8")
+    line("call void @llvm.memcpy.p0.p0.i64(ptr " + dd + ", ptr " + src + ", i64 " + rn + ", i1 false)")
+    var ee = reg_gep(dd, rn)
+    line("store i8 0, ptr " + ee)
+    line(reg + " = getelementptr i8, ptr " + bf + ", i64 8")
 }
 
 // T4.5：extern_call 实参引用——tie 运行时桥参数全为字符串（ptr）。

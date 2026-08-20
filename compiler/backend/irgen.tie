@@ -66,6 +66,11 @@ var g_lookup_ty: i64 = 0;
 var g_lookup_is_global: i64 = 0;
 // 内置调用结果全局槽（builtin_expr 置位；tie 无引用返回）
 var g_builtin_res: i64 = 0;
+// 批次5 任务13：用户 extern 名集（顶层 S_N_EXTERN=117，仅声明无函数体）。
+// 稀疏收集（用户程序通常 0~若干；编译器自身 0）→ gen_user_call 判定 extern → 路由
+// op36（llvmgen 推导 declare + 字符串返回自动扫描 char* → {ptr,len}）。
+var g_extern_ids: table<i64>;
+var g_extern_ready: i64 = 0;
 
 namespace irgen {
 
@@ -3617,6 +3622,32 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
         table_push(argisref, 0)
         table_push(argkinds, 0)
     }
+    // 批次5 任务13：用户 extern 函数（仅声明无函数体，如 libc getenv）→ 路由
+    // op36（extern_call）。否则走 op35（本模块函数 call）。op36 复用 llvmgen 的
+    // 「未登记符号签名推导 declare」+「string 返回自动扫描（char* → {ptr,len}）」。
+    // 判定：full 为用户声明的 extern（稀疏 g_extern_ids 线性命中）→ 路由 op36
+    //（declare 推导 + 字符串返回自动扫描）。非 extern 的正常模块函数走 op35。
+    // sym 即 interner.intern(full)（前面已算，O(1) 复用，勿再逐调用 re-intern）。
+    if is_extern_fn_id(sym) {
+        var etys: table<i64> = table_new_i64()
+        var evs: table<i64> = table_new_i64()
+        var ek: i64 = 0
+        while ek < len(argvals) {
+            var ety: i64 = types.named(TK_I64)
+            if ek < nparams {
+                if argisref[ek] == 1 {
+                    ety = types.named(TK_STR)   // ref 实参：槽地址 → ptr
+                } else {
+                    ety = ptys[ek]
+                }
+            }
+            table_push(etys, ety)
+            table_push(evs, argvals[ek])
+            ek = ek + 1
+        }
+        // extern 返回 void 时 ret_ty 恒为 TK_VOID，gen_ext_call_typed 建 void 指令
+        return gen_ext_call_typed(full, etys, evs, ret_ty)
+    }
     var ty35: i64 = -1
     if ret_ty != types.named(TK_VOID) {
         ty35 = ret_ty
@@ -6859,6 +6890,42 @@ func gen_block_stmts(blk: i64) -> i64 {
 // （parse + import 展开 + 符号表重建）的性能浪费。调用方在 frontend 失败时
 // 已提前返回，故本函数无需再判语义错误。
 // 返回 0 成功 / -1 错误（sm_err_* 已置）。
+// ==================== 批次5 任务13：用户 extern 判定（稀疏 extern 名集） ====================
+// extern 函数仅声明无函数体（顶层 S_N_EXTERN=117，名集 g_extern_ids 见模块头）。
+// gen_user_call 判定 full 是 extern → 路由 op36（llvmgen 推导 declare + 字符串返回
+// 自动扫描 char* → {ptr,len}）。
+
+// 收集模块全部 extern 函数名（顶层 extern 声明节点），懒初始化
+func collect_extern_fns() {
+    g_extern_ids = table_new_i64()
+    var n2 = len(g_extra_tops)
+    var i3: i64 = 0
+    while i3 < n2 {
+        var s3 = g_extra_tops[i3]
+        if s_tags[s3] == 117 {
+            table_push(g_extern_ids, interner.intern(sstate.name_str(s3)))
+        }
+        i3 = i3 + 1
+    }
+    g_extern_ready = 1
+}
+
+// 判定 interned id 是否为用户 extern（稀疏表线性 id 比对，O(externs) ≈ O(1)）。
+// 入参为「已 interned」的函数全名 id（gen_user_call 的 sym），避免逐调用 re-intern。
+func is_extern_fn_id(fid: i64) -> bool {
+    if g_extern_ready == 0 {
+        collect_extern_fns()
+    }
+    var gi2: i64 = 0
+    while gi2 < len(g_extern_ids) {
+        if g_extern_ids[gi2] == fid {
+            return true
+        }
+        gi2 = gi2 + 1
+    }
+    return false
+}
+
 pub func gen_ast() -> i64 {
     // 重置生成器状态
     g_sc_keys = table_new_i64()

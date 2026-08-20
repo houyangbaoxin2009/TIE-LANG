@@ -1,0 +1,37 @@
+type tie<logic>
+
+// 批次5（dev33-plans 任务13/14）验收：FFI 接收方向自动扫描。
+// extern 函数返回 `char*` → 编译器自动扫描（strlen + 拷贝）为 {ptr,len} 字符串，
+// 无需手动转换；NULL 契约为空串（避免 strlen(NULL) 崩溃）。
+// 覆盖两类关键边界：
+//   1. 非空 C 串：libc getenv("PATH")（win/linux 均确保非空）→ 自动扫描后
+//      str_len>0（{ptr,len} 长度头正确，数据 NUL 结尾，println 输出正确）；
+//   2. NULL：getenv(未设置变量) 返回 NULL → 契约空串 len 0。
+// 只对「非模块函数的 extern 字符串返回」自动扫描，正常模块函数调用不受影响。
+// 期望输出：path_len>0，unset=0，PASS batch5-ffi-recv。
+
+// 用户声明的 libc extern：`char *getenv(const char*)`，返回 string（char*）。
+unsafe extern fn getenv(name: string) -> string;
+
+func main() {
+    var p = ""
+    var n = ""
+    unsafe {
+        p = getenv("PATH")              // 非空 C 串 → 自动扫描（strlen+拷贝）
+        n = getenv("TIE_FFI_UNSET_9x")  // 未设置 → NULL → 契约空串
+    }
+    println("path_len=" + to_string(str_len(p)))
+    println("unset=" + to_string(str_len(n)))
+    // 契约断言：
+    // 1) 非空自动扫描：PATH len>0（strlen+拷贝后 {ptr,len} 头正确）
+    if str_len(p) <= 0 {
+        println("FAIL nonempty scan")
+        exit(1)
+    }
+    // 2) NULL 契约：未设置变量 → 空串 len 0（不崩溃、O(1) 长度头一致）
+    if str_len(n) != 0 {
+        println("FAIL null contract")
+        exit(1)
+    }
+    println("PASS batch5-ffi-recv")
+}
