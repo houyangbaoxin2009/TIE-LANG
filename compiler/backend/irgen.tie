@@ -2909,25 +2909,23 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         return 0
     }
     if nm == "str_from_code" {
-        // 码点 → 单字符字符串（与 char_code 对称）。桥签名 (i64) -> ptr（堆串），
-        // 独立语句时调用方 gen_stmt 统一 free（与 str_char 同机制）。
-        g_used_interp = true
+        // 去 Rust 桥：码点 → 单字符 UTF-8 字符串，改 irgen 内联生成
+        // s21_codepoint_to_str（纯 tie 内联，不链接 tie_interp.lib）。
         var v = gen_expr(call_arg(id, 0))
         if v < 0 {
             return -1
         }
-        // 实参类型：i64 直传；窄整数（trit/char/i8/i16/i32 等）先 sext 到 i64
-        // （桥只收 i64，直传会生成 `call ptr @tie_str_from_code(i64 %i8)` 类型错）
+        // 窄整数（trit/char/i8/i16/i32 等）先 sext 到 i64（s21 编码期望 i64）
         var vt = node_types[call_arg(id, 0)]
-        if vt == types.named(TK_I64) || vt == types.named(TK_U64) || vt < 0 {
-            g_builtin_res = gen_ext_call1("tie_str_from_code", v, types.named(TK_I64), types.named(TK_STR))
-        } else {
-            var sv = gen_sext(v, vt, types.named(TK_I64))
-            if sv < 0 {
+        var sv = v
+        if vt >= 0 && vt != types.named(TK_I64) && vt != types.named(TK_U64) {
+            var se = gen_sext(v, vt, types.named(TK_I64))
+            if se < 0 {
                 return -1
             }
-            g_builtin_res = gen_ext_call1("tie_str_from_code", sv, types.named(TK_I64), types.named(TK_STR))
+            sv = se
         }
+        g_builtin_res = s21_codepoint_to_str(sv)
         return 0
     }
     // ---------- S2.1 字符串 {ptr,len} 原语 ----------
@@ -5597,6 +5595,144 @@ func gen_i128_to_str(v: i64, is_signed: bool) -> i64 {
     var ip = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr → ptr
     ir.add_operand(ip, ir.get_value(pi), 0)
     return ir.get_value(ip)
+}
+
+// 码点 → 带头单字符 UTF-8 字符串（去 Rust 桥：替代 tie_str_from_code）。
+// 输入 cp（i64 值寄存器）。非法码点（负、>0x10FFFF、代理区 D800-DFFF）→ 空串；
+// 合法 → 按 UTF-8 序列长分支写字节到 buf，统一 merge 写长度头 + NUL 并返回
+// 数据指针。结构仿 s21_utf8_char_at（内存槽跨块传递结果），带头串构造沿用
+// gen_i128_to_str 尾部模式（{len 头, 数据, \0}，ptrtoint+inttoptr 包装）。
+func s21_codepoint_to_str(cp: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var T8 = types.named(TK_I8)
+    // 结果槽（跨块 store/load）：非法空串 或 合法 buf 数据指针
+    var res_a = ir.new_inst(g_cur_block, 20, types.named(TK_STR))
+    ir.add_operand(res_a, types.named(TK_STR), 2)
+    var res_ptr = ir.get_value(res_a)
+    // 长度槽（跨块）：1/2/3/4 由各分支写入
+    var len_a = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(len_a, T64, 2)
+    var len_ptr = ir.get_value(len_a)
+    // 缓冲：4 数据 + 8 头 + \0 → malloc(13)；data = 数据起始（buf+8）
+    var buf = gen_ext_call1("malloc", gen_int_lit(13), T64, types.named(TK_STR))
+    var data = s21_gep(buf, 8, true)
+    // 非法判定：cp<0 || cp>0x10FFFF || (cp>=0xD800 && cp<=0xDFFF)
+    var is_neg = gen_cmp_const(cp, 2, 0, T64)              // slt 0
+    var is_oob = gen_cmp_const(cp, 3, 0x10FFFF, T64)       // sgt
+    var ge_d8 = gen_cmp_const(cp, 5, 0xD800, T64)          // sge
+    var le_df = gen_cmp_const(cp, 4, 0xDFFF, T64)          // sle
+    var surrogate = gen_and_i1(ge_d8, le_df)
+    var bad = gen_or_i1(gen_or_i1(is_neg, is_oob), surrogate)
+    // 块：bad / ent(入口分派) / l1-l4 / enc(构造) / exit
+    var bad_blk = ir.new_block(g_cur_func, interner.intern("cp.bad"))
+    var ent_blk = ir.new_block(g_cur_func, interner.intern("cp.ent"))
+    var l1 = ir.new_block(g_cur_func, interner.intern("cp.l1"))
+    var l2c = ir.new_block(g_cur_func, interner.intern("cp.l2c"))
+    var l2 = ir.new_block(g_cur_func, interner.intern("cp.l2"))
+    var l3c = ir.new_block(g_cur_func, interner.intern("cp.l3c"))
+    var l3 = ir.new_block(g_cur_func, interner.intern("cp.l3"))
+    var l4 = ir.new_block(g_cur_func, interner.intern("cp.l4"))
+    var enc_blk = ir.new_block(g_cur_func, interner.intern("cp.enc"))
+    var exit_blk = ir.new_block(g_cur_func, interner.intern("cp.exit"))
+    var cb0 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb0, bad, 0)
+    ir.add_operand(cb0, bad_blk, 1)
+    ir.add_operand(cb0, ent_blk, 1)
+    // entra：分派 1 字节（cp<=0x7F）→ l1，否则 l2c
+    g_cur_block = ent_blk
+    var c1 = gen_cmp_const(cp, 4, 0x7F, T64)  // sle 0x7F
+    var cb1 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb1, c1, 0)
+    ir.add_operand(cb1, l1, 1)
+    ir.add_operand(cb1, l2c, 1)
+    // bad：空串
+    g_cur_block = bad_blk
+    var empty = gen_str_lit(interner.intern("\"\""))
+    var stb = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(stb, types.named(TK_STR), 2)
+    ir.add_operand(stb, empty, 0)
+    ir.add_operand(stb, res_ptr, 0)
+    var brb = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brb, exit_blk, 1)
+    // l1：1 字节 [cp]
+    g_cur_block = l1
+    s21_store(data, s21_trunc_i8(cp), T8)
+    s21_store(len_ptr, gen_int_lit(1), T64)
+    var br1 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br1, enc_blk, 1)
+    // l2c：cp<=0x7FF → l2，否则 l3c
+    g_cur_block = l2c
+    var c2 = gen_cmp_const(cp, 4, 0x7FF, T64)  // sle
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, c2, 0)
+    ir.add_operand(cb2, l2, 1)
+    ir.add_operand(cb2, l3c, 1)
+    // l2：2 字节 [0xC0|(cp>>6)&0x1F][0x80|cp&0x3F]
+    g_cur_block = l2
+    var sh6 = s21_bin(11, cp, gen_int_lit(6))          // cp>>6 (ashr)
+    var lead2 = s21_bin(7, gen_int_lit(0xC0), s21_bin(6, sh6, gen_int_lit(0x1F)))
+    var cont2 = s21_bin(7, gen_int_lit(0x80), s21_bin(6, cp, gen_int_lit(0x3F)))
+    s21_store(data, s21_trunc_i8(lead2), T8)
+    s21_store(s21_gep(data, 1, true), s21_trunc_i8(cont2), T8)
+    s21_store(len_ptr, gen_int_lit(2), T64)
+    var br2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br2, enc_blk, 1)
+    // l3c：cp<=0xFFFF → l3，否则 l4
+    g_cur_block = l3c
+    var c3 = gen_cmp_const(cp, 4, 0xFFFF, T64)  // sle
+    var cb3 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb3, c3, 0)
+    ir.add_operand(cb3, l3, 1)
+    ir.add_operand(cb3, l4, 1)
+    // l3：3 字节 [0xE0|(cp>>12)&0x0F][0x80|(cp>>6)&0x3F][0x80|cp&0x3F]
+    g_cur_block = l3
+    var sh12 = s21_bin(11, cp, gen_int_lit(12))
+    var sh6b = s21_bin(11, cp, gen_int_lit(6))
+    var lead3 = s21_bin(7, gen_int_lit(0xE0), s21_bin(6, sh12, gen_int_lit(0x0F)))
+    var mid3 = s21_bin(7, gen_int_lit(0x80), s21_bin(6, sh6b, gen_int_lit(0x3F)))
+    var tail3 = s21_bin(7, gen_int_lit(0x80), s21_bin(6, cp, gen_int_lit(0x3F)))
+    s21_store(data, s21_trunc_i8(lead3), T8)
+    s21_store(s21_gep(data, 1, true), s21_trunc_i8(mid3), T8)
+    s21_store(s21_gep(data, 2, true), s21_trunc_i8(tail3), T8)
+    s21_store(len_ptr, gen_int_lit(3), T64)
+    var br3 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br3, enc_blk, 1)
+    // l4：4 字节 [0xF0|(cp>>18)&0x07][0x80|(cp>>12)&0x3F][0x80|(cp>>6)&0x3F][0x80|cp&0x3F]
+    g_cur_block = l4
+    var sh18 = s21_bin(11, cp, gen_int_lit(18))
+    var sh12b = s21_bin(11, cp, gen_int_lit(12))
+    var sh6c = s21_bin(11, cp, gen_int_lit(6))
+    var lead4 = s21_bin(7, gen_int_lit(0xF0), s21_bin(6, sh18, gen_int_lit(0x07)))
+    var m1 = s21_bin(7, gen_int_lit(0x80), s21_bin(6, sh12b, gen_int_lit(0x3F)))
+    var m2 = s21_bin(7, gen_int_lit(0x80), s21_bin(6, sh6c, gen_int_lit(0x3F)))
+    var m3 = s21_bin(7, gen_int_lit(0x80), s21_bin(6, cp, gen_int_lit(0x3F)))
+    s21_store(data, s21_trunc_i8(lead4), T8)
+    s21_store(s21_gep(data, 1, true), s21_trunc_i8(m1), T8)
+    s21_store(s21_gep(data, 2, true), s21_trunc_i8(m2), T8)
+    s21_store(s21_gep(data, 3, true), s21_trunc_i8(m3), T8)
+    s21_store(len_ptr, gen_int_lit(4), T64)
+    var br4 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br4, enc_blk, 1)
+    // enc：写长度头 + 尾 \0，数据指针包装 TK_STR，结果存 res
+    g_cur_block = enc_blk
+    var lv = s21_load(len_ptr, T64)
+    s21_store(s21_gep(buf, 0, true), lv, T64)  // 长度头（buf 首 8 字节）
+    s21_store(s21_gep(data, lv, false), gen_int_lit_ty(0, T8), T8)  // 尾 \0
+    var pic = ir.new_inst(g_cur_block, 24, T64)  // ptrtoint data
+    ir.add_operand(pic, data, 0)
+    var ipc = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr → ptr
+    ir.add_operand(ipc, ir.get_value(pic), 0)
+    var ste = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(ste, types.named(TK_STR), 2)
+    ir.add_operand(ste, ir.get_value(ipc), 0)
+    ir.add_operand(ste, res_ptr, 0)
+    var bre = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bre, exit_blk, 1)
+    // exit：返回 res（数据指针）
+    g_cur_block = exit_blk
+    var ld = ir.new_inst(g_cur_block, 21, types.named(TK_STR))
+    ir.add_operand(ld, res_ptr, 0)
+    return ir.get_value(ld)
 }
 
 // 便捷：双参数 void 桥
