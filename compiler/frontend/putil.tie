@@ -41,6 +41,7 @@ pub func fill_pending() {
     g_pending_idx = 0
     // S2.2：清空延迟闭包登记（闭包函数体快照，见 defer_closure_*）
     g_defer_nodes = table_new_i64()
+    g_defer_done = 0   // 已回填游标清零（嵌套闭包防重复回填）
     g_defer_pos = table_new_i64()
     g_defer_idx = table_new_i64()
     g_defer_pending = table_new_i64()
@@ -52,6 +53,7 @@ pub func fill_pending() {
     g_defer_err_msg = table_new_i64()
     // S3.3：清空延迟准引用块登记（块体快照，见 defer_code_*）
     g_defer_code_nodes = table_new_i64()
+    g_defer_code_done = 0   // 已回填游标清零（嵌套准引用防重复回填）
     g_defer_code_pos = table_new_i64()
     g_defer_code_idx = table_new_i64()
     g_defer_code_pending = table_new_i64()

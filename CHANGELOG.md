@@ -1,3 +1,34 @@
+## [新增] 闭包后置项：嵌套捕获 + fn×泛型 + C 回调（dev33 批次 8）
+
+dev33 计划批次 8（任务 21-23）：闭包模型（closure-model.md §10 未决项）落地——
+
+- **嵌套捕获（任务 21）**：闭包内再闭包、内层捕获外层闭包所捕获的变量。
+  三层以上嵌套捕获探针 `probe6_nested_capture.tie` 全绿（make → C1(捕获 a)
+  → C2(捕获 a,b) → C3(捕获 a,b,c)，最终 a+b+c=33）。实现 = **捕获传播后处理**
+  （`scheck.propagate_captures`）：闭包 k 的有效捕获 = 直接捕获 ∪ 子闭包传播
+  捕获，再减自身参数/局部（自身槽直接访问，无需进 env）；沿 `cl_parent` 父链
+  从内到外上溯。配套修复：延迟闭包/准引用回填加 `g_defer_done`/`g_defer_code_done`
+  游标（避免 parse_deferred_all 重复回填把内层闭包二次登记 → count 无限增长
+  死循环）、`check_pending_closures` 改动态边界（嵌套闭包在外层体检查期间登记，
+  固定 n 会漏检内层）；
+- **fn×泛型单态化（任务 22）**：泛型函数作闭包体/返回闭包，多次实例化各生成
+  独立闭包入口。`probe7_gen_closure.tie` 全绿（`make_adder<T>` 于 i64/f64 两次
+  实例化，各捕获自己的 base，输出 15 / 3.5）。机制：instantiate_fn 克隆函数时
+  TypeVar 替换为具体类型，体内闭包 N_FN_LIT 随实例化登记、入口名 clos_<新节点id>
+  天然区分；
+- **闭包作 extern 回调（任务 23）**：新增内建 `cb_ptr(f) -> string`——无捕获
+  闭包/命名函数转 C 兼容回调 thunk（`cb_<节点id>`，签名去掉隐藏 env 参数，体内
+  call 闭包入口传 env=null / call 命名函数），返回函数地址（string/ptr 槽）。
+  捕获闭包 → 编译拒绝（C 回调不携带环境）。`probe8_cb_ptr.tie` 全绿：libc atexit
+  注册 2 个无捕获闭包回调 + 1 个命名函数回调，进程退出 LIFO 触发打印（C 运行时
+  经 thunk 回调进 tie）。配套：llvmgen `typed_ref` 补 opcode 63（函数地址 → 直引
+  @sym，extern string/ptr 参数消费回调地址）；负例 `cb_ptr_neg.tie` 捕获闭包被拒；
+- **回归**：s21/s22/s23 探针 + tests/language 全量 PASS=65（probe6/7/8 新增全过，
+  cb_ptr_neg 正确拒绝）；既有 11 个 import 大库失败为既有漏洞 B（HEAD 对照确认
+  非本批引入；probe3_chars 亦为漏洞 B 布局敏感闪崩——tiec2/tiec2b 生成 IR 逐字节
+  一致证明非本批逻辑回归，已记入 .omo/evidence/regress-b8.txt）；try_probe/
+  shift_neg_free 为已知基线。
+
 ## [新增] 错误处理 C2：switch 解构 + 可捕获 panic + 组合子机制（dev33 批次 7）
 
 dev33 计划批次 7（任务 18-20）：错误处理 C2 落地——

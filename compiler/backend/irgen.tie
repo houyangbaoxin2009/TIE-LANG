@@ -2143,7 +2143,8 @@ func is_builtin_name(nm: string) -> bool {
     // StringBuilder 句柄（string_builder/sb_append/sb_append_byte/sb_build）
     if nm == "str_byte" || nm == "utf8_seq_len" || nm == "utf8_char_at" ||
         nm == "string_builder" || nm == "sb_append" || nm == "sb_append_byte" ||
-        nm == "sb_build" || nm == "sso_malloc_count" || nm == "catch_panic" {
+        nm == "sb_build" || nm == "sso_malloc_count" || nm == "catch_panic" ||
+        nm == "cb_ptr" {
         return true
     }
     // ---------- 网络原语（P0：std/net）----------
@@ -3047,6 +3048,14 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     if nm == "catch_panic" {
         var r = gen_catch_panic(id)
         if r < 0 {
+            return -1
+        }
+        return 0
+    }
+    // 闭包 → C 回调函数指针（dev33 批次8 任务23）：cb_ptr(f) -> string
+    if nm == "cb_ptr" {
+        var r2 = gen_cb_ptr(id)
+        if r2 < 0 {
             return -1
         }
         return 0
@@ -5134,6 +5143,138 @@ func gen_catch_panic(id: i64) -> i64 {
     // merge：load res（bool 值返回）
     g_cur_block = merge
     g_builtin_res = s21_load(res_p, types.named(TK_BOOL))
+    return 0
+}
+
+// 批次 8（任务 23）：`cb_ptr(f) -> string`——无捕获闭包/命名函数转 C 回调指针。
+// f 须为无捕获闭包字面量（env=null）或命名函数（无 env）；捕获闭包无法作
+// C 回调（C 函数指针不携带 env）。生成 thunk `cb_<节点id>`：签名 fn(A...) -> R
+//（去掉隐藏 env 参数），体内 call 目标（闭包入口 call clos_<id>(ptr null, A...)；
+// 命名函数 call @func(A...)）→ ret。返回 @cb_<节点id> 地址（opcode 63 ptrtoint，
+// extern 函数指针参数按 string/ptr 槽消费，llvmgen to_ptr 直引 @sym）。
+func gen_cb_ptr(id: i64) -> i64 {
+    var fn_node = call_arg(id, 0)
+    var fty = node_types[fn_node]
+    if fty < 0 || !types.is_fn(fty) {
+        sm_err_line = s_lines[fn_node]
+        sm_err_col = s_cols[fn_node]
+        sm_err_msg = "cb_ptr 参数必须是函数值（fn(A) -> R），函数 " + g_cur_fn_name
+        return -1
+    }
+    var ret_ty = types.fn_ret_ty(fty)
+    var nparams = types.fn_nparams_of(fty)
+    // 目标符号与调用形态：with_env=1 → 闭包入口（call clos_<id>(null, ...)），
+    // with_env=0 → 命名函数（call @func(...)）
+    var target: string = ""
+    var with_env: i64 = 0
+    var tag = s_tags[fn_node]
+    if tag == 132 {   // N_FN_LIT 闭包字面量
+        // 捕获非空 → 无法作 C 回调（环境无处置）
+        var ci = closure_index(fn_node)
+        if ci >= 0 {
+            var c_end = len(cl_capkeys)
+            if ci + 1 < len(cl_capoff) {
+                c_end = cl_capoff[ci + 1]
+            }
+            if c_end - cl_capoff[ci] > 0 {
+                sm_err_line = s_lines[fn_node]
+                sm_err_col = s_cols[fn_node]
+                sm_err_msg = "cb_ptr 参数闭包含捕获变量（C 回调函数指针不携带环境），函数 " + g_cur_fn_name
+                return -1
+            }
+        }
+        // 生成闭包入口函数 clos_<id>（cb_ptr 只取地址、不构造闭包值，但入口
+        // 须落地，否则 thunk 引用 @clos_<id> 未定义）；返回值（闭包聚合）丢弃
+        var gv = gen_closure_lit(fn_node)
+        if gv < 0 {
+            return -1
+        }
+        target = "clos_" + to_string(fn_node)
+        with_env = 1
+    } else if tag == 6 {   // S_N_VAR 命名函数提升（变量名解析为函数）
+        var full_nm = resolve_call_name(sstate.name_str(fn_node))
+        var fsig = sstate.fn_sig(full_nm)
+        if fsig < 0 {
+            sm_err_line = s_lines[fn_node]
+            sm_err_col = s_cols[fn_node]
+            sm_err_msg = "cb_ptr 参数 '" + sstate.name_str(fn_node) + "' 不是命名函数（函数 " + g_cur_fn_name + "）"
+            return -1
+        }
+        target = full_nm
+        with_env = 0
+    } else {
+        sm_err_line = s_lines[fn_node]
+        sm_err_col = s_cols[fn_node]
+        sm_err_msg = "cb_ptr 参数必须是无捕获闭包字面量或命名函数（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    // 生成 thunk：fn(A...) -> R（无 env 参数，匹配 C 回调签名）
+    var cb_name = "cb_" + to_string(fn_node)
+    var params: table<i64> = table_new_i64()
+    var k: i64 = 0
+    while k < nparams {
+        table_push(params, types.fn_param_of(fty, k))
+        k = k + 1
+    }
+    var saved_func = g_cur_func
+    var saved_block = g_cur_block
+    var fid = ir.new_func(interner.intern(cb_name), ret_ty, params)
+    g_cur_func = fid
+    var entry = ir.new_block(fid, interner.intern("entry"))
+    g_cur_block = entry
+    // call 目标（闭包入口 env=null；命名函数直接传实参）
+    var sym = interner.intern(target)
+    llvmgen.call_sym_reg(sym)
+    var ty35: i64 = -1
+    if ret_ty != types.named(TK_VOID) {
+        ty35 = ret_ty
+    }
+    // 注意：所有值产生指令（const_i/load）必须在 call 指令**之前**创建——
+    // ir_ops 是全局尾插，子表达式指令的操作数会落到 call 操作数区间中间
+    // 覆盖（历史：gen_int_lit 在 add_operand(call) 之间创建，const_i 的操作
+    // 数 L+2 覆盖 call 的 opnd2 → env 类型错乱成 i8 13）。
+    var env_ld: i64 = -1
+    if with_env == 1 {
+        // env=null：alloca ptr 槽 + store null（store 经 to_ptr 转 "null"）+
+        // load → 真 ptr 值（不能直传 const_i——i64 与 ptr 形参类型不匹配）
+        var ea = ir.new_inst(g_cur_block, 20, types.named(TK_STR))  // alloca ptr
+        ir.add_operand(ea, types.named(TK_STR), 2)
+        var eap = ir.get_value(ea)
+        var nullv = gen_int_lit(0)  // const_i 0（store to_ptr → null）
+        var stn = ir.new_inst(g_cur_block, 22, -1)  // store ptr null
+        ir.add_operand(stn, types.named(TK_STR), 2)
+        ir.add_operand(stn, nullv, 0)
+        ir.add_operand(stn, eap, 0)
+        var ldn = ir.new_inst(g_cur_block, 21, types.named(TK_STR))  // load ptr
+        ir.add_operand(ldn, eap, 0)
+        env_ld = ir.get_value(ldn)
+    }
+    var inst = ir.new_inst(g_cur_block, 35, ty35)  // call（子表达式指令已前置）
+    ir.add_operand(inst, sym, 0)
+    ir.add_operand(inst, ret_ty, 2)
+    if with_env == 1 {
+        ir.add_operand(inst, types.named(TK_STR), 2)
+        ir.add_operand(inst, env_ld, 0)
+    }
+    k = 0
+    while k < nparams {
+        var pty = types.fn_param_of(fty, k)
+        ir.add_operand(inst, pty, 2)
+        ir.add_operand(inst, ir.param_val(fid, k), 0)
+        k = k + 1
+    }
+    // ret（void → ret void；其余 → ret 调用结果）
+    if ret_ty == types.named(TK_VOID) {
+        var ret = ir.new_inst(g_cur_block, 32, -1)  // ret void
+    } else {
+        var ret = ir.new_inst(g_cur_block, 32, ret_ty)
+        ir.add_operand(ret, ir.get_value(inst), 0)
+    }
+    // 恢复调用方上下文
+    g_cur_func = saved_func
+    g_cur_block = saved_block
+    // 返回 @cb_<节点id> 地址（string/ptr 槽；extern 参数 to_ptr 直引 @sym）
+    g_builtin_res = gen_func_addr(cb_name)
     return 0
 }
 
@@ -8581,8 +8722,8 @@ func gen_closure_lit(id: i64) -> i64 {
         }
         return -1
     }
-    // 参数类型收集（N_PARAM：children=[类型]；s_vals = by_ref，s_aux = 变参）
     var ptys: table<i64> = table_new_i64()
+    // 参数类型收集（N_PARAM：children=[类型]；s_vals = by_ref，s_aux = 变参）
     var k: i64 = 0
     while k < nparams {
         var p = sstate.child(id, slot + 1 + k)

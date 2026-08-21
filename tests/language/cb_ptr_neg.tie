@@ -1,0 +1,11 @@
+type tie<logic>
+// 负例：cb_ptr 参数闭包含捕获变量 → 编译拒绝（C 回调函数指针不携带环境）
+unsafe extern fn atexit(f: string) -> i32;
+
+func main() {
+    var x: i64 = 5
+    unsafe {
+        var r = atexit(cb_ptr(func() { println("x=" + to_string(x)); }));
+        println(to_string(r))
+    }
+}

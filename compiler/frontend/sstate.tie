@@ -198,6 +198,9 @@ var g_clo_depth: i64 = 0;       // 闭包体检查深度（>0 = 在闭包体内�
 var g_clo_cur: i64 = -1;        // 当前闭包索引（捕获登记目标；-1 = 无）
 var g_clo_ret_stack: table<i64>;// 闭包返回类型栈（S_N_RETURN / ? 解包用）
 var g_clo_ret_top: i64 = 0;     // 返回类型栈逻辑栈顶游标（tie 表无法截断）
+var cl_parent: table<i64>;      // 闭包索引 -> 父闭包索引（sinfer 登记时 g_clo_cur；
+                                // -1 = 直接嵌套在普通函数体）。捕获传播（任务21）
+                                // 沿此链把内层闭包捕获上溯到祖先闭包的 env。
 
 // 顶层 StmtList 根（parse_program 创建的最后节点 id）
 var g_root: i64 = 0;

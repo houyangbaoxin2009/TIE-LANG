@@ -1,0 +1,13 @@
+type tie<logic>
+// S2.2 闭包探针 7：fn×泛型单态化——泛型函数返回闭包，多次实例化（任务 22）
+// make_adder<T> 模板体含闭包字面量；<i64>/<f64> 两次实例化各生成独立闭包入口。
+func make_adder<T>(base: T) -> fn(T) -> T {
+    return func(x: T) -> T { return x + base; };
+}
+
+func main() {
+    var fi = make_adder<i64>(10)
+    var ff = make_adder<f64>(1.5)
+    println(fi(5))    // 15
+    println(ff(2.0))  // 3.5
+}

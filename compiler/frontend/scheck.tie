@@ -1243,15 +1243,120 @@ func check_fn_walk_in_ns(blk: i64, full: string) -> i64 {
 // 嵌套闭包在外层闭包体检查期间登记，仍按 FIFO 排在外层之后）。
 // 每个闭包体用「登记时 lv 快照 + 闭包参数 + 闭包局部」重建独立作用域
 // 检查，结束后恢复外层作用域（函数检查残留的 lv 表）。
+// 注意：用**动态** len(g_clo_pending) 作循环边界——嵌套闭包是在检查外层
+// 闭包体时才被 infer_expr 登记到队尾，若固定 n 则嵌套闭包被漏检，其捕获集
+// 为空，内层闭包体对外层变量的引用在 irgen 阶段「变量未入作用域」。每个
+// N_FN_LIT 节点只被 infer 并登记一次，动态边界不会造成重复处理死循环。
 pub func check_pending_closures() -> i64 {
-    var n = len(g_clo_pending)
     var i: i64 = 0
-    while i < n {
+    while i < len(g_clo_pending) {
         var r = check_closure_body(i)
         if r < 0 {
             return -1
         }
         i = i + 1
+    }
+    // 捕获传播（任务21 嵌套闭包）：所有闭包体检查完后重算各闭包捕获集
+    if propagate_captures() < 0 {
+        return -1
+    }
+    return 0
+}
+
+// S2.2 捕获传播（嵌套闭包，任务21）：闭包 k 的有效捕获 = 直接捕获 ∪ 子闭包
+// 传播捕获，再减自身参数/局部（自身参数/局部走本地槽，无需进 env）。
+// 后处理：所有闭包体检查完后调用（cl_params/cl_locals/cl_cap* 均已定型）。
+// 处理顺序：闭包索引越大越内层（FIFO 登记），从内到外收集——内层闭包的有效
+// 捕获先算好，传播给祖先闭包时直接读子闭包已算好的有效段。
+// 例（probe6 三层）：C3 直接捕获 a/b/c → C2 有效 = {a,b}（c 是 C2 局部排除）→
+// C1 有效 = {a}（b 是 C1 局部排除）。闭包值构造点的 gen_var_ref 才找得到外层变量。
+func propagate_captures() -> i64 {
+    var n = len(g_clo_pending)
+    if n == 0 {
+        return 0
+    }
+    // eff_start[c]/eff_len[c]：闭包 c 有效捕获段（eff_keys/eff_vals）
+    // 注意：tie 表下标写 i>=len 静默失败（须 table_push），先按闭包数预填，
+    // 后续用下标回填 eff_start[c]/eff_len[c]（读侧 cl_capoff 等已由登记预填）。
+    var eff_start: table<i64> = table_new_i64()
+    var eff_len: table<i64> = table_new_i64()
+    var eff_keys: table<i64> = table_new_i64()
+    var eff_vals: table<i64> = table_new_i64()
+    var pf: i64 = 0
+    while pf < n {
+        table_push(eff_start, 0)
+        table_push(eff_len, 0)
+        pf = pf + 1
+    }
+    var c: i64 = n - 1
+    while c >= 0 {
+        eff_start[c] = len(eff_keys)
+        // ① 直接捕获（现有 cl_capkeys 段，检查期间已登记）
+        var off = cl_capoff[c]
+        var end = len(cl_capkeys)
+        if c + 1 < len(cl_capoff) {
+            end = cl_capoff[c + 1]
+        }
+        var j: i64 = off
+        while j < end {
+            var v = cl_capkeys[j]
+            if is_closure_own(c, v) == 0 && sstate.seg_has(eff_keys, eff_start[c], len(eff_keys) - eff_start[c], v) == 0 {
+                table_push(eff_keys, v)
+                table_push(eff_vals, cl_capvals[j])
+            }
+            j = j + 1
+        }
+        // ② 子闭包传播：cl_parent[ch] == c 的子闭包有效捕获并入（减自身参数/局部）
+        var ch: i64 = c + 1
+        while ch < n {
+            if cl_parent[ch] == c {
+                var k: i64 = 0
+                while k < eff_len[ch] {
+                    var v2 = eff_keys[eff_start[ch] + k]
+                    if is_closure_own(c, v2) == 0 && sstate.seg_has(eff_keys, eff_start[c], len(eff_keys) - eff_start[c], v2) == 0 {
+                        table_push(eff_keys, v2)
+                        table_push(eff_vals, eff_vals[eff_start[ch] + k])
+                    }
+                    k = k + 1
+                }
+            }
+            ch = ch + 1
+        }
+        eff_len[c] = len(eff_keys) - eff_start[c]
+        c = c - 1
+    }
+    // 重建 cl_capoff/cl_capkeys/cl_capvals（闭包索引升序布局，后端 gen_closure_lit
+    // 按 [cl_capoff[c], cl_capoff[c+1]) 读段）
+    cl_capoff = table_new_i64()
+    cl_capkeys = table_new_i64()
+    cl_capvals = table_new_i64()
+    var i2: i64 = 0
+    while i2 < n {
+        table_push(cl_capoff, len(cl_capkeys))
+        var j2: i64 = 0
+        while j2 < eff_len[i2] {
+            table_push(cl_capkeys, eff_keys[eff_start[i2] + j2])
+            table_push(cl_capvals, eff_vals[eff_start[i2] + j2])
+            j2 = j2 + 1
+        }
+        i2 = i2 + 1
+    }
+    return 0
+}
+
+// 闭包 c 自身可直访名：参数段 ∪ 局部段（命中 → 走本地槽，不捕获）。
+// 局部段边界取 [cl_locloff[c], cl_locloff[c+1])（闭包检查 FIFO 序，c 的局部
+// 全部在 c+1 检查开始前追加；末段到 len(cl_locals)）。
+func is_closure_own(c: i64, v: i64) -> i64 {
+    if sstate.seg_has(cl_params, cl_paramoff[c], cl_nparams[c], v) == 1 {
+        return 1
+    }
+    var lend = len(cl_locals)
+    if c + 1 < len(cl_locloff) {
+        lend = cl_locloff[c + 1]
+    }
+    if sstate.seg_has(cl_locals, cl_locloff[c], lend - cl_locloff[c], v) == 1 {
+        return 1
     }
     return 0
 }

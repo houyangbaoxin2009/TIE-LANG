@@ -1043,9 +1043,10 @@ pub func infer_expr(id: i64) -> i64 {
         var fnty = types.fn_of(ret_ty, ptys)
         node_types[id] = fnty
         g_typed = g_typed + 1
-        // 登记闭包：入队 + 签名段 + 登记时 lv 快照
+        // 登记闭包：入队 + 签名段 + 登记时 lv 快照 + 父闭包链
         var ci = len(g_clo_pending)
         table_push(g_clo_pending, id)
+        table_push(cl_parent, g_clo_cur)   // 父闭包索引（嵌套闭包捕获传播用）
         table_push(cl_ret, ret_ty)
         table_push(cl_nparams, nparams)
         table_push(cl_paroff, len(cl_ptys))

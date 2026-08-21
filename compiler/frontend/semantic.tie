@@ -468,6 +468,7 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     cl_capoff = table_new_i64()
     cl_capkeys = table_new_i64()
     cl_capvals = table_new_i64()
+    cl_parent = table_new_i64()
     g_clo_ret_stack = table_new_i64()
     g_clo_depth = 0
     g_clo_cur = -1
@@ -715,6 +716,7 @@ pub func check_ast(base_dir: string) -> string {
     cl_capoff = table_new_i64()
     cl_capkeys = table_new_i64()
     cl_capvals = table_new_i64()
+    cl_parent = table_new_i64()
     g_clo_ret_stack = table_new_i64()
     g_clo_depth = 0
     g_clo_cur = -1

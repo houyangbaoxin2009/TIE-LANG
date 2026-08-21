@@ -1,0 +1,35 @@
+type tie<logic>
+// S2.2 闭包探针 6：三层嵌套捕获——闭包内再闭包，内层捕获外层闭包所捕获的变量
+// 任务 21：三层嵌套闭包捕获探针正确
+// 注意：make() 返回的是「闭包返回闭包返回闭包」的嵌套 fn 类型
+// fn() -> fn() -> fn() -> i64，return 语句的类型标注须逐层一致。
+
+// 三层嵌套：make → 闭包1 (捕获 a) → 闭包2 (捕获 a、b) → 闭包3 (捕获 a、b、c)
+func make() -> fn() -> fn() -> fn() -> i64 {
+    var a: i64 = 10
+    return func() -> fn() -> fn() -> i64 {
+        var b: i64 = 20
+        return func() -> fn() -> i64 {
+            var c: i64 = 3
+            return func() -> i64 {
+                return a + b + c;   // 内层捕获外层闭包的 a/b/c
+            };
+        };
+    };
+}
+
+// 中转层：把三层闭包逐层展开
+func call3(f3: fn() -> i64) -> i64 {
+    return f3()
+}
+func call2(f2: fn() -> fn() -> i64) -> i64 {
+    return call3(f2())
+}
+func call1(f1: fn() -> fn() -> fn() -> i64) -> i64 {
+    return call2(f1())
+}
+
+func main() {
+    var f = make()
+    println(call1(f))   // 期望 33
+}

@@ -251,9 +251,11 @@ pub func parse_block() -> i64 {
 // 函数体 → 追加到 N_FN_LIT 的 children 末尾（布局与 N_FN_DEF 一致）。
 // 嵌套闭包：外层闭包函数体内若再有闭包字面量，parse_block 解析时会再次
 // 登记到延迟表队尾——循环条件用动态 defer_closure_count()，外层回填后
-// 内层自动继续处理。
+// 内层自动继续处理。注意从 g_defer_done 游标起处理，仅回填本轮新增闭包：
+// parse_deferred_all 外层 while 会反复调用本函数，若不记游标则会重复 parse
+// 已回填的闭包体，把其内层闭包二次登记 → count 无限增长死循环（内存爆炸）。
 pub func parse_deferred_closures() -> i64 {
-    var i: i64 = 0
+    var i: i64 = g_defer_done
     while i < putil.defer_closure_count() {
         var node = putil.defer_closure_node_at(i)
         putil.defer_closure_restore(i)
@@ -272,6 +274,7 @@ pub func parse_deferred_closures() -> i64 {
         table_push(kids, body)
         ast.set_children(node, kids)
         i = i + 1
+        g_defer_done = i   // 游标推进：本轮已回填到 i，外层循环重复调用时从 i 继续
     }
     return 0
 }
@@ -285,8 +288,10 @@ pub func parse_deferred_closures() -> i64 {
 // 解析块体 → 回填到 N_CODE_LIT 的 children[0]（块形式子 AST = StmtList）。
 // 嵌套：外层准引用块体内若再有准引用块，parse_block 解析时会再次登记到
 // 延迟表队尾——循环条件用动态 defer_code_count()，外层回填后内层自动继续。
+// 与闭包同款游标 g_defer_code_done：仅回填本轮新增，避免 parse_deferred_all
+// 外层循环重复 parse 已回填块体导致二次登记死循环。
 pub func parse_deferred_code_blocks() -> i64 {
-    var i: i64 = 0
+    var i: i64 = g_defer_code_done
     while i < putil.defer_code_count() {
         var node = putil.defer_code_node_at(i)
         putil.defer_code_restore(i)
@@ -301,6 +306,7 @@ pub func parse_deferred_code_blocks() -> i64 {
         table_push(kids, body)
         ast.set_children(node, kids)
         i = i + 1
+        g_defer_code_done = i   // 游标推进
     }
     return 0
 }

@@ -1,0 +1,21 @@
+type tie<logic>
+// S2.2 闭包探针 8：闭包作 extern 回调（任务 23）——cb_ptr(f) 生成 C 兼容
+// 回调 thunk，供 extern 函数指针参数（string/ptr 槽）使用。libc atexit 注册
+// 无捕获闭包回调，进程退出时由 C 运行时调用（验证闭包 → C 函数指针全链路）。
+unsafe extern fn atexit(f: string) -> i32;   // f = 回调函数指针（按 string/ptr 传）
+
+// 命名函数回调（无环境）
+func cleanup() {
+    println("named-callback-ran")
+}
+
+func main() {
+    // ① 无捕获闭包字面量回调：注册两个，退出时按 LIFO 打印
+    unsafe {
+        var r1 = atexit(cb_ptr(func() { println("closure-callback-1"); }))
+        var r2 = atexit(cb_ptr(func() { println("closure-callback-2"); }))
+        // ② 命名函数回调
+        var r3 = atexit(cb_ptr(cleanup))
+        println("registered " + to_string(r1) + to_string(r2) + to_string(r3))
+    }
+}

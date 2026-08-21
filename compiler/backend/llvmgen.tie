@@ -2303,6 +2303,12 @@ func typed_ref(inst_id: i64, k: i64) -> string {
             line(r + " = inttoptr i64 %" + to_string(v) + " to ptr")
             return r
         }
+        if ir.ins_op(def) == 63 {
+            // const_global（S2.2 函数地址）→ 直引 @sym（ptr 类型）
+            // （批次8 任务23：cb_ptr 回调地址经 extern string/ptr 槽传递）
+            var gsym = intern.lookup(ir.ins_opnd(def, 0))
+            return "@" + ns_replace(gsym)
+        }
     }
     return "%" + to_string(v)
 }
