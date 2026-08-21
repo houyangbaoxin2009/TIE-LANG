@@ -882,7 +882,7 @@ func str_len_of_slot(slot: i64) -> i64 {
 // 所有 "@.str.N" 直引点统一走本函数，保证引用指向数据而非头部。
 func str_data_ref(slot: i64) -> string {
     var n = str_len_of_slot(slot)
-    return "getelementptr ({ i64, [" + to_string(n + 1) + " x i8] }, ptr @.str." +
+    return "getelementptr ({ i64, [" + to_string(n + 33) + " x i8] }, ptr @.str." +
         to_string(slot) + ", i32 0, i32 1)"
 }
 
@@ -1383,14 +1383,26 @@ func escape_str(s: string) -> string {
 // { ptr,len } 表示——`{ i64 N, [N+1 x i8] c"...\00" }`（N = UTF-8 字节数，
 // 末尾 \0 为边界自动 NUL 预留位）。数据指针由 str_data_ref 经 GEP 取。
 func emit_strings() {
+    // 32 字节尾部填充的转义（32 个 \00）——LLVM 字符串常量须精确填满数组
+    // 大小（短串 c"" 不会自动补零，opt 报 type mismatch）。追加到 N+1 内容后，
+    // 使常量恰为 N+33 字节（数据 + \0 + 32 填充）。
+    var zz = ""
+    var zi: i64 = 0
+    while zi < 32 {
+        zz = zz + "\\00"
+        zi = zi + 1
+    }
     var i: i64 = 0
     while i < len(str_pool) {
         var txt = intern.lookup(str_pool[i])
         var byte_len = utf.byte_len(txt)
         var esc = escape_str(txt)
+        // 漏洞 B 修复：字面量数组扩为 [N+33 x i8]（数据 N + \0 + 32 尾部填充）。
+        // .rodata 常量为 { i64 头, [N+33 x i8] }，整块 = N+41——容纳 opt 的
+        // 向量化 strlen/memcmp 宽读（16/32 字节），跨出段尾触发 0xC0000005。
         line("@.str." + to_string(str_idx[i]) + " = private unnamed_addr constant { i64, [" +
-            to_string(byte_len + 1) + " x i8] } { i64 " + to_string(byte_len) + ", [" +
-            to_string(byte_len + 1) + " x i8] c\"" + esc + "\\00\" }")
+            to_string(byte_len + 33) + " x i8] } { i64 " + to_string(byte_len) + ", [" +
+            to_string(byte_len + 33) + " x i8] c\"" + esc + "\\00" + zz + "\" }")
         i = i + 1
     }
 }
