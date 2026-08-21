@@ -292,6 +292,27 @@ pub func builtin_call(fn_name: string, args: table<i64>, call_node: i64) -> i64 
         }
         return types.named(TK_STR)
     }
+    // sb_reset(h)：清空复用（len=0，cap/data 缓冲保留）→ i64（0）
+    if fn_name == "sb_reset" {
+        if nargs != 1 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "sb_reset() 期望 1 个参数（句柄），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_I64)
+    }
+    // str_sub_bytes(s, lo, hi)：字节区间子串 [lo, hi)（clamp 越界）→ string。
+    // lexer 专用快路径（配合码点→字节偏移表，lexeme 切片 O(len) 单次 memcpy）
+    if fn_name == "str_sub_bytes" {
+        if nargs != 3 {
+            sm_err_line = s_lines[call_node]
+            sm_err_col = s_cols[call_node]
+            sm_err_msg = "str_sub_bytes() 期望 3 个参数（字符串, 起, 止），实际 " + to_string(nargs) + " 个"
+            return -2
+        }
+        return types.named(TK_STR)
+    }
     if fn_name == "str_from_code" {
         // 码点 → 单字符字符串（与 char_code 对称）：1 参 i64 → string。
         // 非法码点（负值/超上限/代理区）运行时返回空串，编译期只查参数个数。

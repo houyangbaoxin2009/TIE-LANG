@@ -29,6 +29,9 @@ var s_n: i64 = 0;             // 节点总数
 // ==================== 符号表全局 ====================
 var fn_keys: table<i64>;      // 函数全名 id（升序）
 var fn_vals: table<i64>;      // 签名 id
+var fn_def_nodes: table<i64>; // 函数定义 AST 节点 id（与 fn_keys 平行；性能重构：
+                              // check_fn_walk 查表 O(log n) 定位，替代每函数线性
+                              // 扫全部顶层 + ns_full_name 拼串比较的 O(N×M) 平方）
 var sg_nparams: table<i64>;   // 签名表：参数总数
 var sg_required: table<i64>;  // 必选参数数（默认值前）
 var sg_ret: table<i64>;       // 返回类型 id
@@ -923,6 +926,38 @@ pub func sorted_insert(keys: table<i64>, vals: table<i64>, k: i64, v: i64) -> i6
     return pos
 }
 
+// 函数表三列有序插入（keys/vals/nodes 并行同步移位；reg_fn 专用）。
+// 返回插入位置。
+pub func sorted_insert_fn(keys: table<i64>, vals: table<i64>, nodes: table<i64>, k: i64, v: i64, nd: i64) -> i64 {
+    var n = len(keys)
+    var lo: i64 = 0
+    var hi: i64 = n - 1
+    var pos: i64 = n
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        if keys[mid] < k {
+            lo = mid + 1
+        } else {
+            pos = mid
+            hi = mid - 1
+        }
+    }
+    table_push(keys, 0)
+    table_push(vals, 0)
+    table_push(nodes, 0)
+    var i: i64 = n
+    while i > pos {
+        keys[i] = keys[i - 1]
+        vals[i] = vals[i - 1]
+        nodes[i] = nodes[i - 1]
+        i = i - 1
+    }
+    keys[pos] = k
+    vals[pos] = v
+    nodes[pos] = nd
+    return pos
+}
+
 // 全局变量四列有序插入（返回插入位置）：keys/vals/cons/telems 并行同步移位。
 // 全局变量收集顺序与 intern id 顺序不一致（import 文件全局先收集、主文件
 // 全局后收集但 nid 更小），故 sorted_insert 可能中间插入——若 const/telem
@@ -961,8 +996,9 @@ pub func sorted_insert_gb(keys: table<i64>, vals: table<i64>, cons: table<i64>, 
     return pos
 }
 
-// 函数签名登记（重复定义检查，返回签名 id 或 -1）
-pub func reg_fn(full_name: string, is_pub: i64, nparams: i64, required: i64, ret_ty: i64, p_tys: table<i64>, p_refs: table<i64>, p_defs: table<i64>, p_vars: table<i64>) -> i64 {
+// 函数签名登记（重复定义检查，返回签名 id 或 -1）。
+// def_node：函数定义 AST 节点 id（fn_def_nodes 平行登记，check_fn_walk 查表用）。
+pub func reg_fn(full_name: string, is_pub: i64, nparams: i64, required: i64, ret_ty: i64, p_tys: table<i64>, p_refs: table<i64>, p_defs: table<i64>, p_vars: table<i64>, def_node: i64) -> i64 {
     var nid = intern.intern(full_name)
     if bs_find(fn_keys, nid) >= 0 {
         sm_err_line = 1
@@ -993,8 +1029,18 @@ pub func reg_fn(full_name: string, is_pub: i64, nparams: i64, required: i64, ret
         table_push(sp_vars, p_vars[i])
         i = i + 1
     }
-    sorted_insert(fn_keys, fn_vals, nid, sig)
+    sorted_insert_fn(fn_keys, fn_vals, fn_def_nodes, nid, sig, def_node)
     return sig
+}
+
+// 查函数定义 AST 节点 id（未定义 -1）。check_fn_walk 的 O(log n) 快路径。
+pub func fn_def_node(full_name: string) -> i64 {
+    var nid = intern.intern(full_name)
+    var idx = bs_find(fn_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return fn_def_nodes[idx]
 }
 
 // 查函数签名 id（未定义返回 -1）

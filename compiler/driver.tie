@@ -25,6 +25,10 @@ import "./config.tie"
 // S3.2：tieir 序列化（--tieir-out 输出分发单元 / --dump-irt 读回 dump）
 import "./middle/tieir_ser.tie"
 
+// 阶段计时探针（性能诊断）：CRT clock()，毫秒精度。
+// 环境变量 TIEC_TIME=1 时输出各阶段耗时（不设则零开销静默）。
+unsafe extern fn clock() -> i64;
+
 // ==================== 全局 ====================
 var g_input: string = "";
 var g_output: string = "";        // -o 指定（空 = 默认）
@@ -396,15 +400,32 @@ func strip_type_header(src: string) -> string {
 
 // 前端：词法/语法（parser.parse_ast，AST 留内存）→ 语义+import（semantic.check_ast）。
 // 返回 0 成功；失败打印错误并返回 -1。
+// 阶段计时（TIEC_TIME=1 时输出）：词法/语法与语义分开计量。
+var g_t_parse: i64 = 0;   // parse_ast 耗时（ms）
+var g_t_sem: i64 = 0;     // check_ast 耗时（ms）
 func frontend(src: string, base_dir: string) -> i64 {
     // T5.3 内存版：parse_ast 返回 0/-1（成功时 AST 在 ast 节点池内存），
     // 失败时由 parser.ast_err_protocol() 组装与 parse_src 相同的 "ERR:line col msg"
+    unsafe {
+        var t0 = clock()
+    }
     var prc = parser.parse_ast(src)
+    unsafe {
+        var t0e = clock()
+    }
+    g_t_parse = t0e - t0
     if prc < 0 {
         println("语法错误 " + err_span(parser.ast_err_protocol()))
         return -1
     }
+    unsafe {
+        var t1 = clock()
+    }
     var sem = semantic.check_ast(base_dir)
+    unsafe {
+        var t1e = clock()
+    }
+    g_t_sem = t1e - t1
     if has_prefix(str.clone(sem), "ERR:") {
         println("语义错误 " + err_span(sem))
         return -1
@@ -587,6 +608,10 @@ func main() -> i64 {
 }
 
 // 编译工具链（logic / library）：前端 → 中端 → 后端。
+// 阶段计时（TIEC_TIME=1）：irgen / emit / 写盘分开计量。
+var g_t_irgen: i64 = 0;   // irgen.gen_ast 耗时（ms）
+var g_t_emit: i64 = 0;    // llvmgen.emit 耗时（ms）
+var g_t_write: i64 = 0;   // file_write 耗时（ms）
 func compile_program(src: string) -> i64 {
     // base_dir：输入路径的目录（import 展开需要）；\\ 归一化为 /
     var base_dir = dir_of(str.clone(g_input))
@@ -611,7 +636,14 @@ func compile_program(src: string) -> i64 {
         asm_target = "x86_64-pc-windows-msvc"  // 本机默认（Windows x64 开发机）
     }
     irgen.set_target(asm_target)
+    unsafe {
+        var t2 = clock()
+    }
     var rc = irgen.gen_ast()
+    unsafe {
+        var t2e = clock()
+    }
+    g_t_irgen = t2e - t2
     if rc < 0 {
         var msg = sm_err_msg
         if str_len(msg) == 0 {
@@ -629,17 +661,37 @@ func compile_program(src: string) -> i64 {
         }
         println("已生成 tieir: " + g_tieir_out)
     }
+    unsafe {
+        var t3 = clock()
+    }
     var ll_text = llvmgen.emit()
+    unsafe {
+        var t3e = clock()
+    }
+    g_t_emit = t3e - t3
     // IR 文件路径：--emit-ir → -o 或 输入.ll；否则中间文件（输出基准）
     var ir_path = replace_ext(g_input, "ll")
     if str_len(g_output) > 0 {
         ir_path = replace_ext(g_output, "ll")
     }
+    unsafe {
+        var t4 = clock()
+    }
     if !file_write(ir_path, ll_text) {
         println("文件操作失败: 写 IR 文件 " + ir_path)
         return 1
     }
+    unsafe {
+        var t4e = clock()
+    }
+    g_t_write = t4e - t4
     if g_emit_ir {
+        // 阶段计时报告（TIEC_TIME=1）：parse/sem/irgen/emit/write 五段
+        if get_env("TIEC_TIME") == "1" {
+            println("[time] parse=" + to_string(g_t_parse) + "ms sem=" + to_string(g_t_sem) +
+                "ms irgen=" + to_string(g_t_irgen) + "ms emit=" + to_string(g_t_emit) +
+                "ms write=" + to_string(g_t_write) + "ms")
+        }
         println("已生成 LLVM IR: " + ir_path)
         return 0
     }
@@ -730,24 +782,31 @@ func cleanup(ir_path: string, opt_path: string) {
 // ==================== 字符串/路径工具（零依赖） ====================
 
 // 按 \n 拆行（去行尾 \r）。
+// 性能重写（O(n)）：旧实现 line + c 拼接（每行 O(len²)）× str_char(s,i)
+// 从头扫（O(i)）三重平方。新实现字节级扫描（\n/\r 为 ASCII 单字节）+
+// StringBuilder 累积，语义不变（连续 \n 产空行；尾部无 \n 的末行保留）。
 func split_lines(s: string) -> table<string> {
     var rows = table_new_string()
-    var n: i64 = str_len(s)
-    var line: string = ""
+    var n: i64 = len(s)
     var i: i64 = 0
+    var sb = string_builder()
     while i < n {
-        var c = str_char(s, i)
-        if c == "\n" {
-            table_push(rows, line)
-            line = ""
-        } else if c == "\r" {
-        } else {
-            line = line + c
+        var b = str_byte(s, i)
+        if b == 10 {
+            // \n：行结束（每行新建 sb——自举兼容旧原语集；sb_reset 复用留待
+            // 编译器自身认识该原语后启用）
+            table_push(rows, sb_build(sb))
+            sb = string_builder()
+        } else if b != 13 {
+            // 非 \r：追加字节（二进制安全）
+            sb_append_byte(sb, b)
         }
         i = i + 1
     }
-    if str_len(line) > 0 {
-        table_push(rows, line)
+    // 尾部无 \n 的末行（非空才保留——与原实现一致）
+    var tail = sb_build(sb)
+    if tail != "" {
+        table_push(rows, tail)
     }
     return rows
 }

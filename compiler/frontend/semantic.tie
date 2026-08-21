@@ -33,6 +33,19 @@ var g_cur_dir: string = "";
 // 追加到 g_extra_tops 末尾，主循环从该位置续扫）
 var g_scan_extra_last: i64 = 0;
 
+// 子阶段计时（性能诊断，TIEC_TIME=1 时输出）：sem 内部分布定位。
+// 声明须在文件顶层（命名空间体内只允许函数）。符号 = kernel32 GetTickCount
+//（毫秒精度；driver 已声明 CRT clock，extern 不允许跨文件重复定义）。
+unsafe extern fn GetTickCount() -> i64;
+var sm_t_copy: i64 = 0
+var sm_t_mexp: i64 = 0
+var sm_t_imp: i64 = 0
+var sm_t_coll: i64 = 0
+var sm_t_impl: i64 = 0
+var sm_t_gen: i64 = 0
+var sm_t_flds: i64 = 0
+var sm_t_fns: i64 = 0
+
 namespace semantic {
 
 // 路径目录：返回最后一个 '/' 之前的子串（含 '/'）；无 '/' 返回 ""。
@@ -354,6 +367,7 @@ pub func check_impl(ast_text: string, base_dir: string) -> string {
     s_cols = table_new_i64()
     fn_keys = table_new_i64()
     fn_vals = table_new_i64()
+    fn_def_nodes = table_new_i64()
     sg_nparams = table_new_i64()
     sg_required = table_new_i64()
     sg_ret = table_new_i64()
@@ -602,6 +616,7 @@ pub func check_ast(base_dir: string) -> string {
     s_cols = table_new_i64()
     fn_keys = table_new_i64()
     fn_vals = table_new_i64()
+    fn_def_nodes = table_new_i64()
     sg_nparams = table_new_i64()
     sg_required = table_new_i64()
     sg_ret = table_new_i64()
@@ -726,24 +741,43 @@ pub func check_ast(base_dir: string) -> string {
         scollect.tre_bi_init()
     }
     // 内存直拷：ast 节点池 → sstate 9 列（替代 sstate.load_ast 的文本反序列化）
+    unsafe {
+        var smc0 = GetTickCount()
+    }
     if copy_ast_tables() < 0 {
         return "ERR:0 0 AST 协议解析失败"
     }
+    unsafe {
+        var smc1 = GetTickCount()
+    }
+    sm_t_copy = smc1 - smc0
     g_root = s_n - 1
     // S3.3 宏展开 pass（在 import 展开之前：宏定义与使用限主文件；展开结果
     // 参与类型检查）。失败返回与后续同格式的 ERR 协议文本。
     if mexpand.expand_sstate() < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
+    unsafe {
+        var smc2 = GetTickCount()
+    }
+    sm_t_mexp = smc2 - smc1
     // import 展开（主文件顶层进 g_extra_tops，import 文件递归合并）
     var er = expand_imports()
     if er < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
+    unsafe {
+        var smc3 = GetTickCount()
+    }
+    sm_t_imp = smc3 - smc2
     var r = scollect.collect_top()
     if r < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
+    unsafe {
+        var smc4 = GetTickCount()
+    }
+    sm_t_coll = smc4 - smc3
     // S2.4 impl 块统一处理（同 check_impl：方法改名 + 签名登记 + 完整性/
     // 签名检查 + impl 记录；须在 expand_generics 之前——泛型约束校验依赖
     // impl 表就绪）
@@ -751,11 +785,19 @@ pub func check_ast(base_dir: string) -> string {
     if ifr < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
+    unsafe {
+        var smc5 = GetTickCount()
+    }
+    sm_t_impl = smc5 - smc4
     // 泛型单态化预扫描展开（T3b）：同 check_impl（见其注释）
     var ge = expand_generics()
     if ge < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
+    unsafe {
+        var smc6 = GetTickCount()
+    }
+    sm_t_gen = smc6 - smc5
     // 泛型字段类型预实例化（2026-08-14）：字段类型中的模板 struct 引用（如
     // `A<i64>`）在此先行实例化，避免 collect_all_struct_fields 拍平时实例化
     // 副作用顶偏 cls_fldoff（详见 scollect.pre_instantiate_field_types 注释）
@@ -768,6 +810,10 @@ pub func check_ast(base_dir: string) -> string {
     if r3 < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
+    unsafe {
+        var smc7 = GetTickCount()
+    }
+    sm_t_flds = smc7 - smc6
     // enum 变体收集（须在 struct 字段拍平之后——payload 类型可能引用 struct）
     var r5 = scollect.collect_all_enums()
     if r5 < 0 {
@@ -779,6 +825,11 @@ pub func check_ast(base_dir: string) -> string {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
     }
     // 逐函数检查（T3b 稳定化，同 check_impl）
+    // 性能重构：checked 改直索引表（checked[sig] = 1；sig 稠密 0..N-1）——
+    // 旧版线性扫 checked 查 fid 是 O(N²)；泛型展开中 sig 追加时循环扩容。
+    unsafe {
+        var smc8 = GetTickCount()
+    }
     var checked: table<i64> = table_new_i64()
     var again: bool = true
     while again {
@@ -786,17 +837,12 @@ pub func check_ast(base_dir: string) -> string {
         var i: i64 = 0
         while i < len(fn_keys) {
             var fid = fn_keys[i]
-            var chk: i64 = 0
-            var has: bool = false
-            while chk < len(checked) {
-                if checked[chk] == fid {
-                    has = true
-                    break
-                }
-                chk = chk + 1
+            var sig = fn_vals[i]
+            while len(checked) <= sig {
+                table_push(checked, 0)
             }
-            if !has {
-                table_push(checked, fid)
+            if checked[sig] == 0 {
+                checked[sig] = 1
                 again = true
                 var fname = intern.lookup(fid)
                 // S1.5 移动语义：每函数检查前重置 live/moved 状态表（同 check_impl）
@@ -822,6 +868,18 @@ pub func check_ast(base_dir: string) -> string {
     var rc = scheck.check_pending_closures()
     if rc < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
+    unsafe {
+        var smc9 = GetTickCount()
+    }
+    sm_t_fns = smc9 - smc8
+    // 子阶段计时报告（TIEC_TIME=1）
+    var tmv = get_env("TIEC_TIME")
+    if tmv == "1" {
+        println("[sem] copy=" + to_string(sm_t_copy) + "ms mexp=" + to_string(sm_t_mexp) +
+            "ms imports=" + to_string(sm_t_imp) + "ms collect=" + to_string(sm_t_coll) +
+            "ms impl=" + to_string(sm_t_impl) + "ms generics=" + to_string(sm_t_gen) +
+            "ms fields=" + to_string(sm_t_flds) + "ms fns=" + to_string(sm_t_fns) + "ms")
     }
     return "OK:" + to_string(g_typed)
 }

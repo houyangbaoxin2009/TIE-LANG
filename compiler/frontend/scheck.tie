@@ -1154,8 +1154,50 @@ pub func check_fn(fn_node: i64, full: string) -> i64 {
     return 0
 }
 
+// full 名 "::" 段（除最后一段函数名）压 ns_stack，返回压入段数。
+// check_fn_walk 快路径的命名空间上下文重建（对齐旧扫描路径的 ns_push 行为）。
+func push_ns_of(full: string) -> i64 {
+    var cnt: i64 = 0
+    var n = str_len(full)
+    var pos: i64 = 0
+    var seg_start: i64 = 0
+    while pos < n {
+        // 找 "::" 分隔（段边界）
+        if pos + 1 < n && str_char(full, pos) == ":" && str_char(full, pos + 1) == ":" {
+            var seg = str.slice(full, seg_start, pos)
+            sstate.ns_push(intern.intern(seg))
+            cnt = cnt + 1
+            pos = pos + 2
+            seg_start = pos
+        } else {
+            pos = pos + 1
+        }
+    }
+    return cnt
+}
+
 // 带命名空间上下文的函数检查（顶层遍历 g_extra_tops，进入 namespace 时压段）
 pub func check_fn_walk(full: string) -> i64 {
+    // 快路径（性能重构）：fn_def_nodes 平行表 O(log n) 定位定义节点——
+    // 旧版每函数线性扫全部顶层 + 每候选拼 ns_full_name + strcmp，N 函数 ×
+    // M 顶层构成语义阶段最大平方（自举实测 sem 占 99.8%）。查表 miss 再走
+    // 旧扫描兜底（泛型展开等未登记路径）。
+    // 命名空间上下文：full 的 :: 段（除最后一段函数名）压 ns_stack——
+    // 命名空间内私有函数的裸调用解析依赖该栈（曾漏压导致「未定义的函数」）。
+    var fast_node = sstate.fn_def_node(full)
+    if fast_node >= 0 {
+        var segs = push_ns_of(full)
+        var r0 = check_fn(fast_node, full)
+        var pp: i64 = 0
+        while pp < segs {
+            ns_top = ns_top - 1
+            pp = pp + 1
+        }
+        if r0 < 0 {
+            return -1
+        }
+        return 1
+    }
     var n = len(g_extra_tops)
     var i: i64 = 0
     while i < n {

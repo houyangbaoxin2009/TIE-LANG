@@ -1,0 +1,74 @@
+// ==================== 编译流水线管理（LLVM PassManager 式模块化） ====================
+//
+// 每个编译阶段 = 一个 pass 槽位（fn 值全局变量），槽位可整体替换：
+//   set_pass_<name>(impl) 注册/覆盖实现 → 任何阶段可换算法变体（配合 mode.tie 三档）
+//   run_pipeline() 按固定序执行非空槽，任一失败立即中止返回错误码
+//
+// pass 间数据契约：全局状态池（g_src/g_base_dir → AST 池 → sstate → IR 表 → .ll 文本
+// 变量 g_ll_text）——对应 LLVM Module 在 pass 间流转的角色（单进程共享内存实现）。
+//
+// pass 签名统一 fn() -> i64：0 成功；非 0 = 失败码（驱动层打印已记录的诊断）。
+
+// 占位实现（槽位未注册时静默通过——允许裁剪流水线，如 --emit-ir 裁掉 link）
+func pass_noop() -> i64 {
+    return 0
+}
+
+// ---- pass 槽位（默认 noop；driver 启动时注册具体实现）----
+var g_pass_front: fn() -> i64 = pass_noop    // 前端：词法 + 语法 + 语义（含 import）
+var g_pass_irgen: fn() -> i64 = pass_noop    // 中端：AST → tie-IR（gen_ast）
+var g_pass_tieir: fn() -> i64 = pass_noop    // 中端旁路：tieir 序列化（--tieir-out）
+var g_pass_emit: fn() -> i64 = pass_noop     // 后端：tie-IR → .ll 文本（llvmgen.emit + 写盘）
+var g_pass_link: fn() -> i64 = pass_noop     // 后端：opt/clang/lld-link 工具链
+
+// ---- 注册 API（槽位替换点：算法变体 / 模式分派实现在此挂接）----
+pub func set_pass_front(f: fn() -> i64) {
+    g_pass_front = f
+}
+
+pub func set_pass_irgen(f: fn() -> i64) {
+    g_pass_irgen = f
+}
+
+pub func set_pass_tieir(f: fn() -> i64) {
+    g_pass_tieir = f
+}
+
+pub func set_pass_emit(f: fn() -> i64) {
+    g_pass_emit = f
+}
+
+pub func set_pass_link(f: fn() -> i64) {
+    g_pass_link = f
+}
+
+// ---- pass 间数据槽（全局状态池的显式契约面）----
+var g_src: string = ""        // 源文本（front 的输入）
+var g_base_dir: string = ""   // 输入文件目录（import 展开基准）
+var g_ll_text: string = ""    // .ll 文本（emit 的输出 / link 的输入）
+var g_ir_path: string = ""    // IR 文件路径（emit 写盘目标）
+
+// 按序执行流水线；返回第一个失败 pass 的错误码，全绿返回 0。
+// stop_after：在哪个 pass 之后停（"emit" = --emit-ir 路径；空 = 全链）。
+pub func run_pipeline(stop_after: string) -> i64 {
+    var rc = g_pass_front()
+    if rc != 0 {
+        return rc
+    }
+    rc = g_pass_irgen()
+    if rc != 0 {
+        return rc
+    }
+    if stop_after == "emit" {
+        return g_pass_emit()
+    }
+    rc = g_pass_tieir()
+    if rc != 0 {
+        return rc
+    }
+    rc = g_pass_emit()
+    if rc != 0 {
+        return rc
+    }
+    return g_pass_link()
+}

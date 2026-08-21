@@ -90,9 +90,8 @@ var g_fn_lines: table<string>;
 var g_fn_mode: i64 = 0;
 var g_hoisted_allocas: table<i64>;
 var g_hoisted_cnt: i64 = 0;
-// 重编号映射表：旧值 id → 新值 id（线性，行数规模小）
-var g_ren_old: table<i64>;
-var g_ren_new: table<i64>;
+// 重编号映射表（直索引）：旧值 id → 新值 id（-1 = 未设；旧值 id 稠密小整数）
+var g_ren_map: table<i64>;
 var g_ren_next: i64 = 1;
 
 namespace llvmgen {
@@ -101,13 +100,36 @@ namespace llvmgen {
 // 历史 bug：global_ref 曾调用未定义的裸 `slice`，导致所有 import 本模块的
 // 程序（driver-lite/driver）编译报"未定义的函数 'slice'"。本辅助补齐。
 func l_slice(s: string, start: i64, end: i64) -> string {
-    var out: string = ""
-    var i: i64 = start
+    // 性能重写（O(n)）：字节定位 + StringBuilder 拷贝（旧逐字符拼接 O(n²)）
+    var n: i64 = str_len(s)
+    if start < 0 {
+        start = 0
+    }
+    if end > n {
+        end = n
+    }
+    if start >= end {
+        return ""
+    }
+    // 一次码点扫描：顺路记录 start 的字节偏移（bstart），扫到 end 得字节偏移（b）
+    var b: i64 = 0
+    var i: i64 = 0
+    var bstart: i64 = 0
     while i < end {
-        out = out + str_char(s, i)
+        if i == start {
+            bstart = b
+        }
+        b = b + utf8_seq_len(s, b)
         i = i + 1
     }
-    return out
+    // 字节区间拷贝（start < end 保证 bstart 已被赋值）
+    var sb = string_builder()
+    var k: i64 = bstart
+    while k < b {
+        sb_append_byte(sb, str_byte(s, k))
+        k = k + 1
+    }
+    return sb_build(sb)
 }
 
 // 查找字符串中第一个指定字符的下标（-1 = 无）。
@@ -539,8 +561,7 @@ func renumber_lines() {
     var out = table_new_string()
     // 每函数独立重编号：映射表清空，新编号从形参个数 g_pcnt 起（形参值 id 占
     // 0..N-1，定义行保留原样 %0..%N-1，指令新编号从 %N 起避免撞号）。
-    g_ren_old = table_new_i64()
-    g_ren_new = table_new_i64()
+    g_ren_map = table_new_i64()
     g_ren_next = g_pcnt
     var n = len(g_fn_lines)
     var i: i64 = 0
@@ -584,94 +605,93 @@ func renumber_lines() {
 // 撞号）；行内其余 %N 引用按 ren_ref：N < g_pcnt 是形参位置引用（原样保留，
 // define 形参列表 %0..%N-1 不变），否则复用指令映射。
 func renumber_line(ln: string) -> string {
-    var n = str_len(ln)
+    // 性能重写（O(len)）：字节级扫描（%/数字全 ASCII）+ StringBuilder 输出 +
+    // 数字值累算（免 digs 字符串拼接与 parse_int）。旧版逐字符 out + c 拼接
+    // × str_char 从头跳 = 每行 O(len²)，全部生成行累计为 emit 阶段平方热点。
+    var n = len(ln)
     var t = str_trim_left(ln)
     // 检测定义：trim 后以 % 开头且首 %N 后跟 " ="
     var lead_def: bool = false
-    var lead_old: i64 = -1
-    var lead_end: i64 = -1  // 定义 %N 在原始 ln 中的结束下标（相对 ln）
-    if str_len(t) > 0 && str_char(t, 0) == "%" {
+    var lead_end: i64 = -1  // 定义 %N 在原始 ln 中的结束下标（字节）
+    var tn = len(t)
+    if tn > 0 && str_byte(t, 0) == 37 {
         var dj: i64 = 1
-        var ddig: string = ""
-        while dj < str_len(t) {
-            var dc = str_char(t, dj)
-            if dc == "0" || dc == "1" || dc == "2" || dc == "3" || dc == "4" ||
-                dc == "5" || dc == "6" || dc == "7" || dc == "8" || dc == "9" {
-                ddig = ddig + dc
+        var dval: i64 = 0
+        var dcnt: i64 = 0
+        while dj < tn {
+            var dc = str_byte(t, dj)
+            if dc >= 48 && dc <= 57 {
+                dval = dval * 10 + (dc - 48)
+                dcnt = dcnt + 1
                 dj = dj + 1
             } else {
                 break
             }
         }
-        if str_len(ddig) > 0 && dj < str_len(t) && str_char(t, dj) == " " {
+        if dcnt > 0 && dj < tn && str_byte(t, dj) == 32 {
             // 确认后跟 "= "（否则是引用行，如 `call @f(%0)`）
             var ek = dj + 1
-            while ek < str_len(t) && str_char(t, ek) == " " {
+            while ek < tn && str_byte(t, ek) == 32 {
                 ek = ek + 1
             }
-            if ek < str_len(t) && str_char(t, ek) == "=" {
+            if ek < tn && str_byte(t, ek) == 61 {
                 lead_def = true
-                lead_old = parse_int(ddig)
-                // trim 前导空白数 = str_len(ln) - str_len(t)，定义 %N 结束下标
-                lead_end = (str_len(ln) - str_len(t)) + dj
+                // trim 前导空白数 = len(ln) - len(t)，定义 %N 结束下标（字节）
+                lead_end = (len(ln) - tn) + dj
             }
         }
     }
-    var out: string = ""
+    var sb = string_builder()
     var i: i64 = 0
     while i < n {
-        var c = str_char(ln, i)
-        if c == "%" && i + 1 < n {
-            // 尝试读纯数字后缀
+        var b = str_byte(ln, i)
+        if b == 37 && i + 1 < n {
+            // 尝试读纯数字后缀（值累算）
             var j = i + 1
-            var digs: string = ""
-            var is_num: bool = true
+            var val: i64 = 0
+            var nd: i64 = 0
             while j < n {
-                var d = str_char(ln, j)
-                if d == "0" || d == "1" || d == "2" || d == "3" || d == "4" ||
-                    d == "5" || d == "6" || d == "7" || d == "8" || d == "9" {
-                    digs = digs + d
+                var d = str_byte(ln, j)
+                if d >= 48 && d <= 57 {
+                    val = val * 10 + (d - 48)
+                    nd = nd + 1
                     j = j + 1
                 } else {
                     break
                 }
             }
-            if str_len(digs) == 0 {
-                is_num = false
-            }
-            if is_num {
-                var old = parse_int(digs)
+            if nd > 0 {
                 var new_v: i64 = -1
                 // 定义位置：%N 后紧跟空格+等号才可能是定义；lead_end == j 时
                 // 恰是行首定义 %N（首字符 %，无前导空白）
                 if lead_def && i == 0 && j == lead_end {
-                    new_v = ren_def(old)
+                    new_v = ren_def(val)
                 } else {
-                    new_v = ren_ref(old)
+                    new_v = ren_ref(val)
                 }
-                out = out + "%" + to_string(new_v)
+                sb_append(sb, "%" + to_string(new_v))
                 i = j
                 continue
             }
         }
-        out = out + c
+        sb_append_byte(sb, b)
         i = i + 1
     }
-    return out
+    return sb_build(sb)
 }
 
 // 指令定义重映射：总是分配新号（查表复用）。
+// 性能重写：old 是值 id（稠密小整数）→ 直索引表（g_ren_map[old] = new，
+// -1 = 未设）；旧线性查表每函数 O(n²)（每行多个 %N 引用都全扫映射表）。
 func ren_def(old: i64) -> i64 {
-    var i: i64 = 0
-    while i < len(g_ren_old) {
-        if g_ren_old[i] == old {
-            return g_ren_new[i]
-        }
-        i = i + 1
+    while len(g_ren_map) <= old {
+        table_push(g_ren_map, -1)
     }
-    table_push(g_ren_old, old)
-    table_push(g_ren_new, g_ren_next)
+    if g_ren_map[old] >= 0 {
+        return g_ren_map[old]
+    }
     var v = g_ren_next
+    g_ren_map[old] = v
     g_ren_next = g_ren_next + 1
     return v
 }
@@ -1119,9 +1139,6 @@ func extern_decl(sym: string) -> string {
     if sym == "tie_print_err" {
         return "declare void @tie_print_err(ptr)"
     }
-    if sym == "tie_table_new" {
-        return "declare ptr @tie_table_new(i64)"
-    }
     if sym == "tie_table_push_i64" {
         return "declare void @tie_table_push_i64(ptr, i64)"
     }
@@ -1166,18 +1183,6 @@ func extern_decl(sym: string) -> string {
     }
     // E3 键值表（map）桥：键为字符串 ptr；值按类型分 i64 / string 两个桥。
     // 签名 (ptr map, ptr key, val, ptr ok)——与 tie_interp.lib 导出一一对应。
-    if sym == "tie_map_get" {
-        return "declare i64 @tie_map_get(ptr, ptr, ptr)"
-    }
-    if sym == "tie_map_get_string" {
-        return "declare ptr @tie_map_get_string(ptr, ptr, ptr)"
-    }
-    if sym == "tie_map_set" {
-        return "declare void @tie_map_set(ptr, ptr, i64, ptr)"
-    }
-    if sym == "tie_map_set_string" {
-        return "declare void @tie_map_set_string(ptr, ptr, ptr, ptr)"
-    }
     if sym == "tie_mkdir_all" {
         return "declare i8 @tie_mkdir_all(ptr)"
     }
@@ -1276,7 +1281,7 @@ func user_extern_decl(sym: string) -> string {
     // 重复声明，会因签名不一致（如 exit 头为 i32、调用处推导为 i64）报
     // redefinition；这些符号声明固定，绝不在此推导。
     if sym == "printf" || sym == "strlen" || sym == "strcmp" ||
-        sym == "malloc" || sym == "free" || sym == "memcpy" ||
+        sym == "malloc" || sym == "free" || sym == "memcpy" || sym == "memmove" ||
         sym == "fopen" || sym == "fwrite" || sym == "fclose" || sym == "fflush" ||
         sym == "exit" || sym == "remove" {
         return ""
@@ -1572,8 +1577,9 @@ func arg_ref(inst_id: i64, k: i64) -> string {
 // 这类桥在 irgen 用 TK_STR 标注返回值（ptr 槽复用），实际指向桥内表结构，
 // 补头会错乱句柄（tie_table_new 曾致表扩容 LayoutError 崩溃；tie_regex_find_all
 // 漏网曾致 lexer 码点表错乱、自举产物 tiec_v2 编译任何程序产出空 AST）。
+// 批次 7：tie_table_new 已内联（s21_table_new/map_new），从黑名单移除。
 func is_table_bridge(sym: string) -> bool {
-    if sym == "tie_table_new" || sym == "tie_list_dir" ||
+    if sym == "tie_list_dir" ||
         sym == "tie_walk_dir" || sym == "tie_byte_read" ||
         sym == "tie_regex_find_all" {
         return true
@@ -2471,6 +2477,8 @@ pub func emit() -> string {
     line("declare void @free(ptr)")
     line("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)")
     line("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)")
+    // 批次 7：libc memmove（map 有序数组插入平移；重叠安全，clang 链接 CRT 提供）
+    line("declare void @memmove(ptr, ptr, i64)")
     line("")
     line("declare ptr @fopen(ptr, ptr)")
     line("declare i64 @fwrite(ptr, i64, i64, ptr)")

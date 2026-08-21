@@ -4,19 +4,22 @@ type tie<class>
 // O(len) 字符串比较降为 O(1) 整数比较（阶段 2 compiler/lib/interner.tie 消费，
 // AST 名字字段存池 id——B1 列式设计依赖）。
 //
-// 数据结构（三个并行全局动态表，T0.4 全局表特性——本模块是它的首次生产消费）：
-// - intern_pool : table<string>  id -> 串（按登记序追加，pool[id] == 该 id 的串）
-// - intern_keys : table<string>  正查键：全部已登记串，升序（字符串 < 比较，strcmp 码点序）
-// - intern_vals : table<i64>     正查值：与 intern_keys 并行，keys[i] 对应 vals[i]（该串的 id）
-// 正查 = 对 intern_keys 二分（O(log n)）；反向 = intern_pool 下标 O(1)。
-// 说明：全局 map 未放开（顶层 `var m: map` 语法层即报错），故正查用并行排序表
-// 方案（同 D3 排序数组二分模式）；插入用「二分定位 + 尾部追加占位 + 从尾向前
-// 位移」保持升序：先二分定位插入位置（O(log n) 次字符串比较），尾部追加占位后
-// 从尾向前同步搬移 keys/vals（搬移阶段零比较；表元素为共享字符串句柄，赋值即
-// 搬移引用、无深拷贝）——单次插入成本 O(log n) 次 strcmp + O(n) 次表搬移，较
-// 原「追加尾部 + 向前冒泡」实现（O(n) 次 strcmp + O(n) 次两两交换）大幅削减
-// 字符串比较热点：编译器 lexer 逐 token intern（大文件数千 token），冒泡版构成
-// O(n²) strcmp 热点，位移版降为 O(n²) 表搬移 + O(n log n) strcmp。
+// 数据结构（性能重构：哈希桶版）：
+// - intern_pool  : table<string>  id -> 串（按登记序追加，pool[id] == 该 id 的串）
+// - intern_keys  : table<string>  正查键：已登记串（无序，追加序）
+// - intern_vals  : table<i64>     与 intern_keys 平行，keys[i] 对应 vals[i]（id）
+// - intern_bucket: table<i64>     哈希桶（开放寻址线性探测）；桶值 = keys 下标 + 1，
+//                  0 = 空槽（keys 下标从 0 起，+1 偏移让 0 可做空哨兵）
+// - intern_bcnt  : i64            桶数（2 的幂增长，初值 1024）
+// 正查 = 哈希定位 + 线性探测（每次探测一次 strcmp 确认）；插入 = 纯追加
+// keys/vals + 桶登记（O(1)），负载 > 0.7 时翻倍 rehash（全量重探测）。
+//
+// 历史性能教训（防回归）：
+// - 初版「追加尾部 + 向前冒泡」：O(n) 次 strcmp + O(n) 交换，每次插入 → O(n²) strcmp；
+// - 二版「二分定位 + 从尾向前位移」：O(log n) 次 strcmp + O(n) 表搬移/次插入 →
+//   O(n²) 搬移总量。自举实测：数万 lexeme 登记构成 parse 阶段平方热点；
+// - 本版（哈希桶）：查找 O(1) 均摊（1~2 次 strcmp + 探测），插入纯追加 O(1)
+//   均摊，rehash 摊入后续操作。整体 O(n) —— 三代演进的终点结构。
 //
 // 约定（接口稳定，消费者依赖）：
 // - id 从 0 递增分配（首次登记得 0，之后逐个 +1）；重复登记返回原 id，不新增条目；
@@ -29,82 +32,111 @@ type tie<class>
 
 // 全局状态：id -> 串（反向表，按登记序）
 var intern_pool: table<string>;
-// 正查键表：已登记串升序（字符串 < 比较）
+// 正查键表：已登记串（无序追加序；有序性无人依赖——旧二分已被哈希替代）
 var intern_keys: table<string>;
-// 正查值表：与 intern_keys 并行，keys[i] 对应串的 id
+// 正查值表：与 intern_keys 平行，keys[i] 对应串的 id
 var intern_vals: table<i64>;
+// 哈希桶（开放寻址线性探测）：桶值 = keys 下标 + 1；0 = 空槽
+var intern_bucket: table<i64>;
+// 桶数（2 的幂，从 1024 起）
+var intern_bcnt: i64 = 0;
 
 namespace intern {
-// 二分查找已登记串 s 在 intern_keys 中的下标（keys 升序）；未找到返回 -1。
-// 迭代式显式 lo/hi 下标，字符串比较直接用 < / > / == 运算符（IR 走 strcmp）。
-func binsearch(s: string) -> i64 {
-    var lo: i64 = 0
-    var hi: i64 = len(intern_keys) - 1
-    while lo <= hi {
-        var mid = (lo + hi) / 2
-        if intern_keys[mid] == s {
-            return mid
-        }
-        if intern_keys[mid] < s {
-            lo = mid + 1
-        } else {
-            hi = mid - 1
+
+// 哈希函数：Java 式多项式滚动（h = h*31 + byte），i64 乘法溢出环绕（哈希
+// 只要求进程内一致性，环绕无害）。字节级扫描 O(len)，比 strcmp 便宜。
+// 返回前取非负（桶下标模运算要求非负）。
+func hash_str(s: string) -> i64 {
+    var h: i64 = 0
+    var n: i64 = len(s)
+    var i: i64 = 0
+    while i < n {
+        h = h * 31 + str_byte(s, i)
+        i = i + 1
+    }
+    if h < 0 {
+        h = 0 - h
+    }
+    return h
+}
+
+// 桶初始化（首次 intern 时懒执行）：1024 桶全空（0 填充）
+func bucket_init() {
+    if intern_bcnt > 0 {
+        return
+    }
+    intern_bcnt = 1024
+    intern_bucket = table_new_i64()
+    var i: i64 = 0
+    while i < intern_bcnt {
+        table_push(intern_bucket, 0)
+        i = i + 1
+    }
+}
+
+// 单键登记进桶（线性探测放首个空槽）：key_idx 为 keys 下标。
+// 调用前提：该串尚未在桶中（intern 主流程已探测未命中）。
+func bucket_put(key_idx: i64) {
+    var s = intern_keys[key_idx]
+    var h = hash_str(s)
+    var i = h % intern_bcnt
+    while intern_bucket[i] != 0 {
+        i = i + 1
+        if i >= intern_bcnt {
+            i = 0
         }
     }
-    return -1
+    intern_bucket[i] = key_idx + 1
+}
+
+// 负载超 0.7 → 桶翻倍重建（全量 keys 重新探测登记；均摊 O(1)/次插入）
+func bucket_grow() {
+    var cnt = len(intern_keys)
+    if cnt * 10 <= intern_bcnt * 7 {
+        return
+    }
+    var new_bcnt = intern_bcnt * 2
+    intern_bucket = table_new_i64()
+    var i: i64 = 0
+    while i < new_bcnt {
+        table_push(intern_bucket, 0)
+        i = i + 1
+    }
+    intern_bcnt = new_bcnt
+    // 全量重登记
+    var k: i64 = 0
+    while k < cnt {
+        bucket_put(k)
+        k = k + 1
+    }
 }
 
 // 把字符串 s 登记进池，返回稳定 id：相同串返回相同 id（id 从 0 递增）。
-// 新串流程：id = 当前池长（追加前长度）→ pool 追加 → keys/vals 有序插入
-// （二分定位插入位置 pos → 尾部追加占位 → 从尾向前位移 keys/vals，搬移
-// 阶段不再做字符串比较）→ 返回 id。
+// 哈希探测查找（O(1) 均摊）；未命中 → 纯追加 keys/vals + 桶登记。
 pub func intern(s: string) -> i64 {
-    var idx = binsearch(s)
-    if idx >= 0 {
-        return intern_vals[idx]
-    }
-    // 新串：id 为追加前池长（0 起始递增）
-    var id: i64 = len(intern_pool)
-    table_push(intern_pool, s)
-    // 有序插入 keys/vals（二分定位 + 尾部追加占位 + 从尾向前位移）：
-    //
-    // ① 二分定位插入位置 pos：keys 升序，找"第一个 >= s"的下标（新串保证无
-    //    相等元素，等价于"第一个 > s"的下标）。pos 初始为当前表长——当全部
-    //    已登记串都小于 s（s 排到表尾）时 pos 保持表长即正确位置。比较方向：
-    //    keys[mid] < s → 目标在右半，lo = mid + 1（pos 不动）；否则 → 目标在
-    //    [lo, mid]，pos = mid 记下候选并向左收窄 hi = mid - 1。整段仅 O(log n)
-    //    次字符串比较（对应旧冒泡实现每步一次 strcmp 的 O(n) 次比较）。
-    var pos: i64 = len(intern_keys)
-    var lo: i64 = 0
-    var hi: i64 = len(intern_keys) - 1
-    while lo <= hi {
-        var mid = (lo + hi) / 2
-        if intern_keys[mid] < s {
-            lo = mid + 1
-        } else {
-            pos = mid
-            hi = mid - 1
+    bucket_init()
+    var h = hash_str(s)
+    var i = h % intern_bcnt
+    // 线性探测：非空槽逐个 strcmp 确认；空槽 = 未登记
+    while intern_bucket[i] != 0 {
+        var k = intern_bucket[i] - 1
+        if intern_keys[k] == s {
+            return intern_vals[k]
+        }
+        i = i + 1
+        if i >= intern_bcnt {
+            i = 0
         }
     }
-    // ② 尾部追加占位：先把新串/新 id 追加到表尾（i 指向表尾下标），随后统一
-    //    向前搬移，避免中部逐位插入；追加后表长为 n+1，表尾下标即原表长 n。
+    // 新串：id 为追加前池长（0 起始递增）；keys/vals 纯追加（零位移）
+    var id: i64 = len(intern_pool)
+    table_push(intern_pool, s)
     table_push(intern_keys, s)
     table_push(intern_vals, id)
-    // ③ 从尾向前位移：把原 [pos, n-1] 区间的元素整体后移一格，腾出 pos 位置。
-    //    i 从表尾 n 递减到 pos 上方（i > pos 时执行），keys/vals 同步搬移维持
-    //    并行对应；搬移只是句柄赋值（table<string> 元素为共享引用，无深拷贝），
-    //    且全程不再做任何字符串比较——这是与旧冒泡实现的关键差异（冒泡每步
-    //    一次 strcmp + 一次两两交换）。
-    var i: i64 = len(intern_keys) - 1
-    while i > pos {
-        intern_keys[i] = intern_keys[i - 1]
-        intern_vals[i] = intern_vals[i - 1]
-        i = i - 1
-    }
-    // ④ 占位归位：把新串与新 id 写入腾出的 pos 处（vals 与 keys 保持并行对应，
-    //    升序不变量与"id 即登记序"语义均与旧实现一致）。
-    intern_keys[pos] = s
-    intern_vals[pos] = id
+    // 桶登记（放当前空槽 i；桶值 = keys 下标 + 1，末元素下标 = len-1）
+    intern_bucket[i] = len(intern_keys)
+    // 负载检查（翻倍 rehash 均摊）
+    bucket_grow()
     return id
 }
 

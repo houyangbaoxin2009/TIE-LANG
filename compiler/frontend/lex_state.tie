@@ -24,6 +24,10 @@ var g_codes: table<i64>;        // 源码码点表
 var g_src: string = "";         // 源码（lexeme 切片用）
 var g_n: i64 = 0;               // 码点数
 var g_line_starts: table<i64>;  // 各行起点（第 i 行起点 = g_line_starts[i]）
+// 码点索引 → 字节偏移表（性能重构新增）：g_byte_starts[i] = 第 i 个码点在
+// g_src 中的字节起始偏移；g_byte_starts[g_n] = 总字节数（哨兵，右端点用）。
+// lexeme 切片据此走 str_sub_bytes（字节区间 memcpy，O(len) 零码点重扫）。
+var g_byte_starts: table<i64>;
 
 // ---------- ASI 追踪状态（等价 Rust Lexer 字段）----------
 var g_line_has_token: bool = false;

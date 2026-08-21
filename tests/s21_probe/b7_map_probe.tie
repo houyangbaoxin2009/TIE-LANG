@@ -1,0 +1,68 @@
+type tie<logic>
+// 第 7 批字典 tie 化探针：两段式 map（数组模式 + 哈希模式）行为验证。
+// 覆盖：字面量(i64/string)/读写/覆盖/len/缺失键报错/按键升序打印/实参/复合赋值。
+// 运行：tiec tests\s21_probe\b7_map_probe.tie && tests\s21_probe\b7_map_probe.exe
+// 缺失键路径在探针末尾单独触发（预期打印错误后 exit(1)，前面的断言先通过）。
+
+func assert_eq(actual: i64, expected: i64, tag: string) {
+    if actual != expected {
+        println("FAIL " + tag + " 期望=" + to_string(expected) + " 实际=" + to_string(actual))
+        exit(1)
+    }
+    println("PASS " + tag + " = " + to_string(actual))
+}
+
+func assert_str(actual: string, expected: string, tag: string) {
+    if actual != expected {
+        println("FAIL " + tag + " 期望=" + expected + " 实际=" + actual)
+        exit(1)
+    }
+    println("PASS " + tag + " = " + actual)
+}
+
+// map 作实参：符号表查找
+func lookup(symtab: map<string>, name: string) -> string {
+    return symtab[name]
+}
+
+func main() {
+    // 1. i64 值 map 字面量 + 下标读 + len
+    var m: map = ["zebra": 26, "apple": 1, "mango": 13]
+    assert_eq(len(m), 3, "字面量 len=3")
+    assert_eq(m["apple"], 1, "读 apple=1")
+    assert_eq(m["zebra"], 26, "读 zebra=26")
+    assert_eq(m["mango"], 13, "读 mango=13")
+    // 2. 插入新键 / 覆盖旧键
+    m["banana"] = 2
+    assert_eq(len(m), 4, "插入后 len=4")
+    assert_eq(m["banana"], 2, "读 banana=2")
+    m["apple"] = 100
+    assert_eq(m["apple"], 100, "覆盖 apple=100")
+    assert_eq(len(m), 4, "覆盖后 len=4")
+    // 3. 复合赋值（已存在键）
+    m["mango"] = m["mango"] + 10
+    assert_eq(m["mango"], 23, "复合赋值 mango=23")
+    // 4. 打印（按键 strcmp 升序）
+    println(m)  // 期望 {apple: 100, banana: 2, mango: 23, zebra: 26}
+    // 5. string 值 map：字面量 + 读 + 写 + 打印
+    var sm: map<string> = ["main": "0x401000", "helper": "0x401200"]
+    assert_str(sm["main"], "0x401000", "string 值读 main")
+    sm["entry"] = "0x400000"
+    assert_str(sm["entry"], "0x400000", "string 值读 entry")
+    assert_eq(len(sm), 3, "string map len=3")
+    println(sm)  // 期望 {entry: 0x400000, helper: 0x401200, main: 0x401000}
+    // 6. map 作实参
+    assert_str(lookup(sm, "helper"), "0x401200", "map 实参查找 helper")
+    // 7. 空 map + 插入
+    var em: map = []
+    assert_eq(len(em), 0, "空 map len=0")
+    em["k1"] = 1
+    em["k2"] = 2
+    assert_eq(len(em), 2, "空 map 插入后 len=2")
+    assert_eq(em["k2"], 2, "空 map 读 k2=2")
+    println(em)  // 期望 {k1: 1, k2: 2}
+    // 8. 缺失键 → 运行时错误（对齐 interp：运行时错误: map_get 键不存在：'zzz'）
+    println("缺失键读 m[zzz]...")
+    println(m["zzz"])  // 预期打印错误并 exit(1)
+    println("UNREACHED")
+}

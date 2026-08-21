@@ -1,0 +1,83 @@
+// ==================== 编译模式配置（三档） ====================
+//
+// pipeline 各 pass 按全局模式号分派实现变体（热路径整数比较，零间接开销）：
+//   fast     内存占用最大，极快——大预分配 + 全缓存 + StringBuilder 全覆盖
+//   light    内存占用极小，极慢——懒构建 + 精确分配 + 逐字符算法
+//   balanced 一般运行环境配置（默认，适合 80% 场景）
+//
+// 模式切换：CLI `--mode <fast|light|balanced>` → mode_set()（main 早期调用）。
+
+// 模式常量（槽位值）
+const MODE_FAST: i64 = 0
+const MODE_LIGHT: i64 = 1
+const MODE_BALANCED: i64 = 2
+
+// 当前模式（全局；各算法实现读此值分支）
+var g_mode: i64 = 2  // 默认 balanced
+
+// ---- 模式参数集（算法变体读取的旋钮）----
+
+// StringBuilder 初始容量（字节；0 = 懒分配）：fast=256 / light=0 / balanced=64
+var g_mode_sb_init: i64 = 64
+
+// 表/缓冲增长是否 2x 倍增（false = 1.5x）：fast=true
+var g_mode_grow2x: i64 = 0  // 0/1（bool 存 i64，避免类型分派噪音）
+
+// 字面量去重强度：2=哈希缓存(fast) / 1=线性扫描(balanced) / 0=不去重直接重扫(light)
+var g_mode_lit_cache: i64 = 1
+
+// 行/lexeme 缓冲预分配（字节）：fast=65536 / light=0 / balanced=4096
+var g_mode_line_buf: i64 = 4096
+
+// 语义分析符号缓存：1=开启(fast/balanced) / 0=关闭(light，每次重扫)
+var g_mode_sym_cache: i64 = 1
+
+// 按名称设置模式（未知名回退 balanced）；同步刷新参数旋钮
+pub func mode_set(name: string) -> bool {
+    if name == "fast" {
+        g_mode = 0
+        g_mode_sb_init = 256
+        g_mode_grow2x = 1
+        g_mode_lit_cache = 2
+        g_mode_line_buf = 65536
+        g_mode_sym_cache = 1
+        return true
+    }
+    if name == "light" {
+        g_mode = 1
+        g_mode_sb_init = 0
+        g_mode_grow2x = 0
+        g_mode_lit_cache = 0
+        g_mode_line_buf = 0
+        g_mode_sym_cache = 0
+        return true
+    }
+    if name == "balanced" {
+        g_mode = 2
+        g_mode_sb_init = 64
+        g_mode_grow2x = 0
+        g_mode_lit_cache = 1
+        g_mode_line_buf = 4096
+        g_mode_sym_cache = 1
+        return true
+    }
+    // 未知名：回退 balanced
+    g_mode = 2
+    g_mode_sb_init = 64
+    g_mode_grow2x = 0
+    g_mode_lit_cache = 1
+    g_mode_line_buf = 4096
+    g_mode_sym_cache = 1
+    return false
+}
+
+// 模式名（诊断/日志输出用）
+pub func mode_name() -> string {
+    if g_mode == 0 {
+        return "fast"
+    }
+    if g_mode == 1 {
+        return "light"
+    }
+    return "balanced"
+}

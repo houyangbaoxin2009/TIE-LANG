@@ -246,7 +246,7 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
             }
         }
     }
-    if sstate.reg_fn(full, is_pub, nparams, required, ret_ty, p_tys, p_refs, p_defs, p_vars) < 0 {
+    if sstate.reg_fn(full, is_pub, nparams, required, ret_ty, p_tys, p_refs, p_defs, p_vars, fn_node) < 0 {
         sm_err_line = s_lines[fn_node]
         sm_err_col = s_cols[fn_node]
         return -1
@@ -255,14 +255,35 @@ pub func collect_fn(fn_node: i64, full: string) -> i64 {
 }
 
 // 字符串切片（scollect 本地辅助；对齐 irgen.ig_slice）
+// 性能重写（O(n)）：字节定位 + StringBuilder 拷贝（旧逐字符拼接 O(n²)）
 func ig_slice2(s: string, start: i64, end: i64) -> string {
-    var out: string = ""
-    var i: i64 = start
+    var n: i64 = str_len(s)
+    if start < 0 {
+        start = 0
+    }
+    if end > n {
+        end = n
+    }
+    if start >= end {
+        return ""
+    }
+    var b: i64 = 0
+    var i: i64 = 0
+    var bstart: i64 = 0
     while i < end {
-        out = out + str_char(s, i)
+        if i == start {
+            bstart = b
+        }
+        b = b + utf8_seq_len(s, b)
         i = i + 1
     }
-    return out
+    var sb = string_builder()
+    var k: i64 = bstart
+    while k < b {
+        sb_append_byte(sb, str_byte(s, k))
+        k = k + 1
+    }
+    return sb_build(sb)
 }
 
 // 顶层 struct 声明登记分派（泛型语法 2026-08-14）：
@@ -1428,7 +1449,7 @@ pub func collect_top() -> i64 {
                 k = k + 1
             }
             // S1.2：extern 签名登记为 unsafe（pub 位 + unsafe 位，sg_pub 组合标志）
-            if sstate.reg_fn(full, 1 + s_vals[s] * 2, nparams, nparams, ret_ty, p_tys, p_refs, p_defs, p_vars) < 0 {
+            if sstate.reg_fn(full, 1 + s_vals[s] * 2, nparams, nparams, ret_ty, p_tys, p_refs, p_defs, p_vars, s) < 0 {
                 sm_err_line = s_lines[s]
                 sm_err_col = s_cols[s]
                 return -1

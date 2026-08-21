@@ -78,15 +78,21 @@ pub func run_lex(src: string) -> bool {
     g_last_line_tag = -1
     g_paren_depth = 0
     g_err_msg = ""
-    // 源文本 → 码点表（regex 一次切分 O(N)；替代 str_char 逐位取 O(N²)）
+    // 源文本 → 码点表（性能重构：字节遍历 utf8_seq_len/utf8_char_at，
+    // 替代 regex_find_all 逐码点切分——旧法每码点一次堆串分配，N 个字符串
+    // 对象仅取码点值；新法零字符串分配，顺路记录 g_byte_starts 码点→字节
+    // 偏移表，供 lexeme 切片走 str_sub_bytes 字节区间 memcpy）
     g_src = str.clone(src)
-    var chars = regex_find_all(src, "(?s).")
+    var blen: i64 = len(src)
     g_codes = table_new_i64()
-    var i: i64 = 0
-    while i < len(chars) {
-        table_push(g_codes, char_code(chars[i]))
-        i = i + 1
+    g_byte_starts = table_new_i64()
+    var b: i64 = 0
+    while b < blen {
+        table_push(g_byte_starts, b)
+        table_push(g_codes, utf8_char_at(src, b))
+        b = b + utf8_seq_len(src, b)
     }
+    table_push(g_byte_starts, blen)  // 哨兵：g_byte_starts[g_n] = 总字节数
     g_n = len(g_codes)
     lextok.build_line_starts()
     var pos: i64 = 0

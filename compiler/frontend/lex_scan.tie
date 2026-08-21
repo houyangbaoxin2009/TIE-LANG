@@ -30,6 +30,27 @@ func set_err(line: i64, col: i64, msg: string) {
 // ---------- 各 token 扫描器 ----------
 // 输入 pos（当前字符位置），返回扫描结束后的位置；出错置全局错误槽返回 -1。
 
+// 码点区间快切（性能重构）：[a, b) 的 lexeme 切片走 g_byte_starts 字节偏移
+// 表 + str_sub_bytes 字节 memcpy——O(len) 单次拷贝；替代 str.slice（码点
+// 定位每次从头跳，全体 token 累计 O(T×N) 平方）。b == g_n 合法（哨兵项
+// g_byte_starts[g_n] = 总字节数）。
+func cp_slice(a: i64, b: i64) -> string {
+    // 字节快切：g_byte_starts 码点→字节偏移表定位字节区间 + StringBuilder
+    // 逐字节拷贝——O(len) 线性（str.slice 码点定位每次从头跳 O(n)，全体
+    // token 累计 O(T×N) 平方，400 函数实测 parse 89% 耗时根源）。
+    // 注：用 sb_append_byte 组合而非 str_sub_bytes 原语——自举兼容（旧
+    // 编译器即认 S2.1 原语，免两阶段套娃构建）。
+    var lo = g_byte_starts[a]
+    var hi = g_byte_starts[b]
+    var sb = string_builder()
+    var k: i64 = lo
+    while k < hi {
+        sb_append_byte(sb, str_byte(g_src, k))
+        k = k + 1
+    }
+    return sb_build(sb)
+}
+
 // 行尾定位：返回本行最后一个字符之后的位置（停在 '\n'，不消费）
 func line_end(pos: i64) -> i64 {
     while pos < g_n {
@@ -64,7 +85,7 @@ func scan_line_comment(pos: i64) -> i64 {
 // doc 行注释 ///...：内容收集为 doc
 func scan_doc_line(pos: i64) -> i64 {
     var end = line_end(pos + 3)
-    lextok.collect_doc(str.slice(g_src, pos + 3, end))
+    lextok.collect_doc(cp_slice(pos + 3, end))
     return end
 }
 
@@ -85,7 +106,7 @@ func scan_doc_block(pos: i64) -> i64 {
         set_err(lextok.line_of(pos), lextok.col_of(pos), errors.err_msg("lex_block_unclosed"))
         return -1
     }
-    lextok.collect_doc(str.slice(g_src, pos + 3, close - 2))
+    lextok.collect_doc(cp_slice(pos + 3, close - 2))
     return close
 }
 
@@ -125,7 +146,7 @@ pub func scan_string(pos: i64) -> i64 {
         set_err(lextok.line_of(start), lextok.col_of(start), errors.err_msg("lex_str_unclosed"))
         return -1
     }
-    var lid = interner.intern(str.slice(g_src, start, pos))
+    var lid = interner.intern(cp_slice(start, pos))
     lextok.push_token_at(lex_str, start, lid)
     return pos
 }
@@ -160,7 +181,7 @@ pub func scan_char(pos: i64) -> i64 {
     }
     if g_codes[pos] == 39 {            // 闭引号 '\''
         pos = pos + 1
-        var lid = interner.intern(str.slice(g_src, start, pos))
+        var lid = interner.intern(cp_slice(start, pos))
         lextok.push_token_at(lex_charlit, start, lid)
         return pos
     }
@@ -320,7 +341,7 @@ pub func scan_number(pos: i64) -> i64 {
             }
         }
     }
-    var lid = interner.intern(str.slice(g_src, start, pos))
+    var lid = interner.intern(cp_slice(start, pos))
     lextok.push_token_at(tag, start, lid)
     return pos
 }
@@ -335,7 +356,7 @@ pub func scan_ident(pos: i64) -> i64 {
             break
         }
     }
-    var lex = str.slice(g_src, start, pos)
+    var lex = cp_slice(start, pos)
     var lid = interner.intern(lex)
     var tag = lexsym.kw_lookup(lex)
     if tag < 0 {
@@ -351,7 +372,7 @@ pub func scan_symbol(pos: i64) -> i64 {
     var want: i64 = 3
     while want >= 1 {
         if pos + want <= g_n {
-            var lex = str.slice(g_src, pos, pos + want)
+            var lex = cp_slice(pos, pos + want)
             var tag = lexsym.sym_lookup(lex)
             if tag >= 0 {
                 var lid = interner.intern(lex)

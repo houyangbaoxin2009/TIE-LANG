@@ -751,11 +751,45 @@ func check_block(blk: i64) -> i64 {
     return 0
 }
 
+// full 名 "::" 段（除最后一段函数名）压 ns_stack，返回压入段数（对齐
+// scheck.push_ns_of；命名空间上下文重建）
+func push_ns_of(full: string) -> i64 {
+    var cnt: i64 = 0
+    var n = str_len(full)
+    var pos: i64 = 0
+    var seg_start: i64 = 0
+    while pos < n {
+        if pos + 1 < n && str_char(full, pos) == ":" && str_char(full, pos + 1) == ":" {
+            var seg = str.slice(full, seg_start, pos)
+            sstate.ns_push(intern.intern(seg))
+            cnt = cnt + 1
+            pos = pos + 2
+            seg_start = pos
+        } else {
+            pos = pos + 1
+        }
+    }
+    return cnt
+}
+
 // ==================== 入口 ====================
 // 定位函数节点并检查（对齐 scheck.check_fn_walk：遍历 g_extra_tops 顶层
 // FnDef / 命名空间递归）。返回 0 已检查 / -1 错误（sm_err_* 已置）。
 pub func check_fn_walk(full: string) -> i64 {
     smv_cur_fn_name = str.clone(full)
+    // 快路径（性能重构）：fn_def_nodes 平行表定位（同 scheck.check_fn_walk；
+    // :: 段压 ns_stack 重建命名空间上下文——命名空间内私有函数解析依赖）
+    var fast_node = sstate.fn_def_node(full)
+    if fast_node >= 0 {
+        var segs = push_ns_of(full)
+        var r0 = check_fn(fast_node)
+        var pp: i64 = 0
+        while pp < segs {
+            ns_top = ns_top - 1
+            pp = pp + 1
+        }
+        return r0
+    }
     var n = len(g_extra_tops)
     var i: i64 = 0
     while i < n {

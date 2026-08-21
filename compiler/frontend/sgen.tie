@@ -629,7 +629,7 @@ pub func instantiate_fn(gti: i64, args: table<i64>, line: i64, col: i64) -> i64 
             }
         }
     }
-    var sig = sstate.reg_fn(mangled, is_pub, nparams, required, ret_ty, p_tys, p_refs, p_defs, p_vars)
+    var sig = sstate.reg_fn(mangled, is_pub, nparams, required, ret_ty, p_tys, p_refs, p_defs, p_vars, new_node)
     if sig < 0 {
         g_inst_depth = g_inst_depth - 1
         sm_err_line = line

@@ -50,7 +50,10 @@ pub func trim_end(s: string) -> string {
     return slice(s, 0, end)
 }
 
-// 截取字符串 [start, end) 区间的子串；越界自动收敛到边界；空串或 start>=end 返回空串
+// 截取字符串 [start, end) 区间的子串；越界自动收敛到边界；空串或 start>=end 返回空串。
+// 性能重写（O(n)）：旧实现逐字符 `result + str_char(s,i)` 是双重 O(n²)——
+// 每次 `+` 全量拷贝 result + str_char 每次从头跳 i 个码点。新实现：
+// 一次码点扫描定位字节区间 [byte_lo, byte_hi)，StringBuilder 逐字节拷贝。
 pub func slice(s: string, start: i64, end: i64) -> string {
     var n: i64 = str_len(s)
     // 空串直接返回空串
@@ -77,14 +80,28 @@ pub func slice(s: string, start: i64, end: i64) -> string {
     if lo >= hi {
         return ""
     }
-    // 逐字符拼接子串
-    var result: string = ""
-    var i: i64 = lo
-    while i < hi {
-        result = result + str_char(s, i)
+    // 定位起点字节偏移：跳过 lo 个码点
+    var byte_lo: i64 = 0
+    var i: i64 = 0
+    while i < lo {
+        byte_lo = byte_lo + utf8_seq_len(s, byte_lo)
         i = i + 1
     }
-    return result
+    // 定位终点字节偏移：再数 hi - lo 个码点（顺路扫描，不回头）
+    var byte_hi: i64 = byte_lo
+    var j: i64 = lo
+    while j < hi {
+        byte_hi = byte_hi + utf8_seq_len(s, byte_hi)
+        j = j + 1
+    }
+    // 字节区间逐字节拷贝进 StringBuilder（二进制安全）→ 一次产串
+    var sb = string_builder()
+    var k: i64 = byte_lo
+    while k < byte_hi {
+        sb_append_byte(sb, str_byte(s, k))
+        k = k + 1
+    }
+    return sb_build(sb)
 }
 
 // 判断 s 是否包含子串 sub；空子串视为包含
@@ -229,40 +246,54 @@ pub func replace(s: string, from: string, to: string) -> string {
 // 算法：从左到右扫描，命中 sep 即切出一段 [start, i)，跳过 sep 后继续；
 // 扫描结束后把最后一段 [start, n) 推入（可能为空串）。
 pub func split(s: string, sep: string) -> table {
+    // 性能重写（O(n) 字节级）：旧实现匹配循环每字符 str_char(s, i+j) 从头
+    // 跳（O(i)）+ 每段 slice 码点定位（O(start)），双重平方——30 万字节文件
+    // split 实测 ~20 秒（编译器 import 展开的 sem 瓶颈根源）。
+    // 新实现：sep 预转字节表（O(m)），字节扫描匹配（UTF-8 自同步性保证
+    // 字节序列匹配 ≡ 码点序列匹配），段用 StringBuilder 累积（reset 复用）。
     var t = table_new_string()
-    var m: i64 = str_len(sep)
-    // 空分隔符：不切分，整串作为唯一元素
-    if m == 0 {
+    var blen: i64 = len(s)
+    var sb = string_builder()
+    // sep 字节表
+    var seplen: i64 = len(sep)
+    if seplen == 0 {
         table_push(t, s)
         return t
     }
-    var n: i64 = str_len(s)
-    var start: i64 = 0
+    var sepb = table_new_i64()
+    var q: i64 = 0
+    while q < seplen {
+        table_push(sepb, str_byte(sep, q))
+        q = q + 1
+    }
     var i: i64 = 0
-    while i < n {
-        // 检查从 i 开始是否完整匹配 sep
+    while i < blen {
+        // 检查从 i 开始是否完整匹配 sep（字节级）
         var matched: bool = true
         var j: i64 = 0
-        while j < m && matched {
-            if i + j >= n {
+        while j < seplen {
+            if i + j >= blen {
                 matched = false
-            } else if str_char(s, i + j) != str_char(sep, j) {
+                break
+            }
+            if str_byte(s, i + j) != sepb[j] {
                 matched = false
+                break
             }
             j = j + 1
         }
         if matched {
-            // 切出一段 [start, i)，跳过 sep 继续
-            table_push(t, slice(s, start, i))
-            i = i + m
-            start = i
+            // 段结束：build 快照 + reset 复用缓冲
+            table_push(t, sb_build(sb))
+            sb_reset(sb)
+            i = i + seplen
         } else {
-            // 未命中：前进一位
+            sb_append_byte(sb, str_byte(s, i))
             i = i + 1
         }
     }
-    // 收尾：最后一段 [start, n)（sep 结尾时 start==n → 空元素）
-    table_push(t, slice(s, start, n))
+    // 收尾：最后一段（含尾部无 sep 的残余；空段语义与旧版一致）
+    table_push(t, sb_build(sb))
     return t
 }
 
@@ -310,20 +341,22 @@ pub func to_lower(s: string) -> string {
 // 把字符串表 items 的元素用 sep 连接成一个字符串；空表返回空串。
 // 约定：items 是字符串动态表（table<string>），与 split 的输出互逆。
 pub func join(items: table, sep: string) -> string {
-    var out: string = ""
+    // 性能重写（O(total)）：旧 out + items[i] 逐段全量拷贝是 O(n²)——
+    // 万行文本 join 实测秒级。StringBuilder 原地追加替代。
     var n: i64 = len(items)
     if n == 0 {
         return ""
     }
+    var sb = string_builder()
     var i: i64 = 0
     while i < n {
         if i > 0 {
-            out = out + sep
+            sb_append(sb, sep)
         }
-        out = out + items[i]
+        sb_append(sb, items[i])
         i = i + 1
     }
-    return out
+    return sb_build(sb)
 }
 
 // 把 s 重复 n 次拼接；n <= 0 返回空串（n 为负视为不重复）。
