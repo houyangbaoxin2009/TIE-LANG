@@ -1,0 +1,20 @@
+type tie<logic>
+// 第 5 批验收探针：纯字符串 `for c in s.chars()`（无表/字典），验证去桥后
+// tie_interp.lib 引用 = 0（s21_codepoint_to_str 内联替代 tie_str_from_code）。
+// 期望输出：
+//   PURE-PASS
+func main() {
+    var s: string = "A你😀B好C"
+    var acc: string = ""
+    var n: i64 = 0
+    for c in s.chars() {
+        n = n + 1
+        acc = acc + c
+    }
+    if n == 6 && acc == s {
+        println("PURE-PASS")
+    } else {
+        println("PURE-FAIL n=" + to_string(n) + " acc=" + acc)
+        exit(1)
+    }
+}

@@ -7675,11 +7675,10 @@ func is_chars_method(iter: i64) -> bool {
 // for-in 字符串码点迭代：`for c in s.chars()`（dev33 批次4 语法糖）。
 // 布局：循环变量 alloca（TK_STR，单字符）+ 字节位置计数器 alloca（i64）；
 // cond 块：字节位置 < str_len(s) 终结（s21_str_head_len O(1)）；body 块每次
-// 迭代 s21_utf8_char_at 解码码点 → str_from_code 得单字符字符串 → store 到
-// 循环变量；step 块：位置 += s21_utf8_seq_len（字节步进）。continue → step，
+// 迭代 s21_utf8_char_at 解码码点 → s21_codepoint_to_str 得单字符字符串 → store
+// 到循环变量；step 块：位置 += s21_utf8_seq_len（字节步进）。continue → step，
 // break → exit。等价手写 while + utf8_seq_len/utf8_char_at 组合。
 func gen_for_chars(id: i64, iter: i64, body: i64) -> i64 {
-    g_used_interp = true
     // 接收者字符串值（s.chars() 的 s）
     var recv = sstate.child(iter, sstate.slot_off(iter))
     var s = gen_expr(recv)
@@ -7729,12 +7728,8 @@ func gen_for_chars(id: i64, iter: i64, body: i64) -> i64 {
     ir.add_operand(cur2, pos_ptr, 0)
     var cur2_v = ir.get_value(cur2)
     var cp = s21_utf8_char_at(s, cur2_v)
-    // 码点 → 单字符字符串（桥 tie_str_from_code(i64) -> string）
-    g_used_interp = true
-    var ch = gen_ext_call1("tie_str_from_code", cp, types.named(TK_I64), types.named(TK_STR))
-    if ch < 0 {
-        return -1
-    }
+    // 码点 → 单字符字符串（去 Rust 桥：s21_codepoint_to_str 内联，不链 tie_interp.lib）
+    var ch = s21_codepoint_to_str(cp)
     var ist = ir.new_inst(g_cur_block, 22, -1)  // store 单字符 → 循环变量
     ir.add_operand(ist, types.named(TK_STR), 2)
     ir.add_operand(ist, ch, 0)
