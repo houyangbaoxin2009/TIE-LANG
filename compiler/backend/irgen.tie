@@ -2629,15 +2629,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
             ir.add_operand(idx, i_v, 0)
             var ok_slot = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
             ir.add_operand(ok_slot, types.named(TK_I8), 2)
-            var ats: table<i64> = table_new_i64()
-            var avs: table<i64> = table_new_i64()
-            table_push(ats, types.named(TK_STR))
-            table_push(avs, tb)
-            table_push(ats, types.named(TK_I64))
-            table_push(avs, ir.get_value(idx))
-            table_push(ats, types.named(TK_STR))
-            table_push(avs, ir.get_value(ok_slot))
-            var val = gen_ext_call_typed("tie_table_at_" + suffix, ats, avs, ret_ty)
+            var val = s21_table_at(tb, ir.get_value(idx), ir.get_value(ok_slot), ret_ty)
             if val < 0 {
                 return -1
             }
@@ -3267,16 +3259,14 @@ func builtin_expr(nm: string, id: i64) -> i64 {
             g_builtin_res = s21_str_head_len(v)
             return 0
         }
-        g_used_interp = true
         var v2 = gen_expr(a)
         if v2 < 0 {
             return -1
         }
-        g_builtin_res = gen_ext_call1("tie_table_len", v2, types.named(TK_STR), types.named(TK_I64))
+        g_builtin_res = s21_table_len(v2)
         return 0
     }
     if nm == "table_new_i64" || nm == "table_new_f64" || nm == "table_new_string" || nm == "table_new_bool" {
-        g_used_interp = true
         var elem: i64 = types.named(TK_I64)
         if nm == "table_new_string" {
             elem = types.named(TK_STR)
@@ -3286,11 +3276,10 @@ func builtin_expr(nm: string, id: i64) -> i64 {
             elem = types.named(TK_F64)
         }
         var esz_v = gen_int_lit_ty(elem_size(elem), types.named(TK_I64))
-        g_builtin_res = gen_ext_call1("tie_table_new", esz_v, types.named(TK_I64), types.named(TK_STR))
+        g_builtin_res = s21_table_new(esz_v)
         return 0
     }
     if nm == "table_push" {
-        g_used_interp = true
         // 第 1 参数 = 表变量（语义已保证）；元素类型查 lv_telem/gb_telem
         var tname_node = call_arg(id, 0)
         var tname = sstate.name_str(tname_node)
@@ -3342,7 +3331,7 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         } else if suffix == "bool" {
             pty = types.named(TK_BOOL)
         }
-        gen_ext_call2v("tie_table_push_" + suffix, t, types.named(TK_STR), x, pty)
+        s21_table_push(t, pty, x)
         g_builtin_res = gen_int_lit(0)  // void 结果：哑值（调用方丢弃）
         return 0
     }
@@ -3810,7 +3799,6 @@ func builtin_expr(nm: string, id: i64) -> i64 {
     }
     // table_at：表 + 下标 → 元素（与 t[i] 同语义；元素类型 fallback 判定）
     if nm == "table_at" {
-        g_used_interp = true
         var tb = gen_expr(call_arg(id, 0))
         if tb < 0 {
             return -1
@@ -3842,15 +3830,8 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         }
         var ok_slot = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
         ir.add_operand(ok_slot, types.named(TK_I8), 2)
-        var ats: table<i64> = table_new_i64()
-        var avs: table<i64> = table_new_i64()
-        table_push(ats, types.named(TK_STR))
-        table_push(avs, tb)
-        table_push(ats, types.named(TK_I64))
-        table_push(avs, ti)
-        table_push(ats, types.named(TK_STR))
-        table_push(avs, ir.get_value(ok_slot))
-        g_builtin_res = gen_ext_call_typed("tie_table_at_" + suffix, ats, avs, ret_ty)
+        var ok_addr = ir.get_value(ok_slot)
+        g_builtin_res = s21_table_at(tb, ti, ok_addr, ret_ty)
         return 0
     }
     return -1  // 非内置
@@ -4080,10 +4061,10 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
 // 变参打包：多余实参节点 → 动态表（tie_table_new + 逐元素 push）。
 // 元素类型 = 变参元素类型 T（标量）。按值类型选桥（对齐 gen_table_lit）。
 func gen_variadic_table(nodes: table<i64>, elem: i64) -> i64 {
-    g_used_interp = true
+    // 元素类型 = 变参元素类型 T（标量）。按值类型选桥（对齐 gen_table_lit）。
     var size = elem_size(elem)
     var size_v = gen_int_lit_ty(size, types.named(TK_I64))
-    var t = gen_ext_call1("tie_table_new", size_v, types.named(TK_I64), types.named(TK_STR))
+    var t = s21_table_new(size_v)
     var i: i64 = 0
     while i < len(nodes) {
         var v = gen_expr(nodes[i])
@@ -4104,7 +4085,7 @@ func gen_variadic_table(nodes: table<i64>, elem: i64) -> i64 {
         } else if suffix == "bool" {
             pty = types.named(TK_BOOL)
         }
-        gen_ext_call2v("tie_table_push_" + suffix, t, types.named(TK_STR), v, pty)
+        s21_table_push(t, pty, v)
         i = i + 1
     }
     return t
@@ -5376,7 +5357,6 @@ func gen_default_val(ty: i64) -> i64 {
 // 表字面量 → 动态表指针（tie_table_new + 逐元素 push）。
 // 元素类型：语义 node_types 首元素推断；空表 → i64 兜底。
 func gen_table_lit(id: i64) -> i64 {
-    g_used_interp = true
     // E3 键值表（map）字面量：任一个 cell 带字符串键（TableCell → TableId，
     // TableId name = 字符串键池 id >= 0；数字键 name=-1 不算 map）→ 走 map 桥：
     // tie_table_new(16) + 逐对 tie_map_set / tie_map_set_string（键为字符串 ptr）。
@@ -5463,7 +5443,7 @@ func gen_table_lit(id: i64) -> i64 {
     // 数字实参必须先转值 id（gen_ext_call* 的实参都是值 id，直接传数字
     // 会被当作值引用生成前向引用 %N）
     var size_v = gen_int_lit_ty(size, types.named(TK_I64))
-    var t = gen_ext_call1("tie_table_new", size_v, types.named(TK_I64), types.named(TK_STR))
+    var t = s21_table_new(size_v)
     // 逐元素 push
     var i: i64 = 0
     while i < nc {
@@ -5503,7 +5483,7 @@ func gen_table_lit(id: i64) -> i64 {
                 pty = types.named(TK_BOOL)
             }
         }
-        gen_ext_call2v("tie_table_push_" + suffix, t, types.named(TK_STR), v, pty)
+        s21_table_push(t, pty, v)
         i = i + 1
     }
     return t
@@ -6014,6 +5994,162 @@ func s21_sb_build(hv: i64) -> i64 {
     return d0
 }
 
+// ==================== 动态表容器批次 6（去 tie_table_* 桥） ====================
+// 表句柄 = ptr → 32 字节 {cap:i64@0, len:i64@8, data:ptr@16, esz:i64@24}。
+//   cap  = 元素容量（个）；len = 元素数；data = 元素数组首指针；esz = 单元素字节数
+//   （bool=1，其余=8）。data 缓冲大小 = newcap*esz；增长策略 1.5x：
+//   newcap = cap==0 ? max(8, need) : max(cap + cap/2, need)。string/嵌套表元素在
+//   数据区存 8 字节值句柄（ptr）。
+// 以下辅助全部生成内联 tie-IR 指令（零新 opcode、零 Rust tie_table_* 桥调用）。
+// 任意原始缓冲分配统一 s21_raw_alloc_str（K_PTR 返回，绕开 op36 对 TK_STR 的
+// strlen+memcpy 扫描——对未初始化堆缓冲 strlen 读垃圾，属漏洞 A 类隐患）。
+
+// 元素类型零值：ptr 类（string/table/map/port）→ null(0)；f64/f32 → 0.0；
+// bool → false；其余整数 → 0
+func t21_zero(ty: i64) -> i64 {
+    if ty == types.named(TK_STR) || types.is_table(ty) || types.is_map(ty) || types.kind(ty) == K_PORT {
+        return gen_int_lit(0)  // 存为 null ptr
+    }
+    if ty == types.named(TK_F64) || ty == types.named(TK_F32) {
+        return gen_float_lit(interner.intern("0.0"))
+    }
+    if ty == types.named(TK_BOOL) {
+        return gen_bool_lit(0)
+    }
+    return gen_int_lit_ty(0, ty)
+}
+
+// 表句柄数据指针（[16] 字段）
+func t21_data(t: i64) -> i64 {
+    return s21_load(s21_gep(t, 16, true), types.named(TK_STR))
+}
+
+// 表句柄元素字节大小（[24] 字段）
+func t21_esz(t: i64) -> i64 {
+    return s21_load(s21_gep(t, 24, true), types.named(TK_I64))
+}
+
+// 新建空表：分配 32 字节句柄（s21_raw_alloc_str），cap=0 / len=0 / data=null /
+// esz=esz_v，返回句柄指针（TK_STR ptr 值，供后续 at/set/push 以 ptr 引用）
+func s21_table_new(esz_v: i64) -> i64 {
+    var h = s21_raw_alloc_str(gen_int_lit(32))
+    s21_store(s21_gep(h, 0, true), gen_int_lit(0), types.named(TK_I64))    // cap = 0
+    s21_store(s21_gep(h, 8, true), gen_int_lit(0), types.named(TK_I64))    // len = 0
+    s21_store(s21_gep(h, 16, true), gen_int_lit(0), types.named(TK_STR))   // data = null
+    s21_store(s21_gep(h, 24, true), esz_v, types.named(TK_I64))            // esz
+    return h
+}
+
+// 表长度：len(t) = load i64 [t+8]
+func s21_table_len(t: i64) -> i64 {
+    return s21_load(s21_gep(t, 8, true), types.named(TK_I64))
+}
+
+// 若 need > cap：重新分配 data 缓冲。newcap = cap==0 ? max(8,need) : max(cap+cap/2, need)；
+// 新缓冲大小 = newcap*esz；拷贝旧 len*esz 字节；free 旧 data；更新句柄 data/cap。
+// 生成 if 块后 g_cur_block 推进到汇合块（调用方在汇合后重读 data 继续追加逻辑）。
+func s21_table_grow(h: i64, cap: i64, len: i64, data: i64, esz: i64, need: i64) {
+    var gc = gen_icmp_c(need, cap, 3)  // sgt：need > cap
+    var gt = ir.new_block(g_cur_func, interner.intern("t21.gt"))
+    var ge = ir.new_block(g_cur_func, interner.intern("t21.ge"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cb, gc, 0)
+    ir.add_operand(cb, gt, 1)
+    ir.add_operand(cb, ge, 1)
+    // then：容量增长（1.5x）
+    g_cur_block = gt
+    var half = s21_bin(3, cap, gen_int_lit(2))      // cap/2（sdiv）
+    var base = s21_bin(0, cap, half)                // cap + cap/2
+    var is_z = gen_icmp_c(cap, gen_int_lit(0), 0)   // cap == 0
+    var gb = gen_select_i(is_z, gen_int_lit(8), base, types.named(TK_I64))  // cap==0 → 8，否则 base
+    var c_lt = gen_icmp_c(gb, need, 2)              // gb < need
+    var newcap = gen_select_i(c_lt, need, gb, types.named(TK_I64))  // max(gb, need)
+    // 数据缓冲 = 原始字节区（非 {头,数据,\0} 布局），s21_raw_alloc_str 绕开 TK_STR 扫描；
+    // 缓冲大小 = newcap*esz
+    var nd = s21_raw_alloc_str(s21_bin(2, newcap, esz))  // mul：newcap*esz
+    s21_memcpy_if(nd, data, s21_bin(2, len, esz))        // 拷贝旧 len*esz 字节
+    gen_ext_call1("free", data, types.named(TK_STR), -1) // 释放旧缓冲（null free 合法）
+    s21_store(s21_gep(h, 16, true), nd, types.named(TK_STR))
+    s21_store(s21_gep(h, 0, true), newcap, types.named(TK_I64))
+    var brg = ir.new_inst(g_cur_block, 30, -1)  // br ge
+    ir.add_operand(brg, ge, 1)
+    g_cur_block = ge
+}
+
+// 表追加：读 len → need=len+1 → grow（汇合后重读 data）→ GEP(data, len*esz) store →
+// len = need
+func s21_table_push(t: i64, elem_llvm_ty: i64, v: i64) {
+    var cap = s21_load(s21_gep(t, 0, true), types.named(TK_I64))
+    var len = s21_load(s21_gep(t, 8, true), types.named(TK_I64))
+    var data = s21_load(s21_gep(t, 16, true), types.named(TK_STR))
+    var need = s21_bin(0, len, gen_int_lit(1))
+    s21_table_grow(t, cap, len, data, t21_esz(t), need)
+    var data2 = t21_data(t)  // 汇合后重读 data（增长分支可能已更新）
+    var off = s21_bin(2, len, t21_esz(t))  // len*esz（字节偏移）
+    var dst = s21_gep(data2, off, false)
+    s21_store(dst, v, elem_llvm_ty)
+    s21_store(s21_gep(t, 8, true), need, types.named(TK_I64))
+}
+
+// 表下标读：读 len/esz → ok = (i < len) 存 ok_ptr（i8）→ 若 ok 则 GEP(data, i*esz)
+// 读元素存槽，否则槽存元素零值；汇合后 load 槽返回。g_cur_block 推进到汇合。
+func s21_table_at(t: i64, i: i64, ok_ptr: i64, elem_llvm_ty: i64) -> i64 {
+    var len = s21_load(s21_gep(t, 8, true), types.named(TK_I64))
+    var esz = t21_esz(t)
+    var ok = gen_icmp_c(i, len, 2)  // slt：i < len
+    var okb = s21_zext(ok, types.named(TK_BOOL))  // i1 → i64
+    s21_store(ok_ptr, s21_trunc_i8(okb), types.named(TK_I8))  // 越界标志 → 出参 i8
+    // 结果槽（alloca 提升到 entry 由 llvmgen 统一处理）
+    var slot = ir.new_inst(g_cur_block, 20, elem_llvm_ty)  // alloca elem
+    ir.add_operand(slot, elem_llvm_ty, 2)
+    var sv = ir.get_value(slot)
+    // 分支：ok → bt（读元素）/ else → be（元素零值）/ 汇合 merge
+    var bt = ir.new_block(g_cur_func, interner.intern("t21.at"))
+    var be = ir.new_block(g_cur_func, interner.intern("t21.ae"))
+    var merge = ir.new_block(g_cur_func, interner.intern("t21.am"))
+    var cbr = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cbr, ok, 0)
+    ir.add_operand(cbr, bt, 1)
+    ir.add_operand(cbr, be, 1)
+    // then：读元素
+    g_cur_block = bt
+    var data = t21_data(t)
+    var off = s21_bin(2, i, esz)  // i*esz
+    var addr = s21_gep(data, off, false)
+    s21_store(sv, s21_load(addr, elem_llvm_ty), elem_llvm_ty)
+    var br1 = ir.new_inst(g_cur_block, 30, -1)  // br merge
+    ir.add_operand(br1, merge, 1)
+    // else：元素零值
+    g_cur_block = be
+    s21_store(sv, t21_zero(elem_llvm_ty), elem_llvm_ty)
+    var br2 = ir.new_inst(g_cur_block, 30, -1)  // br merge
+    ir.add_operand(br2, merge, 1)
+    // merge：结果 = load 槽
+    g_cur_block = merge
+    return s21_load(sv, elem_llvm_ty)
+}
+
+// 表下标写：读 len/esz → 若 i < len：GEP(data, i*esz) store v；否则静默跳过。
+// g_cur_block 推进到汇合。
+func s21_table_set(t: i64, i: i64, elem_llvm_ty: i64, v: i64) {
+    var len = s21_load(s21_gep(t, 8, true), types.named(TK_I64))
+    var ok = gen_icmp_c(i, len, 2)  // slt：i < len
+    var bt = ir.new_block(g_cur_func, interner.intern("t21.st"))
+    var be = ir.new_block(g_cur_func, interner.intern("t21.se"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cb, ok, 0)
+    ir.add_operand(cb, bt, 1)
+    ir.add_operand(cb, be, 1)
+    g_cur_block = bt
+    var data = t21_data(t)
+    var off = s21_bin(2, i, t21_esz(t))  // i*esz
+    var addr = s21_gep(data, off, false)
+    s21_store(addr, v, elem_llvm_ty)
+    var br = ir.new_inst(g_cur_block, 30, -1)  // br be
+    ir.add_operand(br, be, 1)
+    g_cur_block = be
+}
+
 // i128/u128 → 十进制字符串（批次 2，内联除法循环）。
 // 输入：v = i128 值寄存器；is_signed = 有符号（i128）或无符号（u128）。
 // 输出：带头字符串数据指针（{len 头, 数据, NUL}）。
@@ -6454,7 +6590,6 @@ func gen_file_exists(p: i64) -> i64 {
 // 表下标读取 t[i]：动态表 → tie_table_at_<suffix>(表指针, i64, ok)。
 // 简化（阶段 A）：不生成越界检查块（driver 树索引均有 len 守卫）。
 func gen_index_read(id: i64) -> i64 {
-    g_used_interp = true
     var base = sstate.child(id, 0)
     var idx = sstate.child(id, 1)
     var t = gen_expr(base)
@@ -6586,25 +6721,16 @@ func gen_index_read(id: i64) -> i64 {
     } else if suffix == "bool" {
         ret_ty = types.named(TK_BOOL)
     }
-    // ok 出参槽（越界标志；阶段 A 简化不检查，传哑槽）
+    // ok 出参槽（越界标志；读越界置 ok=0 并返回元素零值）
     var ok_slot = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
     ir.add_operand(ok_slot, types.named(TK_I8), 2)
     var ok_addr = ir.get_value(ok_slot)
-    var ats: table<i64> = table_new_i64()
-    var avs: table<i64> = table_new_i64()
-    table_push(ats, types.named(TK_STR))
-    table_push(avs, t)
-    table_push(ats, types.named(TK_I64))
-    table_push(avs, iv)
-    table_push(ats, types.named(TK_STR))
-    table_push(avs, ok_addr)
-    return gen_ext_call_typed("tie_table_at_" + suffix, ats, avs, ret_ty)
+    return s21_table_at(t, iv, ok_addr, ret_ty)
 }
 
 // 表下标赋值 t[i] = v → tie_table_set_<suffix> 桥（void）。
 // AST：IndexAssign[val=op, children=[目标(Index), 值]]。
 func gen_index_assign(id: i64) -> i64 {
-    g_used_interp = true
     var target = sstate.child(id, 0)
     var val = sstate.child(id, 1)
     var op = s_vals[id]  // 复合赋值码（-1 普通；0..17，对齐 B_*）
@@ -6769,20 +6895,12 @@ func gen_index_assign(id: i64) -> i64 {
     } else if suffix == "bool" {
         pty = types.named(TK_BOOL)
     }
-    // 复合赋值（t[i] += v）：先读旧值（tie_table_at 带 ok）→ 运算 → 写回
+    // 复合赋值（t[i] += v）：先读旧值（s21_table_at 带越界判定）→ 运算 → 写回
     var v: i64 = -1
     if op >= 0 {
-        var ats_r: table<i64> = table_new_i64()
-        var avs_r: table<i64> = table_new_i64()
-        table_push(ats_r, types.named(TK_STR))
-        table_push(avs_r, t)
-        table_push(ats_r, types.named(TK_I64))
-        table_push(avs_r, iv)
         var ok_r = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
         ir.add_operand(ok_r, types.named(TK_I8), 2)
-        table_push(ats_r, types.named(TK_STR))
-        table_push(avs_r, ir.get_value(ok_r))
-        var old = gen_ext_call_typed("tie_table_at_" + suffix, ats_r, avs_r, pty)
+        var old = s21_table_at(t, iv, ir.get_value(ok_r), pty)
         if old < 0 {
             return -1
         }
@@ -6801,21 +6919,7 @@ func gen_index_assign(id: i64) -> i64 {
             return -1
         }
     }
-    var ats: table<i64> = table_new_i64()
-    var avs: table<i64> = table_new_i64()
-    table_push(ats, types.named(TK_STR))
-    table_push(avs, t)
-    table_push(ats, types.named(TK_I64))
-    table_push(avs, iv)
-    table_push(ats, pty)
-    table_push(avs, v)
-    // ok 标志槽（越界标志）：Rust 桥签名 (ptr, i64, val, ptr ok)，
-    // 缺此参数会导致 ABI 错位、运行时写垃圾指针崩溃（0xC0000005）
-    var set_ok = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
-    ir.add_operand(set_ok, types.named(TK_I8), 2)
-    table_push(ats, types.named(TK_STR))
-    table_push(avs, ir.get_value(set_ok))
-    gen_ext_call_typed("tie_table_set_" + suffix, ats, avs, -1)
+    s21_table_set(t, iv, pty, v)  // 下标写：越界静默跳过（不追加）
     return 0
 }
 
@@ -7768,7 +7872,6 @@ func gen_for_chars(id: i64, iter: i64, body: i64) -> i64 {
 // 调 tie_table_len）+ 循环变量 alloca（元素类型 T）；body 每次迭代
 // tie_table_at 读取元素 → store 到循环变量；continue → step，break → exit。
 func gen_for_table(id: i64, iter: i64, body: i64) -> i64 {
-    g_used_interp = true
     // 表指针（load ptr 槽 / 全局表 load ptr, ptr @g）
     var t = gen_expr(iter)
     if t < 0 {
@@ -7890,7 +7993,7 @@ func gen_for_table(id: i64, iter: i64, body: i64) -> i64 {
     var cur = ir.new_inst(g_cur_block, 21, types.named(TK_I64))  // load
     ir.add_operand(cur, idx_ptr, 0)
     var cur_v = ir.get_value(cur)
-    var tlen = gen_ext_call1("tie_table_len", t, types.named(TK_STR), types.named(TK_I64))
+    var tlen = s21_table_len(t)
     if tlen < 0 {
         return -1
     }
@@ -7907,15 +8010,7 @@ func gen_for_table(id: i64, iter: i64, body: i64) -> i64 {
     g_cur_block = body_blk
     var ok_slot = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
     ir.add_operand(ok_slot, types.named(TK_I8), 2)
-    var ats: table<i64> = table_new_i64()
-    var avs: table<i64> = table_new_i64()
-    table_push(ats, types.named(TK_STR))
-    table_push(avs, t)
-    table_push(ats, types.named(TK_I64))
-    table_push(avs, cur_v)
-    table_push(ats, types.named(TK_STR))
-    table_push(avs, ir.get_value(ok_slot))
-    var iv = gen_ext_call_typed("tie_table_at_" + suffix, ats, avs, elem_llvm_ty)
+    var iv = s21_table_at(t, cur_v, ir.get_value(ok_slot), elem_llvm_ty)
     if iv < 0 {
         return -1
     }
@@ -8556,7 +8651,7 @@ func gen_fn_def(fn_node: i64, prefix: string) -> i64 {
             if gte >= 0 {
                 var gsz = elem_size(gte)
                 var gsz_v = gen_int_lit_ty(gsz, types.named(TK_I64))
-                var gnt = gen_ext_call1("tie_table_new", gsz_v, types.named(TK_I64), types.named(TK_STR))
+                var gnt = s21_table_new(gsz_v)
                 if gnt < 0 {
                     return -1
                 }

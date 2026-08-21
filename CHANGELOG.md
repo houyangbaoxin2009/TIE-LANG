@@ -1,3 +1,27 @@
+## [去 Rust 桥 第六批] 表容器 tie 化——动态表脱离 Rust tie_interp.lib
+
+动态表容器（`table<T>`）的运行时实现从 Rust `tie_table_*` 桥改为 **irgen 内联生成**，
+编译器自身与用户程序的表运算不再依赖 Rust tie-interp 库（`g_used_interp` 不再因表
+运算置位）。表句柄 = 32 字节 `{cap, len, data, esz}`（cap/len=元素数、data=元素数组
+首指针、esz=单元素字节数 bool=1 其余=8），`data` 缓冲 = 元素连续数组，原始分配统一
+走 `s21_raw_alloc_str`（绕开 op36 的 TK_STR 垃圾 strlen 扫描，含 32 字节尾部填充）。
+
+- **新增内联组**（compiler/backend/irgen.tie）：`s21_table_new/len/grow/push/at/set`
+  + 辅助 `t21_zero/t21_data/t21_esz`；空表零拷贝起步、容量 **1.5x 增长**（摊还 O(1)），
+  越界读置 ok 位、越界写静默失败（对齐 Rust 桥语义）；
+- **覆盖**：`len(表)`、`table_new_*`、`table_push`、`table_at`（内置 + 下标读 +
+  for-in 表迭代 + slice_of）、`t[i]=v` 下标写（含复合赋值读旧值）、变参打包、表
+  字面量、全局表 init 全部改内联；map/正则/文件等其余桥留后续批（第 7 批起）；
+- **验证**：表探针（byref_table/global_table/2d_table/variadic/chars_iter/
+  slice_table_probe/examples.table）全绿；纯表程序 IR 的 `tie_table_*` 引用 = 0；
+  一阶 + 二阶自举（tiec 编译自身）成功，闭环确认编译器自身表运算脱离 Rust。
+
+## [去 Rust 桥 第五批] 补漏：`for c in s.chars()` 码点迭代去桥
+
+`for c in s.chars()` 后端此前仍残留 `tie_str_from_code` 调用（第三批除 str_char 时
+漏了 `gen_for_chars`）。本批改为 `s21_codepoint_to_str`（纯 tie 内联），并移除误置的
+`g_used_interp`。纯字符串码点迭代程序 `tie_interp.lib` 引用 = 0。
+
 ## [修复] 漏洞 B 残余根因：字符串字面量 .rodata 无 32 字节尾部填充
 
 缺口排查收敛到唯一未覆盖尾部填充的字符串存储点——**字符串字面量**：`emit_strings`
