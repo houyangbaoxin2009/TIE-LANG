@@ -9,6 +9,11 @@ type tie<class>
 // 树式无环：由 parser.tie import。
 import "./pstmt_flow.tie"
 
+// 三期通用 `#[]` 属性通道（§7.1）：解析 `#[unsafe.share]` 等声明属性后暂存
+// 在此，附着到下一 actor/func 声明节点（N_ACTOR / N_FN_DEF 的 val bit3）。
+// 0 = 无 pending；>0 = 属性全名池 id。解析完声明即清零。
+var g_pending_attr: i64 = 0;
+
 namespace pstmt_top {
 
 pub func parse_program() -> i64 {
@@ -154,13 +159,24 @@ pub func parse_program() -> i64 {
             }
             ast.collect_stmt(stmts, s)
         } else if tag == lex_hash {
-            // M4（dev33 批次9）：属性语法 `#[macro]` 标记宏定义为过程宏
-            //（token 流 API 驱动）。当前仅支持 `#[macro]` + 紧跟 macro 定义。
-            var ps = parse_proc_macro_attr()
-            if ps < 0 {
-                return -1
+            // M4（dev33 批次9）过程宏属性 `#[macro]` + 三期通用 `#[]` 属性通道
+            // （§7.1，A/B/C 组声明属性 `#[unsafe.share]` 等）。按属性名分派：
+            //   #[macro] → 过程宏定义（保留兼容）
+            //   其他（#[unsafe.x]）→ 通用属性，附着到下一 actor/func 声明
+            var an2 = putil.peek_lexeme_n(2)
+            if an2 == "macro" {
+                var ps = parse_proc_macro_attr()
+                if ps < 0 {
+                    return -1
+                }
+                ast.collect_stmt(stmts, ps)
+            } else {
+                var attr = parse_generic_attr()
+                if attr < 0 {
+                    return -1
+                }
+                g_pending_attr = attr   // 附着到下一声明（actor/func）
             }
-            ast.collect_stmt(stmts, ps)
         } else {
             putil.set_err(putil.peek_line(), putil.peek_col(), "顶层只允许函数定义、import、using、struct、enum、命名空间声明、extern 声明、全局变量或宏定义，实际是 " + putil.describe(tag))
             return -1
@@ -332,6 +348,49 @@ func parse_proc_macro_attr() -> i64 {
     }
     ast.set_val(s, 1)   // val=1 标记过程宏（普通宏 val=0）
     return s
+}
+
+// 三期通用 `#[]` 属性通道（concurrency-model.md §7.1，2026-08-23 定稿）：
+// 点号命名空间风格属性 `#[ns.sub]`（如 `#[unsafe.share]` / `#[unsafe.trm]` /
+// `#[unsafe.mem]` / `#[unsafe.ext]`），附着在声明（actor / func / 方法）前，
+// 作为 unsafe 凭据门禁标记。`#[tag.x]` goto 标签走语句位置（parse_goto_label，
+// 本处不处理）；`#[macro]` 过程宏走 parse_proc_macro_attr（本处不处理）。
+// 已消费 '#': 解析 `[` ns `.` sub `]` → 返回属性全名池 id（如 "unsafe.share"）；
+// 未知属性返回 -1 报错。属性仅作声明标记，语义层按需消费。
+func parse_generic_attr() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // #
+    if !putil.expect(lex_lbracket, "'['") {
+        return -1
+    }
+    // ns 段：读 lexeme（unsafe 是关键字 token 非 ident）
+    var ns = interner.intern(putil.peek_lexeme())
+    putil.advance()
+    if !putil.expect(lex_dot, "'.'") {
+        return -1
+    }
+    // sub 段：标识符（如 share / trm / mem / ext）
+    var sub = putil.expect_ident()
+    if sub < 0 {
+        return -1
+    }
+    if !putil.expect(lex_rbracket, "']'") {
+        return -1
+    }
+    var full = interner.lookup(ns) + "." + interner.lookup(sub)
+    // 白名单：仅 unsafe 凭据域属性（A/B/C 组标记）
+    if interner.lookup(ns) != "unsafe" {
+        putil.set_err(line, col, "未知属性 '#[" + full + "]'（属性命名空间仅支持 unsafe，如 #[unsafe.share]）")
+        return -1
+    }
+    if interner.lookup(sub) != "share" && interner.lookup(sub) != "trm" &&
+        interner.lookup(sub) != "mem" && interner.lookup(sub) != "ext" {
+        putil.set_err(line, col, "未知 unsafe 属性 '#[" + full + "]'（支持 share/trm/mem/ext 四域）")
+        return -1
+    }
+    putil.eat(lex_semi)   // 吃掉 ASI 补分号（属性后无分号语义）
+    return interner.intern(full)
 }
 
 // ---------- 语句分派 ----------
@@ -932,6 +991,12 @@ func parse_fn_def() -> i64 {
     }
     table_push(kids, body)
     ast.set_children(f, kids)
+    // 三期通用 `#[]` 属性通道（§7.1）：`#[unsafe.share] func X` 等声明属性
+    // 附着到函数节点（val bit3 = has_attr；函数级便捷 = 整函数隐式持证）
+    if g_pending_attr != 0 {
+        ast.set_val(f, ast.val(f) + 8)   // val bit3 = has_attr
+        g_pending_attr = 0
+    }
     return f
 }
 
@@ -1227,6 +1292,12 @@ func parse_actor() -> i64 {
     }
     var s = ast.new_node(N_ACTOR, name, -1, len(items), line, col)
     ast.set_children(s, items)
+    // 三期通用 `#[]` 属性通道（§7.1）：`#[unsafe.share] actor X` 等声明属性
+    // 附着到 actor 节点（val bit3 = 有属性；actor 级属性 = 整 actor 解锁对应域）
+    if g_pending_attr != 0 {
+        ast.set_val(s, 8)   // val bit3 = has_attr（语义层按属性名查 pending 域）
+        g_pending_attr = 0
+    }
     return s
 }
 

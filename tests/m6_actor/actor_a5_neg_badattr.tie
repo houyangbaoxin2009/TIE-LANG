@@ -1,0 +1,13 @@
+type tie<logic>
+// tests/m6_actor/actor_a5_neg_badattr.tie —— 三期通用 #[] 属性负例（§7.1）
+// 未知属性域 → 编译错误「未知 unsafe 属性」
+#[unsafe.bogus]
+actor Bad {
+    pub func m() -> i64 { return 1 }
+}
+func main() {
+    unsafe {
+        var b = run Bad()
+        println(to_string(b.m()))
+    }
+}

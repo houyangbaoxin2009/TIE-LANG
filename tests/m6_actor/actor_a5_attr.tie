@@ -1,0 +1,29 @@
+type tie<logic>
+// tests/m6_actor/actor_a5_attr.tie —— 三期通用 #[] 属性通道探针（concurrency-model.md §7.1）
+// 验证：`#[unsafe.share]` / `#[unsafe.trm]` / `#[unsafe.mem]` / `#[unsafe.ext]`
+// 点号命名空间属性附着到 actor / func 声明（val bit3），编译零错误。
+// 属性本身是声明标记（凭据门禁语义由 A/B/C 组消费），此处验证解析 + 附着通路。
+
+// 函数级便捷属性：#[unsafe.share] fn 隐式持证（函数级，无函数体消费暂占位）
+#[unsafe.share]
+unsafe fn tagged_fn() -> i64 {
+    return 42
+}
+
+// actor 级属性：#[unsafe.share] actor 整 actor 解锁对应域（消息处理可持证）
+#[unsafe.share]
+actor Logger {
+    var count: i64 = 0
+    pub func log(msg: string) -> i64 {
+        count = count + 1
+        return count
+    }
+}
+
+func main() {
+    unsafe {
+        println("tagged_fn: " + to_string(tagged_fn()))
+        var l = run Logger()
+        println("log: " + to_string(l.log("hello")))
+    }
+}
