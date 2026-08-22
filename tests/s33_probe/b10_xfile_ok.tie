@@ -1,0 +1,12 @@
+type tie<logic>
+// dev33 批次10 任务29：跨文件宏——OK 分支
+// 导入 maclib 并使用其 pub 宏 xf_add1（跨文件可见）
+// 期望输出：42
+
+import "./xfile/maclib.tie"
+
+func main() -> i64 {
+    var v = xf_add1(41)
+    println(v)
+    return 0
+}

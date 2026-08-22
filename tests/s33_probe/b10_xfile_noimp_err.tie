@@ -1,0 +1,11 @@
+type tie<logic>
+// dev33 批次10 任务29：跨文件宏——未导入报错分支
+// 未 import maclib 就调用其宏 xf_add1 → 编译错误：
+// 「未定义的函数 'xf_add1'」（未导入其定义文件）
+// 期望：编译失败（非崩溃），明确报错
+
+func main() -> i64 {
+    var v = xf_add1(41)
+    println(v)
+    return 0
+}

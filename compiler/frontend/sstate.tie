@@ -247,6 +247,11 @@ var im_mnames: table<i64>;    // 方法实现函数全名 id 扁平段（"Struct
 // ==================== import 展开状态（semantic 主入口驱动）====================
 var g_imported: table<string>;   // 已导入文件路径集合（去重/防环）
 var g_extra_tops: table<i64>;    // 全部文件顶层语句 id（主 + 被导入；collect/查找统一遍历）
+// dev33 批次10 任务29 跨文件宏：文件起源跟踪——顶层 StmtList 根 id → 文件 id
+//（主文件 0，导入文件按展开顺序递增），供 mexpand 判定宏定义/调用所属文件，
+// 实现 pub 宏跨文件可见、非 pub 宏同文件私有。
+var g_file_roots: table<i64>;    // 顶层 StmtList 根 id → 文件 id
+var g_file_count: i64 = 1;       // 已分配文件 id 数（主文件 0 占位）
 
 const S_N_INT_LIT: i64 = 0;
 const S_N_FLOAT_LIT: i64 = 1;

@@ -1,0 +1,13 @@
+type tie<logic>
+// dev33 批次10 任务29：跨文件宏——私有宏错误分支
+// 导入 maclib 但使用其**非 pub** 宏 xf_private → 编译错误：
+// 「宏 'xf_private' 是私有宏，只能在定义文件内使用」
+// 期望：编译失败，错误定位到调用点
+
+import "./xfile/maclib.tie"
+
+func main() -> i64 {
+    var v = xf_private(5)
+    println(v)
+    return 0
+}

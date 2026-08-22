@@ -27,11 +27,32 @@ pub func parse_program() -> i64 {
             }
             ast.collect_stmt(stmts, s)
         } else if tag == lex_pub {
-            var s = parse_fn_def()
-            if s < 0 {
-                return -1
+            // pub 后：pub func / pub macro / pub #[macro]（dev33 批次10 任务29
+            // 跨文件宏：pub macro 导出跨文件可见，非 pub 宏同文件私有）。
+            var nxt = putil.peek_n(1)
+            if nxt == lex_macro {
+                putil.advance()   // pub
+                var s = parse_macro_def()
+                if s < 0 {
+                    return -1
+                }
+                ast.set_val(s, ast.val(s) + 2)   // val bit1 = ispub
+                ast.collect_stmt(stmts, s)
+            } else if nxt == lex_hash {
+                putil.advance()   // pub
+                var s = parse_proc_macro_attr()
+                if s < 0 {
+                    return -1
+                }
+                ast.set_val(s, ast.val(s) + 2)   // val bit1 = ispub
+                ast.collect_stmt(stmts, s)
+            } else {
+                var s = parse_fn_def()
+                if s < 0 {
+                    return -1
+                }
+                ast.collect_stmt(stmts, s)
             }
-            ast.collect_stmt(stmts, s)
         } else if tag == lex_unsafe {
             // S1.2：`unsafe fn ...`（unsafe 函数）或 `unsafe extern fn ...`
             // （E3 强制 unsafe 标注的 extern 声明）。按下一 token 分派。

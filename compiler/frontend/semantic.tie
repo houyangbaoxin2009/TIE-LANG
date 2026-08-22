@@ -296,7 +296,9 @@ func expand_one_import(imp_node: i64) -> i64 {
             ak = ak + 1
         }
     }
-    // 新文件顶层 StmtList root = 追加后最后节点
+    // dev33 批次10 任务29：记录导入文件顶层 StmtList 根 → 文件 id（宏可见性）
+    table_push(g_file_roots, new_root)
+    g_file_count = g_file_count + 1
     // 递归：新文件顶层中的 import 立即展开；其余进 g_extra_tops
     var saved_dir = g_cur_dir
     g_cur_dir = path_dir(full)
@@ -323,6 +325,11 @@ func expand_one_import(imp_node: i64) -> i64 {
 func expand_imports() -> i64 {
     g_imported = table_new_string()
     g_extra_tops = table_new_i64()
+    // dev33 批次10 任务29：文件起源跟踪复位；g_file_roots[文件 id] = 顶层
+    // StmtList 根 id（平行表；主文件 = 0，导入文件按展开顺序递增）
+    g_file_roots = table_new_i64()
+    g_file_count = 1
+    table_push(g_file_roots, g_root)   // 文件 0 = 主文件顶层根
     var n = sstate.nchild(g_root)
     var i: i64 = 0
     while i < n {
@@ -768,16 +775,10 @@ pub func check_ast(base_dir: string) -> string {
     }
     sm_t_copy = smc1 - smc0
     g_root = s_n - 1
-    // S3.3 宏展开 pass（在 import 展开之前：宏定义与使用限主文件；展开结果
-    // 参与类型检查）。失败返回与后续同格式的 ERR 协议文本。
-    if mexpand.expand_sstate() < 0 {
-        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
-    }
-    unsafe {
-        var smc2 = GetTickCount()
-    }
-    sm_t_mexp = smc2 - smc1
-    // import 展开（主文件顶层进 g_extra_tops，import 文件递归合并）
+    // import 展开（主文件顶层进 g_extra_tops，import 文件递归合并）。
+    // dev33 批次10 任务29：跨文件宏——import 展开**先于**宏展开，导入文件的
+    // 宏定义（pub）才可见；同时记录各文件顶层 StmtList 根（g_file_roots，
+    // 供 mexpand 做宏可见性判定）。
     var er = expand_imports()
     if er < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
@@ -785,7 +786,16 @@ pub func check_ast(base_dir: string) -> string {
     unsafe {
         var smc3 = GetTickCount()
     }
-    sm_t_imp = smc3 - smc2
+    sm_t_imp = smc3 - smc1
+    // S3.3 宏展开 pass（跨文件宏：g_extra_tops 收集全部文件顶层宏定义；
+    // 展开结果参与类型检查）。失败返回与后续同格式的 ERR 协议文本。
+    if mexpand.expand_sstate() < 0 {
+        return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg
+    }
+    unsafe {
+        var smc2 = GetTickCount()
+    }
+    sm_t_mexp = smc2 - smc3
     var r = scollect.collect_top()
     if r < 0 {
         return "ERR:" + to_string(sm_err_line) + " " + to_string(sm_err_col) + " " + sm_err_msg

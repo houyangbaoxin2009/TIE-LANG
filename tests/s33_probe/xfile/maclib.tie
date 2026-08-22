@@ -1,0 +1,15 @@
+type tie<class>
+// dev33 批次10 任务29：跨文件宏库（被导入文件）
+// pub macro 跨文件可见；非 pub macro 仅定义文件内可见（私有）。
+
+pub macro xf_add1(x: code) -> code {
+    return `( ($x) + 1 )
+}
+
+pub macro xf_double(x: code) -> code {
+    return `( ($x) * 2 )
+}
+
+macro xf_private(x: code) -> code {
+    return `( ($x) * 10 )
+}

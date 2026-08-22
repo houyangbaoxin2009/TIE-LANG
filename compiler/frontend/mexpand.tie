@@ -36,6 +36,8 @@ import "../interp/interp.tie"
 var g_macro_keys: table<i64>;   // 宏名池 id（升序语义：线性查找即可）
 var g_macro_nodes: table<i64>;  // 宏定义节点 id（与 keys 平行）
 var g_macro_isproc: table<i64>; // 过程宏标记（1 = #[macro] token 流宏，与 keys 平行）
+var g_macro_ispub: table<i64>;  // pub 导出标记（1 = pub macro 跨文件可见）
+var g_macro_file: table<i64>;   // 宏定义所属文件 id（g_file_roots 编号；主文件 0）
 
 // ==================== s_* 池快照（宏执行隔离） ====================
 // 宏执行（interp.eval_proto / eval_macro / eval_code / .call()）内部会
@@ -115,17 +117,22 @@ func macro_find(name_id: i64) -> i64 {
     return -1
 }
 
-// 登记宏（name 池 id + 定义节点 id + 过程宏标记；重复登记覆盖——后定义优先）。
-func macro_put(name_id: i64, node: i64, isproc: i64) {
+// 登记宏（name 池 id + 定义节点 id + 过程宏标记 + pub 标记 + 定义文件 id；
+// 重复登记覆盖——后定义优先）。
+func macro_put(name_id: i64, node: i64, isproc: i64, ispub: i64, file: i64) {
     var i = macro_find(name_id)
     if i >= 0 {
         g_macro_nodes[i] = node
         g_macro_isproc[i] = isproc
+        g_macro_ispub[i] = ispub
+        g_macro_file[i] = file
         return
     }
     table_push(g_macro_keys, name_id)
     table_push(g_macro_nodes, node)
     table_push(g_macro_isproc, isproc)
+    table_push(g_macro_ispub, ispub)
+    table_push(g_macro_file, file)
 }
 
 // ==================== 主入口 ====================
@@ -158,7 +165,21 @@ pub func expand_sstate() -> i64 {
             if s_tags[i] == N_CALL {
                 var nm_id = s_names[i]
                 if nm_id >= 0 {
-                    if macro_find(nm_id) >= 0 {
+                    var mi = macro_find(nm_id)
+                    if mi >= 0 {
+                        // 跨文件宏可见性（dev33 批次10 任务29）：pub 宏跨文件
+                        // 可见；非 pub 宏只能在定义文件内使用（同文件私有）。
+                        var ispub = g_macro_ispub[mi]
+                        if ispub == 0 {
+                            var cfile = node_file_of(i)
+                            if cfile != g_macro_file[mi] {
+                                sm_err_line = s_lines[i]
+                                sm_err_col = s_cols[i]
+                                sm_err_msg = "宏 '" + interner.lookup(nm_id) +
+                                    "' 是私有宏，只能在定义文件内使用（pub macro 导出跨文件可见）"
+                                return -1
+                            }
+                        }
                         var rc = expand_one(i)
                         if rc < 0 {
                             return -1
@@ -187,14 +208,15 @@ pub func expand_sstate() -> i64 {
     return 0
 }
 
-// 收集顶层宏定义（g_root children 中的 N_MACRO_DEF）→ 宏表；同时重建
-// g_root children 剔除宏定义（宏不参与语义/IR）。
+// 收集顶层宏定义（g_extra_tops 中的 N_MACRO_DEF——跨文件宏 dev33 批次10 任务29：
+// import 展开先于宏展开，g_extra_tops = 主 + 全部导入文件顶层语句）→ 宏表；
+// 同时重建 g_extra_tops 剔除宏定义（宏不参与语义/IR）。
 func collect_macros() -> i64 {
     var kept: table<i64> = table_new_i64()
-    var n = s_nchild[g_root]
+    var n = len(g_extra_tops)
     var i: i64 = 0
     while i < n {
-        var s = s_children[s_coff[g_root] + i]
+        var s = g_extra_tops[i]
         if s_tags[s] == N_MACRO_DEF {
             var nm_id = s_names[s]
             if nm_id < 0 {
@@ -203,26 +225,61 @@ func collect_macros() -> i64 {
                 sm_err_msg = "宏定义缺少名字"
                 return -1
             }
-            // val=1 标记过程宏（#[macro] 属性，token 流驱动）
+            // val 位标志：bit0=过程宏（#[macro]），bit1=pub 导出
             var isproc: i64 = 0
-            if s_vals[s] == 1 {
+            var ispub: i64 = 0
+            if s_vals[s] % 2 == 1 {
                 isproc = 1
             }
-            macro_put(nm_id, s, isproc)
+            if s_vals[s] / 2 % 2 == 1 {
+                ispub = 1
+            }
+            macro_put(nm_id, s, isproc, ispub, node_file_of(s))
         } else {
             table_push(kept, s)
         }
         i = i + 1
     }
-    // 重建 g_root children 段（旧段孤儿化；g_root 是主文件顶层 StmtList）
-    s_coff[g_root] = len(s_children)
-    s_nchild[g_root] = len(kept)
-    var k: i64 = 0
-    while k < len(kept) {
-        table_push(s_children, kept[k])
-        k = k + 1
+    // 重建 g_extra_tops（剔除宏定义；收集/查找统一遍历用）
+    g_extra_tops = kept
+    return 0
+}
+
+// 节点所属文件 id：沿父链上溯到最近的已记录顶层 StmtList 根（g_file_roots），
+// 其文件 id 即节点所属文件；找不到（主文件顶层直接子节点）→ 0（主文件）。
+func node_file_of(node: i64) -> i64 {
+    var cur = node
+    var depth: i64 = 0
+    while depth < 64 {
+        var out: table<i64> = table_new_i64()
+        table_push(out, -1)
+        table_push(out, -1)
+        if find_parent(cur, out) < 0 {
+            break
+        }
+        var p = out[0]
+        // 已记录顶层 StmtList 根 → 其文件 id
+        var fi = file_root_find(p)
+        if fi >= 0 {
+            return fi
+        }
+        cur = p
+        depth = depth + 1
     }
     return 0
+}
+
+// 查 g_file_roots 中是否存在顶层 StmtList 根 id（线性；文件数少）。命中返回
+// 文件 id；未命中 -1。
+func file_root_find(root_id: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_file_roots) {
+        if g_file_roots[i] == root_id {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
 }
 
 // 注册全部宏到 interp：每个宏定义子树序列化为协议文本（根 = 宏定义
