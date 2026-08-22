@@ -2,29 +2,29 @@ type tie<class>
 // compiler/backend/irgen_lit.tie —— 生成器 L1 字面量层 子模块
 // ============================================================
 // 从 irgen.tie 拆分而来：这是 irgen LLVM 风格分层重构的 S2 步。
-// 本文件承载 L1 字面量/常量层：整数（gen_int_lit/gen_int_lit_ty）、字符串
-//（gen_str_lit）、浮点（gen_float_lit/gen_float_lit_ty）、字符（gen_char_lit）、
-// 三进制（gen_trit_lit）、布尔（gen_bool_lit）字面量，外加三目运算
-//（gen_ternary）与字符串反转义/切片（str_unescape_quoted/str_slice）。
+// 本文件承载 L1 字面量/常量层：整数（tig_int_lit/tig_int_lit_ty）、字符串
+//（tig_str_lit）、浮点（tig_float_lit/tig_float_lit_ty）、字符（tig_char_lit）、
+// 三进制（tig_trit_lit）、布尔（tig_bool_lit）字面量，外加三目运算
+//（tig_ternary）与字符串反转义/切片（str_unescape_quoted/str_slice）。
 // 它们生成 const_i/const_str/const_f 等常量指令，被上层语句/表达式生成层裸名调用。
 //
 // 拆分范式：【同 namespace 跨文件】（文本内联）。
 // 同 irgen_builder.tie（S1）。irgen.tie 顶层 import 本文件后，本文件被文本内联
 // 进同一编译单元，声明与 irgen.tie 相同的 `namespace irgen`，同名 namespace
 // 跨文件闭合并集：
-//   - 同 namespace 函数可互相裸名调用（主文件照常裸名调用 gen_int_lit 等）；
+//   - 同 namespace 函数可互相裸名调用（主文件照常裸名调用 tig_int_lit 等）；
 //   - 可访问主文件顶层全局 var（g_cur_block/g_cur_func 等）；
 //   - 本文件只含函数与注释，不含顶层全局 var 声明、不含 import——
 //     全局 var 与 import 树均留在 irgen.tie 主文件，避免重复定义。
 namespace irgen {
 // 常量：int 字面量 → const_i 指令（值 id 为操作数）
-// ty 为结果类型（默认调用方传 i64；i32 变量初始化用 gen_int_lit_ty）
-func gen_int_lit(val: i64) -> i64 {
-    return gen_int_lit_ty(val, types.named(TK_I64))
+// ty 为结果类型（默认调用方传 i64；i32 变量初始化用 tig_int_lit_ty）
+func tig_int_lit(val: i64) -> i64 {
+    return tig_int_lit_ty(val, types.named(TK_I64))
 }
 // 按指定类型生成 int 常量（i32/i64 等）：const_i 结果类型跟随存储目标，
-// 避免 llvmgen 的 store 类型不匹配（见 gen_stmt VarDecl 说明）。
-func gen_int_lit_ty(val: i64, ty: i64) -> i64 {
+// 避免 llvmgen 的 store 类型不匹配（见 tig_stmt VarDecl 说明）。
+func tig_int_lit_ty(val: i64, ty: i64) -> i64 {
     var inst = ir.new_inst(g_cur_block, 60, ty)  // const_i
     ir.add_operand(inst, val, 2)  // OK_IMM 立即数
     return ir.get_value(inst)
@@ -35,7 +35,7 @@ func gen_int_lit_ty(val: i64, ty: i64) -> i64 {
 // 否则生成的 @.str.N 会含 \22 引号（Rust 参考 AST 存去引号文本）。
 // 结果值：const_str 在 llvmgen 生成 `%N = ptrtoint ptr @.str.N to i64`——必须有结果
 // 寄存器，故 ty 用 i64（TK_I64）而非 -1（new_inst 对 ty<0 不分配结果值）。
-func gen_str_lit(name_id: i64) -> i64 {
+func tig_str_lit(name_id: i64) -> i64 {
     var clean = str_unescape_quoted(name_id)
     var inst = ir.new_inst(g_cur_block, 62, types.named(TK_I64))  // const_str, i64 结果
     ir.add_operand(inst, clean, 0)  // OK_VALUE 字符串池 id
@@ -44,19 +44,19 @@ func gen_str_lit(name_id: i64) -> i64 {
 // 浮点字面量 → const_f 指令（操作数 = 浮点文本的字符串池 id）。
 // lexeme 来自词法 lex_float（必然合法，parse_float 编译期执行不会失败）；
 // llvmgen 端按 LLVM 语法规范化（补小数点）后输出 fadd double <lit>, 0.0。
-func gen_float_lit(name_id: i64) -> i64 {
-    return gen_float_lit_ty(name_id, types.named(TK_F64))
+func tig_float_lit(name_id: i64) -> i64 {
+    return tig_float_lit_ty(name_id, types.named(TK_F64))
 }
 // 按目标类型生成浮点常量（S1.3 f32：`var d = 1.5f32` → const_f float；
 // llvmgen 按 ins_ty 输出 float/double）
-func gen_float_lit_ty(name_id: i64, ty: i64) -> i64 {
+func tig_float_lit_ty(name_id: i64, ty: i64) -> i64 {
     var inst = ir.new_inst(g_cur_block, 51, ty)  // const_f
     ir.add_operand(inst, name_id, 0)  // OK_VALUE 浮点文本池 id（原 lexeme）
     return ir.get_value(inst)
 }
 // 字符字面量 → i32 码点常量（对齐 Rust CharLit → (c as i32, "i32")）。
 // lexeme 形如 "'a'" / "'\n'"（带引号）：去引号 + 反转义 → 单字符 → 码点。
-func gen_char_lit(name_id: i64) -> i64 {
+func tig_char_lit(name_id: i64) -> i64 {
     var raw = interner.lookup(name_id)
     var n: i64 = str_len(raw)
     if n >= 3 && str_char(raw, 0) == "'" && str_char(raw, n - 1) == "'" {
@@ -92,16 +92,16 @@ func gen_char_lit(name_id: i64) -> i64 {
     return ir.get_value(inst)
 }
 // trit 字面量 → i8 常量（值域 -1/0/1；driver 树仅 lex_zero → 0）
-func gen_trit_lit(v: i64) -> i64 {
+func tig_trit_lit(v: i64) -> i64 {
     var inst = ir.new_inst(g_cur_block, 60, types.named(TK_I8))  // const_i i8
     ir.add_operand(inst, v, 2)  // OK_IMM
     return ir.get_value(inst)
 }
-// 三目运算 cond ? then : else：三块短路 + phi 汇合（对齐 Rust gen_expr Ternary）。
+// 三目运算 cond ? then : else：三块短路 + phi 汇合（对齐 Rust tig_expr Ternary）。
 // AST：Ternary[children=[cond, then, else]]；then/else 为表达式（无 return），
 // 分支内必然以 br merge 结束，无需 block_terminated 检查。
-func gen_ternary(id: i64) -> i64 {
-    var cond = gen_expr(sstate.child(id, 0))
+func tig_ternary(id: i64) -> i64 {
+    var cond = tig_expr(sstate.child(id, 0))
     if cond < 0 {
         return -1
     }
@@ -114,7 +114,7 @@ func gen_ternary(id: i64) -> i64 {
     ir.add_operand(cbr, else_blk, 1)
     // then 分支
     g_cur_block = then_blk
-    var tv = gen_expr(sstate.child(id, 1))
+    var tv = tig_expr(sstate.child(id, 1))
     if tv < 0 {
         return -1
     }
@@ -123,7 +123,7 @@ func gen_ternary(id: i64) -> i64 {
     ir.add_operand(br1, merge_blk, 1)
     // else 分支
     g_cur_block = else_blk
-    var ev = gen_expr(sstate.child(id, 2))
+    var ev = tig_expr(sstate.child(id, 2))
     if ev < 0 {
         return -1
     }
@@ -225,7 +225,7 @@ func str_slice(s: string, start: i64, end: i64) -> string {
     return sb_build(sb)
 }
 // bool 字面量 → i1 常量（phi 短路分支用；add 0, v 形式）
-func gen_bool_lit(v: i64) -> i64 {
+func tig_bool_lit(v: i64) -> i64 {
     var inst = ir.new_inst(g_cur_block, 60, types.named(TK_BOOL))
     ir.add_operand(inst, v, 2)
     return ir.get_value(inst)

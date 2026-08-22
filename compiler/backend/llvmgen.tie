@@ -162,7 +162,7 @@ func l_find_char(s: string, c: string) -> i64 {
 }
 
 // 全局变量登记：表全局（global ptr null + main 初始化）/ 标量（零值 global）。
-// 供 irgen.gen_global_var 调用（driver 树顶层 VarDecl 439 个）。
+// 供 irgen.tig_global_var 调用（driver 树顶层 VarDecl 439 个）。
 pub func global_table_reg(nm: string) {
     var nid = interner.intern(nm)
     table_push(g_global_names, nid)
@@ -200,7 +200,7 @@ pub func global_str_init(nm: string, lexeme_id: i64) {
     var i: i64 = 0
     while i < len(g_global_names) {
         if g_global_names[i] == nid {
-            // 去引号 lexeme → 纯文本池 id（与 gen_str_lit 同款）
+            // 去引号 lexeme → 纯文本池 id（与 tig_str_lit 同款）
             var clean = lexeme_id
             var txt = intern.lookup(lexeme_id)
             var n: i64 = str_len(txt)
@@ -415,7 +415,7 @@ pub func call_sym_reg(sid: i64) {
 // S2.4 vtable 登记：vt_name = "vt.<port名>.<struct名>"；mnames = 方法实现函数
 // 全名表（按 port 方法声明序，如 ["Button::draw", "Button::bounds"]）。
 // 类型文本 = 内联聚合 "{ ptr, ... }"（字段数 = 方法数）。幂等（同名跳过）。
-// irgen.gen_ast 阶段对每个 impl 记录调用一次；emit_vtables 统一输出。
+// irgen.tig_ast 阶段对每个 impl 记录调用一次；emit_vtables 统一输出。
 pub func vtable_reg(vt_name: string, mnames: table<string>) {
     var i: i64 = 0
     while i < len(g_vt_names) {

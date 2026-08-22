@@ -2,11 +2,11 @@ type tie<class>
 // compiler/backend/irgen_arith.tie —— 生成器 L2 算术/比较层 子模块
 // ============================================================
 // 从 irgen.tie 拆分而来：这是 irgen LLVM 风格分层重构的 S3（第三步）。
-// 本文件承载 L2 算术/比较层：二元/一元运算（gen_binary）、宽窄转换
-//（gen_widen/gen_coerce/gen_narrow_bin）、checked_* 溢出检测族（gen_checked）、
-// 浮点运算（gen_binary_float）、trit 运算（gen_trit_bin/gen_trit_mixed）、
-// 元组 ==/!= 比较（gen_tuple_compare）、复合赋值（gen_compound_assign）、
-// 字符串 +/比较（gen_binary_str）、短路逻辑（gen_logic_short）、
+// 本文件承载 L2 算术/比较层：二元/一元运算（tig_binary）、宽窄转换
+//（tig_widen/tig_coerce/tig_narrow_bin）、checked_* 溢出检测族（tig_checked）、
+// 浮点运算（tig_binary_float）、trit 运算（tig_trit_bin/tig_trit_mixed）、
+// 元组 ==/!= 比较（tig_tuple_compare）、复合赋值（tig_compound_assign）、
+// 字符串 +/比较（tig_binary_str）、短路逻辑（tig_logic_short）、
 // 块终止判断（block_terminated）等。它们生成 add/sub/mul/icmp/select/phi 等
 // 指令，被上层语句/表达式生成层裸名调用。
 //
@@ -14,7 +14,7 @@ type tie<class>
 // 同 irgen_builder.tie（S1）/ irgen_lit.tie（S2）。irgen.tie 顶层 import 本文件
 // 后，本文件被文本内联进同一编译单元，声明与 irgen.tie 相同的 `namespace irgen`，
 // 同名 namespace 跨文件闭合并集：
-//   - 同 namespace 函数可互相裸名调用（主文件照常裸名调用 gen_binary 等）；
+//   - 同 namespace 函数可互相裸名调用（主文件照常裸名调用 tig_binary 等）；
 //   - 可访问主文件顶层全局 var（g_cur_block/g_cur_func/node_types/s_tags 等）；
 //   - 本文件只含函数与注释，不含顶层全局 var 声明、不含 import——
 //     全局 var 与 import 树均留在 irgen.tie 主文件，避免重复定义。
@@ -22,35 +22,35 @@ namespace irgen {
 // 二元运算：生成左右操作数后按 op 生成算术/比较/逻辑/位运算指令。
 // 字符串操作（+ 拼接 / 比较）走运行时桥（str_cat / strcmp），由 node_types 判定。
 // && || 走短路（cond_br + phi 汇合，对齐 Rust ir.rs 短路模式）。
-func gen_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
-    // trit 判定先行（对齐 Rust gen_binary 分派顺序）：trit 的 &&/|| 是 Kleene
+func tig_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
+    // trit 判定先行（对齐 Rust tig_binary 分派顺序）：trit 的 &&/|| 是 Kleene
     // min/max（非短路），混合 trit×i64 走 gen_binary_trit——短路分支只服务 bool
     var lhs_t = node_types[lhs]
     var rhs_t = node_types[rhs]
     if lhs_t == types.named(TK_TRIT) || rhs_t == types.named(TK_TRIT) {
-        var lv0 = gen_expr(lhs)
+        var lv0 = tig_expr(lhs)
         if lv0 < 0 {
             return -1
         }
-        var rv0 = gen_expr(rhs)
+        var rv0 = tig_expr(rhs)
         if rv0 < 0 {
             return -1
         }
         // 分流：两侧都 trit → Kleene/饱和/icmp i8；一侧 trit（×i64 混合）→ sext
         if lhs_t == types.named(TK_TRIT) && rhs_t == types.named(TK_TRIT) {
-            return gen_trit_bin(op, lv0, rv0)
+            return tig_trit_bin(op, lv0, rv0)
         }
-        return gen_trit_mixed(op, lhs_t == types.named(TK_TRIT), lv0, rv0)
+        return tig_trit_mixed(op, lhs_t == types.named(TK_TRIT), lv0, rv0)
     }
     // 逻辑短路：&&（11）/ ||（12）→ cond_br + phi（两侧类型 i1）
     if op == 11 || op == 12 {
-        return gen_logic_short(op, lhs, rhs)
+        return tig_logic_short(op, lhs, rhs)
     }
-    var lv = gen_expr(lhs)
+    var lv = tig_expr(lhs)
     if lv < 0 {
         return -1
     }
-    var rv = gen_expr(rhs)
+    var rv = tig_expr(rhs)
     if rv < 0 {
         return -1
     }
@@ -58,18 +58,18 @@ func gen_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
     var lhs_str = lhs_t == types.named(TK_STR)
     var rhs_str = rhs_t == types.named(TK_STR)
     if lhs_str || rhs_str {
-        return gen_binary_str(op, lv, rv)
+        return tig_binary_str(op, lv, rv)
     }
     // 浮点判定（f64/f32 字面量与算术；对齐 Rust：类型以一侧为准，语义已统一）
     var lhs_f = lhs_t == types.named(TK_F64) || lhs_t == types.named(TK_F32)
     var rhs_f = rhs_t == types.named(TK_F64) || rhs_t == types.named(TK_F32)
     if lhs_f || rhs_f {
-        return gen_binary_float(op, lv, rv)
+        return tig_binary_float(op, lv, rv)
     }
     // 元组 ==/!=：逐字段递归比较（语义层已校验两侧为结构相等元组；
     // < > <= >= 在语义层已被拦截，此处仅处理 5/6）
     if types.kind(lhs_t) == K_TUPLE {
-        return gen_tuple_compare(op, lhs, rhs, lv, rv)
+        return tig_tuple_compare(op, lhs, rhs, lv, rv)
     }
     // op 码（ast）：0=+ 1=- 2=* 3=/ 4=% 5== 6!= 7< 8> 9<= 10>= 11&& 12||
     // 13& 14| 15^ 16<< 17>>（逻辑已在短路分支处理；此处为位运算）
@@ -151,7 +151,7 @@ func gen_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
                 common = types.named(TK_I64)
             }
         }
-        return gen_narrow_bin(op, iop, lv, rv, lhs_t, rhs_t, common)
+        return tig_narrow_bin(op, iop, lv, rv, lhs_t, rhs_t, common)
     }
     var inst = ir.new_inst(g_cur_block, iop, types.named(3))
     ir.add_operand(inst, lv, 0)
@@ -181,7 +181,7 @@ func gen_binary(op: i64, lhs: i64, rhs: i64) -> i64 {
 // 公共宽度（有符号 sext / 无符号 zext）。同宽度直传（LLVM 位模式一致）。
 // src 宽于 dst（字面量 i64 → 窄公共宽度）→ trunc 缩窄（常量回绕语义）。
 // 返回新值 id（未拓宽原样返回）。
-func gen_widen(v: i64, src_ty: i64, dst_ty: i64) -> i64 {
+func tig_widen(v: i64, src_ty: i64, dst_ty: i64) -> i64 {
     if src_ty == dst_ty {
         return v
     }
@@ -201,7 +201,7 @@ func gen_widen(v: i64, src_ty: i64, dst_ty: i64) -> i64 {
     }
     var ss = stype.is_signed(src_ty)
     if ss {
-        return gen_sext(v, src_ty, dst_ty)
+        return tig_sext(v, src_ty, dst_ty)
     }
     // 无符号：zext（opcode 29）
     var z = ir.new_inst(g_cur_block, 29, dst_ty)
@@ -214,7 +214,7 @@ func gen_widen(v: i64, src_ty: i64, dst_ty: i64) -> i64 {
 // 覆盖：同符号整数拓宽（sext/zext）、缩窄（trunc）、int→float（sitofp）、
 // float→int（fptosi）、f32↔f64（fpext/fptrunc）；同宽 i↔u 位模式一致直传；
 // 字符串/表/聚合类型不做转换（原样返回）。返回新值 id。
-func gen_coerce(v: i64, src: i64, dst: i64) -> i64 {
+func tig_coerce(v: i64, src: i64, dst: i64) -> i64 {
     if src == dst || src < 0 || dst < 0 {
         return v
     }
@@ -226,7 +226,7 @@ func gen_coerce(v: i64, src: i64, dst: i64) -> i64 {
             return v  // 同宽（含 i↔u）：位模式一致，直传
         }
         if sw < dw {
-            return gen_widen(v, src, dst)  // 拓宽
+            return tig_widen(v, src, dst)  // 拓宽
         }
         // 缩窄：trunc（opcode 37）
         var tr = ir.new_inst(g_cur_block, 37, dst)
@@ -285,12 +285,12 @@ func lit_in_range_irgen(v: i64, ty: i64) -> bool {
 // 窄侧先 sext/zext 拓宽——LLVM add i8 直接支持但两侧必须同型，i8+i16
 // 混合须先提升。比较（icmp）操作数同样公共宽度，结果仍 i1（LLVM 自动）。
 // 返回结果值 id。
-func gen_narrow_bin(op: i64, iop: i64, lv: i64, rv: i64, lt: i64, rt: i64, common: i64) -> i64 {
-    var l2 = gen_widen(lv, lt, common)
+func tig_narrow_bin(op: i64, iop: i64, lv: i64, rv: i64, lt: i64, rt: i64, common: i64) -> i64 {
+    var l2 = tig_widen(lv, lt, common)
     if l2 < 0 {
         return -1
     }
-    var r2 = gen_widen(rv, rt, common)
+    var r2 = tig_widen(rv, rt, common)
     if r2 < 0 {
         return -1
     }
@@ -299,8 +299,8 @@ func gen_narrow_bin(op: i64, iop: i64, lv: i64, rv: i64, lt: i64, rt: i64, commo
     // ashr(位宽-1) 求）；逻辑右移 → 0。LLVM shift 该场景 poison，select 保护。
     if op == 16 || op == 17 {
         var w = stype.int_width(common)
-        var sh_bad = gen_cmp_const(r2, 5, w, common)  // 移位量 >= w
-        var z3 = gen_int_lit_ty(0, common)
+        var sh_bad = tig_cmp_const(r2, 5, w, common)  // 移位量 >= w
+        var z3 = tig_int_lit_ty(0, common)
         var sv3 = ir.new_inst(g_cur_block, iop, common)
         ir.add_operand(sv3, l2, 0)
         ir.add_operand(sv3, r2, 0)
@@ -309,9 +309,9 @@ func gen_narrow_bin(op: i64, iop: i64, lv: i64, rv: i64, lt: i64, rt: i64, commo
             var s4 = ir.new_inst(g_cur_block, 11, common)  // ashr
             ir.add_operand(s4, l2, 0)
             ir.add_operand(s4, w - 1, 2)
-            return gen_select_i(sh_bad, ir.get_value(s4), svv, common)
+            return tig_select_i(sh_bad, ir.get_value(s4), svv, common)
         }
-        return gen_select_i(sh_bad, z3, svv, common)
+        return tig_select_i(sh_bad, z3, svv, common)
     }
     var inst = ir.new_inst(g_cur_block, iop, common)
     ir.add_operand(inst, l2, 0)
@@ -353,7 +353,7 @@ func gen_narrow_bin(op: i64, iop: i64, lv: i64, rv: i64, lt: i64, rt: i64, commo
 // 除零/移过量等 poison 源用 select 保护（未选中分支不传播 poison）。
 
 // icmp 快捷（cc：0=eq 1=ne 2=slt 3=sgt 4=sle 5=sge 6=ult 7=ugt 8=ule 9=uge）
-func gen_icmp_c(v0: i64, v1: i64, cc: i64) -> i64 {
+func tig_icmp_c(v0: i64, v1: i64, cc: i64) -> i64 {
     var ic = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
     ir.add_operand(ic, v0, 0)
     ir.add_operand(ic, v1, 0)
@@ -362,12 +362,12 @@ func gen_icmp_c(v0: i64, v1: i64, cc: i64) -> i64 {
 }
 
 // 比较 v0 与字面 0（IMM 操作数，非值引用）。
-// 修复（段拷 bug 根因）：旧 `gen_icmp_c(v, 0, cc)` 把 0 作 VALUE 操作数 → 引用
+// 修复（段拷 bug 根因）：旧 `tig_icmp_c(v, 0, cc)` 把 0 作 VALUE 操作数 → 引用
 // 「值 id 0」（模块首个常量，如 const 8），跨函数悬挂引用 + 与形参 %0 撞号 →
 // renumber 误判为形参引用 → IR 类型错误（`icmp sle i64 %X, %0`，%0=ptr）。
 // 对齐 is_null 内置的写法（立即数 0 必须 IMM）：llvmgen icmp 对 ptr 上下文自动
 // 把字面 0 转 null（`icmp eq ptr %kp, null`）。
-func gen_cmp_zero(v0: i64, cc: i64) -> i64 {
+func tig_cmp_zero(v0: i64, cc: i64) -> i64 {
     var ic = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
     ir.add_operand(ic, v0, 0)
     ir.add_operand(ic, 0, 2)  // IMM 0（llvmgen ptr 上下文 → null）
@@ -376,7 +376,7 @@ func gen_cmp_zero(v0: i64, cc: i64) -> i64 {
 }
 
 // and i1 快捷
-func gen_and_i1(v0: i64, v1: i64) -> i64 {
+func tig_and_i1(v0: i64, v1: i64) -> i64 {
     var a2 = ir.new_inst(g_cur_block, 6, types.named(TK_BOOL))
     ir.add_operand(a2, v0, 0)
     ir.add_operand(a2, v1, 0)
@@ -384,7 +384,7 @@ func gen_and_i1(v0: i64, v1: i64) -> i64 {
 }
 
 // or i1 快捷
-func gen_or_i1(v0: i64, v1: i64) -> i64 {
+func tig_or_i1(v0: i64, v1: i64) -> i64 {
     var o2 = ir.new_inst(g_cur_block, 7, types.named(TK_BOOL))
     ir.add_operand(o2, v0, 0)
     ir.add_operand(o2, v1, 0)
@@ -392,13 +392,13 @@ func gen_or_i1(v0: i64, v1: i64) -> i64 {
 }
 
 // 常量比较（值 vs 立即数常量，类型跟随值）
-func gen_cmp_const(v: i64, cc: i64, cval: i64, cty: i64) -> i64 {
-    var cv = gen_int_lit_ty(cval, cty)
-    return gen_icmp_c(v, cv, cc)
+func tig_cmp_const(v: i64, cc: i64, cval: i64, cty: i64) -> i64 {
+    var cv = tig_int_lit_ty(cval, cty)
+    return tig_icmp_c(v, cv, cc)
 }
 
 // select i1 快捷（opcode 34）：cond ? tval : fval（同类型）
-func gen_select_i(cond: i64, tval: i64, fval: i64, ty: i64) -> i64 {
+func tig_select_i(cond: i64, tval: i64, fval: i64, ty: i64) -> i64 {
     var sl = ir.new_inst(g_cur_block, 34, ty)
     ir.add_operand(sl, cond, 0)
     ir.add_operand(sl, tval, 0)
@@ -459,18 +459,18 @@ func slice_field(s: i64, f: i64) -> i64 {
 }
 
 // a 是否为类型最小值（位模式检测：a!=0 && a<<1==0，避开 i64 min 字面量）
-func gen_is_min(a: i64, ty: i64) -> i64 {
-    var nz = gen_icmp_c(a, gen_int_lit_ty(0, ty), 1)  // a != 0
+func tig_is_min(a: i64, ty: i64) -> i64 {
+    var nz = tig_icmp_c(a, tig_int_lit_ty(0, ty), 1)  // a != 0
     var sh = ir.new_inst(g_cur_block, 10, ty)  // shl a, 1
     ir.add_operand(sh, a, 0)
     ir.add_operand(sh, 1, 2)
-    var z = gen_icmp_c(ir.get_value(sh), gen_int_lit_ty(0, ty), 0)  // a<<1 == 0
-    return gen_and_i1(nz, z)
+    var z = tig_icmp_c(ir.get_value(sh), tig_int_lit_ty(0, ty), 0)  // a<<1 == 0
+    return tig_and_i1(nz, z)
 }
 
 // checked_* 主生成：返回 (值, 标志) 聚合值 id
-func gen_checked(nm: string, id: i64) -> i64 {
-    var a = gen_expr(call_arg(id, 0))
+func tig_checked(nm: string, id: i64) -> i64 {
+    var a = tig_expr(call_arg(id, 0))
     if a < 0 {
         return -1
     }
@@ -483,7 +483,7 @@ func gen_checked(nm: string, id: i64) -> i64 {
     var bt = at
     var b: i64 = -1
     if nm != "checked_neg" {
-        b = gen_expr(call_arg(id, 1))
+        b = tig_expr(call_arg(id, 1))
         if b < 0 {
             return -1
         }
@@ -502,17 +502,17 @@ func gen_checked(nm: string, id: i64) -> i64 {
         ir.add_operand(s, b, 0)
         val = ir.get_value(s)
         if signed {
-            var a_pos = gen_cmp_const(a, 3, 0, bt)   // a > 0
-            var b_pos = gen_cmp_const(b, 3, 0, bt)   // b > 0
-            var s_neg = gen_cmp_const(val, 2, 0, bt)  // s < 0
-            var c1 = gen_and_i1(gen_and_i1(a_pos, b_pos), s_neg)
-            var a_neg = gen_cmp_const(a, 2, 0, bt)   // a < 0
-            var b_neg = gen_cmp_const(b, 2, 0, bt)   // b < 0
-            var s_ge = gen_cmp_const(val, 5, 0, bt)  // s >= 0
-            var c2 = gen_and_i1(gen_and_i1(a_neg, b_neg), s_ge)
-            ovf = gen_or_i1(c1, c2)
+            var a_pos = tig_cmp_const(a, 3, 0, bt)   // a > 0
+            var b_pos = tig_cmp_const(b, 3, 0, bt)   // b > 0
+            var s_neg = tig_cmp_const(val, 2, 0, bt)  // s < 0
+            var c1 = tig_and_i1(tig_and_i1(a_pos, b_pos), s_neg)
+            var a_neg = tig_cmp_const(a, 2, 0, bt)   // a < 0
+            var b_neg = tig_cmp_const(b, 2, 0, bt)   // b < 0
+            var s_ge = tig_cmp_const(val, 5, 0, bt)  // s >= 0
+            var c2 = tig_and_i1(tig_and_i1(a_neg, b_neg), s_ge)
+            ovf = tig_or_i1(c1, c2)
         } else {
-            ovf = gen_icmp_c(val, a, 6)  // s < a（ult）
+            ovf = tig_icmp_c(val, a, 6)  // s < a（ult）
         }
     } else if nm == "checked_sub" {
         var s = ir.new_inst(g_cur_block, 1, bt)  // sub
@@ -520,13 +520,13 @@ func gen_checked(nm: string, id: i64) -> i64 {
         ir.add_operand(s, b, 0)
         val = ir.get_value(s)
         if signed {
-            var b_pos = gen_cmp_const(b, 3, 0, bt)   // b > 0
-            var s_gt_a = gen_icmp_c(val, a, 3)       // s > a
-            var b_neg = gen_cmp_const(b, 2, 0, bt)   // b < 0
-            var s_lt_a = gen_icmp_c(val, a, 2)       // s < a
-            ovf = gen_or_i1(gen_and_i1(b_pos, s_gt_a), gen_and_i1(b_neg, s_lt_a))
+            var b_pos = tig_cmp_const(b, 3, 0, bt)   // b > 0
+            var s_gt_a = tig_icmp_c(val, a, 3)       // s > a
+            var b_neg = tig_cmp_const(b, 2, 0, bt)   // b < 0
+            var s_lt_a = tig_icmp_c(val, a, 2)       // s < a
+            ovf = tig_or_i1(tig_and_i1(b_pos, s_gt_a), tig_and_i1(b_neg, s_lt_a))
         } else {
-            ovf = gen_icmp_c(val, a, 7)  // s > a（ugt）
+            ovf = tig_icmp_c(val, a, 7)  // s > a（ugt）
         }
     } else if nm == "checked_mul" {
         var s = ir.new_inst(g_cur_block, 2, bt)  // mul
@@ -535,43 +535,43 @@ func gen_checked(nm: string, id: i64) -> i64 {
         val = ir.get_value(s)
         if signed {
             // ovf1 = (a == -1 && b == min)
-            var a_minus1 = gen_cmp_const(a, 0, -1, bt)
-            var b_min = gen_is_min(b, bt)
-            var ovf1 = gen_and_i1(a_minus1, b_min)
+            var a_minus1 = tig_cmp_const(a, 0, -1, bt)
+            var b_min = tig_is_min(b, bt)
+            var ovf1 = tig_and_i1(a_minus1, b_min)
             // ovf2 = (a != 0 && b != 0 && a != -1 && s/a != b)
-            var a_nz = gen_cmp_const(a, 1, 0, bt)
-            var b_nz = gen_cmp_const(b, 1, 0, bt)
-            var a_not_m1 = gen_cmp_const(a, 1, -1, bt)
+            var a_nz = tig_cmp_const(a, 1, 0, bt)
+            var b_nz = tig_cmp_const(b, 1, 0, bt)
+            var a_not_m1 = tig_cmp_const(a, 1, -1, bt)
             var q = ir.new_inst(g_cur_block, 3, bt)  // sdiv
             ir.add_operand(q, val, 0)
             ir.add_operand(q, a, 0)
-            var q_neq_b = gen_icmp_c(ir.get_value(q), b, 1)
-            var ovf2 = gen_and_i1(gen_and_i1(gen_and_i1(a_nz, b_nz), a_not_m1), q_neq_b)
-            ovf = gen_or_i1(ovf1, ovf2)
+            var q_neq_b = tig_icmp_c(ir.get_value(q), b, 1)
+            var ovf2 = tig_and_i1(tig_and_i1(tig_and_i1(a_nz, b_nz), a_not_m1), q_neq_b)
+            ovf = tig_or_i1(ovf1, ovf2)
         } else {
-            var b_nz2 = gen_cmp_const(b, 1, 0, bt)
+            var b_nz2 = tig_cmp_const(b, 1, 0, bt)
             var q2 = ir.new_inst(g_cur_block, 46, bt)  // udiv
             ir.add_operand(q2, val, 0)
             ir.add_operand(q2, b, 0)
-            var q2_neq = gen_icmp_c(ir.get_value(q2), a, 1)
-            ovf = gen_and_i1(b_nz2, q2_neq)
+            var q2_neq = tig_icmp_c(ir.get_value(q2), a, 1)
+            ovf = tig_and_i1(b_nz2, q2_neq)
         }
     } else if nm == "checked_div" {
-        var b_eq0 = gen_cmp_const(b, 0, 0, bt)
+        var b_eq0 = tig_cmp_const(b, 0, 0, bt)
         var q = ir.new_inst(g_cur_block, 3, bt)  // sdiv（先算，select 保护）
         ir.add_operand(q, a, 0)
         ir.add_operand(q, b, 0)
         var qv = ir.get_value(q)
-        var z = gen_int_lit_ty(0, bt)
+        var z = tig_int_lit_ty(0, bt)
         if signed {
-            var b_minus1 = gen_cmp_const(b, 0, -1, bt)
-            var a_min = gen_is_min(a, bt)
+            var b_minus1 = tig_cmp_const(b, 0, -1, bt)
+            var a_min = tig_is_min(a, bt)
             // 除零/极值：q 置 0（避免 poison 传播）
-            var bad = gen_or_i1(b_eq0, gen_and_i1(a_min, b_minus1))
-            val = gen_select_i(bad, z, qv, bt)
+            var bad = tig_or_i1(b_eq0, tig_and_i1(a_min, b_minus1))
+            val = tig_select_i(bad, z, qv, bt)
             ovf = bad
         } else {
-            val = gen_select_i(b_eq0, z, qv, bt)
+            val = tig_select_i(b_eq0, z, qv, bt)
             ovf = b_eq0
         }
     } else if nm == "checked_neg" {
@@ -579,7 +579,7 @@ func gen_checked(nm: string, id: i64) -> i64 {
         ir.add_operand(n2, 0, 2)
         ir.add_operand(n2, a, 0)
         val = ir.get_value(n2)
-        ovf = gen_is_min(a, bt)
+        ovf = tig_is_min(a, bt)
     } else if nm == "checked_shl" || nm == "checked_shr" {
         var s = ir.new_inst(g_cur_block, 11, bt)  // shr（llvmgen 按符号选 ashr/lshr）
         ir.add_operand(s, a, 0)
@@ -587,16 +587,16 @@ func gen_checked(nm: string, id: i64) -> i64 {
         var sv = ir.get_value(s)
         // 移过量 >= 位宽 → 溢出（LLVM shift 该场景 poison，select 保护）
         var w = stype.int_width(bt)
-        var sh_bad = gen_cmp_const(b, 5, w, bt)  // b >= w
-        var z2 = gen_int_lit_ty(0, bt)
-        val = gen_select_i(sh_bad, z2, sv, bt)
+        var sh_bad = tig_cmp_const(b, 5, w, bt)  // b >= w
+        var z2 = tig_int_lit_ty(0, bt)
+        val = tig_select_i(sh_bad, z2, sv, bt)
         if nm == "checked_shr" && signed {
             // 算术右移：移过量时结果 = 符号位（0 或 -1）——用 ashr(位宽-1) 求符号
             var s2 = ir.new_inst(g_cur_block, 11, bt)  // ashr
             ir.add_operand(s2, a, 0)
             ir.add_operand(s2, w - 1, 2)
             var sv2 = ir.get_value(s2)
-            val = gen_select_i(sh_bad, sv2, sv, bt)
+            val = tig_select_i(sh_bad, sv2, sv, bt)
         }
         ovf = sh_bad
     } else {
@@ -608,7 +608,7 @@ func gen_checked(nm: string, id: i64) -> i64 {
 
 // 浮点二元运算（f64/f32）：算术 → fadd/fsub/fmul/fdiv/frem；比较 → fcmp（ordered）。
 // 对齐 Rust gen_binary_on_regs 的 is_float 分支；比较结果 i1，算术结果 f64。
-func gen_binary_float(op: i64, lv: i64, rv: i64) -> i64 {
+func tig_binary_float(op: i64, lv: i64, rv: i64) -> i64 {
     var iop: i64 = -1
     if op == 0 {
         iop = 13  // fadd
@@ -659,9 +659,9 @@ func gen_binary_float(op: i64, lv: i64, rv: i64) -> i64 {
 // icmp，嵌套元组字段递归（值落内存再 GEP）。表/映射字段不支持（报错）。
 
 // 元组比较入口：op 仅 5(==)/6(!=)；两侧语义类型为结构相等元组。
-// lv/rv 为 gen_binary 已求值的左右值——表达式操作数直接落内存（避免
+// lv/rv 为 tig_binary 已求值的左右值——表达式操作数直接落内存（避免
 // 二次求值副作用），Var 操作数走槽地址（不重复求值）。
-func gen_tuple_compare(op: i64, lhs: i64, rhs: i64, lv: i64, rv: i64) -> i64 {
+func tig_tuple_compare(op: i64, lhs: i64, rhs: i64, lv: i64, rv: i64) -> i64 {
     if op != 5 && op != 6 {
         sm_err_msg = "元组仅支持 ==/!= 比较（函数 " + g_cur_fn_name + "）"
         return -1
@@ -671,15 +671,15 @@ func gen_tuple_compare(op: i64, lhs: i64, rhs: i64, lv: i64, rv: i64) -> i64 {
         sm_err_msg = "元组比较目标不是元组（函数 " + g_cur_fn_name + "）"
         return -1
     }
-    var laddr = gen_agg_operand_addr(lhs, lv, agg)
+    var laddr = tig_agg_operand_addr(lhs, lv, agg)
     if laddr < 0 {
         return -1
     }
-    var raddr = gen_agg_operand_addr(rhs, rv, agg)
+    var raddr = tig_agg_operand_addr(rhs, rv, agg)
     if raddr < 0 {
         return -1
     }
-    var eq = gen_agg_cmp_fields(agg, laddr, raddr)
+    var eq = tig_agg_cmp_fields(agg, laddr, raddr)
     if eq < 0 {
         return -1
     }
@@ -693,18 +693,18 @@ func gen_tuple_compare(op: i64, lhs: i64, rhs: i64, lv: i64, rv: i64) -> i64 {
     return eq
 }
 
-// 聚合比较操作数地址：Var → 槽地址（gen_agg_addr，不重复求值）；
+// 聚合比较操作数地址：Var → 槽地址（tig_agg_addr，不重复求值）；
 // 表达式 → 已求值值落内存（agg_val_to_addr）。
-func gen_agg_operand_addr(node: i64, pre_val: i64, agg: i64) -> i64 {
+func tig_agg_operand_addr(node: i64, pre_val: i64, agg: i64) -> i64 {
     if s_tags[node] == 6 {
-        return gen_agg_addr(node, agg)
+        return tig_agg_addr(node, agg)
     }
     return agg_val_to_addr(pre_val, agg)
 }
 
 // 比较两个同类型聚合地址的全部字段（== 语义）：逐字段比较 + and 合并。
 // 返回 i1（全部字段相等 → true）；空元组恒真。
-func gen_agg_cmp_fields(agg: i64, laddr: i64, raddr: i64) -> i64 {
+func tig_agg_cmp_fields(agg: i64, laddr: i64, raddr: i64) -> i64 {
     var t = agg - BASE_TUPLE
     var nf = tup_n[t]
     var off = tup_offs[t]
@@ -715,18 +715,18 @@ func gen_agg_cmp_fields(agg: i64, laddr: i64, raddr: i64) -> i64 {
         var lgp = ir.new_inst(g_cur_block, 27, agg)  // agg_gep 左字段地址
         ir.add_operand(lgp, laddr, 0)
         ir.add_operand(lgp, i, 2)
-        var lfv = gen_agg_field_load(ir.get_value(lgp), fty)
+        var lfv = tig_agg_field_load(ir.get_value(lgp), fty)
         if lfv < 0 {
             return -1
         }
         var rgp = ir.new_inst(g_cur_block, 27, agg)  // agg_gep 右字段地址
         ir.add_operand(rgp, raddr, 0)
         ir.add_operand(rgp, i, 2)
-        var rfv = gen_agg_field_load(ir.get_value(rgp), fty)
+        var rfv = tig_agg_field_load(ir.get_value(rgp), fty)
         if rfv < 0 {
             return -1
         }
-        var fc = gen_agg_field_cmp(fty, lfv, rfv)
+        var fc = tig_agg_field_cmp(fty, lfv, rfv)
         if fc < 0 {
             return -1
         }
@@ -743,13 +743,13 @@ func gen_agg_cmp_fields(agg: i64, laddr: i64, raddr: i64) -> i64 {
     }
     if acc < 0 {
         // 空元组 () 语义层已拦截；防御恒真
-        return gen_bool_lit(1)
+        return tig_bool_lit(1)
     }
     return acc
 }
 
 // 字段地址 → 字段值（load；ins_ty = 字段类型 fty）
-func gen_agg_field_load(faddr: i64, fty: i64) -> i64 {
+func tig_agg_field_load(faddr: i64, fty: i64) -> i64 {
     var ld = ir.new_inst(g_cur_block, 21, fty)
     ir.add_operand(ld, faddr, 0)
     return ir.get_value(ld)
@@ -769,10 +769,10 @@ func agg_val_to_addr(v: i64, agg: i64) -> i64 {
 
 // 单字段比较（==）：标量 icmp / 浮点 fcmp / 字符串 strcmp+icmp /
 // 嵌套元组递归；表/映射字段不支持。
-func gen_agg_field_cmp(fty: i64, lfv: i64, rfv: i64) -> i64 {
+func tig_agg_field_cmp(fty: i64, lfv: i64, rfv: i64) -> i64 {
     if fty == types.named(TK_STR) {
         // strcmp(lfv, rfv) == 0
-        var cmp = gen_ext_call2("strcmp", lfv, types.named(TK_STR), rfv, types.named(TK_STR), types.named(TK_I32))
+        var cmp = tig_ext_call2("strcmp", lfv, types.named(TK_STR), rfv, types.named(TK_STR), types.named(TK_I32))
         if cmp < 0 {
             return -1
         }
@@ -800,7 +800,7 @@ func gen_agg_field_cmp(fty: i64, lfv: i64, rfv: i64) -> i64 {
         if ra < 0 {
             return -1
         }
-        return gen_agg_cmp_fields(fty, la, ra)
+        return tig_agg_cmp_fields(fty, la, ra)
     }
     if types.is_table(fty) || types.is_map(fty) {
         sm_err_msg = "元组字段为表类型，不支持 ==/!= 比较（字段类型 " + types.type_name(fty) + "）"
@@ -818,12 +818,12 @@ func gen_agg_field_cmp(fty: i64, lfv: i64, rfv: i64) -> i64 {
 //   - 混合 trit×i64：trit 侧 sext i8→i64 后常规整数运算（返回 i64/i1）；
 //   - 同为 trit：&&=min ||=max（icmp+select）；+ - * = 饱和算术（i8 运算 + clamp）；
 //     比较 → icmp i8 → i1。
-// 由 gen_binary 分流：两侧都 trit → gen_trit_bin；一侧 trit → gen_trit_mixed。
+// 由 tig_binary 分流：两侧都 trit → tig_trit_bin；一侧 trit → tig_trit_mixed。
 
 // 两侧同为 trit：Kleene 逻辑（And=min / Or=max）与饱和算术（Add/Sub/Mul）
 // 用 icmp+select 实现；比较类 → icmp i8 → i1。
 // trit 值域仅 -1/0/1，i8 运算不会溢出（-2..2 均在 i8 范围），clamp 用 select。
-func gen_trit_bin(op: i64, lv: i64, rv: i64) -> i64 {
+func tig_trit_bin(op: i64, lv: i64, rv: i64) -> i64 {
     if op == 11 || op == 12 {
         // Kleene &&=min ||=max：icmp slt/sgt i8 + select i8
         var cmp = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp i1
@@ -905,7 +905,7 @@ func gen_trit_bin(op: i64, lv: i64, rv: i64) -> i64 {
 // trit×i64 混合运算：trit 侧 sext i8→i64 后整数运算（+ - * == != < > <= >=）。
 // lhs_is_trit：trit 在左侧（true）还是右侧（false）；非交换运算按位置语义。
 // 结果：算术 → i64；比较 → i1。需要 sext opcode（ir 19，llvmgen 已实现）。
-func gen_trit_mixed(op: i64, lhs_is_trit: bool, lv: i64, rv: i64) -> i64 {
+func tig_trit_mixed(op: i64, lhs_is_trit: bool, lv: i64, rv: i64) -> i64 {
     var trit_reg: i64 = lv
     var int_reg: i64 = rv
     if !lhs_is_trit {
@@ -968,7 +968,7 @@ func gen_trit_mixed(op: i64, lhs_is_trit: bool, lv: i64, rv: i64) -> i64 {
 
 // 自增/自减生成（Unary op 2-5）：load → add/sub 1（浮点 1.0）→ store 回槽。
 // 前缀（2/3）返回新值；后缀（4/5）返回旧值。操作数须为变量（语义层保证）。
-func gen_inc_dec(op: i64, operand: i64) -> i64 {
+func tig_inc_dec(op: i64, operand: i64) -> i64 {
     var nm = sstate.name_str(operand)
     var nid = interner.intern(nm)
     if scope_get_global(nid) < 0 {
@@ -988,7 +988,7 @@ func gen_inc_dec(op: i64, operand: i64) -> i64 {
     var is_dec = op == 3 || op == 5
     var new_v: i64 = -1
     if types.is_float(ty) {
-        var one = gen_float_lit(interner.intern("1.0"))
+        var one = tig_float_lit(interner.intern("1.0"))
         var opc = 13  // fadd
         if is_dec {
             opc = 14  // fsub
@@ -1025,7 +1025,7 @@ func gen_inc_dec(op: i64, operand: i64) -> i64 {
 
 // 复合赋值运算（Assign op ≥ 0）：在 load 出的旧值与右值上执行二元运算。
 // 类型分派：字符串 += → str_cat；浮点 → fadd 族；整数/位运算 → 常规 opcode。
-func gen_compound_assign(op: i64, lv: i64, rv: i64, ty: i64) -> i64 {
+func tig_compound_assign(op: i64, lv: i64, rv: i64, ty: i64) -> i64 {
     // 字符串拼接（+=）：str_cat 指令
     if ty == types.named(TK_STR) && op == 0 {
         var sc = ir.new_inst(g_cur_block, 56, types.named(TK_STR))  // str_cat
@@ -1081,7 +1081,7 @@ func gen_compound_assign(op: i64, lv: i64, rv: i64, ty: i64) -> i64 {
 // 字符串二元运算：拼接（+）→ tie 运行时 str_cat 桥（tie_str_cat 无——用
 // llvmgen 的 str_cat(56) 指令，llvmgen 内联 malloc+memcpy）；比较 → strcmp。
 // 复用 ir opcode：str_cat(56) 拼接；比较走 icmp(12) + 桥 strcmp。
-func gen_binary_str(op: i64, lv: i64, rv: i64) -> i64 {
+func tig_binary_str(op: i64, lv: i64, rv: i64) -> i64 {
     if op == 0 {
         // 拼接：str_cat(56) 指令 [lhs, rhs]
         var inst = ir.new_inst(g_cur_block, 56, types.named(TK_STR))
@@ -1091,7 +1091,7 @@ func gen_binary_str(op: i64, lv: i64, rv: i64) -> i64 {
     }
     // 比较：strcmp(lv, rv) → i32；再与 0 比较。
     // strcmp 是 libc 函数（llvmgen 无条件 declare），走 extern_call(36)。
-    var cmp = gen_ext_call2("strcmp", lv, types.named(TK_STR), rv, types.named(TK_STR), types.named(TK_I32))
+    var cmp = tig_ext_call2("strcmp", lv, types.named(TK_STR), rv, types.named(TK_STR), types.named(TK_I32))
     if cmp < 0 {
         return -1
     }
@@ -1121,8 +1121,8 @@ func gen_binary_str(op: i64, lv: i64, rv: i64) -> i64 {
 // 逻辑短路 && / ||：cond_br + phi 汇合（对齐 Rust ir.rs）。
 //   a && b：br a → then(求 b) / else(false)；then 后 phi [b, then], [false, else]
 //   a || b：br a → then(true) / else(求 b)；else 后 phi [true, then], [b, else]
-func gen_logic_short(op: i64, lhs: i64, rhs: i64) -> i64 {
-    var lv = gen_expr(lhs)
+func tig_logic_short(op: i64, lhs: i64, rhs: i64) -> i64 {
+    var lv = tig_expr(lhs)
     if lv < 0 {
         return -1
     }
@@ -1144,14 +1144,14 @@ func gen_logic_short(op: i64, lhs: i64, rhs: i64) -> i64 {
     g_cur_block = then_blk
     var tv: i64 = 0
     if op == 11 {
-        var bv = gen_expr(rhs)
+        var bv = tig_expr(rhs)
         if bv < 0 {
             return -1
         }
         tv = bv
     } else {
         // || 短路 true：i1 字面量 true
-        tv = gen_bool_lit(1)
+        tv = tig_bool_lit(1)
     }
     // 值实际产生块：rhs 若为嵌套短路，g_cur_block 已是其内部 merge 块
     // （phi 的 incoming 前驱必须用该块，否则违反 LLVM 支配规则）
@@ -1164,9 +1164,9 @@ func gen_logic_short(op: i64, lhs: i64, rhs: i64) -> i64 {
     g_cur_block = else_blk
     var ev: i64 = 0
     if op == 11 {
-        ev = gen_bool_lit(0)
+        ev = tig_bool_lit(0)
     } else {
-        var bv2 = gen_expr(rhs)
+        var bv2 = tig_expr(rhs)
         if bv2 < 0 {
             return -1
         }

@@ -12,7 +12,7 @@ type tie<class>
 //     本文件内的闭包相关函数 clos_curry / gen_closure / fn_type 等）；
 //   - 同理可访问主文件顶层全局 var（g_* 表、s_* / im_* / node_types 等）；
 //   - 本文件经 import 文本内联，只含函数与注释，不含顶层全局 var 声明；
-//   - 被搬函数内的裸名调用（gen_int_lit / gen_func_addr / make_tuple2 /
+//   - 被搬函数内的裸名调用（tig_int_lit / tig_func_addr / make_tuple2 /
 //     ir.* / types / interner 等）保持不变（同 namespace 跨文件仍解析）。
 
 // 子文件根：driver 二叉依赖树中本文件由 irgen.tie 使可达，无环。
@@ -64,7 +64,7 @@ func closure_cap_slot_ty(t: i64) -> i64 {
 // N 字段 tuple 类型构造（查重登记，仿 sinfer.tuple2_of；环境结构体用）：
 // 字段类型表 → tuple 类型 id（tup_offs/tup_n/tup_names/tup_tys/tuple_tys
 // 为 sstate 顶层全局，与语义层 tuple 登记同布局）
-func gen_tuple_ty(ftys: table<i64>) -> i64 {
+func tig_tuple_ty(ftys: table<i64>) -> i64 {
     var n = len(ftys)
     var i: i64 = 0
     while i < len(tuple_tys) {
@@ -101,7 +101,7 @@ func gen_tuple_ty(ftys: table<i64>) -> i64 {
 
 // 函数地址 → i64 指针整数（opcode 63 const_global：ptrtoint ptr @sym to i64；
 // store/参数等需真 ptr 处由 llvmgen to_ptr 直引 @sym）
-func gen_func_addr(name: string) -> i64 {
+func tig_func_addr(name: string) -> i64 {
     var inst = ir.new_inst(g_cur_block, 63, types.named(TK_STR))
     ir.add_operand(inst, interner.intern(name), 0)
     return ir.get_value(inst)
@@ -111,7 +111,7 @@ func gen_func_addr(name: string) -> i64 {
 // clos_<节点id>（签名 fn(ptr env, A...) -> R，捕获变量绑定 env 字段，闭包体
 // 正常生成）；② 构造闭包值 {env, entry}：捕获集非空 → malloc(8*ncap) +
 // 逐字段 store 外层捕获值；捕获为空 → env = null。返回 %fn.X 聚合值。
-func gen_closure_lit(id: i64) -> i64 {
+func tig_closure_lit(id: i64) -> i64 {
     var slot = sstate.slot_off(id)
     var nparams = s_aux[id]
     // 返回类型：children[slot]（泛型槽占 0，返回类型 = children[slot]）
@@ -172,13 +172,13 @@ func gen_closure_lit(id: i64) -> i64 {
             table_push(cts, closure_cap_slot_ty(cl_capvals[capoff + j]))
             j = j + 1
         }
-        cap_ty = gen_tuple_ty(cts)
+        cap_ty = tig_tuple_ty(cts)
     }
     // 保存当前函数/块（入口函数生成会切换）
     var saved_func = g_cur_func
     var saved_block = g_cur_block
     // 生成入口函数
-    var cfid = gen_closure_entry_fn(ci, id, ret_ty, ptys, cap_ty, ncap)
+    var cfid = tig_closure_entry_fn(ci, id, ret_ty, ptys, cap_ty, ncap)
     if cfid < 0 {
         return -1
     }
@@ -189,13 +189,13 @@ func gen_closure_lit(id: i64) -> i64 {
     var env_v: i64 = -1
     if ncap > 0 {
         // malloc(8 * ncap)：所有环境字段 8 字节（ptr/i64/聚合地址）
-        var sz = gen_int_lit_ty(8 * ncap, types.named(TK_I64))
-        env_v = gen_ext_call1("malloc", sz, types.named(TK_I64), types.named(TK_STR))
+        var sz = tig_int_lit_ty(8 * ncap, types.named(TK_I64))
+        env_v = tig_ext_call1("malloc", sz, types.named(TK_I64), types.named(TK_STR))
         // 逐字段 store 捕获值（load 外层槽 → store env 字段 j）
         var j: i64 = 0
         while j < ncap {
             var cnid = cl_capkeys[capoff + j]
-            var cv = gen_var_ref(cnid)
+            var cv = tig_var_ref(cnid)
             if cv < 0 {
                 return -1
             }
@@ -209,19 +209,19 @@ func gen_closure_lit(id: i64) -> i64 {
             j = j + 1
         }
     } else {
-        env_v = gen_int_lit(0)  // null（store 时 to_ptr → inttoptr 0 to ptr）
+        env_v = tig_int_lit(0)  // null（store 时 to_ptr → inttoptr 0 to ptr）
     }
-    var entry_v = gen_func_addr("clos_" + to_string(id))
+    var entry_v = tig_func_addr("clos_" + to_string(id))
     return make_tuple2(env_v, types.named(TK_STR), entry_v, types.named(TK_STR), fnty)
 }
 
 // 闭包入口函数生成：clos_<节点id>，签名 fn(ptr env, A...) -> R。
 // 布局：env 参数（param 0）→ 捕获变量绑定 env 字段地址（闭包体引用捕获
-// 变量 = load 字段）；闭包参数 → alloca + store（与 gen_fn_def 一致）；
-// 闭包体 → gen_block_stmts；尾部补 ret。返回函数 id。
-func gen_closure_entry_fn(ci: i64, id: i64, ret_ty: i64, ptys: table<i64>, cap_ty: i64, ncap: i64) -> i64 {
+// 变量 = load 字段）；闭包参数 → alloca + store（与 tig_fn_def 一致）；
+// 闭包体 → tig_block_stmts；尾部补 ret。返回函数 id。
+func tig_closure_entry_fn(ci: i64, id: i64, ret_ty: i64, ptys: table<i64>, cap_ty: i64, ncap: i64) -> i64 {
     // 保存外层作用域（入口函数用独立作用域：捕获变量 + 参数登记；生成完
-    // 恢复——否则闭包构造点的 gen_var_ref 会查到入口函数的 env 字段地址，
+    // 恢复——否则闭包构造点的 tig_var_ref 会查到入口函数的 env 字段地址，
     // 跨函数引用产生 undefined value）。tie 表变量赋值 = 引用，须开新表。
     var s_keys = g_sc_keys
     var s_allocas = g_sc_allocas
@@ -286,18 +286,18 @@ func gen_closure_entry_fn(ci: i64, id: i64, ret_ty: i64, ptys: table<i64>, cap_t
     g_cur_ret_ty = ret_ty
     g_cur_fn_name = "clos_" + to_string(id)
     var body = sstate.child(id, sstate.slot_off(id) + 1 + len(ptys))
-    var r = gen_block_stmts(body)
+    var r = tig_block_stmts(body)
     g_cur_ret_ty = saved_ret
     g_cur_fn_name = saved_fn_name
     if r < 0 {
         return -1
     }
-    // 尾部补 ret（同 gen_fn_def；无 main 特例——闭包入口返回类型即闭包返回类型）
+    // 尾部补 ret（同 tig_fn_def；无 main 特例——闭包入口返回类型即闭包返回类型）
     if !block_terminated() {
         if ret_ty == types.named(TK_VOID) {
             var ret = ir.new_inst(g_cur_block, 32, -1)  // ret void
         } else {
-            var dv = gen_default_val(ret_ty)
+            var dv = tig_default_val(ret_ty)
             var ret = ir.new_inst(g_cur_block, 32, ret_ty)
             ir.add_operand(ret, dv, 0)
         }
@@ -318,7 +318,7 @@ func gen_closure_entry_fn(ci: i64, id: i64, ret_ty: i64, ptys: table<i64>, cap_t
 // IR 布局：fn 值落内存（局部变量 → 槽地址；全局/表达式 → load 后落临时
 // alloca）→ agg_gep(0) + load = env → agg_gep(1) + load = entry →
 // call_indirect(70)：entry(ptr env, args...)。返回类型 = fn 返回类型。
-func gen_call_indirect(id: i64, nm: string) -> i64 {
+func tig_call_indirect(id: i64, nm: string) -> i64 {
     var fv_ty = g_lookup_ty  // scope_get_global 已填充
     if fv_ty < 0 || !types.is_fn(fv_ty) {
         sm_err_msg = "函数值调用：变量 '" + nm + "' 类型缺失（函数 " + g_cur_fn_name + "）"
@@ -333,7 +333,7 @@ func gen_call_indirect(id: i64, nm: string) -> i64 {
     var k: i64 = aoff
     while k < nc {
         var arg_node = sstate.child(id, k)
-        var av = gen_expr(arg_node)
+        var av = tig_expr(arg_node)
         if av < 0 {
             return -1
         }
@@ -341,7 +341,7 @@ func gen_call_indirect(id: i64, nm: string) -> i64 {
         k = k + 1
     }
     // fn 值地址：局部变量 → 槽地址直接 GEP；全局 → load 后落临时 alloca。
-    // 注意：实参求值（gen_expr）可能再次调用 scope_get_global（实参也是
+    // 注意：实参求值（tig_expr）可能再次调用 scope_get_global（实参也是
     // 变量），覆盖 g_lookup_*/g_lookup_alloca 全局副作用——须**重新查找**
     // 调用名，否则 fn 值地址会错取到实参的槽（probe2/probe5 崩溃根因）。
     var fv2 = scope_get_global(interner.intern(nm))
@@ -353,7 +353,7 @@ func gen_call_indirect(id: i64, nm: string) -> i64 {
     if g_lookup_is_global == 0 {
         fn_addr = g_lookup_alloca  // 局部聚合槽（kind 0）
     } else {
-        var fv = gen_var_ref(interner.intern(nm))
+        var fv = tig_var_ref(interner.intern(nm))
         if fv < 0 {
             return -1
         }
@@ -398,7 +398,7 @@ func gen_call_indirect(id: i64, nm: string) -> i64 {
         k = k + 1
     }
     if ret_ty == types.named(TK_VOID) {
-        return gen_int_lit(0)  // void 结果：哑值（调用方丢弃）
+        return tig_int_lit(0)  // void 结果：哑值（调用方丢弃）
     }
     return ir.get_value(inst)
 }
@@ -406,7 +406,7 @@ func gen_call_indirect(id: i64, nm: string) -> i64 {
 // 命名函数提升：`var f: fn(A) -> R = my_func` → 生成适配器函数
 // adapt_<节点id>（签名 fn(ptr env, A...) -> R，体内 call @my_func + ret，
 // 忽略 env——命名函数无捕获），返回闭包值 {null, @adapt}。
-func gen_named_fn_value(id: i64, full: string, fnty: i64) -> i64 {
+func tig_named_fn_value(id: i64, full: string, fnty: i64) -> i64 {
     var sig = sstate.fn_sig(full)
     if sig < 0 {
         sm_err_line = s_lines[id]
@@ -459,8 +459,8 @@ func gen_named_fn_value(id: i64, full: string, fnty: i64) -> i64 {
     g_cur_func = saved_func
     g_cur_block = saved_block
     // 闭包值 {null, @adapt_<id>}（无捕获 → env = null）
-    var env_v = gen_int_lit(0)  // null（store 时 to_ptr → inttoptr 0 to ptr）
-    var entry_v = gen_func_addr(adap)
+    var env_v = tig_int_lit(0)  // null（store 时 to_ptr → inttoptr 0 to ptr）
+    var entry_v = tig_func_addr(adap)
     return make_tuple2(env_v, types.named(TK_STR), entry_v, types.named(TK_STR), fnty)
 }
 

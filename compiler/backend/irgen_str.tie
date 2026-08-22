@@ -3,7 +3,7 @@ type tie<class>
 // ============================================================
 // 从 irgen.tie 拆分而来：把 S2.1 字符串原语（s21_*）、SSO 短串池（s21_sso_* / s21_sb_* /
 // s21_str_*）、动态表容器批次6（s21_table_* / t21_*）、字典容器批次7（s21_map_*）以及
-// 数字转字符串（gen_i128_to_str / gen_i64_to_str / s21_codepoint_to_str）这批"内联原语"
+// 数字转字符串（tig_i128_to_str / tig_i64_to_str / s21_codepoint_to_str）这批"内联原语"
 // 独立成子文件。它们全部面向 {ptr,len} 字符串、表、字典容器，生成普通 tie-IR 指令
 //（零新 opcode），供 irgen 主文件的核心区函数与 sstmt/ssexpr 生成函数裸名调用。
 //
@@ -12,14 +12,14 @@ type tie<class>
 // 其中所有代码全局可见。本文件声明与 irgen.tie 相同的 `namespace irgen`，
 // tie 允许同名 namespace 横跨多文件（进编译单元后为同一 namespace）闭合并集。
 //   - 同 namespace 的函数可互相裸名调用（irgen.tie 主文件仍可按原样裸名调用
-//     本文件内的 s21_gep / s21_load / s21_table_push / s21_map_get / gen_i64_to_str
+//     本文件内的 s21_gep / s21_load / s21_table_push / s21_map_get / tig_i64_to_str
 //     等，无需改名）；
 //   - 同理可访问主文件顶层全局 var（g_cur_block / g_sc_top / g_* 表等，均为编译
 //     单元内顶层全局，命名空间体内不允许 var）；
 //   - 本文件经 import 文本内联，只含函数与注释，不含顶层全局 var 声明——
 //     全局 var 仍留在 irgen.tie 主文件，避免重复定义。
-//   - 本文件内对 gen_int_lit / gen_cmp_const / gen_cmp_zero / gen_and_i1 / gen_or_i1 /
-//     gen_str_lit 等核心区函数的裸名调用保持不变（同 namespace 跨文件仍解析）。
+//   - 本文件内对 tig_int_lit / tig_cmp_const / tig_cmp_zero / tig_and_i1 / tig_or_i1 /
+//     tig_str_lit 等核心区函数的裸名调用保持不变（同 namespace 跨文件仍解析）。
 // 依赖约定：ir.* / types / interner 等经主文件既有 import 链内联可达（本文件不重复 import）。
 
 namespace irgen {
@@ -95,12 +95,12 @@ func s21_memcpy(dst: i64, src: i64, n: i64) {
     table_push(avs, src)
     table_push(ats, types.named(TK_I64))
     table_push(avs, n)
-    gen_ext_call_typed("memcpy", ats, avs, -1)
+    tig_ext_call_typed("memcpy", ats, avs, -1)
 }
 
 // if n > 0: memcpy(dst, src, n)——保护 src 为 null（空缓冲）的零长拷贝
 func s21_memcpy_if(dst: i64, src: i64, n: i64) {
-    var c = gen_icmp_c(n, gen_int_lit(0), 3)  // sgt
+    var c = tig_icmp_c(n, tig_int_lit(0), 3)  // sgt
     var t = ir.new_block(g_cur_func, interner.intern("s21.mt"))
     var e = ir.new_block(g_cur_func, interner.intern("s21.me"))
     var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
@@ -124,7 +124,7 @@ func s21_memcpy_if(dst: i64, src: i64, n: i64) {
 func s21_raw_alloc_str(n: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var P8 = types.ptr_of(types.named(TK_I8))
-    var m = gen_ext_call1("malloc", n, T64, P8)
+    var m = tig_ext_call1("malloc", n, T64, P8)
     if m < 0 {
         return -1
     }
@@ -145,22 +145,22 @@ func s21_raw_alloc_str(n: i64) -> i64 {
 func s21_sso_alloc(n: i64) -> i64 {
     llvmgen.sso_enable()  // 置位：llvmgen 据此输出池全局
     var T64 = types.named(TK_I64)
-    var CAP = gen_int_lit(262144)  // 256KB 静态池
+    var CAP = tig_int_lit(262144)  // 256KB 静态池
     // 结果槽（alloca 提升到 entry 由 llvmgen 统一处理）
     var slot = ir.new_inst(g_cur_block, 20, T64)
     ir.add_operand(slot, T64, 2)
     var sv = ir.get_value(slot)
     // need = n + 41（块总大小）；off = load @s21_sso_off
-    var need = s21_bin(0, n, gen_int_lit(41))  // add
+    var need = s21_bin(0, n, tig_int_lit(41))  // add
     var off_id = interner.intern("@s21_sso_off")
     var ldo = ir.new_inst(g_cur_block, 21, T64)  // load
     ir.add_operand(ldo, off_id, 3)  // OK_GLOBAL → @s21_sso_off
     var off = ir.get_value(ldo)
     // remain = CAP - off；short_c = n ≤ 31；space_c = need ≤ remain
     var remain = s21_bin(1, CAP, off)  // sub
-    var short_c = gen_icmp_c(n, gen_int_lit(31), 4)  // sle
-    var space_c = gen_icmp_c(need, remain, 4)  // sle
-    var cond = gen_and_i1(short_c, space_c)
+    var short_c = tig_icmp_c(n, tig_int_lit(31), 4)  // sle
+    var space_c = tig_icmp_c(need, remain, 4)  // sle
+    var cond = tig_and_i1(short_c, space_c)
     // 分支：then（池路径）/ else（malloc 回退）/ merge
     var bt = ir.new_block(g_cur_func, interner.intern("sso.t"))
     var be = ir.new_block(g_cur_func, interner.intern("sso.e"))
@@ -190,7 +190,7 @@ func s21_sso_alloc(n: i64) -> i64 {
     var ldc = ir.new_inst(g_cur_block, 21, T64)  // load
     ir.add_operand(ldc, cnt_id, 3)  // OK_GLOBAL → @s21_sso_malloc_cnt
     var cnt = ir.get_value(ldc)
-    var ncnt = s21_bin(0, cnt, gen_int_lit(1))  // add
+    var ncnt = s21_bin(0, cnt, tig_int_lit(1))  // add
     var st2 = ir.new_inst(g_cur_block, 22, -1)  // store
     ir.add_operand(st2, T64, 2)
     ir.add_operand(st2, ncnt, 0)
@@ -228,10 +228,10 @@ func s21_str_byte(s: i64, i: i64) -> i64 {
 //   l = 4 - (b<0x80) - (b<0xE0) - (b<0xF0)   （ult 无符号比较，字节值 0-255）
 func s21_utf8_seq_len(s: i64, i: i64) -> i64 {
     var b = s21_str_byte(s, i)
-    var t1 = s21_zext(gen_icmp_c(b, gen_int_lit(128), 6), types.named(TK_BOOL))
-    var t2 = s21_zext(gen_icmp_c(b, gen_int_lit(224), 6), types.named(TK_BOOL))
-    var t3 = s21_zext(gen_icmp_c(b, gen_int_lit(240), 6), types.named(TK_BOOL))
-    var r = s21_bin(1, gen_int_lit(4), t1)  // sub
+    var t1 = s21_zext(tig_icmp_c(b, tig_int_lit(128), 6), types.named(TK_BOOL))
+    var t2 = s21_zext(tig_icmp_c(b, tig_int_lit(224), 6), types.named(TK_BOOL))
+    var t3 = s21_zext(tig_icmp_c(b, tig_int_lit(240), 6), types.named(TK_BOOL))
+    var r = s21_bin(1, tig_int_lit(4), t1)  // sub
     var r2 = s21_bin(1, r, t2)
     return s21_bin(1, r2, t3)
 }
@@ -255,16 +255,16 @@ func s21_utf8_char_at(s: i64, i: i64) -> i64 {
     var blk4 = ir.new_block(g_cur_func, interner.intern("s21.c4"))
     var merge = ir.new_block(g_cur_func, interner.intern("s21.cm"))
     // if l == 2 → blk2，else → blk1c
-    var c2 = gen_cmp_const(l, 0, 2, types.named(TK_I64))  // eq 2
+    var c2 = tig_cmp_const(l, 0, 2, types.named(TK_I64))  // eq 2
     var cb2 = ir.new_inst(g_cur_block, 31, -1)  // cond_br
     ir.add_operand(cb2, c2, 0)
     ir.add_operand(cb2, blk2, 1)
     ir.add_operand(cb2, blk1c, 1)
     // blk2：cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F)
     g_cur_block = blk2
-    var bi1 = s21_bin(0, i, gen_int_lit(1))
+    var bi1 = s21_bin(0, i, tig_int_lit(1))
     var b1 = s21_str_byte(s, bi1)
-    var cp2 = s21_bin(7, s21_bin(10, s21_bin(6, b0, gen_int_lit(31)), gen_int_lit(6)), s21_bin(6, b1, gen_int_lit(63)))
+    var cp2 = s21_bin(7, s21_bin(10, s21_bin(6, b0, tig_int_lit(31)), tig_int_lit(6)), s21_bin(6, b1, tig_int_lit(63)))
     s21_store(sv, cp2, types.named(TK_I64))
     var br2 = ir.new_inst(g_cur_block, 30, -1)  // br merge
     ir.add_operand(br2, merge, 1)
@@ -272,14 +272,14 @@ func s21_utf8_char_at(s: i64, i: i64) -> i64 {
     // 修复（dev33 批次4）：原实现 l==1 落入 blk4 用 4 字节公式算错码点
     // （如 'h'=0x68 被后续字节算出 0x25B2C）——1 字节序列从未正确解码。
     g_cur_block = blk1c
-    var c1 = gen_cmp_const(l, 0, 1, types.named(TK_I64))  // eq 1
+    var c1 = tig_cmp_const(l, 0, 1, types.named(TK_I64))  // eq 1
     var cb1 = ir.new_inst(g_cur_block, 31, -1)  // cond_br
     ir.add_operand(cb1, c1, 0)
     ir.add_operand(cb1, merge, 1)
     ir.add_operand(cb1, blk3c, 1)
     // blk3c：if l == 3 → blk3，else → blk4
     g_cur_block = blk3c
-    var c3 = gen_cmp_const(l, 0, 3, types.named(TK_I64))  // eq 3
+    var c3 = tig_cmp_const(l, 0, 3, types.named(TK_I64))  // eq 3
     var cb3 = ir.new_inst(g_cur_block, 31, -1)  // cond_br
     ir.add_operand(cb3, c3, 0)
     ir.add_operand(cb3, blk3, 1)
@@ -287,29 +287,29 @@ func s21_utf8_char_at(s: i64, i: i64) -> i64 {
     // blk3：cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
     // 注意：偏移指令在块内重新生成（SSA：不能跨互斥块引用 blk2 的指令值）
     g_cur_block = blk3
-    var bi1b = s21_bin(0, i, gen_int_lit(1))
+    var bi1b = s21_bin(0, i, tig_int_lit(1))
     var b1b = s21_str_byte(s, bi1b)
-    var bi2 = s21_bin(0, i, gen_int_lit(2))
+    var bi2 = s21_bin(0, i, tig_int_lit(2))
     var b2 = s21_str_byte(s, bi2)
-    var t3a = s21_bin(10, s21_bin(6, b0, gen_int_lit(15)), gen_int_lit(12))
-    var t3b = s21_bin(10, s21_bin(6, b1b, gen_int_lit(63)), gen_int_lit(6))
-    var t3c = s21_bin(6, b2, gen_int_lit(63))
+    var t3a = s21_bin(10, s21_bin(6, b0, tig_int_lit(15)), tig_int_lit(12))
+    var t3b = s21_bin(10, s21_bin(6, b1b, tig_int_lit(63)), tig_int_lit(6))
+    var t3c = s21_bin(6, b2, tig_int_lit(63))
     var cp3 = s21_bin(7, s21_bin(7, t3a, t3b), t3c)
     s21_store(sv, cp3, types.named(TK_I64))
     var br3 = ir.new_inst(g_cur_block, 30, -1)  // br merge
     ir.add_operand(br3, merge, 1)
     // blk4：cp = ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)
     g_cur_block = blk4
-    var bi1c = s21_bin(0, i, gen_int_lit(1))
+    var bi1c = s21_bin(0, i, tig_int_lit(1))
     var b1c = s21_str_byte(s, bi1c)
-    var bi2c = s21_bin(0, i, gen_int_lit(2))
+    var bi2c = s21_bin(0, i, tig_int_lit(2))
     var b2c = s21_str_byte(s, bi2c)
-    var bi3 = s21_bin(0, i, gen_int_lit(3))
+    var bi3 = s21_bin(0, i, tig_int_lit(3))
     var b3 = s21_str_byte(s, bi3)
-    var t4a = s21_bin(10, s21_bin(6, b0, gen_int_lit(7)), gen_int_lit(18))
-    var t4b = s21_bin(10, s21_bin(6, b1c, gen_int_lit(63)), gen_int_lit(12))
-    var t4c = s21_bin(10, s21_bin(6, b2c, gen_int_lit(63)), gen_int_lit(6))
-    var t4d = s21_bin(6, b3, gen_int_lit(63))
+    var t4a = s21_bin(10, s21_bin(6, b0, tig_int_lit(7)), tig_int_lit(18))
+    var t4b = s21_bin(10, s21_bin(6, b1c, tig_int_lit(63)), tig_int_lit(12))
+    var t4c = s21_bin(10, s21_bin(6, b2c, tig_int_lit(63)), tig_int_lit(6))
+    var t4d = s21_bin(6, b3, tig_int_lit(63))
     var cp4 = s21_bin(7, s21_bin(7, s21_bin(7, t4a, t4b), t4c), t4d)
     s21_store(sv, cp4, types.named(TK_I64))
     var br4 = ir.new_inst(g_cur_block, 30, -1)  // br merge
@@ -325,10 +325,10 @@ func s21_sb_new() -> i64 {
     // 句柄 = 原始字节缓冲 {cap, len, data}，用 s21_raw_alloc_str（K_PTR 返回，
     // 绕开 op36 对 TK_STR 返回的 strlen+memcpy 扫描——曾用 TK_STR malloc 触发
     // 对未初始化句柄做垃圾 strlen 扫描，属漏洞 A 类隐患）
-    var h = s21_raw_alloc_str(gen_int_lit(24))
-    s21_store(s21_gep(h, 0, true), gen_int_lit(0), types.named(TK_I64))    // cap = 0
-    s21_store(s21_gep(h, 8, true), gen_int_lit(0), types.named(TK_I64))    // len = 0
-    s21_store(s21_gep(h, 16, true), gen_int_lit(0), types.named(TK_STR))   // data = null
+    var h = s21_raw_alloc_str(tig_int_lit(24))
+    s21_store(s21_gep(h, 0, true), tig_int_lit(0), types.named(TK_I64))    // cap = 0
+    s21_store(s21_gep(h, 8, true), tig_int_lit(0), types.named(TK_I64))    // len = 0
+    s21_store(s21_gep(h, 16, true), tig_int_lit(0), types.named(TK_STR))   // data = null
     var pi = ir.new_inst(g_cur_block, 24, types.named(TK_I64))  // ptrtoint
     ir.add_operand(pi, h, 0)
     return ir.get_value(pi)
@@ -345,7 +345,7 @@ func s21_sb_ptr(hv: i64) -> i64 {
 // 拷贝旧数据（len>0 时）、释放旧缓冲、更新句柄 cap/data 字段。
 // 生成 if 链后 g_cur_block 推进到汇合块（调用方继续生成追加逻辑）。
 func s21_sb_grow(h: i64, cap: i64, len: i64, data: i64, need: i64) {
-    var gc = gen_icmp_c(need, cap, 3)  // sgt
+    var gc = tig_icmp_c(need, cap, 3)  // sgt
     var gt = ir.new_block(g_cur_func, interner.intern("s21.gt"))
     var ge = ir.new_block(g_cur_func, interner.intern("s21.ge"))
     var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
@@ -354,14 +354,14 @@ func s21_sb_grow(h: i64, cap: i64, len: i64, data: i64, need: i64) {
     ir.add_operand(cb, ge, 1)
     // then：倍增容量（newcap = max(cap*2, need)）
     g_cur_block = gt
-    var nc2 = s21_bin(2, cap, gen_int_lit(2))  // mul
-    var c_lt = gen_icmp_c(nc2, need, 2)  // slt
-    var newcap = gen_select_i(c_lt, need, nc2, types.named(TK_I64))
+    var nc2 = s21_bin(2, cap, tig_int_lit(2))  // mul
+    var c_lt = tig_icmp_c(nc2, need, 2)  // slt
+    var newcap = tig_select_i(c_lt, need, nc2, types.named(TK_I64))
     // 数据缓冲 = 原始字节区（非 {头,数据,\0} 布局），用 s21_raw_alloc_str 绕开
     // TK_STR 扫描（漏洞 A 类隐患同 s21_sb_new）
     var nd = s21_raw_alloc_str(newcap)
     s21_memcpy_if(nd, data, len)
-    gen_ext_call1("free", data, types.named(TK_STR), -1)
+    tig_ext_call1("free", data, types.named(TK_STR), -1)
     s21_store(s21_gep(h, 16, true), nd, types.named(TK_STR))
     s21_store(s21_gep(h, 0, true), newcap, types.named(TK_I64))
     var brg = ir.new_inst(g_cur_block, 30, -1)  // br ge
@@ -391,7 +391,7 @@ func s21_sb_append_byte(hv: i64, b: i64) {
     var cap = s21_load(s21_gep(h, 0, true), types.named(TK_I64))
     var len = s21_load(s21_gep(h, 8, true), types.named(TK_I64))
     var data = s21_load(s21_gep(h, 16, true), types.named(TK_STR))
-    var need = s21_bin(0, len, gen_int_lit(1))
+    var need = s21_bin(0, len, tig_int_lit(1))
     s21_sb_grow(h, cap, len, data, need)
     var data2 = s21_load(s21_gep(h, 16, true), types.named(TK_STR))
     var dst = s21_gep(data2, len, false)
@@ -410,7 +410,7 @@ func s21_sb_build(hv: i64) -> i64 {
     s21_store(s21_gep(buf, 0, true), len, types.named(TK_I64))  // 长度头
     var d0 = s21_gep(buf, 8, true)  // 数据起始
     s21_memcpy_if(d0, data, len)
-    s21_store(s21_gep(d0, len, false), gen_int_lit_ty(0, types.named(TK_I8)), types.named(TK_I8))  // 尾 \0
+    s21_store(s21_gep(d0, len, false), tig_int_lit_ty(0, types.named(TK_I8)), types.named(TK_I8))  // 尾 \0
     return d0
 }
 
@@ -418,8 +418,8 @@ func s21_sb_build(hv: i64) -> i64 {
 // 追加会累积旧内容，split_lines 类逐行扫描必须 reset。返回 0。
 func s21_sb_reset(hv: i64) -> i64 {
     var h = s21_sb_ptr(hv)
-    s21_store(s21_gep(h, 8, true), gen_int_lit(0), types.named(TK_I64))  // len = 0
-    return gen_int_lit(0)
+    s21_store(s21_gep(h, 8, true), tig_int_lit(0), types.named(TK_I64))  // len = 0
+    return tig_int_lit(0)
 }
 
 // str_sub_bytes(s, lo, hi)：字节区间子串 [lo, hi)（clamp 越界到 [0, byte_len]；
@@ -429,27 +429,27 @@ func s21_sb_reset(hv: i64) -> i64 {
 func s21_str_sub_bytes(s: i64, lo: i64, hi: i64) -> i64 {
     var blen = s21_str_head_len(s)
     // clamp：lo2 = max(lo, 0)；lo3 = min(lo2, blen)；hi 同款。
-    // 修复（段拷 bug 根因）：0 比较须走 gen_cmp_zero（IMM 字面 0），不能用
-    // gen_icmp_c 传值 id 0（悬挂引用 + 与形参 %0 撞号 → renumber 误判 → 类型错）。
-    var lo_neg = gen_cmp_zero(lo, 4)             // slt 0
-    var lo2 = gen_select_i(lo_neg, gen_int_lit(0), lo, types.named(TK_I64))
-    var lo_big = gen_icmp_c(lo2, blen, 3)      // sgt blen
-    var lo3 = gen_select_i(lo_big, blen, lo2, types.named(TK_I64))
-    var hi_neg = gen_cmp_zero(hi, 4)
-    var hi2 = gen_select_i(hi_neg, gen_int_lit(0), hi, types.named(TK_I64))
-    var hi_big = gen_icmp_c(hi2, blen, 3)
-    var hi3 = gen_select_i(hi_big, blen, hi2, types.named(TK_I64))
+    // 修复（段拷 bug 根因）：0 比较须走 tig_cmp_zero（IMM 字面 0），不能用
+    // tig_icmp_c 传值 id 0（悬挂引用 + 与形参 %0 撞号 → renumber 误判 → 类型错）。
+    var lo_neg = tig_cmp_zero(lo, 4)             // slt 0
+    var lo2 = tig_select_i(lo_neg, tig_int_lit(0), lo, types.named(TK_I64))
+    var lo_big = tig_icmp_c(lo2, blen, 3)      // sgt blen
+    var lo3 = tig_select_i(lo_big, blen, lo2, types.named(TK_I64))
+    var hi_neg = tig_cmp_zero(hi, 4)
+    var hi2 = tig_select_i(hi_neg, tig_int_lit(0), hi, types.named(TK_I64))
+    var hi_big = tig_icmp_c(hi2, blen, 3)
+    var hi3 = tig_select_i(hi_big, blen, hi2, types.named(TK_I64))
     // 长度 = hi3 - lo3；负值钳 0
     var d = s21_bin(1, hi3, lo3)               // sub
-    var d_neg = gen_cmp_zero(d, 4)
-    var dl = gen_select_i(d_neg, gen_int_lit(0), d, types.named(TK_I64))
+    var d_neg = tig_cmp_zero(d, 4)
+    var dl = tig_select_i(d_neg, tig_int_lit(0), d, types.named(TK_I64))
     // 分配 {头, 数据, \0, 32 尾垫}（与 sb_build 同布局）
     var buf = s21_sso_alloc(dl)
     s21_store(s21_gep(buf, 0, true), dl, types.named(TK_I64))  // 长度头
     var d0 = s21_gep(buf, 8, true)             // 数据起始
     var src = s21_gep(s, lo3, false)           // 源数据起点（字节偏移）
     s21_memcpy_if(d0, src, dl)
-    s21_store(s21_gep(d0, dl, false), gen_int_lit_ty(0, types.named(TK_I8)), types.named(TK_I8))  // 尾 \0
+    s21_store(s21_gep(d0, dl, false), tig_int_lit_ty(0, types.named(TK_I8)), types.named(TK_I8))  // 尾 \0
     return d0
 }
 
@@ -467,15 +467,15 @@ func s21_str_sub_bytes(s: i64, lo: i64, hi: i64) -> i64 {
 // bool → false；其余整数 → 0
 func t21_zero(ty: i64) -> i64 {
     if ty == types.named(TK_STR) || types.is_table(ty) || types.is_map(ty) || types.kind(ty) == K_PORT {
-        return gen_int_lit(0)  // 存为 null ptr
+        return tig_int_lit(0)  // 存为 null ptr
     }
     if ty == types.named(TK_F64) || ty == types.named(TK_F32) {
-        return gen_float_lit(interner.intern("0.0"))
+        return tig_float_lit(interner.intern("0.0"))
     }
     if ty == types.named(TK_BOOL) {
-        return gen_bool_lit(0)
+        return tig_bool_lit(0)
     }
-    return gen_int_lit_ty(0, ty)
+    return tig_int_lit_ty(0, ty)
 }
 
 // 表句柄数据指针（[16] 字段）
@@ -491,10 +491,10 @@ func t21_esz(t: i64) -> i64 {
 // 新建空表：分配 32 字节句柄（s21_raw_alloc_str），cap=0 / len=0 / data=null /
 // esz=esz_v，返回句柄指针（TK_STR ptr 值，供后续 at/set/push 以 ptr 引用）
 func s21_table_new(esz_v: i64) -> i64 {
-    var h = s21_raw_alloc_str(gen_int_lit(32))
-    s21_store(s21_gep(h, 0, true), gen_int_lit(0), types.named(TK_I64))    // cap = 0
-    s21_store(s21_gep(h, 8, true), gen_int_lit(0), types.named(TK_I64))    // len = 0
-    s21_store(s21_gep(h, 16, true), gen_int_lit(0), types.named(TK_STR))   // data = null
+    var h = s21_raw_alloc_str(tig_int_lit(32))
+    s21_store(s21_gep(h, 0, true), tig_int_lit(0), types.named(TK_I64))    // cap = 0
+    s21_store(s21_gep(h, 8, true), tig_int_lit(0), types.named(TK_I64))    // len = 0
+    s21_store(s21_gep(h, 16, true), tig_int_lit(0), types.named(TK_STR))   // data = null
     s21_store(s21_gep(h, 24, true), esz_v, types.named(TK_I64))            // esz
     return h
 }
@@ -508,7 +508,7 @@ func s21_table_len(t: i64) -> i64 {
 // 新缓冲大小 = newcap*esz；拷贝旧 len*esz 字节；free 旧 data；更新句柄 data/cap。
 // 生成 if 块后 g_cur_block 推进到汇合块（调用方在汇合后重读 data 继续追加逻辑）。
 func s21_table_grow(h: i64, cap: i64, len: i64, data: i64, esz: i64, need: i64) {
-    var gc = gen_icmp_c(need, cap, 3)  // sgt：need > cap
+    var gc = tig_icmp_c(need, cap, 3)  // sgt：need > cap
     var gt = ir.new_block(g_cur_func, interner.intern("t21.gt"))
     var ge = ir.new_block(g_cur_func, interner.intern("t21.ge"))
     var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
@@ -517,17 +517,17 @@ func s21_table_grow(h: i64, cap: i64, len: i64, data: i64, esz: i64, need: i64) 
     ir.add_operand(cb, ge, 1)
     // then：容量增长（1.5x）
     g_cur_block = gt
-    var half = s21_bin(3, cap, gen_int_lit(2))      // cap/2（sdiv）
+    var half = s21_bin(3, cap, tig_int_lit(2))      // cap/2（sdiv）
     var base = s21_bin(0, cap, half)                // cap + cap/2
-    var is_z = gen_icmp_c(cap, gen_int_lit(0), 0)   // cap == 0
-    var gb = gen_select_i(is_z, gen_int_lit(8), base, types.named(TK_I64))  // cap==0 → 8，否则 base
-    var c_lt = gen_icmp_c(gb, need, 2)              // gb < need
-    var newcap = gen_select_i(c_lt, need, gb, types.named(TK_I64))  // max(gb, need)
+    var is_z = tig_icmp_c(cap, tig_int_lit(0), 0)   // cap == 0
+    var gb = tig_select_i(is_z, tig_int_lit(8), base, types.named(TK_I64))  // cap==0 → 8，否则 base
+    var c_lt = tig_icmp_c(gb, need, 2)              // gb < need
+    var newcap = tig_select_i(c_lt, need, gb, types.named(TK_I64))  // max(gb, need)
     // 数据缓冲 = 原始字节区（非 {头,数据,\0} 布局），s21_raw_alloc_str 绕开 TK_STR 扫描；
     // 缓冲大小 = newcap*esz
     var nd = s21_raw_alloc_str(s21_bin(2, newcap, esz))  // mul：newcap*esz
     s21_memcpy_if(nd, data, s21_bin(2, len, esz))        // 拷贝旧 len*esz 字节
-    gen_ext_call1("free", data, types.named(TK_STR), -1) // 释放旧缓冲（null free 合法）
+    tig_ext_call1("free", data, types.named(TK_STR), -1) // 释放旧缓冲（null free 合法）
     s21_store(s21_gep(h, 16, true), nd, types.named(TK_STR))
     s21_store(s21_gep(h, 0, true), newcap, types.named(TK_I64))
     var brg = ir.new_inst(g_cur_block, 30, -1)  // br ge
@@ -541,7 +541,7 @@ func s21_table_push(t: i64, elem_llvm_ty: i64, v: i64) {
     var cap = s21_load(s21_gep(t, 0, true), types.named(TK_I64))
     var len = s21_load(s21_gep(t, 8, true), types.named(TK_I64))
     var data = s21_load(s21_gep(t, 16, true), types.named(TK_STR))
-    var need = s21_bin(0, len, gen_int_lit(1))
+    var need = s21_bin(0, len, tig_int_lit(1))
     s21_table_grow(t, cap, len, data, t21_esz(t), need)
     var data2 = t21_data(t)  // 汇合后重读 data（增长分支可能已更新）
     var off = s21_bin(2, len, t21_esz(t))  // len*esz（字节偏移）
@@ -555,7 +555,7 @@ func s21_table_push(t: i64, elem_llvm_ty: i64, v: i64) {
 func s21_table_at(t: i64, i: i64, ok_ptr: i64, elem_llvm_ty: i64) -> i64 {
     var len = s21_load(s21_gep(t, 8, true), types.named(TK_I64))
     var esz = t21_esz(t)
-    var ok = gen_icmp_c(i, len, 2)  // slt：i < len
+    var ok = tig_icmp_c(i, len, 2)  // slt：i < len
     var okb = s21_zext(ok, types.named(TK_BOOL))  // i1 → i64
     s21_store(ok_ptr, s21_trunc_i8(okb), types.named(TK_I8))  // 越界标志 → 出参 i8
     // 结果槽（alloca 提升到 entry 由 llvmgen 统一处理）
@@ -592,7 +592,7 @@ func s21_table_at(t: i64, i: i64, ok_ptr: i64, elem_llvm_ty: i64) -> i64 {
 // g_cur_block 推进到汇合。
 func s21_table_set(t: i64, i: i64, elem_llvm_ty: i64, v: i64) {
     var len = s21_load(s21_gep(t, 8, true), types.named(TK_I64))
-    var ok = gen_icmp_c(i, len, 2)  // slt：i < len
+    var ok = tig_icmp_c(i, len, 2)  // slt：i < len
     var bt = ir.new_block(g_cur_func, interner.intern("t21.st"))
     var be = ir.new_block(g_cur_func, interner.intern("t21.se"))
     var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
@@ -627,18 +627,18 @@ func s21_table_set(t: i64, i: i64, elem_llvm_ty: i64, v: i64) {
 // 是否哈希模式：esz 高位符号位（i64 负值）
 func s21_map_is_hash(m: i64) -> i64 {
     var esz = s21_load(s21_gep(m, 24, true), types.named(TK_I64))
-    return gen_icmp_c(esz, gen_int_lit(0), 2)  // esz < 0（i1）
+    return tig_icmp_c(esz, tig_int_lit(0), 2)  // esz < 0（i1）
 }
 
 // 新建空 map（数组模式）：复用表基座 s21_table_new(16)
 func s21_map_new() -> i64 {
-    return s21_table_new(gen_int_lit_ty(16, types.named(TK_I64)))
+    return s21_table_new(tig_int_lit_ty(16, types.named(TK_I64)))
 }
 
 // 数组模式元素基址：data + i*16（i8 gep）
 func s21_map_elem(m: i64, i: i64) -> i64 {
     var data = t21_data(m)
-    return s21_gep(data, s21_bin(2, i, gen_int_lit(16)), false)
+    return s21_gep(data, s21_bin(2, i, tig_int_lit(16)), false)
 }
 
 // memmove(dst, src, n)：libc（重叠安全；is_libc 不置 g_used_interp）
@@ -651,7 +651,7 @@ func s21_memmove(dst: i64, src: i64, n: i64) {
     table_push(avs, src)
     table_push(ats, types.named(TK_I64))
     table_push(avs, n)
-    gen_ext_call_typed("memmove", ats, avs, -1)
+    tig_ext_call_typed("memmove", ats, avs, -1)
 }
 
 // memmove 元素右移一格：data[cnt-1..pos] → data[cnt..pos+1]（重叠安全）。
@@ -660,7 +660,7 @@ func s21_memmove(dst: i64, src: i64, n: i64) {
 func s21_arr_shift_right(data: i64, pos: i64, cnt: i64) {
     var T64 = types.named(TK_I64)
     var shift = s21_bin(1, cnt, pos)
-    var gc = gen_icmp_c(shift, gen_int_lit(0), 3)  // shift > 0
+    var gc = tig_icmp_c(shift, tig_int_lit(0), 3)  // shift > 0
     var gt = ir.new_block(g_cur_func, interner.intern("mash.t"))
     var ge = ir.new_block(g_cur_func, interner.intern("mash.e"))
     var cb = ir.new_inst(g_cur_block, 31, -1)
@@ -668,9 +668,9 @@ func s21_arr_shift_right(data: i64, pos: i64, cnt: i64) {
     ir.add_operand(cb, gt, 1)
     ir.add_operand(cb, ge, 1)
     g_cur_block = gt
-    var dst = s21_gep(data, s21_bin(2, s21_bin(0, pos, gen_int_lit(1)), gen_int_lit(16)), false)  // (pos+1)*16
-    var src = s21_gep(data, s21_bin(2, pos, gen_int_lit(16)), false)                            // pos*16
-    s21_memmove(dst, src, s21_bin(2, shift, gen_int_lit(16)))  // shift*16
+    var dst = s21_gep(data, s21_bin(2, s21_bin(0, pos, tig_int_lit(1)), tig_int_lit(16)), false)  // (pos+1)*16
+    var src = s21_gep(data, s21_bin(2, pos, tig_int_lit(16)), false)                            // pos*16
+    s21_memmove(dst, src, s21_bin(2, shift, tig_int_lit(16)))  // shift*16
     var br = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(br, ge, 1)
     g_cur_block = ge
@@ -688,9 +688,9 @@ func s21_arr_find(data: i64, cnt: i64, key: i64, pos_slot: i64, found_slot: i64)
     var hi_a = ir.new_inst(g_cur_block, 20, T64)
     ir.add_operand(hi_a, T64, 2)
     var hi_p = ir.get_value(hi_a)
-    s21_store(lo_p, gen_int_lit(0), T64)
-    s21_store(hi_p, s21_bin(1, cnt, gen_int_lit(1)), T64)  // cnt-1
-    s21_store(found_slot, gen_bool_lit(0), TB)
+    s21_store(lo_p, tig_int_lit(0), T64)
+    s21_store(hi_p, s21_bin(1, cnt, tig_int_lit(1)), T64)  // cnt-1
+    s21_store(found_slot, tig_bool_lit(0), TB)
     var cond = ir.new_block(g_cur_func, interner.intern("maf.cond"))
     var body = ir.new_block(g_cur_func, interner.intern("maf.body"))
     var cont = ir.new_block(g_cur_func, interner.intern("maf.cont"))
@@ -704,7 +704,7 @@ func s21_arr_find(data: i64, cnt: i64, key: i64, pos_slot: i64, found_slot: i64)
     g_cur_block = cond
     var lo1 = s21_load(lo_p, T64)
     var hi1 = s21_load(hi_p, T64)
-    var le = gen_icmp_c(lo1, hi1, 4)  // sle
+    var le = tig_icmp_c(lo1, hi1, 4)  // sle
     var cb = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb, le, 0)
     ir.add_operand(cb, body, 1)
@@ -713,18 +713,18 @@ func s21_arr_find(data: i64, cnt: i64, key: i64, pos_slot: i64, found_slot: i64)
     g_cur_block = body
     var lo2 = s21_load(lo_p, T64)
     var hi2 = s21_load(hi_p, T64)
-    var mid = s21_bin(3, s21_bin(0, lo2, hi2), gen_int_lit(2))  // (lo+hi)/2
-    var kaddr = s21_gep(data, s21_bin(2, mid, gen_int_lit(16)), false)
+    var mid = s21_bin(3, s21_bin(0, lo2, hi2), tig_int_lit(2))  // (lo+hi)/2
+    var kaddr = s21_gep(data, s21_bin(2, mid, tig_int_lit(16)), false)
     var mk = s21_load(kaddr, types.named(TK_STR))
-    var cmp = gen_ext_call2("strcmp", key, types.named(TK_STR), mk, types.named(TK_STR), types.named(TK_I32))
-    var eq = gen_cmp_zero(cmp, 0)  // cmp == 0（IMM 0，勿用值 id 0）
+    var cmp = tig_ext_call2("strcmp", key, types.named(TK_STR), mk, types.named(TK_STR), types.named(TK_I32))
+    var eq = tig_cmp_zero(cmp, 0)  // cmp == 0（IMM 0，勿用值 id 0）
     var cb2 = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb2, eq, 0)
     ir.add_operand(cb2, fnd, 1)
     ir.add_operand(cb2, cont, 1)
     // cont（非相等）：cmp<0 → 左；否则右
     g_cur_block = cont
-    var lt = gen_cmp_zero(cmp, 2)  // cmp < 0
+    var lt = tig_cmp_zero(cmp, 2)  // cmp < 0
     var cb3 = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb3, lt, 0)
     ir.add_operand(cb3, lft, 1)
@@ -732,17 +732,17 @@ func s21_arr_find(data: i64, cnt: i64, key: i64, pos_slot: i64, found_slot: i64)
     // found：pos=mid；found=true
     g_cur_block = fnd
     s21_store(pos_slot, mid, T64)
-    s21_store(found_slot, gen_bool_lit(1), TB)
+    s21_store(found_slot, tig_bool_lit(1), TB)
     var bf = ir.new_inst(g_cur_block, 30, -1)  // br exit
     ir.add_operand(bf, exit, 1)
     // left：hi=mid-1
     g_cur_block = lft
-    s21_store(hi_p, s21_bin(1, mid, gen_int_lit(1)), T64)
+    s21_store(hi_p, s21_bin(1, mid, tig_int_lit(1)), T64)
     var bl = ir.new_inst(g_cur_block, 30, -1)  // br cond
     ir.add_operand(bl, cond, 1)
     // right：lo=mid+1
     g_cur_block = rgt
-    s21_store(lo_p, s21_bin(0, mid, gen_int_lit(1)), T64)
+    s21_store(lo_p, s21_bin(0, mid, tig_int_lit(1)), T64)
     var br2 = ir.new_inst(g_cur_block, 30, -1)  // br cond
     ir.add_operand(br2, cond, 1)
     // exit：未命中则 pos=lo（插入点）
@@ -750,7 +750,7 @@ func s21_arr_find(data: i64, cnt: i64, key: i64, pos_slot: i64, found_slot: i64)
     var fv = s21_load(found_slot, TB)
     var lv = s21_load(lo_p, T64)
     var pv = s21_load(pos_slot, T64)
-    var pos_f = gen_select_i(fv, pv, lv, T64)
+    var pos_f = tig_select_i(fv, pv, lv, T64)
     s21_store(pos_slot, pos_f, T64)
 }
 
@@ -778,7 +778,7 @@ func s21_arr_insert(data: i64, cnt_p: i64, key: i64, val: i64, vty: i64) {
     // overwrite：elem[pos].value = val
     g_cur_block = bt
     var pos1 = s21_load(pos_p, T64)
-    var vaddr = s21_gep(s21_gep(data, s21_bin(2, pos1, gen_int_lit(16)), false), 8, true)
+    var vaddr = s21_gep(s21_gep(data, s21_bin(2, pos1, tig_int_lit(16)), false), 8, true)
     s21_store(vaddr, val, vty)
     var b1 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(b1, merge, 1)
@@ -786,10 +786,10 @@ func s21_arr_insert(data: i64, cnt_p: i64, key: i64, val: i64, vty: i64) {
     g_cur_block = be
     var pos2 = s21_load(pos_p, T64)
     s21_arr_shift_right(data, pos2, cnt)
-    var e = s21_gep(data, s21_bin(2, pos2, gen_int_lit(16)), false)
+    var e = s21_gep(data, s21_bin(2, pos2, tig_int_lit(16)), false)
     s21_store(e, key, types.named(TK_STR))
     s21_store(s21_gep(e, 8, true), val, vty)
-    s21_store(cnt_p, s21_bin(0, cnt, gen_int_lit(1)), T64)  // cnt+1
+    s21_store(cnt_p, s21_bin(0, cnt, tig_int_lit(1)), T64)  // cnt+1
     var b2 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(b2, merge, 1)
     g_cur_block = merge
@@ -798,7 +798,7 @@ func s21_arr_insert(data: i64, cnt_p: i64, key: i64, val: i64, vty: i64) {
 // 数组模式精确增长：need > cap → realloc 到 need*16 字节（零尾部浪费），
 // 拷贝旧 len*16 字节、free 旧缓冲、更新句柄 data/cap。g_cur_block 推进到汇合。
 func s21_map_arr_grow_exact(m: i64, cap: i64, len: i64, data: i64, need: i64) {
-    var gc = gen_icmp_c(need, cap, 3)  // need > cap
+    var gc = tig_icmp_c(need, cap, 3)  // need > cap
     var gt = ir.new_block(g_cur_func, interner.intern("mag.t"))
     var ge = ir.new_block(g_cur_func, interner.intern("mag.e"))
     var cb = ir.new_inst(g_cur_block, 31, -1)
@@ -806,9 +806,9 @@ func s21_map_arr_grow_exact(m: i64, cap: i64, len: i64, data: i64, need: i64) {
     ir.add_operand(cb, gt, 1)
     ir.add_operand(cb, ge, 1)
     g_cur_block = gt
-    var nd = s21_raw_alloc_str(s21_bin(2, need, gen_int_lit(16)))  // need*16
-    s21_memcpy_if(nd, data, s21_bin(2, len, gen_int_lit(16)))      // len*16
-    gen_ext_call1("free", data, types.named(TK_STR), -1)
+    var nd = s21_raw_alloc_str(s21_bin(2, need, tig_int_lit(16)))  // need*16
+    s21_memcpy_if(nd, data, s21_bin(2, len, tig_int_lit(16)))      // len*16
+    tig_ext_call1("free", data, types.named(TK_STR), -1)
     s21_store(s21_gep(m, 16, true), nd, types.named(TK_STR))
     s21_store(s21_gep(m, 0, true), need, types.named(TK_I64))
     var brg = ir.new_inst(g_cur_block, 30, -1)
@@ -820,13 +820,13 @@ func s21_map_arr_grow_exact(m: i64, cap: i64, len: i64, data: i64, need: i64) {
 // exit(1)（对齐 interp g_err 文本；不可捕获、打印即终止）。next_blk 供死 br
 // 收尾（LLVM 要求块有 terminator；opt 会 DCE 死 br）。
 func s21_map_missing_raise(key: i64, next_blk: i64) {
-    var p1 = gen_binary_str(0, gen_str_lit(interner.intern("\"运行时错误: map_get 键不存在：'\"")), key)
-    var msg = gen_binary_str(0, p1, gen_str_lit(interner.intern("\"'\"")))
+    var p1 = tig_binary_str(0, tig_str_lit(interner.intern("\"运行时错误: map_get 键不存在：'\"")), key)
+    var msg = tig_binary_str(0, p1, tig_str_lit(interner.intern("\"'\"")))
     var fmt = interner.intern("%s\n")
     var inst = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
     ir.add_operand(inst, fmt, 0)
     ir.add_operand(inst, msg, 0)
-    gen_ext_call1("exit", gen_int_lit_ty(1, types.named(TK_I32)), types.named(TK_I32), -1)
+    tig_ext_call1("exit", tig_int_lit_ty(1, types.named(TK_I32)), types.named(TK_I32), -1)
     var db = ir.new_inst(g_cur_block, 30, -1)  // 死 br（exit noreturn）
     ir.add_operand(db, next_blk, 1)
 }
@@ -861,7 +861,7 @@ func s21_map_arr_get(m: i64, key: i64, vty: i64) -> i64 {
     // found：返回 value
     g_cur_block = bt
     var pos1 = s21_load(pos_p, T64)
-    var vaddr = s21_gep(s21_gep(data, s21_bin(2, pos1, gen_int_lit(16)), false), 8, true)
+    var vaddr = s21_gep(s21_gep(data, s21_bin(2, pos1, tig_int_lit(16)), false), 8, true)
     s21_store(slot_p, s21_load(vaddr, vty), vty)
     var b1 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(b1, merge, 1)
@@ -899,16 +899,16 @@ func s21_map_arr_set(m: i64, key: i64, val: i64, vty: i64) {
     // overwrite
     g_cur_block = ovr
     var pos1 = s21_load(pos_p, T64)
-    var vaddr1 = s21_gep(s21_gep(data, s21_bin(2, pos1, gen_int_lit(16)), false), 8, true)
+    var vaddr1 = s21_gep(s21_gep(data, s21_bin(2, pos1, tig_int_lit(16)), false), 8, true)
     s21_store(vaddr1, val, vty)
     var b1 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(b1, merge, 1)
     // insert
     g_cur_block = ins
     var pos2 = s21_load(pos_p, T64)
-    var need = s21_bin(0, len, gen_int_lit(1))  // len+1
+    var need = s21_bin(0, len, tig_int_lit(1))  // len+1
     // 阈值检查：need > 1024 → 升级哈希模式并在其中插入（用户定案两段式混合）
-    var over = gen_icmp_c(need, gen_int_lit(1024), 3)  // need > 1024
+    var over = tig_icmp_c(need, tig_int_lit(1024), 3)  // need > 1024
     var upg = ir.new_block(g_cur_func, interner.intern("mas.up"))
     var ains = ir.new_block(g_cur_func, interner.intern("mas.ai"))
     var cb2 = ir.new_inst(g_cur_block, 31, -1)
@@ -925,7 +925,7 @@ func s21_map_arr_set(m: i64, key: i64, val: i64, vty: i64) {
     s21_map_arr_grow_exact(m, cap, len, data, need)
     var data2 = t21_data(m)  // 汇合后重读（可能已 realloc）
     s21_arr_shift_right(data2, pos2, len)
-    var e = s21_gep(data2, s21_bin(2, pos2, gen_int_lit(16)), false)
+    var e = s21_gep(data2, s21_bin(2, pos2, tig_int_lit(16)), false)
     s21_store(e, key, types.named(TK_STR))
     s21_store(s21_gep(e, 8, true), val, vty)
     s21_store(s21_gep(m, 8, true), need, T64)  // len = need
@@ -940,15 +940,15 @@ func s21_map_arr_set(m: i64, key: i64, val: i64, vty: i64) {
 func s21_map_upgrade(m: i64, key: i64, val: i64, vty: i64) {
     var T64 = types.named(TK_I64)
     var n = s21_table_len(m)
-    var need = s21_bin(0, n, gen_int_lit(1))
-    var newcap = s21_bin(2, need, gen_int_lit(2))  // need*2（LF 0.5 起步，减少早期 rehash）
-    var htab = s21_raw_alloc_str(s21_bin(2, newcap, gen_int_lit(16)))
+    var need = s21_bin(0, n, tig_int_lit(1))
+    var newcap = s21_bin(2, need, tig_int_lit(2))  // need*2（LF 0.5 起步，减少早期 rehash）
+    var htab = s21_raw_alloc_str(s21_bin(2, newcap, tig_int_lit(16)))
     var olddata = t21_data(m)
     // 1. 清零 key 字段（z 槽循环）
     var z_a = ir.new_inst(g_cur_block, 20, T64)
     ir.add_operand(z_a, T64, 2)
     var z_p = ir.get_value(z_a)
-    s21_store(z_p, gen_int_lit(0), T64)
+    s21_store(z_p, tig_int_lit(0), T64)
     var zc = ir.new_block(g_cur_func, interner.intern("mup.zc"))
     var zb = ir.new_block(g_cur_func, interner.intern("mup.zb"))
     var ze = ir.new_block(g_cur_func, interner.intern("mup.ze"))
@@ -956,16 +956,16 @@ func s21_map_upgrade(m: i64, key: i64, val: i64, vty: i64) {
     ir.add_operand(bz, zc, 1)
     g_cur_block = zc
     var z1 = s21_load(z_p, T64)
-    var zlt = gen_icmp_c(z1, newcap, 2)  // z < newcap
+    var zlt = tig_icmp_c(z1, newcap, 2)  // z < newcap
     var cbz = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cbz, zlt, 0)
     ir.add_operand(cbz, zb, 1)
     ir.add_operand(cbz, ze, 1)
     g_cur_block = zb
     var z2 = s21_load(z_p, T64)
-    var zaddr = s21_gep(htab, s21_bin(2, z2, gen_int_lit(16)), false)
-    s21_store(zaddr, gen_int_lit(0), types.named(TK_STR))  // key = null
-    s21_store(z_p, s21_bin(0, z2, gen_int_lit(1)), T64)
+    var zaddr = s21_gep(htab, s21_bin(2, z2, tig_int_lit(16)), false)
+    s21_store(zaddr, tig_int_lit(0), types.named(TK_STR))  // key = null
+    s21_store(z_p, s21_bin(0, z2, tig_int_lit(1)), T64)
     var bzb = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(bzb, zc, 1)
     // 2. 旧数组逐条 rehash 迁入（r 槽循环）
@@ -973,7 +973,7 @@ func s21_map_upgrade(m: i64, key: i64, val: i64, vty: i64) {
     var r_a = ir.new_inst(g_cur_block, 20, T64)
     ir.add_operand(r_a, T64, 2)
     var r_p = ir.get_value(r_a)
-    s21_store(r_p, gen_int_lit(0), T64)
+    s21_store(r_p, tig_int_lit(0), T64)
     var rc = ir.new_block(g_cur_func, interner.intern("mup.rc"))
     var rb = ir.new_block(g_cur_func, interner.intern("mup.rb"))
     var re = ir.new_block(g_cur_func, interner.intern("mup.re"))
@@ -981,14 +981,14 @@ func s21_map_upgrade(m: i64, key: i64, val: i64, vty: i64) {
     ir.add_operand(brc, rc, 1)
     g_cur_block = rc
     var r1 = s21_load(r_p, T64)
-    var rlt = gen_icmp_c(r1, n, 2)  // r < n
+    var rlt = tig_icmp_c(r1, n, 2)  // r < n
     var cbr = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cbr, rlt, 0)
     ir.add_operand(cbr, rb, 1)
     ir.add_operand(cbr, re, 1)
     g_cur_block = rb
     var r2 = s21_load(r_p, T64)
-    var eaddr = s21_gep(olddata, s21_bin(2, r2, gen_int_lit(16)), false)
+    var eaddr = s21_gep(olddata, s21_bin(2, r2, tig_int_lit(16)), false)
     var rk = s21_load(eaddr, types.named(TK_STR))
     var rv = s21_load(s21_gep(eaddr, 8, true), vty)
     // is_new 出参哑槽（批量迁入不需要长度管理；签名要求第 6 参）
@@ -997,15 +997,15 @@ func s21_map_upgrade(m: i64, key: i64, val: i64, vty: i64) {
     var dup_p = ir.get_value(dup_a)
     s21_hash_place(htab, newcap, rk, rv, vty, dup_p)  // 迁入（LF<0.5 无需判长）
     // 继续在 hash_place 汇合块：r+1 → r_p；br rc
-    s21_store(r_p, s21_bin(0, r2, gen_int_lit(1)), T64)
+    s21_store(r_p, s21_bin(0, r2, tig_int_lit(1)), T64)
     var brb = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(brb, rc, 1)
     // 3. 收尾：free 旧、更新头、哈希插入新键
     g_cur_block = re
-    gen_ext_call1("free", olddata, types.named(TK_STR), -1)
+    tig_ext_call1("free", olddata, types.named(TK_STR), -1)
     s21_store(s21_gep(m, 16, true), htab, types.named(TK_STR))
     s21_store(s21_gep(m, 0, true), newcap, T64)
-    s21_store(s21_gep(m, 24, true), gen_int_lit(-9223372036854775792), T64)  // 16|1<<63 哈希标记
+    s21_store(s21_gep(m, 24, true), tig_int_lit(-9223372036854775792), T64)  // 16|1<<63 哈希标记
     s21_store(s21_gep(m, 8, true), n, T64)  // len 暂为 n（哈希插入会把新键 +1）
     s21_map_hash_set(m, key, val, vty)  // 插入新键（LF 0.5，不触发 rehash）
 }
@@ -1028,8 +1028,8 @@ func s21_map_hash(key: i64) -> i64 {
     var i_a = ir.new_inst(g_cur_block, 20, T64)
     ir.add_operand(i_a, T64, 2)
     var i_p = ir.get_value(i_a)
-    s21_store(h_p, gen_int_lit(-3750763034362895579), T64)  // 0xcbf29ce484222325
-    s21_store(i_p, gen_int_lit(0), T64)
+    s21_store(h_p, tig_int_lit(-3750763034362895579), T64)  // 0xcbf29ce484222325
+    s21_store(i_p, tig_int_lit(0), T64)
     var cond = ir.new_block(g_cur_func, interner.intern("mfh.c"))
     var body = ir.new_block(g_cur_func, interner.intern("mfh.b"))
     var exit = ir.new_block(g_cur_func, interner.intern("mfh.e"))
@@ -1037,7 +1037,7 @@ func s21_map_hash(key: i64) -> i64 {
     ir.add_operand(b0, cond, 1)
     g_cur_block = cond
     var i1 = s21_load(i_p, T64)
-    var ilt = gen_icmp_c(i1, n, 2)  // i < n
+    var ilt = tig_icmp_c(i1, n, 2)  // i < n
     var cb = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb, ilt, 0)
     ir.add_operand(cb, body, 1)
@@ -1047,9 +1047,9 @@ func s21_map_hash(key: i64) -> i64 {
     var b = s21_str_byte(key, i2)  // zext i8 → i64
     var hv = s21_load(h_p, T64)
     var x = s21_bin(8, hv, b)  // xor i64
-    var h2 = s21_bin(2, x, gen_int_lit(1099511628211))  // * 0x100000001b3
+    var h2 = s21_bin(2, x, tig_int_lit(1099511628211))  // * 0x100000001b3
     s21_store(h_p, h2, T64)
-    s21_store(i_p, s21_bin(0, i2, gen_int_lit(1)), T64)
+    s21_store(i_p, s21_bin(0, i2, tig_int_lit(1)), T64)
     var bb = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(bb, cond, 1)
     g_cur_block = exit
@@ -1058,19 +1058,19 @@ func s21_map_hash(key: i64) -> i64 {
 
 // 哈希槽 key（null = 空槽）
 func s21_hslot_key(htab: i64, i: i64) -> i64 {
-    return s21_load(s21_gep(htab, s21_bin(2, i, gen_int_lit(16)), false), types.named(TK_STR))
+    return s21_load(s21_gep(htab, s21_bin(2, i, tig_int_lit(16)), false), types.named(TK_STR))
 }
 // 哈希槽 value
 func s21_hslot_val(htab: i64, i: i64, vty: i64) -> i64 {
-    return s21_load(s21_gep(s21_gep(htab, s21_bin(2, i, gen_int_lit(16)), false), 8, true), vty)
+    return s21_load(s21_gep(s21_gep(htab, s21_bin(2, i, tig_int_lit(16)), false), 8, true), vty)
 }
 // 哈希槽 value 覆盖
 func s21_hslot_set_val(htab: i64, i: i64, vty: i64, v: i64) {
-    s21_store(s21_gep(s21_gep(htab, s21_bin(2, i, gen_int_lit(16)), false), 8, true), v, vty)
+    s21_store(s21_gep(s21_gep(htab, s21_bin(2, i, tig_int_lit(16)), false), 8, true), v, vty)
 }
 // 哈希槽写 key+value（插入）
 func s21_hslot_put(htab: i64, i: i64, key: i64, vty: i64, v: i64) {
-    var e = s21_gep(htab, s21_bin(2, i, gen_int_lit(16)), false)
+    var e = s21_gep(htab, s21_bin(2, i, tig_int_lit(16)), false)
     s21_store(e, key, types.named(TK_STR))
     s21_store(s21_gep(e, 8, true), v, vty)
 }
@@ -1086,7 +1086,7 @@ func s21_hash_place(htab: i64, cap: i64, key: i64, val: i64, vty: i64, is_new_p:
     ir.add_operand(idx_a, T64, 2)
     var idx_p = ir.get_value(idx_a)
     s21_store(idx_p, s21_urem(h, cap), T64)
-    s21_store(is_new_p, gen_bool_lit(1), TB)  // 默认新条目
+    s21_store(is_new_p, tig_bool_lit(1), TB)  // 默认新条目
     var cond = ir.new_block(g_cur_func, interner.intern("mhp.c"))
     var chk = ir.new_block(g_cur_func, interner.intern("mhp.k"))
     var nxt = ir.new_block(g_cur_func, interner.intern("mhp.n"))
@@ -1099,7 +1099,7 @@ func s21_hash_place(htab: i64, cap: i64, key: i64, val: i64, vty: i64, is_new_p:
     g_cur_block = cond
     var i1 = s21_load(idx_p, T64)
     var kp = s21_hslot_key(htab, i1)
-    var emp = gen_cmp_zero(kp, 0)  // key == null（IMM 0 → llvmgen ptr 上下文自动 null）
+    var emp = tig_cmp_zero(kp, 0)  // key == null（IMM 0 → llvmgen ptr 上下文自动 null）
     var cb = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb, emp, 0)
     ir.add_operand(cb, ins, 1)
@@ -1108,8 +1108,8 @@ func s21_hash_place(htab: i64, cap: i64, key: i64, val: i64, vty: i64, is_new_p:
     g_cur_block = chk
     var i2 = s21_load(idx_p, T64)
     var kp2 = s21_hslot_key(htab, i2)
-    var c_ck = gen_ext_call2("strcmp", key, types.named(TK_STR), kp2, types.named(TK_STR), types.named(TK_I32))
-    var eq = gen_cmp_zero(c_ck, 0)  // cmp == 0（IMM 0，勿用值 id 0）
+    var c_ck = tig_ext_call2("strcmp", key, types.named(TK_STR), kp2, types.named(TK_STR), types.named(TK_I32))
+    var eq = tig_cmp_zero(c_ck, 0)  // cmp == 0（IMM 0，勿用值 id 0）
     var cb2 = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb2, eq, 0)
     ir.add_operand(cb2, ovr, 1)
@@ -1118,7 +1118,7 @@ func s21_hash_place(htab: i64, cap: i64, key: i64, val: i64, vty: i64, is_new_p:
     g_cur_block = ovr
     var i3 = s21_load(idx_p, T64)
     s21_hslot_set_val(htab, i3, vty, val)
-    s21_store(is_new_p, gen_bool_lit(0), TB)
+    s21_store(is_new_p, tig_bool_lit(0), TB)
     var b1 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(b1, exit, 1)
     // ins：写入 {key,val}；is_new 保持 true
@@ -1130,7 +1130,7 @@ func s21_hash_place(htab: i64, cap: i64, key: i64, val: i64, vty: i64, is_new_p:
     // nxt：idx = (idx+1) % cap；br cond
     g_cur_block = nxt
     var i5 = s21_load(idx_p, T64)
-    s21_store(idx_p, s21_urem(s21_bin(0, i5, gen_int_lit(1)), cap), T64)
+    s21_store(idx_p, s21_urem(s21_bin(0, i5, tig_int_lit(1)), cap), T64)
     var b3 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(b3, cond, 1)
     g_cur_block = exit
@@ -1163,7 +1163,7 @@ func s21_map_hash_get(m: i64, key: i64, vty: i64) -> i64 {
     g_cur_block = cond
     var i1 = s21_load(idx_p, T64)
     var kp = s21_hslot_key(htab, i1)
-    var emp = gen_cmp_zero(kp, 0)  // key == null（IMM 0 → null）
+    var emp = tig_cmp_zero(kp, 0)  // key == null（IMM 0 → null）
     var cb = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb, emp, 0)
     ir.add_operand(cb, mis, 1)
@@ -1172,8 +1172,8 @@ func s21_map_hash_get(m: i64, key: i64, vty: i64) -> i64 {
     g_cur_block = chk
     var i2 = s21_load(idx_p, T64)
     var kp2 = s21_hslot_key(htab, i2)
-    var c_ck = gen_ext_call2("strcmp", key, types.named(TK_STR), kp2, types.named(TK_STR), types.named(TK_I32))
-    var eq = gen_cmp_zero(c_ck, 0)  // cmp == 0（IMM 0，勿用值 id 0）
+    var c_ck = tig_ext_call2("strcmp", key, types.named(TK_STR), kp2, types.named(TK_STR), types.named(TK_I32))
+    var eq = tig_cmp_zero(c_ck, 0)  // cmp == 0（IMM 0，勿用值 id 0）
     var cb2 = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb2, eq, 0)
     ir.add_operand(cb2, fnd, 1)
@@ -1192,7 +1192,7 @@ func s21_map_hash_get(m: i64, key: i64, vty: i64) -> i64 {
     // nxt：idx=(idx+1)%cap；br cond
     g_cur_block = nxt
     var i4 = s21_load(idx_p, T64)
-    s21_store(idx_p, s21_urem(s21_bin(0, i4, gen_int_lit(1)), cap), T64)
+    s21_store(idx_p, s21_urem(s21_bin(0, i4, tig_int_lit(1)), cap), T64)
     var b2 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(b2, cond, 1)
     g_cur_block = exit
@@ -1215,8 +1215,8 @@ func s21_map_hash_set(m: i64, key: i64, val: i64, vty: i64) {
     var cp_p = ir.get_value(cp_a)
     s21_store(ht_p, htab, types.named(TK_STR))
     s21_store(cp_p, cap, T64)
-    var need = s21_bin(0, len, gen_int_lit(1))
-    var lf = gen_icmp_c(s21_bin(2, need, gen_int_lit(10)), s21_bin(2, cap, gen_int_lit(7)), 3)  // need*10 > cap*7
+    var need = s21_bin(0, len, tig_int_lit(1))
+    var lf = tig_icmp_c(s21_bin(2, need, tig_int_lit(10)), s21_bin(2, cap, tig_int_lit(7)), 3)  // need*10 > cap*7
     var rh = ir.new_block(g_cur_func, interner.intern("mhs.r"))
     var pl = ir.new_block(g_cur_func, interner.intern("mhs.p"))
     var merge = ir.new_block(g_cur_func, interner.intern("mhs.m"))
@@ -1226,13 +1226,13 @@ func s21_map_hash_set(m: i64, key: i64, val: i64, vty: i64) {
     ir.add_operand(cb, pl, 1)
     // rehash：newcap = cap + cap/2（1.5x 大倍增）
     g_cur_block = rh
-    var newcap = s21_bin(0, cap, s21_bin(3, cap, gen_int_lit(2)))
-    var nhtab = s21_raw_alloc_str(s21_bin(2, newcap, gen_int_lit(16)))
+    var newcap = s21_bin(0, cap, s21_bin(3, cap, tig_int_lit(2)))
+    var nhtab = s21_raw_alloc_str(s21_bin(2, newcap, tig_int_lit(16)))
     // 清零 key（z 槽循环）
     var z_a = ir.new_inst(g_cur_block, 20, T64)
     ir.add_operand(z_a, T64, 2)
     var z_p = ir.get_value(z_a)
-    s21_store(z_p, gen_int_lit(0), T64)
+    s21_store(z_p, tig_int_lit(0), T64)
     var zc = ir.new_block(g_cur_func, interner.intern("mhs.zc"))
     var zb = ir.new_block(g_cur_func, interner.intern("mhs.zb"))
     var ze = ir.new_block(g_cur_func, interner.intern("mhs.ze"))
@@ -1240,15 +1240,15 @@ func s21_map_hash_set(m: i64, key: i64, val: i64, vty: i64) {
     ir.add_operand(bz, zc, 1)
     g_cur_block = zc
     var z1 = s21_load(z_p, T64)
-    var zlt = gen_icmp_c(z1, newcap, 2)
+    var zlt = tig_icmp_c(z1, newcap, 2)
     var cbz = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cbz, zlt, 0)
     ir.add_operand(cbz, zb, 1)
     ir.add_operand(cbz, ze, 1)
     g_cur_block = zb
     var z2 = s21_load(z_p, T64)
-    s21_store(s21_gep(nhtab, s21_bin(2, z2, gen_int_lit(16)), false), gen_int_lit(0), types.named(TK_STR))
-    s21_store(z_p, s21_bin(0, z2, gen_int_lit(1)), T64)
+    s21_store(s21_gep(nhtab, s21_bin(2, z2, tig_int_lit(16)), false), tig_int_lit(0), types.named(TK_STR))
+    s21_store(z_p, s21_bin(0, z2, tig_int_lit(1)), T64)
     var bzb = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(bzb, zc, 1)
     // 迁入旧条目（r 槽循环；仅非空槽）
@@ -1256,7 +1256,7 @@ func s21_map_hash_set(m: i64, key: i64, val: i64, vty: i64) {
     var r_a = ir.new_inst(g_cur_block, 20, T64)
     ir.add_operand(r_a, T64, 2)
     var r_p = ir.get_value(r_a)
-    s21_store(r_p, gen_int_lit(0), T64)
+    s21_store(r_p, tig_int_lit(0), T64)
     var rc = ir.new_block(g_cur_func, interner.intern("mhs.rc"))
     var rb = ir.new_block(g_cur_func, interner.intern("mhs.rb"))
     var re = ir.new_block(g_cur_func, interner.intern("mhs.re"))
@@ -1264,7 +1264,7 @@ func s21_map_hash_set(m: i64, key: i64, val: i64, vty: i64) {
     ir.add_operand(brc, rc, 1)
     g_cur_block = rc
     var r1 = s21_load(r_p, T64)
-    var rlt = gen_icmp_c(r1, cap, 2)  // 遍历旧表全部槽
+    var rlt = tig_icmp_c(r1, cap, 2)  // 遍历旧表全部槽
     var cbr = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cbr, rlt, 0)
     ir.add_operand(cbr, rb, 1)
@@ -1272,7 +1272,7 @@ func s21_map_hash_set(m: i64, key: i64, val: i64, vty: i64) {
     g_cur_block = rb
     var r2 = s21_load(r_p, T64)
     var rk = s21_hslot_key(htab, r2)
-    var rempty = gen_cmp_zero(rk, 1)  // rk != null（IMM 0 → null）
+    var rempty = tig_cmp_zero(rk, 1)  // rk != null（IMM 0 → null）
     var rn = ir.new_block(g_cur_func, interner.intern("mhs.rn"))
     var rx = ir.new_block(g_cur_func, interner.intern("mhs.rx"))
     var cb2 = ir.new_inst(g_cur_block, 31, -1)
@@ -1287,18 +1287,18 @@ func s21_map_hash_set(m: i64, key: i64, val: i64, vty: i64) {
     ir.add_operand(dup2_a, types.named(TK_BOOL), 2)
     var dup2_p = ir.get_value(dup2_a)
     s21_hash_place(nhtab, newcap, rk, rv, vty, dup2_p)  // 迁入（LF≈0.47 无需 rehash）
-    s21_store(r_p, s21_bin(0, r2, gen_int_lit(1)), T64)
+    s21_store(r_p, s21_bin(0, r2, tig_int_lit(1)), T64)
     var brr = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(brr, rc, 1)
     // rx：空槽 → 直接 r+1；br rc
     g_cur_block = rx
     var r4 = s21_load(r_p, T64)
-    s21_store(r_p, s21_bin(0, r4, gen_int_lit(1)), T64)
+    s21_store(r_p, s21_bin(0, r4, tig_int_lit(1)), T64)
     var brx = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(brx, rc, 1)
     // re：free 旧、更新 m.data/cap、槽写新表
     g_cur_block = re
-    gen_ext_call1("free", htab, types.named(TK_STR), -1)
+    tig_ext_call1("free", htab, types.named(TK_STR), -1)
     s21_store(s21_gep(m, 16, true), nhtab, types.named(TK_STR))
     s21_store(s21_gep(m, 0, true), newcap, T64)
     s21_store(ht_p, nhtab, types.named(TK_STR))
@@ -1386,11 +1386,11 @@ func s21_map_set(m: i64, key: i64, val: i64, vty: i64) {
 func s21_map_print_pairs(data: i64, cnt: i64, vty: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var h = s21_sb_new()
-    s21_sb_append(h, gen_str_lit(interner.intern("\"{\"")))
+    s21_sb_append(h, tig_str_lit(interner.intern("\"{\"")))
     var i_a = ir.new_inst(g_cur_block, 20, T64)
     ir.add_operand(i_a, T64, 2)
     var i_p = ir.get_value(i_a)
-    s21_store(i_p, gen_int_lit(0), T64)
+    s21_store(i_p, tig_int_lit(0), T64)
     var cond = ir.new_block(g_cur_func, interner.intern("mpr.c"))
     var body = ir.new_block(g_cur_func, interner.intern("mpr.b"))
     var exit = ir.new_block(g_cur_func, interner.intern("mpr.e"))
@@ -1402,7 +1402,7 @@ func s21_map_print_pairs(data: i64, cnt: i64, vty: i64) -> i64 {
     // cond：i < cnt
     g_cur_block = cond
     var i1 = s21_load(i_p, T64)
-    var ilt = gen_icmp_c(i1, cnt, 2)
+    var ilt = tig_icmp_c(i1, cnt, 2)
     var cb = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb, ilt, 0)
     ir.add_operand(cb, body, 1)
@@ -1410,14 +1410,14 @@ func s21_map_print_pairs(data: i64, cnt: i64, vty: i64) -> i64 {
     // body：i>0 → sep
     g_cur_block = body
     var i2 = s21_load(i_p, T64)
-    var gt0 = gen_icmp_c(i2, gen_int_lit(0), 3)  // i > 0
+    var gt0 = tig_icmp_c(i2, tig_int_lit(0), 3)  // i > 0
     var cb2 = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb2, gt0, 0)
     ir.add_operand(cb2, sep, 1)
     ir.add_operand(cb2, nsep, 1)
     // sep：", "
     g_cur_block = sep
-    s21_sb_append(h, gen_str_lit(interner.intern("\", \"")))
+    s21_sb_append(h, tig_str_lit(interner.intern("\", \"")))
     var bs = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(bs, cont, 1)
     // nsep：直接 cont
@@ -1427,22 +1427,22 @@ func s21_map_print_pairs(data: i64, cnt: i64, vty: i64) -> i64 {
     // cont：key ": " value；i+1
     g_cur_block = cont
     var i3 = s21_load(i_p, T64)
-    var eaddr = s21_gep(data, s21_bin(2, i3, gen_int_lit(16)), false)
+    var eaddr = s21_gep(data, s21_bin(2, i3, tig_int_lit(16)), false)
     var k = s21_load(eaddr, types.named(TK_STR))
     var v = s21_load(s21_gep(eaddr, 8, true), vty)
     s21_sb_append(h, k)
-    s21_sb_append(h, gen_str_lit(interner.intern("\": \"")))
+    s21_sb_append(h, tig_str_lit(interner.intern("\": \"")))
     if vty == types.named(TK_STR) {
         s21_sb_append(h, v)
     } else {
-        s21_sb_append(h, gen_i64_to_str(v, true))
+        s21_sb_append(h, tig_i64_to_str(v, true))
     }
-    s21_store(i_p, s21_bin(0, i3, gen_int_lit(1)), T64)
+    s21_store(i_p, s21_bin(0, i3, tig_int_lit(1)), T64)
     var bt = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(bt, cond, 1)
     // exit："}"
     g_cur_block = exit
-    s21_sb_append(h, gen_str_lit(interner.intern("\"}\"")))
+    s21_sb_append(h, tig_str_lit(interner.intern("\"}\"")))
     return s21_sb_build(h)
 }
 
@@ -1474,15 +1474,15 @@ func s21_map_to_string(m: i64, vty: i64) -> i64 {
     var n = s21_table_len(m)
     var cap = s21_load(s21_gep(m, 0, true), T64)
     var htab = s21_load(s21_gep(m, 16, true), types.named(TK_STR))
-    var tbuf = s21_raw_alloc_str(s21_bin(2, n, gen_int_lit(16)))  // 精确 n 条
+    var tbuf = s21_raw_alloc_str(s21_bin(2, n, tig_int_lit(16)))  // 精确 n 条
     var cnt_a = ir.new_inst(g_cur_block, 20, T64)
     ir.add_operand(cnt_a, T64, 2)
     var cnt_p = ir.get_value(cnt_a)
-    s21_store(cnt_p, gen_int_lit(0), T64)
+    s21_store(cnt_p, tig_int_lit(0), T64)
     var i_a = ir.new_inst(g_cur_block, 20, T64)
     ir.add_operand(i_a, T64, 2)
     var i_p = ir.get_value(i_a)
-    s21_store(i_p, gen_int_lit(0), T64)
+    s21_store(i_p, tig_int_lit(0), T64)
     var cond = ir.new_block(g_cur_func, interner.intern("mht.c"))
     var body = ir.new_block(g_cur_func, interner.intern("mht.b"))
     var exit = ir.new_block(g_cur_func, interner.intern("mht.e"))
@@ -1493,7 +1493,7 @@ func s21_map_to_string(m: i64, vty: i64) -> i64 {
     // cond：i < cap
     g_cur_block = cond
     var i1 = s21_load(i_p, T64)
-    var ilt = gen_icmp_c(i1, cap, 2)
+    var ilt = tig_icmp_c(i1, cap, 2)
     var cb2 = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb2, ilt, 0)
     ir.add_operand(cb2, body, 1)
@@ -1502,7 +1502,7 @@ func s21_map_to_string(m: i64, vty: i64) -> i64 {
     g_cur_block = body
     var i2 = s21_load(i_p, T64)
     var kp = s21_hslot_key(htab, i2)
-    var nonempty = gen_cmp_zero(kp, 1)  // kp != null（IMM 0 → null）
+    var nonempty = tig_cmp_zero(kp, 1)  // kp != null（IMM 0 → null）
     var cb3 = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb3, nonempty, 0)
     ir.add_operand(cb3, got, 1)
@@ -1518,7 +1518,7 @@ func s21_map_to_string(m: i64, vty: i64) -> i64 {
     // skip：i+1；br cond
     g_cur_block = skip
     var i4 = s21_load(i_p, T64)
-    s21_store(i_p, s21_bin(0, i4, gen_int_lit(1)), T64)
+    s21_store(i_p, s21_bin(0, i4, tig_int_lit(1)), T64)
     var bs = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(bs, cond, 1)
     // exit：打印 tbuf（n 条已全部迁入，键升序）
@@ -1544,31 +1544,31 @@ func s21_map_to_string(m: i64, vty: i64) -> i64 {
 //   4. 0 值：循环未执行（idx 仍 39）→ buf[39] = '0'，idx = 38；
 //   5. 符号位：if neg: buf[idx] = '-'；idx--；
 //   6. 构造带头字符串：len = 39 - idx；malloc(len+9)；写头；拷数据；NUL。
-func gen_i128_to_str(v: i64, is_signed: bool) -> i64 {
+func tig_i128_to_str(v: i64, is_signed: bool) -> i64 {
     var T128 = types.named(TK_I128)
     var T64 = types.named(TK_I64)
     var T8 = types.named(TK_I8)
-    var z128 = gen_int_lit_ty(0, T128)
-    var ten = gen_int_lit_ty(10, T128)
+    var z128 = tig_int_lit_ty(0, T128)
+    var ten = tig_int_lit_ty(10, T128)
     // 1. 符号判定（signed only）：neg = v < 0（icmp slt）
     var neg: i64 = -1
     var v_abs: i64 = v
     if is_signed {
-        var negc = gen_icmp_c(v, z128, 2)  // slt
+        var negc = tig_icmp_c(v, z128, 2)  // slt
         // 2. 取补码绝对值：v_abs = neg ? (0 - v) : v（位模式减法，最小值不溢出）
         var sub = ir.new_inst(g_cur_block, 1, T128)  // sub i128
         ir.add_operand(sub, z128, 0)
         ir.add_operand(sub, v, 0)
-        v_abs = gen_select_i(negc, ir.get_value(sub), v, T128)
+        v_abs = tig_select_i(negc, ir.get_value(sub), v, T128)
         neg = negc
     }
     // 3. 缓冲区：raw malloc(40)（i128 十进制最多 39 位 + 符号位）
-    var buf = s21_raw_alloc_str(gen_int_lit(40))
+    var buf = s21_raw_alloc_str(tig_int_lit(40))
     // idx 槽（i64）：从 39 开始（缓冲区末尾，从后往前填）
     var idx_slot = ir.new_inst(g_cur_block, 20, T64)  // alloca i64
     ir.add_operand(idx_slot, T64, 2)
     var idx_v = ir.get_value(idx_slot)
-    s21_store(idx_v, gen_int_lit(39), T64)
+    s21_store(idx_v, tig_int_lit(39), T64)
     // v_abs 槽（i128）：循环内反复读写
     var v_slot = ir.new_inst(g_cur_block, 20, T128)  // alloca i128
     ir.add_operand(v_slot, T128, 2)
@@ -1582,7 +1582,7 @@ func gen_i128_to_str(v: i64, is_signed: bool) -> i64 {
     ir.add_operand(b0, cond_blk, 1)
     g_cur_block = cond_blk
     var cur_v = s21_load(vs_v, T128)
-    var cne = gen_icmp_c(cur_v, z128, 1)  // ne
+    var cne = tig_icmp_c(cur_v, z128, 1)  // ne
     var cb = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb, cne, 0)
     ir.add_operand(cb, body_blk, 1)
@@ -1609,7 +1609,7 @@ func gen_i128_to_str(v: i64, is_signed: bool) -> i64 {
     ir.add_operand(ch, 48, 2)  // '0'
     s21_store(bp, ir.get_value(ch), T8)
     // idx -= 1
-    s21_store(idx_v, s21_bin(1, idx1, gen_int_lit(1)), T64)
+    s21_store(idx_v, s21_bin(1, idx1, tig_int_lit(1)), T64)
     var bb2 = ir.new_inst(g_cur_block, 30, -1)  // br cond
     ir.add_operand(bb2, cond_blk, 1)
     g_cur_block = exit_blk
@@ -1617,14 +1617,14 @@ func gen_i128_to_str(v: i64, is_signed: bool) -> i64 {
     var z0_blk = ir.new_block(g_cur_func, interner.intern("i128.zero"))
     var z1_blk = ir.new_block(g_cur_func, interner.intern("i128.ze"))
     var idx4 = s21_load(idx_v, T64)
-    var isz = gen_icmp_c(idx4, gen_int_lit(39), 0)  // eq
+    var isz = tig_icmp_c(idx4, tig_int_lit(39), 0)  // eq
     var cbz = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cbz, isz, 0)
     ir.add_operand(cbz, z0_blk, 1)
     ir.add_operand(cbz, z1_blk, 1)
     g_cur_block = z0_blk
-    s21_store(s21_gep(buf, gen_int_lit(39), false), gen_int_lit_ty(48, T8), T8)  // '0'
-    s21_store(idx_v, gen_int_lit(38), T64)
+    s21_store(s21_gep(buf, tig_int_lit(39), false), tig_int_lit_ty(48, T8), T8)  // '0'
+    s21_store(idx_v, tig_int_lit(38), T64)
     var brz = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(brz, z1_blk, 1)
     g_cur_block = z1_blk
@@ -1638,8 +1638,8 @@ func gen_i128_to_str(v: i64, is_signed: bool) -> i64 {
         ir.add_operand(cb2, se, 1)
         g_cur_block = st
         var idx3 = s21_load(idx_v, T64)
-        s21_store(s21_gep(buf, idx3, false), gen_int_lit_ty(45, T8), T8)  // '-'
-        s21_store(idx_v, s21_bin(1, idx3, gen_int_lit(1)), T64)
+        s21_store(s21_gep(buf, idx3, false), tig_int_lit_ty(45, T8), T8)  // '-'
+        s21_store(idx_v, s21_bin(1, idx3, tig_int_lit(1)), T64)
         var brs = ir.new_inst(g_cur_block, 30, -1)
         ir.add_operand(brs, se, 1)
         g_cur_block = se
@@ -1647,13 +1647,13 @@ func gen_i128_to_str(v: i64, is_signed: bool) -> i64 {
     // 7. 构造带头字符串：len = 39 - idx；SSO 分配（短串走池 / 长串 malloc
     //    len+41：8 头 + 1 \0 + 32 填充）；写头；拷数据；NUL
     var idx5 = s21_load(idx_v, T64)
-    var len = s21_bin(1, gen_int_lit(39), idx5)  // sub
+    var len = s21_bin(1, tig_int_lit(39), idx5)  // sub
     var out = s21_sso_alloc(len)
     s21_store(s21_gep(out, 0, true), len, T64)  // 长度头
     var d0 = s21_gep(out, 8, true)  // 数据起始
-    var src = s21_gep(buf, s21_bin(0, idx5, gen_int_lit(1)), false)  // buf + idx + 1
+    var src = s21_gep(buf, s21_bin(0, idx5, tig_int_lit(1)), false)  // buf + idx + 1
     s21_memcpy_if(d0, src, len)
-    s21_store(s21_gep(d0, len, false), gen_int_lit_ty(0, T8), T8)  // 尾 \0
+    s21_store(s21_gep(d0, len, false), tig_int_lit_ty(0, T8), T8)  // 尾 \0
     // 包装为 TK_STR 类型：d0 是 gep 结果（ins_ty=TK_I8 元素类型），arg_ref 按
     // ins_ty 判 ptr 会落兜底 i64——ptrtoint+inttoptr 后 ins_ty=TK_STR，
     // printf 实参/str_cat 拼接等消费方按 ptr 处理。
@@ -1665,32 +1665,32 @@ func gen_i128_to_str(v: i64, is_signed: bool) -> i64 {
 }
 
 // i64/u64 → 十进制字符串（去 Rust 桥：替代 tie_to_string_i64）。
-// 实现与 gen_i128_to_str 同构（无符号位模式 + udiv/urem 除法循环），仅宽度
+// 实现与 tig_i128_to_str 同构（无符号位模式 + udiv/urem 除法循环），仅宽度
 // 为 i64、缓冲 24（i64 十进制最多 20 位 + 符号 + 余量）。0 值 idx 起始 22。
-func gen_i64_to_str(v: i64, is_signed: bool) -> i64 {
+func tig_i64_to_str(v: i64, is_signed: bool) -> i64 {
     var T64 = types.named(TK_I64)
     var T8 = types.named(TK_I8)
-    var z64 = gen_int_lit_ty(0, T64)
-    var ten = gen_int_lit_ty(10, T64)
+    var z64 = tig_int_lit_ty(0, T64)
+    var ten = tig_int_lit_ty(10, T64)
     // 1. 符号判定（signed only）：neg = v < 0（icmp slt）
     var neg: i64 = -1
     var v_abs: i64 = v
     if is_signed {
-        var negc = gen_icmp_c(v, z64, 2)  // slt
+        var negc = tig_icmp_c(v, z64, 2)  // slt
         // 2. 取补码绝对值：v_abs = neg ? (0 - v) : v（位模式减法，最小值不溢出）
         var sub = ir.new_inst(g_cur_block, 1, T64)  // sub i64
         ir.add_operand(sub, z64, 0)
         ir.add_operand(sub, v, 0)
-        v_abs = gen_select_i(negc, ir.get_value(sub), v, T64)
+        v_abs = tig_select_i(negc, ir.get_value(sub), v, T64)
         neg = negc
     }
     // 3. 缓冲区：raw malloc(24)（i64 十进制最多 20 位 + 符号 + 余量）
-    var buf = s21_raw_alloc_str(gen_int_lit(24))
+    var buf = s21_raw_alloc_str(tig_int_lit(24))
     // idx 槽（i64）：从 23 开始（缓冲末索引 = len 基数，仿 i128 用 39）
     var idx_slot = ir.new_inst(g_cur_block, 20, T64)  // alloca i64
     ir.add_operand(idx_slot, T64, 2)
     var idx_v = ir.get_value(idx_slot)
-    s21_store(idx_v, gen_int_lit(23), T64)
+    s21_store(idx_v, tig_int_lit(23), T64)
     // v_abs 槽（i64）：循环内反复读写
     var v_slot = ir.new_inst(g_cur_block, 20, T64)  // alloca i64
     ir.add_operand(v_slot, T64, 2)
@@ -1704,7 +1704,7 @@ func gen_i64_to_str(v: i64, is_signed: bool) -> i64 {
     ir.add_operand(b0, cond_blk, 1)
     g_cur_block = cond_blk
     var cur_v = s21_load(vs_v, T64)
-    var cne = gen_icmp_c(cur_v, z64, 1)  // ne
+    var cne = tig_icmp_c(cur_v, z64, 1)  // ne
     var cb = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb, cne, 0)
     ir.add_operand(cb, body_blk, 1)
@@ -1730,7 +1730,7 @@ func gen_i64_to_str(v: i64, is_signed: bool) -> i64 {
     ir.add_operand(ch, 48, 2)  // '0'
     s21_store(bp, ir.get_value(ch), T8)
     // idx -= 1
-    s21_store(idx_v, s21_bin(1, idx1, gen_int_lit(1)), T64)
+    s21_store(idx_v, s21_bin(1, idx1, tig_int_lit(1)), T64)
     var bb2 = ir.new_inst(g_cur_block, 30, -1)  // br cond
     ir.add_operand(bb2, cond_blk, 1)
     g_cur_block = exit_blk
@@ -1738,14 +1738,14 @@ func gen_i64_to_str(v: i64, is_signed: bool) -> i64 {
     var z0_blk = ir.new_block(g_cur_func, interner.intern("i64s.zero"))
     var z1_blk = ir.new_block(g_cur_func, interner.intern("i64s.ze"))
     var idx4 = s21_load(idx_v, T64)
-    var isz = gen_icmp_c(idx4, gen_int_lit(23), 0)  // eq
+    var isz = tig_icmp_c(idx4, tig_int_lit(23), 0)  // eq
     var cbz = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cbz, isz, 0)
     ir.add_operand(cbz, z0_blk, 1)
     ir.add_operand(cbz, z1_blk, 1)
     g_cur_block = z0_blk
-    s21_store(s21_gep(buf, gen_int_lit(23), false), gen_int_lit_ty(48, T8), T8)  // '0'
-    s21_store(idx_v, gen_int_lit(22), T64)
+    s21_store(s21_gep(buf, tig_int_lit(23), false), tig_int_lit_ty(48, T8), T8)  // '0'
+    s21_store(idx_v, tig_int_lit(22), T64)
     var brz = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(brz, z1_blk, 1)
     g_cur_block = z1_blk
@@ -1759,8 +1759,8 @@ func gen_i64_to_str(v: i64, is_signed: bool) -> i64 {
         ir.add_operand(cb2, se, 1)
         g_cur_block = st
         var idx3 = s21_load(idx_v, T64)
-        s21_store(s21_gep(buf, idx3, false), gen_int_lit_ty(45, T8), T8)  // '-'
-        s21_store(idx_v, s21_bin(1, idx3, gen_int_lit(1)), T64)
+        s21_store(s21_gep(buf, idx3, false), tig_int_lit_ty(45, T8), T8)  // '-'
+        s21_store(idx_v, s21_bin(1, idx3, tig_int_lit(1)), T64)
         var brs = ir.new_inst(g_cur_block, 30, -1)
         ir.add_operand(brs, se, 1)
         g_cur_block = se
@@ -1768,13 +1768,13 @@ func gen_i64_to_str(v: i64, is_signed: bool) -> i64 {
     // 7. 构造带头字符串：len = 23 - idx；SSO 分配（短串走池 / 长串 malloc
     //    len+41：8 头 + 1 \0 + 32 填充）；写头；拷数据；NUL
     var idx5 = s21_load(idx_v, T64)
-    var len = s21_bin(1, gen_int_lit(23), idx5)  // sub
+    var len = s21_bin(1, tig_int_lit(23), idx5)  // sub
     var out = s21_sso_alloc(len)
     s21_store(s21_gep(out, 0, true), len, T64)  // 长度头
     var d0 = s21_gep(out, 8, true)  // 数据起始
-    var src = s21_gep(buf, s21_bin(0, idx5, gen_int_lit(1)), false)  // buf + idx + 1
+    var src = s21_gep(buf, s21_bin(0, idx5, tig_int_lit(1)), false)  // buf + idx + 1
     s21_memcpy_if(d0, src, len)
-    s21_store(s21_gep(d0, len, false), gen_int_lit_ty(0, T8), T8)  // 尾 \0
+    s21_store(s21_gep(d0, len, false), tig_int_lit_ty(0, T8), T8)  // 尾 \0
     // 包装为 TK_STR 类型
     var pi = ir.new_inst(g_cur_block, 24, T64)  // ptrtoint
     ir.add_operand(pi, d0, 0)
@@ -1787,7 +1787,7 @@ func gen_i64_to_str(v: i64, is_signed: bool) -> i64 {
 // 输入 cp（i64 值寄存器）。非法码点（负、>0x10FFFF、代理区 D800-DFFF）→ 空串；
 // 合法 → 按 UTF-8 序列长分支写字节到 buf，统一 merge 写长度头 + NUL 并返回
 // 数据指针。结构仿 s21_utf8_char_at（内存槽跨块传递结果），带头串构造沿用
-// gen_i128_to_str 尾部模式（{len 头, 数据, \0}，ptrtoint+inttoptr 包装）。
+// tig_i128_to_str 尾部模式（{len 头, 数据, \0}，ptrtoint+inttoptr 包装）。
 func s21_codepoint_to_str(cp: i64) -> i64 {
     var T64 = types.named(TK_I64)
     var T8 = types.named(TK_I8)
@@ -1803,15 +1803,15 @@ func s21_codepoint_to_str(cp: i64) -> i64 {
     // 码点最多 4 字节恒短串 → 恒零 malloc）；data = 数据起始（buf+8）。
     // 用 s21_sso_alloc：曾用 TK_STR malloc 触发 op36 对未初始化缓冲的垃圾
     // strlen 扫描（漏洞 A 类隐患）；池/raw_alloc 绕开扫描 + 填充容纳向量化宽读。
-    var buf = s21_sso_alloc(gen_int_lit(4))
+    var buf = s21_sso_alloc(tig_int_lit(4))
     var data = s21_gep(buf, 8, true)
     // 非法判定：cp<0 || cp>0x10FFFF || (cp>=0xD800 && cp<=0xDFFF)
-    var is_neg = gen_cmp_const(cp, 2, 0, T64)              // slt 0
-    var is_oob = gen_cmp_const(cp, 3, 0x10FFFF, T64)       // sgt
-    var ge_d8 = gen_cmp_const(cp, 5, 0xD800, T64)          // sge
-    var le_df = gen_cmp_const(cp, 4, 0xDFFF, T64)          // sle
-    var surrogate = gen_and_i1(ge_d8, le_df)
-    var bad = gen_or_i1(gen_or_i1(is_neg, is_oob), surrogate)
+    var is_neg = tig_cmp_const(cp, 2, 0, T64)              // slt 0
+    var is_oob = tig_cmp_const(cp, 3, 0x10FFFF, T64)       // sgt
+    var ge_d8 = tig_cmp_const(cp, 5, 0xD800, T64)          // sge
+    var le_df = tig_cmp_const(cp, 4, 0xDFFF, T64)          // sle
+    var surrogate = tig_and_i1(ge_d8, le_df)
+    var bad = tig_or_i1(tig_or_i1(is_neg, is_oob), surrogate)
     // 块：bad / ent(入口分派) / l1-l4 / enc(构造) / exit
     var bad_blk = ir.new_block(g_cur_func, interner.intern("cp.bad"))
     var ent_blk = ir.new_block(g_cur_func, interner.intern("cp.ent"))
@@ -1829,14 +1829,14 @@ func s21_codepoint_to_str(cp: i64) -> i64 {
     ir.add_operand(cb0, ent_blk, 1)
     // entra：分派 1 字节（cp<=0x7F）→ l1，否则 l2c
     g_cur_block = ent_blk
-    var c1 = gen_cmp_const(cp, 4, 0x7F, T64)  // sle 0x7F
+    var c1 = tig_cmp_const(cp, 4, 0x7F, T64)  // sle 0x7F
     var cb1 = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb1, c1, 0)
     ir.add_operand(cb1, l1, 1)
     ir.add_operand(cb1, l2c, 1)
     // bad：空串
     g_cur_block = bad_blk
-    var empty = gen_str_lit(interner.intern("\"\""))
+    var empty = tig_str_lit(interner.intern("\"\""))
     var stb = ir.new_inst(g_cur_block, 22, -1)
     ir.add_operand(stb, types.named(TK_STR), 2)
     ir.add_operand(stb, empty, 0)
@@ -1846,67 +1846,67 @@ func s21_codepoint_to_str(cp: i64) -> i64 {
     // l1：1 字节 [cp]
     g_cur_block = l1
     s21_store(data, s21_trunc_i8(cp), T8)
-    s21_store(len_ptr, gen_int_lit(1), T64)
+    s21_store(len_ptr, tig_int_lit(1), T64)
     var br1 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(br1, enc_blk, 1)
     // l2c：cp<=0x7FF → l2，否则 l3c
     g_cur_block = l2c
-    var c2 = gen_cmp_const(cp, 4, 0x7FF, T64)  // sle
+    var c2 = tig_cmp_const(cp, 4, 0x7FF, T64)  // sle
     var cb2 = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb2, c2, 0)
     ir.add_operand(cb2, l2, 1)
     ir.add_operand(cb2, l3c, 1)
     // l2：2 字节 [0xC0|(cp>>6)&0x1F][0x80|cp&0x3F]
     g_cur_block = l2
-    var sh6 = s21_bin(11, cp, gen_int_lit(6))          // cp>>6 (ashr)
-    var lead2 = s21_bin(7, gen_int_lit(0xC0), s21_bin(6, sh6, gen_int_lit(0x1F)))
-    var cont2 = s21_bin(7, gen_int_lit(0x80), s21_bin(6, cp, gen_int_lit(0x3F)))
+    var sh6 = s21_bin(11, cp, tig_int_lit(6))          // cp>>6 (ashr)
+    var lead2 = s21_bin(7, tig_int_lit(0xC0), s21_bin(6, sh6, tig_int_lit(0x1F)))
+    var cont2 = s21_bin(7, tig_int_lit(0x80), s21_bin(6, cp, tig_int_lit(0x3F)))
     s21_store(data, s21_trunc_i8(lead2), T8)
     s21_store(s21_gep(data, 1, true), s21_trunc_i8(cont2), T8)
-    s21_store(len_ptr, gen_int_lit(2), T64)
+    s21_store(len_ptr, tig_int_lit(2), T64)
     var br2 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(br2, enc_blk, 1)
     // l3c：cp<=0xFFFF → l3，否则 l4
     g_cur_block = l3c
-    var c3 = gen_cmp_const(cp, 4, 0xFFFF, T64)  // sle
+    var c3 = tig_cmp_const(cp, 4, 0xFFFF, T64)  // sle
     var cb3 = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb3, c3, 0)
     ir.add_operand(cb3, l3, 1)
     ir.add_operand(cb3, l4, 1)
     // l3：3 字节 [0xE0|(cp>>12)&0x0F][0x80|(cp>>6)&0x3F][0x80|cp&0x3F]
     g_cur_block = l3
-    var sh12 = s21_bin(11, cp, gen_int_lit(12))
-    var sh6b = s21_bin(11, cp, gen_int_lit(6))
-    var lead3 = s21_bin(7, gen_int_lit(0xE0), s21_bin(6, sh12, gen_int_lit(0x0F)))
-    var mid3 = s21_bin(7, gen_int_lit(0x80), s21_bin(6, sh6b, gen_int_lit(0x3F)))
-    var tail3 = s21_bin(7, gen_int_lit(0x80), s21_bin(6, cp, gen_int_lit(0x3F)))
+    var sh12 = s21_bin(11, cp, tig_int_lit(12))
+    var sh6b = s21_bin(11, cp, tig_int_lit(6))
+    var lead3 = s21_bin(7, tig_int_lit(0xE0), s21_bin(6, sh12, tig_int_lit(0x0F)))
+    var mid3 = s21_bin(7, tig_int_lit(0x80), s21_bin(6, sh6b, tig_int_lit(0x3F)))
+    var tail3 = s21_bin(7, tig_int_lit(0x80), s21_bin(6, cp, tig_int_lit(0x3F)))
     s21_store(data, s21_trunc_i8(lead3), T8)
     s21_store(s21_gep(data, 1, true), s21_trunc_i8(mid3), T8)
     s21_store(s21_gep(data, 2, true), s21_trunc_i8(tail3), T8)
-    s21_store(len_ptr, gen_int_lit(3), T64)
+    s21_store(len_ptr, tig_int_lit(3), T64)
     var br3 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(br3, enc_blk, 1)
     // l4：4 字节 [0xF0|(cp>>18)&0x07][0x80|(cp>>12)&0x3F][0x80|(cp>>6)&0x3F][0x80|cp&0x3F]
     g_cur_block = l4
-    var sh18 = s21_bin(11, cp, gen_int_lit(18))
-    var sh12b = s21_bin(11, cp, gen_int_lit(12))
-    var sh6c = s21_bin(11, cp, gen_int_lit(6))
-    var lead4 = s21_bin(7, gen_int_lit(0xF0), s21_bin(6, sh18, gen_int_lit(0x07)))
-    var m1 = s21_bin(7, gen_int_lit(0x80), s21_bin(6, sh12b, gen_int_lit(0x3F)))
-    var m2 = s21_bin(7, gen_int_lit(0x80), s21_bin(6, sh6c, gen_int_lit(0x3F)))
-    var m3 = s21_bin(7, gen_int_lit(0x80), s21_bin(6, cp, gen_int_lit(0x3F)))
+    var sh18 = s21_bin(11, cp, tig_int_lit(18))
+    var sh12b = s21_bin(11, cp, tig_int_lit(12))
+    var sh6c = s21_bin(11, cp, tig_int_lit(6))
+    var lead4 = s21_bin(7, tig_int_lit(0xF0), s21_bin(6, sh18, tig_int_lit(0x07)))
+    var m1 = s21_bin(7, tig_int_lit(0x80), s21_bin(6, sh12b, tig_int_lit(0x3F)))
+    var m2 = s21_bin(7, tig_int_lit(0x80), s21_bin(6, sh6c, tig_int_lit(0x3F)))
+    var m3 = s21_bin(7, tig_int_lit(0x80), s21_bin(6, cp, tig_int_lit(0x3F)))
     s21_store(data, s21_trunc_i8(lead4), T8)
     s21_store(s21_gep(data, 1, true), s21_trunc_i8(m1), T8)
     s21_store(s21_gep(data, 2, true), s21_trunc_i8(m2), T8)
     s21_store(s21_gep(data, 3, true), s21_trunc_i8(m3), T8)
-    s21_store(len_ptr, gen_int_lit(4), T64)
+    s21_store(len_ptr, tig_int_lit(4), T64)
     var br4 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(br4, enc_blk, 1)
     // enc：写长度头 + 尾 \0，数据指针包装 TK_STR，结果存 res
     g_cur_block = enc_blk
     var lv = s21_load(len_ptr, T64)
     s21_store(s21_gep(buf, 0, true), lv, T64)  // 长度头（buf 首 8 字节）
-    s21_store(s21_gep(data, lv, false), gen_int_lit_ty(0, T8), T8)  // 尾 \0
+    s21_store(s21_gep(data, lv, false), tig_int_lit_ty(0, T8), T8)  // 尾 \0
     var pic = ir.new_inst(g_cur_block, 24, T64)  // ptrtoint data
     ir.add_operand(pic, data, 0)
     var ipc = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr → ptr

@@ -2,10 +2,10 @@ type tie<logic>
 // compiler/backend/_driver_test.tie —— 自举 v2 T2.8 端到端验收脚本
 // ============================================================
 // 作用：把 tie 源码走完整后端链路并对比输出——
-//   源码 → AST(irgen.gen_src) → tie-IR → .ll(llvmgen.emit)
+//   源码 → AST(irgen.tig_src) → tie-IR → .ll(llvmgen.emit)
 //   → opt 优化 → clang 链接 → 运行 exe → 与预期输出逐行对比。
 // 链路各部件：
-//   - irgen.gen_src(src, base_dir)：AST → tie-IR 列式表，返回 0/-1，
+//   - irgen.tig_src(src, base_dir)：AST → tie-IR 列式表，返回 0/-1，
 //     失败时全局变量 sm_err_msg 携带错误消息（sstate.tie 顶层全局，import 树传递可达）。
 //   - llvmgen.emit()：把 tie-IR 生成完整 .ll 文本（模块头+declare+define+字符串节）。
 //   - 工具链：D:\LLVM\bin\opt.exe（-O2 -S）优化 + clang.exe 链接生成 exe。
@@ -119,13 +119,13 @@ func main() -> i64 {
     println("[1] 读源码 OK (" + to_string(str_len(src)) + " 字符)")
 
     // 2) 前端 + 中端：AST → tie-IR
-    var rc = irgen.gen_src(src, "F:\\Projects\\tie")
+    var rc = irgen.tig_src(src, "F:\\Projects\\tie")
     if rc != 0 {
-        println("=== FAIL: irgen.gen_src 失败 rc=" + to_string(rc))
+        println("=== FAIL: irgen.tig_src 失败 rc=" + to_string(rc))
         println("  sm_err_msg: " + sm_err_msg)
         return 1
     }
-    println("[2] irgen.gen_src OK (rc=0)")
+    println("[2] irgen.tig_src OK (rc=0)")
 
     // 3) 后端入口：tie-IR → .ll 文本
     var ll = llvmgen.emit()

@@ -4,7 +4,7 @@ type tie<logic>
 // 里程碑：自举 v2 计划 T2.9（.omo/plans/self-hosting-v2.md）——把 T2.6/T2.8
 // 既有链路组装成可用的命令行编译器（只组装消费，不改 backend/frontend）：
 //   读文件 → 前端（parser.parse_src + semantic.check_impl，含 import 展开）
-//   → 中端（irgen.gen_src，tie-IR）→ 后端（llvmgen.emit → opt -O2 → clang）
+//   → 中端（irgen.tig_src，tie-IR）→ 后端（llvmgen.emit → opt -O2 → clang）
 //   → 可执行文件。
 //
 // 用法：
@@ -285,7 +285,7 @@ func main() -> i64 {
 
     // 4) 中端：AST → tie-IR（irgen 最小集；不支持的语句返回 -1）
     //    此处 check_src 已通过，返回 -1 即 irgen 最小集之外的语句
-    var rc = irgen.gen_src(src, base_dir)
+    var rc = irgen.tig_src(src, base_dir)
     if rc != 0 {
         var why = sm_err_msg
         if why == "" {

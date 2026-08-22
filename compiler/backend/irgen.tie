@@ -50,7 +50,7 @@ var g_used_runtime: bool = false;
 // 置位后 driver 链接 tie_interp.lib（Rust 桥，覆盖全部 tie_* 符号；
 // 与 runtime.a 二选一——interp.lib 覆盖 runtime.a 的三个符号）。
 var g_used_interp: bool = false;
-// 当前编译目标三元组（driver 在 gen_ast 前经 set_target 注入；空 = 未设置）。
+// 当前编译目标三元组（driver 在 tig_ast 前经 set_target 注入；空 = 未设置）。
 // 任务17 asm! 平台条件编译：target("arch") 按此目标匹配。
 var g_asm_target: string = "";
 // 当前函数的**全名**（命名空间函数含 "::"，如 sstate::child）——调用名解析
@@ -78,7 +78,7 @@ var g_lookup_is_global: i64 = 0;
 // 内置调用结果全局槽（builtin_expr 置位；tie 无引用返回）
 var g_builtin_res: i64 = 0;
 // 批次5 任务13：用户 extern 名集（顶层 S_N_EXTERN=117，仅声明无函数体）。
-// 稀疏收集（用户程序通常 0~若干；编译器自身 0）→ gen_user_call 判定 extern → 路由
+// 稀疏收集（用户程序通常 0~若干；编译器自身 0）→ tig_user_call 判定 extern → 路由
 // op36（llvmgen 推导 declare + 字符串返回自动扫描 char* → {ptr,len}）。
 var g_extern_ids: table<i64>;
 var g_extern_ready: i64 = 0;
@@ -86,7 +86,7 @@ var g_extern_ready: i64 = 0;
 namespace irgen {
 // 变量引用：load 指令（从 alloca 读取）。含全局变量（标量 load @g /
 // 表全局 load ptr, ptr @g——表指针本身）。
-func gen_var_ref(name_id: i64) -> i64 {
+func tig_var_ref(name_id: i64) -> i64 {
     if scope_get_global(name_id) < 0 {
         sm_err_msg = "变量 '" + intern.lookup(name_id) + "' 未入作用域（函数 " + g_cur_fn_name + "）"
         return -1
@@ -257,7 +257,7 @@ func ig_ns_sym(full: string) -> string {
 
 // tie 运行时桥调用（exec_code/time_now/get_env/exec_output；全字符串参数，
 // 符号 tie_<name>；返回 i64 或 string）
-func gen_runtime_call(nm: string, id: i64) -> i64 {
+func tig_runtime_call(nm: string, id: i64) -> i64 {
     g_used_runtime = true
     // Call children = [泛型槽, 实参...]：实参从 children[slot_off] 起
     var off = sstate.slot_off(id)
@@ -265,7 +265,7 @@ func gen_runtime_call(nm: string, id: i64) -> i64 {
     var argvals = table_new_i64()
     var k: i64 = 0
     while k < nc {
-        var av = gen_expr(sstate.child(id, off + k))
+        var av = tig_expr(sstate.child(id, off + k))
         if av < 0 {
             return -1
         }
@@ -284,7 +284,7 @@ func gen_runtime_call(nm: string, id: i64) -> i64 {
         table_push(avs, argvals[k])
         k = k + 1
     }
-    return gen_ext_call_typed("tie_" + nm, ats, avs, ret_ty)
+    return tig_ext_call_typed("tie_" + nm, ats, avs, ret_ty)
 }
 
 // ==================== 阶段 A：扩展表达式/语句 ====================
@@ -323,11 +323,11 @@ func call_arg(id: i64, k: i64) -> i64 {
 // arg_start：实参起始 child 下标（Call=slot_off；MethodCall=1+slot_off，
 // children[0] 是泛型槽、children[1] 是 receiver）。
 // 操作数布局：[0]=符号池id, [1]=返回类型id(IMM), 然后每参数 [类型id(IMM), 值]。
-func gen_user_call(full: string, id: i64) -> i64 {
-    return gen_user_call_from(full, id, sstate.slot_off(id))
+func tig_user_call(full: string, id: i64) -> i64 {
+    return tig_user_call_from(full, id, sstate.slot_off(id))
 }
 
-func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
+func tig_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
     var sig = sstate.fn_sig(full)
     var probe_i: i64 = 0
     while probe_i < sstate.nchild(id) {
@@ -392,7 +392,7 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
             }
         }
         if av < 0 {
-            av = gen_expr(arg_node)
+            av = tig_expr(arg_node)
         }
         table_push(argvals, av)
         table_push(argisref, is_ref_arg)
@@ -401,7 +401,7 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
     }
     // 变参打包：多余实参 → 动态表（无多余实参也要传空表）
     if has_var {
-        var tbl = gen_variadic_table(extra_nodes, var_elem)
+        var tbl = tig_variadic_table(extra_nodes, var_elem)
         if tbl < 0 {
             return -1
         }
@@ -432,8 +432,8 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
             table_push(evs, argvals[ek])
             ek = ek + 1
         }
-        // extern 返回 void 时 ret_ty 恒为 TK_VOID，gen_ext_call_typed 建 void 指令
-        return gen_ext_call_typed(full, etys, evs, ret_ty)
+        // extern 返回 void 时 ret_ty 恒为 TK_VOID，tig_ext_call_typed 建 void 指令
+        return tig_ext_call_typed(full, etys, evs, ret_ty)
     }
     var ty35: i64 = -1
     if ret_ty != types.named(TK_VOID) {
@@ -459,7 +459,7 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
             var at2 = node_types[an]
             if pty >= 0 && at2 >= 0 && (types.is_int(pty) || types.is_float(pty)) &&
                 (types.is_int(at2) || types.is_float(at2)) && pty != at2 {
-                var ac = gen_coerce(argvals[k], at2, pty)
+                var ac = tig_coerce(argvals[k], at2, pty)
                 if ac < 0 {
                     return -1
                 }
@@ -471,21 +471,21 @@ func gen_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
         k = k + 1
     }
     if ret_ty == types.named(TK_VOID) {
-        return gen_int_lit(0)  // void 结果：哑值（调用方丢弃）
+        return tig_int_lit(0)  // void 结果：哑值（调用方丢弃）
     }
     return ir.get_value(inst)
 }
 
 // 变参打包：多余实参节点 → 动态表（tie_table_new + 逐元素 push）。
-// 元素类型 = 变参元素类型 T（标量）。按值类型选桥（对齐 gen_table_lit）。
-func gen_variadic_table(nodes: table<i64>, elem: i64) -> i64 {
-    // 元素类型 = 变参元素类型 T（标量）。按值类型选桥（对齐 gen_table_lit）。
+// 元素类型 = 变参元素类型 T（标量）。按值类型选桥（对齐 tig_table_lit）。
+func tig_variadic_table(nodes: table<i64>, elem: i64) -> i64 {
+    // 元素类型 = 变参元素类型 T（标量）。按值类型选桥（对齐 tig_table_lit）。
     var size = elem_size(elem)
-    var size_v = gen_int_lit_ty(size, types.named(TK_I64))
+    var size_v = tig_int_lit_ty(size, types.named(TK_I64))
     var t = s21_table_new(size_v)
     var i: i64 = 0
     while i < len(nodes) {
-        var v = gen_expr(nodes[i])
+        var v = tig_expr(nodes[i])
         if v < 0 {
             return -1
         }
@@ -512,7 +512,7 @@ func gen_variadic_table(nodes: table<i64>, elem: i64) -> i64 {
 // 方法调用（MethodCall，tag 18）：receiver + 方法名 → 命名空间函数全名。
 // receiver 是 Path/Var/FieldAccess 链（未绑定）→ ns 调用；绑定实例 → struct
 // 方法转发（obj.method() → StructName::method(obj, ...)，语义层已校验签名）。
-func gen_method_call(id: i64) -> i64 {
+func tig_method_call(id: i64) -> i64 {
     // MethodCall 接收者 = children[slot_off]（新布局 children[0]=泛型槽→偏移 1）
     var recv = sstate.child(id, sstate.slot_off(id))
     var mname = sstate.name_str(id)
@@ -524,7 +524,7 @@ func gen_method_call(id: i64) -> i64 {
         var rnm = sstate.name_str(recv)
         var eidx2 = sstate.bs_find(en_keys, interner.intern(rnm))
         if eidx2 >= 0 {
-            return gen_enum_construct(eidx2, mname, id, 1 + sstate.slot_off(id))
+            return tig_enum_construct(eidx2, mname, id, 1 + sstate.slot_off(id))
         }
     }
     // 接收者是已绑定实例（局部/全局变量）且类型为 struct → 实例方法转发：
@@ -534,18 +534,18 @@ func gen_method_call(id: i64) -> i64 {
         if scope_get_global(rnid) >= 0 {
             if types.kind(g_lookup_ty) == K_ATOMIC {
                 // S1.2 A1 atomic<T> 内置方法（c.load() / c.fetch_add(1, Relaxed)）
-                return gen_atomic_method(recv, g_lookup_ty, mname, id)
+                return tig_atomic_method(recv, g_lookup_ty, mname, id)
             }
             if types.kind(g_lookup_ty) == K_STRUCT {
                 var si = g_lookup_ty - BASE_STRUCT
                 var full = sstate.struct_name_of(si) + "::" + mname
                 if sstate.fn_sig(full) >= 0 {
-                    return gen_struct_method_call(full, id, recv, g_lookup_ty)
+                    return tig_struct_method_call(full, id, recv, g_lookup_ty)
                 }
             }
             if types.kind(g_lookup_ty) == K_PORT {
                 // S2.4：port 对象方法调用（动态分发，vtable 间接调用）
-                return gen_port_method_call(id, recv, g_lookup_ty, mname)
+                return tig_port_method_call(id, recv, g_lookup_ty, mname)
             }
         }
     }
@@ -553,7 +553,7 @@ func gen_method_call(id: i64) -> i64 {
     // 动态分发（vtable 间接调用）。node_types[recv] 由语义层登记。
     var rt4 = node_types[recv]
     if rt4 >= 0 && types.kind(rt4) == K_PORT {
-        return gen_port_method_call(id, recv, rt4, mname)
+        return tig_port_method_call(id, recv, rt4, mname)
     }
     var prefix = sinfer.recv_path_name(recv)
     if prefix == "" {
@@ -562,13 +562,13 @@ func gen_method_call(id: i64) -> i64 {
     }
     var full = prefix + "::" + mname
     // 实参从 children[slot_off + 1] 开始（children[slot_off]=receiver）
-    return gen_user_call_from(full, id, 1 + sstate.slot_off(id))
+    return tig_user_call_from(full, id, 1 + sstate.slot_off(id))
 }
 
 // ==================== S1.2 A1 atomic<T> 方法生成 ====================
 // 接收者 = 原子变量槽（alloca）。内存序 IMM 由 irgen 侧解析（Relaxed=0
 // Acquire=1 Release=2 AcqRel=3 SeqCst=4；语义层已校验标识符）。
-func gen_atomic_method(recv: i64, aty: i64, mname: string, id: i64) -> i64 {
+func tig_atomic_method(recv: i64, aty: i64, mname: string, id: i64) -> i64 {
     var rnid = interner.intern(sstate.name_str(recv))
     if scope_get_global(rnid) < 0 {
         sm_err_msg = "原子变量 '" + sstate.name_str(recv) + "' 未入作用域（函数 " + g_cur_fn_name + "）"
@@ -597,13 +597,13 @@ func gen_atomic_method(recv: i64, aty: i64, mname: string, id: i64) -> i64 {
         order = atomic_order_imm(last)
     }
     if mname == "store" {
-        var v = gen_expr(sstate.child(id, aoff))
+        var v = tig_expr(sstate.child(id, aoff))
         if v < 0 {
             return -1
         }
         var vt = node_types[sstate.child(id, aoff)]
         if vt >= 0 && vt != elem && (types.is_int(vt) || types.is_float(vt)) {
-            var cv = gen_coerce(v, vt, elem)
+            var cv = tig_coerce(v, vt, elem)
             if cv < 0 {
                 return -1
             }
@@ -614,17 +614,17 @@ func gen_atomic_method(recv: i64, aty: i64, mname: string, id: i64) -> i64 {
         ir.add_operand(inst, slot, 0)  // ② 地址
         ir.add_operand(inst, v, 0)     // ③ 值
         ir.add_operand(inst, order, 2) // ④ order
-        return gen_int_lit(0)
+        return tig_int_lit(0)
     }
     if mname == "fetch_add" || mname == "fetch_sub" || mname == "fetch_and" ||
         mname == "fetch_or" || mname == "fetch_xor" {
-        var v = gen_expr(sstate.child(id, aoff))
+        var v = tig_expr(sstate.child(id, aoff))
         if v < 0 {
             return -1
         }
         var vt = node_types[sstate.child(id, aoff)]
         if vt >= 0 && vt != elem && (types.is_int(vt) || types.is_float(vt)) {
-            var cv = gen_coerce(v, vt, elem)
+            var cv = tig_coerce(v, vt, elem)
             if cv < 0 {
                 return -1
             }
@@ -648,11 +648,11 @@ func gen_atomic_method(recv: i64, aty: i64, mname: string, id: i64) -> i64 {
         return ir.get_value(inst)
     }
     if mname == "compare_exchange" {
-        var exp = gen_expr(sstate.child(id, aoff))
+        var exp = tig_expr(sstate.child(id, aoff))
         if exp < 0 {
             return -1
         }
-        var newv = gen_expr(sstate.child(id, aoff + 1))
+        var newv = tig_expr(sstate.child(id, aoff + 1))
         if newv < 0 {
             return -1
         }
@@ -702,8 +702,8 @@ func atomic_order_imm(node: i64) -> i64 {
 }
 
 // struct 实例方法转发调用：函数 = StructName::method，首参 = receiver 聚合值，
-// 其余实参 = children[1..]。操作数布局与 gen_user_call_from 完全一致。
-func gen_struct_method_call(full: string, id: i64, recv: i64, rty: i64) -> i64 {
+// 其余实参 = children[1..]。操作数布局与 tig_user_call_from 完全一致。
+func tig_struct_method_call(full: string, id: i64, recv: i64, rty: i64) -> i64 {
     var sig = sstate.fn_sig(full)
     if sig < 0 {
         sm_err_msg = "函数 '" + full + "' 无签名（函数 " + g_cur_fn_name + "）"
@@ -725,9 +725,9 @@ func gen_struct_method_call(full: string, id: i64, recv: i64, rty: i64) -> i64 {
     var argtys: table<i64> = table_new_i64()  // 并行实参类型（ref 首参 → ptr）
     var rv: i64 = -1
     if first_ref == 1 {
-        rv = gen_agg_addr(recv, rty)  // 接收者槽地址（Var → alloca；表达式落内存）
+        rv = tig_agg_addr(recv, rty)  // 接收者槽地址（Var → alloca；表达式落内存）
     } else {
-        rv = gen_expr(recv)
+        rv = tig_expr(recv)
     }
     if rv < 0 {
         return -1
@@ -754,7 +754,7 @@ func gen_struct_method_call(full: string, id: i64, recv: i64, rty: i64) -> i64 {
             k = k + 1
             continue
         }
-        var av = gen_expr(arg_node)
+        var av = tig_expr(arg_node)
         if av < 0 {
             return -1
         }
@@ -772,14 +772,14 @@ func gen_struct_method_call(full: string, id: i64, recv: i64, rty: i64) -> i64 {
     // 变参打包：多余实参 → 动态表（无多余也要传空表）
     if has_var {
         var var_elem2 = types.table_elem(ptys[nparams - 1])
-        var tbl2 = gen_variadic_table(extra_nodes, var_elem2)
+        var tbl2 = tig_variadic_table(extra_nodes, var_elem2)
         if tbl2 < 0 {
             return -1
         }
         table_push(argvals, tbl2)
         table_push(argtys, ptys[nparams - 1])   // table<T> → ptr
     }
-    // 生成 call（同 gen_user_call_from 尾部；实参类型用 argtys 并行表）
+    // 生成 call（同 tig_user_call_from 尾部；实参类型用 argtys 并行表）
     var ty35: i64 = -1
     if ret_ty != types.named(TK_VOID) {
         ty35 = ret_ty
@@ -794,7 +794,7 @@ func gen_struct_method_call(full: string, id: i64, recv: i64, rty: i64) -> i64 {
         k = k + 1
     }
     if ret_ty == types.named(TK_VOID) {
-        return gen_int_lit(0)  // void 结果：哑值（调用方丢弃）
+        return tig_int_lit(0)  // void 结果：哑值（调用方丢弃）
     }
     return ir.get_value(inst)
 }
@@ -879,7 +879,7 @@ func num_field_index(fname: string) -> i64 {
 
 // 取聚合 base 的地址（alloca 指针）：Var → 作用域槽地址；表达式 → 求聚合值
 // 后 alloca + store（寄存器聚合值落内存，供 GEP 寻址）。
-func gen_agg_addr(base: i64, agg: i64) -> i64 {
+func tig_agg_addr(base: i64, agg: i64) -> i64 {
     if s_tags[base] == 6 {
         var nm = interner.intern(sstate.name_str(base))
         if scope_get_global(nm) >= 0 && g_lookup_is_global == 0 {
@@ -887,7 +887,7 @@ func gen_agg_addr(base: i64, agg: i64) -> i64 {
         }
     }
     // 表达式（构造调用 / 函数返回 / 字段链）→ 落内存
-    var v = gen_expr(base)
+    var v = tig_expr(base)
     if v < 0 {
         return -1
     }
@@ -903,19 +903,19 @@ func gen_agg_addr(base: i64, agg: i64) -> i64 {
 
 // 元组字面量 (a, b) → 聚合值：alloca 聚合 → 逐字段 agg_gep + store → load。
 // 字段类型取自语义层 tup_tys（node_types[id] 已登记元组类型）。
-func gen_tuple_lit(id: i64) -> i64 {
+func tig_tuple_lit(id: i64) -> i64 {
     var agg = node_types[id]
     if agg < 0 {
         sm_err_msg = "元组字面量缺少语义类型（函数 " + g_cur_fn_name + "）"
         return -1
     }
-    return gen_tuple_lit_typed(id, agg)
+    return tig_tuple_lit_typed(id, agg)
 }
 
 // 元组字面量按**目标类型**构造（类型标注适配）：`var w: (i32, i64) = (7, 8)`
 // 时语义层把字面量推断为 (i64,i64)，必须按目标 (i32,i64) 构造——IntLit 字段
 // 按目标字段类型生成常量（i32 槽存 i32 值；f64 槽转浮点字面量）。
-func gen_tuple_lit_typed(id: i64, agg: i64) -> i64 {
+func tig_tuple_lit_typed(id: i64, agg: i64) -> i64 {
     var alloca = ir.new_inst(g_cur_block, 20, agg)  // alloca
     ir.add_operand(alloca, agg, 2)
     var ap = ir.get_value(alloca)
@@ -929,12 +929,12 @@ func gen_tuple_lit_typed(id: i64, agg: i64) -> i64 {
         if s_tags[vnode] == 0 {
             // IntLit：按目标字段类型生成常量（i32 槽 i32 值 / f64 槽浮点文本）
             if fty == types.named(TK_F64) || fty == types.named(TK_F32) {
-                v = gen_float_lit(interner.intern(to_string(s_vals[vnode]) + ".0"))
+                v = tig_float_lit(interner.intern(to_string(s_vals[vnode]) + ".0"))
             } else {
-                v = gen_int_lit_ty(s_vals[vnode], fty)
+                v = tig_int_lit_ty(s_vals[vnode], fty)
             }
         } else {
-            v = gen_expr(vnode)
+            v = tig_expr(vnode)
         }
         if v < 0 {
             return -1
@@ -955,7 +955,7 @@ func gen_tuple_lit_typed(id: i64, agg: i64) -> i64 {
 }
 
 // 字段访问（读）：base.field → 地址 + agg_gep + load。
-func gen_field_access(id: i64) -> i64 {
+func tig_field_access(id: i64) -> i64 {
     var base = sstate.child(id, 0)
     var fname = sstate.name_str(id)
     var base_ty = node_types[base]
@@ -970,7 +970,7 @@ func gen_field_access(id: i64) -> i64 {
         return -1
     }
     var fty = agg_field_ty(base_ty, fidx)
-    var addr = gen_agg_addr(base, base_ty)
+    var addr = tig_agg_addr(base, base_ty)
     if addr < 0 {
         return -1
     }
@@ -984,8 +984,8 @@ func gen_field_access(id: i64) -> i64 {
 }
 
 // 字段赋值（FieldAssign 115）：base.field op= value → 地址 + agg_gep + store。
-// 复合赋值（op ≥ 0）先 load 旧值运算再写回（对齐 gen_compound_assign）。
-func gen_field_assign(id: i64) -> i64 {
+// 复合赋值（op ≥ 0）先 load 旧值运算再写回（对齐 tig_compound_assign）。
+func tig_field_assign(id: i64) -> i64 {
     var fname = sstate.name_str(id)
     var base = sstate.child(id, 0)
     var val = sstate.child(id, 1)
@@ -1002,7 +1002,7 @@ func gen_field_assign(id: i64) -> i64 {
         return -1
     }
     var fty = agg_field_ty(base_ty, fidx)
-    var addr = gen_agg_addr(base, base_ty)
+    var addr = tig_agg_addr(base, base_ty)
     if addr < 0 {
         return -1
     }
@@ -1015,11 +1015,11 @@ func gen_field_assign(id: i64) -> i64 {
         var cur = ir.new_inst(g_cur_block, 21, fty)  // load
         ir.add_operand(cur, gpp, 0)
         var cur_v = ir.get_value(cur)
-        var rv = gen_expr(val)
+        var rv = tig_expr(val)
         if rv < 0 {
             return -1
         }
-        var res = gen_compound_assign(op, cur_v, rv, fty)
+        var res = tig_compound_assign(op, cur_v, rv, fty)
         if res < 0 {
             sm_err_msg = "复合字段赋值运算失败（字段 " + fname + "，函数 " + g_cur_fn_name + "）"
             return -1
@@ -1030,7 +1030,7 @@ func gen_field_assign(id: i64) -> i64 {
         ir.add_operand(st, gpp, 0)
         return 0
     }
-    var vv = gen_expr(val)
+    var vv = tig_expr(val)
     if vv < 0 {
         return -1
     }
@@ -1038,7 +1038,7 @@ func gen_field_assign(id: i64) -> i64 {
     var vt = node_types[val]
     if vt >= 0 && (types.is_int(vt) || types.is_float(vt)) &&
         (types.is_int(fty) || types.is_float(fty)) && vt != fty {
-        var cv = gen_coerce(vv, vt, fty)
+        var cv = tig_coerce(vv, vt, fty)
         if cv < 0 {
             return -1
         }
@@ -1066,7 +1066,7 @@ func is_enum_name(nm: string) -> bool {
 
 // 枚举变体 tag 解析：枚举名 + 变体名 → tag 值（0..nvar-1）；-1 = 未找到。
 // 在 en_vnames 拍平段（en_varoff[ei] 起 en_nvar[ei] 个）线性查找变体名。
-// 供 gen_enum_construct（构造）与 gen_switch（case 模式 → tag 常量）共用。
+// 供 tig_enum_construct（构造）与 tig_switch（case 模式 → tag 常量）共用。
 func enum_variant_tag(ei: i64, vname: string) -> i64 {
     var varoff = en_varoff[ei]
     var nvar = en_nvar[ei]
@@ -1126,9 +1126,9 @@ func enum_case_tag(pat: i64, subj_ty: i64) -> i64 {
 }
 
 // 批次 7：枚举变体解构 `case Ok(v)` 的 payload 绑定（在绑定块内调用）。
-// subject 已求值（gen_expr 结果，聚合值）；从槽 1 提取 payload，还原成绑定
+// subject 已求值（tig_expr 结果，聚合值）；从槽 1 提取 payload，还原成绑定
 // 变量类型（string → inttoptr / 窄整数 → trunc），存入新建 alloca 并 scope_put。
-func gen_case_bind_body(subject: i64, subj_ty: i64, pat: i64) -> i64 {
+func tig_case_bind_body(subject: i64, subj_ty: i64, pat: i64) -> i64 {
     var ei = types.low(subj_ty)
     var ptag = enum_case_tag(pat, subj_ty)
     if ptag < 0 {
@@ -1140,7 +1140,7 @@ func gen_case_bind_body(subject: i64, subj_ty: i64, pat: i64) -> i64 {
     var foff = en_vfldoff[varoff + ptag]
     var pty = en_ftys[foff]
     // subject 聚合地址 + 槽 1（payload）
-    var eaddr = gen_agg_addr(subject, subj_ty)
+    var eaddr = tig_agg_addr(subject, subj_ty)
     if eaddr < 0 {
         return -1
     }
@@ -1151,14 +1151,14 @@ func gen_case_bind_body(subject: i64, subj_ty: i64, pat: i64) -> i64 {
     var ld = ir.new_inst(g_cur_block, 21, T64)  // load i64 payload
     ir.add_operand(ld, g1p, 0)
     var pv = ir.get_value(ld)
-    // 还原 payload 类型（对齐 gen_try：string → inttoptr；窄整数 → trunc）
+    // 还原 payload 类型（对齐 tig_try：string → inttoptr；窄整数 → trunc）
     var bv: i64 = pv
     if pty == types.named(TK_STR) {
         var ip = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr
         ir.add_operand(ip, pv, 0)
         bv = ir.get_value(ip)
     } else if pty != T64 && pty != types.named(TK_U64) && types.is_int(pty) {
-        var cv = gen_coerce(bv, T64, pty)
+        var cv = tig_coerce(bv, T64, pty)
         if cv < 0 {
             return -1
         }
@@ -1178,11 +1178,11 @@ func gen_case_bind_body(subject: i64, subj_ty: i64, pat: i64) -> i64 {
 // eidx：en_keys 下标（构造名反查的枚举）；vname：变体名；id：AST 节点
 //（MethodCall 取实参；FieldAccess 无实参）；arg_start：实参起始 child
 // 下标（MethodCall = slot_off + 1；FieldAccess/无实参 = -1）。
-// 布局（对齐 gen_struct_construct）：alloca %enum.X → store tag（槽 0）→
+// 布局（对齐 tig_struct_construct）：alloca %enum.X → store tag（槽 0）→
 // 逐 payload 槽 store（实参覆盖前 nfld 个；其余槽零值）→ load 聚合值。
 // 槽类型统一 i64：窄整数/字符/布尔 payload 经 sext 升宽到 i64（一期白名单
 // 限整数系；string payload 无现成 ptr↔i64 桥 → 报"暂不支持"）。
-func gen_enum_construct(eidx: i64, vname: string, id: i64, arg_start: i64) -> i64 {
+func tig_enum_construct(eidx: i64, vname: string, id: i64, arg_start: i64) -> i64 {
     var ei = en_vals[eidx]
     var ename = sstate.enum_name_of(ei)
     var tag = enum_variant_tag(ei, vname)
@@ -1202,7 +1202,7 @@ func gen_enum_construct(eidx: i64, vname: string, id: i64, arg_start: i64) -> i6
     ir.add_operand(alloca, agg, 2)
     var ap = ir.get_value(alloca)
     // store tag（槽 0，i64）
-    var tagv = gen_int_lit_ty(tag, types.named(TK_I64))
+    var tagv = tig_int_lit_ty(tag, types.named(TK_I64))
     var g0 = ir.new_inst(g_cur_block, 27, agg)  // agg_gep 下标 0
     ir.add_operand(g0, ap, 0)
     ir.add_operand(g0, 0, 2)
@@ -1226,7 +1226,7 @@ func gen_enum_construct(eidx: i64, vname: string, id: i64, arg_start: i64) -> i6
                 // 见 llvmgen op==56）；其余 string 变量/调用返回值是 ptr 值，
                 // 需 ptrtoint 转 i64 后存储。读取侧（switch case 绑定 / ? 解包）
                 // 由消费方按需 inttoptr 还原 ptr。
-                v = gen_expr(arg)
+                v = tig_expr(arg)
                 if v < 0 {
                     return -1
                 }
@@ -1241,13 +1241,13 @@ func gen_enum_construct(eidx: i64, vname: string, id: i64, arg_start: i64) -> i6
                 }
             } else {
                 // 窄整数字段 + 整数字面量：按字段类型生成常量（i32 槽 i32 值）——
-                // 否则字面量走 gen_expr 恒 i64，sext i32 %i64 类型不匹配。
-                // 非字面量（变量/表达式）gen_expr 产出天然窄类型（i32 变量 load i32、
+                // 否则字面量走 tig_expr 恒 i64，sext i32 %i64 类型不匹配。
+                // 非字面量（变量/表达式）tig_expr 产出天然窄类型（i32 变量 load i32、
                 // 字符/布尔字面量 i32/i1），sext 源类型与 fty 一致。
                 if fty != types.named(TK_I64) && fty != types.named(TK_U64) && s_tags[arg] == 0 {
-                    v = gen_int_lit_ty(s_vals[arg], fty)
+                    v = tig_int_lit_ty(s_vals[arg], fty)
                 } else {
-                    v = gen_expr(arg)
+                    v = tig_expr(arg)
                 }
                 if v < 0 {
                     return -1
@@ -1264,7 +1264,7 @@ func gen_enum_construct(eidx: i64, vname: string, id: i64, arg_start: i64) -> i6
             }
         } else {
             // 无 payload 变体 / 超出实参的槽：零值（聚合不含未定义位）
-            v = gen_int_lit_ty(0, types.named(TK_I64))
+            v = tig_int_lit_ty(0, types.named(TK_I64))
         }
         var gp = ir.new_inst(g_cur_block, 27, agg)  // agg_gep 下标 1+i
         ir.add_operand(gp, ap, 0)
@@ -1284,11 +1284,11 @@ func gen_enum_construct(eidx: i64, vname: string, id: i64, arg_start: i64) -> i6
 // S2.3：`expr ?` 解包展开（N_TRY=133）。语义已由 sinfer.infer_try_unwrap
 // 校验：操作数必须是 Result/Option 形态枚举（含 Ok/Some 与 Err/None 变体），
 // 当前函数返回类型必须是同一枚举实例；解包类型 = Ok/Some 的 payload 类型
-// （node_types[id] 已登记）。IR 布局：gen_agg_addr 落内存 → 槽 0 读 tag →
+// （node_types[id] 已登记）。IR 布局：tig_agg_addr 落内存 → 槽 0 读 tag →
 // icmp eq err_tag → cond_br；err 分支 ret 操作数聚合值本身（返回类型与
 // 操作数同实例，Err 值原样返回）；ok 分支解包槽 1（string 槽存 i64 指针值
 // → inttoptr 还原 ptr；窄整数槽存 sext 后 i64 → trunc 还原；i64/u64 直用）。
-func gen_try(id: i64) -> i64 {
+func tig_try(id: i64) -> i64 {
     var operand = sstate.child(id, 0)
     var oty = node_types[operand]
     if oty < 0 || types.kind(oty) != K_ENUM {
@@ -1309,8 +1309,8 @@ func gen_try(id: i64) -> i64 {
         sm_err_msg = "内部错误：'?' 解包枚举缺少 Err/None 变体（函数 " + g_cur_fn_name + "）"
         return -1
     }
-    // 1. 操作数落内存（gen_agg_addr 取聚合地址：变量直接槽，表达式 store 到 alloca）
-    var eaddr = gen_agg_addr(operand, oty)
+    // 1. 操作数落内存（tig_agg_addr 取聚合地址：变量直接槽，表达式 store 到 alloca）
+    var eaddr = tig_agg_addr(operand, oty)
     if eaddr < 0 {
         return -1
     }
@@ -1323,7 +1323,7 @@ func gen_try(id: i64) -> i64 {
     ir.add_operand(ld0, g0p, 0)
     var tag_v = ir.get_value(ld0)
     // 3. icmp eq tag_v, err_tag
-    var err_c = gen_int_lit_ty(err_tag, types.named(TK_I64))
+    var err_c = tig_int_lit_ty(err_tag, types.named(TK_I64))
     var ic = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp eq
     ir.add_operand(ic, tag_v, 0)
     ir.add_operand(ic, err_c, 0)
@@ -1362,12 +1362,12 @@ func gen_try(id: i64) -> i64 {
         ir.add_operand(ip, pv1, 0)
         return ir.get_value(ip)
     }
-    // 窄整数 payload：槽存 sext 后 i64 → load i64 → trunc 还原（gen_coerce）
+    // 窄整数 payload：槽存 sext 后 i64 → load i64 → trunc 还原（tig_coerce）
     if types.is_int(uty) && uty != types.named(TK_I64) && uty != types.named(TK_U64) {
         var ld2 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
         ir.add_operand(ld2, g1p, 0)
         var pv2 = ir.get_value(ld2)
-        return gen_coerce(pv2, types.named(TK_I64), uty)  // trunc opcode 37
+        return tig_coerce(pv2, types.named(TK_I64), uty)  // trunc opcode 37
     }
     // 其他（i64/u64）：槽统一 i64，load 直用
     var ld3 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
@@ -1376,14 +1376,14 @@ func gen_try(id: i64) -> i64 {
 }
 
 // S2.3：`panic("消息")` 不可恢复错误语句（N_PANIC=134）→ 打印消息 + 退出。
-// 参考 gen_println（call_vararg + 格式串池 id + 消息）与 exit() 先例
-// （gen_ext_call1("exit", ...)，C 运行时 exit() 自带 stdio flush）。
+// 参考 tig_println（call_vararg + 格式串池 id + 消息）与 exit() 先例
+// （tig_ext_call1("exit", ...)，C 运行时 exit() 自带 stdio flush）。
 // 批次 7（任务 18）：可捕获 panic——若处于 catch_panic 捕获域（@tie_panic_active
 // 为真），打印消息后 longjmp 回 catch 点（不 exit，宿主继续运行）；否则保持
 // 原语义 printf + exit(1)。可配置目标行为（嵌入式 halt / wasm trap）后续。
-func gen_panic(id: i64) -> i64 {
+func tig_panic(id: i64) -> i64 {
     var msg = sstate.child(id, 0)
-    var mv = gen_expr(msg)
+    var mv = tig_expr(msg)
     if mv < 0 {
         return -1
     }
@@ -1407,7 +1407,7 @@ func gen_panic(id: i64) -> i64 {
     ir.add_operand(inst, fmt, 0)
     ir.add_operand(inst, mv, 0)
     var jb_id = interner.intern("@tie_panic_jb")
-    var one32 = gen_int_lit_ty(1, types.named(TK_I32))
+    var one32 = tig_int_lit_ty(1, types.named(TK_I32))
     var lj = ir.new_inst(g_cur_block, 36, -1)  // extern_call void（longjmp）
     ir.add_operand(lj, interner.intern("longjmp"), 0)
     ir.add_operand(lj, -1, 2)  // 返回 void
@@ -1424,8 +1424,8 @@ func gen_panic(id: i64) -> i64 {
     var inst2 = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
     ir.add_operand(inst2, fmt, 0)
     ir.add_operand(inst2, mv, 0)
-    var one = gen_int_lit_ty(1, types.named(TK_I64))
-    gen_ext_call1("exit", one, types.named(TK_I64), -1)
+    var one = tig_int_lit_ty(1, types.named(TK_I64))
+    tig_ext_call1("exit", one, types.named(TK_I64), -1)
     return 0
 }
 
@@ -1435,11 +1435,11 @@ func gen_panic(id: i64) -> i64 {
 // 对齐 clang 对 MSVC setjmp 的生成：`_setjmp(env, frameaddr)`（returns_twice，
 // 帧地址经 llvm.frameaddress.p0(i32 0)）+ `longjmp(env, 1)`（noreturn）；
 // jmp_buf = 256 字节 align 16（对齐 [16 x _SETJMP_FLOAT128]）。
-func gen_catch_panic(id: i64) -> i64 {
+func tig_catch_panic(id: i64) -> i64 {
     llvmgen.catch_enable()
     // 1. 求值闭包 f（fn 值聚合）；语义层已登记 node_types[fn_node] = fn 类型
     var fn_node = call_arg(id, 0)
-    var fv = gen_expr(fn_node)
+    var fv = tig_expr(fn_node)
     if fv < 0 {
         return -1
     }
@@ -1494,7 +1494,7 @@ func gen_catch_panic(id: i64) -> i64 {
     ir.add_operand(sj, fa_v, 0)
     var sj_v = ir.get_value(sj)
     // 4. r == 0 → ok_blk（正常执行 f）/ cap_blk（捕获）
-    var z0 = gen_int_lit_ty(0, types.named(TK_I32))
+    var z0 = tig_int_lit_ty(0, types.named(TK_I32))
     var is0 = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp eq i32
     ir.add_operand(is0, sj_v, 0)
     ir.add_operand(is0, z0, 0)
@@ -1510,7 +1510,7 @@ func gen_catch_panic(id: i64) -> i64 {
     var merge = ir.new_block(g_cur_func, interner.intern("cap.m"))
     // 5. ok_blk：active=true；调用 f（call_indirect，无参，结果丢弃）；active=false；res=false
     g_cur_block = ok_blk
-    var tr = gen_bool_lit(1)  // true（i1，块内独立生成，SSA）
+    var tr = tig_bool_lit(1)  // true（i1，块内独立生成，SSA）
     var st1 = ir.new_inst(g_cur_block, 22, -1)  // store i1 true
     ir.add_operand(st1, types.named(TK_BOOL), 2)
     ir.add_operand(st1, tr, 0)
@@ -1520,7 +1520,7 @@ func gen_catch_panic(id: i64) -> i64 {
     ir.add_operand(ci, entry_v, 0)
     ir.add_operand(ci, ret_ty, 2)
     ir.add_operand(ci, env_v, 0)
-    var fl_ok = gen_bool_lit(0)  // false（i1，块内独立）
+    var fl_ok = tig_bool_lit(0)  // false（i1，块内独立）
     var st2 = ir.new_inst(g_cur_block, 22, -1)  // store i1 false（active）
     ir.add_operand(st2, types.named(TK_BOOL), 2)
     ir.add_operand(st2, fl_ok, 0)
@@ -1530,12 +1530,12 @@ func gen_catch_panic(id: i64) -> i64 {
     ir.add_operand(br1, merge, 1)
     // 6. cap_blk：active=false；res=true
     g_cur_block = cap_blk
-    var fl_cap = gen_bool_lit(0)  // false（块内独立，SSA）
+    var fl_cap = tig_bool_lit(0)  // false（块内独立，SSA）
     var st3 = ir.new_inst(g_cur_block, 22, -1)  // store i1 false
     ir.add_operand(st3, types.named(TK_BOOL), 2)
     ir.add_operand(st3, fl_cap, 0)
     ir.add_operand(st3, act_id, 3)
-    var tr2 = gen_bool_lit(1)  // true（块内独立）
+    var tr2 = tig_bool_lit(1)  // true（块内独立）
     s21_store(res_p, tr2, types.named(TK_BOOL))  // res = true
     var br2 = ir.new_inst(g_cur_block, 30, -1)  // br merge
     ir.add_operand(br2, merge, 1)
@@ -1551,7 +1551,7 @@ func gen_catch_panic(id: i64) -> i64 {
 //（去掉隐藏 env 参数），体内 call 目标（闭包入口 call clos_<id>(ptr null, A...)；
 // 命名函数 call @func(A...)）→ ret。返回 @cb_<节点id> 地址（opcode 63 ptrtoint，
 // extern 函数指针参数按 string/ptr 槽消费，llvmgen to_ptr 直引 @sym）。
-func gen_cb_ptr(id: i64) -> i64 {
+func tig_cb_ptr(id: i64) -> i64 {
     var fn_node = call_arg(id, 0)
     var fty = node_types[fn_node]
     if fty < 0 || !types.is_fn(fty) {
@@ -1584,7 +1584,7 @@ func gen_cb_ptr(id: i64) -> i64 {
         }
         // 生成闭包入口函数 clos_<id>（cb_ptr 只取地址、不构造闭包值，但入口
         // 须落地，否则 thunk 引用 @clos_<id> 未定义）；返回值（闭包聚合）丢弃
-        var gv = gen_closure_lit(fn_node)
+        var gv = tig_closure_lit(fn_node)
         if gv < 0 {
             return -1
         }
@@ -1630,7 +1630,7 @@ func gen_cb_ptr(id: i64) -> i64 {
     }
     // 注意：所有值产生指令（const_i/load）必须在 call 指令**之前**创建——
     // ir_ops 是全局尾插，子表达式指令的操作数会落到 call 操作数区间中间
-    // 覆盖（历史：gen_int_lit 在 add_operand(call) 之间创建，const_i 的操作
+    // 覆盖（历史：tig_int_lit 在 add_operand(call) 之间创建，const_i 的操作
     // 数 L+2 覆盖 call 的 opnd2 → env 类型错乱成 i8 13）。
     var env_ld: i64 = -1
     if with_env == 1 {
@@ -1639,7 +1639,7 @@ func gen_cb_ptr(id: i64) -> i64 {
         var ea = ir.new_inst(g_cur_block, 20, types.named(TK_STR))  // alloca ptr
         ir.add_operand(ea, types.named(TK_STR), 2)
         var eap = ir.get_value(ea)
-        var nullv = gen_int_lit(0)  // const_i 0（store to_ptr → null）
+        var nullv = tig_int_lit(0)  // const_i 0（store to_ptr → null）
         var stn = ir.new_inst(g_cur_block, 22, -1)  // store ptr null
         ir.add_operand(stn, types.named(TK_STR), 2)
         ir.add_operand(stn, nullv, 0)
@@ -1673,14 +1673,14 @@ func gen_cb_ptr(id: i64) -> i64 {
     g_cur_func = saved_func
     g_cur_block = saved_block
     // 返回 @cb_<节点id> 地址（string/ptr 槽；extern 参数 to_ptr 直引 @sym）
-    g_builtin_res = gen_func_addr(cb_name)
+    g_builtin_res = tig_func_addr(cb_name)
     return 0
 }
 
 // struct 构造调用：StructName(args...) → 聚合值。
 // 布局：alloca 聚合 → 逐字段 store（实参覆盖前 n 个；缺省字段零值——
 // 字段默认字面量未登记，与 Rust 行为差异留待后续）→ load 聚合值。
-func gen_struct_construct(id: i64, nm: string) -> i64 {
+func tig_struct_construct(id: i64, nm: string) -> i64 {
     var nid = interner.intern(nm)
     var sidx = sstate.bs_find(st_keys, nid)
     if sidx < 0 {
@@ -1702,7 +1702,7 @@ func gen_struct_construct(id: i64, nm: string) -> i64 {
         var fty = fld_tys[off + i]
         var v: i64 = -1
         if i < nc {
-            v = gen_expr(sstate.child(id, soff + i))
+            v = tig_expr(sstate.child(id, soff + i))
             if v < 0 {
                 return -1
             }
@@ -1711,7 +1711,7 @@ func gen_struct_construct(id: i64, nm: string) -> i64 {
             var at = node_types[an]
             if at >= 0 && (types.is_int(at) || types.is_float(at)) &&
                 (types.is_int(fty) || types.is_float(fty)) && at != fty {
-                var cv = gen_coerce(v, at, fty)
+                var cv = tig_coerce(v, at, fty)
                 if cv < 0 {
                     return -1
                 }
@@ -1719,13 +1719,13 @@ func gen_struct_construct(id: i64, nm: string) -> i64 {
             }
         } else if off + i < len(fld_defs) && fld_defs[off + i] >= 0 {
             // 字段默认值（`var y: i64 = 10` → Point(5) 缺省 y 用 10）
-            v = gen_expr(fld_defs[off + i])
+            v = tig_expr(fld_defs[off + i])
             if v < 0 {
                 return -1
             }
         } else {
             // 无默认值字段：零值（i64=0 / string 空串指针 / bool false）
-            v = gen_default_val(fty)
+            v = tig_default_val(fty)
         }
         var gp = ir.new_inst(g_cur_block, 27, agg)  // agg_gep
         ir.add_operand(gp, ap, 0)
@@ -1744,18 +1744,18 @@ func gen_struct_construct(id: i64, nm: string) -> i64 {
 
 // 类型零值生成：i64/整数 → const 0；string/ptr → 空串全局常量；
 // bool → false；f64 → 0.0（const_f）；i8/i32 等 → 0 常量
-func gen_default_val(ty: i64) -> i64 {
+func tig_default_val(ty: i64) -> i64 {
     if ty == types.named(TK_STR) || types.is_table(ty) || types.is_map(ty) {
-        return gen_str_lit(interner.intern("\"\""))  // 空串指针
+        return tig_str_lit(interner.intern("\"\""))  // 空串指针
     }
     if ty == types.named(TK_F64) || ty == types.named(TK_F32) {
-        return gen_float_lit(interner.intern("0.0"))
+        return tig_float_lit(interner.intern("0.0"))
     }
     if ty == types.named(TK_BOOL) {
-        return gen_bool_lit(0)
+        return tig_bool_lit(0)
     }
     if ty == types.named(TK_I8) || ty == types.named(TK_CHAR) || ty == types.named(TK_TRIT) {
-        return gen_int_lit_ty(0, ty)
+        return tig_int_lit_ty(0, ty)
     }
     // 聚合类型（struct/enum/fn/tuple/port）：alloca + load 得零/未初始化聚合值。
     // 用于「switch 无 default 的 fallthrough 补 ret」等不可达代码——运行时不会
@@ -1769,12 +1769,12 @@ func gen_default_val(ty: i64) -> i64 {
         ir.add_operand(lz, zp, 0)
         return ir.get_value(lz)
     }
-    return gen_int_lit_ty(0, types.named(TK_I64))
+    return tig_int_lit_ty(0, types.named(TK_I64))
 }
 
 // 表字面量 → 动态表指针（tie_table_new + 逐元素 push）。
 // 元素类型：语义 node_types 首元素推断；空表 → i64 兜底。
-func gen_table_lit(id: i64) -> i64 {
+func tig_table_lit(id: i64) -> i64 {
     // E3 键值表（map）字面量：任一个 cell 带字符串键（TableCell → TableId，
     // TableId name = 字符串键池 id >= 0；数字键 name=-1 不算 map）→ 走 map 桥：
     // tie_table_new(16) + 逐对 tie_map_set / tie_map_set_string（键为字符串 ptr）。
@@ -1796,7 +1796,7 @@ func gen_table_lit(id: i64) -> i64 {
     }
     if has_str_key {
         // map 值类型：node_types[id] = map<V> → low 解码 V；裸 map 兜底 i64；
-        // 值为 string → tie_map_set_string（对齐 gen_index_read/assign 的 map 分支）。
+        // 值为 string → tie_map_set_string（对齐 tig_index_read/assign 的 map 分支）。
         var mval_ty: i64 = types.named(TK_I64)
         var lit_ty = node_types[id]
         if types.is_map(lit_ty) {
@@ -1818,11 +1818,11 @@ func gen_table_lit(id: i64) -> i64 {
                 sm_err_msg = "键值表字面量元素缺少字符串键（函数 " + g_cur_fn_name + "）"
                 return -1
             }
-            // 键字符串 → @.str.N 全局（gen_str_lit 去引号 + 登记常量；键借用约定：
+            // 键字符串 → @.str.N 全局（tig_str_lit 去引号 + 登记常量；键借用约定：
             // 字符串字面量是全局常量，比表存活更久——对齐 Rust string_global）
-            var k = gen_str_lit(s_names[cid2])
+            var k = tig_str_lit(s_names[cid2])
             var val = sstate.child(cell, 1)
-            var v = gen_expr(val)
+            var v = tig_expr(val)
             if v < 0 {
                 return -1
             }
@@ -1851,14 +1851,14 @@ func gen_table_lit(id: i64) -> i64 {
     var size = elem_size(elem)
     // 数字实参必须先转值 id（gen_ext_call* 的实参都是值 id，直接传数字
     // 会被当作值引用生成前向引用 %N）
-    var size_v = gen_int_lit_ty(size, types.named(TK_I64))
+    var size_v = tig_int_lit_ty(size, types.named(TK_I64))
     var t = s21_table_new(size_v)
     // 逐元素 push
     var i: i64 = 0
     while i < nc {
         var cell = sstate.child(id, i)
         var val = sstate.child(cell, 1)
-        var v = gen_expr(val)
+        var v = tig_expr(val)
         if v < 0 {
             return -1
         }
@@ -1902,7 +1902,7 @@ func gen_table_lit(id: i64) -> i64 {
 // 返回结果值 id（void 桥返回 -1，指令 ty=-1 无结果寄存器）。
 // 操作数布局：[0]=符号池id, [1]=返回类型id(IMM), 然后每参数 [类型id(IMM), 值]。
 // is_libc：true = libc 符号（不置 g_used_interp）；false = tie_interp 桥。
-func gen_ext_call_typed(sym: string, argtys: table<i64>, argv: table<i64>, ret_ty: i64) -> i64 {
+func tig_ext_call_typed(sym: string, argtys: table<i64>, argv: table<i64>, ret_ty: i64) -> i64 {
     if !is_libc_sym(sym) {
         g_used_interp = true
     }
@@ -1951,16 +1951,16 @@ func is_libc_sym(sym: string) -> bool {
 }
 
 // 便捷：单参数桥（返回非 void）
-func gen_ext_call1(sym: string, v: i64, vty: i64, ret_ty: i64) -> i64 {
+func tig_ext_call1(sym: string, v: i64, vty: i64, ret_ty: i64) -> i64 {
     var ats: table<i64> = table_new_i64()
     var avs: table<i64> = table_new_i64()
     table_push(ats, vty)
     table_push(avs, v)
-    return gen_ext_call_typed(sym, ats, avs, ret_ty)
+    return tig_ext_call_typed(sym, ats, avs, ret_ty)
 }
 
 // 符号扩展：src 类型值 → dst 类型（sext opcode 19）。trit/窄整数提升用。
-func gen_sext(v: i64, src_ty: i64, dst_ty: i64) -> i64 {
+func tig_sext(v: i64, src_ty: i64, dst_ty: i64) -> i64 {
     var sext = ir.new_inst(g_cur_block, 19, dst_ty)
     ir.add_operand(sext, src_ty, 2)  // 源类型 IMM
     ir.add_operand(sext, v, 0)
@@ -1969,7 +1969,7 @@ func gen_sext(v: i64, src_ty: i64, dst_ty: i64) -> i64 {
 
 // 整数 → f64 提升（sitofp opcode 28）：数学函数整数实参（sqrt(4)）转浮点。
 // 已是 f64/f32 直传；窄整数/无符号按有符号 sitofp（tie 整数有符号语义）。
-func gen_to_f64(v: i64, vt: i64) -> i64 {
+func tig_to_f64(v: i64, vt: i64) -> i64 {
     if types.is_int(vt) {
         var s = ir.new_inst(g_cur_block, 28, types.named(TK_F64))  // sitofp
         ir.add_operand(s, vt, 2)  // 源类型 IMM
@@ -1980,8 +1980,8 @@ func gen_to_f64(v: i64, vt: i64) -> i64 {
 }
 
 // i8 返回桥 → bool（i1）：call i8 → icmp ne i8 %r, 0（对齐 Rust i8→i1 转换）
-func gen_bool_bridge1(sym: string, v: i64, vty: i64) -> i64 {
-    var r = gen_ext_call1(sym, v, vty, types.named(TK_I8))
+func tig_bool_bridge1(sym: string, v: i64, vty: i64) -> i64 {
+    var r = tig_ext_call1(sym, v, vty, types.named(TK_I8))
     if r < 0 {
         return -1
     }
@@ -1993,8 +1993,8 @@ func gen_bool_bridge1(sym: string, v: i64, vty: i64) -> i64 {
 }
 
 // 双字符串参数 i8 返回桥 → bool（file_copy/file_move/untar_gz/unzip/copy_dir 等）
-func gen_bool_bridge2(sym: string, v1: i64, v2: i64) -> i64 {
-    var r = gen_ext_call2(sym, v1, types.named(TK_STR), v2, types.named(TK_STR), types.named(TK_I8))
+func tig_bool_bridge2(sym: string, v1: i64, v2: i64) -> i64 {
+    var r = tig_ext_call2(sym, v1, types.named(TK_STR), v2, types.named(TK_STR), types.named(TK_I8))
     if r < 0 {
         return -1
     }
@@ -2006,40 +2006,40 @@ func gen_bool_bridge2(sym: string, v1: i64, v2: i64) -> i64 {
 }
 
 // 便捷：双参数桥（返回非 void）
-func gen_ext_call2(sym: string, v1: i64, ty1: i64, v2: i64, ty2: i64, ret_ty: i64) -> i64 {
+func tig_ext_call2(sym: string, v1: i64, ty1: i64, v2: i64, ty2: i64, ret_ty: i64) -> i64 {
     var ats: table<i64> = table_new_i64()
     var avs: table<i64> = table_new_i64()
     table_push(ats, ty1)
     table_push(avs, v1)
     table_push(ats, ty2)
     table_push(avs, v2)
-    return gen_ext_call_typed(sym, ats, avs, ret_ty)
+    return tig_ext_call_typed(sym, ats, avs, ret_ty)
 }
 
 
 // 便捷：双参数 void 桥
-func gen_ext_call2v(sym: string, v1: i64, ty1: i64, v2: i64, ty2: i64) {
+func tig_ext_call2v(sym: string, v1: i64, ty1: i64, v2: i64, ty2: i64) {
     var ats: table<i64> = table_new_i64()
     var avs: table<i64> = table_new_i64()
     table_push(ats, ty1)
     table_push(avs, v1)
     table_push(ats, ty2)
     table_push(avs, v2)
-    gen_ext_call_typed(sym, ats, avs, -1)
+    tig_ext_call_typed(sym, ats, avs, -1)
 }
 
 // file_write/file_append：UTF-8 安全桥（tie_file_write / tie_file_append，
 // Rust std::fs 覆盖写 / OpenOptions 追加写）。曾用 libc fopen("wb"/"ab") +
 // fwrite——中文路径按 ANSI 代码页误读必失败。返回 bool（成功与否）。
-func gen_file_write(p: i64, c: i64, append: bool) -> i64 {
+func tig_file_write(p: i64, c: i64, append: bool) -> i64 {
     if append {
-        return gen_bool_bridge2("tie_file_append", p, c)
+        return tig_bool_bridge2("tie_file_append", p, c)
     }
-    return gen_bool_bridge2("tie_file_write", p, c)
+    return tig_bool_bridge2("tie_file_write", p, c)
 }
 
 // 便捷：四参数桥（返回非 void）
-func gen_ext_call4(sym: string, v1: i64, ty1: i64, v2: i64, ty2: i64, v3: i64, ty3: i64, v4: i64, ty4: i64) -> i64 {
+func tig_ext_call4(sym: string, v1: i64, ty1: i64, v2: i64, ty2: i64, v3: i64, ty3: i64, v4: i64, ty4: i64) -> i64 {
     var ats: table<i64> = table_new_i64()
     var avs: table<i64> = table_new_i64()
     table_push(ats, ty1)
@@ -2050,15 +2050,15 @@ func gen_ext_call4(sym: string, v1: i64, ty1: i64, v2: i64, ty2: i64, v3: i64, t
     table_push(avs, v3)
     table_push(ats, ty4)
     table_push(avs, v4)
-    return gen_ext_call_typed(sym, ats, avs, types.named(TK_I64))
+    return tig_ext_call_typed(sym, ats, avs, types.named(TK_I64))
 }
 
 // file_exists：UTF-8 安全桥（tie_file_exists，Rust std::fs File::open 探测）。
 // 曾用 libc fopen(path, "rb")——Windows ANSI 代码页误读 UTF-8 中文路径，
 // 中文目录/文件名的存在性检查必失败（tiec 编译中文路径源文件报"读取源码失败"）。
 // 桥返回 i8 → icmp ne 0 → bool（对齐 Rust i8→i1 转换）。
-func gen_file_exists(p: i64) -> i64 {
-    return gen_bool_bridge1("tie_file_exists", p, types.named(TK_STR))
+func tig_file_exists(p: i64) -> i64 {
+    return tig_bool_bridge1("tie_file_exists", p, types.named(TK_STR))
 }
 
 // ==================== 顶层入口 ====================
@@ -2076,7 +2076,7 @@ func gen_file_exists(p: i64) -> i64 {
 // 返回 0 成功 / -1 错误（sm_err_* 已置）。
 // ==================== 批次5 任务13：用户 extern 判定（稀疏 extern 名集） ====================
 // extern 函数仅声明无函数体（顶层 S_N_EXTERN=117，名集 g_extern_ids 见模块头）。
-// gen_user_call 判定 full 是 extern → 路由 op36（llvmgen 推导 declare + 字符串返回
+// tig_user_call 判定 full 是 extern → 路由 op36（llvmgen 推导 declare + 字符串返回
 // 自动扫描 char* → {ptr,len}）。
 
 // 收集模块全部 extern 函数名（顶层 extern 声明节点），懒初始化
@@ -2095,7 +2095,7 @@ func collect_extern_fns() {
 }
 
 // 判定 interned id 是否为用户 extern（稀疏表线性 id 比对，O(externs) ≈ O(1)）。
-// 入参为「已 interned」的函数全名 id（gen_user_call 的 sym），避免逐调用 re-intern。
+// 入参为「已 interned」的函数全名 id（tig_user_call 的 sym），避免逐调用 re-intern。
 func is_extern_fn_id(fid: i64) -> bool {
     if g_extern_ready == 0 {
         collect_extern_fns()
@@ -2127,7 +2127,7 @@ func asm_target_matches(arch: string) -> bool {
     return has_prefix(g_asm_target, arch + "-")
 }
 
-pub func gen_ast() -> i64 {
+pub func tig_ast() -> i64 {
     // 重置生成器状态
     g_sc_keys = table_new_i64()
     g_sc_allocas = table_new_i64()
@@ -2151,7 +2151,7 @@ pub func gen_ast() -> i64 {
     while i < n {
         var s = g_extra_tops[i]
         if s_tags[s] == 100 {
-            gen_global_var(s)
+            tig_global_var(s)
         }
         i = i + 1
     }
@@ -2161,7 +2161,7 @@ pub func gen_ast() -> i64 {
         var s = g_extra_tops[i]
         if s_tags[s] == 101 {
             // 顶层函数：全名 = 裸名
-            var r = gen_fn_def(s, "")
+            var r = tig_fn_def(s, "")
             if r < 0 {
                 if str_len(sm_err_msg) == 0 {
                     sm_err_msg = "顶层函数 " + sstate.name_str(s) + " 生成失败"
@@ -2170,7 +2170,7 @@ pub func gen_ast() -> i64 {
             }
         } else if s_tags[s] == 112 {
             // 命名空间：递归生成体内函数（全名 = ns 段::函数名）
-            var nr = gen_ns(s, "")
+            var nr = tig_ns(s, "")
             if nr < 0 {
                 if str_len(sm_err_msg) == 0 {
                     sm_err_msg = "顶层命名空间生成失败"
@@ -2185,9 +2185,9 @@ pub func gen_ast() -> i64 {
 
 // 生成 tie-IR（完整版）：内部调 semantic.check_src（parse + 语义 + import）
 // 填充 AST + 类型表，然后遍历顶层 FnDef。driver-lite.tie 与 backend/
-// _driver_test.tie 仍在使用；driver.tie 主路径改用 gen_ast() 避免重复前端。
+// _driver_test.tie 仍在使用；driver.tie 主路径改用 tig_ast() 避免重复前端。
 // 返回 0 成功 / -1 错误（sm_err_* 已置）
-pub func gen_src(src: string, base_dir: string) -> i64 {
+pub func tig_src(src: string, base_dir: string) -> i64 {
     var sem = semantic.check_src(src, base_dir)
     if str_len(sem) < 3 {
         return -1
@@ -2220,7 +2220,7 @@ pub func gen_src(src: string, base_dir: string) -> i64 {
     while i < n {
         var s = g_extra_tops[i]
         if s_tags[s] == 100 {
-            gen_global_var(s)
+            tig_global_var(s)
         }
         i = i + 1
     }
@@ -2230,7 +2230,7 @@ pub func gen_src(src: string, base_dir: string) -> i64 {
         var s = g_extra_tops[i]
         if s_tags[s] == 101 {
             // 顶层函数：全名 = 裸名
-            var r = gen_fn_def(s, "")
+            var r = tig_fn_def(s, "")
             if r < 0 {
                 if str_len(sm_err_msg) == 0 {
                     sm_err_msg = "顶层函数 " + sstate.name_str(s) + " 生成失败"
@@ -2239,7 +2239,7 @@ pub func gen_src(src: string, base_dir: string) -> i64 {
             }
         } else if s_tags[s] == 112 {
             // 命名空间：递归生成体内函数（全名 = ns 段::函数名）
-            var nr = gen_ns(s, "")
+            var nr = tig_ns(s, "")
             if nr < 0 {
                 if str_len(sm_err_msg) == 0 {
                     sm_err_msg = "顶层命名空间生成失败"
@@ -2253,15 +2253,15 @@ pub func gen_src(src: string, base_dir: string) -> i64 {
 }
 
 // ==================== S2.4 vtable / port 对象后端 ====================
-// reg_all_vtables / gen_ptr_tuple_ty / gen_port_coerce / gen_port_method_call 仍在
+// reg_all_vtables / tig_ptr_tuple_ty / tig_port_coerce / tig_port_method_call 仍在
 // 子文件 compiler/backend/irgen_vtable.tie（同 namespace 文本内联）。以下返回
-// gen_global_var / gen_ns / gen_fn_def 三个顶层入口 / 函数生成主逻辑。
+// tig_global_var / tig_ns / tig_fn_def 三个顶层入口 / 函数生成主逻辑。
 // 归属纠偏：这三个函数原被误移入子文件，现迁回主文件顶层入口分区。
 
 // 顶层全局变量声明（tag 100）：登记到 llvmgen 全局段。
 // 表全局 → @g = global ptr null（main 入口运行时创建，对齐 T0.4）；
 // 标量全局 → @g = global T <字面量零值>。
-func gen_global_var(s: i64) {
+func tig_global_var(s: i64) {
     var nm = sstate.name_str(s)
     var ty = sgen.parse_generic_type_node(sstate.child(s, 0))
     if ty < 0 {
@@ -2287,7 +2287,7 @@ func gen_global_var(s: i64) {
 }
 // 命名空间递归：生成体内全部函数（全名 = prefix::函数名）。
 // ns_node 为 N_NAMESPACE 节点：children=[Segment...]+[体 StmtList]。
-func gen_ns(ns_node: i64, prefix: string) -> i64 {
+func tig_ns(ns_node: i64, prefix: string) -> i64 {
     var segs: table<string> = table_new_string()
     var nseg = s_aux[ns_node]
     var k: i64 = 0
@@ -2314,7 +2314,7 @@ func gen_ns(ns_node: i64, prefix: string) -> i64 {
         var st = sstate.child(body, i)
         var tag = s_tags[st]
         if tag == 101 {
-            var r = gen_fn_def(st, full_pre)
+            var r = tig_fn_def(st, full_pre)
             if r < 0 {
                 if str_len(sm_err_msg) == 0 {
                     sm_err_msg = "命名空间 " + full_pre + " 的函数 " + sstate.name_str(st) + " 生成失败"
@@ -2322,7 +2322,7 @@ func gen_ns(ns_node: i64, prefix: string) -> i64 {
                 return -1
             }
         } else if tag == 112 {
-            var nr = gen_ns(st, full_pre)
+            var nr = tig_ns(st, full_pre)
             if nr < 0 {
                 return -1
             }
@@ -2334,7 +2334,7 @@ func gen_ns(ns_node: i64, prefix: string) -> i64 {
 
 // 函数定义 → tie-IR 函数。prefix 为命名空间前缀（顶层函数传 ""）。
 // 函数全名 = prefix::name（命名空间函数）；LLVM 符号由 llvmgen 转 $。
-func gen_fn_def(fn_node: i64, prefix: string) -> i64 {
+func tig_fn_def(fn_node: i64, prefix: string) -> i64 {
     // 泛型模板声明（children[0] == N_TYPE_PARAMS）：T3b 单态化前不生成 IR——
     // 模板体内 TypeVar 类型（"T"）无法静态编码，生成会报"类 'T' 未定义"。
     // 语义层已把模板登记进 gt_* 表并跳过普通函数检查；此处对称跳过生成。
@@ -2458,7 +2458,7 @@ func gen_fn_def(fn_node: i64, prefix: string) -> i64 {
             var gte = gb_telem[gi]
             if gte >= 0 {
                 var gsz = elem_size(gte)
-                var gsz_v = gen_int_lit_ty(gsz, types.named(TK_I64))
+                var gsz_v = tig_int_lit_ty(gsz, types.named(TK_I64))
                 var gnt = s21_table_new(gsz_v)
                 if gnt < 0 {
                     return -1
@@ -2473,7 +2473,7 @@ func gen_fn_def(fn_node: i64, prefix: string) -> i64 {
     }
     // 函数体：children[slot_off + 1 + nparams]
     var body = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + nparams)
-    var r = gen_block_stmts(body)
+    var r = tig_block_stmts(body)
     if r < 0 {
         return -1
     }
@@ -2505,7 +2505,7 @@ func gen_fn_def(fn_node: i64, prefix: string) -> i64 {
                 // string/ptr 用空串常量（曾用 IMM 0——llvmgen ret 的 to_ptr
                 // 把字面量 0 误当值 id 0 → ret ptr %0 类型错）。
                 // **先建常量再建 ret**：ret 指令会终止块，其后不能追加指令
-                var dv = gen_default_val(ret_ty)
+                var dv = tig_default_val(ret_ty)
                 var ret = ir.new_inst(g_cur_block, 32, ret_ty)
                 ir.add_operand(ret, dv, 0)
             }

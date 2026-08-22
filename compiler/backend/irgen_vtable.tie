@@ -1,8 +1,8 @@
 type tie<class>
 // compiler/backend/irgen_vtable.tie —— 生成器"S2.4 vtable / port 对象后端" 子模块
 // ============================================================
-// 从 irgen.tie 拆分而来：把 S2.4 分区（reg_all_vtables / gen_ptr_tuple_ty /
-// gen_port_coerce / gen_port_method_call）独立成子文件。纯搬运、不改任何逻辑，
+// 从 irgen.tie 拆分而来：把 S2.4 分区（reg_all_vtables / tig_ptr_tuple_ty /
+// tig_port_coerce / tig_port_method_call）独立成子文件。纯搬运、不改任何逻辑，
 // 保持逐字一致。
 //
 // 拆分范式：【同 namespace 跨文件】（文本内联）。
@@ -10,18 +10,18 @@ type tie<class>
 // 其中所有代码全局可见。本文件声明与 irgen.tie 相同的 `namespace irgen`，
 // tie 允许同名 namespace 横跨多文件（进编译单元后为同一 namespace）闭合并集。
 //   - 同 namespace 的函数可互相裸名调用（irgen.tie 主文件仍可按原样裸名调用
-//     本文件内的 reg_all_vtables / gen_ptr_tuple_ty / gen_port_coerce /
-//     gen_port_method_call 等，无需改名）；
+//     本文件内的 reg_all_vtables / tig_ptr_tuple_ty / tig_port_coerce /
+//     tig_port_method_call 等，无需改名）；
 //   - 同理可访问主文件顶层全局 var（g_* 表、s_* / im_* / node_types /
 //     s_tags / s_vals / s_aux / g_cur_fn_name / g_cur_func / g_cur_block /
 //     sm_err_msg 等，均为编译单元内顶层全局，命名空间体内不允许 var）；
 //   - 本文件经 import 文本内联，只含函数与注释，不含顶层全局 var 声明——
 //     全局 var 仍留在 irgen.tie 主文件，避免重复定义。
-//   - 被搬函数内的裸名调用（gen_tuple_ty / gen_agg_addr / gen_expr /
-//     gen_ext_call1 / gen_int_lit_ty / gen_int_lit 等核心区函数）保持不变
+//   - 被搬函数内的裸名调用（tig_tuple_ty / tig_agg_addr / tig_expr /
+//     tig_ext_call1 / tig_int_lit_ty / tig_int_lit 等核心区函数）保持不变
 //     （同 namespace 跨文件仍解析）。
 // 归属纠偏：此前随 S2.4 分区一并移出、实为顶层入口/函数生成主逻辑的
-// gen_global_var / gen_ns / gen_fn_def 三个函数已迁回 irgen.tie（顶层入口分区），
+// tig_global_var / tig_ns / tig_fn_def 三个函数已迁回 irgen.tie（顶层入口分区），
 // 本文件只保留 4 个 vtable / port 对象后端函数，命名与职责匹配。
 // 依赖约定：ir.* / types / interner / intern / sstate / sgen / sinfer / llvmgen
 // 等经主文件既有 import 链内联可达（本文件不重复 import）。
@@ -63,15 +63,15 @@ func reg_all_vtables() {
 
 // N 字段全 ptr 聚合类型（打包对象 {ptr,ptr} / vtable {ptr×N}）：
 // 复用 sstate tuple 登记（tup_* 表），字段类型全 TK_STR（LLVM ptr）。
-// 查重复用 gen_tuple_ty（布局相同即同 id）。
-func gen_ptr_tuple_ty(n: i64) -> i64 {
+// 查重复用 tig_tuple_ty（布局相同即同 id）。
+func tig_ptr_tuple_ty(n: i64) -> i64 {
     var ftys: table<i64> = table_new_i64()
     var k: i64 = 0
     while k < n {
         table_push(ftys, types.named(TK_STR))
         k = k + 1
     }
-    return gen_tuple_ty(ftys)
+    return tig_tuple_ty(ftys)
 }
 
 // 提升代码生成：具体类型值（struct）→ port 对象（打包 {data, vtable}）。
@@ -81,7 +81,7 @@ func gen_ptr_tuple_ty(n: i64) -> i64 {
 //   打包 = malloc(16) + 两字段 store；返回打包对象指针（port 对象 = ptr）。
 // 生命周期归 arena/unsafe（调用方保证：被提升对象存活 ≥ 接口对象使用时间）。
 // init 为 struct 类型表达式（node_types[init] = K_STRUCT，语义层已校验 impl）。
-func gen_port_coerce(init: i64, port_ty: i64) -> i64 {
+func tig_port_coerce(init: i64, port_ty: i64) -> i64 {
     var s_ty = node_types[init]
     if s_ty < 0 {
         sm_err_msg = "提升操作数类型缺失（函数 " + g_cur_fn_name + "）"
@@ -89,17 +89,17 @@ func gen_port_coerce(init: i64, port_ty: i64) -> i64 {
     }
     var vt_name = "vt." + types.type_name(port_ty) + "." + types.type_name(s_ty)
     // struct 槽地址（self 按引用 = 传地址；Var → 槽地址，表达式落内存）
-    var addr = gen_agg_addr(init, s_ty)
+    var addr = tig_agg_addr(init, s_ty)
     if addr < 0 {
         return -1
     }
     // malloc(16)：打包对象 {ptr, ptr}
-    var size = gen_int_lit_ty(16, types.named(TK_I64))
-    var obj = gen_ext_call1("malloc", size, types.named(TK_I64), types.named(TK_STR))
+    var size = tig_int_lit_ty(16, types.named(TK_I64))
+    var obj = tig_ext_call1("malloc", size, types.named(TK_I64), types.named(TK_STR))
     if obj < 0 {
         return -1
     }
-    var tup2 = gen_ptr_tuple_ty(2)
+    var tup2 = tig_ptr_tuple_ty(2)
     // [0] = data（struct 槽地址）
     var g0 = ir.new_inst(g_cur_block, 27, tup2)  // agg_gep
     ir.add_operand(g0, obj, 0)
@@ -127,10 +127,10 @@ func gen_port_coerce(init: i64, port_ty: i64) -> i64 {
 //   vtable = gep(obj, 1) → load → entry = vtable[方法序号] → load 函数指针
 //   指令：call_indirect [entry, ret_ty IMM, env=data, (ty, val)...]
 // 注意：**先求值全部实参收集到表，再 new_inst + add_operand**——实参求值
-// （gen_expr）会生成新指令并 push 操作数，若穿插在 call 指令的 add_operand
+// （tig_expr）会生成新指令并 push 操作数，若穿插在 call 指令的 add_operand
 // 之间会导致操作数段交错（const_i 的字面量被算进 call 段，实参错位）。
-// 与闭包 gen_call_indirect 同模式。
-func gen_port_method_call(id: i64, recv: i64, pty: i64, mname: string) -> i64 {
+// 与闭包 tig_call_indirect 同模式。
+func tig_port_method_call(id: i64, recv: i64, pty: i64, mname: string) -> i64 {
     var pi = types.low(pty)
     var mi = sstate.port_method_idx(pi, mname)
     if mi < 0 {
@@ -139,11 +139,11 @@ func gen_port_method_call(id: i64, recv: i64, pty: i64, mname: string) -> i64 {
     }
     var ret_ty = sstate.port_method_ret(pi, mi)
     // 接收者值：port 对象（ptr）
-    var recv_v = gen_expr(recv)
+    var recv_v = tig_expr(recv)
     if recv_v < 0 {
         return -1
     }
-    var tup2 = gen_ptr_tuple_ty(2)
+    var tup2 = tig_ptr_tuple_ty(2)
     // data = gep(obj, 0) → load ptr
     var g0 = ir.new_inst(g_cur_block, 27, tup2)  // agg_gep
     ir.add_operand(g0, recv_v, 0)
@@ -157,7 +157,7 @@ func gen_port_method_call(id: i64, recv: i64, pty: i64, mname: string) -> i64 {
     var ld1 = ir.new_inst(g_cur_block, 21, types.named(TK_STR))  // load ptr
     ir.add_operand(ld1, ir.get_value(g1), 0)
     // entry = vtable[方法序号]：vtable 聚合类型 = {ptr × port 方法数}
-    var vt_ty = gen_ptr_tuple_ty(pm_n[pi])
+    var vt_ty = tig_ptr_tuple_ty(pm_n[pi])
     var g2 = ir.new_inst(g_cur_block, 27, vt_ty)  // agg_gep
     ir.add_operand(g2, ir.get_value(ld1), 0)
     ir.add_operand(g2, mi, 2)
@@ -169,7 +169,7 @@ func gen_port_method_call(id: i64, recv: i64, pty: i64, mname: string) -> i64 {
     var argvals: table<i64> = table_new_i64()
     var j: i64 = 1 + soff2
     while j < nc {
-        var av = gen_expr(sstate.child(id, j))
+        var av = tig_expr(sstate.child(id, j))
         if av < 0 {
             return -1
         }
@@ -195,7 +195,7 @@ func gen_port_method_call(id: i64, recv: i64, pty: i64, mname: string) -> i64 {
         j = j + 1
     }
     if ret_ty == types.named(TK_VOID) {
-        return gen_int_lit(0)  // void 结果：哑值（调用方丢弃）
+        return tig_int_lit(0)  // void 结果：哑值（调用方丢弃）
     }
     return ir.get_value(inst)
 }

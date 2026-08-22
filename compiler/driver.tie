@@ -3,8 +3,8 @@ type tie<logic>
 // ============================================================
 // 对齐 Rust crates/tie-llvm/src/main.rs + driver.rs：参数解析、角色分派、
 // 消息格式、退出码。组装前端（parse_ast/check_ast，T5.3 内存 AST 版）+ 中端
-//（irgen.gen_ast/llvmgen.emit）+ 后端（backend/toolchain.tie）。中端用
-// gen_ast()（AST 已由 frontend 就绪，不再二次执行前端；gen_src 由
+//（irgen.tig_ast/llvmgen.emit）+ 后端（backend/toolchain.tie）。中端用
+// tig_ast()（AST 已由 frontend 就绪，不再二次执行前端；tig_src 由
 // driver-lite/_driver_test 使用）。
 //
 // 用法：tiec <input.tie> [-o <out>] [-O0|-O1|-O2|-O3] [--target <三元组>]
@@ -609,7 +609,7 @@ func main() -> i64 {
 
 // 编译工具链（logic / library）：前端 → 中端 → 后端。
 // 阶段计时（TIEC_TIME=1）：irgen / emit / 写盘分开计量。
-var g_t_irgen: i64 = 0;   // irgen.gen_ast 耗时（ms）
+var g_t_irgen: i64 = 0;   // irgen.tig_ast 耗时（ms）
 var g_t_emit: i64 = 0;    // llvmgen.emit 耗时（ms）
 var g_t_write: i64 = 0;   // file_write 耗时（ms）
 func compile_program(src: string) -> i64 {
@@ -621,8 +621,8 @@ func compile_program(src: string) -> i64 {
     }
     // 中端：AST → tie-IR → .ll 文本
     // frontend() 已执行完整前端（parse_ast + check_ast），sstate 全局表/
-    // g_extra_tops/node_types 均已就绪——直接 gen_ast() 复用，避免前端重复
-    // 执行（gen_src 内部会再 parse + check_impl 一遍，行为等价但浪费一倍）
+    // g_extra_tops/node_types 均已就绪——直接 tig_ast() 复用，避免前端重复
+    // 执行（tig_src 内部会再 parse + check_impl 一遍，行为等价但浪费一倍）
     // 任务17：asm! 平台条件编译注入编译目标（CLI --target > 配置 target >
     // 本机默认 x86_64-pc-windows-msvc）。
     var asm_target = normalize_target(g_target)
@@ -639,7 +639,7 @@ func compile_program(src: string) -> i64 {
     unsafe {
         var t2 = clock()
     }
-    var rc = irgen.gen_ast()
+    var rc = irgen.tig_ast()
     unsafe {
         var t2e = clock()
     }

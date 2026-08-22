@@ -721,7 +721,7 @@ func gen_inst(inst_id: i64) {
         // S2.1：升级为 {ptr,len} 布局——malloc 8 头 + 数据 + \0：
         //   buf[0..8)  = i64 总长（O(1) len 读取）；buf[8..] = UTF-8 数据；
         //   数据末尾 \0（FFI 边界自动 NUL，旧 strlen/strcmp/printf 兼容）。
-        // 对齐 Rust gen_binary_str 的 Add：strlen+strlen → malloc(len1+len2+9)
+        // 对齐 Rust tig_binary_str 的 Add：strlen+strlen → malloc(len1+len2+9)
         // → 写头 → memcpy 两段 → 末尾 \0。
         var lv = ir.ins_opnd(inst_id, 0)
         var rv = ir.ins_opnd(inst_id, 1)
