@@ -1,0 +1,25 @@
+type tie<logic>
+// 一期并发 A4 Step6：处理器 panic → actor 线程捕获存活。
+// async 方法内部 panic：actor 线程 setjmp 捕获 → 置 fail+done → 线程继续服务。
+// 随后同步 get() 验证 actor 线程仍在（fire-and-forget 的 panic 不会杀线程）。
+actor Worker {
+    var done: i64 = 0
+    pub async func jitter() {
+        done = done + 1
+        panic("boom!")
+    }
+    pub func get() -> i64 {
+        return done
+    }
+}
+func main() {
+    var w = run Worker()
+    w.jitter()          // async：handler panic，actor 线程内部捕获，存活
+    var v = w.get()     // 同步：actor 线程仍在服务 → 1
+    println("panic 后 actor 仍存活 done=" + to_string(v))
+    if v == 1 {
+        println("A4 panic 存活通过")
+    } else {
+        println("A4 panic 存活失败")
+    }
+}

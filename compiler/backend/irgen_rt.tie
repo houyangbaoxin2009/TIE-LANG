@@ -541,6 +541,7 @@ func gen_actor_loop_eager() {
     var resp = s21_gep(recp, 88, true)
     var donep = s21_gep(recp, 96, true)
     var dispp = s21_gep(recp, 104, true)
+    var failp = s21_gep(recp, 112, true)
     var loop = ir.new_block(fid, interner.intern("al.loop"))
     var check = ir.new_block(fid, interner.intern("al.chk"))
     var mb = ir.new_block(fid, interner.intern("al.mb"))
@@ -601,7 +602,7 @@ func gen_actor_loop_eager() {
     tig_ext_call_typed("LeaveCriticalSection", atsL, avsL, -1)
     var bw = ir.new_inst(g_cur_block, 30, -1)  // br loop
     ir.add_operand(bw, loop, 1)
-    // work：取 mid/arg0，清 pending，解锁，间接调 dispatch，写 result+done，唤醒
+    // work：取 mid/arg0，清 pending，解锁，setjmp 捕获 handler panic
     g_cur_block = work
     var mid_v = s21_load(midp, T64)
     var arg_v = s21_load(argp, T64)
@@ -612,25 +613,85 @@ func gen_actor_loop_eager() {
     table_push(atsW2, types.named(TK_STR))
     table_push(avsW2, lockp)
     tig_ext_call_typed("LeaveCriticalSection", atsW2, avsW2, -1)
-    // funcptr = inttoptr(disp)；op70 call_indirect(entry, ret, env=recp, mid, arg)
+    // setjmp 捕获点（handler panic → longjmp 回此）
+    llvmgen.catch_enable()
+    var fa2 = ir.new_inst(g_cur_block, 36, types.ptr_of(types.named(TK_I8)))  // frameaddress
+    ir.add_operand(fa2, interner.intern("llvm.frameaddress.p0"), 0)
+    ir.add_operand(fa2, types.ptr_of(types.named(TK_I8)), 2)
+    ir.add_operand(fa2, types.named(TK_I32), 2)
+    ir.add_operand(fa2, 0, 2)
+    var fa_v = ir.get_value(fa2)
+    var jb_id = interner.intern("@tie_panic_jb")
+    var sj = ir.new_inst(g_cur_block, 36, types.named(TK_I32))  // _setjmp
+    ir.add_operand(sj, interner.intern("_setjmp"), 0)
+    ir.add_operand(sj, types.named(TK_I32), 2)
+    ir.add_operand(sj, types.named(TK_STR), 2)
+    ir.add_operand(sj, jb_id, 3)
+    ir.add_operand(sj, types.named(TK_STR), 2)
+    ir.add_operand(sj, fa_v, 0)
+    var sj_v = ir.get_value(sj)
+    var z32 = tig_int_lit_ty(0, types.named(TK_I32))
+    var is0 = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp eq
+    ir.add_operand(is0, sj_v, 0)
+    ir.add_operand(is0, z32, 0)
+    ir.add_operand(is0, 0, 2)
+    var wok = ir.new_block(fid, interner.intern("al.wok"))
+    var wcap = ir.new_block(fid, interner.intern("al.wcap"))
+    var wsign = ir.new_block(fid, interner.intern("al.wsign"))
+    var cbr2 = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cbr2, ir.get_value(is0), 0)
+    ir.add_operand(cbr2, wok, 1)
+    ir.add_operand(cbr2, wcap, 1)
+    // wok：active=1 → dispatch → active=0 → 置 result/fail=0 → wsign
+    var act_id = interner.intern("@tie_panic_active")
+    g_cur_block = wok
+    var trA = tig_bool_lit(1)
+    var stA1 = ir.new_inst(g_cur_block, 22, -1)
+    ir.add_operand(stA1, types.named(TK_BOOL), 2)
+    ir.add_operand(stA1, trA, 0)
+    ir.add_operand(stA1, act_id, 3)
     var fp = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr
     ir.add_operand(fp, disp, 0)
     var fpv = ir.get_value(fp)
     var ci = ir.new_inst(g_cur_block, 70, T64)  // call_indirect
     ir.add_operand(ci, fpv, 0)
-    ir.add_operand(ci, T64, 2)  // 返回类型 IMM
-    ir.add_operand(ci, recp, 0) // env（record ptr）
-    ir.add_operand(ci, T64, 2)  // mid 类型
+    ir.add_operand(ci, T64, 2)
+    ir.add_operand(ci, recp, 0)
+    ir.add_operand(ci, T64, 2)
     ir.add_operand(ci, mid_v, 0)
-    ir.add_operand(ci, T64, 2)  // arg 类型
+    ir.add_operand(ci, T64, 2)
     ir.add_operand(ci, arg_v, 0)
     var res = ir.get_value(ci)
+    var fA0 = tig_bool_lit(0)
+    var stA2 = ir.new_inst(g_cur_block, 22, -1)  // active=0
+    ir.add_operand(stA2, types.named(TK_BOOL), 2)
+    ir.add_operand(stA2, fA0, 0)
+    ir.add_operand(stA2, act_id, 3)
     var atsE2: table<i64> = table_new_i64()
     var avsE2: table<i64> = table_new_i64()
-    table_push(atsE2, types.named(TK_STR))
-    table_push(avsE2, lockp)
+    table_push(atsE2, types.named(TK_STR)); table_push(avsE2, lockp)
     tig_ext_call_typed("EnterCriticalSection", atsE2, avsE2, -1)
     s21_store(resp, res, T64)
+    s21_store(failp, tig_int_lit_ty(0, T64), T64)
+    var bwok = ir.new_inst(g_cur_block, 30, -1)  // br wsign
+    ir.add_operand(bwok, wsign, 1)
+    // wcap：handler panic（longjmp 跳回）→ active=0 → 置 fail=1/result=0 → wsign
+    g_cur_block = wcap
+    var fA1 = tig_bool_lit(0)
+    var stA3 = ir.new_inst(g_cur_block, 22, -1)  // active=0
+    ir.add_operand(stA3, types.named(TK_BOOL), 2)
+    ir.add_operand(stA3, fA1, 0)
+    ir.add_operand(stA3, act_id, 3)
+    var atsE3: table<i64> = table_new_i64()
+    var avsE3: table<i64> = table_new_i64()
+    table_push(atsE3, types.named(TK_STR)); table_push(avsE3, lockp)
+    tig_ext_call_typed("EnterCriticalSection", atsE3, avsE3, -1)
+    s21_store(resp, tig_int_lit_ty(0, T64), T64)
+    s21_store(failp, tig_int_lit_ty(1, T64), T64)
+    var bwcap = ir.new_inst(g_cur_block, 30, -1)  // br wsign
+    ir.add_operand(bwcap, wsign, 1)
+    // wsign：done=1；Wake；解锁；回 loop
+    g_cur_block = wsign
     s21_store(donep, tig_int_lit_ty(1, T64), T64)
     var atsWk: table<i64> = table_new_i64()
     var avsWk: table<i64> = table_new_i64()
@@ -1032,9 +1093,39 @@ func gen_actor_sync_call(rech: i64, mi: i64, arg_v: i64, ret_ty: i64, is_async: 
     tig_ext_call_typed("SleepConditionVariableCS", atsW2, avsW2, types.named(TK_I8))
     var bw2 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(bw2, gate2, 1)
-    // done：读 result；解锁；返回
+    // done：读 result / fail；fail≠0 → raise（打印+退出）；否则解锁返回
     g_cur_block = doneb
     var res = s21_load(resp, T64)
+    var failp2 = s21_gep(rec_ptr, 112, true)
+    var fv = s21_load(failp2, T64)
+    var fz = tig_int_lit_ty(0, T64)
+    var isf = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp ne
+    ir.add_operand(isf, fv, 0)
+    ir.add_operand(isf, fz, 0)
+    ir.add_operand(isf, 1, 2)
+    var raiseb = ir.new_block(g_cur_func, interner.intern("s.raise"))
+    var okb = ir.new_block(g_cur_func, interner.intern("s.ok"))
+    var cbf = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cbf, ir.get_value(isf), 0)
+    ir.add_operand(cbf, raiseb, 1)
+    ir.add_operand(cbf, okb, 1)
+    // raise：解锁 → 打印「actor 方法 panic」→ exit(1)（noreturn，死 br 补 terminator）
+    g_cur_block = raiseb
+    var atsR: table<i64> = table_new_i64()
+    var avsR: table<i64> = table_new_i64()
+    table_push(atsR, P); table_push(avsR, lockp)
+    tig_ext_call_typed("LeaveCriticalSection", atsR, avsR, -1)
+    var fmtR = interner.intern("%s\n")
+    var msgR = tig_str_lit(interner.intern("\"actor 方法 panic\""))
+    var pri = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
+    ir.add_operand(pri, fmtR, 0)
+    ir.add_operand(pri, msgR, 0)
+    var oneR = tig_int_lit_ty(1, T64)
+    tig_ext_call1("exit", oneR, T64, -1)
+    var brR = ir.new_inst(g_cur_block, 30, -1)  // 死 br（terminator）
+    ir.add_operand(brR, okb, 1)
+    // ok：解锁；返回（void → 哑值）
+    g_cur_block = okb
     var atsL2: table<i64> = table_new_i64()
     var avsL2: table<i64> = table_new_i64()
     table_push(atsL2, P); table_push(avsL2, lockp)

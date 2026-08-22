@@ -1,0 +1,15 @@
+type tie<logic>
+// 一期并发 A4 Step6：处理器 panic → 调用方 raise。
+// 同步调用一个 panic 的方法：actor 线程 setjmp 捕获置 fail，调用方同步等待
+// done 后读到 fail → raise（打印「actor 方法 panic」并退出非零）。
+// 本探针预期打印 raise 消息并非零退出（验收点：消息可见 + 不悬垂/不死锁）。
+actor Bomb {
+    pub func explode() -> i64 {
+        panic("bomb!")
+    }
+}
+func main() {
+    var b = run Bomb()
+    var x = b.explode()   // 同步 → 调用方 raise（打印 + 退出）
+    println("不应到达 x=" + to_string(x))
+}
