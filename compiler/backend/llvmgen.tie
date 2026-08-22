@@ -21,6 +21,13 @@ type tie<class>
 import "../middle/ir.tie"
 import "../../std/utf.tie"
 
+// emit 子阶段计时（性能诊断，TIEC_TIME=1 时输出）：函数生成 vs 归并。
+// GetTickCount extern 在 semantic.tie 顶层声明（跨文件 extern 全局可调用，
+// 本文件不重复声明——编译器禁止跨文件重复定义同一 extern）。
+var e_t_funcs: i64 = 0
+var e_t_join: i64 = 0
+var g_t_ren: i64 = 0  // renumber_lines 累计（全部函数）
+
 // ==================== 输出缓冲 ====================
 // 行收集表：line() 只追加（O(1)），emit() 末尾分治拼接成完整文本。
 // 避免 `out_buf = out_buf + s` 的 O(N²) 全量拷贝——tie 字符串不可变，
@@ -513,24 +520,27 @@ func line(s: string) {
 }
 
 // 行首去空白（重编号判定用；llvmgen 不 import std/string 避免菱形 import，
-// 这里只剥空格/制表符）
+// 这里只剥空格/制表符）。
+// 性能重构（emit ren 7.4s 热点）：旧版第 2 循环 `sub = sub + str_char(s, i)`
+// 逐码点拼接 O(n²)（每次 str_cat 分配新串），且重编号路径每行调用 2 次
+// （renumber_lines no_num 判定 + renumber_line lead_def 判定）。IR 行纯 ASCII
+// → 字节索引 == 码点索引，改字节探测（O(1) str_byte）+ str_sub_bytes 单次
+// memcpy（O(n)），消除 O(n²)。
 func str_trim_left(s: string) -> string {
-    var n = str_len(s)
+    var n = len(s)
     var i: i64 = 0
     while i < n {
-        var c = str_char(s, i)
-        if c == " " || c == "\t" {
+        var b = str_byte(s, i)
+        if b == 32 || b == 9 {   // 空格 / 制表符
             i = i + 1
         } else {
             break
         }
     }
-    var sub: string = ""
-    while i < n {
-        sub = sub + str_char(s, i)
-        i = i + 1
+    if i >= n {
+        return ""
     }
-    return sub
+    return str_sub_bytes(s, i, n)
 }
 
 // 前缀判定：s 是否以 pre 开头（str_char 逐字符比较，不依赖 std/string）
@@ -599,29 +609,64 @@ func renumber_lines() {
     g_fn_lines = out
 }
 
+// 本地 i64 → StringBuilder（性能重构）：按位数分支直接输出 ASCII 字节。
+// 替代 to_string——to_string 是 irgen 内联的整段除法循环 IR（每次 ~40 条
+// 指令 + 运行时分配），renumber_line 每 %N 一次，53 万行 × 每行 1-2 个 %N
+// = 上百万次 IR 爆炸（emit 阶段 ren 7.3s 的根源）。值编号恒 ≥0 小整数。
+func sb_append_i64(sb: i64, v: i64) {
+    if v < 10 {
+        sb_append_byte(sb, 48 + v)
+    } else if v < 100 {
+        sb_append_byte(sb, 48 + v / 10)
+        sb_append_byte(sb, 48 + v % 10)
+    } else if v < 1000 {
+        sb_append_byte(sb, 48 + v / 100)
+        sb_append_byte(sb, 48 + (v / 10) % 10)
+        sb_append_byte(sb, 48 + v % 10)
+    } else if v < 10000 {
+        sb_append_byte(sb, 48 + v / 1000)
+        sb_append_byte(sb, 48 + (v / 100) % 10)
+        sb_append_byte(sb, 48 + (v / 10) % 10)
+        sb_append_byte(sb, 48 + v % 10)
+    } else {
+        // 通用回退（值 ≥10000，极少触发）：逆序收集再正序输出
+        var digits = table_new_i64()
+        var x = v
+        while x > 0 {
+            table_push(digits, 48 + x % 10)
+            x = x / 10
+        }
+        var k = len(digits) - 1
+        while k >= 0 {
+            sb_append_byte(sb, digits[k])
+            k = k - 1
+        }
+    }
+}
+
 // 单行重编号：行内每个 `%N`（N 为纯数字）重映射；`%scN`/`%extN` 非纯数字不动。
 // 定义/引用区分（关键）：行首 `%N = ...` 的 %N 是**指令定义**（总是分配新号，
 // 即使 N < g_pcnt——函数体值 id 每函数从 0 起，alloca %0 可能与形参位置 %0
 // 撞号）；行内其余 %N 引用按 ren_ref：N < g_pcnt 是形参位置引用（原样保留，
 // define 形参列表 %0..%N-1 不变），否则复用指令映射。
 func renumber_line(ln: string) -> string {
-    // 性能重写（O(len)）：字节级扫描（%/数字全 ASCII）+ StringBuilder 输出 +
-    // 数字值累算（免 digs 字符串拼接与 parse_int）。旧版逐字符 out + c 拼接
-    // × str_char 从头跳 = 每行 O(len²)，全部生成行累计为 emit 阶段平方热点。
+    // 性能重构（段拷贝）：探测仍逐字节 str_byte（O(1) 轻量），但非 % 的普通
+    // 字节连续段用 str_sub_bytes 一次整拷入 sb（O(段长) 单次 memcpy）。sb 调用
+    // 次数 = 行内 %N 数 + 1，而非字节数——消除逐字节 sb_append_byte 的增长检查
+    // 与写回开销（emit ren 7.5s 主因）。值编号用小整数分支转写（免 to_string
+    // 内联 IR 爆炸）。定义/引用区分优先按「行首 %N =」模式判定。
     var n = len(ln)
     var t = str_trim_left(ln)
-    // 检测定义：trim 后以 % 开头且首 %N 后跟 " ="
+    var tn = len(t)
+    // 检测行首定义：trim 后以 % 开头且首 %N 后跟 " ="
     var lead_def: bool = false
     var lead_end: i64 = -1  // 定义 %N 在原始 ln 中的结束下标（字节）
-    var tn = len(t)
     if tn > 0 && str_byte(t, 0) == 37 {
         var dj: i64 = 1
-        var dval: i64 = 0
         var dcnt: i64 = 0
         while dj < tn {
             var dc = str_byte(t, dj)
             if dc >= 48 && dc <= 57 {
-                dval = dval * 10 + (dc - 48)
                 dcnt = dcnt + 1
                 dj = dj + 1
             } else {
@@ -629,20 +674,19 @@ func renumber_line(ln: string) -> string {
             }
         }
         if dcnt > 0 && dj < tn && str_byte(t, dj) == 32 {
-            // 确认后跟 "= "（否则是引用行，如 `call @f(%0)`）
             var ek = dj + 1
             while ek < tn && str_byte(t, ek) == 32 {
                 ek = ek + 1
             }
             if ek < tn && str_byte(t, ek) == 61 {
                 lead_def = true
-                // trim 前导空白数 = len(ln) - len(t)，定义 %N 结束下标（字节）
                 lead_end = (len(ln) - tn) + dj
             }
         }
     }
     var sb = string_builder()
     var i: i64 = 0
+    var seg: i64 = 0  // 当前未拷贝字节段起点
     while i < n {
         var b = str_byte(ln, i)
         if b == 37 && i + 1 < n {
@@ -661,6 +705,10 @@ func renumber_line(ln: string) -> string {
                 }
             }
             if nd > 0 {
+                // 先整拷 [seg, i) 前缀普通字节段
+                if i > seg {
+                    sb_append(sb, str_sub_bytes(ln, seg, i))
+                }
                 var new_v: i64 = -1
                 // 定义位置：%N 后紧跟空格+等号才可能是定义；lead_end == j 时
                 // 恰是行首定义 %N（首字符 %，无前导空白）
@@ -669,13 +717,18 @@ func renumber_line(ln: string) -> string {
                 } else {
                     new_v = ren_ref(val)
                 }
-                sb_append(sb, "%" + to_string(new_v))
+                sb_append_byte(sb, 37)   // '%'
+                sb_append_i64(sb, new_v)
                 i = j
+                seg = j
                 continue
             }
         }
-        sb_append_byte(sb, b)
         i = i + 1
+    }
+    // 尾段 [seg, n)
+    if n > seg {
+        sb_append(sb, str_sub_bytes(ln, seg, n))
     }
     return sb_build(sb)
 }
@@ -2514,17 +2567,37 @@ pub func emit() -> string {
     // 各函数
     var nf = ir.func_count()
     var i: i64 = 0
+    unsafe {
+        var et0 = GetTickCount()
+    }
     while i < nf {
         gen_func(i)
         i = i + 1
     }
+    unsafe {
+        var et1 = GetTickCount()
+    }
+    e_t_funcs = et1 - et0
     // 字符串常量节
     line("")
     emit_strings()
     // SSO 短串池全局段 + @tie_sso_alloc helper：**必须在函数遍历之后**输出——
     // op56（str_cat）在 gen_func 时才调 sso_enable()，提前输出会漏 helper。
     emit_sso_globals()
-    return join_lines()
+    unsafe {
+        var et2 = GetTickCount()
+    }
+    var joined = join_lines()
+    unsafe {
+        var et3 = GetTickCount()
+    }
+    e_t_join = et3 - et2
+    // emit 子阶段计时报告（TIEC_TIME=1）
+    var etmv = get_env("TIEC_TIME")
+    if etmv == "1" {
+        println("[emit] funcs=" + to_string(e_t_funcs) + "ms ren=" + to_string(g_t_ren) + "ms join=" + to_string(e_t_join) + "ms")
+    }
+    return joined
 }
 
 func build_inst_blk() {
@@ -2644,7 +2717,16 @@ func gen_func(fid: i64) {
     line("")
     // 函数级缓冲收尾：行级重编号（%N → 连续新编号，解决 alloca 提升后的
     // 编号倒挂）后并入全局 out_lines，恢复全局 line() 目标。
+    // 子计时（累加至全局，emit 报告）：
+    var gft0: i64 = 0
+    unsafe {
+        gft0 = GetTickCount()
+    }
     renumber_lines()
+    unsafe {
+        var gft1 = GetTickCount()
+    }
+    g_t_ren = g_t_ren + (gft1 - gft0)
     var rn: i64 = 0
     while rn < len(g_fn_lines) {
         table_push(out_lines, g_fn_lines[rn])

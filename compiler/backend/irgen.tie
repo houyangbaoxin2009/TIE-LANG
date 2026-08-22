@@ -1005,6 +1005,20 @@ func gen_icmp_c(v0: i64, v1: i64, cc: i64) -> i64 {
     return ir.get_value(ic)
 }
 
+// 比较 v0 与字面 0（IMM 操作数，非值引用）。
+// 修复（段拷 bug 根因）：旧 `gen_icmp_c(v, 0, cc)` 把 0 作 VALUE 操作数 → 引用
+// 「值 id 0」（模块首个常量，如 const 8），跨函数悬挂引用 + 与形参 %0 撞号 →
+// renumber 误判为形参引用 → IR 类型错误（`icmp sle i64 %X, %0`，%0=ptr）。
+// 对齐 is_null 内置的写法（立即数 0 必须 IMM）：llvmgen icmp 对 ptr 上下文自动
+// 把字面 0 转 null（`icmp eq ptr %kp, null`）。
+func gen_cmp_zero(v0: i64, cc: i64) -> i64 {
+    var ic = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+    ir.add_operand(ic, v0, 0)
+    ir.add_operand(ic, 0, 2)  // IMM 0（llvmgen ptr 上下文 → null）
+    ir.add_operand(ic, cc, 2)
+    return ir.get_value(ic)
+}
+
 // and i1 快捷
 func gen_and_i1(v0: i64, v1: i64) -> i64 {
     var a2 = ir.new_inst(g_cur_block, 6, types.named(TK_BOOL))
@@ -6065,18 +6079,20 @@ func s21_sb_reset(hv: i64) -> i64 {
 // 每次 O(n) 从头跳）。二进制安全（UTF-8 边界由调用方保证）。
 func s21_str_sub_bytes(s: i64, lo: i64, hi: i64) -> i64 {
     var blen = s21_str_head_len(s)
-    // clamp：lo2 = max(lo, 0)；lo3 = min(lo2, blen)；hi 同款
-    var lo_neg = gen_icmp_c(lo, 0, 4)          // slt 0
+    // clamp：lo2 = max(lo, 0)；lo3 = min(lo2, blen)；hi 同款。
+    // 修复（段拷 bug 根因）：0 比较须走 gen_cmp_zero（IMM 字面 0），不能用
+    // gen_icmp_c 传值 id 0（悬挂引用 + 与形参 %0 撞号 → renumber 误判 → 类型错）。
+    var lo_neg = gen_cmp_zero(lo, 4)             // slt 0
     var lo2 = gen_select_i(lo_neg, gen_int_lit(0), lo, types.named(TK_I64))
     var lo_big = gen_icmp_c(lo2, blen, 3)      // sgt blen
     var lo3 = gen_select_i(lo_big, blen, lo2, types.named(TK_I64))
-    var hi_neg = gen_icmp_c(hi, 0, 4)
+    var hi_neg = gen_cmp_zero(hi, 4)
     var hi2 = gen_select_i(hi_neg, gen_int_lit(0), hi, types.named(TK_I64))
     var hi_big = gen_icmp_c(hi2, blen, 3)
     var hi3 = gen_select_i(hi_big, blen, hi2, types.named(TK_I64))
     // 长度 = hi3 - lo3；负值钳 0
     var d = s21_bin(1, hi3, lo3)               // sub
-    var d_neg = gen_icmp_c(d, 0, 4)
+    var d_neg = gen_cmp_zero(d, 4)
     var dl = gen_select_i(d_neg, gen_int_lit(0), d, types.named(TK_I64))
     // 分配 {头, 数据, \0, 32 尾垫}（与 sb_build 同布局）
     var buf = s21_sso_alloc(dl)
@@ -6352,14 +6368,14 @@ func s21_arr_find(data: i64, cnt: i64, key: i64, pos_slot: i64, found_slot: i64)
     var kaddr = s21_gep(data, s21_bin(2, mid, gen_int_lit(16)), false)
     var mk = s21_load(kaddr, types.named(TK_STR))
     var cmp = gen_ext_call2("strcmp", key, types.named(TK_STR), mk, types.named(TK_STR), types.named(TK_I32))
-    var eq = gen_icmp_c(cmp, 0, 0)  // cmp == 0
+    var eq = gen_cmp_zero(cmp, 0)  // cmp == 0（IMM 0，勿用值 id 0）
     var cb2 = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb2, eq, 0)
     ir.add_operand(cb2, fnd, 1)
     ir.add_operand(cb2, cont, 1)
     // cont（非相等）：cmp<0 → 左；否则右
     g_cur_block = cont
-    var lt = gen_icmp_c(cmp, 0, 2)  // cmp < 0
+    var lt = gen_cmp_zero(cmp, 2)  // cmp < 0
     var cb3 = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb3, lt, 0)
     ir.add_operand(cb3, lft, 1)
@@ -6727,7 +6743,7 @@ func s21_hash_place(htab: i64, cap: i64, key: i64, val: i64, vty: i64, is_new_p:
     g_cur_block = cond
     var i1 = s21_load(idx_p, T64)
     var kp = s21_hslot_key(htab, i1)
-    var emp = gen_icmp_c(kp, 0, 0)  // key == null
+    var emp = gen_cmp_zero(kp, 0)  // key == null（IMM 0 → llvmgen ptr 上下文自动 null）
     var cb = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb, emp, 0)
     ir.add_operand(cb, ins, 1)
@@ -6736,7 +6752,8 @@ func s21_hash_place(htab: i64, cap: i64, key: i64, val: i64, vty: i64, is_new_p:
     g_cur_block = chk
     var i2 = s21_load(idx_p, T64)
     var kp2 = s21_hslot_key(htab, i2)
-    var eq = gen_icmp_c(gen_ext_call2("strcmp", key, types.named(TK_STR), kp2, types.named(TK_STR), types.named(TK_I32)), 0, 0)
+    var c_ck = gen_ext_call2("strcmp", key, types.named(TK_STR), kp2, types.named(TK_STR), types.named(TK_I32))
+    var eq = gen_cmp_zero(c_ck, 0)  // cmp == 0（IMM 0，勿用值 id 0）
     var cb2 = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb2, eq, 0)
     ir.add_operand(cb2, ovr, 1)
@@ -6785,7 +6802,7 @@ func s21_map_hash_get(m: i64, key: i64, vty: i64) -> i64 {
     g_cur_block = cond
     var i1 = s21_load(idx_p, T64)
     var kp = s21_hslot_key(htab, i1)
-    var emp = gen_icmp_c(kp, 0, 0)
+    var emp = gen_cmp_zero(kp, 0)  // key == null（IMM 0 → null）
     var cb = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb, emp, 0)
     ir.add_operand(cb, mis, 1)
@@ -6794,7 +6811,8 @@ func s21_map_hash_get(m: i64, key: i64, vty: i64) -> i64 {
     g_cur_block = chk
     var i2 = s21_load(idx_p, T64)
     var kp2 = s21_hslot_key(htab, i2)
-    var eq = gen_icmp_c(gen_ext_call2("strcmp", key, types.named(TK_STR), kp2, types.named(TK_STR), types.named(TK_I32)), 0, 0)
+    var c_ck = gen_ext_call2("strcmp", key, types.named(TK_STR), kp2, types.named(TK_STR), types.named(TK_I32))
+    var eq = gen_cmp_zero(c_ck, 0)  // cmp == 0（IMM 0，勿用值 id 0）
     var cb2 = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb2, eq, 0)
     ir.add_operand(cb2, fnd, 1)
@@ -6891,7 +6909,7 @@ func s21_map_hash_set(m: i64, key: i64, val: i64, vty: i64) {
     g_cur_block = rb
     var r2 = s21_load(r_p, T64)
     var rk = s21_hslot_key(htab, r2)
-    var rempty = gen_icmp_c(rk, 0, 1)  // rk != null
+    var rempty = gen_cmp_zero(rk, 1)  // rk != null（IMM 0 → null）
     var rn = ir.new_block(g_cur_func, interner.intern("mhs.rn"))
     var rx = ir.new_block(g_cur_func, interner.intern("mhs.rx"))
     var cb2 = ir.new_inst(g_cur_block, 31, -1)
@@ -7121,7 +7139,7 @@ func s21_map_to_string(m: i64, vty: i64) -> i64 {
     g_cur_block = body
     var i2 = s21_load(i_p, T64)
     var kp = s21_hslot_key(htab, i2)
-    var nonempty = gen_icmp_c(kp, 0, 1)  // kp != null
+    var nonempty = gen_cmp_zero(kp, 1)  // kp != null（IMM 0 → null）
     var cb3 = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb3, nonempty, 0)
     ir.add_operand(cb3, got, 1)
