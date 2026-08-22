@@ -1,0 +1,706 @@
+type tie<class>
+// compiler/backend/llvmgen_str.tie —— 字符串自省 + extern 声明 + 类型映射 子模块
+// ============================================================
+// 从 llvmgen.tie 拆分而来：把"字符串自省（collect_strings / str_slot /
+// str_len_of_slot / str_data_ref / emit_strings） + extern 声明（collect_externs /
+// extern_decl / user_extern_decl / emit_extern_decls） + 类型映射（llvm_ty）
+// + asm 模板转换 / 字符串转义 + 原子内存序"这批函数独立成子文件。
+//
+// 拆分范式：【同 namespace 跨文件】（文本内联）。
+// llvmgen.tie 顶层 import 本文件后，本文件被"文本内联"进同一编译单元，
+// 其中所有代码全局可见。本文件声明与 llvmgen.tie 相同的 `namespace llvmgen`，
+// tie 允许同名 namespace 横跨多文件（进编译单元后为同一 namespace）闭合并集。
+//   - 同 namespace 的函数可互相裸名调用（llvmgen.tie 主文件仍可按原样裸名调用
+//     本文件内的 llvm_ty / str_data_ref / str_slot / extern_decl 等，无需改名）；
+//   - 同理可访问主文件顶层全局 var（str_pool / str_idx / ext_syms / call_syms
+//     / out_lines 等，均为编译单元内顶层全局，命名空间体内不允许 var）；
+//   - 本文件经 import 文本内联，只含函数与注释，不含顶层全局 var 声明——
+//     全局 var 仍留在 llvmgen.tie 主文件，避免重复定义。
+// 依赖约定：intern / utf / char_code / str_char / str_len 为编译单元内可见
+// 符号；ir.tie / types 的访问经主文件既有 import 链内联可达（本文件不重复 import）。
+
+namespace llvmgen {
+
+// ==================== 类型映射 ====================
+// types 自编码 → LLVM 类型名
+func llvm_ty(t: i64) -> string {
+    if t == TK_VOID {
+        return "void"
+    }
+    if t == TK_I8 || t == TK_U8 {
+        return "i8"
+    }
+    if t == TK_I16 || t == TK_U16 {
+        return "i16"
+    }
+    if t == TK_I32 || t == TK_U32 {
+        return "i32"
+    }
+    if t == TK_I64 || t == TK_U64 {
+        return "i64"
+    }
+    if t == TK_I128 || t == TK_U128 {
+        // 批次 2（i128/u128）：LLVM 原生 i128 类型（add/sub/mul/sdiv/srem/
+        // udiv/icmp 均类型参数化，llvm_ty 映射后自动支持）
+        return "i128"
+    }
+    if t == TK_F32 {
+        return "float"
+    }
+    if t == TK_F64 {
+        return "double"
+    }
+    if t == TK_BOOL {
+        return "i1"
+    }
+    if t == TK_CHAR {
+        return "i32"
+    }
+    if t == TK_TRIT {
+        // 平衡三进制：i8 存储（值域 -1/0/1），对齐 Rust ir.rs（TritLit → i8）
+        return "i8"
+    }
+    // 元组/struct 聚合类型（M4/M6 扩展）：
+    //   元组 → 内联结构体文本 {f0, f1, ...}（字段类型递归展开）；
+    //   struct → 命名结构体 %struct.<名字>（emit_agg_types 输出 type 定义）。
+    // 对齐 Rust llvm_ty 的 Tuple/Struct 映射（元组内联、类命名）。
+    var agg_k = types.kind(t)
+    if agg_k == K_FN {
+        // S2.2 fn 函数值类型：命名结构体 %fn.<签名索引> = { ptr, ptr }
+        //（字段 0 = 环境指针，字段 1 = 入口函数指针；emit_agg_types 输出定义）。
+        // 签名索引 = t - BASE_FN（types.fn 类型低负载）
+        return "%fn." + to_string(t - BASE_FN)
+    }
+    if agg_k == K_PORT {
+        // S2.4 port 对象类型：LLVM 表示 = 单个 ptr（指向堆上打包对象
+        // {data, vtable}）——表/传参/字段/返回天然支持（探针异构
+        // table<Drawable> 依赖此表示；vtable 本身是全局静态常量）。
+        return "ptr"
+    }
+    if agg_k == K_TUPLE {
+        var tidx = t - BASE_TUPLE
+        var toff = tup_offs[tidx]
+        var tn = tup_n[tidx]
+        var tout: string = "{"
+        var ti: i64 = 0
+        while ti < tn {
+            if ti > 0 {
+                tout = tout + ", "
+            }
+            tout = tout + llvm_ty(tup_tys[toff + ti])
+            ti = ti + 1
+        }
+        return tout + "}"
+    }
+    if agg_k == K_STRUCT {
+        var sidx2 = t - BASE_STRUCT
+        return "%struct." + sstate.struct_name_of(sidx2)
+    }
+    // enum 聚合类型（2026-08-15 enum 语言特性）：命名结构体 %enum.<名字>，
+    // emit_agg_types 输出 `%enum.<名> = type { i64, i64, ..., i64 }`
+    //（槽 0 = tag，槽 1..K = payload；K = en_nslot 见 emit_agg_types）。
+    if agg_k == K_ENUM {
+        var eidx2 = t - BASE_ENUM
+        return "%enum." + sstate.enum_name_of(eidx2)
+    }
+    // S1.2 不安全类型：
+    //   ptr<T>  → LLVM opaque ptr（元素类型仅语义信息）
+    //   atomic<T> → 元素 LLVM 类型（atomic 是语义包装，LLVM 类型同元素）
+    if agg_k == K_PTR {
+        return "ptr"
+    }
+    if agg_k == K_ATOMIC {
+        return llvm_ty(types.table_elem(t))
+    }
+    if agg_k == K_SLICE {
+        // slice<T> → {ptr, i64} 聚合（指针 + 长度；LLVM opaque ptr，
+        // 元素类型只影响 GEP 步长不体现在类型文本）
+        return "{ ptr, i64 }"
+    }
+    // string/table/map 等 → ptr（引用类型）
+    return "ptr"
+}
+
+// ==================== 字符串自省 ====================
+// 原子内存序名称（S1.2 A1）：order IMM → LLVM ordering 关键字
+func at_ord_name(ord: i64) -> string {
+    if ord == 1 {
+        return "acquire"
+    }
+    if ord == 2 {
+        return "release"
+    }
+    if ord == 3 {
+        return "acq_rel"
+    }
+    if ord == 4 {
+        return "seq_cst"
+    }
+    return "relaxed"
+}
+
+// asm 模板占位符转换（S1.2 I1）：Rust 风格 `{N}` → LLVM `$N`。
+// `{N}` 是操作数序号引用；LLVM 语法是 `$N`。字符级扫描替换。
+func asm_tmpl_convert(t: string) -> string {
+    var out = ""
+    var n = str_len(t)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(t, i)
+        if c == "{" {
+            // `{N}` → `$N`（N 为数字）；非数字大括号原样保留
+            var j = i + 1
+            var digits = ""
+            while j < n {
+                var cc = str_char(t, j)
+                if cc >= "0" && cc <= "9" {
+                    digits = digits + cc
+                    j = j + 1
+                } else {
+                    break
+                }
+            }
+            if j < n && str_char(t, j) == "}" && str_len(digits) > 0 {
+                out = out + "$" + digits
+                i = j + 1
+                continue
+            }
+            out = out + c
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+// S2.1：@.str.N 序号 → 该字符串常量字节长度（与 emit_strings 同款 utf.byte_len）。
+// 头部长度字段是 {ptr,len} 表示的编译期来源——字面量在 .rodata 带 8 字节 i64 头。
+func str_len_of_slot(slot: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(str_pool) {
+        if str_idx[i] == slot {
+            return utf.byte_len(intern.lookup(str_pool[i]))
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// S2.1：字符串常量**数据指针**引用（内联 GEP 常量表达式，可直用于实参/ret/
+// global 初始化——LLVM 常量表达式允许内联）。
+// 字面量布局升级：`{ i64 长度头, [N+1 x i8] 数据+\0 }`（{ptr,len} 表示 +
+// 边界自动 NUL：数据末尾保留 \0 供 FFI 零拷贝传递）。数据指针 = GEP 0,1。
+// 所有 "@.str.N" 直引点统一走本函数，保证引用指向数据而非头部。
+func str_data_ref(slot: i64) -> string {
+    var n = str_len_of_slot(slot)
+    return "getelementptr ({ i64, [" + to_string(n + 33) + " x i8] }, ptr @.str." +
+        to_string(slot) + ", i32 0, i32 1)"
+}
+
+// 查找/登记字符串池 id → @.str.N 序号
+func str_slot(name_id: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(str_pool) {
+        if str_pool[i] == name_id {
+            return str_idx[i]
+        }
+        i = i + 1
+    }
+    var n = str_count
+    table_push(str_pool, name_id)
+    table_push(str_idx, n)
+    str_count = str_count + 1
+    return n
+}
+
+// 遍历 tie-IR 全部指令，收集 const_str(62) 与 call_vararg(41) 的字符串操作数
+func collect_strings() {
+    str_pool = table_new_i64()
+    str_idx = table_new_i64()
+    str_count = 0
+    var ni = ir.inst_count()
+    var i: i64 = 0
+    while i < ni {
+        var op = ir.ins_op(i)
+        var cnt = ir.ins_ops_cnt(i)
+        var k: i64 = 0
+        if op == 62 {
+            // const_str：操作数[0] = 字符串池 id
+            if cnt >= 1 {
+                str_slot(ir.ins_opnd(i, 0))
+            }
+        } else if op == 41 {
+            // call_vararg：操作数[0] = 格式串池 id
+            if cnt >= 1 {
+                str_slot(ir.ins_opnd(i, 0))
+            }
+        }
+        i = i + 1
+    }
+}
+
+// T4.5：遍历全部指令，收集 extern_call(36) 的符号名池 id（去重）。
+// 符号名经 interner 还原文本；emit_extern_decls 按符号名输出 declare。
+// 阶段 A：同时收集 call(35) 用户函数符号（call_syms；无需 declare，本模块定义）。
+func collect_externs() {
+    ext_syms = table_new_i64()
+    call_syms = table_new_i64()
+    var ni = ir.inst_count()
+    var i: i64 = 0
+    while i < ni {
+        var op = ir.ins_op(i)
+        if op == 36 && ir.ins_ops_cnt(i) >= 1 {
+            var sid = ir.ins_opnd(i, 0)
+            var dup = false
+            var k: i64 = 0
+            while k < len(ext_syms) {
+                if ext_syms[k] == sid {
+                    dup = true
+                    break
+                }
+                k = k + 1
+            }
+            if !dup {
+                table_push(ext_syms, sid)
+            }
+        } else if op == 35 && ir.ins_ops_cnt(i) >= 1 {
+            var sid2 = ir.ins_opnd(i, 0)
+            call_sym_reg(sid2)
+        }
+        i = i + 1
+    }
+}
+
+// 符号名 → declare 声明文本（tie 运行时桥签名表；未登记符号返回空串）。
+// 与 std/runtime.tie / tie_interp.lib 的导出符号一一对应（阶段 A 扩展）：
+//   返回 i64：tie_exec_code(ptr) / tie_time_now() / tie_str_len(ptr) /
+//            tie_char_code(ptr) / tie_arg_count() / tie_table_len(ptr) /
+//            tie_parse_int(ptr, ptr)
+//   返回 ptr：tie_get_env(ptr) / tie_exec_output(ptr) / tie_str_char(ptr, i64) /
+//            tie_to_string_i64(i64) / tie_to_string_f64(double) / tie_file_read(ptr) /
+//            tie_arg_string(i64) / tie_table_new(i64) / tie_table_at_i64(ptr, i64, ptr) /
+//            tie_table_at_string(ptr, i64, ptr) / tie_print_err(ptr) / tie_mkdir_all(ptr) /
+//            tie_regex_find_all(ptr, ptr) / tie_read_line() / tie_cwd() / tie_eval_expr(ptr)
+//   返回 void：tie_table_push_i64(ptr, i64) / tie_table_push_string(ptr, ptr) /
+//            tie_table_push_bool(ptr, i8) / tie_table_set_i64(ptr, i64, i64, ptr) /
+//            tie_table_set_string(ptr, i64, ptr, ptr) / tie_byte_write(ptr, ptr) /
+//            tie_set_env(ptr, ptr) / tie_msg_register(ptr, ptr, ptr)
+//   返回 i8：tie_mkdir_all(ptr) / tie_file_copy(ptr, ptr) / tie_file_move(ptr, ptr) /
+//            tie_http_get_file(ptr, ptr) / tie_untar_gz(ptr, ptr) / tie_unzip(ptr, ptr) /
+//            tie_copy_dir(ptr, ptr) / tie_byte_write(ptr, ptr)
+// 注意：返回 void 的桥在 irgen 用 ty=-1 建指令（无结果寄存器）。
+func extern_decl(sym: string) -> string {
+    if sym == "tie_exec_code" {
+        return "declare i64 @tie_exec_code(ptr)"
+    }
+    // S2.1：libc memcpy（StringBuilder 数据拷贝；clang 链接 CRT 提供）
+    if sym == "memcpy" {
+        return "declare void @memcpy(ptr, ptr, i64)"
+    }
+    // 批次 7 catch_panic：无条件 declare（emit 头部，带 returns_twice/noreturn
+    // 属性），此处不重复 declare（LLVM 拒绝重复定义）。
+    if sym == "longjmp" || sym == "_setjmp" || sym == "llvm.frameaddress.p0" {
+        return ""
+    }
+    if sym == "tie_get_env" {
+        return "declare ptr @tie_get_env(ptr)"
+    }
+    if sym == "tie_time_now" {
+        return "declare i64 @tie_time_now()"
+    }
+    if sym == "tie_str_len" {
+        return "declare i64 @tie_str_len(ptr)"
+    }
+    if sym == "tie_char_code" {
+        return "declare i64 @tie_char_code(ptr)"
+    }
+    if sym == "tie_str_char" {
+        return "declare ptr @tie_str_char(ptr, i64)"
+    }
+    if sym == "tie_str_from_code" {
+        // 码点 → 单字符 UTF-8 字符串（返回堆串，调用方负责 tie_free_result）。
+        return "declare ptr @tie_str_from_code(i64)"
+    }
+    // ---------- 网络原语（P0：std/net）----------
+    // 句柄 i64；recv 返回 ptr（堆串）；close 返回 i8（bool 桥）。
+    if sym == "tie_net_tcp_listen" {
+        return "declare i64 @tie_net_tcp_listen(i64)"
+    }
+    if sym == "tie_net_tcp_accept" {
+        return "declare i64 @tie_net_tcp_accept(i64)"
+    }
+    if sym == "tie_net_tcp_connect" {
+        return "declare i64 @tie_net_tcp_connect(ptr, i64)"
+    }
+    if sym == "tie_net_tcp_send" {
+        return "declare i64 @tie_net_tcp_send(i64, ptr)"
+    }
+    if sym == "tie_net_tcp_recv" {
+        return "declare ptr @tie_net_tcp_recv(i64, i64)"
+    }
+    if sym == "tie_net_udp_bind" {
+        return "declare i64 @tie_net_udp_bind(i64)"
+    }
+    if sym == "tie_net_udp_send" {
+        return "declare i64 @tie_net_udp_send(i64, ptr, i64, ptr)"
+    }
+    if sym == "tie_net_udp_recv" {
+        return "declare ptr @tie_net_udp_recv(i64, i64)"
+    }
+    if sym == "tie_net_close" {
+        return "declare i8 @tie_net_close(i64)"
+    }
+    if sym == "tie_to_string_i64" {
+        return "declare ptr @tie_to_string_i64(i64)"
+    }
+    if sym == "tie_to_string_f64" {
+        return "declare ptr @tie_to_string_f64(double)"
+    }
+    if sym == "tie_parse_int" {
+        return "declare i64 @tie_parse_int(ptr, ptr)"
+    }
+    if sym == "tie_parse_float" {
+        return "declare double @tie_parse_float(ptr, ptr)"
+    }
+    if sym == "tie_parse_trit" {
+        return "declare i8 @tie_parse_trit(ptr, ptr)"
+    }
+    if sym == "tie_list_dir" {
+        return "declare ptr @tie_list_dir(ptr)"
+    }
+    if sym == "tie_http_get" {
+        return "declare ptr @tie_http_get(ptr)"
+    }
+    if sym == "tie_msg_t_lang" {
+        return "declare ptr @tie_msg_t_lang(ptr, ptr)"
+    }
+    if sym == "tie_set_env" {
+        return "declare void @tie_set_env(ptr, ptr)"
+    }
+    if sym == "tie_msg_register" {
+        return "declare void @tie_msg_register(ptr, ptr, ptr)"
+    }
+    if sym == "tie_byte_write" {
+        return "declare i8 @tie_byte_write(ptr, ptr)"
+    }
+    if sym == "tie_exec_output" {
+        return "declare ptr @tie_exec_output(ptr)"
+    }
+    if sym == "tie_arg_count" {
+        return "declare i64 @tie_arg_count()"
+    }
+    if sym == "tie_arg_string" {
+        return "declare ptr @tie_arg_string(i64)"
+    }
+    if sym == "tie_file_read" {
+        return "declare ptr @tie_file_read(ptr)"
+    }
+    // 完整 fs 桥（UTF-8 路径安全，Windows 宽字符 API；irgen 的 file_* 内置
+    // 从 libc fopen/remove 迁至此处——中文路径不再被 ANSI 代码页误读）
+    if sym == "tie_file_exists" {
+        return "declare i8 @tie_file_exists(ptr)"
+    }
+    if sym == "tie_file_write" {
+        return "declare i8 @tie_file_write(ptr, ptr)"
+    }
+    if sym == "tie_file_append" {
+        return "declare i8 @tie_file_append(ptr, ptr)"
+    }
+    if sym == "tie_file_delete" {
+        return "declare i8 @tie_file_delete(ptr)"
+    }
+    if sym == "tie_file_size" {
+        return "declare i64 @tie_file_size(ptr)"
+    }
+    if sym == "tie_file_is_dir" {
+        return "declare i8 @tie_file_is_dir(ptr)"
+    }
+    if sym == "tie_file_is_file" {
+        return "declare i8 @tie_file_is_file(ptr)"
+    }
+    if sym == "tie_read_line" {
+        return "declare ptr @tie_read_line()"
+    }
+    if sym == "tie_eval_expr" {
+        return "declare ptr @tie_eval_expr(ptr)"
+    }
+    if sym == "tie_cwd" {
+        return "declare ptr @tie_cwd()"
+    }
+    if sym == "tie_print_err" {
+        return "declare void @tie_print_err(ptr)"
+    }
+    if sym == "tie_table_push_i64" {
+        return "declare void @tie_table_push_i64(ptr, i64)"
+    }
+    if sym == "tie_table_push_string" {
+        return "declare void @tie_table_push_string(ptr, ptr)"
+    }
+    if sym == "tie_table_push_bool" {
+        return "declare void @tie_table_push_bool(ptr, i8)"
+    }
+    if sym == "tie_table_push_f64" {
+        return "declare void @tie_table_push_f64(ptr, double)"
+    }
+    if sym == "tie_table_at_i64" {
+        return "declare i64 @tie_table_at_i64(ptr, i64, ptr)"
+    }
+    if sym == "tie_table_at_f64" {
+        return "declare double @tie_table_at_f64(ptr, i64, ptr)"
+    }
+    if sym == "tie_table_at_ptr" {
+        return "declare ptr @tie_table_at_ptr(ptr, i64, ptr)"
+    }
+    if sym == "tie_table_at_string" {
+        return "declare ptr @tie_table_at_string(ptr, i64, ptr)"
+    }
+    if sym == "tie_table_at_bool" {
+        return "declare i8 @tie_table_at_bool(ptr, i64, ptr)"
+    }
+    if sym == "tie_table_len" {
+        return "declare i64 @tie_table_len(ptr)"
+    }
+    if sym == "tie_table_set_i64" {
+        return "declare void @tie_table_set_i64(ptr, i64, i64, ptr)"
+    }
+    if sym == "tie_table_set_f64" {
+        return "declare void @tie_table_set_f64(ptr, i64, double, ptr)"
+    }
+    if sym == "tie_table_set_ptr" {
+        return "declare void @tie_table_set_ptr(ptr, i64, ptr, ptr)"
+    }
+    if sym == "tie_table_set_string" {
+        return "declare void @tie_table_set_string(ptr, i64, ptr, ptr)"
+    }
+    // E3 键值表（map）桥：键为字符串 ptr；值按类型分 i64 / string 两个桥。
+    // 签名 (ptr map, ptr key, val, ptr ok)——与 tie_interp.lib 导出一一对应。
+    if sym == "tie_mkdir_all" {
+        return "declare i8 @tie_mkdir_all(ptr)"
+    }
+    if sym == "tie_file_copy" {
+        return "declare i8 @tie_file_copy(ptr, ptr)"
+    }
+    if sym == "tie_file_move" {
+        return "declare i8 @tie_file_move(ptr, ptr)"
+    }
+    if sym == "tie_http_get_file" {
+        return "declare i8 @tie_http_get_file(ptr, ptr)"
+    }
+    if sym == "tie_untar_gz" {
+        return "declare i8 @tie_untar_gz(ptr, ptr)"
+    }
+    if sym == "tie_unzip" {
+        return "declare i8 @tie_unzip(ptr, ptr)"
+    }
+    if sym == "tie_copy_dir" {
+        return "declare i8 @tie_copy_dir(ptr, ptr)"
+    }
+    if sym == "tie_regex_find_all" {
+        return "declare ptr @tie_regex_find_all(ptr, ptr)"
+    }
+    if sym == "tie_regex_match" {
+        return "declare i8 @tie_regex_match(ptr, ptr, ptr)"
+    }
+    if sym == "tie_regex_find" {
+        return "declare ptr @tie_regex_find(ptr, ptr)"
+    }
+    if sym == "tie_regex_group" {
+        return "declare ptr @tie_regex_group(ptr, ptr, i64)"
+    }
+    if sym == "tie_regex_replace" {
+        return "declare ptr @tie_regex_replace(ptr, ptr, ptr)"
+    }
+    if sym == "tie_msg_t" {
+        return "declare ptr @tie_msg_t(ptr)"
+    }
+    if sym == "tie_msg_get_lang" {
+        return "declare ptr @tie_msg_get_lang()"
+    }
+    if sym == "tie_msg_set_lang" {
+        return "declare void @tie_msg_set_lang(ptr)"
+    }
+    if sym == "tie_eval_call" {
+        return "declare ptr @tie_eval_call(ptr, ptr)"
+    }
+    if sym == "tie_byte_read" {
+        return "declare ptr @tie_byte_read(ptr)"
+    }
+    if sym == "tie_byte_concat" {
+        return "declare ptr @tie_byte_concat(ptr, ptr)"
+    }
+    if sym == "tie_bit_read" {
+        return "declare i64 @tie_bit_read(ptr, i64)"
+    }
+    if sym == "tie_bit_write" {
+        return "declare i8 @tie_bit_write(ptr, i64, i64)"
+    }
+    if sym == "tie_remove_dir_all" {
+        return "declare i8 @tie_remove_dir_all(ptr)"
+    }
+    if sym == "tie_walk_dir" {
+        return "declare ptr @tie_walk_dir(ptr)"
+    }
+    if sym == "tie_path_basename" {
+        return "declare ptr @tie_path_basename(ptr)"
+    }
+    if sym == "tie_path_dirname" {
+        return "declare ptr @tie_path_dirname(ptr)"
+    }
+    if sym == "tie_path_abs" {
+        return "declare ptr @tie_path_abs(ptr)"
+    }
+    if sym == "tie_path_normalize" {
+        return "declare ptr @tie_path_normalize(ptr)"
+    }
+    if sym == "tie_path_join" {
+        return "declare ptr @tie_path_join(ptr, ptr)"
+    }
+    if sym == "tie_rand_range" {
+        return "declare i64 @tie_rand_range(i64, i64, ptr)"
+    }
+    return ""
+}
+
+// 未登记符号（用户 libc extern，如 getenv/rand）声明推导：
+// 从 extern_call(36) 指令签名重构 `declare T @sym(T0, T1, ...)`。
+// op36 操作数：[0]=符号池id, [1]=返回类型IMM, 其后 [类型IMM, 值] 成对。
+// 批次5 任务13：用户 `unsafe extern fn getenv(name) -> string`（返回 char*）
+// 必须在模块头声明 `declare ptr @getenv(ptr)`，否则 opt 报 use of undefined value。
+// 返回 ""（符号未被调用 / 已在模块头无条件 declare，无需再声明）。
+func user_extern_decl(sym: string) -> string {
+    // 模块头已无条件 declare 的 libc 符号（emit() 头部段）——若再从调用签名
+    // 重复声明，会因签名不一致（如 exit 头为 i32、调用处推导为 i64）报
+    // redefinition；这些符号声明固定，绝不在此推导。
+    if sym == "printf" || sym == "strlen" || sym == "strcmp" ||
+        sym == "malloc" || sym == "free" || sym == "memcpy" || sym == "memmove" ||
+        sym == "fopen" || sym == "fwrite" || sym == "fclose" || sym == "fflush" ||
+        sym == "exit" || sym == "remove" {
+        return ""
+    }
+    if sym == "sqrt" || sym == "sin" || sym == "cos" || sym == "tan" ||
+        sym == "exp" || sym == "log" || sym == "pow" ||
+        sym == "floor" || sym == "ceil" || sym == "round" {
+        return ""
+    }
+    var ni = ir.inst_count()
+    var i: i64 = 0
+    while i < ni {
+        var op = ir.ins_op(i)
+        // 用户 extern：既可能走 op36（tie_ 桥调用），也可能走 op35（用户顶层
+        // `unsafe extern fn` 调用，如 getenv）——两种指令操作数布局一致。
+        if (op == 36 || op == 35) && ir.ins_ops_cnt(i) >= 2 {
+            if intern.lookup(ir.ins_opnd(i, 0)) != sym {
+                i = i + 1
+                continue
+            }
+            // 返回类型：ins_ty <0 或 TK_VOID → void
+            var ret = "void"
+            var rty = ir.ins_ty(i)
+            if rty >= 0 && rty != TK_VOID {
+                ret = llvm_ty(rty)
+            }
+            // 参数类型表（操作数 2,4,6... 的 IMM 类型 id → LLVM 类型）
+            var args = ""
+            var first = true
+            var cnt = ir.ins_ops_cnt(i)
+            var k: i64 = 2
+            while k + 1 < cnt {
+                if !first {
+                    args = args + ", "
+                }
+                args = args + llvm_ty(ir.ins_opnd(i, k))
+                first = false
+                k = k + 2
+            }
+            return "declare " + ret + " @" + sym + "(" + args + ")"
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 输出 extern_call 收集到的 declare（模块头，无条件 declare 之后）。
+func emit_extern_decls() {
+    var i: i64 = 0
+    while i < len(ext_syms) {
+        var nm = intern.lookup(ext_syms[i])
+        // 批次 7 catch_panic：longjmp/_setjmp/llvm.frameaddress 已在模块头
+        // 无条件 declare（带 returns_twice/noreturn 属性），跳过二次 declare。
+        if nm == "longjmp" || nm == "_setjmp" || nm == "llvm.frameaddress.p0" {
+            i = i + 1
+            continue
+        }
+        var d = extern_decl(nm)
+        if d == "" {
+            // 未登记的 libc extern（用户顶层声明）→ 从调用签名推导
+            d = user_extern_decl(nm)
+        }
+        if d != "" {
+            line(d)
+        }
+        i = i + 1
+    }
+    if len(ext_syms) > 0 {
+        line("")
+    }
+}
+
+// 字符串文本 → LLVM 转义（对齐 Rust escape_ir_string：可打印 ASCII 原样，
+// 特殊字符 \XX 十六进制；含中文等非 ASCII 码点逐字节转义）
+func escape_str(s: string) -> string {
+    var out: string = ""
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var cc = char_code(str_char(s, i))
+        if cc == 92 {
+            out = out + "\\5C"
+        } else if cc == 34 {
+            out = out + "\\22"
+        } else if cc == 10 {
+            out = out + "\\0A"
+        } else if cc == 13 {
+            out = out + "\\0D"
+        } else if cc == 9 {
+            out = out + "\\09"
+        } else if cc >= 32 && cc <= 126 {
+            out = out + str_char(s, i)
+        } else {
+            // 非 ASCII 码点（含中文）或 ASCII 控制字符：按 UTF-8 字节序列 \XX 转义
+            // （std/utf.hex_escape 字节级编码；码点值 ≠ UTF-8 字节序列）
+            out = out + utf.hex_escape(cc)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 输出字符串常量节（模块末尾）。S2.1：布局升级为带 8 字节 i64 长度头的
+// { ptr,len } 表示——`{ i64 N, [N+1 x i8] c"...\00" }`（N = UTF-8 字节数，
+// 末尾 \0 为边界自动 NUL 预留位）。数据指针由 str_data_ref 经 GEP 取。
+func emit_strings() {
+    // 32 字节尾部填充的转义（32 个 \00）——LLVM 字符串常量须精确填满数组
+    // 大小（短串 c"" 不会自动补零，opt 报 type mismatch）。追加到 N+1 内容后，
+    // 使常量恰为 N+33 字节（数据 + \0 + 32 填充）。
+    var zz = ""
+    var zi: i64 = 0
+    while zi < 32 {
+        zz = zz + "\\00"
+        zi = zi + 1
+    }
+    var i: i64 = 0
+    while i < len(str_pool) {
+        var txt = intern.lookup(str_pool[i])
+        var byte_len = utf.byte_len(txt)
+        var esc = escape_str(txt)
+        // 漏洞 B 修复：字面量数组扩为 [N+33 x i8]（数据 N + \0 + 32 尾部填充）。
+        // .rodata 常量为 { i64 头, [N+33 x i8] }，整块 = N+41——容纳 opt 的
+        // 向量化 strlen/memcmp 宽读（16/32 字节），跨出段尾触发 0xC0000005。
+        line("@.str." + to_string(str_idx[i]) + " = private unnamed_addr constant { i64, [" +
+            to_string(byte_len + 33) + " x i8] } { i64 " + to_string(byte_len) + ", [" +
+            to_string(byte_len + 33) + " x i8] c\"" + esc + "\\00" + zz + "\" }")
+        i = i + 1
+    }
+}
+
+}
