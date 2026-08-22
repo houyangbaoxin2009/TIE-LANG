@@ -1,0 +1,222 @@
+type tie<class>
+// compiler/backend/irgen_builder.tie —— 生成器 L0 Builder 层 子模块
+// ============================================================
+// 从 irgen.tie 拆分而来：这是 irgen LLVM 风格分层重构的 S1 步。
+// 本文件承载 L0 Builder 层：作用域栈（scope_put/scope_get/scope_push/scope_pop）、
+// 循环栈（loop_*）、表变量元素登记查询（tblvar_put/tblvar_get）、全局类型查询
+//（global_ty/global_telem/scope_get_global）与字符串常量登记（string_reg）。
+// 它们是 AST→tie-IR 生成时最基础的状态查询/构建原语，被上层（字面量/语句/表达式
+// 生成层）裸名调用，LLVM 风格分层把"Builder"与上层语义生成相剥离。
+//
+// 拆分范式：【同 namespace 跨文件】（文本内联）。
+// irgen.tie 顶层 import 本文件后，本文件被"文本内联"进同一编译单元，
+// 其中所有代码全局可见。本文件声明与 irgen.tie 相同的 `namespace irgen`，
+// tie 允许同名 namespace 横跨多文件（进编译单元后为同一 namespace）闭合并集。
+//   - 同 namespace 的函数可互相裸名调用（irgen.tie 主文件仍可按原样裸名调用
+//     本文件内的 scope_put / scope_get / loop_push / string_reg 等，无需改名）；
+//   - 同理可访问主文件顶层全局 var（g_sc_*/g_lp_*/g_tv_*/g_str_*/g_lookup_*
+//     gb_*/tb_* 等，均为编译单元内顶层全局，命名空间体内不允许 var）；
+//   - 本文件经 import 文本内联，只含函数与注释，不含顶层全局 var 声明——
+//     全局 var 仍留在 irgen.tie 主文件，避免重复定义。
+namespace irgen {
+
+// 变量入作用域：当前帧内已存在 → 覆盖；否则追加到栈顶。
+// 遮蔽语义：内层同名变量追加新槽（外层槽保留在帧边界之下），pop 后外层可见。
+func scope_put(name_id: i64, alloca: i64, ty: i64) {
+    // 当前帧内查找（从栈顶向下到最近哨兵之后）
+    var i: i64 = g_sc_top - 1
+    while i >= 0 {
+        if g_sc_keys[i] == -1 {
+            break  // 越过本帧边界哨兵
+        }
+        if g_sc_keys[i] == name_id {
+            g_sc_allocas[i] = alloca
+            g_sc_tys[i] = ty
+            return
+        }
+        i = i - 1
+    }
+    // 本帧内无同名 → 追加到栈顶
+    if g_sc_top < len(g_sc_keys) {
+        g_sc_keys[g_sc_top] = name_id
+        g_sc_allocas[g_sc_top] = alloca
+        g_sc_tys[g_sc_top] = ty
+    } else {
+        table_push(g_sc_keys, name_id)
+        table_push(g_sc_allocas, alloca)
+        table_push(g_sc_tys, ty)
+    }
+    g_sc_top = g_sc_top + 1
+}
+
+// 表变量元素类型登记/查询（irgen 自维护，函数级）：
+// 语义层 lv_telem 是 per-function 且 irgen 阶段已过期（只可靠查到最后一个
+// 函数），table_new_f64()/table<T> 变量的元素类型须由 irgen 自己记录，
+// table_push/table_at 才能选对桥（push_f64 vs push_i64）。
+func tblvar_put(nm: i64, te: i64) {
+    var i: i64 = 0
+    while i < len(g_tv_keys) {
+        if g_tv_keys[i] == nm {
+            g_tv_elems[i] = te
+            return
+        }
+        i = i + 1
+    }
+    table_push(g_tv_keys, nm)
+    table_push(g_tv_elems, te)
+}
+
+// 查表变量元素类型；未登记 -1
+func tblvar_get(nm: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_tv_keys) {
+        if g_tv_keys[i] == nm {
+            return g_tv_elems[i]
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 变量查作用域：从栈顶向下（内层优先遮蔽外层）。命中置全局槽。
+func scope_get(name_id: i64) -> i64 {
+    var i: i64 = g_sc_top - 1
+    while i >= 0 {
+        if g_sc_keys[i] == name_id {
+            g_lookup_found = true
+            g_lookup_alloca = g_sc_allocas[i]
+            g_lookup_ty = g_sc_tys[i]
+            return 0
+        }
+        i = i - 1
+    }
+    g_lookup_found = false
+    return -1
+}
+
+// 全局变量语义类型查询（sstate gb_*，irgen 阶段语义已完成）：
+// 返回类型 id（表全局 → 表类型；标量 → 标量类型）；未登记 -1。
+func global_ty(nid: i64) -> i64 {
+    var idx = sstate.bs_find(gb_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return gb_vals[idx]
+}
+
+// 全局表元素类型（顶层 table<T>）；非表全局 -1
+func global_telem(nid: i64) -> i64 {
+    var idx = sstate.bs_find(gb_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return gb_telem[idx]
+}
+
+// 变量引用（含全局变量）：scope_get 失败 → 查全局标量/表。
+// 全局标量 → load @g；全局表 → load ptr, ptr @g（表指针）。
+// 返回：本地命中返回 0 且置 g_lookup_*；全局命中返回 1 且置 g_lookup_is_global；
+// 未命中返回 -1。
+func scope_get_global(name_id: i64) -> i64 {
+    g_lookup_is_global = 0
+    if scope_get(name_id) >= 0 {
+        return 0
+    }
+    var ty = global_ty(name_id)
+    if ty < 0 {
+        return -1
+    }
+    if types.is_table(ty) || global_telem(name_id) >= 0 {
+        // 全局表：伪绑定 @name（ptr 全局槽，load ptr 取表指针）
+        g_lookup_is_global = 2
+        g_lookup_alloca = interner.intern("@" + intern.lookup(name_id))
+        g_lookup_ty = types.named(TK_STR)  // 表槽 = ptr（占位，gen 时按表处理）
+        return 1
+    }
+    g_lookup_is_global = 1
+    g_lookup_alloca = interner.intern("@" + intern.lookup(name_id))
+    g_lookup_ty = ty
+    return 1
+}
+
+// 作用域栈 push：压入帧边界哨兵（-1 标记）
+func scope_push() {
+    if g_sc_top < len(g_sc_keys) {
+        g_sc_keys[g_sc_top] = -1
+        g_sc_allocas[g_sc_top] = -1
+        g_sc_tys[g_sc_top] = -1
+    } else {
+        table_push(g_sc_keys, -1)
+        table_push(g_sc_allocas, -1)
+        table_push(g_sc_tys, -1)
+    }
+    g_sc_top = g_sc_top + 1
+}
+
+// 作用域栈 pop：游标回退到上一层（丢弃本帧变量与哨兵）
+func scope_pop() {
+    if g_sc_top > 0 {
+        g_sc_top = g_sc_top - 1
+    }
+}
+
+// 循环上下文压栈（while/for 进入）：标签池 id（-1 无）、break 块、continue 块
+func loop_push(label_id: i64, break_blk: i64, cont_blk: i64) {
+    if g_lp_top < len(g_lp_labels) {
+        g_lp_labels[g_lp_top] = label_id
+        g_lp_breaks[g_lp_top] = break_blk
+        g_lp_cont[g_lp_top] = cont_blk
+    } else {
+        table_push(g_lp_labels, label_id)
+        table_push(g_lp_breaks, break_blk)
+        table_push(g_lp_cont, cont_blk)
+    }
+    g_lp_top = g_lp_top + 1
+}
+
+// 循环上下文弹栈
+func loop_pop() {
+    if g_lp_top > 0 {
+        g_lp_top = g_lp_top - 1
+    }
+}
+
+// 按标签找循环上下文（无标签 → 最近循环）。返回 break 块 id；-1 = 未找到
+func loop_find_break(label_id: i64) -> i64 {
+    var i: i64 = g_lp_top - 1
+    while i >= 0 {
+        if label_id < 0 || g_lp_labels[i] == label_id {
+            return g_lp_breaks[i]
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+// 按标签找 continue 目标块
+func loop_find_cont(label_id: i64) -> i64 {
+    var i: i64 = g_lp_top - 1
+    while i >= 0 {
+        if label_id < 0 || g_lp_labels[i] == label_id {
+            return g_lp_cont[i]
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+// 字符串常量登记：返回全局序号（llvmgen 据此生成 @.str.N）
+func string_reg(name_id: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_str_keys) {
+        if g_str_keys[i] == name_id {
+            return i
+        }
+        i = i + 1
+    }
+    table_push(g_str_keys, name_id)
+    g_str_count = g_str_count + 1
+    return len(g_str_keys) - 1
+}
+
+}
