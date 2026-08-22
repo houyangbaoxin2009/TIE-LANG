@@ -1480,16 +1480,15 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         return 0
     }
     if nm == "parse_trit" {
-        // trit 解析：Rust 桥签名 (ptr s, ptr ok) -> i8（值域 -1/0/1）
-        g_used_interp = true
+        // 去 Rust 桥（批次A）：tig_parse_trit 内联 IR 生成，替代桥 tie_parse_trit。
+        // 返回 i8（值域 -1/0/1，语义类型标 TK_TRIT）。不再置 g_used_interp。
         var v = tig_expr(call_arg(id, 0))
         if v < 0 {
             return -1
         }
         var pto = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
         ir.add_operand(pto, types.named(TK_I8), 2)
-        g_builtin_res = tig_ext_call2("tie_parse_trit", v, types.named(TK_STR),
-            ir.get_value(pto), types.named(TK_STR), types.named(TK_I8))
+        g_builtin_res = tig_parse_trit(v, ir.get_value(pto))
         return 0
     }
     if nm == "len" {

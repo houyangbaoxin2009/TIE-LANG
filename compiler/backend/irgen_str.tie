@@ -2052,4 +2052,83 @@ func tig_parse_int(s: i64, ok_ptr: i64) -> i64 {
     s21_store(ok_ptr, s21_trunc_i8(okv), T8)
     return s21_load(rs_ptr, T64)
 }
+
+// ==================== 去 Rust 桥：parse_trit ====================
+// 字符串 → trit（i8，值域 -1/0/1）。替代 Rust 桥 tie_parse_trit。
+// 签名 s:string 值 + ok 出参槽。合法输入："-1"→-1；"0"→0；"1"→+1（对齐
+// to_string(trit) 逆形式）。其余（含空串/其它文本）→ ok=0。
+// 结构：各分支（one/neg）各自把结果值写入共享 rs 槽（内存传值，避免跨块 SSA
+// 支配冲突），再分派到 succ/fail；exit 统一读槽 → 外部 ok 槽。
+func tig_parse_trit(s: i64, ok_ptr: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var T8 = types.named(TK_I8)
+    var z64 = tig_int_lit_ty(0, T64)
+    var n = s21_str_head_len(s)
+    var res_slot = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(res_slot, T64, 2)
+    var rs_ptr = ir.get_value(res_slot)
+    var ok_slot = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ok_slot, T64, 2)
+    var ok_int_ptr = ir.get_value(ok_slot)
+    s21_store(rs_ptr, z64, T64)
+    s21_store(ok_int_ptr, z64, T64)
+    // 块：one / other / neg / succ / fail / exit
+    var one_blk = ir.new_block(g_cur_func, interner.intern("pt.one"))
+    var other_blk = ir.new_block(g_cur_func, interner.intern("pt.other"))
+    var neg_blk = ir.new_block(g_cur_func, interner.intern("pt.neg"))
+    var succ_blk = ir.new_block(g_cur_func, interner.intern("pt.succ"))
+    var fail_blk = ir.new_block(g_cur_func, interner.intern("pt.fail"))
+    var exit_blk = ir.new_block(g_cur_func, interner.intern("pt.exit"))
+    // 分派：n==1 → one；否则 → other
+    var len1 = tig_icmp_c(n, tig_int_lit(1), 0)  // eq 1
+    var cb1 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb1, len1, 0)
+    ir.add_operand(cb1, one_blk, 1)
+    ir.add_operand(cb1, other_blk, 1)
+    // one：byte0 判 '1'(49)/'0'(48)；rs = e1?1:0；is01 → succ 否则 fail
+    g_cur_block = one_blk
+    var b1 = s21_str_byte(s, z64)
+    var e1 = tig_icmp_c(b1, tig_int_lit_ty(49, T64), 0)  // eq '1'
+    var e0 = tig_icmp_c(b1, tig_int_lit_ty(48, T64), 0)  // eq '0'
+    var is01 = tig_or_i1(e1, e0)
+    var v1 = tig_select_i(e1, tig_int_lit(1), z64, T64)
+    s21_store(rs_ptr, v1, T64)
+    var cb2 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb2, is01, 0)
+    ir.add_operand(cb2, succ_blk, 1)
+    ir.add_operand(cb2, fail_blk, 1)
+    // other：n==2 → neg；否则 fail
+    g_cur_block = other_blk
+    var len2 = tig_icmp_c(n, tig_int_lit(2), 0)  // eq 2
+    var cb3 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb3, len2, 0)
+    ir.add_operand(cb3, neg_blk, 1)
+    ir.add_operand(cb3, fail_blk, 1)
+    // neg：byte0='-'(45) 且 byte1='1'(49)；rs=-1；is_m1 → succ 否则 fail
+    g_cur_block = neg_blk
+    var mb0 = s21_str_byte(s, z64)
+    var mb1 = s21_str_byte(s, tig_int_lit(1))
+    var is_min = tig_icmp_c(mb0, tig_int_lit_ty(45, T64), 0)  // eq '-'
+    var is_one = tig_icmp_c(mb1, tig_int_lit_ty(49, T64), 0)  // eq '1'
+    var is_m1 = tig_and_i1(is_min, is_one)
+    s21_store(rs_ptr, tig_int_lit(-1), T64)
+    var cb4 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb4, is_m1, 0)
+    ir.add_operand(cb4, succ_blk, 1)
+    ir.add_operand(cb4, fail_blk, 1)
+    // succ：ok=1
+    g_cur_block = succ_blk
+    s21_store(ok_int_ptr, tig_int_lit(1), T64)
+    var brs = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brs, exit_blk, 1)
+    // fail：ok=0（默认）
+    g_cur_block = fail_blk
+    var brf = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brf, exit_blk, 1)
+    // exit
+    g_cur_block = exit_blk
+    var okv = s21_load(ok_int_ptr, T64)
+    s21_store(ok_ptr, s21_trunc_i8(okv), T8)
+    return s21_trunc_i8(s21_load(rs_ptr, T64))
+}
 }
