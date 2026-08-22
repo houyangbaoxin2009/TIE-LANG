@@ -358,6 +358,11 @@ func splice_call(parent: i64, pidx: i64, call_id: i64, new_root: i64) -> i64 {
         }
         var grand = gout[0]
         var gidx = gout[1]
+        // 展开完成后旧 N_EXPR_STMT（parent）成为孤儿：解除其到调用点的子引用
+        //（置 -1）。否则展开循环重扫全池时 find_parent(call_id) 会再命中该
+        // 孤儿节点，二次展开语句位置宏调用 → "表达式语句节点找不到父节点"
+        //（表达式分支直接覆盖子槽为 new_root 故无此问题）。
+        s_children[s_coff[parent] + pidx] = -1
         if rtag == N_STMTLIST {
             // 结果多语句：收集结果子语句，替换祖父 children 中 [parent] 位置
             var stmts: table<i64> = table_new_i64()

@@ -181,7 +181,14 @@ func is_builtin(name: string) -> bool {
         name == "table_at" || name == "eval" || name == "eval_call" {
         return true
     }
-    if name == "gensym" || name == "eval_code" {
+    if name == "gensym" || name == "eval_code" || name == "eval_expr" {
+        return true
+    }
+    // M4 过程宏（dev33 批次9）：token 流 API——tokenize（源码→token 流）、
+    // deparse（token 流→源码）、token_len/token_tag_at/token_lexeme_at
+    // （token 流检视）。仅宏环境（编译期 interp）可用。
+    if name == "tokenize" || name == "deparse" || name == "token_len" ||
+        name == "token_tag_at" || name == "token_lexeme_at" {
         return true
     }
     return false
@@ -224,6 +231,37 @@ func call_builtin(name: string, args: table<i64>) -> i64 {
             return -1
         }
         return ivalue.new_code(proto)
+    }
+    if name == "eval_expr" {
+        // M4（dev33 批次9）：eval_expr("表达式源码") → code 值（根 = 表达式
+        // 子树）。eval_code 只能解析完整程序，表达式需独立入口——包装成
+        // `func __tie_wrap__() -> i64 { return ( <expr> ) }` 解析后抽取
+        // return 表达式子树序列化。编译期常量计算宏（任务25）用它注入
+        // 计算结果字面量。
+        if len(args) != 1 {
+            g_err = "eval_expr 需要一个字符串参数"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_STR {
+            g_err = "eval_expr 需要一个字符串参数"
+            return -1
+        }
+        var src = ivalue.str_val(args[0])
+        // 单行包装无换行 → ASI 不补分号，return 语句须显式分号
+        var proto = parser.parse_src("func __tie_wrap__() -> i64 { return ( " + src + " ) ; }")
+        if has_str_prefix(proto, "ERR:") {
+            g_err = "eval_expr 源码语法错误: " + proto
+            return -1
+        }
+        if sstate.load_ast(proto) < 0 {
+            g_err = "内部错误: eval_expr 协议加载失败"
+            return -1
+        }
+        var p = expr_from_wrap()
+        if g_err != "" {
+            return -1
+        }
+        return ivalue.new_code(p)
     }
     if name == "println" {
         var line = join_print(args)
@@ -396,6 +434,115 @@ func call_builtin(name: string, args: table<i64>) -> i64 {
         }
         return ivalue.new_str(r)
     }
+    // ==================== M4 token 流 API（宏环境，dev33 批次9） ====================
+    // tokenize：源码字符串 → token 流文本（首行 <N>:，随后每行 <tag> <lexeme>，
+    // 排除末尾 Eof；lexeme 反斜杠/换行转义——保证每 token 单行且往返一致）。
+    if name == "tokenize" {
+        if len(args) != 1 {
+            g_err = "tokenize 需要一个字符串参数"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_STR {
+            g_err = "tokenize 需要一个字符串参数"
+            return -1
+        }
+        var ok = lexer.run_lex(ivalue.str_val(args[0]))
+        if !ok {
+            g_err = "tokenize 失败: 词法错误 @" + to_string(lexer.lex_err_line()) + ":" +
+                to_string(lexer.lex_err_col()) + ": " + lexer.lex_err_msg()
+            return -1
+        }
+        var cnt = lexer.token_count()
+        var n: i64 = 0
+        var k: i64 = 0
+        while k < cnt {
+            if lexer.token_tag(k) == lex_eof {
+                break
+            }
+            n = n + 1
+            k = k + 1
+        }
+        var out: string = to_string(n) + ":\n"
+        var j: i64 = 0
+        while j < n {
+            out = out + to_string(lexer.token_tag(j)) + " " +
+                escape_token_lexeme(lexer.token_lexeme(j)) + "\n"
+            j = j + 1
+        }
+        return ivalue.new_str(out)
+    }
+    // deparse：token 流文本 → 源码字符串（逐 token 发射原始拼写，token 间单空格；
+    // 反序列化保证 tokenize(deparse(tokenize(s))) == tokenize(s)）。
+    if name == "deparse" {
+        if len(args) != 1 {
+            g_err = "deparse 需要一个 token 流参数"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_STR {
+            g_err = "deparse 需要一个 token 流参数"
+            return -1
+        }
+        var src = deparse_tokens(ivalue.str_val(args[0]))
+        if g_err != "" {
+            return -1
+        }
+        return ivalue.new_str(src)
+    }
+    if name == "token_len" {
+        if len(args) != 1 {
+            g_err = "token_len 需要一个 token 流参数"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_STR {
+            g_err = "token_len 需要一个 token 流参数"
+            return -1
+        }
+        var n = parse_tokens(ivalue.str_val(args[0]))
+        if g_err != "" {
+            return -1
+        }
+        return ivalue.new_int(n)
+    }
+    if name == "token_tag_at" {
+        if len(args) != 2 {
+            g_err = "token_tag_at 需要 token 流与下标参数"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_STR || ivalue.type_of(args[1]) != T_INT {
+            g_err = "token_tag_at 需要 token 流与下标参数"
+            return -1
+        }
+        var n = parse_tokens(ivalue.str_val(args[0]))
+        if g_err != "" {
+            return -1
+        }
+        var i = ivalue.int_val(args[1])
+        if i < 0 || i >= n {
+            g_err = "token_tag_at 下标越界：索引 " + to_string(i) + " 超出长度 " + to_string(n)
+            return -1
+        }
+        return ivalue.new_int(g_tk_tags[i])
+    }
+    if name == "token_lexeme_at" {
+        if len(args) != 2 {
+            g_err = "token_lexeme_at 需要 token 流与下标参数"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_STR || ivalue.type_of(args[1]) != T_INT {
+            g_err = "token_lexeme_at 需要 token 流与下标参数"
+            return -1
+        }
+        var n = parse_tokens(ivalue.str_val(args[0]))
+        if g_err != "" {
+            return -1
+        }
+        var i = ivalue.int_val(args[1])
+        if i < 0 || i >= n {
+            g_err = "token_lexeme_at 下标越界：索引 " + to_string(i) + " 超出长度 " + to_string(n)
+            return -1
+        }
+        return ivalue.new_str(g_tk_lexemes[i])
+    }
     g_err = "内部错误: 未实现的内置函数 '" + name + "'"
     return -1
 }
@@ -406,6 +553,167 @@ func join_print(args: table<i64>) -> string {
     var i: i64 = 0
     while i < len(args) {
         out = out + ivalue.to_print_string(args[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ==================== M4 token 流工具（宏环境，dev33 批次9） ====================
+
+// 从 eval_expr 的包装程序（s_* 池）抽取 return 表达式子树协议文本。
+// 注意：parse_src 的 build_protocol 按**创建顺序**编号节点，顶层 StmtList
+// 在 parse_program 末尾创建 → 根是最后一个节点（id = s_n - 1），不是 id 0
+//（id 0 是第一个创建的节点，如返回类型 NAMED_TYPE）。导航：
+// 根 StmtList[0] = FnDef；FnDef 最后子 = 函数体 StmtList；体[0] = Return；
+// Return[0] = 表达式。返回协议文本；失败置 g_err 返回空串。
+func expr_from_wrap() -> string {
+    if s_n < 1 {
+        g_err = "内部错误: eval_expr 包装程序缺少节点"
+        return ""
+    }
+    var root = s_n - 1
+    if s_tags[root] != N_STMTLIST {
+        g_err = "内部错误: eval_expr 包装程序根不是语句列表 (tag=" +
+            to_string(s_tags[root]) + ")"
+        return ""
+    }
+    var fn = s_children[s_coff[root]]
+    if fn < 0 {
+        g_err = "内部错误: eval_expr 包装程序缺少函数定义"
+        return ""
+    }
+    var body = s_children[s_coff[fn] + s_nchild[fn] - 1]
+    if body < 0 {
+        g_err = "内部错误: eval_expr 包装程序缺少函数体"
+        return ""
+    }
+    var ret = s_children[s_coff[body]]
+    if ret < 0 {
+        g_err = "内部错误: eval_expr 包装程序缺少 return 语句"
+        return ""
+    }
+    var expr = s_children[s_coff[ret]]
+    if expr < 0 {
+        g_err = "eval_expr 表达式为空"
+        return ""
+    }
+    return sstate_subtree_protocol(expr)
+}
+
+// token 流 lexeme 转义（序列化）：\ → \\，实际换行 → \n，\r → \r，\t → \t。
+// 反斜杠先转义消除歧义：源字符串字面量里的 \n 转义（2 字符）序列化为 \\n，
+// 反序列化还原；真正换行符序列化为 \n，反序列化还原。往返一致。
+func escape_token_lexeme(s: string) -> string {
+    var out: string = ""
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "\\" {
+            out = out + "\\\\"
+        } else if c == "\n" {
+            out = out + "\\n"
+        } else if c == "\r" {
+            out = out + "\\r"
+        } else if c == "\t" {
+            out = out + "\\t"
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 转义还原：\\ → \，\n → 换行，\r → 回车，\t → 制表；未知转义按字面保留。
+func unescape_token_lexeme(s: string) -> string {
+    var out: string = ""
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == "\\" {
+            if i + 1 < n {
+                var n2 = str_char(s, i + 1)
+                if n2 == "n" {
+                    out = out + "\n"
+                    i = i + 2
+                    continue
+                }
+                if n2 == "r" {
+                    out = out + "\r"
+                    i = i + 2
+                    continue
+                }
+                if n2 == "t" {
+                    out = out + "\t"
+                    i = i + 2
+                    continue
+                }
+                if n2 == "\\" {
+                    out = out + "\\"
+                    i = i + 2
+                    continue
+                }
+            }
+            out = out + c
+            i = i + 1
+            continue
+        }
+        out = out + c
+        i = i + 1
+    }
+    return out
+}
+
+// 解析 token 流文本 → g_tk_tags/g_tk_lexemes（平行表，lexeme 未转义）。
+// 返回 token 数；失败置 g_err 返回 -1。首行 <N>: 头部跳过，其后每行
+// <tag> <lexeme>（lexeme 含空格只按首个空格切分）。
+func parse_tokens(stream: string) -> i64 {
+    g_tk_tags = table_new_i64()
+    g_tk_lexemes = table_new_string()
+    var lines = split_proto_lines(stream)
+    if len(lines) < 1 {
+        g_err = "token 流为空"
+        return -1
+    }
+    var i: i64 = 1
+    while i < len(lines) {
+        var line = lines[i]
+        var sp = find_char_str(line, " ")
+        if sp < 0 {
+            g_err = "token 流格式错误（第 " + to_string(i) + " 行缺少空格分隔）"
+            return -1
+        }
+        var tag = sstate.parse_dec(str.slice(line, 0, sp))
+        var lex = str.slice(line, sp + 1, str_len(line))
+        table_push(g_tk_tags, tag)
+        table_push(g_tk_lexemes, unescape_token_lexeme(lex))
+        i = i + 1
+    }
+    return len(g_tk_tags)
+}
+
+// token 流 → 源码文本：逐 token 发射原始拼写（未转义 lexeme），token 间单
+// 空格；跳过 Eof token。返回源码字符串（失败置 g_err 返回空串）。
+func deparse_tokens(stream: string) -> string {
+    var n = parse_tokens(stream)
+    if g_err != "" {
+        return ""
+    }
+    var out: string = ""
+    var first: bool = true
+    var i: i64 = 0
+    while i < n {
+        if g_tk_tags[i] == lex_eof {
+            i = i + 1
+            continue
+        }
+        if !first {
+            out = out + " "
+        }
+        out = out + g_tk_lexemes[i]
+        first = false
         i = i + 1
     }
     return out

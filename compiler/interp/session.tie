@@ -364,7 +364,10 @@ pub func scope_pop() {
         env_alive[off + i] = 0
         i = i + 1
     }
-    table_push(env_soff, 0)  // 不可缩表：用哨兵占位维持栈长一致性（不再弹用）
+    // 不可缩表：用哨兵占位维持栈长一致性。哨兵偏移 = 当前扁平表长度
+    //（不是 0）——否则弹层后 `var x` 声明落入偏移 0 的哨兵段，段内条目
+    // 查不到（旧 bug：if 块后声明变量 → 后续赋值报"未声明"）。
+    table_push(env_soff, len(env_keys))
     table_push(env_scnt, 0)
 }
 

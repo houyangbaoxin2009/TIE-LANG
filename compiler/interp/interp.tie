@@ -75,6 +75,12 @@ var g_clone_new: table<i64>;   // 克隆 id 映射（s_* 池新 id）
 var g_hyg_old: table<i64>;     // 卫生改名映射（旧 name 池 id）
 var g_hyg_new: table<i64>;     // 卫生改名映射（新 name 池 id）
 
+// ==================== M4 token 流解析缓存 ====================
+// tokenize/deparse/token_* 内置（dev33 批次9）共享：parse_tokens 把 token 流
+// 文本解析为 tag 与 lexeme 两平行表，供检视内置与 deparse 复用。
+var g_tk_tags: table<i64>;       // 解析后的 token 流 tag 表
+var g_tk_lexemes: table<string>; // 解析后的 token 流 lexeme 表（未转义）
+
 namespace interp {
 
 // ==================== 入口 ====================
@@ -93,6 +99,9 @@ pub func reset() {
     g_clone_new = table_new_i64()
     g_hyg_old = table_new_i64()
     g_hyg_new = table_new_i64()
+    // M4 token 流解析缓存清零
+    g_tk_tags = table_new_i64()
+    g_tk_lexemes = table_new_string()
 }
 
 // 求值一段代码：顶层定义注册，否则包装为 main 体执行，返回格式化结果或错误。

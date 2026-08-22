@@ -1,0 +1,41 @@
+type tie<logic>
+// dev33 批次9 任务24：token 流 API（tokenize/deparse 于宏环境）往返探针
+// ============================================================
+// 宏体内（编译期 interp）调用 M4 token 流内置，验证：
+//   1. tokenize(deparse(tokenize(s))) == tokenize(s)——token 流往返一致；
+//   2. token_len/token_tag_at/token_lexeme_at 检视正确（首 token = var/6）。
+// 宏返回 code 值（eval_expr 注入编译期计算结果字面量），调用点在表达式
+// 位置展开。
+// 期望输出：2（往返一致 1 + 首 token 检视正确 1）
+
+macro tok_roundtrip() -> code {
+    var s = "var x = 40 + 2\nprintln(x)"
+    var t1 = tokenize(s)
+    var s2 = deparse(t1)
+    var t2 = tokenize(s2)
+    var ok: i64 = 0
+    if t1 == t2 {
+        ok = 1
+    }
+    var tvar: i64 = -1
+    if token_len(t1) > 0 {
+        tvar = token_tag_at(t1, 0)
+    }
+    var tlex: string = ""
+    if token_len(t1) > 0 {
+        tlex = token_lexeme_at(t1, 0)
+    }
+    var tlv: i64 = 0
+    if tvar == 6 {
+        if tlex == "var" {
+            tlv = 1
+        }
+    }
+    return eval_expr("(" + to_string(ok + tlv) + ")")
+}
+
+func main() -> i64 {
+    var r = tok_roundtrip()
+    println(r)
+    return 0
+}
