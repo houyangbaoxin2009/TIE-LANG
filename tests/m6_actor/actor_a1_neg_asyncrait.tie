@@ -1,0 +1,11 @@
+type tie<logic>
+// 负例：async 方法必须 void 返回
+actor Counter {
+    var count: i64 = 0
+    pub async func get() -> i64 {
+        return count
+    }
+}
+func main() {
+    println("不应到达")
+}

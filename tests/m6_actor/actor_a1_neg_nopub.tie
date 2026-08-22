@@ -1,0 +1,12 @@
+type tie<logic>
+// 负例：actor 消息方法必须 pub
+actor Counter {
+    var count: i64 = 0
+    func inc(by: i64) -> i64 {
+        count = count + by
+        return count
+    }
+}
+func main() {
+    println("不应到达")
+}

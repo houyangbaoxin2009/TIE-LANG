@@ -27,17 +27,18 @@ namespace lexsym {
 // 批次 2（i128/u128）：i128 在 i16 前（'2'<'6'）、u128 在 u16 前——严格升序。
 // 顺序必须严格升序否则二分错乱。
 func build_kw() {
-    var k: table<string> = ["as", "asm", "bool", "break", "case", "char", "code",
-        "const", "continue", "default", "else", "enum", "extends", "extern",
-        "f32", "f64", "false", "for", "func", "i128", "i16", "i32", "i64", "i8", "if",
-        "impl", "import", "in", "macro", "map", "misc", "namespace", "num",
-        "panic", "port", "pub", "ref", "repr", "return", "string", "struct",
-        "switch", "table", "text", "trit", "true", "u128", "u16", "u32", "u64", "u8",
-        "unsafe", "using", "var", "void", "when", "while", "zero"]
-    var v: table<i64> = [21, 84, 32, 14, 17, 32, 32, 7, 15, 18, 9, 81, 23, 27, 32,
-        32, 29, 11, 5, 32, 32, 32, 32, 32, 8, 87, 20, 12, 88, 32,
-        32, 24, 32, 85, 86, 25, 31, 83, 13, 32, 22, 16, 32, 32, 32,
-        28, 32, 32, 32, 32, 32, 82, 26, 6, 32, 19, 10, 30]
+    var k: table<string> = ["actor", "as", "asm", "async", "bool", "break",
+        "case", "char", "code", "const", "continue", "default", "else", "enum",
+        "extends", "extern", "f32", "f64", "false", "for", "func", "i128", "i16",
+        "i32", "i64", "i8", "if", "impl", "import", "in", "macro", "map", "misc",
+        "namespace", "num", "panic", "port", "pub", "ref", "repr", "return",
+        "string", "struct", "switch", "table", "text", "trit", "true", "u128",
+        "u16", "u32", "u64", "u8", "unsafe", "using", "var", "void", "when",
+        "while", "zero"]
+    var v: table<i64> = [92, 21, 84, 93, 32, 14, 17, 32, 32, 7, 15, 18, 9, 81,
+        23, 27, 32, 32, 29, 11, 5, 32, 32, 32, 32, 32, 8, 87, 20, 12, 88, 32,
+        32, 24, 32, 85, 86, 25, 31, 83, 13, 32, 22, 16, 32, 32, 32, 28, 32,
+        32, 32, 32, 32, 82, 26, 6, 32, 19, 10, 30]
     kw_keys = table_new_string()
     kw_vals = table_new_i64()
     var i: i64 = 0

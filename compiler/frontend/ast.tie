@@ -171,6 +171,12 @@ const N_IMPL: i64 = 139;
 //     —— `case Ok(v):` / `case Result.Ok(v):` —— 命中变体后把 payload 绑定到 v。
 //     仅出现在 SwitchCase 的 PatternList 内。
 const N_CASE_BIND: i64 = 140;
+// 一期并发：actor 原生语法
+//   ActorDecl[name=actor 名, aux=字段+方法总数, children=[字段 N_CLASS_FIELD...,
+//   方法 N_FN_DEF...]]。字段与方法混合收集：字段先、方法后，均裸节点序列
+//   （children[0] 起即内容，无泛型槽——一期 actor 不支持泛型）。async 方法
+//   用 N_FN_DEF 的 val bit2（ax%）标记，见 parser。
+const N_ACTOR: i64 = 141;
 // S3.3 宏/元编程（三节点，布局约定见 mexpand.tie 头注释）：
 //   MacroDef[name=宏名, val=0, aux=nparams, children=[返回类型, 参数..., 函数体]]
 //     —— 布局与 FnDef 一致但**无泛型槽**（children[0] 即返回类型；形参从 1 起，

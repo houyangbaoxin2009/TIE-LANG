@@ -71,6 +71,8 @@ const lex_dollar: i64 = 90;     // $ 插值符（S3.3：$x 嵌入 / $name 标识
 // M4 过程宏（dev33 批次9）：# 属性起始符——`#[macro]` 标记宏定义为过程宏
 //（token 流 API 驱动），tag 91 为符号表新增（'#' = 0x23，介于 '!=' 与 '$' 之间）。
 const lex_hash: i64 = 91;       // # 哈希符（属性语法 `#[name]`）
+const lex_actor: i64 = 92;      // actor 关键字（一期并发：actor 原生语法）
+const lex_async: i64 = 93;      // async 关键字（actor 异步投递方法修饰）
 
 namespace lextok {
 
@@ -167,6 +169,10 @@ func is_decl_start(tag: i64) -> bool {
     // S2.4：port 声明 / impl 块的 doc 附着；S3.3：macro 定义
     // （doc 附着到宏定义声明）
     if tag == lex_port || tag == lex_impl || tag == lex_macro {
+        return true
+    }
+    // 一期并发：actor 声明的 doc 附着
+    if tag == lex_actor {
         return true
     }
     return false

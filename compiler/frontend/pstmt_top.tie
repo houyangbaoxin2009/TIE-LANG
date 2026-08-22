@@ -121,6 +121,13 @@ pub func parse_program() -> i64 {
                 return -1
             }
             ast.collect_stmt(stmts, s)
+        } else if tag == lex_actor {
+            // 一期并发：actor 原生语法（`actor Name { ... }`）
+            var s = parse_actor()
+            if s < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, s)
         } else if tag == lex_extern {
             var s = parse_extern()
             if s < 0 {
@@ -478,6 +485,13 @@ func parse_namespace() -> i64 {
                     return -1
                 }
                 table_push(body_stmts, st)
+            } else if tag == lex_actor {
+                // 一期并发：命名空间内 actor 声明
+                var st = parse_actor()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
             } else if tag == lex_enum {
                 var st = parse_enum()
                 if st < 0 {
@@ -559,6 +573,13 @@ func parse_namespace() -> i64 {
                 table_push(body_stmts, st)
             } else if tag == lex_struct {
                 var st = parse_struct()
+                if st < 0 {
+                    return -1
+                }
+                table_push(body_stmts, st)
+            } else if tag == lex_actor {
+                // 一期并发：命名空间内 actor 声明
+                var st = parse_actor()
                 if st < 0 {
                     return -1
                 }
@@ -771,14 +792,20 @@ func parse_type_param_one(p: i64, line: i64, col: i64) -> i64 {
 // 泛型（2026-08-14）：名字后紧跟类型参数列表 `<T1, T2>`；产出 N_FN_DEF
 // children = [泛型槽(-1或N_TYPE_PARAMS), 返回类型, 参数..., 函数体]。
 // S1.2：val 复用为标志位（bit0=is_pub, bit1=is_unsafe）。
+// 一期并发：val bit2 = is_async（`pub async func` = actor 异步投递方法；仅 actor
+// 体内语义合法，解析层统一接受、语义层拦截非 actor 用法）。
 // S2.4：port 方法签名（无体）由 parse_port_method 单独解析（见下）。
 func parse_fn_def() -> i64 {
     var line = putil.peek_line()
     var col = putil.peek_col()
     var is_pub: i64 = 0
     var is_unsafe: i64 = 0
+    var is_async: i64 = 0
     if putil.eat(lex_pub) {
         is_pub = 1
+    }
+    if putil.eat(lex_async) {
+        is_async = 1
     }
     if putil.eat(lex_unsafe) {
         is_unsafe = 1
@@ -894,7 +921,7 @@ func parse_fn_def() -> i64 {
     if body < 0 {
         return -1
     }
-    var f = ast.new_node(N_FN_DEF, name, is_pub + is_unsafe * 2, len(params), line, col)
+    var f = ast.new_node(N_FN_DEF, name, is_pub + is_unsafe * 2 + is_async * 4, len(params), line, col)
     var kids: table<i64> = table_new_i64()
     table_push(kids, type_params)
     table_push(kids, ret_ty)
@@ -1118,6 +1145,91 @@ func parse_impl() -> i64 {
 // 泛型（2026-08-14）：struct 名后紧跟类型参数列表；产出 N_STRUCT
 // children = [泛型槽(-1或N_TYPE_PARAMS), ClassField...]。
 // S1.2 R1：`repr(C) struct` → val = 1（显式 C 内存布局）；普通 struct val = -1。
+// `actor Name { var ...; pub func ...; pub async func ... }`（一期并发原生语法）
+// 例子：
+//   actor Counter {
+//       var count: i64 = 0
+//       pub func inc(by: i64) -> i64 { count = count + by; return count }
+//       pub async func reset() { count = 0 }
+//   }
+// 产出 N_ACTOR，children = [字段 N_CLASS_FIELD..., 方法 N_FN_DEF...]（无泛型槽，
+// 一期 actor 不支持泛型）。字段与 struct 字段同构；方法经 parse_fn_def（自带
+// pub/async/unsafe 关键字缀饰处理，async 用 N_FN_DEF val bit2 标记）。方法必须
+// pub（语义层拦截非 pub 方法）；async 方法必须 void 返回（语义层拦截）。
+func parse_actor() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // actor
+    var name = putil.expect_ident()
+    if name < 0 {
+        return -1
+    }
+    if !putil.expect(lex_lbrace, "actor 声明必须跟 '{'") {
+        return -1
+    }
+    var items: table<i64> = table_new_i64()
+    var done = false
+    while !done {
+        var tag = putil.peek_tag()
+        if tag == lex_rbrace {
+            putil.advance()
+            done = true
+        } else if tag == lex_eof {
+            if !putil.expect(lex_rbrace, "actor 声明必须跟 '}'") {
+                return -1
+            }
+            done = true
+        } else if tag == lex_semi {
+            putil.advance()   // ASI 补的分号
+        } else if tag == lex_var {
+            // 状态字段：复用 struct 字段解析（N_CLASS_FIELD）
+            var fl = putil.peek_line()
+            var fc = putil.peek_col()
+            putil.advance()   // var
+            var fname = putil.expect_ident()
+            if fname < 0 {
+                return -1
+            }
+            var fty = -1
+            if putil.eat(lex_colon) {
+                fty = pexpr_type.parse_type()
+                if fty < 0 {
+                    return -1
+                }
+            }
+            var finit = -1
+            if putil.eat(lex_eq) {
+                finit = pexpr.parse_expr()
+                if finit < 0 {
+                    return -1
+                }
+            }
+            if !putil.expect(lex_semi, "actor 字段声明结束符") {
+                return -1
+            }
+            var f = ast.new_node(N_CLASS_FIELD, fname, -1, -1, fl, fc)
+            var fkids: table<i64> = table_new_i64()
+            table_push(fkids, fty)
+            table_push(fkids, finit)
+            ast.set_children(f, fkids)
+            table_push(items, f)
+        } else if tag == lex_func || tag == lex_pub {
+            // 消息方法：`[pub] [async] func ...`（parse_fn_def 处理修饰缀）
+            var m = parse_fn_def()
+            if m < 0 {
+                return -1
+            }
+            table_push(items, m)
+        } else {
+            putil.set_err(putil.peek_line(), putil.peek_col(), "actor 体内只允许字段(var)或消息方法([pub][async]func)，实际是 " + putil.describe(tag))
+            return -1
+        }
+    }
+    var s = ast.new_node(N_ACTOR, name, -1, len(items), line, col)
+    ast.set_children(s, items)
+    return s
+}
+
 func parse_struct() -> i64 {
     var line = putil.peek_line()
     var col = putil.peek_col()

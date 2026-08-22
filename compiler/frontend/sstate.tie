@@ -328,6 +328,10 @@ const S_N_IMPL: i64 = 139;          // impl 块：Impl[children=[port 类型, st
 const S_N_MACRO_DEF: i64 = 135;     // 宏定义（M3）
 const S_N_CODE_LIT: i64 = 136;      // 准引用字面量（C1）
 const S_N_CODE_INTERP: i64 = 137;   // 插值表达式（$x / $(expr)）
+// 一期并发 actor（与 ast.tie N_ACTOR 同号）：
+const S_N_ACTOR: i64 = 141;         // actor 声明：Actor[name=actor 名, aux=items 数,
+                                    //   children=[字段 ClassField..., 方法 FnDef...]]
+                                    //   （方法 async 标记经 FnDef val bit2）
 namespace sstate {
 
 // ==================== 工具：协议解析 ====================

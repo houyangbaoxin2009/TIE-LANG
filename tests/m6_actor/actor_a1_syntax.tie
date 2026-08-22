@@ -1,0 +1,17 @@
+type tie<logic>
+// 一期并发 A1 语法层探针：actor 关键字与解析（同步方法 + async 方法 + 字段）。
+// 本探针仅验证 actor 声明能被解析并通过语义收集（不落地句柄/消息执行，
+// 那是 A2/A3 范围）。main 为空，编译成功即 A1 通过。
+actor Counter {
+    var count: i64 = 0
+    pub func inc(by: i64) -> i64 {
+        count = count + by
+        return count
+    }
+    pub async func reset() {
+        count = 0
+    }
+}
+func main() {
+    println("actor A1 语法探针通过")
+}
