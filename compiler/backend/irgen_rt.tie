@@ -402,7 +402,58 @@ func tig_cb_ptr(id: i64) -> i64 {
 }
 
 
-// 类型零值生成：i64/整数 → const 0；string/ptr → 空串全局常量；
+// ---------- 一期并发 A4 执行层：per-actor 运行期（纯 codegen 零运行时） ----------
+// per-actor record 布局（字节偏移；纯 codegen 直接分配原始缓冲）：
+//   @0   : i64 magic（0xAC70524E 校验句柄/记录）
+//   @8   : CRITICAL_SECTION lock（40 字节）
+//   @48  : CONDITION_VARIABLE cv（8 字节）
+//   @56+ : mailbox / 状态字段（Step4 起：shutdown/队列头尾/容量）
+// 布局常量用内联字面量（namespace 体内不允许 const/var 声明）。
+
+// `run<Actor>(实参...)` 生成：求值实参（step4 起作初始消息）→ 分配 per-actor
+// record（s21_raw_alloc_str，安全堆 + 尾部填充）→ 初始化 CRITICAL_SECTION 与
+// CONDITION_VARIABLE（kernel32 extern，is_libc_sym 免 interp）→ 返回句柄
+//（record 指针 ptrtoint → i64，K_ACTOR 槽承载）。
+// Step3：仅分配 + 锁/条件变量就绪 + 返回真实句柄（不再占位 0）；线程消息循环
+// （mailbox + dispatch + 同步 RPC）在 Step4 于 record 上接续。
+func tig_actor_run(id: i64) -> i64 {
+    // 实参求值（丢弃；Step4 起作为初始消息/构造入队）
+    var rnc = sstate.nchild(id)
+    var rk: i64 = 1
+    while rk < rnc {
+        var rv = tig_expr(sstate.child(id, rk))
+        if rv < 0 {
+            return -1
+        }
+        rk = rk + 1
+    }
+    var T64 = types.named(TK_I64)
+    var rec = s21_raw_alloc_str(tig_int_lit_ty(256, T64))  // A_REC_SIZE = 256
+    if rec < 0 {
+        return -1
+    }
+    // magic @0：写 0xAC70524E（句柄/记录校验）
+    var mg = tig_int_lit_ty(0xAC70524E, T64)
+    s21_store(rec, mg, T64)
+    // lock @8：InitializeCriticalSection(ptr)
+    var lockp = s21_gep(rec, 8, true)  // A_OFF_LOCK = 8
+    var ats1: table<i64> = table_new_i64()
+    var avs1: table<i64> = table_new_i64()
+    table_push(ats1, types.named(TK_STR))
+    table_push(avs1, lockp)
+    tig_ext_call_typed("InitializeCriticalSection", ats1, avs1, -1)
+    // cv @48：InitializeConditionVariable(ptr)
+    var cvp = s21_gep(rec, 48, true)  // A_OFF_CV = 48
+    var ats2: table<i64> = table_new_i64()
+    var avs2: table<i64> = table_new_i64()
+    table_push(ats2, types.named(TK_STR))
+    table_push(avs2, cvp)
+    tig_ext_call_typed("InitializeConditionVariable", ats2, avs2, -1)
+    // 句柄 = ptrtoint record（i64；var-decl 槽类型 K_ACTOR = i64，LLVM 类型匹配）
+    var pi = ir.new_inst(g_cur_block, 24, T64)  // ptrtoint → i64
+    ir.add_operand(pi, rec, 0)
+    return ir.get_value(pi)
+}
 // bool → false；f64 → 0.0（const_f）；i8/i32 等 → 0 常量
 func tig_default_val(ty: i64) -> i64 {
     if ty == types.named(TK_STR) || types.is_table(ty) || types.is_map(ty) {

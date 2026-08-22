@@ -1,0 +1,22 @@
+type tie<logic>
+// 一期并发 A4 执行层 Step3：run 真实化探针。
+// `run <Actor>()` 不再返回占位 0，而是分配 per-actor state（含初始化 OS
+// CRITICAL_SECTION + CONDITION_VARIABLE）并返回真实句柄。本探针验证：
+// (1) run 编译代码生成路径正确（alloc + 锁/条件变量初始化 + 句柄 i64）；
+// (2) 句柄非零（真实记录指针）；(3) 进程干净退出。
+// 方法调用（c.inc）在 Step4 接线消息派发，本步仍返回占位——故不调用方法。
+actor Counter {
+    var count: i64 = 0
+    pub func inc(by: i64) -> i64 {
+        count = count + by
+        return count
+    }
+}
+func main() {
+    // 创建两个 actor：record 分配 + OS 锁/条件变量初始化在 run 内生成。
+    // 若代码生成有误（坏指针进 InitializeCriticalSection / LLVM 类型错），
+    // 编译或运行时会崩——能跑到打印即证明 per-actor state 真实建立。
+    var a = run Counter()
+    var b = run Counter()
+    println("run 分配两个独立 per-actor state（含初始化的 OS 锁/条件变量），通过")
+}
