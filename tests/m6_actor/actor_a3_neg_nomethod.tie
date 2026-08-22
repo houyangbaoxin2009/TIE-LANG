@@ -1,0 +1,14 @@
+type tie<logic>
+// 负例：调用 actor 不存在的方法 → 语义错误
+actor Counter {
+    var count: i64 = 0
+    pub func inc(by: i64) -> i64 {
+        count = count + by
+        return count
+    }
+}
+func main() {
+    var c = run Counter()
+    var v = c.no_such(5)
+    println("不应到达")
+}

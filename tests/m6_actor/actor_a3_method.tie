@@ -1,0 +1,14 @@
+type tie<logic>
+// A3 探针骨架：验证 c.inc(5) 方法转发的解析/语义路径
+actor Counter {
+    var count: i64 = 0
+    pub func inc(by: i64) -> i64 {
+        count = count + by
+        return count
+    }
+}
+func main() {
+    var c = run Counter()
+    var v = c.inc(5)
+    println("v=" + to_string(v))
+}

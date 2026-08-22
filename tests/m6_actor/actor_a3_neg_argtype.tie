@@ -1,0 +1,14 @@
+type tie<logic>
+// 负例：actor 方法参数个数/类型不匹配 → 语义错误
+actor Counter {
+    var count: i64 = 0
+    pub func inc(by: i64) -> i64 {
+        count = count + by
+        return count
+    }
+}
+func main() {
+    var c = run Counter()
+    var v = c.inc("oops")
+    println("不应到达")
+}

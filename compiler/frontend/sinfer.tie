@@ -1506,6 +1506,9 @@ pub func infer_method_call(id: i64) -> i64 {
         } else if types.kind(rt2) == K_ATOMIC {
             // S1.2 A1 atomic<T> 内置方法（c.load() / c.fetch_add(1, Relaxed)）
             return infer_atomic_method(rt2, mname, args, id)
+        } else if types.kind(rt2) == K_ACTOR {
+            // 一期并发：actor 句柄方法调用（c.inc(5) 转发到该 actor 的消息方法）
+            return infer_actor_method(rt2, mname, args, id)
         } else if types.kind(rt2) == K_PORT {
             // S2.4：port 对象方法调用（动态分发，vtable 间接调用）
             return infer_port_method(rt2, mname, args, id)
@@ -1978,6 +1981,46 @@ func infer_port_method(pty: i64, mname: string, args: table<i64>, id: i64) -> i6
         j = j + 1
     }
     var rt = sstate.port_method_ret(pi, mi)
+    node_types[id] = rt
+    g_typed = g_typed + 1
+    return rt
+}
+
+// 一期并发：actor 句柄方法调用（c.inc(5) → 该 actor 的消息方法；A3 转发）。
+// 句柄类型低位 = actor 索引，消息方法签名由 sstate actor 方法表提供。
+func infer_actor_method(aty: i64, mname: string, args: table<i64>, id: i64) -> i64 {
+    var ai = types.low(aty)
+    var mi = sstate.actor_method_idx(ai, mname)
+    if mi < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "actor '" + types.type_name(aty) + "' 没有消息方法 '" + mname + "'"
+        return -1
+    }
+    var n_args = len(args)
+    var np = sstate.actor_method_npar(ai, mname)
+    if n_args != np {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "方法 '" + mname + "' 期望 " + to_string(np) + " 个参数，实际 " + to_string(n_args) + " 个"
+        return -1
+    }
+    var j: i64 = 0
+    while j < n_args {
+        var at = infer_expr(args[j])
+        if at < 0 {
+            return -1
+        }
+        var want = sstate.actor_method_param(ai, mname, j)
+        if !stype.types_compatible(want, at) && !stype.types_match(want, at, args[j]) {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "方法 '" + mname + "' 参数类型不匹配：期望 " + types.type_name(want) + "，实际 " + types.type_name(at)
+            return -1
+        }
+        j = j + 1
+    }
+    var rt = sstate.actor_method_ret(ai, mname)
     node_types[id] = rt
     g_typed = g_typed + 1
     return rt

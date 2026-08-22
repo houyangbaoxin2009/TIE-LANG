@@ -213,6 +213,24 @@ var g_root: i64 = 0;
 // types.BASE_ACTOR 行号对应（scollect 收集时 set_actor_name 登记同名）。
 var ac_keys: table<i64>;
 var ac_vals: table<i64>;
+// actor 方法签名表（行 = actor 索引）：
+//   ac_moff[actor] -> 方法名段偏移（ac_mnames，声明顺序）
+//   ac_mn[actor]   -> 方法个数
+//   ac_mpar[actor] -> 参数个数表段偏移（ac_mnpars 扁平段）
+//   ac_paroff[actor]-> 参数类型段偏移（ac_mptys 扁平段）
+//   ac_mret[actor] -> 返回类型表段偏移（ac_mrets 扁平段）
+// 方法 m 的签名：参数个数 = ac_mnpars[ac_mpar + m]，参数段 =
+// ac_mptys[ac_paroff + m .. +个数]，返回 = ac_mrets[ac_mret + m]。
+// actor 方法无显式 self 参数（状态隐式，msg 参数即显式形参）。
+var ac_moff: table<i64>;
+var ac_mn: table<i64>;
+var ac_mpar: table<i64>;
+var ac_paroff: table<i64>;
+var ac_mret: table<i64>;
+var ac_mnames: table<i64>;   // 方法名 id 扁平段（声明顺序）
+var ac_mnpars: table<i64>;   // 每方法参数个数扁平段
+var ac_mptys: table<i64>;    // 每方法参数类型扁平段
+var ac_mrets: table<i64>;    // 每方法返回类型扁平段
 
 // ==================== S2.4 port / impl 状态表（接口模型）====================
 // port 表：pt_keys（port 名 id，升序）→ pt_vals（port 索引）。
@@ -1255,7 +1273,87 @@ pub func reg_actor(name: string) -> i64 {
     var idx = len(ac_vals)
     sorted_insert(ac_keys, ac_vals, intern.intern(name), idx)
     types.set_actor_name(idx, name)
+    // 初始化 actor 方法签名表行（仿 port：空行）
+    table_push(ac_moff, len(ac_mnames))
+    table_push(ac_mn, 0)
+    table_push(ac_mpar, len(ac_mnpars))
+    table_push(ac_paroff, len(ac_mptys))
+    table_push(ac_mret, len(ac_mrets))
     return idx
+}
+
+// actor 消息方法登记（collect_actor_decl 用）：方法名 + 参数类型表 + 返回类型。
+// 返回方法索引（声明顺序）；-1 错误（sm_err_* 已置）。
+pub func reg_actor_method(ai: i64, mname: string, ptys: table<i64>, ret: i64) -> i64 {
+    var nid = intern.intern(mname)
+    // 重名检查（actor 内方法名唯一）
+    var off = ac_moff[ai]
+    var n = ac_mn[ai]
+    var k: i64 = 0
+    while k < n {
+        if ac_mnames[off + k] == nid {
+            sm_err_msg = "actor '" + intern.lookup(ac_keys[ai]) + "' 的方法 '" + mname + "' 重复定义"
+            return -1
+        }
+        k = k + 1
+    }
+    var mi = n
+    table_push(ac_mnames, nid)
+    table_push(ac_mnpars, len(ptys))
+    var j: i64 = 0
+    while j < len(ptys) {
+        table_push(ac_mptys, ptys[j])
+        j = j + 1
+    }
+    table_push(ac_mrets, ret)
+    ac_mn[ai] = n + 1
+    return mi
+}
+
+// actor 方法索引查询（方法名 -> 声明序号；-1 = 无）
+pub func actor_method_idx(ai: i64, mname: string) -> i64 {
+    var nid = intern.intern(mname)
+    var off = ac_moff[ai]
+    var n = ac_mn[ai]
+    var k: i64 = 0
+    while k < n {
+        if ac_mnames[off + k] == nid {
+            return k
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// actor 方法参数个数查询（-1 = 非该 actor 方法）
+pub func actor_method_npar(ai: i64, mname: string) -> i64 {
+    var mi = actor_method_idx(ai, mname)
+    if mi < 0 {
+        return -1
+    }
+    return ac_mnpars[ac_mpar[ai] + mi]
+}
+
+// actor 方法第 k 个参数类型（-1 = 越界）
+pub func actor_method_param(ai: i64, mname: string, k: i64) -> i64 {
+    var mi = actor_method_idx(ai, mname)
+    if mi < 0 {
+        return -1
+    }
+    var np = ac_mnpars[ac_mpar[ai] + mi]
+    if k < 0 || k >= np {
+        return -1
+    }
+    return ac_mptys[ac_paroff[ai] + mi + k]
+}
+
+// actor 方法返回类型（-1 = 非该 actor 方法；void → TK_VOID）
+pub func actor_method_ret(ai: i64, mname: string) -> i64 {
+    var mi = actor_method_idx(ai, mname)
+    if mi < 0 {
+        return -1
+    }
+    return ac_mrets[ac_mret[ai] + mi]
 }
 
 // port 方法登记（collect_port 用）：方法名 + 参数类型表（含 self 槽）+ 返回类型。

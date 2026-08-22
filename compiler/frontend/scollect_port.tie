@@ -1020,7 +1020,7 @@ pub func collect_global_var(v: i64) -> i64 {
 
 // 一期并发 A1/A2 语法层：actor 声明收集。
 // 登记 actor 名到 actor 表（防重名 + 句柄类型解析依据）；校验结构约束
-// （内部方法必须 pub、async 必须 void 返回）。方法签名/句柄方法表在 A3 落地。
+// （内部方法必须 pub、async 必须 void 返回）+ 登记消息方法签名（A3 转发依据）。
 // 返回 0 成功 / -1 错误。children = [字段 N_CLASS_FIELD..., 方法 N_FN_DEF...]。
 pub func collect_actor_decl(s: i64) -> i64 {
     var nm = sstate.name_str(s)
@@ -1044,9 +1044,35 @@ pub func collect_actor_decl(s: i64) -> i64 {
                 sm_err_msg = "actor 消息方法 '" + sstate.name_str(item) + "' 必须声明为 pub"
                 return -1
             }
+            var mname = sstate.name_str(item)
+            var nparams = s_aux[item]
+            // 返回类型：FnDef children[slot_off]（同 collect_fn）
+            var rt_node = sstate.child(item, sstate.slot_off(item))
+            var ret_ty = sgen.parse_generic_type_node(rt_node)
+            if ret_ty < 0 {
+                return -1
+            }
+            // 参数类型：children[slot_off + 1 .. +nparams]
+            var ptys: table<i64> = table_new_i64()
+            var k: i64 = 0
+            while k < nparams {
+                var pnode = sstate.child(item, sstate.slot_off(item) + 1 + k)
+                var pty = sgen.parse_generic_type_node(sstate.child(pnode, 0))
+                if pty < 0 {
+                    return -1
+                }
+                table_push(ptys, pty)
+                k = k + 1
+            }
+            var mr = sstate.reg_actor_method(aidx, mname, ptys, ret_ty)
+            if mr < 0 {
+                sm_err_line = s_lines[item]
+                sm_err_col = s_cols[item]
+                return -1
+            }
             // async 方法必须 void 返回（fire-and-forget 无返回值契约）
             if s_vals[item] / 4 % 2 == 1 {
-                var ret_node = sstate.child(item, sstate.slot_off(item))
+                var ret_node = rt_node
                 var ret_is_void = false
                 if ret_node >= 0 {
                     if s_tags[ret_node] == S_N_NAMED_TYPE {
@@ -1058,7 +1084,7 @@ pub func collect_actor_decl(s: i64) -> i64 {
                 if !ret_is_void {
                     sm_err_line = s_lines[item]
                     sm_err_col = s_cols[item]
-                    sm_err_msg = "async 消息方法 '" + sstate.name_str(item) + "' 必须返回 void（异步投递无返回值）"
+                    sm_err_msg = "async 消息方法 '" + mname + "' 必须返回 void（异步投递无返回值）"
                     return -1
                 }
             }

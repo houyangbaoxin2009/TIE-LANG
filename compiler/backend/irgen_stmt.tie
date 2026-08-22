@@ -714,6 +714,10 @@ func tig_stmt(id: i64) -> i64 {
                 // S1.2：指针/切片/原子类型推断（`var p = addr_of(x)`）→
                 // 对应槽（alloca ptr / alloca {ptr,i64} / alloca 元素型）
                 ty = it
+            } else if it >= 0 && types.kind(it) == K_ACTOR {
+                // 一期并发：actor 句柄变量推断 → 保留句柄类型（LLVM=i64 槽，
+                // 但须保留 K_ACTOR 供方法转发 scope 查类型）
+                ty = it
             } else if it >= 0 && (types.kind(it) == K_TUPLE || types.kind(it) == K_STRUCT || types.kind(it) == K_ENUM || types.kind(it) == K_FN || types.kind(it) == K_PORT) {
                 // 聚合变量：alloca 聚合槽，init（构造调用/元组字面量/返回）求聚合值
                 // （K_ENUM 2026-08-15：枚举变量同 struct——alloca %enum.X 槽，

@@ -196,6 +196,34 @@ func tig_method_call(id: i64) -> i64 {
                     return tig_struct_method_call(full, id, recv, g_lookup_ty)
                 }
             }
+            if types.kind(g_lookup_ty) == K_ACTOR {
+                // 一期并发 A3：actor 句柄方法调用（c.inc(5)）。
+                // A3 语法层：仅生成占位结果（返回类型零值）；真实消息入队 +
+                // 同步 RPC 应答在 A4/A5 落地（届时改为消息投递 + 阻塞应答）。
+                var is_ret_void = false
+                var act_ret = types.named(TK_VOID)
+                var ai2 = g_lookup_ty - BASE_ACTOR
+                var mi2 = sstate.actor_method_idx(ai2, mname)
+                if mi2 < 0 {
+                    sm_err_msg = "actor 方法 '" + mname + "' 未找到（函数 " + g_cur_fn_name + "）"
+                    return -1
+                }
+                act_ret = sstate.actor_method_ret(ai2, mname)
+                if act_ret == types.named(TK_VOID) {
+                    is_ret_void = true
+                }
+                // 实参求值（丢弃，A4/A5 才做消息打包）
+                var aoff2 = 1 + sstate.slot_off(id)
+                var ak: i64 = aoff2
+                while ak < sstate.nchild(id) {
+                    tig_expr(sstate.child(id, ak))
+                    ak = ak + 1
+                }
+                if is_ret_void {
+                    return tig_int_lit(0)
+                }
+                return tig_default_val(act_ret)
+            }
             if types.kind(g_lookup_ty) == K_PORT {
                 // S2.4：port 对象方法调用（动态分发，vtable 间接调用）
                 return tig_port_method_call(id, recv, g_lookup_ty, mname)
@@ -207,6 +235,26 @@ func tig_method_call(id: i64) -> i64 {
     var rt4 = node_types[recv]
     if rt4 >= 0 && types.kind(rt4) == K_PORT {
         return tig_port_method_call(id, recv, rt4, mname)
+    }
+    if rt4 >= 0 && types.kind(rt4) == K_ACTOR {
+        // 一期并发 A3：local/表达式接收者的 actor 方法调用（c.inc(5)）。
+        // node_types[recv] 恒为句柄类型（比 scope 槽更可靠，actor 句柄变量
+        // 的局部槽类型未经 struct 方法路径注册）。占位结果，A4/A5 真投递。
+        var rai = rt4 - BASE_ACTOR
+        if sstate.actor_method_idx(rai, mname) < 0 {
+            sm_err_msg = "actor 方法 '" + mname + "' 未找到（函数 " + g_cur_fn_name + "）"
+            return -1
+        }
+        var rret = sstate.actor_method_ret(rai, mname)
+        var rak = 1 + sstate.slot_off(id)
+        while rak < sstate.nchild(id) {
+            tig_expr(sstate.child(id, rak))
+            rak = rak + 1
+        }
+        if rret == types.named(TK_VOID) {
+            return tig_int_lit(0)
+        }
+        return tig_default_val(rret)
     }
     var prefix = sinfer.recv_path_name(recv)
     if prefix == "" {
