@@ -1,0 +1,414 @@
+type tie<class>
+// compiler/interp/interp_call.tie —— 自举 v2 解释器核心：函数调用求值
+// （从 interp.tie 拆出：call_fn/参数绑定/call_builtin/is_builtin/join_print
+//   及宏调用分派等函数调用求值函数）
+// ============================================================
+// 范式：tie import 是文本内联——被 import 文件全部代码并入编译单元，一切
+// 符号全局可见。本文件与主文件 interp.tie 共享一个 `namespace interp`（跨
+// 文件闭合并集，同 interp_bin.tie 先例），函数可互相裸名调用、访问主文件
+// 顶层全局 var（g_err/g_flow 等）与 ivalue 等。
+// 本文件不自建全局 var，不含 import。
+
+namespace interp {
+
+// ==================== 函数调用 ====================
+
+// 函数调用：内置函数 → 用户函数 → 报错。返回值 id；失败置 g_err 返回 -1。
+// args = 实参值 id 表；arg_nodes = 实参 AST 节点表（by_ref 需取实参变量名）。
+func call_fn(name: string, args: table<i64>, arg_nodes: table<i64>) -> i64 {
+    // 内置函数（对齐 Rust call_fn 的 match name 分支）
+    if is_builtin(name) {
+        return call_builtin(name, args)
+    }
+    // 用户函数（REPL 中定义的；命名空间函数以全名注册）
+    var f = isess.f_get(name)
+    if f < 0 {
+        g_err = "未定义的函数 '" + name + "'"
+        return -1
+    }
+    // FnDef 泛型槽偏移：children = [类型参数槽, 返回类型, 参数..., 函数体]，
+    // 形参从 1 + soff 起（对齐 sstate.slot_off——曾按旧布局读 children[1+i]，
+    // 泛型槽引入后把槽/返回类型误当形参绑定，函数调用全错位）
+    var fsoff: i64 = 0
+    if isess.nchild(f) > 1 {
+        var fc0 = isess.nchild_at(f, 0)
+        if fc0 < 0 {
+            fsoff = 1
+        } else if isess.ntag(fc0) == N_TYPE_PARAMS {
+            fsoff = 1
+        }
+    }
+    // 参数个数区间检查（默认值参数）：实参数必须在 [必选数, 总形参数] 内；
+    // 变参（最后一个形参 aux==1）：无上界，必选数不含变参本身
+    var total = isess.naux(f)
+    var has_var: bool = false
+    var required: i64 = 0
+    var pi: i64 = 0
+    while pi < total {
+        var p = isess.nchild_at(f, 1 + fsoff + pi)
+        if isess.naux(p) == 1 {
+            has_var = true   // 变参形参（aux 标记）
+        } else if isess.nchild_at(p, 1) < 0 {
+            required = required + 1
+        }
+        pi = pi + 1
+    }
+    if len(args) < required || (!has_var && len(args) > total) {
+        var cnt_desc = ""
+        if has_var {
+            cnt_desc = to_string(required) + "+"
+        } else if required == total {
+            cnt_desc = to_string(total)
+        } else {
+            cnt_desc = to_string(required) + "-" + to_string(total)
+        }
+        g_err = "函数 '" + name + "' 期望 " + cnt_desc + " 个参数，实际 " + to_string(len(args)) + " 个"
+        return -1
+    }
+    // 函数体执行期间，裸调用按本函数命名空间前缀补全
+    var saved_ns = isess.ns_save()
+    if rfind_ns_str(name) >= 0 {
+        env_ns = ns_prefix_of_name(name)
+    }
+    // 保存调用者的作用域起点，压参后本函数作用域从参数作用域开始
+    var saved_base = env_base
+    isess.scope_push()
+    isess.ref_push()
+    var i: i64 = 0
+    while i < total {
+        var p = isess.nchild_at(f, 1 + fsoff + i)
+        var pname = isess.nname_str(p)
+        if isess.naux(p) == 1 {
+            // 变参：剩余全部实参打包为 Value 表（支持 len/下标/for）
+            var tv = ivalue.new_table()
+            var ai: i64 = i
+            while ai < len(args) {
+                tv = ivalue.table_push_val(tv, args[ai])
+                ai = ai + 1
+            }
+            isess.var_declare(pname, tv)
+        } else if isess.nval(p) == 1 {
+            // T0.3 by_ref：实参必须是可寻址表变量；引用槽记录调用方变量名。
+            // 注意：tie 的 || 不短路，先判越界再取节点
+            if i >= len(arg_nodes) {
+                g_err = "函数 '" + name +
+                    "' 的 ref 参数需要可寻址的表变量实参（字面量/下标/调用结果不可取地址）"
+                isess.ref_pop()
+                isess.scope_pop()
+                env_base = saved_base
+                isess.ns_restore(saved_ns)
+                return -1
+            }
+            if isess.ntag(arg_nodes[i]) != N_VAR {
+                g_err = "函数 '" + name +
+                    "' 的 ref 参数需要可寻址的表变量实参（字面量/下标/调用结果不可取地址）"
+                isess.ref_pop()
+                isess.scope_pop()
+                env_base = saved_base
+                isess.ns_restore(saved_ns)
+                return -1
+            }
+            isess.ref_add(pname, isess.nname_str(arg_nodes[i]))
+        } else {
+            var v: i64 = -1
+            if i < len(args) {
+                v = args[i]
+            } else {
+                // 缺省参数按默认值表达式求值补齐（限字面量/空表，无作用域依赖）
+                var def = isess.nchild_at(p, 1)
+                if def >= 0 {
+                    v = gen_expr(def)
+                    if g_err != "" {
+                        isess.ref_pop()
+                        isess.scope_pop()
+                        env_base = saved_base
+                        isess.ns_restore(saved_ns)
+                        return -1
+                    }
+                } else {
+                    g_err = "函数 '" + name + "' 缺少第 " + to_string(i + 1) +
+                        " 个参数且无默认值"
+                    isess.ref_pop()
+                    isess.scope_pop()
+                    env_base = saved_base
+                    isess.ns_restore(saved_ns)
+                    return -1
+                }
+            }
+            isess.var_declare(pname, v)
+        }
+        i = i + 1
+    }
+    env_base = isess.scope_top()
+    var body = isess.nchild_at(f, isess.nchild(f) - 1)
+    exec_block(body)
+    isess.ref_pop()
+    isess.scope_pop()
+    env_base = saved_base
+    isess.ns_restore(saved_ns)
+    if g_err != "" {
+        return -1
+    }
+    // 处理 return 传播
+    if g_flow == FL_RETURN {
+        g_flow = FL_NORMAL
+        return g_flow_val
+    }
+    if g_flow == FL_BREAK {
+        g_err = "break" + label_space(g_flow_label) + "逃出函数体（内部错误）"
+        return -1
+    }
+    if g_flow == FL_CONTINUE {
+        g_err = "continue" + label_space(g_flow_label) + "逃出函数体（内部错误）"
+        return -1
+    }
+    g_flow = FL_NORMAL
+    if g_lastval >= 0 {
+        return g_lastval
+    }
+    return ivalue.new_void()
+}
+
+// 内置函数名单（对齐 Rust call_fn 的内置分支；T4.1 核心子集）。
+// S3.3 新增：gensym（H3 显式卫生唯一标识符）、eval_code（C3 编译期
+// 代码生成——仅宏体环境可用，运行期语义层拦截）。
+func is_builtin(name: string) -> bool {
+    if name == "println" || name == "print" || name == "len" || name == "str_len" ||
+        name == "str_char" || name == "char_code" || name == "to_string" ||
+        name == "parse_int" || name == "parse_float" ||
+        name == "table_new_i64" || name == "table_new_f64" ||
+        name == "table_new_string" || name == "table_new_bool" ||
+        name == "table_at" || name == "eval" || name == "eval_call" {
+        return true
+    }
+    if name == "gensym" || name == "eval_code" {
+        return true
+    }
+    return false
+}
+
+// 内置函数分派（对齐 Rust call_fn 内置分支语义与错误文本）。
+// 值传递类（str_char/char_code/to_string/parse_float 等）直接转发语言底座
+// 原语（两路径共用同一份 Rust 桥实现，行为一致）。
+func call_builtin(name: string, args: table<i64>) -> i64 {
+    if name == "gensym" {
+        // S3.3 H3 显式卫生：gensym("前缀") → 唯一标识符（intern 池 + 计数器）。
+        // 宏体内生成导出/共享名，经插值（$name / $nm 名字位置）使用。
+        if len(args) != 1 {
+            g_err = "gensym 需要一个字符串前缀参数"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_STR {
+            g_err = "gensym 需要一个字符串前缀参数"
+            return -1
+        }
+        g_gensym_n = g_gensym_n + 1
+        return ivalue.new_str("__tie_gensym" + to_string(g_gensym_n) + "_" +
+            ivalue.str_val(args[0]))
+    }
+    if name == "eval_code" {
+        // S3.3 C3 编译期 eval：eval_code("源码") → code 值（AST 协议文本）。
+        // 编译期代码生成（宏体内用）；源码必须语法合法（解析即校验）。
+        if len(args) != 1 {
+            g_err = "eval_code 需要一个字符串源码参数"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_STR {
+            g_err = "eval_code 需要一个字符串源码参数"
+            return -1
+        }
+        var src = ivalue.str_val(args[0])
+        var proto = parser.parse_src(src)
+        if has_str_prefix(proto, "ERR:") {
+            g_err = "eval_code 源码语法错误: " + proto
+            return -1
+        }
+        return ivalue.new_code(proto)
+    }
+    if name == "println" {
+        var line = join_print(args)
+        println(line)
+        return ivalue.new_void()
+    }
+    if name == "print" {
+        var line = join_print(args)
+        print(line)
+        return ivalue.new_void()
+    }
+    if name == "len" {
+        if len(args) != 1 {
+            g_err = "len 需要一个参数"
+            return -1
+        }
+        var v = args[0]
+        var t = ivalue.type_of(v)
+        if t == T_STR {
+            // 字节数（与 Rust s.len() 一致；编译路径 len 同语义）
+            return ivalue.new_int(byte_len(ivalue.str_val(v)))
+        }
+        if t == T_TABLE || t == T_MAP {
+            return ivalue.new_int(ivalue.elem_count(v))
+        }
+        g_err = "len 只支持字符串、表或键值表"
+        return -1
+    }
+    if name == "str_len" {
+        if len(args) != 1 {
+            g_err = "str_len 需要一个参数"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_STR {
+            g_err = "str_len 只支持字符串"
+            return -1
+        }
+        return ivalue.new_int(str_len(ivalue.str_val(args[0])))
+    }
+    if name == "str_char" {
+        if len(args) != 2 {
+            g_err = "str_char 需要字符串与整数参数"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_STR || ivalue.type_of(args[1]) != T_INT {
+            g_err = "str_char 需要字符串与整数参数"
+            return -1
+        }
+        return ivalue.new_str(str_char(ivalue.str_val(args[0]), ivalue.int_val(args[1])))
+    }
+    if name == "char_code" {
+        if len(args) != 1 {
+            g_err = "char_code 需要一个字符串参数"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_STR {
+            g_err = "char_code 需要一个字符串参数"
+            return -1
+        }
+        return ivalue.new_int(char_code(ivalue.str_val(args[0])))
+    }
+    if name == "to_string" {
+        if len(args) != 1 {
+            g_err = "to_string 需要一个数字参数"
+            return -1
+        }
+        var v = args[0]
+        var t = ivalue.type_of(v)
+        if t == T_INT {
+            return ivalue.new_str(to_string(ivalue.int_val(v)))
+        }
+        if t == T_FLOAT {
+            return ivalue.new_str(to_string(ivalue.float_val(v)))
+        }
+        if t == T_TRIT {
+            return ivalue.new_str(to_string(ivalue.int_val(v)))
+        }
+        g_err = "to_string 需要一个数字参数"
+        return -1
+    }
+    if name == "parse_int" {
+        if len(args) != 1 {
+            g_err = "parse_int 需要一个字符串参数"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_STR {
+            g_err = "parse_int 需要一个字符串参数"
+            return -1
+        }
+        var s = ivalue.str_val(args[0])
+        // 非法输入先自检（对齐 Rust str::parse::<i64> 严格文法；语言底座
+        // parse_int 非法时直接退出进程，解释路径必须改为返回错误）
+        if !is_int_text(s) {
+            g_err = "运行时错误: parse_int 参数 '" + s + "' 不是合法的整数"
+            return -1
+        }
+        return ivalue.new_int(parse_int(s))
+    }
+    if name == "parse_float" {
+        if len(args) != 1 {
+            g_err = "parse_float 需要一个字符串参数"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_STR {
+            g_err = "parse_float 需要一个字符串参数"
+            return -1
+        }
+        var s = ivalue.str_val(args[0])
+        if !is_float_text(s) {
+            g_err = "运行时错误: parse_float 参数 '" + s + "' 不是合法的浮点数"
+            return -1
+        }
+        return ivalue.new_float(parse_float(s))
+    }
+    // 动态表构造：全部返回空表值（与编译路径 table_new_* 语义一致）
+    if name == "table_new_i64" || name == "table_new_f64" ||
+        name == "table_new_string" || name == "table_new_bool" {
+        if len(args) != 0 {
+            g_err = name + " 不需要参数"
+            return -1
+        }
+        return ivalue.new_table()
+    }
+    if name == "table_at" {
+        if len(args) != 2 {
+            g_err = "table_at 需要表与整数下标参数"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_TABLE || ivalue.type_of(args[1]) != T_INT {
+            g_err = "table_at 需要表与整数下标参数"
+            return -1
+        }
+        var t = args[0]
+        var idx = ivalue.int_val(args[1])
+        if idx < 0 || idx >= ivalue.elem_count(t) {
+            g_err = "运行时错误: table_at 下标越界：索引 " + to_string(idx) +
+                " 超出长度 " + to_string(ivalue.elem_count(t))
+            return -1
+        }
+        return ivalue.elem_at(t, idx)
+    }
+    if name == "eval" {
+        if len(args) != 1 {
+            g_err = "eval 需要一个字符串参数"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_STR {
+            g_err = "eval 需要一个字符串参数"
+            return -1
+        }
+        // 递归 eval（同一会话；对齐 Rust session.eval）
+        var r = eval(ivalue.str_val(args[0]))
+        if g_err != "" {
+            return -1
+        }
+        return ivalue.new_str(r)
+    }
+    if name == "eval_call" {
+        if len(args) != 2 {
+            g_err = "eval_call 需要两个字符串参数（函数名, 参数）"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_STR || ivalue.type_of(args[1]) != T_STR {
+            g_err = "eval_call 需要两个字符串参数（函数名, 参数）"
+            return -1
+        }
+        var r = eval_call(ivalue.str_val(args[0]), ivalue.str_val(args[1]))
+        if g_err != "" {
+            return -1
+        }
+        return ivalue.new_str(r)
+    }
+    g_err = "内部错误: 未实现的内置函数 '" + name + "'"
+    return -1
+}
+
+// 参数值列表 → 打印文本（print/println 共用；to_print_string 无分隔符拼接）。
+func join_print(args: table<i64>) -> string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < len(args) {
+        out = out + ivalue.to_print_string(args[i])
+        i = i + 1
+    }
+    return out
+}
+
+}   // namespace interp
