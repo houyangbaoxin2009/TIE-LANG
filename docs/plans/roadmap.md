@@ -17,6 +17,8 @@
 > 关联：ui-framework（里程碑 M0-M8）、全部专项模型文档（unsafe/int/error/
 > closure/port/package/role/string/macro/tieir/trm/tucore/tieconsole/tsp/
 > build-config/hw-accel/llvm-upgrade）。
+> 并发：语言级并发原语（原生 actor + trm 协程）的设计见
+> [docs/designs/concurrency-model.md](../designs/concurrency-model.md)。
 
 ## 0. 执行模式（多会话并行，1 周冲刺）
 

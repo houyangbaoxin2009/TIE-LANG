@@ -233,8 +233,9 @@ actor Router {
 
 ## 12. 相关文档与待决问题
 
-- 相关：docs/designs/（本文件）、docs/language-comparison.md（缺口与路线）、
-  docs/plans/trm-arch.md（引擎/M4 协程）、docs/plans/roadmap.md、docs/plans/unsafe-model.md。
+- 相关：[docs/language-comparison.md](../language-comparison.md)（缺口与路线）、
+  [docs/plans/trm-arch.md](../plans/trm-arch.md)（引擎/M4 协程）、
+  [docs/plans/roadmap.md](../plans/roadmap.md)、[docs/plans/unsafe-model.md](../plans/unsafe-model.md)。
 - 待决：
   1. `reentrant` 的默认关闭是否过严——是否需要对「纯数据型 actor」自动开重入。
   2. `unsafe` 共享是否需要正经 `Mutex` 进正式 API，还是保留 atomic 即可。

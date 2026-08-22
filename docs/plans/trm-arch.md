@@ -542,5 +542,5 @@ trm-embedded（静态链接，无动态库，interp 执行）
 | tiu 事件 | trm.ui event_drain（事件队列 + 信号），tiu 冒泡/重建消费 |
 | tiu 生命周期 | trm.init()/shutdown()（L1 显式），tiu app.run 内调用 |
 | tiu 主题持久化 | trm.session 的 config/tie:data（主题 token 可落盘） |
-| tiu 跨线程 | trm.clock 定时器信号 → 动画驱动；协程/channel（M4 后） |
+| tiu 跨线程 | trm.clock 定时器信号 → 动画驱动；协程/channel（M4 后，tie 并发设计见 [concurrency-model.md](../designs/concurrency-model.md)） |
 | tiu 分发 | tieir 字节码 + trm 引擎（路线 B）——tiu 应用默认走路线 B |
