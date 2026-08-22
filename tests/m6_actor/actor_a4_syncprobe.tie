@@ -1,0 +1,74 @@
+type tie<logic>
+// 一期并发 A4 执行层第 2 步（同步基座）：CRITICAL_SECTION + CONDITION_VARIABLE。
+// 目标：验证纯 codegen（tiec→LLVM→clang）下，mailbox 所需的跨线程同步原语
+// 能在 tie 程序里正确工作——一个 worker 线程在锁保护下写共享值，主线程用
+// 条件变量阻塞等待唤醒后读回。这正是 A4 邮箱/同步 RPC 的全部并发底座。
+// 做法：alloc 分配 CS/CV 缓冲 → ptr_to_int 传地址给 kernel32；worker 由
+// cb_ptr 生成 C 回调；主线程 SleepConditionVariableCS 阻塞 + worker
+// WakeConditionVariable 唤醒。
+// 验证点：共享值读到 42、线程正常收尾、进程干净退出。
+
+// 共享同步原语地址（全局，两线程按名访问同一缓冲）
+var g_cs: i64 = 0     // CRITICAL_SECTION 缓冲地址
+var g_cv: i64 = 0     // CONDITION_VARIABLE 缓冲地址
+var g_work: i64 = 0   // 共享工作值（锁保护）
+
+// kernel32 同步原语（x64；void 桥按 i64 返回声明，调用方丢弃）
+unsafe extern fn InitializeCriticalSection(cs: i64) -> i64
+unsafe extern fn DeleteCriticalSection(cs: i64) -> i64
+unsafe extern fn EnterCriticalSection(cs: i64) -> i64
+unsafe extern fn LeaveCriticalSection(cs: i64) -> i64
+unsafe extern fn InitializeConditionVariable(cv: i64) -> i64
+unsafe extern fn WakeConditionVariable(cv: i64) -> i64
+unsafe extern fn SleepConditionVariableCS(cv: i64, cs: i64, ms: i64) -> i64
+unsafe extern fn CreateThread(sec: i64, stack: i64, start: string, arg: i64, flags: i64, tid: i64) -> i64
+unsafe extern fn WaitForSingleObject(h: i64, ms: i64) -> i64
+unsafe extern fn CloseHandle(h: i64) -> i64
+
+// worker：锁内写 g_work，唤醒主线程
+func worker(_: i64) -> i64 {
+    unsafe {
+        EnterCriticalSection(g_cs)
+        g_work = 42
+        LeaveCriticalSection(g_cs)
+        WakeConditionVariable(g_cv)
+    }
+    return 0
+}
+
+func main() {
+    unsafe {
+        // 分配并初始化同步原语（alloc 返回 K_PTR；ptr_to_int 传地址 i64）
+        g_cs = ptr_to_int(alloc(64))
+        g_cv = ptr_to_int(alloc(64))
+        InitializeCriticalSection(g_cs)
+        InitializeConditionVariable(g_cv)
+    }
+    // 起 worker 线程（cb_ptr 生成 C 回调入口）
+    var th: i64 = 0
+    unsafe {
+        th = CreateThread(0, 0, cb_ptr(worker), 0, 0, 0)
+    }
+    // 主线程：锁内等 g_work 非 0（条件变量阻塞），读到 42 后解锁
+    var got: i64 = 0
+    unsafe {
+        EnterCriticalSection(g_cs)
+        while g_work == 0 {
+            var r = SleepConditionVariableCS(g_cv, g_cs, 5000)
+            if r == 0 {
+                break
+            }
+        }
+        got = g_work
+        LeaveCriticalSection(g_cs)
+        WaitForSingleObject(th, 10000)
+        CloseHandle(th)
+        DeleteCriticalSection(g_cs)
+    }
+    println("同步基座：共享值=" + to_string(got))
+    if got == 42 {
+        println("A4 同步基座通过")
+    } else {
+        println("A4 同步基座失败")
+    }
+}
