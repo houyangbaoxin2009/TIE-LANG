@@ -95,6 +95,12 @@ var g_str_reg_cnt: i64 = 0;
 // 函数级缓冲：gen_func 期间 line() 写入 g_fn_lines，结束重编号后追加全局。
 var g_fn_lines: table<string>;
 var g_fn_mode: i64 = 0;
+// 函数指令区间索引（性能：emit 开头构建一次，O(B)）：lo[fid]..hi[fid] =
+// 函数 fid 的指令区间。指令表按函数连续（ir.new_inst 顺序 append、块按函数
+// 创建），gen_func 遍历从全表 O(F×N) 降为区间 O(N)——不再每函数全量扫全部
+// 指令表（此前 400+ 函数 × 几十万指令 = 上亿次迭代，emit funcs 4.4s 主体）。
+var g_fn_inst_lo: table<i64>;
+var g_fn_inst_hi: table<i64>;
 var g_hoisted_allocas: table<i64>;
 var g_hoisted_cnt: i64 = 0;
 // 重编号映射表（直索引）：旧值 id → 新值 id（-1 = 未设；旧值 id 稠密小整数）
@@ -581,19 +587,25 @@ func renumber_lines() {
         // 元行（无 %N 操作数，整行跳过）：define 首行、块标签 bbN:、注释、空行。
         // br/store/ret/call void 等指令行仍有 %N 操作数 → 走 renumber_line
         // （引用复用映射；行首无 %N 定义则不产生新编号——对齐 Rust 实现）。
+        // 性能：no_num 判定一次逐字节扫描（str_byte 轻量）替代 str_char + 4 次
+        // str_prefix（每行 53 万行累积）；前缀互斥（; ( ) / d / b / u）一次判完。
         var no_num: bool = false
-        if str_len(t) == 0 {
+        var tn = str_len(t)
+        if tn == 0 {
             no_num = true
         } else {
-            var c0 = str_char(t, 0)
-            if c0 == ";" || c0 == "(" || c0 == ")" {
+            var c0 = str_byte(t, 0)
+            if c0 == 59 || c0 == 40 || c0 == 41 {  // ';' '(' ')'
                 no_num = true
-            } else if str_prefix(t, "define") {
-                no_num = true
-            } else if str_prefix(t, "bb") {
-                no_num = true
-            } else if str_prefix(t, "unreacha") {
-                no_num = true
+            } else if c0 == 100 {  // 'd' → "define"
+                no_num = tn >= 6 && str_byte(t, 1) == 101 && str_byte(t, 2) == 102 &&
+                    str_byte(t, 3) == 105 && str_byte(t, 4) == 110 && str_byte(t, 5) == 101
+            } else if c0 == 98 {  // 'b' → "bb"（块标签）
+                no_num = tn >= 2 && str_byte(t, 1) == 98
+            } else if c0 == 117 {  // 'u' → "unreacha"（unreachable 指令）
+                no_num = tn >= 8 && str_byte(t, 1) == 110 && str_byte(t, 2) == 114 &&
+                    str_byte(t, 3) == 101 && str_byte(t, 4) == 97 && str_byte(t, 5) == 99 &&
+                    str_byte(t, 6) == 104 && str_byte(t, 7) == 97
             }
         }
         // 有编号行：`%N = ...` —— 首 %N 是定义（分配新号），其余 %N 引用复用。
@@ -601,7 +613,9 @@ func renumber_lines() {
         if no_num {
             table_push(out, ln)
         } else {
-            var rebuilt = renumber_line(ln)
+            // 传已 trim 行 t：renumber_line 内部不再二次 str_trim_left（消除
+            // 每行双 trim 的重复扫描）。
+            var rebuilt = renumber_line(ln, t)
             table_push(out, rebuilt)
         }
         i = i + 1
@@ -649,14 +663,14 @@ func sb_append_i64(sb: i64, v: i64) {
 // 即使 N < g_pcnt——函数体值 id 每函数从 0 起，alloca %0 可能与形参位置 %0
 // 撞号）；行内其余 %N 引用按 ren_ref：N < g_pcnt 是形参位置引用（原样保留，
 // define 形参列表 %0..%N-1 不变），否则复用指令映射。
-func renumber_line(ln: string) -> string {
+// 参数 t：已 str_trim_left 的行（renumber_lines 已 trim，传参避免二次扫描）。
+func renumber_line(ln: string, t: string) -> string {
     // 性能重构（段拷贝）：探测仍逐字节 str_byte（O(1) 轻量），但非 % 的普通
     // 字节连续段用 str_sub_bytes 一次整拷入 sb（O(段长) 单次 memcpy）。sb 调用
     // 次数 = 行内 %N 数 + 1，而非字节数——消除逐字节 sb_append_byte 的增长检查
     // 与写回开销（emit ren 7.5s 主因）。值编号用小整数分支转写（免 to_string
     // 内联 IR 爆炸）。定义/引用区分优先按「行首 %N =」模式判定。
     var n = len(ln)
-    var t = str_trim_left(ln)
     var tn = len(t)
     // 检测行首定义：trim 后以 % 开头且首 %N 后跟 " ="
     var lead_def: bool = false
@@ -2617,7 +2631,39 @@ func build_inst_blk() {
         }
         bi = bi + 1
     }
+    build_fn_inst_ranges()
     g_inst_blk_ready = 1
+}
+
+// 构建每函数指令区间（O(B) 一次）：遍历块表取每函数 min start / max end。
+// 用 min/max 而非「首块 start / 末块 end」，稳健不假设块创建序与函数序一致；
+// 区间 [lo, hi) 覆盖函数全部指令（含 alloca 与内联展开指令——它们都按
+// new_inst 顺序落在本函数段内）。
+func build_fn_inst_ranges() {
+    var nf = ir.func_count()
+    var big = ir.inst_count()
+    g_fn_inst_lo = table_new_i64()
+    g_fn_inst_hi = table_new_i64()
+    var i: i64 = 0
+    while i < nf {
+        table_push(g_fn_inst_lo, big)
+        table_push(g_fn_inst_hi, 0)
+        i = i + 1
+    }
+    var nb = ir.block_count()
+    var bi: i64 = 0
+    while bi < nb {
+        var fid = ir.block_func(bi)
+        var st = ir.block_start(bi)
+        var en = ir.block_end(bi)
+        if st < g_fn_inst_lo[fid] {
+            g_fn_inst_lo[fid] = st
+        }
+        if en > g_fn_inst_hi[fid] {
+            g_fn_inst_hi[fid] = en
+        }
+        bi = bi + 1
+    }
 }
 
 // 单个函数生成
@@ -2663,9 +2709,13 @@ func gen_func(fid: i64) {
     if g_inst_blk_ready == 0 {
         build_inst_blk()
     }
-    var nia = ir.inst_count()
-    var ia: i64 = 0
-    while ia < nia {
+    // 性能：只遍历本函数指令区间 [lo, hi)（build_fn_inst_ranges 一次构建），
+    // 替代全表扫描 O(F×N)（此前每函数都扫全部指令表）。保留 block_func 过滤
+    // 防区间交叉（按连续假设区间精确，过滤仅兜底，不影响 O(N)）。
+    var lo = g_fn_inst_lo[fid]
+    var hi = g_fn_inst_hi[fid]
+    var ia: i64 = lo
+    while ia < hi {
         var blk_a: i64 = -1
         if ia < len(g_inst_blk) {
             blk_a = g_inst_blk[ia]
@@ -2681,9 +2731,8 @@ func gen_func(fid: i64) {
     // entry block 内静态分配（循环内 alloca → 动态栈分配，栈溢出）。
     var eblk = ir.func_entry(fid)
     var entry_alloca_done: i64 = 0
-    var ni2 = ir.inst_count()
-    var ii: i64 = 0
-    while ii < ni2 {
+    var ii: i64 = lo
+    while ii < hi {
         var blk: i64 = -1
         if ii < len(g_inst_blk) {
             blk = g_inst_blk[ii]

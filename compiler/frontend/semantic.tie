@@ -176,42 +176,57 @@ func imported_has(p: string) -> bool {
 // （允许空行），声明行空行占位（行号不变）；其余行原样。
 // 与 Rust 链清理脚本 prep/clean.tie 同规则——被导入文件（std/库等）现在带
 // 类型声明头部（新文件类型声明体系），import 展开须先剥离再解析。
+// 性能（import 展开热点）：单遍扫描 + 正文整拷（str_sub_bytes 一次 memcpy），
+// 替代旧实现 str.split(src,"\n") 全量切数组 + str.join 全量重建（每文件 3 次
+// 全量分配；driver 树几十个库文件累积可观）。头部通常仅 1-3 行，正文原样。
 func strip_type_decl(src: string) -> string {
-    var rows = str.split(src, "\n")
-    var n: i64 = len(rows)
-    var out = table_new_string()
-    var in_header = true
+    // n = 字节长度（len 而非 str_len）：str_byte/str_sub_bytes 是字节级，
+    // str_len 返回码点数——库文件含中文注释（UTF-8 多字节）时按码点数截断
+    // 会提前结束文件（std/string.tie 388 行解析到 303 行即文件结束的根因）。
+    var n = len(src)
     var i: i64 = 0
-    while i < n {
-        var ln = rows[i]
-        if in_header {
-            var t = str.trim(ln)
-            if str_len(t) == 0 {
-                // 头部区空行：保留（占位，行号不变）
-                table_push(out, ln)
-            } else if sstate.has_prefix_str(t, "type tie") {
-                var rest = str.trim(str.slice(t, 8, str_len(t)))
-                // 合法声明：`type tie` 或 `type tie<X>`（无尾随内容）→ 空行占位
-                if str_len(rest) == 0 {
-                    table_push(out, "")
-                } else if str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">" {
-                    table_push(out, "")
-                } else {
-                    // 非法形态（如 `type tie<data> extra`）：非声明，头部区结束
-                    in_header = false
-                    table_push(out, ln)
+    var out: string = ""
+    var in_header: bool = true
+    while in_header {
+        // 逐行扫描：行 = [ln_s, ln_e)，换行（若有）在 ln_e；next_i 越过换行
+        var ln_s = i
+        var ln_e = i
+        while ln_e < n && str_byte(src, ln_e) != 10 {
+            ln_e = ln_e + 1
+        }
+        var has_nl = ln_e < n
+        var next_i = ln_e
+        if has_nl {
+            next_i = ln_e + 1
+        }
+        var t = str.trim(str_sub_bytes(src, ln_s, ln_e))
+        if str_len(t) == 0 {
+            // 头部区空行：保留（占位，行号不变）
+            out = out + str_sub_bytes(src, ln_s, next_i)
+        } else if sstate.has_prefix_str(t, "type tie") {
+            var rest = str.trim(str.slice(t, 8, str_len(t)))
+            // 合法声明：`type tie` 或 `type tie<X>`（无尾随内容）→ 空行占位
+            if str_len(rest) == 0 || (str_char(rest, 0) == "<" && str_char(rest, str_len(rest) - 1) == ">") {
+                if has_nl {
+                    out = out + "\n"
                 }
             } else {
-                // 第一个非声明内容行：头部区结束，原样保留
+                // 非法形态（如 `type tie<data> extra`）：头部区结束，本行原样
+                out = out + str_sub_bytes(src, ln_s, n)
                 in_header = false
-                table_push(out, ln)
             }
         } else {
-            table_push(out, ln)
+            // 第一个非声明内容行：头部区结束，本行起原样保留（正文整拷）
+            out = out + str_sub_bytes(src, ln_s, n)
+            in_header = false
         }
-        i = i + 1
+        i = next_i
+        if in_header && i >= n {
+            // 整个文件都是头部区（无正文）→ 结束
+            in_header = false
+        }
     }
-    return str.join(out, "\n")
+    return out
 }
 
 // 递归展开单个 import 节点：读文件 → parse → append_ast 合并，
