@@ -1,0 +1,296 @@
+type tie<class>
+// compiler/frontend/smove_stmt.tie —— S1.5 移动语义独立检查 pass（语句检查分区）
+// ============================================================
+// 从 smove.tie 拆分出的"语句检查"分区：负责移动语义检查的语句级递归遍历
+// （check_stmt / check_switch_case / check_block / push_ns_of）。
+//
+// # 分区范式
+//   tie import 文本内联：本文件全部代码并入编译单元，一切符号全局可见；
+//   本文件与 smove.tie 共用 `namespace smove`（同名 namespace 跨多文件闭合并集）。
+//   同 namespace 跨文件函数可互相裸名调用、访问主文件顶层全局 var。
+//   与 sinfer_ret / sgen_inst / scollect_port 的分文件范式一致。
+//
+// # 依赖
+//   依赖主文件 smove.tie 保留的辅助函数（is_owned/var_nid/var_is_const/
+//   is_move_src/check_expr_read）与 sstate/types 全局表，跨文件裸调保持。
+//   不含全局 var、不含 import（由主文件 smove.tie import 本文件）。
+
+namespace smove {
+
+// ==================== 语句检查 ====================
+func check_stmt(s: i64) -> i64 {
+    var tag = s_tags[s]
+    // VarDecl：children=[类型或 -1, 初值]
+    if tag == S_N_VAR_DECL {
+        var init = sstate.child(s, 1)
+        if init >= 0 {
+            // 直接变量初值 + 堆类型 + 非 const → 源移动
+            var nid = var_nid(init)
+            if nid >= 0 {
+                if var_is_const(nid) == 0 && is_move_src(init) {
+                    sstate.lv_moved_mark(nid)
+                }
+            } else {
+                // 复杂初值：递归读取检查
+                var r = check_expr_read(init)
+                if r < 0 {
+                    return -1
+                }
+            }
+        }
+        return 0
+    }
+    // Assign：name=目标名, children=[值]
+    if tag == S_N_ASSIGN {
+        var nm = sstate.name_str(s)
+        var tgt = interner.intern(nm)
+        var val = sstate.child(s, 0)
+        var op = s_vals[s]
+        if op < 0 {
+            // 普通赋值：右侧直接变量（非自身）→ 源移动；自身赋值 a=a 是读取
+            var nid = var_nid(val)
+            if nid >= 0 && nid != tgt {
+                if var_is_const(nid) == 0 && is_move_src(val) {
+                    sstate.lv_moved_mark(nid)
+                }
+            } else {
+                // 复杂表达式或 a = a：读取检查（moved 则报错）
+                var r = check_expr_read(val)
+                if r < 0 {
+                    return -1
+                }
+            }
+            // 目标恢复 live（重新赋值 = 重新初始化）
+            sstate.lv_moved_unmark(tgt)
+        } else {
+            // 复合赋值（+= 等）：右侧是读取（先读旧值再写）
+            var r2 = check_expr_read(val)
+            if r2 < 0 {
+                return -1
+            }
+        }
+        return 0
+    }
+    // Return：children=[表达式或 -1]
+    if tag == S_N_RETURN {
+        var v = sstate.child(s, 0)
+        if v >= 0 {
+            var nid = var_nid(v)
+            if nid >= 0 {
+                if var_is_const(nid) == 0 && is_move_src(v) {
+                    sstate.lv_moved_mark(nid)
+                }
+            } else {
+                var r = check_expr_read(v)
+                if r < 0 {
+                    return -1
+                }
+            }
+        }
+        return 0
+    }
+    // ExprStmt：children=[表达式]
+    if tag == S_N_EXPR_STMT {
+        return check_expr_read(sstate.child(s, 0))
+    }
+    // If：children=[条件, then, else]
+    // 分支状态隔离：检查条件 → 快照 → 检查 then → 恢复快照 → 检查 else → 恢复快照。
+    // 分支内 return/赋值触发的移动标记不泄漏到分支外（分支互斥路径，
+    // 如 `if m == 0 { return s }` 后继续用 s 是合法模式）。
+    if tag == S_N_IF {
+        var r1 = check_expr_read(sstate.child(s, 0))
+        if r1 < 0 {
+            return -1
+        }
+        var snap1 = sstate.lv_moved_snap()
+        var r2 = check_block(sstate.child(s, 1))
+        if r2 < 0 {
+            return -1
+        }
+        sstate.lv_moved_restore(snap1)
+        var els = sstate.child(s, 2)
+        if els >= 0 {
+            var snap2 = sstate.lv_moved_snap()
+            var r3 = check_block(els)
+            if r3 < 0 {
+                return -1
+            }
+            sstate.lv_moved_restore(snap2)
+        }
+        return 0
+    }
+    // While：children=[条件, 体]
+    // 循环体状态隔离：条件读取 → 快照 → 检查体 → 恢复（循环每次迭代独立）。
+    if tag == S_N_WHILE {
+        var r4 = check_expr_read(sstate.child(s, 0))
+        if r4 < 0 {
+            return -1
+        }
+        var snap3 = sstate.lv_moved_snap()
+        var r4b = check_block(sstate.child(s, 1))
+        if r4b < 0 {
+            return -1
+        }
+        sstate.lv_moved_restore(snap3)
+        return 0
+    }
+    // For：name=迭代变量, children=[迭代对象, 体]
+    // 迭代对象 = 读取（表遍历借用，不移动）；范围两端 = 读取。
+    // 迭代变量每次迭代重新赋值（恢复 live）——循环体内移动它后，
+    // 下次迭代重新绑定；循环结束变量保留最后值（重新赋值语义）。
+    // 循环体状态隔离（每次迭代独立，移动标记不泄漏到循环外）。
+    if tag == S_N_FOR {
+        var iter = sstate.child(s, 0)
+        var r5 = check_expr_read(iter)
+        if r5 < 0 {
+            return -1
+        }
+        // 迭代变量重新赋值（恢复 live）——循环体检查前 unmark
+        var iter_nm = sstate.name_str(s)
+        if str_len(iter_nm) > 0 {
+            var iter_nid = interner.intern(iter_nm)
+            sstate.lv_moved_unmark(iter_nid)
+        }
+        var snap6 = sstate.lv_moved_snap()
+        var r5b = check_block(sstate.child(s, 1))
+        if r5b < 0 {
+            return -1
+        }
+        sstate.lv_moved_restore(snap6)
+        return 0
+    }
+    // Switch：children=[主体, case..., default]；主体读取 + 各 case 体
+    // 各 case 分支状态隔离（互斥路径，移动标记不跨 case 泄漏）。
+    if tag == S_N_SWITCH {
+        var r6 = check_expr_read(sstate.child(s, 0))
+        if r6 < 0 {
+            return -1
+        }
+        var ncases = s_aux[s]
+        var i: i64 = 0
+        while i < ncases {
+            var snap4 = sstate.lv_moved_snap()
+            var c = sstate.child(s, 1 + i)
+            var r7 = check_switch_case(c)
+            if r7 < 0 {
+                return -1
+            }
+            sstate.lv_moved_restore(snap4)
+            i = i + 1
+        }
+        var dflt = sstate.child(s, 1 + ncases)
+        if dflt >= 0 {
+            var snap5 = sstate.lv_moved_snap()
+            var r8 = check_block(dflt)
+            if r8 < 0 {
+                return -1
+            }
+            sstate.lv_moved_restore(snap5)
+        }
+        return 0
+    }
+    // Break/Continue：无变量
+    if tag == S_N_BREAK || tag == S_N_CONTINUE {
+        return 0
+    }
+    // FieldAssign：children=[基址, 值]（基址按引用；值 = 读取/移动）
+    if tag == S_N_FIELD_ASSIGN {
+        var base = sstate.child(s, 0)
+        var r9 = check_expr_read(base)
+        if r9 < 0 {
+            return -1
+        }
+        var val2 = sstate.child(s, 1)
+        var nid2 = var_nid(val2)
+        if nid2 >= 0 {
+            if var_is_const(nid2) == 0 && is_move_src(val2) {
+                sstate.lv_moved_mark(nid2)
+            }
+        } else {
+            var r10 = check_expr_read(val2)
+            if r10 < 0 {
+                return -1
+            }
+        }
+        return 0
+    }
+    // IndexAssign：children=[目标, 值]（目标按引用；值 = 读取/移动）
+    if tag == S_N_INDEX_ASSIGN {
+        var tgt2 = sstate.child(s, 0)
+        var r11 = check_expr_read(tgt2)
+        if r11 < 0 {
+            return -1
+        }
+        var val3 = sstate.child(s, 1)
+        var nid3 = var_nid(val3)
+        if nid3 >= 0 {
+            if var_is_const(nid3) == 0 && is_move_src(val3) {
+                sstate.lv_moved_mark(nid3)
+            }
+        } else {
+            var r12 = check_expr_read(val3)
+            if r12 < 0 {
+                return -1
+            }
+        }
+        return 0
+    }
+    return 0
+}
+
+// switch case：children=[PatternList, when 或 -1, 体]
+func check_switch_case(c: i64) -> i64 {
+    var nc = sstate.nchild(c)
+    if nc >= 3 {
+        var when_node = sstate.child(c, 1)
+        if when_node >= 0 {
+            var r = check_expr_read(when_node)
+            if r < 0 {
+                return -1
+            }
+        }
+        return check_block(sstate.child(c, 2))
+    }
+    return 0
+}
+
+// 语句块检查（StmtList）
+func check_block(blk: i64) -> i64 {
+    if blk < 0 {
+        return 0
+    }
+    var n = sstate.nchild(blk)
+    var i: i64 = 0
+    while i < n {
+        var s = sstate.child(blk, i)
+        var r = check_stmt(s)
+        if r < 0 {
+            return -1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// full 名 "::" 段（除最后一段函数名）压 ns_stack，返回压入段数（对齐
+// scheck.push_ns_of；命名空间上下文重建）
+func push_ns_of(full: string) -> i64 {
+    var cnt: i64 = 0
+    var n = str_len(full)
+    var pos: i64 = 0
+    var seg_start: i64 = 0
+    while pos < n {
+        if pos + 1 < n && str_char(full, pos) == ":" && str_char(full, pos + 1) == ":" {
+            var seg = str.slice(full, seg_start, pos)
+            sstate.ns_push(intern.intern(seg))
+            cnt = cnt + 1
+            pos = pos + 2
+            seg_start = pos
+        } else {
+            pos = pos + 1
+        }
+    }
+    return cnt
+}
+
+}
