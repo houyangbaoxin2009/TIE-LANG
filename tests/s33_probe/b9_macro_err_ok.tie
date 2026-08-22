@@ -1,0 +1,28 @@
+type tie<logic>
+// dev33 批次9 任务27：宏错误传播——OK 分支
+// 同宏 assert_positive 在编译期用 compile_error 拒绝负数实参；本文件实参为正
+// → 编译通过并运行。错误分支见 b9_macro_err_neg.tie。
+// 期望输出：10
+
+#[macro]
+macro assert_positive(x: code) -> code {
+    var toks = tokenize(x)              // 实参源码 → token 流
+    var src = deparse(toks)
+    // 检视首 token：减号（lex_minus=47）→ 负数 → 编译期报错
+    var is_neg: i64 = 0
+    if token_len(toks) > 0 {
+        if token_tag_at(toks, 0) == 47 {
+            is_neg = 1
+        }
+    }
+    if is_neg == 1 {
+        compile_error("assert_positive 实参不能为负数：" + src)
+    }
+    return eval_expr("(" + src + ")")
+}
+
+func main() -> i64 {
+    var a = assert_positive(10)
+    println(a)
+    return 0
+}

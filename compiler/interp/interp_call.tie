@@ -184,6 +184,11 @@ func is_builtin(name: string) -> bool {
     if name == "gensym" || name == "eval_code" || name == "eval_expr" {
         return true
     }
+    // M4（dev33 批次9 任务27）：compile_error("消息") 宏内主动报编译错误——
+    // 置 g_err 上抛，mexpand 以调用点行列号报「宏展开失败」。
+    if name == "compile_error" {
+        return true
+    }
     // M4 过程宏（dev33 批次9）：token 流 API——tokenize（源码→token 流）、
     // deparse（token 流→源码）、token_len/token_tag_at/token_lexeme_at
     // （token 流检视）。仅宏环境（编译期 interp）可用。
@@ -437,6 +442,21 @@ func call_builtin(name: string, args: table<i64>) -> i64 {
     // ==================== M4 token 流 API（宏环境，dev33 批次9） ====================
     // tokenize：源码字符串 → token 流文本（首行 <N>:，随后每行 <tag> <lexeme>，
     // 排除末尾 Eof；lexeme 反斜杠/换行转义——保证每 token 单行且往返一致）。
+    if name == "compile_error" {
+        // M4（dev33 批次9 任务27）：宏内主动报编译错误。置 g_err 上抛，
+        // eval_macro/exec 链传播，mexpand 以**调用点**行列号报「宏展开失败:
+        // 编译错误: <消息>」——编译错误定位到宏调用点（任务27 验收）。
+        if len(args) != 1 {
+            g_err = "compile_error 需要一个字符串参数"
+            return -1
+        }
+        if ivalue.type_of(args[0]) != T_STR {
+            g_err = "compile_error 需要一个字符串参数"
+            return -1
+        }
+        g_err = "编译错误: " + ivalue.str_val(args[0])
+        return -1
+    }
     if name == "tokenize" {
         if len(args) != 1 {
             g_err = "tokenize 需要一个字符串参数"
