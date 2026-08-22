@@ -200,7 +200,7 @@ var g2 = g.delegate(share)                // 限制委托/衰减
 var og = unsafe.get(share -> buf)         // 对象绑定：只能碰 buf
 var child = g.branch(); unsafe.revoke(g)  // 层级撤销（父亡子亡）
 unsafe.audit(g)                           // 运行期审计调用链
-#[unsafe(share)] fn agg() -> i64 { ... }  // 函数级便捷（隐式持证）
+#[unsafe.share] fn agg() -> i64 { ... }  // 函数级便捷（隐式持证）
 ```
 
 - `atomic<T>`：**已实现**；非 unsafe 代码默认仅 `seq_cst`，弱序须持 `guard<share>` 显式标注。

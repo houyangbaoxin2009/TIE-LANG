@@ -358,7 +358,7 @@ var ch  = g.branch()                     // 层级派生：父亡子亡
 unsafe.revoke(g)                         // 显式撤销（全局作废，层级级联）
 unsafe.audit(g)                          // 运行期审计：谁/何处在用这张凭据
 
-#[unsafe(ext)] fn probe() -> i64 { ... } // 函数级便捷：整函数隐式持证
+#[unsafe.ext] fn probe() -> i64 { ... }  // 函数级便捷：整函数隐式持证
 func h(buf: ptr<i64>, g: guard<mem>)     // 参数最小权限：给多少用多少
 ```
 
@@ -375,5 +375,5 @@ func h(buf: ptr<i64>, g: guard<mem>)     // 参数最小权限：给多少用多
 ### 13.4 一期最小闭环
 
 - 先落 `guard<share>`（并发逃生，与一期 actor 咬合）：
-  `unsafe.get(share)` / `unsafe use g {}` / `unsafe with(share) {}` / `#[unsafe(share)]`。
+  `unsafe.get(share)` / `unsafe use g {}` / `unsafe with(share) {}` / `#[unsafe.share]`。
 - mem/ext 及委派/对象绑定/层级回收/审计随三期推进，语法在 13.2 已定稿。
