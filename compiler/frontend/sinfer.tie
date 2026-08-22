@@ -1117,6 +1117,45 @@ pub func infer_expr(id: i64) -> i64 {
         g_typed = g_typed + 1
         return ht
     }
+    // 三期 A 组 `unsafe.get(share)` 凭据获取表达式 → guard<cap> 类型。
+    // children[0] = 能力域名（N_NAMED_TYPE name=share/mem/ext），children[1] = 对象
+    // 绑定表达式或 -1。仅 unsafe 上下文语义合法（安全代码持证被拦截）。
+    if tag == S_N_GUARD_GET {
+        // 三期 A 组 `unsafe.get(share)` 凭据获取 → guard<cap> 类型。仅 unsafe 上下文
+        // 合法（安全代码取得凭据 = 无门禁 = 绕过机制，编译期拦截）。
+        if g_unsafe_depth == 0 {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "unsafe.get 只能在 unsafe 上下文使用（unsafe 块或 unsafe 函数内）"
+            return -1
+        }
+        var capn = sstate.name_str(sstate.child(id, 0))
+        var cap: i64 = -1
+        if capn == "share" {
+            cap = 0
+        } else if capn == "mem" {
+            cap = 1
+        } else if capn == "ext" {
+            cap = 2
+        } else {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "unsafe.get 的能力域必须是 share/mem/ext，实际是 '" + capn + "'"
+            return -1
+        }
+        // 对象绑定表达式推断（凭据绑定的对象必须有类型）
+        var bind = sstate.child(id, 1)
+        if bind >= 0 {
+            var bt = infer_expr(bind)
+            if bt < 0 {
+                return -1
+            }
+        }
+        var gt = types.guard_of(cap)
+        node_types[id] = gt
+        g_typed = g_typed + 1
+        return gt
+    }
     // S2.3：`expr ?` 后缀解包（Result/Option）
     if tag == S_N_TRY {
         return infer_try_unwrap(id)

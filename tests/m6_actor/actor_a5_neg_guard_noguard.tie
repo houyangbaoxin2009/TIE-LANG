@@ -1,0 +1,11 @@
+type tie<logic>
+// tests/m6_actor/actor_a5_neg_guard_noguard.tie —— 三期 A 组 guard 负例（§7.1.1）
+// unsafe use 的非 guard 变量 → 编译错误「必须是 guard<cap> 凭据变量」
+func main() {
+    unsafe {
+        var x: i64 = 1
+        unsafe use x {
+            println("x")
+        }
+    }
+}

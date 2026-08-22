@@ -58,6 +58,7 @@ const K_ATOMIC: i64 = 9;     // atomic<T> 原子类型（S1.2）
 const K_FN: i64 = 10;        // fn 函数值类型（S2.2，闭包/函数指针）
 const K_PORT: i64 = 11;      // port 对象类型（S2.4：接口对象，LLVM 表示 = ptr 指向堆打包 {data,vtable}）
 const K_ACTOR: i64 = 12;     // actor 句柄类型（一期并发：运行期一张 actor 表管所有权，LLVM 表示 = i64 句柄槽）
+const K_GUARD: i64 = 13;     // guard<cap> 凭据类型（三期 A 组：跨 actor 共享内存逃生口凭据，LLVM 表示 = i64 占位）
 const K_SHIFT: i64 = 40;           // 高位分离位移量（负载 < 2^40）
 
 // ---------- TyKw 索引常量（0..22，对齐 Rust TyKw 变体顺序）----------
@@ -114,6 +115,10 @@ const BASE_PORT: i64 = 12094627905536;
 // 一期并发 actor 句柄类型段：id = 12<<40 | actor 索引（actor 表行号）。
 // 12<<40 = 13194139533312，i64 有符号下远小于 2^63 无溢出。
 const BASE_ACTOR: i64 = 13194139533312;
+// 三期 A 组 guard<cap> 凭据类型段：id = 13<<40 | 能力域索引
+//（0=share 1=mem 2=ext；guard<share> 即 13<<40+0）。LLVM 表示 = i64 占位
+//（凭据值本身运行期无操作，门禁在编译期语义层强制）。
+const BASE_GUARD: i64 = 14293651161088;
 
 // ---------- 全局状态（懒构建）----------
 var tykw_names: table<string>;   // TyKw 索引 -> 类型名（错误消息用）
@@ -376,17 +381,44 @@ pub func set_actor_name(idx: i64, nm: string) {
     table_push(act_names, nm)
 }
 
+// ---------- 三期 A 组 guard<cap> 凭据类型构造 ----------
+// guard<cap>：id = 13<<40 | 能力域索引（0=share 1=mem 2=ext）。
+pub func guard_of(cap: i64) -> i64 {
+    return BASE_GUARD + cap
+}
+// guard 判据：kind == K_GUARD（13<<40 段）。
+pub func is_guard(t: i64) -> bool {
+    if kind(t) == K_GUARD {
+        return true
+    }
+    return false
+}
+// guard 能力域名（type_name 用）：share / mem / ext
+func guard_cap_name(t: i64) -> string {
+    var c = low(t)
+    if c == 0 {
+        return "share"
+    }
+    if c == 1 {
+        return "mem"
+    }
+    return "ext"
+}
+
 // ---------- 类型 id 解码 ----------
 
 // 类型类别：0=Named 1=Table 2=Map 3=Struct 4=Tuple 5=TypeVar 6=Enum
-// 7=Ptr 8=Slice 9=Atomic 10=Fn。
+// 7=Ptr 8=Slice 9=Atomic 10=Fn 11=Port 12=Actor 13=Guard。
 // Named 判定用 id < 100（TyKw 索引 0..20，留余量）；
-// 其余按高位阈值顺序判别（Fn 段 10<<40 最高必须最先判；之后
-// Atomic 9<<40、Slice 8<<40、Ptr 7<<40、Enum 6<<40、TypeVar、Tuple、
-// Struct、Map，其余为 Table——与 semantic ty_kind 一致）。
+// 其余按高位阈值顺序判别（Guard 段 13<<40 最高必须最先判；之后 Actor
+// 12<<40、Port 11<<40、Fn 10<<40、Atomic 9<<40、Slice 8<<40、Ptr 7<<40、
+// Enum 6<<40、TypeVar、Tuple、Struct、Map，其余为 Table——与 semantic ty_kind 一致）。
 pub func kind(id: i64) -> i64 {
     if id < 100 {
         return K_NAMED
+    }
+    if id >= BASE_GUARD {
+        return K_GUARD
     }
     if id >= BASE_ACTOR {
         return K_ACTOR
@@ -427,6 +459,9 @@ pub func kind(id: i64) -> i64 {
 // 类型负载：Table/Map/Ptr/Slice/Atomic 的元素类型 id、Struct/Tuple/Enum/Port 的
 // 索引、TypeVar 的 intern 池 id；Named 类型无意义（调用方先判 kind）。
 pub func low(id: i64) -> i64 {
+    if id >= BASE_GUARD {
+        return id - BASE_GUARD
+    }
     if id >= BASE_ACTOR {
         return id - BASE_ACTOR
     }
@@ -768,6 +803,10 @@ pub func type_name(t: i64) -> string {
             return act_names[aidx]
         }
         return "actor"   // 未登记兜底（理论不发生，防御性）
+    }
+    if k == K_GUARD {
+        // 三期 A 组 guard<cap> 凭据：显示 "guard<share>" 等
+        return "guard<" + guard_cap_name(t) + ">"
     }
     if k == K_FN {
         var s: string = "fn("

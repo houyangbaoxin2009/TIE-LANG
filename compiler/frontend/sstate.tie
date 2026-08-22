@@ -374,6 +374,10 @@ const S_N_RUN_ACTOR: i64 = 142;     // run 表达式（run 上下文识别，非
 // 三期 goto/标签（与 ast.tie N_GOTO_LABEL/N_GOTO 同号）：
 const S_N_GOTO_LABEL: i64 = 143;    // `#[tag.x]` 语句位置标签
 const S_N_GOTO: i64 = 144;          // `unsafe goto #x` 无条件跳转
+// 三期 A 组 guard<cap> 凭据（与 ast.tie N_GUARD_GET/N_GUARD_USE/N_GUARD_WITH 同号）
+const S_N_GUARD_GET: i64 = 145;     // `unsafe.get(share)` 取得凭据（表达式）
+const S_N_GUARD_USE: i64 = 146;     // `unsafe use g { ... }` 持证越界块
+const S_N_GUARD_WITH: i64 = 147;    // `unsafe with(share) { ... }` 临时凭据块
 namespace sstate {
 
 // ==================== 工具：协议解析 ====================

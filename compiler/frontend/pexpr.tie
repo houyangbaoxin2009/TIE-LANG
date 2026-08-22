@@ -533,6 +533,21 @@ func parse_primary() -> i64 {
     var line = putil.peek_line()
     var col = putil.peek_col()
     var tag = putil.peek_tag()
+    if tag == lex_unsafe {
+        // 三期 A 组 `unsafe.get(share)` / `unsafe.get(share -> obj)`（§7.1.1 +
+        // unsafe-model §13.4）：unsafe 后跟 `.get` 方法调用 = 取得 guard<cap> 凭据
+        // 表达式。仅 unsafe 上下文语义合法（语义层拦截）。产出 N_GUARD_GET。
+        var n1 = putil.peek_n(1)
+        if n1 == lex_dot {
+            var n2 = putil.peek_lexeme_n(2)
+            if n2 == "get" {
+                return parse_guard_get(line, col)
+            }
+        }
+        // 其余 unsafe 上下文（unsafe{}/unsafe goto 等）不在表达式位置出现
+        putil.set_err(line, col, "表达式位置 'unsafe' 仅支持 unsafe.get(share) 凭据获取")
+        return -1
+    }
     if tag == lex_asm {
         // S1.2 I1：`asm!("template", in(reg) expr, out(reg) expr)` 内联汇编
         return parse_asm_expr(line, col)
@@ -903,6 +918,48 @@ func parse_table_lit(line: i64, col: i64) -> i64 {
         ast.set_children(t, cells)
     }
     return t
+}
+
+// 三期 A 组 `unsafe.get(share)` 凭据获取表达式（§7.1.1 + unsafe-model §13.4）：
+// unsafe → . → get → ( 能力域名 [-> 对象绑定] )。
+//   unsafe.get(share)            → guard<share> 凭据（基础）
+//   unsafe.get(share -> obj)     → guard<share> 凭据对象绑定（只能碰 obj）
+// 产出 N_GUARD_GET[children=[能力域名节点, 对象绑定表达式或 -1]]。
+// 已探测 unsafe . get 三连（当前 peek = '(' 或 '.'）。
+func parse_guard_get(line: i64, col: i64) -> i64 {
+    putil.advance()   // unsafe
+    putil.advance()   // .
+    putil.advance()   // get
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var cap = putil.expect_ident()
+    if cap < 0 {
+        return -1
+    }
+    // 能力域白名单：share / mem / ext（三期最小闭环 share）
+    var capname = interner.lookup(cap)
+    if capname != "share" && capname != "mem" && capname != "ext" {
+        putil.set_err(putil.peek_line(), putil.peek_col(), "unsafe.get 的能力域必须是 share/mem/ext，实际是 '" + capname + "'")
+        return -1
+    }
+    var bind = -1
+    if putil.eat(lex_arrow) {
+        // 对象绑定：`share -> obj`（凭据只能碰该对象，防滥用任意内存）
+        bind = parse_unary()
+        if bind < 0 {
+            return -1
+        }
+    }
+    if !putil.expect(lex_rparen, "')'") {
+        return -1
+    }
+    var n = ast.new_node(N_GUARD_GET, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, ast.new_node(N_NAMED_TYPE, cap, -1, -1, line, col))
+    table_push(kids, bind)
+    ast.set_children(n, kids)
+    return n
 }
 
 // S1.2 I1 内联汇编：`asm!("template", in(reg) expr, out(reg) expr, ...)`

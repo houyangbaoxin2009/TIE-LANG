@@ -718,6 +718,9 @@ func tig_stmt(id: i64) -> i64 {
                 // 一期并发：actor 句柄变量推断 → 保留句柄类型（LLVM=i64 槽，
                 // 但须保留 K_ACTOR 供方法转发 scope 查类型）
                 ty = it
+            } else if it >= 0 && types.kind(it) == K_GUARD {
+                // 三期 A 组：guard<cap> 凭据变量推断 → i64 槽（凭据运行期占位）
+                ty = it
             } else if it >= 0 && (types.kind(it) == K_TUPLE || types.kind(it) == K_STRUCT || types.kind(it) == K_ENUM || types.kind(it) == K_FN || types.kind(it) == K_PORT) {
                 // 聚合变量：alloca 聚合槽，init（构造调用/元组字面量/返回）求聚合值
                 // （K_ENUM 2026-08-15：枚举变量同 struct——alloca %enum.X 槽，
@@ -1135,6 +1138,15 @@ func tig_stmt(id: i64) -> i64 {
         var b = ir.new_inst(g_cur_block, 30, -1)
         ir.add_operand(b, gblk, 1)
         return 0
+    }
+    if tag == 146 {
+        // 三期 A 组 `unsafe use g { ... }` 持证越界块（§7.1.1 + unsafe-model §13.4）：
+        // 凭据运行期无操作（编译期门禁已由语义层强制），块体正常生成。
+        return tig_stmtlist_as_stmt(sstate.child(id, 0))
+    }
+    if tag == 147 {
+        // 三期 A 组 `unsafe with(share) { ... }` 临时凭据块：同上，块体正常生成。
+        return tig_stmtlist_as_stmt(sstate.child(id, 1))
     }
     if tag == 103 {
         // Assign：name=目标名, val=op（-1 普通；0..17 复合赋值码，对齐 B_*），

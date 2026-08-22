@@ -57,9 +57,24 @@ pub func parse_stmt() -> i64 {
         // S1.2 U3：`unsafe { ... }` 局部逃逸块（块内可触底）
         // 三期 goto：`unsafe goto #x`（§7.1.5）——unsafe 后跟 goto 关键字
         // 是 goto 跳转语句（无条件 br），否则按 unsafe 块解析。
+        // 三期 A 组（§7.1.1 + unsafe-model §13.4）：
+        //   `unsafe use g { ... }` 持证越界块 / `unsafe with(share) { ... }`
+        //   临时凭据块（unsafe 后跟 use/with 关键字）；
+        //   `unsafe.get(share)` 是表达式（unsafe 后跟 . 或标识符调用），
+        //   落回 parse_expr_or_assign（parse_primary 识别 N_GUARD_GET）。
         var nxt = putil.peek_n(1)
         if nxt == lex_goto {
             return parse_goto_stmt()
+        }
+        if nxt == lex_ident && putil.peek_lexeme_n(1) == "use" {
+            return parse_guard_use()
+        }
+        if nxt == lex_ident && putil.peek_lexeme_n(1) == "with" {
+            return parse_guard_with()
+        }
+        // `unsafe.get(share)` 表达式：unsafe 后跟 `.`（get 是方法名）
+        if nxt == lex_dot {
+            return pstmt.parse_expr_or_assign()
         }
         return parse_unsafe_block()
     }
@@ -269,6 +284,60 @@ func parse_goto_label() -> i64 {
     }
     putil.eat(lex_semi)   // 吃掉 ASI 补分号（标签本身无分号语义）
     return ast.new_node(N_GOTO_LABEL, tname, -1, -1, line, col)
+}
+
+// 三期 A 组 `unsafe use g { ... }` 持证越界块（§7.1.1 + unsafe-model §13.4）：
+// unsafe → use → 凭据变量名（guard<cap> 变量）→ { stmts }。块内以凭据身份开启
+// 对应能力域（语义层校验 g 的类型与块内持证越界）。产出 N_GUARD_USE[name=凭据
+// 变量名池 id, children=[块 StmtList]]。
+func parse_guard_use() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // unsafe
+    putil.advance()   // use
+    var gname = putil.expect_ident()
+    if gname < 0 {
+        return -1
+    }
+    var body = parse_block()
+    if body < 0 {
+        return -1
+    }
+    var n = ast.new_node(N_GUARD_USE, gname, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, body)
+    ast.set_children(n, kids)
+    return n
+}
+
+// 三期 A 组 `unsafe with(share) { ... }` 临时凭据块（§7.1.1 + unsafe-model §13.4）：
+// unsafe → with → ( 能力域名 ) → { stmts }。块内创建临时 guard<cap> 凭据，退块
+// 自动回收。产出 N_GUARD_WITH[children=[能力域名节点, 块 StmtList]]。
+func parse_guard_with() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // unsafe
+    putil.advance()   // with
+    if !putil.expect(lex_lparen, "'('") {
+        return -1
+    }
+    var cap = putil.expect_ident()
+    if cap < 0 {
+        return -1
+    }
+    if !putil.expect(lex_rparen, "')'") {
+        return -1
+    }
+    var body = parse_block()
+    if body < 0 {
+        return -1
+    }
+    var n = ast.new_node(N_GUARD_WITH, -1, -1, -1, line, col)
+    var kids: table<i64> = table_new_i64()
+    table_push(kids, ast.new_node(N_NAMED_TYPE, cap, -1, -1, line, col))
+    table_push(kids, body)
+    ast.set_children(n, kids)
+    return n
 }
 
 // ---------- 顶层 import / using / namespace / extern ----------

@@ -330,6 +330,20 @@ func tig_expr(id: i64) -> i64 {
         // 接线程消息循环（mailbox + dispatch + 同步 RPC）。
         return tig_actor_run(id)
     }
+    if tag == S_N_GUARD_GET {
+        // 三期 A 组 `unsafe.get(share)` 凭据获取（§7.1.1 + unsafe-model §13.4）：
+        // guard<cap> 凭据运行期无操作（门禁在编译期语义层强制），LLVM 表示 = i64
+        // 占位值 0。对象绑定表达式（children[1]）若存在先求值（取其地址语义由
+        // 语义层定义，此处仅保证对象表达式编译通过）。
+        var bind = sstate.child(id, 1)
+        if bind >= 0 {
+            var bv = tig_expr(bind)
+            if bv < 0 {
+                return -1
+            }
+        }
+        return tig_int_lit(0)
+    }
     // 其他表达式后续扩展
     sm_err_line = s_lines[id]
     sm_err_col = s_cols[id]

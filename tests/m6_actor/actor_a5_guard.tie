@@ -1,0 +1,22 @@
+type tie<logic>
+// tests/m6_actor/actor_a5_guard.tie —— 三期 A 组 guard<share> 凭据探针（§7.1.1 + unsafe-model §13.4）
+// 验证：`unsafe.get(share)` 取得 guard<share> 凭据 + `unsafe use g { }` 持证越界
+// + `unsafe with(share) { }` 临时凭据。凭据运行期无操作（编译期门禁），LLVM=i64。
+// 预期输出：get:1 / use:2 / with:3
+var shared: i64 = 0
+
+func main() {
+    unsafe {
+        var g = unsafe.get(share)
+        shared = shared + 1
+        println("get: " + to_string(shared))
+        unsafe use g {
+            shared = shared + 1
+            println("use: " + to_string(shared))
+        }
+        unsafe with(share) {
+            shared = shared + 1
+            println("with: " + to_string(shared))
+        }
+    }
+}

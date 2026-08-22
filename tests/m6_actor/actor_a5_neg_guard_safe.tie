@@ -1,0 +1,7 @@
+type tie<logic>
+// tests/m6_actor/actor_a5_neg_guard_safe.tie —— 三期 A 组 guard 负例（§7.1.1）
+// 安全代码（unsafe 上下文外）调用 unsafe.get → 编译错误「必须在 unsafe 上下文」
+func main() {
+    var g = unsafe.get(share)
+    println("x")
+}

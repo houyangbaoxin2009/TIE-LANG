@@ -499,6 +499,64 @@ pub func check_stmt(s: i64) -> i64 {
         g_unsafe_depth = saved2
         return r2
     }
+    if tag == S_N_GUARD_USE {
+        // 三期 A 组 `unsafe use g { ... }` 持证越界块（§7.1.1 + unsafe-model §13.4）：
+        // 仅 unsafe 上下文合法；g 必须是 guard<cap> 类型变量（持证才能越界）。
+        // 块内开启 unsafe 上下文（+1 深度）——凭据身份越界。
+        if g_unsafe_depth == 0 {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "unsafe use 只能在 unsafe 上下文使用（unsafe 块或 unsafe 函数内）"
+            return -1
+        }
+        var gname = s_names[s]
+        var gnid = gname   // s_names 已是 intern 池 id（N_GUARD_USE 解析时 intern）
+        var gty = sinfer.lv_find(gnid)
+        if gty < 0 {
+            gty = sinfer.gb_find(gnid)
+        }
+        if gty < 0 || !types.is_guard(gty) {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "unsafe use 的 '" + sstate.name_str(s) + "' 必须是 guard<cap> 凭据变量（来自 unsafe.get(share) 等）"
+            return -1
+        }
+        var saved_u = g_unsafe_depth
+        g_unsafe_depth = g_unsafe_depth + 1
+        var body_u = sstate.child(s, 0)
+        var r_u: i64 = 0
+        if body_u >= 0 {
+            r_u = check_block(body_u)
+        }
+        g_unsafe_depth = saved_u
+        return r_u
+    }
+    if tag == S_N_GUARD_WITH {
+        // 三期 A 组 `unsafe with(share) { ... }` 临时凭据块（§7.1.1 + unsafe-model
+        // §13.4）：仅 unsafe 上下文合法；块内创建临时 guard<cap>，退块自动回收。
+        if g_unsafe_depth == 0 {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "unsafe with 只能在 unsafe 上下文使用（unsafe 块或 unsafe 函数内）"
+            return -1
+        }
+        var capn = sstate.name_str(sstate.child(s, 0))
+        if capn != "share" && capn != "mem" && capn != "ext" {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "unsafe with 的能力域必须是 share/mem/ext，实际是 '" + capn + "'"
+            return -1
+        }
+        var saved_w = g_unsafe_depth
+        g_unsafe_depth = g_unsafe_depth + 1
+        var body_w = sstate.child(s, 1)
+        var r_w: i64 = 0
+        if body_w >= 0 {
+            r_w = check_block(body_w)
+        }
+        g_unsafe_depth = saved_w
+        return r_w
+    }
     if tag == S_N_PANIC {
         // S2.3：panic("消息") —— 消息必须是 string 表达式（可配置目标行为：
         // 桌面打印+退出 / 嵌入式 halt / wasm trap，irgen 按 target 发射）

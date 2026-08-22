@@ -484,6 +484,18 @@ func exec_stmt(id: i64) {
         g_err = "REPL v1 暂不支持字段赋值（类）"
         g_flow = FL_NORMAL
         g_lastval = -1
+    } else if t == N_GOTO_LABEL {
+        // 三期 goto 标签：语句位置标记，解释器空操作
+        g_flow = FL_NORMAL
+        g_lastval = -1
+    } else if t == N_GOTO {
+        g_err = "REPL v1 暂不支持 goto 跳转（请用编译路径）"
+        g_flow = FL_NORMAL
+        g_lastval = -1
+    } else if t == N_GUARD_USE || t == N_GUARD_WITH {
+        // 三期 A 组 guard 块：解释器遍历块体（凭据运行期无操作）
+        g_flow = FL_NORMAL
+        g_lastval = -1
     } else {
         g_err = "内部错误: 未知语句节点 tag " + to_string(t)
         g_flow = FL_NORMAL

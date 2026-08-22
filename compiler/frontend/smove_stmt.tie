@@ -229,6 +229,30 @@ func check_stmt(s: i64) -> i64 {
     if tag == S_N_GOTO_LABEL || tag == S_N_GOTO {
         return 0
     }
+    // 三期 A 组 guard<cap>（§7.1.1）：unsafe.get 表达式作表达式（children 读/
+    // move 处理）；unsafe use/with 块遍历子语句。凭据本身 move-only 由语义层
+    // 拦截复制（此处仅正常遍历）。
+    if tag == S_N_GUARD_USE {
+        var blk_u = sstate.child(s, 0)
+        if blk_u >= 0 {
+            return check_block(blk_u)
+        }
+        return 0
+    }
+    if tag == S_N_GUARD_WITH {
+        var blk_w = sstate.child(s, 1)
+        if blk_w >= 0 {
+            return check_block(blk_w)
+        }
+        return 0
+    }
+    if tag == S_N_GUARD_GET {
+        var bind_g = sstate.child(s, 1)
+        if bind_g >= 0 {
+            return check_expr_read(bind_g)
+        }
+        return 0
+    }
     // FieldAssign：children=[基址, 值]（基址按引用；值 = 读取/移动）
     if tag == S_N_FIELD_ASSIGN {
         var base = sstate.child(s, 0)
