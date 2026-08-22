@@ -125,6 +125,14 @@ pub func parse_program() -> i64 {
                 return -1
             }
             ast.collect_stmt(stmts, s)
+        } else if tag == lex_hash {
+            // M4（dev33 批次9）：属性语法 `#[macro]` 标记宏定义为过程宏
+            //（token 流 API 驱动）。当前仅支持 `#[macro]` + 紧跟 macro 定义。
+            var ps = parse_proc_macro_attr()
+            if ps < 0 {
+                return -1
+            }
+            ast.collect_stmt(stmts, ps)
         } else {
             putil.set_err(putil.peek_line(), putil.peek_col(), "顶层只允许函数定义、import、using、struct、enum、命名空间声明、extern 声明、全局变量或宏定义，实际是 " + putil.describe(tag))
             return -1
@@ -260,6 +268,42 @@ func is_code_type_node(ty: i64) -> bool {
         }
     }
     return false
+}
+
+// M4（dev33 批次9）过程宏属性：`#[macro]` 已消费 '#'，解析 `[macro]` 后紧跟
+// macro 定义，把 N_MACRO_DEF 的 val 置 1 标记为过程宏（token 流 API 驱动：
+// mexpand 展开时把实参解引用为源码文本、绑定为字符串传给宏体）。
+func parse_proc_macro_attr() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // #
+    if !putil.expect(lex_lbracket, "'['") {
+        return -1
+    }
+    // 属性名读取 lexeme（不限定标识符：`#[macro]` 中 macro 是关键字 token）
+    var aname = interner.intern(putil.peek_lexeme())
+    putil.advance()
+    if !putil.expect(lex_rbracket, "']'") {
+        return -1
+    }
+    if aname != interner.intern("macro") {
+        putil.set_err(line, col, "未知属性 '#[" + interner.lookup(aname) +
+            "]'（当前仅支持 #[macro] 过程宏标记）")
+        return -1
+    }
+    // 属性后必须紧跟 macro 定义（`#[macro]` 行尾 ASI 可能补分号，先消费）
+    putil.eat(lex_semi)
+    if putil.peek_tag() != lex_macro {
+        putil.set_err(putil.peek_line(), putil.peek_col(),
+            "#[macro] 后必须紧跟宏定义（macro 关键字）")
+        return -1
+    }
+    var s = parse_macro_def()
+    if s < 0 {
+        return -1
+    }
+    ast.set_val(s, 1)   // val=1 标记过程宏（普通宏 val=0）
+    return s
 }
 
 // ---------- 语句分派 ----------

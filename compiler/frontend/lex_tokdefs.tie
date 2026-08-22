@@ -68,6 +68,9 @@ const lex_impl: i64 = 87;       // impl 关键字（S2.4：实现块 impl Drawab
 const lex_macro: i64 = 88;      // macro 关键字（S3.3：宏定义 macro name(...) -> code { ... }）
 const lex_backtick: i64 = 89;   // ` 反引号（S3.3：准引用 `(expr) / `{ stmts } 构造 code 值）
 const lex_dollar: i64 = 90;     // $ 插值符（S3.3：$x 嵌入 / $name 标识符插值，仅准引用内合法）
+// M4 过程宏（dev33 批次9）：# 属性起始符——`#[macro]` 标记宏定义为过程宏
+//（token 流 API 驱动），tag 91 为符号表新增（'#' = 0x23，介于 '!=' 与 '$' 之间）。
+const lex_hash: i64 = 91;       // # 哈希符（属性语法 `#[name]`）
 
 namespace lextok {
 

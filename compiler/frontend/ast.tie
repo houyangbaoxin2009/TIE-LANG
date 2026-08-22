@@ -317,6 +317,11 @@ pub func set_children(node: i64, children: table<i64>) {
     node_nchild[node] = len(children)
 }
 
+// 覆盖节点 val 字段（M4：`#[macro]` 属性把 N_MACRO_DEF 的 val 置 1 标记过程宏）。
+pub func set_val(node: i64, v: i64) {
+    node_vals[node] = v
+}
+
 // 子节点个数（无子节点返回 0）。
 pub func child_count(id: i64) -> i64 {
     return node_nchild[id]

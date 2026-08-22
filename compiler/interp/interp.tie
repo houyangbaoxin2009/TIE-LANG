@@ -386,6 +386,68 @@ pub func eval_macro(name: string, args: table<string>) -> string {
     return g_err
 }
 
+// 执行过程宏（M4，dev33 批次9）：#[macro] 标记的宏由 mexpand 把实参子树
+// 解引用为**源码文本**传入（args = 字符串表），本函数把形参绑定为字符串值
+//（普通宏绑定为 code 值）。宏体用 tokenize/deparse 驱动 token 流变换，须
+// return code 值（eval_expr/eval_code 构造）。与 eval_macro 同构。
+pub func eval_macro_proc(name: string, args: table<string>) -> string {
+    g_err = ""
+    var f = isess.f_get(name)
+    if f < 0 {
+        g_err = "过程宏 '" + name + "' 未定义"
+        return g_err
+    }
+    if !isess.m_has(name) {
+        g_err = "'" + name + "' 不是宏（未以 macro 声明）"
+        return g_err
+    }
+    g_macro_depth = g_macro_depth + 1
+    if g_macro_depth > 64 {
+        g_macro_depth = g_macro_depth - 1
+        g_err = "宏展开嵌套过深（超过 64 层，疑似无限递归）：" + name
+        return g_err
+    }
+    var total = isess.naux(f)
+    if len(args) != total {
+        g_macro_depth = g_macro_depth - 1
+        g_err = "过程宏 '" + name + "' 期望 " + to_string(total) + " 个参数，实际 " + to_string(len(args)) + " 个"
+        return g_err
+    }
+    var saved_ns = isess.ns_save()
+    var saved_base = env_base
+    isess.scope_push()
+    var i: i64 = 0
+    while i < total {
+        var p = isess.nchild_at(f, 1 + i)
+        var pname = isess.nname_str(p)
+        // 过程宏：形参绑定为实参源码文本（字符串值）
+        isess.var_declare(pname, ivalue.new_str(args[i]))
+        i = i + 1
+    }
+    env_base = isess.scope_top()
+    var body = isess.nchild_at(f, isess.nchild(f) - 1)
+    exec_block(body)
+    isess.scope_pop()
+    env_base = saved_base
+    isess.ns_restore(saved_ns)
+    g_macro_depth = g_macro_depth - 1
+    if g_err != "" {
+        return g_err
+    }
+    if g_flow == FL_RETURN {
+        var val = g_flow_val
+        g_flow = FL_NORMAL
+        if ivalue.type_of(val) == T_CODE {
+            return ivalue.code_str(val)
+        }
+        g_err = "过程宏 '" + name + "' 必须返回 code 值（return 了一个 " +
+            ivalue.type_name(val) + "）"
+        return g_err
+    }
+    g_err = "过程宏 '" + name + "' 未返回 code 值（函数体缺少 return code 语句）"
+    return g_err
+}
+
 // 执行 code 值文本（C2 thunk `.call()` / 编译期执行）：协议文本 → 归档 →
 // 根 StmtList 逐语句执行 / 单表达式求值。返回最后值 id（void → Void 值）。
 // 失败置 g_err 返回 -1。

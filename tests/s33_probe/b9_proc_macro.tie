@@ -1,0 +1,39 @@
+type tie<logic>
+// dev33 批次9 任务26：过程宏注册/展开（#[macro] 声明 + 调用点展开）
+// ============================================================
+// #[macro] 标记宏定义为**过程宏**：实参子树由 mexpand 解引用为源码文本
+//（字符串值）传给宏体；宏体用 tokenize/deparse 做 token 流变换，eval_expr
+// 构造返回 code 值；调用点正常函数式调用，端到端展开正确。
+// 期望输出：42 / -5 / 30
+
+#[macro]
+macro tok_append1(x: code) -> code {
+    var toks = tokenize(x)              // 实参源码 → token 流
+    var newsrc = deparse(toks) + " + 1" // token 流 → 源码 + 追加
+    return eval_expr("(" + newsrc + ")")
+}
+
+#[macro]
+macro tok_neg(x: code) -> code {
+    var toks = tokenize(x)
+    var newsrc = "-(" + deparse(toks) + ")"
+    return eval_expr(newsrc)
+}
+
+#[macro]
+macro tok_sum2(a: code, b: code) -> code {
+    var ta = tokenize(a)
+    var tb = tokenize(b)
+    var newsrc = "(" + deparse(ta) + " + " + deparse(tb) + ")"
+    return eval_expr(newsrc)
+}
+
+func main() -> i64 {
+    var v1 = tok_append1(41)   // (41) + 1 = 42
+    var v2 = tok_neg(5)        // -(5) = -5
+    var v3 = tok_sum2(20, 10)  // (20 + 10) = 30
+    println(v1)
+    println(v2)
+    println(v3)
+    return 0
+}
