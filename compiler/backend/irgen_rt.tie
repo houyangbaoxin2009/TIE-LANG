@@ -933,7 +933,7 @@ func gen_actor_dispatch_eager() {
 // 单条件变量 + 谓词检查免丢唤醒（等 done 时 SleepConditionVariableCS 释放锁，
 // actor 线程可持锁写 result+done+唤醒）。返回结果值 id（void → 0 哑值）。
 // 全部新块归 g_cur_func；result 在 done 块 load，调用方续在同一块追加。
-func gen_actor_sync_call(rech: i64, mi: i64, arg_v: i64, ret_ty: i64) -> i64 {
+func gen_actor_sync_call(rech: i64, mi: i64, arg_v: i64, ret_ty: i64, is_async: bool) -> i64 {
     var T64 = types.named(TK_I64)
     var P = types.named(TK_STR)
     // rec_ptr = inttoptr(rech)
@@ -995,6 +995,12 @@ func gen_actor_sync_call(rech: i64, mi: i64, arg_v: i64, ret_ty: i64) -> i64 {
     var avsWk: table<i64> = table_new_i64()
     table_push(atsWk, P); table_push(avsWk, cvp)
     tig_ext_call_typed("WakeConditionVariable", atsWk, avsWk, -1)
+    // async：投递即返回（fire-and-forget，不阻塞等 done）
+    if is_async {
+        g_cur_block = p1
+        return tig_int_lit_ty(0, T64)
+    }
+    // 同步：等 done → 读 result
     var atsE2: table<i64> = table_new_i64()
     var avsE2: table<i64> = table_new_i64()
     table_push(atsE2, P); table_push(avsE2, lockp)

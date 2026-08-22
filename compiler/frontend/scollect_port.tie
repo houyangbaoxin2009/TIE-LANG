@@ -1108,6 +1108,12 @@ pub func collect_actor_decl(s: i64) -> i64 {
                 sm_err_col = s_cols[item]
                 return -1
             }
+            // 登记 async 标志（与 ac_mrets 同位对齐；s_vals bit2 = async）
+            if s_vals[item] / 4 % 2 == 1 {
+                table_push(ac_masync, 1)
+            } else {
+                table_push(ac_masync, 0)
+            }
             // async 方法必须 void 返回（fire-and-forget 无返回值契约）
             if s_vals[item] / 4 % 2 == 1 {
                 var ret_node = rt_node

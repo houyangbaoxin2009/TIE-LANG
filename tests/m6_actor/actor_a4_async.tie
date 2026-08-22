@@ -1,0 +1,26 @@
+type tie<logic>
+// 一期并发 A4 Step5：async/fire-and-forget 探针。
+// `pub async func` = 投递即返回（不阻塞等 done）；同步方法仍阻塞读 result。
+// 主线程连续两次 async bump（不等待）后，同步 get() 强制 actor 按 FIFO 顺序
+// 处理前面已入队的消息——读到 async 已更新的 count。
+actor Counter {
+    var count: i64 = 0
+    pub async func bump(by: i64) {
+        count = count + by
+    }
+    pub func get() -> i64 {
+        return count
+    }
+}
+func main() {
+    var c = run Counter()
+    c.bump(3)   // async：仅入队，不阻塞即返回
+    c.bump(4)   // async
+    var v = c.get()   // 同步：阻塞等 done，读 result
+    println("count=" + to_string(v))
+    if v == 7 {
+        println("A4 async 投递+FIFO 顺序通过")
+    } else {
+        println("A4 async 失败 count=" + to_string(v))
+    }
+}

@@ -220,7 +220,7 @@ func tig_method_call(id: i64) -> i64 {
                     }
                     a2k = a2k + 1
                 }
-                return gen_actor_sync_call(rech, mi2, a2v, act_ret)
+                return gen_actor_sync_call(rech, mi2, a2v, act_ret, ac_masync[ac_mret[ai2] + mi2] == 1)
             }
             if types.kind(g_lookup_ty) == K_PORT {
                 // S2.4：port 对象方法调用（动态分发，vtable 间接调用）
@@ -261,7 +261,7 @@ func tig_method_call(id: i64) -> i64 {
             }
             ark = ark + 1
         }
-        return gen_actor_sync_call(rrec, rmi, arv, rret)
+        return gen_actor_sync_call(rrec, rmi, arv, rret, ac_masync[ac_mret[rai] + rmi] == 1)
     }
     var prefix = sinfer.recv_path_name(recv)
     if prefix == "" {

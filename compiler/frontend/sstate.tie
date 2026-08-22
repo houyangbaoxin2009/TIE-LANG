@@ -231,6 +231,7 @@ var ac_mnames: table<i64>;   // 方法名 id 扁平段（声明顺序）
 var ac_mnpars: table<i64>;   // 每方法参数个数扁平段
 var ac_mptys: table<i64>;    // 每方法参数类型扁平段
 var ac_mrets: table<i64>;    // 每方法返回类型扁平段
+var ac_masync: table<i64>;   // 每方法是否 async（fire-and-forget；与 ac_mrets 同位对齐）
 // actor 私有状态字段布局（行 = actor 索引；Step4b 起 per-actor state 真实槽位）：
 //   ac_fnoff[actor] -> 字段名段偏移（ac_fnames）
 //   ac_fncnt[actor] -> 字段个数
