@@ -1,0 +1,507 @@
+type tie<class>
+// compiler/backend/irgen_call.tie —— 生成器 L6 调用分派/ABI 子模块（用户调用/方法调用/extern 桥/atomic）
+// ============================================================
+// 从 irgen.tie 的 L6 调用分派层拆出（同 namespace irgen 文本内联跨文件）；本文件只含函数，
+// 不含顶层全局 var。依赖经主文件 import 链内联可达，不重复 import。
+namespace irgen {
+// 生成用户函数调用（顶层/命名空间函数）→ call(35) 指令。
+// full_name 为函数全名（裸调用已 resolve，MethodCall 已拼 prefix::method）。
+// arg_start：实参起始 child 下标（Call=slot_off；MethodCall=1+slot_off，
+// children[0] 是泛型槽、children[1] 是 receiver）。
+// 操作数布局：[0]=符号池id, [1]=返回类型id(IMM), 然后每参数 [类型id(IMM), 值]。
+func tig_user_call(full: string, id: i64) -> i64 {
+    return tig_user_call_from(full, id, sstate.slot_off(id))
+}
+
+func tig_user_call_from(full: string, id: i64, arg_start: i64) -> i64 {
+    var sig = sstate.fn_sig(full)
+    var probe_i: i64 = 0
+    while probe_i < sstate.nchild(id) {
+        var pc = sstate.child(id, probe_i)
+        probe_i = probe_i + 1
+    }
+    if sig < 0 {
+        sm_err_msg = "函数 '" + full + "' 无签名（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var ret_ty = fn_ret_ty(sig)
+    var nparams = fn_nparams(sig)
+    var ptys = fn_param_tys(sig)
+    var sym = interner.intern(full)
+    llvmgen.call_sym_reg(sym)
+    // 变参（`...T`）：固定形参数 = nparams - 1，多余实参打包为动态表实参
+    var has_var = sstate.fn_has_variadic(sig) == 1
+    var fixed_n: i64 = nparams
+    var var_elem: i64 = -1
+    if has_var {
+        fixed_n = nparams - 1
+        var_elem = types.table_elem(ptys[nparams - 1])
+    }
+    // 实参全求值（by_ref 形参 + Var 实参 → 传槽地址跳过 load）
+    var nc = sstate.nchild(id)
+    var argvals: table<i64> = table_new_i64()
+    var argisref: table<i64> = table_new_i64()  // 并行：ref 实参标志（类型 → ptr）
+    var argkinds: table<i64> = table_new_i64()  // 并行：操作数 kind（S3.2：ref 全局 → 3）
+    var extra_nodes: table<i64> = table_new_i64()  // 变参多余实参（稍后打包）
+    var k: i64 = arg_start
+    while k < nc {
+        var arg_node = sstate.child(id, k)
+        var av: i64 = -1
+        var is_ref_arg: i64 = 0
+        var arg_kind: i64 = 0
+        var arg_idx = k - arg_start  // 实参序号（aoff=1 时 children[0] 是路径节点）
+        if has_var && arg_idx >= fixed_n {
+            // 变参多余实参：收集节点，最后统一打包成表实参（不单独求值/压参）
+            table_push(extra_nodes, arg_node)
+            k = k + 1
+            continue
+        }
+        if arg_idx < nparams {
+            // T0.3 by_ref：实参是 Var 时传实参槽地址（局部 alloca %N / 全局 @g），
+            // 函数内 load/store 透过该槽 → 内容修改 + 重绑定都写回调用方。
+            // M2.1.8：struct 接收者自动 ref（表 ref 原本 table→ptr 一致，
+            // struct 聚合类型必须显式 ptr——形参已声明 ptr，实参须同型）
+            var ref_flag = sp_refs[sg_off[sig] + arg_idx]
+            if ref_flag == 1 && s_tags[arg_node] == 6 {
+                var anm = interner.intern(sstate.name_str(arg_node))
+                if scope_get_global(anm) >= 0 {
+                    av = g_lookup_alloca
+                    is_ref_arg = 1
+                    // S3.2：ref 全局实参（标量/表）操作数 kind 用 3（全局地址
+                    // @sym，llvmgen typed_ref/opnd_ref 直引）——kind 0 会把
+                    // "@name" 池 id 当 SSA 值输出 "%N"（N 是池 id 非本函数
+                    // 定义的值）→ opt 报 use of undefined value
+                    if g_lookup_is_global >= 1 {
+                        arg_kind = 3
+                    }
+                }
+            }
+        }
+        if av < 0 {
+            av = tig_expr(arg_node)
+        }
+        table_push(argvals, av)
+        table_push(argisref, is_ref_arg)
+        table_push(argkinds, arg_kind)
+        k = k + 1
+    }
+    // 变参打包：多余实参 → 动态表（无多余实参也要传空表）
+    if has_var {
+        var tbl = tig_variadic_table(extra_nodes, var_elem)
+        if tbl < 0 {
+            return -1
+        }
+        table_push(argvals, tbl)
+        table_push(argisref, 0)
+        table_push(argkinds, 0)
+    }
+    // 批次5 任务13：用户 extern 函数（仅声明无函数体，如 libc getenv）→ 路由
+    // op36（extern_call）。否则走 op35（本模块函数 call）。op36 复用 llvmgen 的
+    // 「未登记符号签名推导 declare」+「string 返回自动扫描（char* → {ptr,len}）」。
+    // 判定：full 为用户声明的 extern（稀疏 g_extern_ids 线性命中）→ 路由 op36
+    //（declare 推导 + 字符串返回自动扫描）。非 extern 的正常模块函数走 op35。
+    // sym 即 interner.intern(full)（前面已算，O(1) 复用，勿再逐调用 re-intern）。
+    if is_extern_fn_id(sym) {
+        var etys: table<i64> = table_new_i64()
+        var evs: table<i64> = table_new_i64()
+        var ek: i64 = 0
+        while ek < len(argvals) {
+            var ety: i64 = types.named(TK_I64)
+            if ek < nparams {
+                if argisref[ek] == 1 {
+                    ety = types.named(TK_STR)   // ref 实参：槽地址 → ptr
+                } else {
+                    ety = ptys[ek]
+                }
+            }
+            table_push(etys, ety)
+            table_push(evs, argvals[ek])
+            ek = ek + 1
+        }
+        // extern 返回 void 时 ret_ty 恒为 TK_VOID，tig_ext_call_typed 建 void 指令
+        return tig_ext_call_typed(full, etys, evs, ret_ty)
+    }
+    var ty35: i64 = -1
+    if ret_ty != types.named(TK_VOID) {
+        ty35 = ret_ty
+    }
+    // 只创建一条（曾先建 ret_ty 再覆盖建 -1——void 时遗留无操作数垃圾指令
+    // → llvmgen 生成 `call void @()` 空符号）
+    var inst = ir.new_inst(g_cur_block, 35, ty35)  // call（void 用 -1）
+    ir.add_operand(inst, sym, 0)
+    ir.add_operand(inst, ret_ty, 2)  // 返回类型（IMM）
+    k = 0
+    while k < len(argvals) {
+        var pty = types.named(TK_I64)
+        if k < nparams {
+            if argisref[k] == 1 {
+                pty = types.named(TK_STR)  // ref 实参：槽地址 → ptr
+            } else {
+                pty = ptys[k]
+            }
+            // S1.3 C2/C3：形参类型（数字族）≠ 实参表达式类型 → 转换
+            // （调用点拓宽/常量缩窄；语义层已校验合法性，此处只做 IR 转换）
+            var an = sstate.child(id, arg_start + k)
+            var at2 = node_types[an]
+            if pty >= 0 && at2 >= 0 && (types.is_int(pty) || types.is_float(pty)) &&
+                (types.is_int(at2) || types.is_float(at2)) && pty != at2 {
+                var ac = tig_coerce(argvals[k], at2, pty)
+                if ac < 0 {
+                    return -1
+                }
+                argvals[k] = ac
+            }
+        }
+        ir.add_operand(inst, pty, 2)
+        ir.add_operand(inst, argvals[k], argkinds[k])
+        k = k + 1
+    }
+    if ret_ty == types.named(TK_VOID) {
+        return tig_int_lit(0)  // void 结果：哑值（调用方丢弃）
+    }
+    return ir.get_value(inst)
+}
+
+// 方法调用（MethodCall，tag 18）：receiver + 方法名 → 命名空间函数全名。
+// receiver 是 Path/Var/FieldAccess 链（未绑定）→ ns 调用；绑定实例 → struct
+// 方法转发（obj.method() → StructName::method(obj, ...)，语义层已校验签名）。
+func tig_method_call(id: i64) -> i64 {
+    // MethodCall 接收者 = children[slot_off]（新布局 children[0]=泛型槽→偏移 1）
+    var recv = sstate.child(id, sstate.slot_off(id))
+    var mname = sstate.name_str(id)
+    // 枚举变体构造探测（EnumName.Variant(args)）：接收者是未绑定变量且命中
+    // en_keys → 枚举构造（仿 sinfer.infer_method_call 的枚举分支；实参从
+    // children[slot_off + 1] 起）。须先于 struct 实例方法转发——枚举名不可
+    // 能是已绑定实例，互不冲突。
+    if s_tags[recv] == 6 {
+        var rnm = sstate.name_str(recv)
+        var eidx2 = sstate.bs_find(en_keys, interner.intern(rnm))
+        if eidx2 >= 0 {
+            return tig_enum_construct(eidx2, mname, id, 1 + sstate.slot_off(id))
+        }
+    }
+    // 接收者是已绑定实例（局部/全局变量）且类型为 struct → 实例方法转发：
+    // 函数全名 = <struct 名>::<方法>，实参 = [receiver 值] + 显式实参
+    if s_tags[recv] == 6 {
+        var rnid = interner.intern(sstate.name_str(recv))
+        if scope_get_global(rnid) >= 0 {
+            if types.kind(g_lookup_ty) == K_ATOMIC {
+                // S1.2 A1 atomic<T> 内置方法（c.load() / c.fetch_add(1, Relaxed)）
+                return tig_atomic_method(recv, g_lookup_ty, mname, id)
+            }
+            if types.kind(g_lookup_ty) == K_STRUCT {
+                var si = g_lookup_ty - BASE_STRUCT
+                var full = sstate.struct_name_of(si) + "::" + mname
+                if sstate.fn_sig(full) >= 0 {
+                    return tig_struct_method_call(full, id, recv, g_lookup_ty)
+                }
+            }
+            if types.kind(g_lookup_ty) == K_PORT {
+                // S2.4：port 对象方法调用（动态分发，vtable 间接调用）
+                return tig_port_method_call(id, recv, g_lookup_ty, mname)
+            }
+        }
+    }
+    // S2.4：表达式接收者（list[0] / 函数返回值 / 字段访问）——port 对象
+    // 动态分发（vtable 间接调用）。node_types[recv] 由语义层登记。
+    var rt4 = node_types[recv]
+    if rt4 >= 0 && types.kind(rt4) == K_PORT {
+        return tig_port_method_call(id, recv, rt4, mname)
+    }
+    var prefix = sinfer.recv_path_name(recv)
+    if prefix == "" {
+        sm_err_msg = "方法调用接收者不可解析（方法 " + mname + "，函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var full = prefix + "::" + mname
+    // 实参从 children[slot_off + 1] 开始（children[slot_off]=receiver）
+    return tig_user_call_from(full, id, 1 + sstate.slot_off(id))
+}
+
+// ==================== S1.2 A1 atomic<T> 方法生成 ====================
+// 接收者 = 原子变量槽（alloca）。内存序 IMM 由 irgen 侧解析（Relaxed=0
+// Acquire=1 Release=2 AcqRel=3 SeqCst=4；语义层已校验标识符）。
+func tig_atomic_method(recv: i64, aty: i64, mname: string, id: i64) -> i64 {
+    var rnid = interner.intern(sstate.name_str(recv))
+    if scope_get_global(rnid) < 0 {
+        sm_err_msg = "原子变量 '" + sstate.name_str(recv) + "' 未入作用域（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var slot = g_lookup_alloca
+    var elem = types.table_elem(aty)
+    // 实参求值（从 children[slot_off + 1] 起）
+    var aoff = 1 + sstate.slot_off(id)
+    var nc = sstate.nchild(id)
+    var order: i64 = 0
+    if mname == "load" {
+        // load([order])：0 或 1 参；order 默认 SeqCst
+        var ord2: i64 = 4
+        if nc > aoff {
+            ord2 = atomic_order_imm(sstate.child(id, aoff))
+        }
+        var inst = ir.new_inst(g_cur_block, 66, elem)
+        ir.add_operand(inst, slot, 0)
+        ir.add_operand(inst, ord2, 2)  // SeqCst
+        return ir.get_value(inst)
+    }
+    // 取 order（最后一个实参）
+    if nc > aoff {
+        var last = sstate.child(id, nc - 1)
+        order = atomic_order_imm(last)
+    }
+    if mname == "store" {
+        var v = tig_expr(sstate.child(id, aoff))
+        if v < 0 {
+            return -1
+        }
+        var vt = node_types[sstate.child(id, aoff)]
+        if vt >= 0 && vt != elem && (types.is_int(vt) || types.is_float(vt)) {
+            var cv = tig_coerce(v, vt, elem)
+            if cv < 0 {
+                return -1
+            }
+            v = cv
+        }
+        var inst = ir.new_inst(g_cur_block, 67, -1)
+        ir.add_operand(inst, elem, 2)  // ① 值类型 IMM
+        ir.add_operand(inst, slot, 0)  // ② 地址
+        ir.add_operand(inst, v, 0)     // ③ 值
+        ir.add_operand(inst, order, 2) // ④ order
+        return tig_int_lit(0)
+    }
+    if mname == "fetch_add" || mname == "fetch_sub" || mname == "fetch_and" ||
+        mname == "fetch_or" || mname == "fetch_xor" {
+        var v = tig_expr(sstate.child(id, aoff))
+        if v < 0 {
+            return -1
+        }
+        var vt = node_types[sstate.child(id, aoff)]
+        if vt >= 0 && vt != elem && (types.is_int(vt) || types.is_float(vt)) {
+            var cv = tig_coerce(v, vt, elem)
+            if cv < 0 {
+                return -1
+            }
+            v = cv
+        }
+        var opn: i64 = 0
+        if mname == "fetch_sub" {
+            opn = 1
+        } else if mname == "fetch_and" {
+            opn = 2
+        } else if mname == "fetch_or" {
+            opn = 3
+        } else if mname == "fetch_xor" {
+            opn = 4
+        }
+        var inst = ir.new_inst(g_cur_block, 68, elem)
+        ir.add_operand(inst, slot, 0)
+        ir.add_operand(inst, v, 0)
+        ir.add_operand(inst, opn, 2)
+        ir.add_operand(inst, order, 2)
+        return ir.get_value(inst)
+    }
+    if mname == "compare_exchange" {
+        var exp = tig_expr(sstate.child(id, aoff))
+        if exp < 0 {
+            return -1
+        }
+        var newv = tig_expr(sstate.child(id, aoff + 1))
+        if newv < 0 {
+            return -1
+        }
+        var inst = ir.new_inst(g_cur_block, 69, elem)
+        ir.add_operand(inst, slot, 0)
+        ir.add_operand(inst, exp, 0)
+        ir.add_operand(inst, newv, 0)
+        ir.add_operand(inst, order, 2)
+        ir.add_operand(inst, order, 2)  // fail order（第一版同 succ）
+        // cmpxchg 结果 {Ty, i1}：落内存（tuple 类型 {elem, bool}）+ agg_gep 提取
+        var tup = sinfer.tuple2_of(elem, types.named(TK_BOOL))
+        var agg = ir.get_value(inst)
+        var alloca = ir.new_inst(g_cur_block, 20, tup)
+        ir.add_operand(alloca, tup, 2)
+        var ap = ir.get_value(alloca)
+        var st0 = ir.new_inst(g_cur_block, 22, -1)
+        ir.add_operand(st0, tup, 2)
+        ir.add_operand(st0, agg, 0)
+        ir.add_operand(st0, ap, 0)
+        var gp = ir.new_inst(g_cur_block, 27, tup)
+        ir.add_operand(gp, ap, 0)
+        ir.add_operand(gp, 1, 2)
+        var ld = ir.new_inst(g_cur_block, 21, types.named(TK_BOOL))
+        ir.add_operand(ld, ir.get_value(gp), 0)
+        return ir.get_value(ld)
+    }
+    sm_err_msg = "atomic 方法 '" + mname + "' 生成失败（函数 " + g_cur_fn_name + "）"
+    return -1
+}
+
+// struct 实例方法转发调用：函数 = StructName::method，首参 = receiver 聚合值，
+// 其余实参 = children[1..]。操作数布局与 tig_user_call_from 完全一致。
+func tig_struct_method_call(full: string, id: i64, recv: i64, rty: i64) -> i64 {
+    var sig = sstate.fn_sig(full)
+    if sig < 0 {
+        sm_err_msg = "函数 '" + full + "' 无签名（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var ret_ty = fn_ret_ty(sig)
+    var nparams = fn_nparams(sig)
+    var ptys = fn_param_tys(sig)
+    // 首参 ref 标志（M2.1.8 struct 接收者自动按引用）：sp_refs[sg_off[sig] + 0]
+    var first_ref = 0
+    var sgo = sg_off[sig]
+    if sgo >= 0 && sgo < len(sp_refs) {
+        first_ref = sp_refs[sgo]
+    }
+    var sym = interner.intern(full)
+    llvmgen.call_sym_reg(sym)
+    // 首参 = receiver（struct 接收者按引用：传槽地址；否则按值传聚合）
+    var argvals: table<i64> = table_new_i64()
+    var argtys: table<i64> = table_new_i64()  // 并行实参类型（ref 首参 → ptr）
+    var rv: i64 = -1
+    if first_ref == 1 {
+        rv = tig_agg_addr(recv, rty)  // 接收者槽地址（Var → alloca；表达式落内存）
+    } else {
+        rv = tig_expr(recv)
+    }
+    if rv < 0 {
+        return -1
+    }
+    table_push(argvals, rv)
+    if first_ref == 1 {
+        table_push(argtys, types.named(TK_STR))  // 引用 → ptr
+    } else {
+        table_push(argtys, rty)
+    }
+    // 其余实参（从 children[slot_off + 1] 起：children[slot_off]=receiver）
+    var soff2 = sstate.slot_off(id)
+    var nc = sstate.nchild(id)
+    var has_var = sstate.fn_has_variadic(sig) == 1
+    var fixed_m: i64 = nparams - 1   // 去掉接收者后的固定参数（含变参位置）
+    var extra_nodes: table<i64> = table_new_i64()
+    var k: i64 = 1 + soff2
+    while k < nc {
+        var arg_node = sstate.child(id, k)
+        var arg_idx = k - soff2  // 形参序号（0 = 接收者）
+        if has_var && arg_idx >= fixed_m {
+            // 变参多余实参：收集打包（不单独求值/压参）
+            table_push(extra_nodes, arg_node)
+            k = k + 1
+            continue
+        }
+        var av = tig_expr(arg_node)
+        if av < 0 {
+            return -1
+        }
+        table_push(argvals, av)
+        var apty = types.named(TK_I64)
+        // 形参下标 = 实参序号 + 1（首参 0 = 接收者，已单独压入）；child 下标
+        // 与形参下标相差 slot_off（新布局 +1）——ptys[k - soff2] 即该实参的
+        // 形参类型（旧布局 soff2=0 → ptys[k]，与历史行为一致）
+        if k - soff2 < nparams {
+            apty = ptys[k - soff2]
+        }
+        table_push(argtys, apty)
+        k = k + 1
+    }
+    // 变参打包：多余实参 → 动态表（无多余也要传空表）
+    if has_var {
+        var var_elem2 = types.table_elem(ptys[nparams - 1])
+        var tbl2 = tig_variadic_table(extra_nodes, var_elem2)
+        if tbl2 < 0 {
+            return -1
+        }
+        table_push(argvals, tbl2)
+        table_push(argtys, ptys[nparams - 1])   // table<T> → ptr
+    }
+    // 生成 call（同 tig_user_call_from 尾部；实参类型用 argtys 并行表）
+    var ty35: i64 = -1
+    if ret_ty != types.named(TK_VOID) {
+        ty35 = ret_ty
+    }
+    var inst = ir.new_inst(g_cur_block, 35, ty35)  // call
+    ir.add_operand(inst, sym, 0)
+    ir.add_operand(inst, ret_ty, 2)
+    k = 0
+    while k < len(argvals) {
+        ir.add_operand(inst, argtys[k], 2)
+        ir.add_operand(inst, argvals[k], 0)
+        k = k + 1
+    }
+    if ret_ty == types.named(TK_VOID) {
+        return tig_int_lit(0)  // void 结果：哑值（调用方丢弃）
+    }
+    return ir.get_value(inst)
+}
+
+// 外部桥调用（extern_call 36）通用生成。argtys/argv 并行表（实参 LLVM 类型 id + 值 id）。
+// 返回结果值 id（void 桥返回 -1，指令 ty=-1 无结果寄存器）。
+// 操作数布局：[0]=符号池id, [1]=返回类型id(IMM), 然后每参数 [类型id(IMM), 值]。
+// is_libc：true = libc 符号（不置 g_used_interp）；false = tie_interp 桥。
+func tig_ext_call_typed(sym: string, argtys: table<i64>, argv: table<i64>, ret_ty: i64) -> i64 {
+    if !is_libc_sym(sym) {
+        g_used_interp = true
+    }
+    var sid = interner.intern(sym)
+    var inst = ir.new_inst(g_cur_block, 36, ret_ty)
+    ir.add_operand(inst, sid, 0)
+    ir.add_operand(inst, ret_ty, 2)  // 返回类型（IMM）
+    var k: i64 = 0
+    while k < len(argv) {
+        ir.add_operand(inst, argtys[k], 2)
+        ir.add_operand(inst, argv[k], 0)
+        k = k + 1
+    }
+    if ret_ty < 0 {
+        return -1
+    }
+    return ir.get_value(inst)
+}
+
+// 便捷：单参数桥（返回非 void）
+func tig_ext_call1(sym: string, v: i64, vty: i64, ret_ty: i64) -> i64 {
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, vty)
+    table_push(avs, v)
+    return tig_ext_call_typed(sym, ats, avs, ret_ty)
+}
+
+// 便捷：双参数桥（返回非 void）
+func tig_ext_call2(sym: string, v1: i64, ty1: i64, v2: i64, ty2: i64, ret_ty: i64) -> i64 {
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, ty1)
+    table_push(avs, v1)
+    table_push(ats, ty2)
+    table_push(avs, v2)
+    return tig_ext_call_typed(sym, ats, avs, ret_ty)
+}
+
+// 便捷：双参数 void 桥
+func tig_ext_call2v(sym: string, v1: i64, ty1: i64, v2: i64, ty2: i64) {
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, ty1)
+    table_push(avs, v1)
+    table_push(ats, ty2)
+    table_push(avs, v2)
+    tig_ext_call_typed(sym, ats, avs, -1)
+}
+
+// 便捷：四参数桥（返回非 void）
+func tig_ext_call4(sym: string, v1: i64, ty1: i64, v2: i64, ty2: i64, v3: i64, ty3: i64, v4: i64, ty4: i64) -> i64 {
+    var ats: table<i64> = table_new_i64()
+    var avs: table<i64> = table_new_i64()
+    table_push(ats, ty1)
+    table_push(avs, v1)
+    table_push(ats, ty2)
+    table_push(avs, v2)
+    table_push(ats, ty3)
+    table_push(avs, v3)
+    table_push(ats, ty4)
+    table_push(avs, v4)
+    return tig_ext_call_typed(sym, ats, avs, types.named(TK_I64))
+}
+
+}
