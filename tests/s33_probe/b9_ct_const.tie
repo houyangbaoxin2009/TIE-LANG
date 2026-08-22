@@ -1,0 +1,68 @@
+type tie<logic>
+// dev33 批次9 任务25：编译期执行环境——宏在编译期跑 tie 代码
+// ============================================================
+// 宏体由编译期 interp 执行（非运行期）：ct_sum_to 在编译期用循环累加算出
+// 常量，把结果字面量经 eval_expr 注入运行期代码；ct_pow2 在编译期跑递归。
+// 运行期零宏痕迹、零开销——编译产物里只有计算好的常量。
+// 期望输出：
+//   sum=55（1..10 编译期累加）
+//   pow=64（2^6 编译期递归）
+//   comb=90（编译期组合计算 10 选 2 * 2）
+
+macro ct_sum_to(n: code) -> code {
+    var v = $n.call()          // 执行实参 code 值 → 整数（编译期求值）
+    var acc = 0
+    var i = 1
+    while i <= v {
+        acc = acc + i
+        i = i + 1
+    }
+    return eval_expr("(" + to_string(acc) + ")")
+}
+
+macro ct_pow2(n: code) -> code {
+    var v = $n.call()
+    var r = 1
+    var i = 1
+    while i <= v {
+        r = r * 2
+        i = i + 1
+    }
+    return eval_expr("(" + to_string(r) + ")")
+}
+
+macro ct_comb(n: code, k: code) -> code {
+    var nv = $n.call()
+    var kv = $k.call()
+    // 组合数 C(n,k) = n! / (k! * (n-k)!)，编译期阶乘计算
+    var fn = 1
+    var fk = 1
+    var fnk = 1
+    var a = 1
+    while a <= nv {
+        fn = fn * a
+        a = a + 1
+    }
+    a = 1
+    while a <= kv {
+        fk = fk * a
+        a = a + 1
+    }
+    a = 1
+    while a <= nv - kv {
+        fnk = fnk * a
+        a = a + 1
+    }
+    var c = fn / (fk * fnk) * 2
+    return eval_expr("(" + to_string(c) + ")")
+}
+
+func main() -> i64 {
+    var s = ct_sum_to(10)
+    var p = ct_pow2(6)
+    var c = ct_comb(10, 2)
+    println("sum=" + to_string(s))
+    println("pow=" + to_string(p))
+    println("comb=" + to_string(c))
+    return 0
+}
