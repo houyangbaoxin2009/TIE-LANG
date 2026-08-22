@@ -303,6 +303,45 @@ func extern_decl(sym: string) -> string {
     if sym == "longjmp" || sym == "_setjmp" || sym == "llvm.frameaddress.p0" {
         return ""
     }
+    // 一期并发 A4 执行层：kernel32 线程 + 同步原语（纯 codegen 零运行时）。
+    // 用户 `unsafe extern fn` 的 declare 由 user_extern_decl 从调用签名推导，
+    // 但 irgen 内部直接生成的 extern_call（tig_ext_call_typed）走的是本表
+    //（未登记返回 "" → 无 declare，opt 报 use of undefined value）。CRITICAL_
+    // SECTION/CONDITION_VARIABLE 缓冲由 irgen 分配 + inttoptr 传基址；MSG 结构
+    // 亦在此列（mailbox 消息单元）。返回 void 的符号按 void declare 直出。
+    if sym == "InitializeCriticalSection" {
+        return "declare void @InitializeCriticalSection(ptr)"
+    }
+    if sym == "DeleteCriticalSection" {
+        return "declare void @DeleteCriticalSection(ptr)"
+    }
+    if sym == "EnterCriticalSection" {
+        return "declare void @EnterCriticalSection(ptr)"
+    }
+    if sym == "LeaveCriticalSection" {
+        return "declare void @LeaveCriticalSection(ptr)"
+    }
+    if sym == "InitializeConditionVariable" {
+        return "declare void @InitializeConditionVariable(ptr)"
+    }
+    if sym == "WakeConditionVariable" {
+        return "declare void @WakeConditionVariable(ptr)"
+    }
+    if sym == "SleepConditionVariableCS" {
+        return "declare i8 @SleepConditionVariableCS(ptr, ptr, i32)"
+    }
+    if sym == "CreateThread" {
+        return "declare ptr @CreateThread(ptr, i64, ptr, ptr, i32, ptr)"
+    }
+    if sym == "WaitForSingleObject" {
+        return "declare i32 @WaitForSingleObject(ptr, i32)"
+    }
+    if sym == "CloseHandle" {
+        return "declare i32 @CloseHandle(ptr)"
+    }
+    if sym == "GetCurrentThreadId" {
+        return "declare i64 @GetCurrentThreadId()"
+    }
     if sym == "tie_str_len" {
         return "declare i64 @tie_str_len(ptr)"
     }

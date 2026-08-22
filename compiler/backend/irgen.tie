@@ -487,6 +487,15 @@ func is_libc_sym(sym: string) -> bool {
     if sym == "system" || sym == "getenv" || sym == "time" {
         return true
     }
+    // 一期并发 A4 执行层：kernel32 线程 + 同步原语（系统库默认自动链入，非 interp 桥）
+    if sym == "CreateThread" || sym == "WaitForSingleObject" || sym == "CloseHandle" ||
+        sym == "GetCurrentThreadId" ||
+        sym == "InitializeCriticalSection" || sym == "DeleteCriticalSection" ||
+        sym == "EnterCriticalSection" || sym == "LeaveCriticalSection" ||
+        sym == "InitializeConditionVariable" || sym == "WakeConditionVariable" ||
+        sym == "SleepConditionVariableCS" {
+        return true
+    }
     return false
 }
 
