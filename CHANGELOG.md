@@ -1,3 +1,45 @@
+## [新增] M5 动态库编译——tie 库 → .dll/.so + dllexport 导出面（dev33 批次 12）
+
+tie 库（`type tie<class>`）可编译为**动态库**（Windows `.dll` / Linux `.so`），
+C/其他语言可在运行期 `LoadLibrary`/`dlopen` 加载调用——插件体系、跨语言模块
+成为可能。设计见 [docs/plans/dynamic-library.md](docs/plans/dynamic-library.md) §7。
+
+- **CLI**：`--shared` 开关或输出扩展名 `.dll`/`.so` 触发动态库模式（要求 library 角色，
+  否则报错）；默认输出 win `.dll` / linux `.so`；`--target linux-x64` 交叉 `.so`；
+- **导出面**：顶层函数恒导出 + 命名空间 `pub func` 导出（`ir.func_export_set`），
+  llvmgen 在动态库模式输出 `define dllexport`；私有函数不导出（GetProcAddress 取不到）；
+  符号名 = 全名 `::`→`$`（`mathdyn::add` → `mathdyn$add`）；
+- **链接**：`tc.link_shared`——win `clang -shared`（dllexport 自动导出）；linux
+  `-fuse-ld=lld -shared -fPIC`；需 Rust 桥时同样链 tie_interp.lib；
+- **边界规则**（表/struct 不跨库）：导出函数参数/返回仅标量与 string；表/map/struct/
+  enum/元组/fn/port 违例 → 「动态库边界错误」编译错误（irgen `dynlib_ty_ok`）；
+- **示例与回归**：`examples/lib_math_dyn/`（tie 库 + C `main.c` LoadLibrary 冒烟 +
+  run.ps1）；`scripts/regress-m5-dynlib.ps1`（6 项全绿：.dll 编译 / 导出面 / C 冒烟 /
+  边界负例 / 角色校验 / 静态库无回归）；
+- **验证**：6 个 pub 符号导出、私有函数未导出（llvm-readobj 核验）；C 调用断言全过；
+  一/二/三阶自举成功且三阶二进制 hash 一致；regress-s21 无回归。
+
+## [去 Rust 桥] `std/runtime.a` 退役——exec_code/get_env/time_now 内联 libc
+
+运行时静态库 `std/runtime.a`（tie 自写，提供 `tie_exec_code`/`tie_get_env`/
+`tie_time_now` 三符号）**退役**。这三个语言内置改为 **irgen 内联**到 libc 直调
+（`system`/`getenv`/`time`），纯程序（只用这些内置 + 其它纯逻辑）**零运行时依赖**，
+不链接 runtime.a、也不链接 Rust tie_interp.lib。
+
+- **后端**：`builtin_expr` 对 `exec_code`→`@system`、`time_now`→`@time(0)`、
+  `get_env`→`@getenv` 内联发射；`is_libc_sym` 补 system/getenv/time（不置
+  `g_used_interp`）；`llvmgen_str.extern_decl` 删除死掉的 `tie_exec_code/_
+  get_env/_time_now` 特例，declare 由 `user_extern_decl` 从 op36 签名自动推导；
+  `exec_output` 因依赖 ptr 无法内联，改置 `g_used_interp` 走 Rust tie-interp；
+- **链接**：删除 `link_exe` 的 `prefer_interp` 分支与 `find_runtime_lib`，`need_interp`
+  一律链 tie_interp.lib；driver 去掉 `g_used_runtime`；
+- **删除** `std/runtime.tie` 源 + `std/runtime.a`；G3 闸门脚本与 package 打包不再
+  依赖 runtime.a；`tests/language/runtime_staticlib.tie` 改为验证内联路径；
+- **验证**：纯程序（exec_code/get_env/time_now）IR 只含 `@system/@getenv/@time`、
+  无 `tie_*` 符号、零运行时链接；探针运行正确；一/二/三阶自举成功且三阶不动点
+  二进制 hash 一致（tiec3==tiec4）；regress-s21 PASS=79 / FAIL=2 / SKIP=2（既定基线，
+  零回归），`runtime_staticlib.tie` 通过。
+
 ## [去 Rust 桥 第六批] 表容器 tie 化——动态表脱离 Rust tie_interp.lib
 
 动态表容器（`table<T>`）的运行时实现从 Rust `tie_table_*` 桥改为 **irgen 内联生成**，

@@ -978,7 +978,15 @@ func gen_func(fid: i64) {
         params_llvm = params_llvm + llvm_ty(ir.func_param_ty(fid, pk)) + " %" + to_string(pk)
         pk = pk + 1
     }
-    line("define " + ret_llvm + " @" + sym + "(" + params_llvm + ") {")
+    // M5 动态库导出面（dev33 批次 12）：动态库模式下，irgen 登记的导出函数
+    // （顶层函数 + 命名空间 pub func，ir.func_exported==1）带 dllexport——
+    // Windows lld-link 据此自动导出符号（Linux ELF 忽略该存储类，符号默认
+    // 可见）。内部辅助函数（私有/非导出）不标记。
+    var exp_kw = ""
+    if g_dynlib && ir.func_exported(fid) == 1 {
+        exp_kw = "dllexport "
+    }
+    line("define " + exp_kw + ret_llvm + " @" + sym + "(" + params_llvm + ") {")
     // F1 增强：临时 alloca 提升到 entry block——本函数全部 alloca（含循环体内
     // 的 ok 槽）前置输出，再对函数体行级重编号解决编号倒挂。流程：
     // 1) 切函数级缓冲 g_fn_lines（line() 重定向）；

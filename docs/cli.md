@@ -7,7 +7,7 @@
 `tie`（四段式调度器，合并原 tie-cli 职责）：
 
 ```
-tie <input.tie>... [-o output] [-O0|-O1|-O2|-O3] [--target <三元组>] [--emit-ir] [--keep-ir] [--prep-only] [--config <file>]
+tie <input.tie>... [-o output] [-O0|-O1|-O2|-O3] [--target <三元组>] [--emit-ir] [--keep-ir] [--shared] [--prep-only] [--config <file>]
 tie --lsp        # 语言服务器模式（LSP over stdio，供编辑器接入）
 tie             # 无参数 → 进入 REPL 交互模式（启动 tie 语言自写的 repl.exe，自举）
 tie init|add|remove|install|update|build|run|publish|search|info|help   # 包管理器（M6，tie 语言自写）
@@ -20,6 +20,7 @@ tie init|add|remove|install|update|build|run|publish|search|info|help   # 包管
 | `--target <三元组>`      | 交叉编译目标（如 `win-x64` / `x86_64-pc-windows-msvc`，默认本机）。支持平台别名：`win-x64`、`win-x86`、`win-arm64`、`linux-x64`、`linux-arm64`、`macos-x64`、`macos-arm64`，也可直接写 LLVM 三元组 |
 | `--emit-ir`           | 只生成 LLVM IR（.ll），不继续编译                                                                                                                                        |
 | `--keep-ir`           | 保留中间 IR 文件                                                                                                                                                    |
+| `--shared`            | 编译为动态库（library 角色 → Windows `.dll` / Linux `.so`；输出扩展名 `.dll`/`.so` 也可触发，M5）                                                                           |
 | `--prep-only`         | 只做预处理（tie-prep）并打印识别结果                                                                                                                                        |
 | `--config <file>`     | 指定构建配置文件（S3.1：默认查当前目录 `config.data.tie`，分层合并：CLI > 项目 config > 用户 `~/.config/tie/config.data.tie` > 内置默认）                                                     |
 | `--profile <p>`       | 构建 profile（dev/release，覆盖配置顶层 `profile` 键；Cargo 风格，S3.1）                                                                                                      |

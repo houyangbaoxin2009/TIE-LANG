@@ -1,6 +1,6 @@
 # 规划（Harbor M5）：动态库编译（DLL / .so）
 
-> 状态：**规划**（已排期，待实现）
+> 状态：**已实现**（dev33 批次 12，2026-08-22；compiler/driver.tie + irgen + llvmgen + toolchain）
 > 所属：Harbor（2026.1）架构 M5
 > 依赖：Harbor M4（标准库重构）已完成；动态库是库编译（M3 已完成 `.a` 静态库）的延伸
 
@@ -81,3 +81,57 @@ tie lib_math.tie --shared               # 或显式开关
 | tie（CLI） | -o 扩展名识别 / --shared 开关 |
 | docs/ | CLI 用法、库编译章节、示例 |
 | scripts/package.ps1 | 发行版收录示例 |
+
+## 7. 实现记录（dev33 批次 12，2026-08-22）
+
+### 7.1 实现内容
+
+| 任务 | 落地 |
+| --- | --- |
+| 34 CLI + dllexport | driver.tie：`--shared` 开关 + 输出扩展名 `.dll`/`.so` 识别动态库模式（`detect_shared_mode`），要求 library 角色；`compile_shared` 分派。irgen：`set_dynlib` + 每函数 `ir.func_export_set`（顶层函数恒导出、命名空间函数 `pub func` 导出）；llvmgen `gen_func` 动态库模式下对导出函数输出 `define dllexport` |
+| 35 toolchain 链接 | toolchain.tie `tc.link_shared`：win `clang -shared`（dllexport 自动导出）；linux `-fuse-ld=lld -shared -fPIC`；`need_interp` 时同样链 tie_interp.lib；`-rtlib=compiler-rt` |
+| 36 边界规则 | irgen `dynlib_ty_ok`：导出函数参数/返回仅标量与 string；表/map/struct/enum/元组/fn/port 违例 → 「动态库边界错误」编译错误 |
+
+### 7.2 边界规则（表/struct 不跨库）
+
+跨动态库边界（C/其他语言可见）**仅允许**：
+
+- 标量：`i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool trit char`；
+- `string`（tie 内部 `{i64 长度头, 数据+\0}` 堆表示，跨语言方按指针 + 头读取；调用约定见 §2）；
+- 返回 `void`。
+
+**禁止**（编译器在动态库模式直接报错）：`table` / `map` / `struct` / `enum` / 元组 / 函数值 / `port` /
+`ptr` / `slice` / `atomic` ——这些类型是 tie 内部堆布局，跨语言不可见、不可安全传递。
+
+错误示例：
+
+```
+tiec dynlib.tie --shared
+IR 生成失败: 动态库边界错误: 导出函数 badlib::sum_table 参数类型 'table<i64>' 不能跨动态库边界（仅标量与 string 可跨库）
+IR 生成失败: 动态库边界错误: 导出函数 badlib::origin 返回类型 'Point' 不能跨动态库边界（仅标量与 string 可跨库）
+```
+
+### 7.3 导出面与符号命名
+
+- 导出面 = **顶层函数**（恒公有）+ **命名空间 `pub func`**；命名空间私有函数不导出
+  （llvmgen 不标记 dllexport，`GetProcAddress` 取不到）。
+- 符号名 = 全名 `::` 转 `$`（与现有 LLVM 符号约定一致）：`mathdyn::add` → `mathdyn$add`。
+
+### 7.4 使用方式
+
+```
+compiler\tiec.exe examples\lib_math_dyn\lib_math_dyn.tie -o lib_math_dyn.dll   # 显式 .dll 扩展名
+compiler\tiec.exe examples\lib_math_dyn\lib_math_dyn.tie --shared              # 或显式开关（默认 .dll）
+compiler\tiec.exe examples\lib_math_dyn\lib_math_dyn.tie --target linux-x64    # 交叉 .so（-fPIC -shared）
+```
+
+示例与 C 冒烟：`examples/lib_math_dyn/`（`main.c` 用 LoadLibrary + GetProcAddress）；
+回归脚本 `scripts/regress-m5-dynlib.ps1`（6 项：.dll 编译 / 导出面 / C 冒烟 / 边界负例 /
+角色校验 / 静态库无回归）。
+
+### 7.5 已知限制
+
+- Linux `.so` 交叉编译代码路径就绪（`-fPIC -shared` + lld），本机（Windows）无 Linux
+  sysroot 无法端到端链接验证——按 §5「CI 或文档注明未测平台」处理；
+- 字符串跨边界沿用 tie 内部堆表示 + `tie_free_result` 释放约定（复用 tie-interp C ABI
+  桥范式），C 侧需按 `{len, data}` 布局读取（示例 C 冒烟暂用标量函数验证导出/调用链路）。

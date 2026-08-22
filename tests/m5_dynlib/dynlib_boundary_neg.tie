@@ -1,0 +1,24 @@
+type tie<class>
+// tests/m5_dynlib/dynlib_boundary_neg.tie —— M5 动态库边界负例（dev33 批次 12）
+// 动态库模式下导出函数（顶层 + 命名空间 pub func）的参数/返回仅允许标量与
+// string；表/map/struct/enum 等堆布局类型不得跨动态库边界。
+// 由 scripts/regress-m5-dynlib.ps1 以 `--shared` 编译验证应报「动态库边界错误」。
+// 注意：本目录（tests/m5_dynlib/）不入 regress-s21 负例段——负例需 --shared 开关。
+
+// 违例 2 目标：struct 返回类型（struct 顶层定义）
+struct Point {
+    var x: i64 = 0
+    var y: i64 = 0
+}
+
+namespace badlib {
+// 违例 1：导出函数参数为 table（ref 表参数亦同）
+pub func sum_table(t: ref table<i64>) -> i64 {
+    return len(t)
+}
+
+// 违例 2：导出函数返回 struct
+pub func origin() -> Point {
+    return Point(0, 0)
+}
+}

@@ -1,0 +1,47 @@
+type tie<class>
+// examples/lib_math_dyn/lib_math_dyn.tie —— M5 动态库示例（dev33 批次 12）
+// ============================================================
+// tie 库 → 动态库（Windows .dll / Linux .so）：
+//   tiec lib_math_dyn.tie -o lib_math_dyn.dll     # 显式 .dll 扩展名
+//   tiec lib_math_dyn.tie --shared                 # 或 --shared 开关
+//
+// 导出面 = 顶层函数 + 命名空间 pub func（本文件用 namespace mathdyn）。
+// 边界规则：导出函数参数/返回仅标量（i64/f64/bool/trit/char）与 string；
+// 表/struct/map 等堆布局类型不跨动态库边界（编译器在动态库模式拒绝）。
+//
+// 调用方（C）：LoadLibrary + GetProcAddress，符号名 = 命名空间全名转 $，
+// 例：GetProcAddress(h, "mathdyn$add")。见同目录 main.c。
+
+namespace mathdyn {
+pub func add(a: i64, b: i64) -> i64 {
+    return a + b
+}
+
+pub func mul(a: i64, b: i64) -> i64 {
+    return a * b
+}
+
+pub func sub(a: i64, b: i64) -> i64 {
+    return a - b
+}
+
+pub func max2(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+pub func neg(a: i64) -> i64 {
+    return -a
+}
+
+// 私有函数不导出（llvmgen 不标记 dllexport，C 侧 GetProcAddress 取不到）
+func private_helper(x: i64) -> i64 {
+    return x * 100
+}
+
+pub func use_private(a: i64) -> i64 {
+    return private_helper(a) + 1
+}
+}

@@ -7,6 +7,10 @@
 /examples/*.ll
 /examples/*.o
 /examples/*.obj
+# M5 动态库示例编译产物（dev33 批次 12）：.dll/.exp/.so 不入库（含子目录）
+/examples/**/*.dll
+/examples/**/*.exp
+/examples/**/*.so
 
 # IDE 与编辑器
 .idea/
