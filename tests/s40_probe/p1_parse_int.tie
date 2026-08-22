@@ -1,0 +1,10 @@
+type tie<logic>
+// 批次A 去桥探针：parse_int 内联 IR 验证（正/负/加号/多位数；非法输入）
+func main() {
+    var a = parse_int("123")
+    println(a)                      // 123
+    println(parse_int("-45"))       // -45
+    println(parse_int("+7"))        // 7
+    println(parse_int("987654321")) // 987654321
+    println(parse_int("0"))          // 0
+}

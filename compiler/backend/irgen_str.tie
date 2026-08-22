@@ -1923,4 +1923,133 @@ func s21_codepoint_to_str(cp: i64) -> i64 {
     ir.add_operand(ld, res_ptr, 0)
     return ir.get_value(ld)
 }
+
+// ==================== 去 Rust 桥：parse_int（dev33 批次9+） ====================
+// 字符串 → i64（十进制）。替代 Rust 桥 tie_parse_int。签名为 s:string 值 + ok 出参
+// 槽（caller alloca i8）。返回解析值（i64），ok 槽写 1/0。
+// 语义对齐 Rust str::parse::<i64>（与 interp.is_int_text）：可选 +/-, 至少 1 位数字，
+// 全数字 = 合法。非法（空串 / 仅符号 / 含非数字字节）→ ok=0，返回值未定义（0）。
+// 结构仿 tig_i64_to_str 反向：字节循环累加（mul 10 + 数字）。
+func tig_parse_int(s: i64, ok_ptr: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var T8 = types.named(TK_I8)
+    var z64 = tig_int_lit_ty(0, T64)
+    var ten = tig_int_lit_ty(10, T64)
+    // 常量：'0'(48) '9'(57) '+'/'-'
+    var c48 = tig_int_lit_ty(48, T64)
+    var c57 = tig_int_lit_ty(57, T64)
+    var cplus = tig_int_lit_ty(43, T64)
+    var cminus = tig_int_lit_ty(45, T64)
+    var n = s21_str_head_len(s)
+    // 块：sign（符号）+ cond 合并 / body（累加）/ succ（成功出口）/ fail / exit
+    // 简化结构：entry → fail_or_sign=sign → body（循环首）→ ... 
+    // 用四个结果槽存跨块状态：i / neg / acc / ok（均 i64 内存）
+    var i_slot = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(i_slot, T64, 2)
+    var i_ptr = ir.get_value(i_slot)
+    var neg_slot = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(neg_slot, T64, 2)
+    var neg_ptr = ir.get_value(neg_slot)
+    var acc_slot = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(acc_slot, T64, 2)
+    var acc_ptr = ir.get_value(acc_slot)
+    var ok_slot = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(ok_slot, T64, 2)
+    var ok_int_ptr = ir.get_value(ok_slot)
+    var res_slot = ir.new_inst(g_cur_block, 20, T64)
+    ir.add_operand(res_slot, T64, 2)
+    var rs_ptr = ir.get_value(res_slot)
+    // 初始化
+    s21_store(i_ptr, z64, T64)
+    s21_store(neg_ptr, z64, T64)
+    s21_store(ok_int_ptr, z64, T64)
+    s21_store(acc_ptr, z64, T64)
+    s21_store(rs_ptr, z64, T64)
+    // 块声明
+    var sign_blk = ir.new_block(g_cur_func, interner.intern("pi.sign"))
+    var cond_blk = ir.new_block(g_cur_func, interner.intern("pi.cond"))
+    var body_blk = ir.new_block(g_cur_func, interner.intern("pi.body"))
+    var acc_blk = ir.new_block(g_cur_func, interner.intern("pi.acc"))
+    var succ_blk = ir.new_block(g_cur_func, interner.intern("pi.succ"))
+    var fail_blk = ir.new_block(g_cur_func, interner.intern("pi.fail"))
+    var exit_blk = ir.new_block(g_cur_func, interner.intern("pi.exit"))
+    // entry：n==0 → fail；否则 → sign
+    var c_empty = tig_icmp_c(n, z64, 0)  // eq 0 → 空串
+    var cb0 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb0, c_empty, 0)
+    ir.add_operand(cb0, fail_blk, 1)
+    ir.add_operand(cb0, sign_blk, 1)
+    // sign：has_sign ? i=1 : i=0；neg = is_minus；→ cond
+    g_cur_block = sign_blk
+    var b0 = s21_str_byte(s, z64)
+    var is_plus = tig_icmp_c(b0, cplus, 0)   // eq
+    var is_minus = tig_icmp_c(b0, cminus, 0) // eq
+    var has_sign = tig_or_i1(is_plus, is_minus)
+    var i_hz = tig_select_i(has_sign, tig_int_lit(1), tig_int_lit(0), T64)
+    s21_store(i_ptr, i_hz, T64)
+    s21_store(neg_ptr, tig_select_i(is_minus, tig_int_lit(1), z64, T64), T64)
+    // 仅符号无数字（n==1 且 has_sign）→ 若 i>=n 直接 fail（str::parse 对 "+"/"-" 报错）
+    var im1 = s21_load(i_ptr, T64)
+    var b1c = tig_icmp_c(im1, n, 5)  // sge：i >= n → 无剩余数字
+    var cb_sign = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb_sign, b1c, 0)
+    ir.add_operand(cb_sign, fail_blk, 1)
+    ir.add_operand(cb_sign, cond_blk, 1)
+    // cond：i < n → body；否则 → succ
+    g_cur_block = cond_blk
+    var il = s21_load(i_ptr, T64)
+    var c_i = tig_icmp_c(il, n, 6)  // ult
+    var cb1 = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cb1, c_i, 0)
+    ir.add_operand(cb1, body_blk, 1)
+    ir.add_operand(cb1, succ_blk, 1)
+    // body：b = byte(s,i)；非数字 → fail；否则 → acc
+    g_cur_block = body_blk
+    var ib = s21_load(i_ptr, T64)
+    var bv = s21_str_byte(s, ib)
+    var ge48 = tig_icmp_c(bv, c48, 5)  // sge
+    var le57 = tig_icmp_c(bv, c57, 4)  // sle
+    var is_dig = tig_and_i1(ge48, le57)
+    var bd = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(bd, is_dig, 0)
+    ir.add_operand(bd, acc_blk, 1)
+    ir.add_operand(bd, fail_blk, 1)
+    // acc：acc = acc*10 + (b-48)；i++；→ cond
+    g_cur_block = acc_blk
+    var ia = s21_load(i_ptr, T64)
+    var bva = s21_str_byte(s, ia)
+    var ca = s21_load(acc_ptr, T64)
+    var mul = ir.new_inst(g_cur_block, 2, T64)  // mul i64
+    ir.add_operand(mul, ca, 0)
+    ir.add_operand(mul, ten, 0)
+    var dig = s21_bin(1, bva, c48)  // sub（b-48）
+    var newacc = s21_bin(0, ir.get_value(mul), dig)  // add
+    s21_store(acc_ptr, newacc, T64)
+    var nxt = s21_bin(0, ia, tig_int_lit(1))  // i++
+    s21_store(i_ptr, nxt, T64)
+    var b3 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(b3, cond_blk, 1)
+    // succ：ok=1；res = neg ? (0 - acc) : acc；→ exit
+    g_cur_block = succ_blk
+    s21_store(ok_int_ptr, tig_int_lit(1), T64)
+    var n_v = s21_load(neg_ptr, T64)
+    var isn = tig_icmp_c(n_v, z64, 1)  // ne
+    var av = s21_load(acc_ptr, T64)
+    var negacc = ir.new_inst(g_cur_block, 1, T64)  // sub 0 - acc
+    ir.add_operand(negacc, z64, 0)
+    ir.add_operand(negacc, av, 0)
+    var rv = tig_select_i(isn, ir.get_value(negacc), av, T64)
+    s21_store(rs_ptr, rv, T64)
+    var br4 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br4, exit_blk, 1)
+    // fail：ok=0（rs 默认 0）；→ exit
+    g_cur_block = fail_blk
+    var br5 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br5, exit_blk, 1)
+    // exit：写外部 ok 槽；返回结果
+    g_cur_block = exit_blk
+    var okv = s21_load(ok_int_ptr, T64)
+    s21_store(ok_ptr, s21_trunc_i8(okv), T8)
+    return s21_load(rs_ptr, T64)
+}
 }

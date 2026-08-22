@@ -1454,17 +1454,15 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         return 0
     }
     if nm == "parse_int" {
-        g_used_interp = true
+        // 去 Rust 桥（批次A）：tig_parse_int 内联 IR 生成（字节循环累加），
+        // 替代 Rust 桥 tie_parse_int。签名 (s, ok 出参槽) -> i64。不再置 g_used_interp。
         var v = tig_expr(call_arg(id, 0))
         if v < 0 {
             return -1
         }
-        // Rust 桥签名 (ptr, ptr ok) -> i64：缺 ok 出参会导致 ABI 错位、
-        // 写垃圾指针崩溃（与 tie_table_set 同类 bug）
-        var pio = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8
+        var pio = ir.new_inst(g_cur_block, 20, types.named(TK_I8))  // alloca i8 ok
         ir.add_operand(pio, types.named(TK_I8), 2)
-        g_builtin_res = tig_ext_call2("tie_parse_int", v, types.named(TK_STR),
-            ir.get_value(pio), types.named(TK_STR), types.named(TK_I64))
+        g_builtin_res = tig_parse_int(v, ir.get_value(pio))
         return 0
     }
     if nm == "parse_float" {
