@@ -449,10 +449,147 @@ func tig_actor_run(id: i64) -> i64 {
     table_push(ats2, types.named(TK_STR))
     table_push(avs2, cvp)
     tig_ext_call_typed("InitializeConditionVariable", ats2, avs2, -1)
+    // Step4a：启动工作线程（消息循环；进程退出时随之终止）
+    tig_actor_spawn(rec)
     // 句柄 = ptrtoint record（i64；var-decl 槽类型 K_ACTOR = i64，LLVM 类型匹配）
     var pi = ir.new_inst(g_cur_block, 24, T64)  // ptrtoint → i64
     ir.add_operand(pi, rec, 0)
     return ir.get_value(pi)
+}
+
+// NULL 指针值（ptr 类型；作 extern 的 ptr 形参，如 CreateThread 的 NULL 槽）。
+// 不能直传 const_i 0（i64 与 ptr 形参类型不匹配）——用 alloca ptr + store
+//（to_ptr 转 "null"）+ load 得真 ptr 值（对齐 tig_cb_ptr 的 env=null 生成）。
+func tig_null_ptr() -> i64 {
+    var ea = ir.new_inst(g_cur_block, 20, types.named(TK_STR))  // alloca ptr
+    ir.add_operand(ea, types.named(TK_STR), 2)
+    var eap = ir.get_value(ea)
+    var nullv = tig_int_lit(0)  // const_i 0（store to_ptr → null）
+    var st = ir.new_inst(g_cur_block, 22, -1)  // store ptr null
+    ir.add_operand(st, types.named(TK_STR), 2)
+    ir.add_operand(st, nullv, 0)
+    ir.add_operand(st, eap, 0)
+    var ld = ir.new_inst(g_cur_block, 21, types.named(TK_STR))  // load ptr
+    ir.add_operand(ld, eap, 0)
+    return ir.get_value(ld)
+}
+
+// actor 工作循环 thunk `@actor_loop` 生成（fn(i64)->i64）。**急切生成**：模块
+// 生成开始（tig_ast 内、任何用户函数之前）调用一次，避免与进行中的函数指令
+// 编号交错（否则 llvmgen 逐函数重编号报 instruction expected to be numbered）。
+// 记录布局：@8 lock、@48 cv、@56 shutdown。循环：持锁 → 读 shutdown，非 0 →
+// exit；否则 SleepConditionVariableCS(cv, lock, INFINITE) 等待消息 → 回环。
+// Step4a 先起等待骨架（无消息派发）；Step4b 在唤醒后入队处派发方法。
+// 主进程退出时线程随之终止（进程级终止，无悬垂）。
+func gen_actor_loop_eager() {
+    // 无 actor → 不生成 @actor_loop（避免为所有程序无谓添加函数，破坏
+    // llvmgen 逐函数重编号——自举编译器自身无 actor 也会编译）
+    if len(ac_keys) == 0 {
+        return
+    }
+    if g_actor_loop_gen == 1 {
+        return
+    }
+    g_actor_loop_gen = 1
+    var T64 = types.named(TK_I64)
+    var saved_func = g_cur_func
+    var saved_block = g_cur_block
+    var params: table<i64> = table_new_i64()
+    table_push(params, T64)  // param0 = record ptr（i64 形式）
+    var fid = ir.new_func(interner.intern("actor_loop"), T64, params)
+    g_cur_func = fid
+    var entry = ir.new_block(fid, interner.intern("al.entry"))
+    g_cur_block = entry
+    // rec = inttoptr(param0) → ptr
+    var rec = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr
+    ir.add_operand(rec, ir.param_val(fid, 0), 0)
+    var recp = ir.get_value(rec)
+    var lockp = s21_gep(recp, 8, true)
+    var cvp = s21_gep(recp, 48, true)
+    var shutp = s21_gep(recp, 56, true)
+    var loop = ir.new_block(fid, interner.intern("al.loop"))
+    var wait = ir.new_block(fid, interner.intern("al.wait"))
+    var exit = ir.new_block(fid, interner.intern("al.exit"))
+    // entry → br loop
+    var br0 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(br0, loop, 1)
+    // loop：持锁 → 读 shutdown → icmp ne 0 → cond_br（exit / wait）
+    g_cur_block = loop
+    var atsE: table<i64> = table_new_i64()
+    var avsE: table<i64> = table_new_i64()
+    table_push(atsE, types.named(TK_STR))
+    table_push(avsE, lockp)
+    tig_ext_call_typed("EnterCriticalSection", atsE, avsE, -1)
+    var sd = s21_load(shutp, T64)
+    var z0 = tig_int_lit_ty(0, T64)
+    var ic = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp ne
+    ir.add_operand(ic, sd, 0)
+    ir.add_operand(ic, z0, 0)
+    ir.add_operand(ic, 1, 2)  // ne
+    var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cb, ir.get_value(ic), 0)
+    ir.add_operand(cb, exit, 1)
+    ir.add_operand(cb, wait, 1)
+    // wait：SleepConditionVariableCS(cv, lock, INFINITE)；解锁 → 回环
+    g_cur_block = wait
+    var inf = tig_int_lit_ty(0xFFFFFFFF, types.named(TK_I32))  // INFINITE
+    var atsW: table<i64> = table_new_i64()
+    var avsW: table<i64> = table_new_i64()
+    table_push(atsW, types.named(TK_STR))
+    table_push(avsW, cvp)
+    table_push(atsW, types.named(TK_STR))
+    table_push(avsW, lockp)
+    table_push(atsW, types.named(TK_I32))
+    table_push(avsW, inf)
+    tig_ext_call_typed("SleepConditionVariableCS", atsW, avsW, types.named(TK_I8))
+    var atsL: table<i64> = table_new_i64()
+    var avsL: table<i64> = table_new_i64()
+    table_push(atsL, types.named(TK_STR))
+    table_push(avsL, lockp)
+    tig_ext_call_typed("LeaveCriticalSection", atsL, avsL, -1)
+    var bw = ir.new_inst(g_cur_block, 30, -1)  // br loop
+    ir.add_operand(bw, loop, 1)
+    // exit：解锁 → ret 0
+    g_cur_block = exit
+    var atsX: table<i64> = table_new_i64()
+    var avsX: table<i64> = table_new_i64()
+    table_push(atsX, types.named(TK_STR))
+    table_push(avsX, lockp)
+    tig_ext_call_typed("LeaveCriticalSection", atsX, avsX, -1)
+    // 先建常量、后建 ret（值产生指令须在消费指令之前，否则出现在 terminator 后）
+    var zret = tig_int_lit_ty(0, T64)
+    var ret = ir.new_inst(g_cur_block, 32, T64)  // ret i64 0
+    ir.add_operand(ret, zret, 0)
+    // 恢复上下文（模块起始时 g_cur_func/g_cur_block = 0）
+    g_cur_func = saved_func
+    g_cur_block = saved_block
+}
+
+// Step4a：`run` 扩展——成功分配/初始化 per-actor state 后，启动工作线程
+//（@actor_loop，CreateThread；thread routine = tig_actor_loop_addr()）。
+// 返回句柄（record 指针 i64）。线程在进程退出时随之终止。
+func tig_actor_spawn(rec: i64) {
+    var T64 = types.named(TK_I64)
+    // shutdown @56 = 0（malloc 未初始化）
+    var shutp = s21_gep(rec, 56, true)
+    s21_store(shutp, tig_int_lit_ty(0, T64), T64)
+    // 拉起工作线程
+    var np1 = tig_null_ptr()            // lpThreadAttributes
+    var sz0 = tig_int_lit_ty(0, T64)    // dwStackSize
+    var lsa = tig_func_addr("actor_loop")   // lpStartAddress（急切生成于模块起）
+    var flags0 = tig_int_lit_ty(0, types.named(TK_I32))  // dwCreationFlags
+    var np5 = tig_null_ptr()            // lpThreadId
+    var atsC: table<i64> = table_new_i64()
+    var avsC: table<i64> = table_new_i64()
+    table_push(atsC, types.named(TK_STR)); table_push(avsC, np1)
+    table_push(atsC, T64); table_push(avsC, sz0)
+    table_push(atsC, types.named(TK_STR)); table_push(avsC, lsa)
+    table_push(atsC, types.named(TK_STR)); table_push(avsC, rec)
+    table_push(atsC, types.named(TK_I32)); table_push(avsC, flags0)
+    table_push(atsC, types.named(TK_STR)); table_push(avsC, np5)
+    // 返回 HANDLE（ptr）——丢弃（进程退出自动回收）；用 K_PTR 返型避免 op36
+    // 对 TK_STR 返回的错误字符串扫描（strlen HANDLE → 崩溃）
+    tig_ext_call_typed("CreateThread", atsC, avsC, types.ptr_of(types.named(TK_I8)))
 }
 // bool → false；f64 → 0.0（const_f）；i8/i32 等 → 0 常量
 func tig_default_val(ty: i64) -> i64 {

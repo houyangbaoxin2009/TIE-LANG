@@ -77,6 +77,8 @@ var g_tv_elems: table<i64>;
 var g_lookup_found: bool = false;
 var g_lookup_alloca: i64 = 0;
 var g_lookup_ty: i64 = 0;
+// 一期并发 A4：actor 工作循环 thunk（@actor_loop）惰性生成标记（每模块仅一次）
+var g_actor_loop_gen: i64 = 0;
 // 阶段 A：变量命中形态（0=本地/1=全局标量/2=全局表，scope_get_global 置位）
 var g_lookup_is_global: i64 = 0;
 // 内置调用结果全局槽（builtin_expr 置位；tie 无引用返回）
@@ -674,6 +676,9 @@ pub func tig_ast() -> i64 {
     g_str_count = 0
     g_used_interp = false
     ir.new_module()
+    // 一期并发 A4：actor 工作循环 thunk 急切生成（任何用户函数之前，避免指令
+    // 编号交错——llvmgen 逐函数重编号要求函数指令连续）
+    gen_actor_loop_eager()
     // S2.4 vtable 全局常量登记（每个 impl 一个：方法函数指针按 port 方法
     // 声明序；llvmgen 在 emit_globals 后输出 @vt.<port>.<struct> 常量）
     reg_all_vtables()
@@ -742,6 +747,9 @@ pub func tig_src(src: string, base_dir: string) -> i64 {
     g_str_count = 0
     g_used_interp = false
     ir.new_module()
+    // 一期并发 A4：actor 工作循环 thunk 急切生成（任何用户函数之前，避免指令
+    // 编号交错——llvmgen 逐函数重编号要求函数指令连续）
+    gen_actor_loop_eager()
     // S2.4 vtable 全局常量登记（每个 impl 一个：方法函数指针按 port 方法
     // 声明序；llvmgen 在 emit_globals 后输出 @vt.<port>.<struct> 常量）
     reg_all_vtables()
