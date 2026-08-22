@@ -205,6 +205,38 @@ func loop_find_cont(label_id: i64) -> i64 {
     return -1
 }
 
+// 三期 goto 标签块查询：标签名池 id → 目标基本块 id（函数级 g_gt_*）；未登记 -1。
+// 标签块可能在 goto 前（后向跳，已登记）或 goto 后（前向跳，预登记占位——
+// 语义层 R2 已保证目标同块/外层块，LLVM 允许 br 引用后文定义的块标签）。
+func goto_find_block(label_id: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_gt_names) {
+        if g_gt_names[i] == label_id {
+            return g_gt_blks[i]
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 三期 goto 标签块登记（含占位）：登记 name → 块 id，返回块 id
+func goto_reg_block(label_id: i64, blk: i64) {
+    table_push(g_gt_names, label_id)
+    table_push(g_gt_blks, blk)
+}
+
+// 三期 goto 标签新块：查询未命中 → 新建块并登记。返回块 id。
+func goto_label_block(fid: i64, label_id: i64) -> i64 {
+    var b = goto_find_block(label_id)
+    if b >= 0 {
+        return b
+    }
+    var nm = interner.intern("gt." + intern.lookup(label_id))
+    var nb = ir.new_block(fid, nm)
+    goto_reg_block(label_id, nb)
+    return nb
+}
+
 // 字符串常量登记：返回全局序号（llvmgen 据此生成 @.str.N）
 func string_reg(name_id: i64) -> i64 {
     var i: i64 = 0

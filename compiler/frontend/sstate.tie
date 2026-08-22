@@ -371,6 +371,9 @@ const S_N_ACTOR: i64 = 141;         // actor 声明：Actor[name=actor 名, aux=
                                     //   children=[字段 ClassField..., 方法 FnDef...]]
                                     //   （方法 async 标记经 FnDef val bit2）
 const S_N_RUN_ACTOR: i64 = 142;     // run 表达式（run 上下文识别，非保留字）
+// 三期 goto/标签（与 ast.tie N_GOTO_LABEL/N_GOTO 同号）：
+const S_N_GOTO_LABEL: i64 = 143;    // `#[tag.x]` 语句位置标签
+const S_N_GOTO: i64 = 144;          // `unsafe goto #x` 无条件跳转
 namespace sstate {
 
 // ==================== 工具：协议解析 ====================

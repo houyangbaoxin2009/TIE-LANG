@@ -38,6 +38,10 @@ var g_lp_labels: table<i64>;
 var g_lp_breaks: table<i64>;
 var g_lp_cont: table<i64>;
 var g_lp_top: i64 = 0;
+// 三期 goto 标签表（§7.1.5，函数级）：标签名池 id → 目标基本块 id。
+// 语义层已做 R1/R2/R3 校验；irgen 按标签表生成 br 目标块。
+var g_gt_names: table<i64>;
+var g_gt_blks: table<i64>;
 // 字符串常量收集（池 id → 全局序号）；llvmgen 生成 @.str.N
 var g_str_keys: table<i64>;
 var g_str_count: i64 = 0;
@@ -904,6 +908,9 @@ func tig_fn_def(fn_node: i64, prefix: string) -> i64 {
     g_lp_breaks = table_new_i64()
     g_lp_cont = table_new_i64()
     g_lp_top = 0
+    // 三期 goto（§7.1.5）：每函数重置 goto 标签块表（标签块 = 跳转目标）
+    g_gt_names = table_new_i64()
+    g_gt_blks = table_new_i64()
     g_tv_keys = table_new_i64()
     g_tv_elems = table_new_i64()
     var nparams = s_aux[fn_node]

@@ -183,6 +183,13 @@ const N_ACTOR: i64 = 141;
 //   语句位 `run Logger().log("x")`（fire-and-forget）：本节点作方法调用的
 //   接收者，由 MethodCall 后缀链继续处理。
 const N_RUN_ACTOR: i64 = 142;
+// 三期 goto/标签（2026-08-23，§7.1.5）：
+//   GotoLabel[name=标签名池 id]——`#[tag.x]` 语句位置标签：标定一条语句前为
+//   跳转点（LLVM 目标基本块起点）。仅 unsafe 函数/块内合法。
+//   Goto[name=目标标签名池 id]——`unsafe goto #x` 无条件跳转（仅 unsafe 上下文）。
+//   与循环标签（E5 `标识符:`）命名空间分离：goto 用 `#[tag.x]` + `#x`。
+const N_GOTO_LABEL: i64 = 143;
+const N_GOTO: i64 = 144;
 // S3.3 宏/元编程（三节点，布局约定见 mexpand.tie 头注释）：
 //   MacroDef[name=宏名, val=0, aux=nparams, children=[返回类型, 参数..., 函数体]]
 //     —— 布局与 FnDef 一致但**无泛型槽**（children[0] 即返回类型；形参从 1 起，

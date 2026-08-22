@@ -1,0 +1,59 @@
+type tie<logic>
+// tests/m6_actor/actor_a5_goto.tie —— 三期 goto/标签探针（concurrency-model.md §7.1.5）
+// 验证：`#[tag.x]` 语句位置标签 + `unsafe goto #x` 无条件跳转。
+// 语义：R1 同函数 / R2 同块或已执行外层块 / R3 不越过初始化。
+// 预期输出：
+//   poll: 3      （循环模拟：向后跳同函数顶层块头部）
+//   fwd:  10     （同块前向跳，越过无 var 语句）
+//   state: A B C （顶层块状态机前/后跳）
+unsafe fn poll() {
+    // 循环模拟：goto 向后跳同函数顶层块头部（R2 外层块已执行 = 合法）
+    var n: i64 = 0
+    #[tag.again]
+    n = n + 1
+    if n < 3 { unsafe goto #again; }
+    println("poll: " + to_string(n))
+}
+
+unsafe fn fwd() -> i64 {
+    // 同块前向跳：goto 与标签之间无 var/const 声明（R3 合法）
+    var r: i64 = 1
+    unsafe goto #skip;
+    r = r * 100   // 死代码（goto 后不可达，opt 清理）
+    #[tag.skip]
+    r = r + 9
+    return r
+}
+
+unsafe fn state() {
+    // 顶层块状态机：goto 在同块内前/后跳（状态 0 → 1 → 2 → 3 退出）
+    var st: i64 = 0
+    #[tag.top]
+    if st == 0 {
+        println("state: A")
+        st = 1
+        unsafe goto #top;
+    }
+    if st == 1 {
+        println("state: B")
+        st = 2
+        unsafe goto #top;
+    }
+    if st == 2 {
+        println("state: C")
+        st = 3
+        unsafe goto #top;
+    }
+    #[tag.done]
+    if st == 3 {
+        println("state: done")
+    }
+}
+
+func main() {
+    unsafe {
+        poll()
+        println("fwd: " + to_string(fwd()))
+        state()
+    }
+}

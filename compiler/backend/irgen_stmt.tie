@@ -1109,6 +1109,33 @@ func tig_stmt(id: i64) -> i64 {
         ir.add_operand(b, tgt, 1)
         return 0
     }
+    if tag == 143 {
+        // 三期 goto 标签（§7.1.5）：`#[tag.x]` → 目标基本块起点。
+        // 标签块 = 跳转目标：创建（或复用 goto 预登记的占位块）并作为当前块
+        // 的「新起点」——标签后的语句落入该块。前一条语句自然流到标签处，
+        // 若当前块未 terminated，补 br 到标签块（标签 = 块内跳转点）。
+        var lname = s_names[id]
+        var lblk = goto_label_block(g_cur_func, lname)
+        // 当前块未 terminated（有前置语句/空块首）→ br 到标签块；已 terminated
+        // （如 goto/return 后）则标签块仅由 goto br 可达，无需补 br
+        if !block_terminated() {
+            var b = ir.new_inst(g_cur_block, 30, -1)
+            ir.add_operand(b, lblk, 1)
+        }
+        g_cur_block = lblk
+        return 0
+    }
+    if tag == 144 {
+        // 三期 goto（§7.1.5）：`unsafe goto #x` → 无条件 br 到目标标签块。
+        // 语义层已做 R1/R2/R3；标签块可能在前（已登记）或后（预登记占位——
+        // LLVM 允许 br 引用后文标签）。goto 后的语句是死代码（opt DCE 清），
+        // 由 tig_block_stmts 的 block_terminated 承接新块。
+        var gname = s_names[id]
+        var gblk = goto_label_block(g_cur_func, gname)
+        var b = ir.new_inst(g_cur_block, 30, -1)
+        ir.add_operand(b, gblk, 1)
+        return 0
+    }
     if tag == 103 {
         // Assign：name=目标名, val=op（-1 普通；0..17 复合赋值码，对齐 B_*），
         // children=[值]。复合赋值：load 旧值 → 运算 → store（对齐 Rust 同路径）。
@@ -1553,12 +1580,18 @@ func collect_var_refs(st: i64, target: i64, out: table<i64>) {
 }
 
 // 语句块遍历（StmtList children）。每个块独立作用域（push/pop）。
+// 死代码承接：前一条语句已终止块（goto/break/continue/return 等 terminator）
+// 后仍有语句时，新开承接块存放后续死代码——LLVM 不允许 terminator 后跟指令，
+// 死块由 opt DCE 清理（设计 §7.1.5：goto 后不可达代码 opt 清理，不报错）。
 func tig_block_stmts(blk: i64) -> i64 {
     scope_push()
     var n = sstate.nchild(blk)
     var i: i64 = 0
     while i < n {
         var s = sstate.child(blk, i)
+        if block_terminated() {
+            g_cur_block = ir.new_block(g_cur_func, interner.intern("blk.dead"))
+        }
         var r = tig_stmt(s)
         if r < 0 {
             return -1

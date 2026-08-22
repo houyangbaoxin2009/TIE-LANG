@@ -1,0 +1,15 @@
+type tie<logic>
+// tests/m6_actor/actor_a5_neg_skipinit.tie —— 三期 goto 负例（§7.1.5 R3）
+// 同块前向跳跨 var 声明 → 编译错误「不越过初始化」
+unsafe fn bad() {
+    unsafe goto #skip;
+    var x: i64 = 1
+    #[tag.skip]
+    println(to_string(x))
+}
+
+func main() {
+    unsafe {
+        bad()
+    }
+}

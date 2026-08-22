@@ -11,6 +11,29 @@ import "./scollect.tie"
 
 // switch case 值去重表（跨 case 检测重复；switch 分支检查时重置）
 var g_case_seen: table<string>;
+// 三期 goto 标签表（§7.1.5，函数级）：标签名 → 所在块链/块内序号/全局序号。
+// 每函数 check_fn 重置。R1 同函数 / R2 同块或已执行外层块 / R3 不越过初始化。
+var g_gt_keys: table<i64>;      // 标签名池 id
+var g_gt_chain: table<string>;  // 标签所在块链（"/" 分隔块 id）
+var g_gt_blkidx: table<i64>;    // 标签在所在块内语句序号
+var g_gt_seq: table<i64>;       // 标签全局语句序号（函数内单调）
+var g_gt_depths: table<i64>;    // 标签块深度
+var g_gt_blknode: table<i64>;   // 标签所在块 StmtList 节点（R3 扫描用）
+// goto 请求表（延迟校验）：goto 可能在标签前（前向跳），函数体检查完统一校验。
+// 与标签表同位布局：目标名 / goto 所在块链 / 块内序号 / 全局序号 / 行列。
+var g_gtg_keys: table<i64>;
+var g_gtg_chain: table<string>;
+var g_gtg_blkidx: table<i64>;
+var g_gtg_seq: table<i64>;
+var g_gtg_line: table<i64>;
+var g_gtg_col: table<i64>;
+// 当前块追踪（函数级）：块链 / 块深度 / 块内语句序号 / 当前块 StmtList 节点
+var g_cur_chain: string = "";   // 当前块链
+var g_cur_depth: i64 = 0;       // 当前块深度
+var g_cur_blkidx: i64 = 0;      // 当前块内语句序号（check_block 循环设置）
+var g_cur_blknode: i64 = -1;    // 当前块 StmtList 节点（R3 扫描用）
+var g_gt_seq_cnt: i64 = 0;      // 函数内语句全局序号
+var g_gt_blk_seq: i64 = 0;      // 块 id 计数器（函数级）
 
 namespace scheck {
 
@@ -37,11 +60,21 @@ func is_chars_iter(iter: i64) -> bool {
     return true
 }
 
-// 语句块检查（StmtList）
+// 语句块检查（StmtList）。每块分配递增块 id，进入块时把 id 追加到块链
+// g_cur_chain（"/" 分隔），出块恢复——goto 标签 R2 校验依赖块链关系。
 pub func check_block(blk: i64) -> i64 {
+    var saved_chain = g_cur_chain
+    var saved_depth = g_cur_depth
+    var saved_blknode = g_cur_blknode
+    g_gt_blk_seq = g_gt_blk_seq + 1
+    g_cur_chain = g_cur_chain + "/" + to_string(g_gt_blk_seq)
+    g_cur_depth = g_cur_depth + 1
+    g_cur_blknode = blk
     var n = sstate.nchild(blk)
     var i: i64 = 0
     while i < n {
+        g_cur_blkidx = i
+        g_gt_seq_cnt = g_gt_seq_cnt + 1
         var s = sstate.child(blk, i)
         var r = check_stmt(s)
         if r < 0 {
@@ -49,7 +82,51 @@ pub func check_block(blk: i64) -> i64 {
         }
         i = i + 1
     }
+    g_cur_chain = saved_chain
+    g_cur_depth = saved_depth
+    g_cur_blknode = saved_blknode
     return 0
+}
+
+// 块链前缀判定：prefix 是 full 的前缀（同块或外层块）。"/" 分隔段精确匹配，
+// 避免 "1" 误配 "12"（块 id 整数段）。prefix == full 也算前缀（同块）。
+func chain_is_prefix(prefix: string, full: string) -> bool {
+    if str.starts_with(full, prefix) {
+        var pn = str_len(prefix)
+        var fn = str_len(full)
+        if pn == fn {
+            return true
+        }
+        if pn > 0 && str_char(full, pn) == "/" {
+            return true
+        }
+    }
+    return false
+}
+
+// 查 goto 标签表（函数级），返回下标；未找到 -1
+func gt_find(name_id: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_gt_keys) {
+        if g_gt_keys[i] == name_id {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 指定块 StmtList 的 [lo, hi) 直接语句区间内是否存在 var/const 声明（R3 用）
+func blk_has_var_decl(blk: i64, lo: i64, hi: i64) -> bool {
+    var j = lo
+    while j < hi {
+        var st = sstate.child(blk, j)
+        if st >= 0 && s_tags[st] == S_N_VAR_DECL {
+            return true
+        }
+        j = j + 1
+    }
+    return false
 }
 
 // 字面量节点 → 整数值（IntLit 取 val；CharLit 取 name 池 id 对应码点；
@@ -770,6 +847,43 @@ pub func check_stmt(s: i64) -> i64 {
         }
         return 0
     }
+    if tag == S_N_GOTO_LABEL {
+        // 三期 goto 标签（§7.1.5）：`#[tag.x]` 语句位置登记。
+        // 登记标签名 → 当前块链/块内序号/全局序号（R2/R3 校验用）。
+        var lnm = s_names[s]
+        var dup = gt_find(lnm)
+        if dup >= 0 {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "goto 标签 '#" + intern.lookup(lnm) + "' 重复定义（同函数内标签名必须唯一）"
+            return -1
+        }
+        table_push(g_gt_keys, lnm)
+        table_push(g_gt_chain, g_cur_chain)
+        table_push(g_gt_blkidx, g_cur_blkidx)
+        table_push(g_gt_seq, g_gt_seq_cnt)
+        table_push(g_gt_depths, g_cur_depth)
+        table_push(g_gt_blknode, g_cur_blknode)
+        return 0
+    }
+    if tag == S_N_GOTO {
+        // 三期 goto 语句（§7.1.5）：`unsafe goto #x`。goto 仅在 unsafe 上下文合法。
+        // 校验延迟到函数体检查完（标签可能在前向/后向任意位置，须全表收集后统一
+        // 判定 R1/R2/R3）；此处仅做 unsafe 上下文检查 + 登记 goto 请求。
+        if g_unsafe_depth == 0 {
+            sm_err_line = s_lines[s]
+            sm_err_col = s_cols[s]
+            sm_err_msg = "goto 只能在 unsafe 上下文使用（unsafe 块或 unsafe 函数内）"
+            return -1
+        }
+        table_push(g_gtg_keys, s_names[s])
+        table_push(g_gtg_chain, g_cur_chain)
+        table_push(g_gtg_blkidx, g_cur_blkidx)
+        table_push(g_gtg_seq, g_gt_seq_cnt)
+        table_push(g_gtg_line, s_lines[s])
+        table_push(g_gtg_col, s_cols[s])
+        return 0
+    }
     if tag == S_N_SWITCH {
         var subj = sinfer.infer_expr(sstate.child(s, 0))
         if subj < 0 {
@@ -1160,6 +1274,24 @@ pub func check_fn(fn_node: i64, full: string) -> i64 {
     lv_dyn = table_new_i64()
     lp_stack = table_new_i64()
     lp_top = 0
+    // 三期 goto（§7.1.5）：每函数重置 goto 标签表与块追踪（R1 同函数 = 表隔离）
+    g_gt_keys = table_new_i64()
+    g_gt_chain = table_new_string()
+    g_gt_blkidx = table_new_i64()
+    g_gt_seq = table_new_i64()
+    g_gt_depths = table_new_i64()
+    g_gtg_keys = table_new_i64()
+    g_gtg_chain = table_new_string()
+    g_gtg_blkidx = table_new_i64()
+    g_gtg_seq = table_new_i64()
+    g_gtg_line = table_new_i64()
+    g_gtg_col = table_new_i64()
+    g_cur_chain = ""
+    g_cur_depth = 0
+    g_cur_blkidx = 0
+    g_cur_blknode = -1
+    g_gt_seq_cnt = 0
+    g_gt_blk_seq = 0
     var nparams = sg_nparams[sig]
     var off = sg_off[sig]
     var i: i64 = 0
@@ -1194,6 +1326,67 @@ pub func check_fn(fn_node: i64, full: string) -> i64 {
     g_unsafe_depth = saved_depth
     if r < 0 {
         return -1
+    }
+    // 三期 goto（§7.1.5）：函数体检查完后统一校验 goto（标签表已收集全——
+    // goto 可前向/后向任意位置，须全表收集后判定 R1/R2/R3）
+    var gr = check_goto_refs()
+    if gr < 0 {
+        return -1
+    }
+    return 0
+}
+
+// 三期 goto 统一校验（函数体检查完后）：逐 goto 请求校验 R1/R2/R3。
+// R1 同函数：标签必须存在（函数级标签表）。
+// R2 同块或已执行外层块：目标链是 goto 链前缀（同块或外层块）；外层块须向后跳
+// （标签全局序号 < goto 全局序号 = 已执行）。禁止跳入更内层块（非前缀）。
+// R3 不越过初始化：同块前向跳（goto 序号 < 标签序号）不得跨 var/const 声明。
+func check_goto_refs() -> i64 {
+    var i: i64 = 0
+    while i < len(g_gtg_keys) {
+        var gnm = g_gtg_keys[i]
+        var gi = gt_find(gnm)
+        if gi < 0 {
+            sm_err_line = g_gtg_line[i]
+            sm_err_col = g_gtg_col[i]
+            sm_err_msg = "goto 的目标标签 '#" + intern.lookup(gnm) + "' 未定义（R1 同函数：同函数内必须有 #[tag." + intern.lookup(gnm) + "] 标签）"
+            return -1
+        }
+        var tchain = g_gt_chain[gi]
+        var gchain = g_gtg_chain[i]
+        // R2：目标链是 goto 链前缀（同块或外层块）
+        if !chain_is_prefix(tchain, gchain) {
+            sm_err_line = g_gtg_line[i]
+            sm_err_col = g_gtg_col[i]
+            sm_err_msg = "goto 目标 '#" + intern.lookup(gnm) + "' 不在同块或外层块（禁止跳入更内层块/跨块跳转，R2）"
+            return -1
+        }
+        if str_len(tchain) < str_len(gchain) {
+            // 外层块：须向后跳（标签已执行，标签序号 < goto 序号）
+            if g_gt_seq[gi] >= g_gtg_seq[i] {
+                sm_err_line = g_gtg_line[i]
+                sm_err_col = g_gtg_col[i]
+                sm_err_msg = "goto 目标 '#" + intern.lookup(gnm) + "' 在外层块但位于 goto 之后（只能向后跳到已执行的外层块头，R2）"
+                return -1
+            }
+        } else if tchain == gchain {
+            // 同块：R3 不越过初始化——仅前向跳（goto 序号 < 标签序号，跳过后续
+            // 声明）违规；向后跳同块头合法（重新初始化）。
+            if g_gt_seq[gi] > g_gtg_seq[i] {
+                // 块内语句区间 (goto_idx, label_idx)：标签与 goto 同块，块内序号
+                // 可比较。扫描标签所在块 StmtList 的 (goto_idx+1 .. label_idx)
+                // 直接语句，若有 var/const 声明 → 违规。
+                var lo = g_gtg_blkidx[i]
+                var hi = g_gt_blkidx[gi]
+                if blk_has_var_decl(g_gt_blknode[gi], lo + 1, hi) {
+                    sm_err_line = g_gtg_line[i]
+                    sm_err_col = g_gtg_col[i]
+                    sm_err_msg = "goto 向前跳过局部变量初始化（goto 与标签之间不得经过 var/const 声明，R3）"
+                    return -1
+                }
+            }
+        }
+        i = i + 1
     }
     return 0
 }

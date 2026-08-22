@@ -55,7 +55,18 @@ pub func parse_stmt() -> i64 {
     }
     if tag == lex_unsafe {
         // S1.2 U3：`unsafe { ... }` 局部逃逸块（块内可触底）
+        // 三期 goto：`unsafe goto #x`（§7.1.5）——unsafe 后跟 goto 关键字
+        // 是 goto 跳转语句（无条件 br），否则按 unsafe 块解析。
+        var nxt = putil.peek_n(1)
+        if nxt == lex_goto {
+            return parse_goto_stmt()
+        }
         return parse_unsafe_block()
+    }
+    if tag == lex_hash {
+        // 三期 goto：`#[tag.x]` 语句位置标签（§7.1.5）。`#[]` 紧跟声明
+        // = 属性；紧跟语句 + `tag.` 前缀 = 跳转标签（与循环标签命名空间分离）。
+        return parse_goto_label()
     }
     if tag == lex_panic {
         // S2.3：`panic(expr)` 不可恢复错误语句
@@ -207,6 +218,57 @@ func parse_unsafe_block() -> i64 {
     ast.set_children(n, kids)
     ast.set_children(ast.child_at(n, 0), stmts)
     return n
+}
+
+// 三期 goto（§7.1.5）：`unsafe goto #x` 无条件跳转语句（仅 unsafe 上下文）。
+// 解析：`unsafe`（已由 parse_stmt 探测，此处直接消费）→ `goto` → `#` → 标签名
+// → 分号。产出 N_GOTO[name=目标标签名池 id]。`#` 前缀区分循环标签 `标识符:`。
+func parse_goto_stmt() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // unsafe
+    putil.advance()   // goto
+    if !putil.expect(lex_hash, "'#'") {
+        return -1
+    }
+    var tname = putil.expect_ident()
+    if tname < 0 {
+        return -1
+    }
+    if !putil.expect(lex_semi, "语句结束符") {
+        return -1
+    }
+    return ast.new_node(N_GOTO, tname, -1, -1, line, col)
+}
+
+// 三期 goto 标签（§7.1.5）：`#[tag.x]` 语句位置标签（标定一条语句前为跳转点）。
+// 解析：`#[` → `tag` 段 → `.` → 标签名 → `]`。`#[]` 紧跟声明 = 属性；紧跟语句
+// + `tag.` 前缀 = 跳转标签。产出 N_GOTO_LABEL[name=标签名池 id]。
+// ASI 可能补分号（`]` 行尾补 `;`），标签后无分号语义，吃掉补充分号。
+func parse_goto_label() -> i64 {
+    var line = putil.peek_line()
+    var col = putil.peek_col()
+    putil.advance()   // #
+    if !putil.expect(lex_lbracket, "'['") {
+        return -1
+    }
+    // 属性名段：必须是 `tag`（标识符或关键字 token 均可读 lexeme）
+    if interner.lookup(putil.expect_ident()) != "tag" {
+        putil.set_err(line, col, "标签必须是 #[tag.名称] 形式（tag. 前缀区分 goto 标签与属性）")
+        return -1
+    }
+    if !putil.expect(lex_dot, "'.'") {
+        return -1
+    }
+    var tname = putil.expect_ident()
+    if tname < 0 {
+        return -1
+    }
+    if !putil.expect(lex_rbracket, "']'") {
+        return -1
+    }
+    putil.eat(lex_semi)   // 吃掉 ASI 补分号（标签本身无分号语义）
+    return ast.new_node(N_GOTO_LABEL, tname, -1, -1, line, col)
 }
 
 // ---------- 顶层 import / using / namespace / extern ----------

@@ -224,6 +224,11 @@ func check_stmt(s: i64) -> i64 {
     if tag == S_N_BREAK || tag == S_N_CONTINUE {
         return 0
     }
+    // 三期 goto（§7.1.5）：标签无操作；goto 不移动任何变量（控制流改指，
+    // 变量生命周期由块作用域确定性释放承载，R2/R3 语义层已校验）
+    if tag == S_N_GOTO_LABEL || tag == S_N_GOTO {
+        return 0
+    }
     // FieldAssign：children=[基址, 值]（基址按引用；值 = 读取/移动）
     if tag == S_N_FIELD_ASSIGN {
         var base = sstate.child(s, 0)

@@ -1,0 +1,12 @@
+type tie<logic>
+// tests/m6_actor/actor_a5_neg_nolabel.tie —— 三期 goto 负例（§7.1.5 R1）
+// goto 目标标签未定义 → 编译错误「目标标签未定义」
+unsafe fn bad() {
+    unsafe goto #nope;
+}
+
+func main() {
+    unsafe {
+        bad()
+    }
+}

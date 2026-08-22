@@ -1,0 +1,17 @@
+type tie<logic>
+// tests/m6_actor/actor_a5_neg_outerforward.tie —— 三期 goto 负例（§7.1.5 R2）
+// goto 在外层块中向前跳（标签在外层块但位于 goto 之后）→ 编译错误
+unsafe fn bad() {
+    var x: i64 = 1
+    if x != 0 {
+        unsafe goto #outer;
+    }
+    #[tag.outer]
+    println("hi")
+}
+
+func main() {
+    unsafe {
+        bad()
+    }
+}
