@@ -231,6 +231,19 @@ var ac_mnames: table<i64>;   // 方法名 id 扁平段（声明顺序）
 var ac_mnpars: table<i64>;   // 每方法参数个数扁平段
 var ac_mptys: table<i64>;    // 每方法参数类型扁平段
 var ac_mrets: table<i64>;    // 每方法返回类型扁平段
+// actor 私有状态字段布局（行 = actor 索引；Step4b 起 per-actor state 真实槽位）：
+//   ac_fnoff[actor] -> 字段名段偏移（ac_fnames）
+//   ac_fncnt[actor] -> 字段个数
+//   ac_ftyoff[actor]-> 字段类型段偏移（ac_ftys）
+//   ac_fvoff[actor] -> 记录内字节偏移段偏移（ac_foffs；relative 到字段区基址）
+// // 同一字段名/类型/偏移按下标对齐。record 固定头 + 字段区（8 字节对齐）。
+var ac_fnoff: table<i64>;
+var ac_fncnt: table<i64>;
+var ac_ftyoff: table<i64>;
+var ac_fvoff: table<i64>;
+var ac_fnames: table<i64>;   // 字段名 id 扁平段（声明顺序）
+var ac_ftys: table<i64>;     // 字段类型扁平段
+var ac_foffs: table<i64>;    // 字段在记录内的字节偏移扁平段（含固定头）
 
 // ==================== S2.4 port / impl 状态表（接口模型）====================
 // port 表：pt_keys（port 名 id，升序）→ pt_vals（port 索引）。
@@ -1279,7 +1292,56 @@ pub func reg_actor(name: string) -> i64 {
     table_push(ac_mpar, len(ac_mnpars))
     table_push(ac_paroff, len(ac_mptys))
     table_push(ac_mret, len(ac_mrets))
+    // 初始化字段布局行（仿方法签名：空行）
+    table_push(ac_fnoff, len(ac_fnames))
+    table_push(ac_fncnt, 0)
+    table_push(ac_ftyoff, len(ac_ftys))
+    table_push(ac_fvoff, len(ac_foffs))
     return idx
+}
+
+// actor 私有状态字段登记（collect_actor_decl 用）：字段名 + 类型 + 记录内字节偏移
+//（含固定头；8 字节对齐，由收集方计算）。追加式排平段，与 ac_fnoff/fncnt 行对齐。
+// 返回字段下标；-1 错误（重名）。
+pub func reg_actor_field(ai: i64, fname: string, fty: i64, foff: i64) -> i64 {
+    var nid = intern.intern(fname)
+    var off = ac_fnoff[ai]
+    var n = ac_fncnt[ai]
+    var k: i64 = 0
+    while k < n {
+        if ac_fnames[off + k] == nid {
+            sm_err_msg = "actor '" + intern.lookup(ac_keys[ai]) + "' 的字段 '" + fname + "' 重复定义"
+            return -1
+        }
+        k = k + 1
+    }
+    var fi = n
+    table_push(ac_fnames, nid)
+    table_push(ac_ftys, fty)
+    table_push(ac_foffs, foff)
+    ac_fncnt[ai] = n + 1
+    return fi
+}
+
+// actor 字段区长度（字节，含固定头；run 据此分配 record）。字段区起始偏移 +
+// 各字段 8 对齐大小。返回总字节数。
+pub func actor_field_bytes(ai: i64) -> i64 {
+    var off = ac_fvoff[ai]
+    var n = ac_fncnt[ai]
+    var total: i64 = 0
+    var k: i64 = 0
+    while k < n {
+        var fty = ac_ftys[off + k]
+        var sz: i64 = 8
+        if fty == types.named(TK_F64) {
+            sz = 8
+        } else if types.is_int(fty) {
+            sz = 8  // 标量态一律 8 字节槽（i64/u64/窄整/lifter）
+        }
+        total = total + sz
+        k = k + 1
+    }
+    return total
 }
 
 // actor 消息方法登记（collect_actor_decl 用）：方法名 + 参数类型表 + 返回类型。

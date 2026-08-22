@@ -427,14 +427,38 @@ func tig_actor_run(id: i64) -> i64 {
         }
         rk = rk + 1
     }
+    // 解析 actor 索引（children[0] = actor 类型名节点）
+    var aty_node = sstate.child(id, 0)
+    var anm = sstate.name_str(aty_node)
+    var aidx = sstate.actor_find(anm)
+    if aidx < 0 {
+        sm_err_msg = "run 的 '" + anm + "' 不是已声明的 actor 类型（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
     var T64 = types.named(TK_I64)
-    var rec = s21_raw_alloc_str(tig_int_lit_ty(256, T64))  // A_REC_SIZE = 256
+    // record 大小 = 固定头 112 + 字段区（空则至少 120）
+    var recsz = 112 + sstate.actor_field_bytes(aidx)
+    if recsz < 120 {
+        recsz = 120
+    }
+    var rec = s21_raw_alloc_str(tig_int_lit_ty(recsz, T64))
     if rec < 0 {
         return -1
     }
     // magic @0：写 0xAC70524E（句柄/记录校验）
     var mg = tig_int_lit_ty(0xAC70524E, T64)
     s21_store(rec, mg, T64)
+    // 私有状态字段默认值（store tig_default_val 于 rec + foff）
+    var fbase = ac_fvoff[aidx]
+    var fcnt = ac_fncnt[aidx]
+    var fk: i64 = 0
+    while fk < fcnt {
+        var fty = ac_ftys[fbase + fk]
+        var foff = ac_foffs[fbase + fk]
+        var dv = tig_default_val(fty)
+        s21_store(s21_gep(rec, foff, true), dv, fty)
+        fk = fk + 1
+    }
     // lock @8：InitializeCriticalSection(ptr)
     var lockp = s21_gep(rec, 8, true)  // A_OFF_LOCK = 8
     var ats1: table<i64> = table_new_i64()

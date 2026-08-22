@@ -1032,9 +1032,28 @@ pub func collect_actor_decl(s: i64) -> i64 {
     }
     var n = s_aux[s]   // items 总数
     var i: i64 = 0
+    // 私有状态字段：从记录固定头后（@112，见 irgen tig_actor_run 布局）开始，
+    // 每字段 8 字节槽（标量态统一 8 字节）
+    var field_base: i64 = 112
+    var field_off: i64 = field_base
     while i < n {
         var item = sstate.child(s, i)
         var itag = s_tags[item]
+        if itag == N_CLASS_FIELD {   // `var name: Ty [= def]`
+            var fname = sstate.name_str(item)
+            var fty = sgen.parse_generic_type_node(sstate.child(item, 0))
+            if fty < 0 {
+                sm_err_line = s_lines[item]
+                sm_err_col = s_cols[item]
+                return -1
+            }
+            if sstate.reg_actor_field(aidx, fname, fty, field_off) < 0 {
+                sm_err_line = s_lines[item]
+                sm_err_col = s_cols[item]
+                return -1
+            }
+            field_off = field_off + 8
+        }
         if itag == S_N_FN_DEF {
             // 消息方法必须 pub（非 pub 方法收不到消息，除非显式 unsafe 网关，
             // 一期一律要求 pub——对齐 design §5 默认同步方法形态）
