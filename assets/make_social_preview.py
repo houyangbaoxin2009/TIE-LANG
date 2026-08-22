@@ -42,12 +42,12 @@ def font(size, bold=False):
 d = ImageDraw.Draw(bg)
 # 主标语（中文，粗体）
 f_main = font(44, bold=True)
-tag_cn = "一门语言，写逻辑 · 写界面 · 写数据库 · 当数据交换格式"
+tag_cn = "Python 的开发体验，Rust 的性能安全"
 bbox = d.textbbox((0, 0), tag_cn, font=f_main)
 d.text(((W - (bbox[2] - bbox[0])) // 2, 470), tag_cn, fill="#E2E8F0", font=f_main)
 # 副标语（英文）
 f_sub = font(26)
-tag_en = "One language for logic, UI, database & data exchange"
+tag_en = "Python's DX, Rust's performance & safety"
 bbox2 = d.textbbox((0, 0), tag_en, font=f_sub)
 d.text(((W - (bbox2[2] - bbox2[0])) // 2, 535), tag_en, fill="#7DD3FC", font=f_sub)
 

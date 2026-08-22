@@ -46,13 +46,14 @@ var g_cur_func: i64 = 0;
 var g_cur_block: i64 = 0;
 // 参数区是否已输出（entry 顶部）
 var g_params_done: bool = false;
-// T4.5：程序是否使用了 tie 运行时桥内置（exec_code/get_env/time_now）。
-// 置位后 driver 链接 std/runtime.a（无需 Rust tie-interp 库）。
-var g_used_runtime: bool = false;
-// 阶段 A：程序是否使用了 tie-interp 库桥（str_len/table_*/file_*/arg_* 等）。
-// 置位后 driver 链接 tie_interp.lib（Rust 桥，覆盖全部 tie_* 符号；
-// 与 runtime.a 二选一——interp.lib 覆盖 runtime.a 的三个符号）。
+// 阶段 A：程序是否使用了 tie-interp 库桥（file_*/regex_*/exec_output 等 Rust 桥）。
+// 置位后 driver 链接 tie_interp.lib（Rust 桥）。exec_code/get_env/time_now 已
+// 内联到 libc（runtime.a 退役），不再置位本标志。
 var g_used_interp: bool = false;
+// M5 动态库模式（dev33 批次 12）：driver 在 tig_ast 前经 set_dynlib 注入。
+// 置位后 irgen 登记导出面（ir.func_exported）供 llvmgen 输出 dllexport，
+// 并对导出函数做边界检查（表/struct 不跨动态库边界）。
+var g_dynlib: bool = false;
 // 当前编译目标三元组（driver 在 tig_ast 前经 set_target 注入；空 = 未设置）。
 // 任务17 asm! 平台条件编译：target("arch") 按此目标匹配。
 var g_asm_target: string = "";
@@ -258,10 +259,10 @@ func ig_ns_sym(full: string) -> string {
 }
 
 
-// tie 运行时桥调用（exec_code/time_now/get_env/exec_output；全字符串参数，
-// 符号 tie_<name>；返回 i64 或 string）
+// tie 运行时桥调用（现仅 exec_output；符号 tie_exec_output，Rust 桥，返回 string）。
+// exec_code/get_env/time_now 已内联到 libc，不再经此。
 func tig_runtime_call(nm: string, id: i64) -> i64 {
-    g_used_runtime = true
+    // tie_exec_output 非 libc → tig_ext_call_typed 自动置 g_used_interp（Rust 桥）
     // Call children = [泛型槽, 实参...]：实参从 children[slot_off] 起
     var off = sstate.slot_off(id)
     var nc = sstate.nchild(id) - off
@@ -482,6 +483,10 @@ func is_libc_sym(sym: string) -> bool {
         sym == "round" || sym == "pow" {
         return true
     }
+    // runtime.a 退役：exec_code/get_env/time_now 内联到 libc 直调（不置 g_used_interp）
+    if sym == "system" || sym == "getenv" || sym == "time" {
+        return true
+    }
     return false
 }
 
@@ -608,6 +613,32 @@ pub func set_target(t: string) {
     g_asm_target = t
 }
 
+// 注入动态库模式（driver 在 detect_shared_mode 后调用，M5 dev33 批次 12）。
+// 置位后本模块对每个函数登记导出面（ir.func_export_set）+ 导出边界检查。
+pub func set_dynlib(v: bool) {
+    g_dynlib = v
+}
+
+// 动态库边界类型检查（任务 36）：仅标量（整数/浮点/bool/trit/char）与 string
+// 可跨动态库边界；void 仅作返回类型。表/map/struct/enum/元组/函数值/port 的
+// 堆布局跨语言不可见（内部堆结构，见 docs/plans/dynamic-library.md）→ 违例
+// 返回错误消息（空串 = 允许）。
+func dynlib_ty_ok(t: i64) -> string {
+    if t == types.named(TK_VOID) {
+        return ""
+    }
+    if t == types.named(TK_STR) {
+        return ""
+    }
+    if types.is_int(t) || types.is_float(t) {
+        return ""
+    }
+    if t == types.named(TK_BOOL) || t == types.named(TK_TRIT) || t == types.named(TK_CHAR) {
+        return ""
+    }
+    return "类型 '" + types.type_name(t) + "' 不能跨动态库边界（仅标量与 string 可跨库）"
+}
+
 // 平台名匹配：全等（三元组直写）或架构前缀（"x86_64" 匹配 "x86_64-*"）。
 // 任务17 asm! 平台条件编译：target("arch") 按 g_asm_target 匹配。
 func asm_target_matches(arch: string) -> bool {
@@ -632,7 +663,6 @@ pub func tig_ast() -> i64 {
     g_lp_top = 0
     g_str_keys = table_new_i64()
     g_str_count = 0
-    g_used_runtime = false
     g_used_interp = false
     ir.new_module()
     // S2.4 vtable 全局常量登记（每个 impl 一个：方法函数指针按 port 方法
@@ -701,7 +731,6 @@ pub func tig_src(src: string, base_dir: string) -> i64 {
     g_lp_top = 0
     g_str_keys = table_new_i64()
     g_str_count = 0
-    g_used_runtime = false
     g_used_interp = false
     ir.new_module()
     // S2.4 vtable 全局常量登记（每个 impl 一个：方法函数指针按 port 方法
@@ -865,6 +894,20 @@ func tig_fn_def(fn_node: i64, prefix: string) -> i64 {
         return -1
     }
     g_cur_ret_ty = ret_ty  // Return 生成期 trit 适配用
+    // M5 动态库导出面（dev33 批次 12）：顶层函数恒公有；命名空间函数仅 pub
+    // func 导出（N_FN_DEF val bit0 = is_pub，对齐 parser）。导出标记登记进 IR
+    // 供 llvmgen 在动态库模式输出 dllexport；动态库模式下对导出函数做边界检查。
+    var is_pub: i64 = 1
+    if prefix != "" {
+        is_pub = s_vals[fn_node] & 1
+    }
+    if g_dynlib && is_pub == 1 {
+        var rberr = dynlib_ty_ok(ret_ty)
+        if str_len(rberr) > 0 {
+            sm_err_msg = "动态库边界错误: 导出函数 " + full_name + " 返回" + rberr
+            return -1
+        }
+    }
     // 参数类型收集（T0.3 by_ref + M2.1.8 struct 首参自动 ref：ref 参数 LLVM
     // 形参声明为 ptr——按值声明聚合类型（%struct.Counter）会与调用方传的
     // 槽地址不匹配。表 ref 原本 table id → llvm ptr 恰好一致；struct 需显式 ptr）
@@ -896,6 +939,15 @@ func tig_fn_def(fn_node: i64, prefix: string) -> i64 {
                 pt = sp_tys[sig_off_pre + i]
             }
         }
+        // M5 动态库边界（任务 36）：导出函数参数仅标量/string——表/struct 等堆
+        // 布局跨语言不可见，ref 表参数/变参（表打包）亦在此拦截
+        if g_dynlib && is_pub == 1 {
+            var pberr = dynlib_ty_ok(pt)
+            if str_len(pberr) > 0 {
+                sm_err_msg = "动态库边界错误: 导出函数 " + full_name + " 参数" + pberr
+                return -1
+            }
+        }
         if is_ref_pre == 1 {
             table_push(params, types.named(TK_STR))  // 引用 → ptr 形参
         } else {
@@ -904,6 +956,9 @@ func tig_fn_def(fn_node: i64, prefix: string) -> i64 {
         i = i + 1
     }
     var fid = ir.new_func(intern.intern(full_name), ret_ty, params)
+    // M5 动态库导出面：登记导出标记（llvmgen gen_func 读 ir.func_exported 输出
+    // dllexport；非动态库模式下该标记不影响生成）
+    ir.func_export_set(fid, is_pub)
     g_cur_func = fid
     var entry = ir.new_block(fid, interner.intern("entry"))
     g_cur_block = entry

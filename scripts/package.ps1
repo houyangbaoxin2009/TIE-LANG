@@ -1,4 +1,4 @@
-﻿# tie 正式发行版打包脚本（Windows，0-Rust）
+# tie 正式发行版打包脚本（Windows，0-Rust）
 #
 # 职责：构建 release 工具链（自举）→ 组装发行目录 → 生成 zip 压缩包。
 # 产物：dist/tie-{发行版号}-win-x64.zip（如 tie-Harbor-2026.1-preview.2-win-x64.zip）
@@ -251,13 +251,7 @@ foreach ($lib in @("std", "ext", "rdu")) {
         Get-ChildItem $LibSrc -Filter "*.tie" | ForEach-Object {
             Copy-Item $_.FullName $LibTarget
         }
-        # std/runtime.a（仅 std 特有）：tie 自写运行时静态库（tiec 链接用户程序必需，
-        # tie 语言产物；rdu/ext 不产生 runtime.a——rdu 为 freestanding 零运行时依赖）
-        $RuntimeLib = Join-Path $LibSrc "runtime.a"
-        if (Test-Path $RuntimeLib) {
-            Copy-Item $RuntimeLib $LibTarget
-            Write-Host "  $lib/runtime.a ✔" -ForegroundColor DarkGray
-        }
+        # std/runtime.a 已退役：exec_code/get_env/time_now 内联 libc，无运行时静态库要打包
         Write-Host "  $lib/ ✔" -ForegroundColor DarkGray
     }
 }

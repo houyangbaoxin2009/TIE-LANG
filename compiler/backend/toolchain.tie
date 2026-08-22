@@ -143,16 +143,11 @@ pub func opt(input_ll: string, output_opt: string, level: i64) -> i64 {
     return run(tool + " " + optl + " -S " + input_ll + " -o " + output_opt)
 }
 
-// 链接可执行文件：clang in.opt.ll -o out.exe [--target=T] [runtime/interp 库 + 系统库]。
-// need_interp 为 true 时按 prefer_interp 选择链接目标（阶段 A 扩展）：
-// - prefer_interp=true（程序用了 tie-interp 库桥：str_len/table_*/arg_* 等）：
-//   链接 tie_interp.lib（Rust 桥，覆盖全部 tie_* 符号含 exec_code/get_env/time_now）
-//   + Rust std 依赖系统库——与 T4.5 runtime.a 二选一，避免重复定义；
-// - prefer_interp=false（仅 exec_code/get_env/time_now 三个运行时桥，T4.5 旧路径）：
-//   优先 std/runtime.a（tie 语言自写，覆盖三个符号，无需 Rust）；
-//   未找到 → 回退 tie_interp.lib（Rust 桥）+ 系统库。
-// 返回退出码。
-pub func link_exe(input_opt: string, output_exe: string, target: string, need_interp: bool, prefer_interp: bool) -> i64 {
+// 链接可执行文件：clang in.opt.ll -o out.exe [--target=T] [interp 库 + 系统库]。
+// need_interp 为 true 时链接 tie_interp.lib（Rust 桥）+ Rust std 依赖系统库。
+// std/runtime.a 已退役（exec_code/get_env/time_now 内联到 libc），不再有
+// prefer_interp 分支——凡需桥一律 tie_interp.lib。返回退出码。
+pub func link_exe(input_opt: string, output_exe: string, target: string, need_interp: bool) -> i64 {
     var tool = find_clang()
     if str_len(tool) == 0 {
         tc_err_msg = "未找到 clang，请确认 LLVM 已安装并在 PATH 中"
@@ -185,28 +180,13 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
         cmd = cmd + " --target=" + target
     }
     if need_interp {
-        if prefer_interp {
-            var lib = find_interp_lib()
-            if str_len(lib) == 0 {
-                tc_err_msg = "程序使用了 tie-interp 桥内置，但未找到 tie-interp 静态库。" +
-                    "请先构建 tie-interp（cargo build -p tie-interp --release），或设置环境变量 TIE_INTERP_LIB"
-                return -1
-            }
-            cmd = cmd + " " + lib + " -lws2_32 -luserenv -lntdll -lbcrypt -ladvapi32 -lole32 -lshell32"
-        } else {
-            var rlib = find_runtime_lib()
-            if str_len(rlib) > 0 {
-                cmd = cmd + " " + rlib
-            } else {
-                var lib = find_interp_lib()
-                if str_len(lib) == 0 {
-                    tc_err_msg = "程序使用了 REPL 内置函数（read_line/eval 等），但未找到 tie-interp 静态库。" +
-                        "请先构建 tie-interp（cargo build -p tie-interp --release），或设置环境变量 TIE_INTERP_LIB"
-                    return -1
-                }
-                cmd = cmd + " " + lib + " -lws2_32 -luserenv -lntdll -lbcrypt -ladvapi32 -lole32 -lshell32"
-            }
+        var lib = find_interp_lib()
+        if str_len(lib) == 0 {
+            tc_err_msg = "程序使用了 tie-interp 桥内置，但未找到 tie-interp 静态库。" +
+                "请先构建 tie-interp（cargo build -p tie-interp --release），或设置环境变量 TIE_INTERP_LIB"
+            return -1
         }
+        cmd = cmd + " " + lib + " -lws2_32 -luserenv -lntdll -lbcrypt -ladvapi32 -lole32 -lshell32"
     }
     // 批次 2：i128/u128 除法/取余生成 __divti3/__umodti3 等 compiler-rt 辅助
     // 调用——clang 默认不链接 builtins，缺符号（undefined symbol: __divti3）。
@@ -214,6 +194,85 @@ pub func link_exe(input_opt: string, output_exe: string, target: string, need_in
     // （clang 22 对 -lclang_rt.builtins-x86_64 带点参数解析错误，弃用）。
     cmd = cmd + " -rtlib=compiler-rt"
     return run(cmd)
+}
+
+// 链接动态库（M5 dev33 批次 12）：clang -shared in.opt.ll -o out.dll/.so [--target=T]。
+// Windows：dllexport 导出面由 irgen 标记，lld/link 自动导出符号；
+// Linux：-fPIC -shared（ELF 符号默认可见）。
+// need_interp 为 true 时同样链接 tie_interp.lib（桥程序打成动态库）。
+// 返回退出码。
+pub func link_shared(input_opt: string, output_so: string, target: string, need_interp: bool) -> i64 {
+    var tool = find_clang()
+    if str_len(tool) == 0 {
+        tc_err_msg = "未找到 clang，请确认 LLVM 已安装并在 PATH 中"
+        return -1
+    }
+    // 链接器选择：Linux 目标 → -fuse-ld=lld（clang 默认 GNU ld 在 Windows 宿主
+    // 不可用，且需要 lld 链接 ELF 目标）；Windows 对齐 link_exe：vendored LLVM
+    // → -fuse-ld=lld；本机开发 → -fuse-ld=link（恢复 link.exe 行为）
+    var lld_flag = ""
+    var is_linux = has_sub(target, "linux")
+    if is_linux {
+        lld_flag = " -fuse-ld=lld"
+    } else {
+        var home = get_env("TIE_LLVM_HOME")
+        if str_len(home) > 0 {
+            if tool == home + "\\bin\\clang.exe" {
+                if file_exists(home + "\\bin\\lld-link.exe") {
+                    lld_flag = " -fuse-ld=lld"
+                }
+            }
+        } else {
+            lld_flag = " -fuse-ld=link"
+        }
+    }
+    // -shared：Windows lld-link 等价 /DLL（自动生成入口存根）；Linux 需 -fPIC
+    var shared_flag = "-shared"
+    if is_linux {
+        shared_flag = "-shared -fPIC"
+    }
+    var cmd = tool + lld_flag + " " + shared_flag + " " + input_opt + " -o " + output_so
+    if str_len(target) > 0 {
+        cmd = cmd + " --target=" + target
+    }
+    if need_interp {
+        var lib = find_interp_lib()
+        if str_len(lib) == 0 {
+            tc_err_msg = "程序使用了 tie-interp 桥内置，但未找到 tie-interp 静态库。" +
+                "请先构建 tie-interp（cargo build -p tie-interp --release），或设置环境变量 TIE_INTERP_LIB"
+            return -1
+        }
+        cmd = cmd + " " + lib + " -lws2_32 -luserenv -lntdll -lbcrypt -ladvapi32 -lole32 -lshell32"
+    }
+    // 批次 2：compiler-rt builtins（i128 除法/取余辅助符号）
+    cmd = cmd + " -rtlib=compiler-rt"
+    return run(cmd)
+}
+
+// 子串存在判定（target 平台识别用；本模块不 import std，自写零依赖）。
+func has_sub(s: string, sub: string) -> bool {
+    var n: i64 = str_len(s)
+    var m: i64 = str_len(sub)
+    if m == 0 {
+        return true
+    }
+    var i: i64 = 0
+    while i <= n - m {
+        var j: i64 = 0
+        var ok = true
+        while j < m {
+            if str_char(s, i + j) != str_char(sub, j) {
+                ok = false
+                break
+            }
+            j = j + 1
+        }
+        if ok {
+            return true
+        }
+        i = i + 1
+    }
+    return false
 }
 
 // 编译 IR 为独立目标文件：clang -c in.opt.ll -o out.o [--target=T]（库编译第一步）。
@@ -238,20 +297,6 @@ pub func archive(object: string, lib_path: string) -> i64 {
         return -1
     }
     return run(tool + " rcs " + lib_path + " " + object)
-}
-
-// 定位 tie 运行时静态库：TIE_RUNTIME_LIB 环境变量 → 工作目录 std\runtime.a。
-// 找不到返回空串。std/runtime.a 由 tie-llvm 编译 std/runtime.tie 生成
-// （`tie-llvm std/runtime.tie -o std/runtime.a`，T4.5）。
-func find_runtime_lib() -> string {
-    var env = get_env("TIE_RUNTIME_LIB")
-    if str_len(env) > 0 && file_exists(env) {
-        return env
-    }
-    if file_exists("std\\runtime.a") {
-        return "std\\runtime.a"
-    }
-    return ""
 }
 
 // 定位 tie-interp 静态库：TIE_INTERP_LIB 环境变量 → target\release →

@@ -290,9 +290,6 @@ func collect_externs() {
 //            tie_copy_dir(ptr, ptr) / tie_byte_write(ptr, ptr)
 // 注意：返回 void 的桥在 irgen 用 ty=-1 建指令（无结果寄存器）。
 func extern_decl(sym: string) -> string {
-    if sym == "tie_exec_code" {
-        return "declare i64 @tie_exec_code(ptr)"
-    }
     // S2.1：libc memcpy（StringBuilder 数据拷贝；clang 链接 CRT 提供）
     if sym == "memcpy" {
         return "declare void @memcpy(ptr, ptr, i64)"
@@ -301,12 +298,6 @@ func extern_decl(sym: string) -> string {
     // 属性），此处不重复 declare（LLVM 拒绝重复定义）。
     if sym == "longjmp" || sym == "_setjmp" || sym == "llvm.frameaddress.p0" {
         return ""
-    }
-    if sym == "tie_get_env" {
-        return "declare ptr @tie_get_env(ptr)"
-    }
-    if sym == "tie_time_now" {
-        return "declare i64 @tie_time_now()"
     }
     if sym == "tie_str_len" {
         return "declare i64 @tie_str_len(ptr)"

@@ -22,7 +22,7 @@ compiler\tiec.exe repl\repl.tie          # 构建 REPL 外壳
 
 - 输入 `.tie` 源文件，输出本机可执行文件（logic/script 角色）或静态库 `.a`（class 角色）；
 - 发行 zip 内置 `bin/llvm/`（clang/opt/llvm-ar/lld-link），设置 `TIE_LLVM_HOME` 指向它即可开箱即用，无需单独安装 LLVM；
-- 链接用户程序需要 `std/runtime.a`（tie 自写运行时静态库），tiec 自动定位；
+- 纯程序零运行时依赖：`exec_code`/`get_env`/`time_now` 已内联到 libc，`std/runtime.a` 已退役；只用这些内置的程序不链接任何运行时库；用 tie-interp 桥（file/regex 等）才链 Rust `tie_interp.lib`；
 - LLVM 工具发现顺序：`TIE_LLVM_HOME\bin` → tiec.exe 同目录 `llvm\bin` → `PATH` → 固定目录（`D:\LLVM\bin` 等）。
 
 ## 2. 文件角色（头声明）

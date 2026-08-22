@@ -1017,7 +1017,31 @@ func builtin_expr(nm: string, id: i64) -> i64 {
         g_builtin_res = cv2
         return 0
     }
-    if nm == "exec_code" || nm == "time_now" || nm == "get_env" || nm == "exec_output" {
+    if nm == "exec_code" {
+        // runtime.a 退役：内联到 libc system（返回 i64，RAX 零扩展保证同旧 tie_exec_code）
+        var cv = tig_expr(call_arg(id, 0))
+        if cv < 0 {
+            return -1
+        }
+        g_builtin_res = tig_ext_call1("system", cv, types.named(TK_STR), types.named(TK_I64))
+        return 0
+    }
+    if nm == "time_now" {
+        // runtime.a 退役：内联到 libc time(0)（0 = NULL，返回 Unix 秒数）
+        g_builtin_res = tig_ext_call1("time", tig_int_lit(0), types.named(TK_I64), types.named(TK_I64))
+        return 0
+    }
+    if nm == "get_env" {
+        // runtime.a 退役：内联到 libc getenv（返回 char* → 自动补头为 tie 串）
+        var gv = tig_expr(call_arg(id, 0))
+        if gv < 0 {
+            return -1
+        }
+        g_builtin_res = tig_ext_call1("getenv", gv, types.named(TK_STR), types.named(TK_STR))
+        return 0
+    }
+    if nm == "exec_output" {
+        // 保留 Rust 桥（tie_exec_output 依赖 ptr 无法内联）→ tig_ext_call_typed 置 g_used_interp
         g_builtin_res = tig_runtime_call(nm, id)
         return 0
     }

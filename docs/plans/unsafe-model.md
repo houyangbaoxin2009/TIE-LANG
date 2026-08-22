@@ -322,4 +322,58 @@ unsafe 边界清晰、无隐式通道。
 5. **alloc 失败处理**：返回 null？panic？断言？（嵌入式无异常，需定策略）
 6. **volatile 与内存模型**：volatile 读写与编译器优化的交互（禁止重排/合并）
 7. **ptr 的 Send/Sync 语义**：并发模型下指针能否跨协程传递（第一版建议禁止，
-   只传所有权值）
+  只传所有权值）
+
+---
+
+## 13. 凭据门禁模型（设计，2026-08-23 会话定稿）
+
+> 状态：**设计**（第一步先落 `guard<share>` 并发逃生作最小闭环，随一期 actor 推进）。
+> 定位：统一支配上面 1-7 全类 unsafe 能力的**门禁**——不另造每个能力各自的开关，
+> 而是把「越界权」收敛成一张可持有、可传递、可回收、可审计的 **`guard<cap>` 凭据**。
+> 哲学：**小白用安全语法（actor/纯语义）；一切越界能力归凭据，老鸟持证使用。**
+
+### 13.1 能力三域（7 类 → 3 凭据）
+
+| 凭据 | 支配的 unsafe 能力 | 对应 §1.2 清单 |
+| --- | --- | --- |
+| `guard<mem>` | ptr 创建/读写/算术、alloc/free、cast、repr(C) 布局 | 1, 2, 6 |
+| `guard<ext>` | extern 声明/调用、asm!（外跳机器层） | 3, 5 |
+| `guard<share>` | atomic<T>、跨线程/Actor 共享、vtable/函数指针 | 4, 7 |
+
+- `guard` 为内建**小写**类型（与 string/table/map/ptr/atomic 同款风格）。
+- 旧粗粒度 `unsafe{}` / `unsafe fn` / `type tie<unsafe>` **保留为兼容**：
+  裸用 = 隐式持有三域凭据（迁移期老码头照跑）。
+
+### 13.2 统一操作集（任一 `guard<cap>` 通用）
+
+```tie
+var g  = unsafe.get(mem)                 // 取得凭据（move-only）
+unsafe use g { ptr[0] = 1 }              // 持证越界（能力在该域内才生效）
+unsafe with(share) { ... }               // 作用域临时凭据，退块自动回收
+
+var g2  = g.delegate(mem)                // 限制委托/衰减：从强凭据派生更弱的子凭据
+var og  = unsafe.get(share -> buf)      // 对象绑定：只能碰 buf，防滥用于任意内存
+var ch  = g.branch()                     // 层级派生：父亡子亡
+unsafe.revoke(g)                         // 显式撤销（全局作废，层级级联）
+unsafe.audit(g)                          // 运行期审计：谁/何处在用这张凭据
+
+#[unsafe(ext)] fn probe() -> i64 { ... } // 函数级便捷：整函数隐式持证
+func h(buf: ptr<i64>, g: guard<mem>)     // 参数最小权限：给多少用多少
+```
+
+### 13.3 语义
+
+- **move-only**：凭据复制被拒绝，只能 `move` 转移；持有者唯一。
+- **嵌套不可越权**：内层 via 凭据使用的能力 ⊆ 凭据已有能力。
+- **委派/衰减**：`g.delegate(sub)` 从强凭据派生更弱凭据，作参数传给帮助者——组合最小权限。
+- **对象绑定**：`unsafe.get(share -> obj)` 把凭据绑定到具体对象/区域，缩小越界面。
+- **层级撤销**：撤销根凭据 → 所有 `branch()` 子孙级联作废（树状生命周期）。
+- **审计**：每次 `unsafe use g` 记录调用链；`unsafe.audit(g)` 运行期可查。
+- **兼容**：`unsafe{}` = 隐式 `unsafe.get(mem, ext, share)` 于块内，退块自动释放。
+
+### 13.4 一期最小闭环
+
+- 先落 `guard<share>`（并发逃生，与一期 actor 咬合）：
+  `unsafe.get(share)` / `unsafe use g {}` / `unsafe with(share) {}` / `#[unsafe(share)]`。
+- mem/ext 及委派/对象绑定/层级回收/审计随三期推进，语法在 13.2 已定稿。
