@@ -1,0 +1,25 @@
+type tie<logic>
+// 一期并发 A4 Step4b-2：方法 dispatch + 同步 RPC 端到端探针。
+// `var c = run Counter(); var v = c.inc(5)`：run 分配 per-actor state +
+// 启动工作线程；c.inc(5) 入队消息 → actor 线程持锁清 pending → 解锁 →
+// 间接调 dispatch → handler 编译方法体（count=count+by，count 绑定 record 槽）
+// → 写 result+done → 唤醒调用方 → 调用方读 5。
+actor Counter {
+    var count: i64 = 0
+    pub func inc(by: i64) -> i64 {
+        count = count + by
+        return count
+    }
+}
+func main() {
+    var c = run Counter()
+    var v1 = c.inc(5)
+    println("inc(5)=" + to_string(v1))
+    var v2 = c.inc(7)
+    println("inc(7)=" + to_string(v2))
+    if v1 == 5 && v2 == 12 {
+        println("A4 同步 RPC 通过")
+    } else {
+        println("A4 同步 RPC 失败")
+    }
+}

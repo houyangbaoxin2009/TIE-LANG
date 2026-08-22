@@ -389,6 +389,25 @@ pub func find_enum_node(name: string) -> i64 {
     return -1
 }
 
+// 查找顶层 actor 定义节点（按名字；g_extra_tops 顶层 + 命名空间递归）。
+// 镜像 find_enum_node——Step4b-2 生成方法 handler 时需要 actor 的 AST 节点
+//（其 FnDef body 在此节点 children[字段..., 方法...] 中）。
+pub func find_actor_node(name: string) -> i64 {
+    var n = len(g_extra_tops)
+    var i: i64 = 0
+    while i < n {
+        var s = g_extra_tops[i]
+        var tag = s_tags[s]
+        if tag == N_ACTOR {
+            if sstate.name_str(s) == name {
+                return s
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
 // 命名空间体内递归查找 enum 节点（含嵌套 namespace）
 func find_enum_in_ns(blk: i64, name: string) -> i64 {
     var n = sstate.nchild(blk)

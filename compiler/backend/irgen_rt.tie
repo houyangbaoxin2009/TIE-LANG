@@ -459,6 +459,10 @@ func tig_actor_run(id: i64) -> i64 {
         s21_store(s21_gep(rec, foff, true), dv, fty)
         fk = fk + 1
     }
+    // Step4b-2：pending @64=0、done @96=0、dispatch @104 = actor_disp_<aidx> 地址
+    s21_store(s21_gep(rec, 64, true), tig_int_lit_ty(0, T64), T64)
+    s21_store(s21_gep(rec, 96, true), tig_int_lit_ty(0, T64), T64)
+    s21_store(s21_gep(rec, 104, true), tig_func_addr("actor_disp_" + to_string(aidx)), T64)
     // lock @8：InitializeCriticalSection(ptr)
     var lockp = s21_gep(rec, 8, true)  // A_OFF_LOCK = 8
     var ats1: table<i64> = table_new_i64()
@@ -531,31 +535,55 @@ func gen_actor_loop_eager() {
     var lockp = s21_gep(recp, 8, true)
     var cvp = s21_gep(recp, 48, true)
     var shutp = s21_gep(recp, 56, true)
+    var pendp = s21_gep(recp, 64, true)
+    var midp = s21_gep(recp, 72, true)
+    var argp = s21_gep(recp, 80, true)
+    var resp = s21_gep(recp, 88, true)
+    var donep = s21_gep(recp, 96, true)
+    var dispp = s21_gep(recp, 104, true)
     var loop = ir.new_block(fid, interner.intern("al.loop"))
-    var wait = ir.new_block(fid, interner.intern("al.wait"))
-    var exit = ir.new_block(fid, interner.intern("al.exit"))
+    var check = ir.new_block(fid, interner.intern("al.chk"))
+    var mb = ir.new_block(fid, interner.intern("al.mb"))
+    var idle = ir.new_block(fid, interner.intern("al.idle"))
+    var work = ir.new_block(fid, interner.intern("al.work"))
+    var exitb = ir.new_block(fid, interner.intern("al.exit"))
     // entry → br loop
     var br0 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(br0, loop, 1)
-    // loop：持锁 → 读 shutdown → icmp ne 0 → cond_br（exit / wait）
+    // loop：持锁 → br check
     g_cur_block = loop
     var atsE: table<i64> = table_new_i64()
     var avsE: table<i64> = table_new_i64()
     table_push(atsE, types.named(TK_STR))
     table_push(avsE, lockp)
     tig_ext_call_typed("EnterCriticalSection", atsE, avsE, -1)
+    var brc = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brc, check, 1)
+    // check：读 pending / shutdown → haswork -> work/mb；mb 里 isdown -> exitb/idle
+    g_cur_block = check
+    var pv = s21_load(pendp, T64)
     var sd = s21_load(shutp, T64)
     var z0 = tig_int_lit_ty(0, T64)
-    var ic = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp ne
-    ir.add_operand(ic, sd, 0)
-    ir.add_operand(ic, z0, 0)
-    ir.add_operand(ic, 1, 2)  // ne
-    var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
-    ir.add_operand(cb, ir.get_value(ic), 0)
-    ir.add_operand(cb, exit, 1)
-    ir.add_operand(cb, wait, 1)
-    // wait：SleepConditionVariableCS(cv, lock, INFINITE)；解锁 → 回环
-    g_cur_block = wait
+    var icw = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp ne
+    ir.add_operand(icw, pv, 0)
+    ir.add_operand(icw, z0, 0)
+    ir.add_operand(icw, 1, 2)  // ne
+    var cbw = ir.new_inst(g_cur_block, 31, -1)  // cond_br haswork
+    ir.add_operand(cbw, ir.get_value(icw), 0)
+    ir.add_operand(cbw, work, 1)
+    ir.add_operand(cbw, mb, 1)
+    // mb：isdown → exitb / idle
+    g_cur_block = mb
+    var icd = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+    ir.add_operand(icd, sd, 0)
+    ir.add_operand(icd, z0, 0)
+    ir.add_operand(icd, 1, 2)  // ne
+    var cbd = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbd, ir.get_value(icd), 0)
+    ir.add_operand(cbd, exitb, 1)
+    ir.add_operand(cbd, idle, 1)
+    // idle：SleepConditionVariableCS(cv, lock, INFINITE)；解锁 → 回环（重查）
+    g_cur_block = idle
     var inf = tig_int_lit_ty(0xFFFFFFFF, types.named(TK_I32))  // INFINITE
     var atsW: table<i64> = table_new_i64()
     var avsW: table<i64> = table_new_i64()
@@ -573,8 +601,51 @@ func gen_actor_loop_eager() {
     tig_ext_call_typed("LeaveCriticalSection", atsL, avsL, -1)
     var bw = ir.new_inst(g_cur_block, 30, -1)  // br loop
     ir.add_operand(bw, loop, 1)
+    // work：取 mid/arg0，清 pending，解锁，间接调 dispatch，写 result+done，唤醒
+    g_cur_block = work
+    var mid_v = s21_load(midp, T64)
+    var arg_v = s21_load(argp, T64)
+    s21_store(pendp, tig_int_lit_ty(0, T64), T64)
+    var disp = s21_load(dispp, T64)
+    var atsW2: table<i64> = table_new_i64()
+    var avsW2: table<i64> = table_new_i64()
+    table_push(atsW2, types.named(TK_STR))
+    table_push(avsW2, lockp)
+    tig_ext_call_typed("LeaveCriticalSection", atsW2, avsW2, -1)
+    // funcptr = inttoptr(disp)；op70 call_indirect(entry, ret, env=recp, mid, arg)
+    var fp = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr
+    ir.add_operand(fp, disp, 0)
+    var fpv = ir.get_value(fp)
+    var ci = ir.new_inst(g_cur_block, 70, T64)  // call_indirect
+    ir.add_operand(ci, fpv, 0)
+    ir.add_operand(ci, T64, 2)  // 返回类型 IMM
+    ir.add_operand(ci, recp, 0) // env（record ptr）
+    ir.add_operand(ci, T64, 2)  // mid 类型
+    ir.add_operand(ci, mid_v, 0)
+    ir.add_operand(ci, T64, 2)  // arg 类型
+    ir.add_operand(ci, arg_v, 0)
+    var res = ir.get_value(ci)
+    var atsE2: table<i64> = table_new_i64()
+    var avsE2: table<i64> = table_new_i64()
+    table_push(atsE2, types.named(TK_STR))
+    table_push(avsE2, lockp)
+    tig_ext_call_typed("EnterCriticalSection", atsE2, avsE2, -1)
+    s21_store(resp, res, T64)
+    s21_store(donep, tig_int_lit_ty(1, T64), T64)
+    var atsWk: table<i64> = table_new_i64()
+    var avsWk: table<i64> = table_new_i64()
+    table_push(atsWk, types.named(TK_STR))
+    table_push(avsWk, cvp)
+    tig_ext_call_typed("WakeConditionVariable", atsWk, avsWk, -1)
+    var atsL2: table<i64> = table_new_i64()
+    var avsL2: table<i64> = table_new_i64()
+    table_push(atsL2, types.named(TK_STR))
+    table_push(avsL2, lockp)
+    tig_ext_call_typed("LeaveCriticalSection", atsL2, avsL2, -1)
+    var bw2 = ir.new_inst(g_cur_block, 30, -1)  // br loop
+    ir.add_operand(bw2, loop, 1)
     // exit：解锁 → ret 0
-    g_cur_block = exit
+    g_cur_block = exitb
     var atsX: table<i64> = table_new_i64()
     var avsX: table<i64> = table_new_i64()
     table_push(atsX, types.named(TK_STR))
@@ -615,6 +686,359 @@ func tig_actor_spawn(rec: i64) {
     // 对 TK_STR 返回的错误字符串扫描（strlen HANDLE → 崩溃）
     tig_ext_call_typed("CreateThread", atsC, avsC, types.ptr_of(types.named(TK_I8)))
 }
+// ==================== Step4b-2：actor 方法 dispatch + 同步 RPC ====================
+// per-actor dispatch 函数 `actor_disp_<aidx>`（fn(i64 rec, i64 mid, i64 arg0) -> i64）：
+// 按 method_id switch 调用对应 handler（actor_m_<aidx>_<mi>），缺省返回 0。
+// handler 签名 fn(i64 rec, 方法形参...) -> ret，内部把 actor 私有状态字段绑定到
+// record 槽（scope_put 字段 → gep(rec, foff)），再编译方法 body（tig_block_stmts）。
+// 二者于模块生成开始时急切生成（gen_actor_dispatch_eager），run 把 dispatch 地址
+// 存 record @104；@actor_loop 持锁等 pending → 置 0 → 解锁跑 dispatch → 存 result/
+// done → 唤醒调用方。
+
+// 取 actor 节点的第 mi 个方法 FnDef 节点（children 中按 N_FN_DEF 声明序；字段在前）
+func actor_method_node(anode: i64, mi: i64) -> i64 {
+    var nc = sstate.nchild(anode)
+    var mcount: i64 = 0
+    var k2: i64 = 0
+    while k2 < nc {
+        var c = sstate.child(anode, k2)
+        if s_tags[c] == S_N_FN_DEF {
+            if mcount == mi {
+                return c
+            }
+            mcount = mcount + 1
+        }
+        k2 = k2 + 1
+    }
+    return -1
+}
+
+// 生成单个 actor 方法的 handler 函数（返回 0 成功 / -1 错误）
+func gen_actor_method(aidx: i64, mi: i64, anode: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var fn_node = actor_method_node(anode, mi)
+    if fn_node < 0 {
+        sm_err_msg = "actor 方法 " + to_string(mi) + " 节点未找到"
+        return -1
+    }
+    var npars = s_aux[fn_node]
+    var mret = ac_mret[aidx]
+    var ret_ty = ac_mrets[mret + mi]
+    var fname = "actor_m_" + to_string(aidx) + "_" + to_string(mi)
+    // 参数表：[rec(i64)] + 方法形参数（ac_mptys 段累积偏移）
+    var pstart = ac_paroff[aidx]
+    var pk: i64 = 0
+    while pk < mi {
+        pstart = pstart + ac_mnpars[ac_mpar[aidx] + pk]
+        pk = pk + 1
+    }
+    var params: table<i64> = table_new_i64()
+    table_push(params, T64)  // rec
+    var j: i64 = 0
+    while j < npars {
+        table_push(params, ac_mptys[pstart + j])
+        j = j + 1
+    }
+    var fid = ir.new_func(intern.intern(fname), ret_ty, params)
+    g_cur_func = fid
+    var entry = ir.new_block(fid, interner.intern("entry"))
+    g_cur_block = entry
+    g_cur_ret_ty = ret_ty
+    g_cur_fn_name = str.clone(fname)
+    // 每函数重置作用域/循环/表变量（镜像 tig_fn_def）
+    g_sc_keys = table_new_i64()
+    g_sc_allocas = table_new_i64()
+    g_sc_tys = table_new_i64()
+    g_sc_top = 0
+    g_lp_labels = table_new_i64()
+    g_lp_breaks = table_new_i64()
+    g_lp_cont = table_new_i64()
+    g_lp_top = 0
+    g_tv_keys = table_new_i64()
+    g_tv_elems = table_new_i64()
+    // rec = inttoptr(param0) → ptr
+    var rec = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr
+    ir.add_operand(rec, ir.param_val(fid, 0), 0)
+    var recp = ir.get_value(rec)
+    // 绑定 actor 私有状态字段到 record 槽（scope_put(字段 → gep(rec,foff))）
+    var fbase = ac_fvoff[aidx]
+    var fcnt = ac_fncnt[aidx]
+    var fk: i64 = 0
+    while fk < fcnt {
+        scope_put(ac_fnames[fbase + fk], s21_gep(recp, ac_foffs[fbase + fk], true), ac_ftys[fbase + fk])
+        fk = fk + 1
+    }
+    // 绑定方法形参（params[1..] → alloca + store pararm_val(fid, 1+j)）
+    j = 0
+    while j < npars {
+        var p = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + j)
+        var pname = sstate.name_str(p)
+        var pty = ac_mptys[pstart + j]
+        var alloca = ir.new_inst(g_cur_block, 20, pty)  // alloca
+        ir.add_operand(alloca, pty, 2)
+        var av = ir.get_value(alloca)
+        var st = ir.new_inst(g_cur_block, 22, -1)  // store 参数
+        ir.add_operand(st, pty, 2)
+        ir.add_operand(st, ir.param_val(fid, 1 + j), 0)
+        ir.add_operand(st, av, 0)
+        scope_put(intern.intern(pname), av, pty)
+        j = j + 1
+    }
+    // 函数体：children[slot_off + 1 + npars]
+    var body = sstate.child(fn_node, sstate.slot_off(fn_node) + 1 + npars)
+    var r = tig_block_stmts(body)
+    if r < 0 {
+        return -1
+    }
+    // 末尾补 ret（镜像 tig_fn_def；先建常量后建 ret）
+    if !block_terminated() {
+        if ret_ty == types.named(TK_VOID) {
+            var rv = ir.new_inst(g_cur_block, 32, -1)  // ret void
+        } else {
+            var dv = tig_default_val(ret_ty)
+            var ret = ir.new_inst(g_cur_block, 32, ret_ty)
+            ir.add_operand(ret, dv, 0)
+        }
+    }
+    return 0
+}
+
+// 生成单个 actor 的 dispatch 函数 `actor_disp_<aidx>`。签名适配 opcode 70
+// call_indirect（强制 env ptr 首参）：`fn(ptr env, i64 mid, i64 arg) -> i64`，
+// env = record 指针。线性比较链 switch method_id → 各分支调 handler+ret；
+// 缺省 ret 0。返回 0 成功 / -1。
+func gen_actor_dispatch(aidx: i64, anode: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var nmeth = ac_mn[aidx]
+    var fname = "actor_disp_" + to_string(aidx)
+    var params: table<i64> = table_new_i64()
+    table_push(params, types.named(TK_STR))  // env（record ptr）
+    table_push(params, T64)                  // mid
+    table_push(params, T64)                  // arg0
+    var fid = ir.new_func(interner.intern(fname), T64, params)
+    g_cur_func = fid
+    var entry = ir.new_block(fid, interner.intern("entry"))
+    g_cur_block = entry
+    g_cur_ret_ty = T64
+    g_cur_fn_name = str.clone(fname)
+    g_sc_keys = table_new_i64()
+    g_sc_allocas = table_new_i64()
+    g_sc_tys = table_new_i64()
+    g_sc_top = 0
+    g_lp_labels = table_new_i64()
+    g_lp_breaks = table_new_i64()
+    g_lp_cont = table_new_i64()
+    g_lp_top = 0
+    g_tv_keys = table_new_i64()
+    g_tv_elems = table_new_i64()
+    // rec_i64 = ptrtoint(env)（handler 的 rec 形参是 i64；handler 内部再 inttoptr）
+    var env_p = ir.param_val(fid, 0)
+    var recpi = ir.new_inst(g_cur_block, 24, T64)  // ptrtoint → i64
+    ir.add_operand(recpi, env_p, 0)
+    var rec_i64 = ir.get_value(recpi)
+    // 生成比较链：rest = 入口块；对每个方法 i，rest 里 icmp eq(mid, i) →
+    // 命中块（调 handler+ret）/ 下一 rest；最后一个 rest = 缺省 ret 0
+    var mi: i64 = 0
+    while mi < nmeth {
+        // 当前块 icmp eq mid, mi
+        var mid = ir.param_val(fid, 1)
+        var mi_c = tig_int_lit_ty(mi, T64)
+        var ic = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp eq
+        ir.add_operand(ic, mid, 0)
+        ir.add_operand(ic, mi_c, 0)
+        ir.add_operand(ic, 0, 2)  // eq
+        var icv = ir.get_value(ic)
+        var hit = ir.new_block(fid, interner.intern("d." + to_string(mi)))
+        var nxt = ir.new_block(fid, interner.intern("d." + to_string(mi + 1)))
+        var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+        ir.add_operand(cb, icv, 0)
+        ir.add_operand(cb, hit, 1)
+        ir.add_operand(cb, nxt, 1)
+        // 命中块：call handler + ret/ret0（void → 只调用，回 0）
+        g_cur_block = hit
+        var hname = "actor_m_" + to_string(aidx) + "_" + to_string(mi)
+        llvmgen.call_sym_reg(intern.intern(hname))
+        var hret = ac_mrets[ac_mret[aidx] + mi]
+        var hnpar = ac_mnpars[ac_mpar[aidx] + mi]
+        var is_void = (hret == types.named(TK_VOID))
+        var ty35: i64 = hret
+        if is_void {
+            ty35 = -1
+        }
+        var inst = ir.new_inst(g_cur_block, 35, ty35)  // call
+        ir.add_operand(inst, interner.intern(hname), 0)
+        ir.add_operand(inst, hret, 2)  // 返回类型 IMM
+        ir.add_operand(inst, T64, 2)
+        ir.add_operand(inst, rec_i64, 0)  // rec（i64）
+        if hnpar >= 1 {
+            // 一期单参数（arg0 槽）
+            ir.add_operand(inst, T64, 2)
+            ir.add_operand(inst, ir.param_val(fid, 2), 0)
+        }
+        if is_void {
+            var dv = tig_int_lit_ty(0, T64)
+            var ret = ir.new_inst(g_cur_block, 32, T64)  // ret 0
+            ir.add_operand(ret, dv, 0)
+        } else {
+            var ret = ir.new_inst(g_cur_block, 32, hret)
+            ir.add_operand(ret, ir.get_value(inst), 0)
+        }
+        g_cur_block = nxt
+        mi = mi + 1
+    }
+    // 缺省：ret 0
+    var def0 = tig_int_lit_ty(0, T64)
+    var dret = ir.new_inst(g_cur_block, 32, T64)
+    ir.add_operand(dret, def0, 0)
+    return 0
+}
+
+// eager 生成全部 actor 的 dispatch + handler（模块起始，任何用户函数之前）。
+func gen_actor_dispatch_eager() {
+    if g_actor_disp_gen == 1 {
+        return
+    }
+    g_actor_disp_gen = 1
+    var n = len(ac_vals)
+    var i: i64 = 0
+    while i < n {
+        var anm = intern.lookup(ac_keys[i])
+        // 内联查找 actor 节点（g_extra_tops 顶层 N_ACTOR；避免跨命名空间依赖）
+        var anode: i64 = -1
+        var g2: i64 = 0
+        while g2 < len(g_extra_tops) {
+            var s2 = g_extra_tops[g2]
+            if s_tags[s2] == N_ACTOR {
+                if sstate.name_str(s2) == anm {
+                    anode = s2
+                }
+            }
+            g2 = g2 + 1
+        }
+        if anode >= 0 {
+            var mcnt = ac_mn[i]
+            var k2: i64 = 0
+            while k2 < mcnt {
+                gen_actor_method(i, k2, anode)
+                k2 = k2 + 1
+            }
+            gen_actor_dispatch(i, anode)
+        }
+        i = i + 1
+    }
+}
+
+// 调用方同步 RPC 生成：`c.m(args)` → 入队（等 pending 空闲 → 写
+// method_id/arg0/done=0/pending=1 → 解锁唤醒）→ 等 done → 读 result 返回。
+// 单条件变量 + 谓词检查免丢唤醒（等 done 时 SleepConditionVariableCS 释放锁，
+// actor 线程可持锁写 result+done+唤醒）。返回结果值 id（void → 0 哑值）。
+// 全部新块归 g_cur_func；result 在 done 块 load，调用方续在同一块追加。
+func gen_actor_sync_call(rech: i64, mi: i64, arg_v: i64, ret_ty: i64) -> i64 {
+    var T64 = types.named(TK_I64)
+    var P = types.named(TK_STR)
+    // rec_ptr = inttoptr(rech)
+    var rp = ir.new_inst(g_cur_block, 25, P)
+    ir.add_operand(rp, rech, 0)
+    var rec_ptr = ir.get_value(rp)
+    var lockp = s21_gep(rec_ptr, 8, true)
+    var cvp = s21_gep(rec_ptr, 48, true)
+    var pendp = s21_gep(rec_ptr, 64, true)
+    var midp = s21_gep(rec_ptr, 72, true)
+    var argp = s21_gep(rec_ptr, 80, true)
+    var resp = s21_gep(rec_ptr, 88, true)
+    var donep = s21_gep(rec_ptr, 96, true)
+    var is_void = (ret_ty == types.named(TK_VOID))
+    // ① 入队：Enter(lock)
+    var atsE0: table<i64> = table_new_i64()
+    var avsE0: table<i64> = table_new_i64()
+    table_push(atsE0, P)
+    table_push(avsE0, lockp)
+    tig_ext_call_typed("EnterCriticalSection", atsE0, avsE0, -1)
+    var gate1 = ir.new_block(g_cur_func, interner.intern("s.g1"))
+    var w1 = ir.new_block(g_cur_func, interner.intern("s.w1"))
+    var p1 = ir.new_block(g_cur_func, interner.intern("s.p1"))
+    var brg = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brg, gate1, 1)
+    g_cur_block = gate1
+    var pend_v = s21_load(pendp, T64)
+    var zero64 = tig_int_lit_ty(0, T64)
+    var busy = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+    ir.add_operand(busy, pend_v, 0)
+    ir.add_operand(busy, zero64, 0)
+    ir.add_operand(busy, 1, 2)  // ne
+    var cbb = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbb, ir.get_value(busy), 0)
+    ir.add_operand(cbb, w1, 1)
+    ir.add_operand(cbb, p1, 1)
+    // w1：Sleep；回 gate1
+    g_cur_block = w1
+    var inf = tig_int_lit_ty(0xFFFFFFFF, types.named(TK_I32))
+    var atsW1: table<i64> = table_new_i64()
+    var avsW1: table<i64> = table_new_i64()
+    table_push(atsW1, P); table_push(avsW1, cvp)
+    table_push(atsW1, P); table_push(avsW1, lockp)
+    table_push(atsW1, types.named(TK_I32)); table_push(avsW1, inf)
+    tig_ext_call_typed("SleepConditionVariableCS", atsW1, avsW1, types.named(TK_I8))
+    var bw1 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bw1, gate1, 1)
+    // p1：写槽 + 解锁 + 唤醒 + 再入锁
+    g_cur_block = p1
+    s21_store(midp, tig_int_lit_ty(mi, T64), T64)
+    s21_store(argp, arg_v, T64)
+    s21_store(donep, zero64, T64)
+    s21_store(pendp, tig_int_lit_ty(1, T64), T64)
+    var atsL1: table<i64> = table_new_i64()
+    var avsL1: table<i64> = table_new_i64()
+    table_push(atsL1, P); table_push(avsL1, lockp)
+    tig_ext_call_typed("LeaveCriticalSection", atsL1, avsL1, -1)
+    var atsWk: table<i64> = table_new_i64()
+    var avsWk: table<i64> = table_new_i64()
+    table_push(atsWk, P); table_push(avsWk, cvp)
+    tig_ext_call_typed("WakeConditionVariable", atsWk, avsWk, -1)
+    var atsE2: table<i64> = table_new_i64()
+    var avsE2: table<i64> = table_new_i64()
+    table_push(atsE2, P); table_push(avsE2, lockp)
+    tig_ext_call_typed("EnterCriticalSection", atsE2, avsE2, -1)
+    var gate2 = ir.new_block(g_cur_func, interner.intern("s.g2"))
+    var w2 = ir.new_block(g_cur_func, interner.intern("s.w2"))
+    var doneb = ir.new_block(g_cur_func, interner.intern("s.done"))
+    var brg2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(brg2, gate2, 1)
+    // gate2：等 done
+    g_cur_block = gate2
+    var d_v = s21_load(donep, T64)
+    var isdone = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))
+    ir.add_operand(isdone, d_v, 0)
+    ir.add_operand(isdone, zero64, 0)
+    ir.add_operand(isdone, 1, 2)  // ne
+    var cbd = ir.new_inst(g_cur_block, 31, -1)
+    ir.add_operand(cbd, ir.get_value(isdone), 0)
+    ir.add_operand(cbd, doneb, 1)
+    ir.add_operand(cbd, w2, 1)
+    // w2：Sleep；回 gate2
+    g_cur_block = w2
+    var inf2 = tig_int_lit_ty(0xFFFFFFFF, types.named(TK_I32))
+    var atsW2: table<i64> = table_new_i64()
+    var avsW2: table<i64> = table_new_i64()
+    table_push(atsW2, P); table_push(avsW2, cvp)
+    table_push(atsW2, P); table_push(avsW2, lockp)
+    table_push(atsW2, types.named(TK_I32)); table_push(avsW2, inf2)
+    tig_ext_call_typed("SleepConditionVariableCS", atsW2, avsW2, types.named(TK_I8))
+    var bw2 = ir.new_inst(g_cur_block, 30, -1)
+    ir.add_operand(bw2, gate2, 1)
+    // done：读 result；解锁；返回
+    g_cur_block = doneb
+    var res = s21_load(resp, T64)
+    var atsL2: table<i64> = table_new_i64()
+    var avsL2: table<i64> = table_new_i64()
+    table_push(atsL2, P); table_push(avsL2, lockp)
+    tig_ext_call_typed("LeaveCriticalSection", atsL2, avsL2, -1)
+    if is_void {
+        return tig_int_lit_ty(0, T64)
+    }
+    return res
+}
+
 // bool → false；f64 → 0.0（const_f）；i8/i32 等 → 0 常量
 func tig_default_val(ty: i64) -> i64 {
     if ty == types.named(TK_STR) || types.is_table(ty) || types.is_map(ty) {
