@@ -1,0 +1,603 @@
+type tie<class>
+// compiler/backend/irgen_agg.tie —— 生成器 L5 聚合结构子模块（元组/struct/enum/table 字面量与字段访问）
+// ============================================================
+// 从 irgen.tie 的 L5 聚合结构层拆出（同 namespace irgen 文本内联跨文件）；本文件只含函数，
+// 不含顶层全局 var。依赖经主文件 import 链内联可达，不重复 import。
+namespace irgen {
+
+// 取聚合 base 的地址（alloca 指针）：Var → 作用域槽地址；表达式 → 求聚合值
+// 后 alloca + store（寄存器聚合值落内存，供 GEP 寻址）。
+func tig_agg_addr(base: i64, agg: i64) -> i64 {
+    if s_tags[base] == 6 {
+        var nm = interner.intern(sstate.name_str(base))
+        if scope_get_global(nm) >= 0 && g_lookup_is_global == 0 {
+            return g_lookup_alloca  // 局部聚合变量槽
+        }
+    }
+    // 表达式（构造调用 / 函数返回 / 字段链）→ 落内存
+    var v = tig_expr(base)
+    if v < 0 {
+        return -1
+    }
+    var alloca = ir.new_inst(g_cur_block, 20, agg)  // alloca 聚合
+    ir.add_operand(alloca, agg, 2)
+    var ap = ir.get_value(alloca)
+    var st = ir.new_inst(g_cur_block, 22, -1)  // store 聚合值
+    ir.add_operand(st, agg, 2)
+    ir.add_operand(st, v, 0)
+    ir.add_operand(st, ap, 0)
+    return ap
+}
+
+// 元组字面量 (a, b) → 聚合值：alloca 聚合 → 逐字段 agg_gep + store → load。
+// 字段类型取自语义层 tup_tys（node_types[id] 已登记元组类型）。
+func tig_tuple_lit(id: i64) -> i64 {
+    var agg = node_types[id]
+    if agg < 0 {
+        sm_err_msg = "元组字面量缺少语义类型（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    return tig_tuple_lit_typed(id, agg)
+}
+
+// 元组字面量按**目标类型**构造（类型标注适配）：`var w: (i32, i64) = (7, 8)`
+// 时语义层把字面量推断为 (i64,i64)，必须按目标 (i32,i64) 构造——IntLit 字段
+// 按目标字段类型生成常量（i32 槽存 i32 值；f64 槽转浮点字面量）。
+func tig_tuple_lit_typed(id: i64, agg: i64) -> i64 {
+    var alloca = ir.new_inst(g_cur_block, 20, agg)  // alloca
+    ir.add_operand(alloca, agg, 2)
+    var ap = ir.get_value(alloca)
+    var nc = sstate.nchild(id)
+    var i: i64 = 0
+    while i < nc {
+        var f = sstate.child(id, i)  // N_TUPLE_FIELD
+        var vnode = sstate.child(f, 0)
+        var fty = agg_field_ty(agg, i)
+        var v: i64 = -1
+        if s_tags[vnode] == 0 {
+            // IntLit：按目标字段类型生成常量（i32 槽 i32 值 / f64 槽浮点文本）
+            if fty == types.named(TK_F64) || fty == types.named(TK_F32) {
+                v = tig_float_lit(interner.intern(to_string(s_vals[vnode]) + ".0"))
+            } else {
+                v = tig_int_lit_ty(s_vals[vnode], fty)
+            }
+        } else {
+            v = tig_expr(vnode)
+        }
+        if v < 0 {
+            return -1
+        }
+        var gp = ir.new_inst(g_cur_block, 27, agg)  // agg_gep
+        ir.add_operand(gp, ap, 0)
+        ir.add_operand(gp, i, 2)
+        var gpp = ir.get_value(gp)
+        var st = ir.new_inst(g_cur_block, 22, -1)  // store
+        ir.add_operand(st, fty, 2)
+        ir.add_operand(st, v, 0)
+        ir.add_operand(st, gpp, 0)
+        i = i + 1
+    }
+    var ld = ir.new_inst(g_cur_block, 21, agg)  // load 聚合值
+    ir.add_operand(ld, ap, 0)
+    return ir.get_value(ld)
+}
+
+// 字段访问（读）：base.field → 地址 + agg_gep + load。
+func tig_field_access(id: i64) -> i64 {
+    var base = sstate.child(id, 0)
+    var fname = sstate.name_str(id)
+    var base_ty = node_types[base]
+    var bk = types.kind(base_ty)
+    if base_ty < 0 || (bk != K_TUPLE && bk != K_STRUCT) {
+        sm_err_msg = "字段访问 '.' 的对象不是元组/struct（类型 " + types.type_name(base_ty) + "，函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var fidx = agg_field_index(base_ty, fname)
+    if fidx < 0 {
+        sm_err_msg = "字段 '" + fname + "' 解析失败（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var fty = agg_field_ty(base_ty, fidx)
+    var addr = tig_agg_addr(base, base_ty)
+    if addr < 0 {
+        return -1
+    }
+    var gp = ir.new_inst(g_cur_block, 27, base_ty)  // agg_gep
+    ir.add_operand(gp, addr, 0)
+    ir.add_operand(gp, fidx, 2)
+    var gpp = ir.get_value(gp)
+    var ld = ir.new_inst(g_cur_block, 21, fty)  // load
+    ir.add_operand(ld, gpp, 0)
+    return ir.get_value(ld)
+}
+
+// 字段赋值（FieldAssign 115）：base.field op= value → 地址 + agg_gep + store。
+// 复合赋值（op ≥ 0）先 load 旧值运算再写回（对齐 tig_compound_assign）。
+func tig_field_assign(id: i64) -> i64 {
+    var fname = sstate.name_str(id)
+    var base = sstate.child(id, 0)
+    var val = sstate.child(id, 1)
+    var op = s_vals[id]
+    var base_ty = node_types[base]
+    var bk = types.kind(base_ty)
+    if base_ty < 0 || (bk != K_TUPLE && bk != K_STRUCT) {
+        sm_err_msg = "字段赋值的目标不是元组/struct（类型 " + types.type_name(base_ty) + "，函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var fidx = agg_field_index(base_ty, fname)
+    if fidx < 0 {
+        sm_err_msg = "字段 '" + fname + "' 解析失败（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var fty = agg_field_ty(base_ty, fidx)
+    var addr = tig_agg_addr(base, base_ty)
+    if addr < 0 {
+        return -1
+    }
+    var gp = ir.new_inst(g_cur_block, 27, base_ty)  // agg_gep
+    ir.add_operand(gp, addr, 0)
+    ir.add_operand(gp, fidx, 2)
+    var gpp = ir.get_value(gp)
+    if op >= 0 {
+        // 复合字段赋值：load 旧值 → 运算 → store
+        var cur = ir.new_inst(g_cur_block, 21, fty)  // load
+        ir.add_operand(cur, gpp, 0)
+        var cur_v = ir.get_value(cur)
+        var rv = tig_expr(val)
+        if rv < 0 {
+            return -1
+        }
+        var res = tig_compound_assign(op, cur_v, rv, fty)
+        if res < 0 {
+            sm_err_msg = "复合字段赋值运算失败（字段 " + fname + "，函数 " + g_cur_fn_name + "）"
+            return -1
+        }
+        var st = ir.new_inst(g_cur_block, 22, -1)  // store
+        ir.add_operand(st, fty, 2)
+        ir.add_operand(st, res, 0)
+        ir.add_operand(st, gpp, 0)
+        return 0
+    }
+    var vv = tig_expr(val)
+    if vv < 0 {
+        return -1
+    }
+    // S1.3 窄整数字段：赋值值按字段类型转换（i64 值 → i32 字段）
+    var vt = node_types[val]
+    if vt >= 0 && (types.is_int(vt) || types.is_float(vt)) &&
+        (types.is_int(fty) || types.is_float(fty)) && vt != fty {
+        var cv = tig_coerce(vv, vt, fty)
+        if cv < 0 {
+            return -1
+        }
+        vv = cv
+    }
+    var st2 = ir.new_inst(g_cur_block, 22, -1)  // store
+    ir.add_operand(st2, fty, 2)
+    ir.add_operand(st2, vv, 0)
+    ir.add_operand(st2, gpp, 0)
+    return 0
+}
+
+// struct 名判定（构造调用：Call 名命中 st_keys）
+func is_struct_name(nm: string) -> bool {
+    var nid = interner.intern(nm)
+    return sstate.bs_find(st_keys, nid) >= 0
+}
+
+// enum 名判定（2026-08-15 enum 语言特性）：枚举名命中 en_keys。
+// 仿 is_struct_name——构造分派点（FieldAccess/MethodCall/Call）用。
+func is_enum_name(nm: string) -> bool {
+    var nid = interner.intern(nm)
+    return sstate.bs_find(en_keys, nid) >= 0
+}
+
+// 枚举变体 tag 解析：枚举名 + 变体名 → tag 值（0..nvar-1）；-1 = 未找到。
+// 在 en_vnames 拍平段（en_varoff[ei] 起 en_nvar[ei] 个）线性查找变体名。
+// 供 tig_enum_construct（构造）与 tig_switch（case 模式 → tag 常量）共用。
+func enum_variant_tag(ei: i64, vname: string) -> i64 {
+    var varoff = en_varoff[ei]
+    var nvar = en_nvar[ei]
+    var k: i64 = 0
+    while k < nvar {
+        if intern.lookup(en_vnames[varoff + k]) == vname {
+            return en_vtags[varoff + k]
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// 枚举 switch 的 case 模式 → tag 常量（-1 = 非法模式）。
+// 模式形态：FieldAccess(Enum.Variant)——base 是枚举名 Var，name 是变体名。
+// 枚举名解析：普通 enum 直接查 en_keys；泛型 enum 模板名（如 Option）经
+// gin 记录反查——subject 是对应模板的实例化时，解析到 subject 的实例
+//（scheck 已做同款校验，此处防御性复核）。返回变体 tag 值（0..nvar-1）。
+func enum_case_tag(pat: i64, subj_ty: i64) -> i64 {
+    var ei = types.low(subj_ty)
+    // 批次 7：N_CASE_BIND（`case Ok(v)` 解构）→ 取其变体引用子节点
+    if s_tags[pat] == N_CASE_BIND {
+        pat = sstate.child(pat, 0)
+    }
+    // 变体引用：FieldAccess（Enum.Variant）或裸 Var（Variant，枚举名取 subject）
+    if s_tags[pat] != 15 && s_tags[pat] != 6 {
+        return -1  // 非变体引用（scheck 已拦截，防御）
+    }
+    var bname = ""
+    if s_tags[pat] == 15 {
+        var base = sstate.child(pat, 0)
+        if s_tags[base] != 6 {
+            return -1  // base 非 Var（scheck 已拦截，防御）
+        }
+        bname = sstate.name_str(base)
+    } else {
+        bname = sstate.enum_name_of(ei)
+    }
+    var eidx = sstate.bs_find(en_keys, interner.intern(bname))
+    var ei2: i64 = -1
+    if eidx >= 0 {
+        ei2 = en_vals[eidx]
+    } else {
+        // 泛型 enum 模板：subject 必须是对应模板的实例化
+        var gidx = sstate.gt_find(bname)
+        if gidx >= 0 && gty_is_struct[gidx] == 2 {
+            var rec = sstate.gin_find(sstate.enum_name_of(ei))
+            if rec >= 0 && gin_tmpl[rec] == gidx {
+                ei2 = ei
+            }
+        }
+    }
+    if ei2 != ei {
+        return -1  // base 不是同枚举（scheck 已拦截，防御）
+    }
+    return enum_variant_tag(ei, sstate.name_str(pat))
+}
+
+// 批次 7：枚举变体解构 `case Ok(v)` 的 payload 绑定（在绑定块内调用）。
+// subject 已求值（tig_expr 结果，聚合值）；从槽 1 提取 payload，还原成绑定
+// 变量类型（string → inttoptr / 窄整数 → trunc），存入新建 alloca 并 scope_put。
+func tig_case_bind_body(subject: i64, subj_ty: i64, pat: i64) -> i64 {
+    var ei = types.low(subj_ty)
+    var ptag = enum_case_tag(pat, subj_ty)
+    if ptag < 0 {
+        return -1
+    }
+    var T64 = types.named(TK_I64)
+    // payload 类型（变体恰 1 字段，scheck 已校验）
+    var varoff = en_varoff[ei]
+    var foff = en_vfldoff[varoff + ptag]
+    var pty = en_ftys[foff]
+    // subject 聚合地址 + 槽 1（payload）
+    var eaddr = tig_agg_addr(subject, subj_ty)
+    if eaddr < 0 {
+        return -1
+    }
+    var g1 = ir.new_inst(g_cur_block, 27, subj_ty)  // agg_gep 下标 1
+    ir.add_operand(g1, eaddr, 0)
+    ir.add_operand(g1, 1, 2)
+    var g1p = ir.get_value(g1)
+    var ld = ir.new_inst(g_cur_block, 21, T64)  // load i64 payload
+    ir.add_operand(ld, g1p, 0)
+    var pv = ir.get_value(ld)
+    // 还原 payload 类型（对齐 tig_try：string → inttoptr；窄整数 → trunc）
+    var bv: i64 = pv
+    if pty == types.named(TK_STR) {
+        var ip = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr
+        ir.add_operand(ip, pv, 0)
+        bv = ir.get_value(ip)
+    } else if pty != T64 && pty != types.named(TK_U64) && types.is_int(pty) {
+        var cv = tig_coerce(bv, T64, pty)
+        if cv < 0 {
+            return -1
+        }
+        bv = cv
+    }
+    // 绑定变量：新建 alloca（payload 类型）+ store + 登记作用域（body 可引用）
+    var bind_name = sstate.child(pat, 1)
+    var va = ir.new_inst(g_cur_block, 20, pty)  // alloca pty
+    ir.add_operand(va, pty, 2)
+    var vap = ir.get_value(va)
+    s21_store(vap, bv, pty)
+    scope_put(bind_name, vap, pty)
+    return 0
+}
+
+// 枚举构造：EnumName.Variant(args) → 聚合值。
+// eidx：en_keys 下标（构造名反查的枚举）；vname：变体名；id：AST 节点
+//（MethodCall 取实参；FieldAccess 无实参）；arg_start：实参起始 child
+// 下标（MethodCall = slot_off + 1；FieldAccess/无实参 = -1）。
+// 布局（对齐 tig_struct_construct）：alloca %enum.X → store tag（槽 0）→
+// 逐 payload 槽 store（实参覆盖前 nfld 个；其余槽零值）→ load 聚合值。
+// 槽类型统一 i64：窄整数/字符/布尔 payload 经 sext 升宽到 i64（一期白名单
+// 限整数系；string payload 无现成 ptr↔i64 桥 → 报"暂不支持"）。
+func tig_enum_construct(eidx: i64, vname: string, id: i64, arg_start: i64) -> i64 {
+    var ei = en_vals[eidx]
+    var ename = sstate.enum_name_of(ei)
+    var tag = enum_variant_tag(ei, vname)
+    if tag < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "枚举 '" + ename + "' 没有变体 '" + vname + "'（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var varoff = en_varoff[ei]
+    var nfld = en_vnfld[varoff + tag]
+    var foff = en_vfldoff[varoff + tag]
+    var nslot = en_nslot[ei]
+    var agg = types.enum_of(ei)
+    // alloca 聚合（类型 = %enum.X）
+    var alloca = ir.new_inst(g_cur_block, 20, agg)
+    ir.add_operand(alloca, agg, 2)
+    var ap = ir.get_value(alloca)
+    // store tag（槽 0，i64）
+    var tagv = tig_int_lit_ty(tag, types.named(TK_I64))
+    var g0 = ir.new_inst(g_cur_block, 27, agg)  // agg_gep 下标 0
+    ir.add_operand(g0, ap, 0)
+    ir.add_operand(g0, 0, 2)
+    var g0p = ir.get_value(g0)
+    var st0 = ir.new_inst(g_cur_block, 22, -1)  // store
+    ir.add_operand(st0, types.named(TK_I64), 2)
+    ir.add_operand(st0, tagv, 0)
+    ir.add_operand(st0, g0p, 0)
+    // 逐 payload 槽（槽下标 1..nslot；i 从 0 起对应槽 1+i）
+    var i: i64 = 0
+    while i < nslot {
+        var fty: i64 = types.named(TK_I64)
+        var v: i64 = -1
+        if i < nfld {
+            fty = en_ftys[foff + i]
+            var arg = sstate.child(id, arg_start + i)
+            if fty == types.named(TK_STR) {
+                // string payload（S2.3）：槽是 i64，已按 i64 指针值发射的 string
+                // 表达式可直接存储——两类：字符串字面量（const_str 发射为
+                // ptrtoint i64）与字符串拼接（str_cat 输出同为 ptrtoint i64，
+                // 见 llvmgen op==56）；其余 string 变量/调用返回值是 ptr 值，
+                // 需 ptrtoint 转 i64 后存储。读取侧（switch case 绑定 / ? 解包）
+                // 由消费方按需 inttoptr 还原 ptr。
+                v = tig_expr(arg)
+                if v < 0 {
+                    return -1
+                }
+                // 跳过转换：字面量（S_N_STR_LIT=2）或字符串拼接（S_N_BINARY=9
+                // 且语义类型为 string——比较类二元返回 bool 不会命中）
+                var is_i64_ptrval = s_tags[arg] == 2 ||
+                    (s_tags[arg] == 9 && node_types[arg] == types.named(TK_STR))
+                if !is_i64_ptrval {
+                    var pi = ir.new_inst(g_cur_block, 24, types.named(TK_I64))  // ptrtoint
+                    ir.add_operand(pi, v, 0)
+                    v = ir.get_value(pi)
+                }
+            } else {
+                // 窄整数字段 + 整数字面量：按字段类型生成常量（i32 槽 i32 值）——
+                // 否则字面量走 tig_expr 恒 i64，sext i32 %i64 类型不匹配。
+                // 非字面量（变量/表达式）tig_expr 产出天然窄类型（i32 变量 load i32、
+                // 字符/布尔字面量 i32/i1），sext 源类型与 fty 一致。
+                if fty != types.named(TK_I64) && fty != types.named(TK_U64) && s_tags[arg] == 0 {
+                    v = tig_int_lit_ty(s_vals[arg], fty)
+                } else {
+                    v = tig_expr(arg)
+                }
+                if v < 0 {
+                    return -1
+                }
+                // 窄整数/字符/布尔/trit → sext 升宽到 i64（槽统一 i64；u 类型
+                // 升宽用 sext——一期仅 i64 payload 参与验收，符号扩展边界已注释；
+                // string 已是 i64 指针值，不参与升宽）
+                if fty != types.named(TK_I64) && fty != types.named(TK_U64) {
+                    var se = ir.new_inst(g_cur_block, 19, types.named(TK_I64))  // sext
+                    ir.add_operand(se, fty, 2)
+                    ir.add_operand(se, v, 0)
+                    v = ir.get_value(se)
+                }
+            }
+        } else {
+            // 无 payload 变体 / 超出实参的槽：零值（聚合不含未定义位）
+            v = tig_int_lit_ty(0, types.named(TK_I64))
+        }
+        var gp = ir.new_inst(g_cur_block, 27, agg)  // agg_gep 下标 1+i
+        ir.add_operand(gp, ap, 0)
+        ir.add_operand(gp, 1 + i, 2)
+        var gpp = ir.get_value(gp)
+        var st = ir.new_inst(g_cur_block, 22, -1)  // store i64
+        ir.add_operand(st, types.named(TK_I64), 2)
+        ir.add_operand(st, v, 0)
+        ir.add_operand(st, gpp, 0)
+        i = i + 1
+    }
+    var ld = ir.new_inst(g_cur_block, 21, agg)  // load 聚合值
+    ir.add_operand(ld, ap, 0)
+    return ir.get_value(ld)
+}
+
+// struct 构造调用：StructName(args...) → 聚合值。
+// 布局：alloca 聚合 → 逐字段 store（实参覆盖前 n 个；缺省字段零值——
+// 字段默认字面量未登记，与 Rust 行为差异留待后续）→ load 聚合值。
+func tig_struct_construct(id: i64, nm: string) -> i64 {
+    var nid = interner.intern(nm)
+    var sidx = sstate.bs_find(st_keys, nid)
+    if sidx < 0 {
+        sm_err_msg = "struct '" + nm + "' 未定义（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var si = st_vals[sidx]
+    var agg = types.struct_of(si)
+    var alloca = ir.new_inst(g_cur_block, 20, agg)  // alloca
+    ir.add_operand(alloca, agg, 2)
+    var ap = ir.get_value(alloca)
+    var off = cls_fldoff[si]
+    var nf = cls_nfld[si]
+    // 构造调用 children = [泛型槽, 实参...]：实参从 children[slot_off] 起
+    var soff = sstate.slot_off(id)
+    var nc = sstate.nchild(id) - soff
+    var i: i64 = 0
+    while i < nf {
+        var fty = fld_tys[off + i]
+        var v: i64 = -1
+        if i < nc {
+            v = tig_expr(sstate.child(id, soff + i))
+            if v < 0 {
+                return -1
+            }
+            // S1.3 窄整数字段：实参值按字段类型转换（i64 字面量 → i32 字段）
+            var an = sstate.child(id, soff + i)
+            var at = node_types[an]
+            if at >= 0 && (types.is_int(at) || types.is_float(at)) &&
+                (types.is_int(fty) || types.is_float(fty)) && at != fty {
+                var cv = tig_coerce(v, at, fty)
+                if cv < 0 {
+                    return -1
+                }
+                v = cv
+            }
+        } else if off + i < len(fld_defs) && fld_defs[off + i] >= 0 {
+            // 字段默认值（`var y: i64 = 10` → Point(5) 缺省 y 用 10）
+            v = tig_expr(fld_defs[off + i])
+            if v < 0 {
+                return -1
+            }
+        } else {
+            // 无默认值字段：零值（i64=0 / string 空串指针 / bool false）
+            v = tig_default_val(fty)
+        }
+        var gp = ir.new_inst(g_cur_block, 27, agg)  // agg_gep
+        ir.add_operand(gp, ap, 0)
+        ir.add_operand(gp, i, 2)
+        var gpp = ir.get_value(gp)
+        var st = ir.new_inst(g_cur_block, 22, -1)  // store
+        ir.add_operand(st, fty, 2)
+        ir.add_operand(st, v, 0)
+        ir.add_operand(st, gpp, 0)
+        i = i + 1
+    }
+    var ld = ir.new_inst(g_cur_block, 21, agg)  // load 聚合值
+    ir.add_operand(ld, ap, 0)
+    return ir.get_value(ld)
+}
+
+// 表字面量 → 动态表指针（tie_table_new + 逐元素 push）。
+// 元素类型：语义 node_types 首元素推断；空表 → i64 兜底。
+func tig_table_lit(id: i64) -> i64 {
+    // E3 键值表（map）字面量：任一个 cell 带字符串键（TableCell → TableId，
+    // TableId name = 字符串键池 id >= 0；数字键 name=-1 不算 map）→ 走 map 桥：
+    // tie_table_new(16) + 逐对 tie_map_set / tie_map_set_string（键为字符串 ptr）。
+    // 对齐 Rust 基线 gen_table_lit_arg / gen_dyn_table_var 的 map 展开（元素 16 字节）。
+    // 背景（普适段错误根因）：map 字面量曾落入普通表路径——tie_table_new(8) +
+    // tie_table_push_i64，键全部丢弃、元素宽度 8 与运行时 map 的 16 字节元素不符，
+    // 后续 tie_map_set 按 16 字节越界写堆 → 0xC0000374 / 0xC0000005 崩溃，
+    // m["a"] 读回 0（键从未写入）。
+    var nc = sstate.nchild(id)
+    var has_str_key: bool = false
+    var ci: i64 = 0
+    while ci < nc {
+        var ccell = sstate.child(id, ci)
+        var cid = sstate.child(ccell, 0)
+        if cid >= 0 && s_names[cid] >= 0 {
+            has_str_key = true
+        }
+        ci = ci + 1
+    }
+    if has_str_key {
+        // map 值类型：node_types[id] = map<V> → low 解码 V；裸 map 兜底 i64；
+        // 值为 string → tie_map_set_string（对齐 tig_index_read/assign 的 map 分支）。
+        var mval_ty: i64 = types.named(TK_I64)
+        var lit_ty = node_types[id]
+        if types.is_map(lit_ty) {
+            var lv = types.low(lit_ty)
+            if lv > 0 {
+                mval_ty = lv
+            }
+        }
+        var pty_v = types.named(TK_I64)
+        if mval_ty == types.named(TK_STR) {
+            pty_v = types.named(TK_STR)
+        }
+        var t = s21_map_new()  // 数组模式句柄（esz=16，复用表基座）
+        var i: i64 = 0
+        while i < nc {
+            var cell = sstate.child(id, i)
+            var cid2 = sstate.child(cell, 0)
+            if cid2 < 0 || s_names[cid2] < 0 {
+                sm_err_msg = "键值表字面量元素缺少字符串键（函数 " + g_cur_fn_name + "）"
+                return -1
+            }
+            // 键字符串 → @.str.N 全局（tig_str_lit 去引号 + 登记常量；键借用约定：
+            // 字符串字面量是全局常量，比表存活更久——对齐 Rust string_global）
+            var k = tig_str_lit(s_names[cid2])
+            var val = sstate.child(cell, 1)
+            var v = tig_expr(val)
+            if v < 0 {
+                return -1
+            }
+            s21_map_set(t, k, v, pty_v)  // 有序插入（内联二分，替代 tie_map_set 桥）
+            i = i + 1
+        }
+        return t
+    }
+    // 普通表字面量（元素类型推断）
+    // 空表/空 map `[]`：无 cell，has_str_key=false 落本分支。由语义层
+    // node_types[id]（标注类型引导，见 scheck.check_var_decl）区分：
+    // map → 生成 map 句柄（esz=16，复用表基座）；否则普通空表（esz 按元素
+    // 类型，空表兜底 i64=8）。
+    if nc == 0 && types.is_map(node_types[id]) {
+        return s21_map_new()
+    }
+    var elem: i64 = types.named(TK_I64)
+    if nc > 0 {
+        var cell = sstate.child(id, 0)
+        var val = sstate.child(cell, 1)
+        var vt = node_types[val]
+        if vt >= 0 {
+            elem = vt
+        }
+    }
+    var size = elem_size(elem)
+    // 数字实参必须先转值 id（gen_ext_call* 的实参都是值 id，直接传数字
+    // 会被当作值引用生成前向引用 %N）
+    var size_v = tig_int_lit_ty(size, types.named(TK_I64))
+    var t = s21_table_new(size_v)
+    // 逐元素 push
+    var i: i64 = 0
+    while i < nc {
+        var cell = sstate.child(id, i)
+        var val = sstate.child(cell, 1)
+        var v = tig_expr(val)
+        if v < 0 {
+            return -1
+        }
+        // 桥选择按**值**的实际类型判定（对齐 table_push 内建路径 + Rust
+        // table_elem_suffix）：嵌套表/键值表/字符串值 → push_string 存 ptr；
+        // 浮点值 → push_f64；否则按声明元素类型（i64/bool）。
+        // 背景：二维表/嵌套表字面量 `[[1,2],[3,4]]` 的外层元素类型是
+        // table<i64>，若按 elem 选桥会 push_i64(ptr) 类型错（LLVM 拒收）；
+        // 且空内层表 `[]` 的 node_types 落 i64 兜底——只要 elem 本身是表，
+        // 全部元素一律 push_string（元素全是 ptr）。
+        // S2.4：port 对象元素（table<Drawable>）LLVM 表示 = ptr（堆打包
+        // {data,vtable}）——走 string 桥（参数类型 TK_STR = ptr，类型匹配）；
+        // 返回场景（at）由调用处把返回类型标为 K_PORT 本身，避开 S2.1 的
+        // TK_STR 补头逻辑（补头会对 port 对象 ptr 做 strlen → 崩溃）。
+        var suffix = bridge_suffix(elem)
+        var pty = types.named(TK_I64)
+        if types.is_table(elem) || types.is_map(elem) || types.kind(elem) == K_PORT {
+            suffix = "string"
+            pty = types.named(TK_STR)
+        } else {
+            var vt = node_types[val]
+            if vt >= 0 && (types.is_table(vt) || types.is_map(vt) || vt == types.named(TK_STR) || types.kind(vt) == K_PORT) {
+                suffix = "string"
+                pty = types.named(TK_STR)
+            } else if vt >= 0 && (vt == types.named(TK_F64) || vt == types.named(TK_F32)) {
+                suffix = "f64"
+                pty = types.named(TK_F64)
+            } else if suffix == "string" {
+                pty = types.named(TK_STR)
+            } else if suffix == "bool" {
+                pty = types.named(TK_BOOL)
+            }
+        }
+        s21_table_push(t, pty, v)
+        i = i + 1
+    }
+    return t
+}
+
+}
