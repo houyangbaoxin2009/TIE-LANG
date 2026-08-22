@@ -604,6 +604,44 @@ func parse_primary() -> i64 {
     }
     if tag == lex_ident {
         var name = interner.intern(putil.peek_lexeme())
+        // 一期并发：run 上下文识别——`run <actor型名>(实参...)` 产出 N_RUN_ACTOR。
+        // run 非保留字（规避 toolchain 的 func run()），仅当「run + 标识符 + '('」
+        // 三连时按 actor 创建处理；其余情况（run(...) 函数调用 / run 作普通变量）
+        // 落回常规 N_VAR/N_CALL 路径。注意 `run(tool...)`（run 后直接 '('）不匹配，
+        // 恰好规避 toolchain 的 run(cmd) 调用误判。
+        if str_len(putil.peek_lexeme()) > 0 && putil.peek_lexeme() == "run" {
+            var nxt = putil.peek_n(1)
+            if nxt == lex_ident {
+                var anxt = putil.peek_n(2)
+                if anxt == lex_lparen {
+                    // `run <名>(...)`：actor 创建
+                    var rl = putil.peek_line()
+                    var rc = putil.peek_col()
+                    putil.advance()   // run
+                    var aname = putil.peek_lexeme()
+                    putil.advance()   // actor 型名
+                    // 实参（构造到 actor 的初始消息/参数；一期多为空）
+                    var args: table<i64> = table_new_i64()
+                    if putil.eat(lex_lparen) {
+                        if !parse_args_after_lparen(args) {
+                            return -1
+                        }
+                    }
+                    var run = ast.new_node(N_RUN_ACTOR, -1, -1, -1, rl, rc)
+                    var rkids: table<i64> = table_new_i64()
+                    // 首子节点 = actor 类型名（N_NAMED_TYPE，语义层解析为句柄类型）
+                    var tm = ast.new_node(N_NAMED_TYPE, interner.intern(aname), -1, -1, rl, rc)
+                    table_push(rkids, tm)
+                    var ai: i64 = 0
+                    while ai < len(args) {
+                        table_push(rkids, args[ai])
+                        ai = ai + 1
+                    }
+                    ast.set_children(run, rkids)
+                    return run
+                }
+            }
+        }
         putil.advance()
         // 命名空间路径：a::b::c
         if putil.peek_tag() == lex_dcolon {

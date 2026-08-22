@@ -417,6 +417,10 @@ func tig_default_val(ty: i64) -> i64 {
     if ty == types.named(TK_I8) || ty == types.named(TK_CHAR) || ty == types.named(TK_TRIT) {
         return tig_int_lit_ty(0, ty)
     }
+    // 一期并发：actor 句柄 = i64（运行期 actor 表句柄槽）——零值 = 无效句柄
+    if types.kind(ty) == K_ACTOR {
+        return tig_int_lit_ty(0, types.named(TK_I64))
+    }
     // 聚合类型（struct/enum/fn/tuple/port）：alloca + load 得零/未初始化聚合值。
     // 用于「switch 无 default 的 fallthrough 补 ret」等不可达代码——运行时不会
     // 执行（enum 全覆盖匹配），仅满足 LLVM 语法（ret 类型匹配）。

@@ -57,6 +57,7 @@ const K_SLICE: i64 = 8;      // slice<T> 切片（指针+长度，S1.2）
 const K_ATOMIC: i64 = 9;     // atomic<T> 原子类型（S1.2）
 const K_FN: i64 = 10;        // fn 函数值类型（S2.2，闭包/函数指针）
 const K_PORT: i64 = 11;      // port 对象类型（S2.4：接口对象，LLVM 表示 = ptr 指向堆打包 {data,vtable}）
+const K_ACTOR: i64 = 12;     // actor 句柄类型（一期并发：运行期一张 actor 表管所有权，LLVM 表示 = i64 句柄槽）
 const K_SHIFT: i64 = 40;           // 高位分离位移量（负载 < 2^40）
 
 // ---------- TyKw 索引常量（0..22，对齐 Rust TyKw 变体顺序）----------
@@ -110,11 +111,16 @@ const BASE_FN: i64 = 10995116277760;
 // LLVM 表示 = 单个 ptr（指向堆上打包对象 {data,vtable}）——表/传参/字段
 // 天然支持（探针异构 table<Drawable> 依赖此表示，见 S2.4 注释）。
 const BASE_PORT: i64 = 12094627905536;
+// 一期并发 actor 句柄类型段：id = 12<<40 | actor 索引（actor 表行号）。
+// 12<<40 = 13194139533312，i64 有符号下远小于 2^63 无溢出。
+const BASE_ACTOR: i64 = 13194139533312;
 
 // ---------- 全局状态（懒构建）----------
 var tykw_names: table<string>;   // TyKw 索引 -> 类型名（错误消息用）
 var st_names: table<string>;     // struct 名表（索引 -> 名字；type_name 还原用）
 var en_names: table<string>;     // enum 名表（索引 -> 名字；type_name 还原用）
+// 一期并发 actor 名表（索引 -> 名字；type_name 还原用，由语义层 set_actor_name 登记）
+var act_names: table<string>;
 // 嵌套聚合登记表（序号 → 元素/值类型 id）：table<table<T>> / map<聚合> 的编码载体。
 // 背景：table_of(聚合) 若直接 BASE_TABLE + 聚合，会因聚合 id ≥ 2^40 进位撞入
 // map 段（table<table<i64>> = 2^41+3 == map<i64>）——嵌套类型必须查表编码。
@@ -350,6 +356,26 @@ pub func set_port_name(idx: i64, nm: string) {
     table_push(pt_names, nm)
 }
 
+// ---------- 一期并发 actor 句柄类型构造 ----------
+// actor A 句柄：id = 12<<40 | actor 表行号（语义层登记顺序）。
+pub func actor_of(idx: i64) -> i64 {
+    return BASE_ACTOR + idx
+}
+// actor 句柄判据：kind == K_ACTOR（12<<40 段）。
+pub func is_actor(t: i64) -> bool {
+    if kind(t) == K_ACTOR {
+        return true
+    }
+    return false
+}
+// 登记 actor 索引 -> 名字（语义层收集 actor 时调用；追加式，索引 = 登记顺序）。
+pub func set_actor_name(idx: i64, nm: string) {
+    while len(act_names) < idx {
+        table_push(act_names, "")
+    }
+    table_push(act_names, nm)
+}
+
 // ---------- 类型 id 解码 ----------
 
 // 类型类别：0=Named 1=Table 2=Map 3=Struct 4=Tuple 5=TypeVar 6=Enum
@@ -361,6 +387,9 @@ pub func set_port_name(idx: i64, nm: string) {
 pub func kind(id: i64) -> i64 {
     if id < 100 {
         return K_NAMED
+    }
+    if id >= BASE_ACTOR {
+        return K_ACTOR
     }
     if id >= BASE_PORT {
         return K_PORT
@@ -398,6 +427,9 @@ pub func kind(id: i64) -> i64 {
 // 类型负载：Table/Map/Ptr/Slice/Atomic 的元素类型 id、Struct/Tuple/Enum/Port 的
 // 索引、TypeVar 的 intern 池 id；Named 类型无意义（调用方先判 kind）。
 pub func low(id: i64) -> i64 {
+    if id >= BASE_ACTOR {
+        return id - BASE_ACTOR
+    }
     if id >= BASE_PORT {
         return id - BASE_PORT
     }
@@ -728,6 +760,14 @@ pub func type_name(t: i64) -> string {
             return pt_names[pidx]
         }
         return "port"   // 未登记兜底（理论不发生，防御性）
+    }
+    if k == K_ACTOR {
+        // 一期并发 actor 句柄：显示类型名（如 "Counter"）
+        var aidx = low(t)
+        if aidx >= 0 && aidx < len(act_names) {
+            return act_names[aidx]
+        }
+        return "actor"   // 未登记兜底（理论不发生，防御性）
     }
     if k == K_FN {
         var s: string = "fn("

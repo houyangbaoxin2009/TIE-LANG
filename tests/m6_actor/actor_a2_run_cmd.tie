@@ -1,0 +1,15 @@
+type tie<logic>
+// 一期并发 A2 语法层探针：run 上下文识别 + actor 句柄类型。
+// `var c = run Logger()` 产出 actor 句柄（句柄类型 = Logger）。
+// A2 句柄底层为占位 i64（真实 mailbox/线程在 A4/A5）；本探针验证
+// run 表达式能解析、类型推断为句柄、var 声明类型引导正确。
+actor Logger {
+    var name: string = "log"
+    pub async func reset() {
+        name = ""
+    }
+}
+func main() {
+    var c = run Logger()
+    println("actor A2 run 句柄探针通过")
+}

@@ -177,6 +177,12 @@ const N_CASE_BIND: i64 = 140;
 //   （children[0] 起即内容，无泛型槽——一期 actor 不支持泛型）。async 方法
 //   用 N_FN_DEF 的 val bit2（ax%）标记，见 parser。
 const N_ACTOR: i64 = 141;
+// 一期并发：run 表达式（`run Counter()` 上下文识别——run 非保留字）
+//   RunActor[name=-1, children=[actor 类型名节点(N_NAMED_TYPE), 实参...]]
+//   —— 表达式位 `run Counter()`：run 后跟 actor 类型名 + 调用实参，产出句柄。
+//   语句位 `run Logger().log("x")`（fire-and-forget）：本节点作方法调用的
+//   接收者，由 MethodCall 后缀链继续处理。
+const N_RUN_ACTOR: i64 = 142;
 // S3.3 宏/元编程（三节点，布局约定见 mexpand.tie 头注释）：
 //   MacroDef[name=宏名, val=0, aux=nparams, children=[返回类型, 参数..., 函数体]]
 //     —— 布局与 FnDef 一致但**无泛型槽**（children[0] 即返回类型；形参从 1 起，

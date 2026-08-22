@@ -1,0 +1,6 @@
+type tie<logic>
+// 负例：run 后跟未声明的「actor 类型」→ 语义错误
+func main() {
+    var c = run Nonexistent()
+    println("不应到达")
+}

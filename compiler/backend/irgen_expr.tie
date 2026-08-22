@@ -324,6 +324,19 @@ func tig_expr(id: i64) -> i64 {
         // return，Ok/Some 解包 payload。语义由 sinfer.infer_try_unwrap 校验。
         return tig_try(id)
     }
+    if tag == S_N_RUN_ACTOR {
+        // 一期并发 A2：`run <Actor>(...)` 生成 actor 句柄。
+        // A2 仅句柄类型/占位值（0 = 无效句柄）；真实 mailbox/线程/消息分派
+        // 在 A4/A5 落地（届时此处改为生成 actor 表句柄 + 启动消息循环线程）。
+        // 实参求值丢弃（对齐构造，未来作为初始消息）。
+        var rnc = sstate.nchild(id)
+        var rk: i64 = 1
+        while rk < rnc {
+            tig_expr(sstate.child(id, rk))
+            rk = rk + 1
+        }
+        return tig_int_lit(0)
+    }
     // 其他表达式后续扩展
     sm_err_line = s_lines[id]
     sm_err_col = s_cols[id]

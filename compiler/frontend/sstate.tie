@@ -205,8 +205,14 @@ var cl_parent: table<i64>;      // 闭包索引 -> 父闭包索引（sinfer 登�
                                 // -1 = 直接嵌套在普通函数体）。捕获传播（任务21）
                                 // 沿此链把内层闭包捕获上溯到祖先闭包的 env。
 
-// 顶层 StmtList 根（parse_program 创建的最后节点 id）
+// ==================== 顶层 StmtList 根（parse_program 创建的最后节点 id）
 var g_root: i64 = 0;
+
+// ==================== 一期并发 actor 状态表 ====================
+// actor 表：ac_keys（actor 名 id，升序）→ ac_vals（actor 索引）。索引与
+// types.BASE_ACTOR 行号对应（scollect 收集时 set_actor_name 登记同名）。
+var ac_keys: table<i64>;
+var ac_vals: table<i64>;
 
 // ==================== S2.4 port / impl 状态表（接口模型）====================
 // port 表：pt_keys（port 名 id，升序）→ pt_vals（port 索引）。
@@ -332,6 +338,7 @@ const S_N_CODE_INTERP: i64 = 137;   // 插值表达式（$x / $(expr)）
 const S_N_ACTOR: i64 = 141;         // actor 声明：Actor[name=actor 名, aux=items 数,
                                     //   children=[字段 ClassField..., 方法 FnDef...]]
                                     //   （方法 async 标记经 FnDef val bit2）
+const S_N_RUN_ACTOR: i64 = 142;     // run 表达式（run 上下文识别，非保留字）
 namespace sstate {
 
 // ==================== 工具：协议解析 ====================
@@ -1225,6 +1232,29 @@ pub func reg_port(name: string) -> i64 {
     table_push(pm_ret, len(pm_rets))
     sorted_insert(pt_keys, pt_vals, intern.intern(name), idx)
     types.set_port_name(idx, name)
+    return idx
+}
+
+// actor 索引查询（actor 名 -> 索引；-1 = 未登记）。
+pub func actor_find(name: string) -> i64 {
+    var nid = intern.intern(name)
+    var idx = bs_find(ac_keys, nid)
+    if idx < 0 {
+        return -1
+    }
+    return ac_vals[idx]
+}
+
+// actor 登记（重名检查，返回 actor 索引或 -1）。
+// 同时登记 types 侧 actor 名表（type_name 还原用；追加式与索引顺序一致）。
+pub func reg_actor(name: string) -> i64 {
+    if actor_find(name) >= 0 {
+        sm_err_msg = "actor '" + name + "' 重复定义"
+        return -1
+    }
+    var idx = len(ac_vals)
+    sorted_insert(ac_keys, ac_vals, intern.intern(name), idx)
+    types.set_actor_name(idx, name)
     return idx
 }
 

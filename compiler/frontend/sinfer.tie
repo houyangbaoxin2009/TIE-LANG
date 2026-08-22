@@ -1090,6 +1090,33 @@ pub func infer_expr(id: i64) -> i64 {
     if tag == S_N_METHOD_CALL {
         return infer_method_call(id)
     }
+    // 一期并发：`run <Actor>(args...)` 表达式 → actor 句柄类型。
+    // children[0] = actor 类型名（N_NAMED_TYPE），实参（children[1..]）逐个推断。
+    if tag == S_N_RUN_ACTOR {
+        var aty_node = sstate.child(id, 0)
+        var anm = sstate.name_str(aty_node)
+        var aidx = sstate.actor_find(anm)
+        if aidx < 0 {
+            sm_err_line = s_lines[id]
+            sm_err_col = s_cols[id]
+            sm_err_msg = "run 的 '" + anm + "' 不是已声明的 actor 类型"
+            return -1
+        }
+        // 构造实参逐个推断（类型一致性在 A4/A5 与消息契约校对）
+        var nc = sstate.nchild(id)
+        var k: i64 = 1
+        while k < nc {
+            var at = infer_expr(sstate.child(id, k))
+            if at < 0 {
+                return -1
+            }
+            k = k + 1
+        }
+        var ht = types.actor_of(aidx)
+        node_types[id] = ht
+        g_typed = g_typed + 1
+        return ht
+    }
     // S2.3：`expr ?` 后缀解包（Result/Option）
     if tag == S_N_TRY {
         return infer_try_unwrap(id)

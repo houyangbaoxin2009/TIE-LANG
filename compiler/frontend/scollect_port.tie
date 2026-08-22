@@ -1018,11 +1018,18 @@ pub func collect_global_var(v: i64) -> i64 {
     return 0
 }
 
-// 一期并发 A1 语法层：actor 声明接受（语义注册/句柄/消息契约在 A2/A3 落地）。
-// 当前仅做结构约束校验（内部方法必须 pub、async 方法必须 void 返回、字段先于
-// 方法），不登记任何符号——actor 类型名/句柄注册留给 A3（避免污染全局变量表）。
+// 一期并发 A1/A2 语法层：actor 声明收集。
+// 登记 actor 名到 actor 表（防重名 + 句柄类型解析依据）；校验结构约束
+// （内部方法必须 pub、async 必须 void 返回）。方法签名/句柄方法表在 A3 落地。
 // 返回 0 成功 / -1 错误。children = [字段 N_CLASS_FIELD..., 方法 N_FN_DEF...]。
 pub func collect_actor_decl(s: i64) -> i64 {
+    var nm = sstate.name_str(s)
+    var aidx = sstate.reg_actor(nm)
+    if aidx < 0 {
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        return -1
+    }
     var n = s_aux[s]   // items 总数
     var i: i64 = 0
     while i < n {

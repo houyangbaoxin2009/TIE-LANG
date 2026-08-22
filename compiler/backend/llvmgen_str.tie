@@ -77,6 +77,10 @@ func llvm_ty(t: i64) -> string {
         // table<Drawable> 依赖此表示；vtable 本身是全局静态常量）。
         return "ptr"
     }
+    if agg_k == K_ACTOR {
+        // 一期并发：actor 句柄类型 → i64（运行期 actor 表句柄槽）
+        return "i64"
+    }
     if agg_k == K_TUPLE {
         var tidx = t - BASE_TUPLE
         var toff = tup_offs[tidx]
