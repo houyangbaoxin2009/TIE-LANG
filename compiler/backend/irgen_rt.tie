@@ -1,0 +1,434 @@
+type tie<class>
+// compiler/backend/irgen_rt.tie —— 生成器运行时错误处理/回调/默认值 子模块（try/panic/catch/cb_ptr/default_val）
+// ============================================================
+// 从 irgen.tie 的运行时控制片拆出（同 namespace irgen 文本内联跨文件）；本文件只含函数，
+// 不含顶层全局 var。依赖经主文件 import 链内联可达，不重复 import。
+namespace irgen {
+
+// S2.3：`expr ?` 解包展开（N_TRY=133）。语义已由 sinfer.infer_try_unwrap
+// 校验：操作数必须是 Result/Option 形态枚举（含 Ok/Some 与 Err/None 变体），
+// 当前函数返回类型必须是同一枚举实例；解包类型 = Ok/Some 的 payload 类型
+// （node_types[id] 已登记）。IR 布局：tig_agg_addr 落内存 → 槽 0 读 tag →
+// icmp eq err_tag → cond_br；err 分支 ret 操作数聚合值本身（返回类型与
+// 操作数同实例，Err 值原样返回）；ok 分支解包槽 1（string 槽存 i64 指针值
+// → inttoptr 还原 ptr；窄整数槽存 sext 后 i64 → trunc 还原；i64/u64 直用）。
+func tig_try(id: i64) -> i64 {
+    var operand = sstate.child(id, 0)
+    var oty = node_types[operand]
+    if oty < 0 || types.kind(oty) != K_ENUM {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "内部错误：'?' 解包操作数缺少枚举类型（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    var ei = types.low(oty)
+    // 找 Err/None 变体 tag（提前返回分支的判定值）
+    var err_tag = enum_variant_tag(ei, "Err")
+    if err_tag < 0 {
+        err_tag = enum_variant_tag(ei, "None")
+    }
+    if err_tag < 0 {
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "内部错误：'?' 解包枚举缺少 Err/None 变体（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    // 1. 操作数落内存（tig_agg_addr 取聚合地址：变量直接槽，表达式 store 到 alloca）
+    var eaddr = tig_agg_addr(operand, oty)
+    if eaddr < 0 {
+        return -1
+    }
+    // 2. 读 tag（槽 0）：agg_gep 0 → load i64
+    var g0 = ir.new_inst(g_cur_block, 27, oty)  // agg_gep
+    ir.add_operand(g0, eaddr, 0)
+    ir.add_operand(g0, 0, 2)
+    var g0p = ir.get_value(g0)
+    var ld0 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))  // load i64
+    ir.add_operand(ld0, g0p, 0)
+    var tag_v = ir.get_value(ld0)
+    // 3. icmp eq tag_v, err_tag
+    var err_c = tig_int_lit_ty(err_tag, types.named(TK_I64))
+    var ic = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp eq
+    ir.add_operand(ic, tag_v, 0)
+    ir.add_operand(ic, err_c, 0)
+    ir.add_operand(ic, 0, 2)  // eq
+    var icv = ir.get_value(ic)
+    // 4. cond_br → err_blk（提前 return）/ ok_blk（解包）
+    var err_blk = ir.new_block(g_cur_func, interner.intern("try.err"))
+    var ok_blk = ir.new_block(g_cur_func, interner.intern("try.ok"))
+    var cbr = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cbr, icv, 0)
+    ir.add_operand(cbr, err_blk, 1)
+    ir.add_operand(cbr, ok_blk, 1)
+    // 5. err_blk：ret 操作数聚合值（返回类型 == 操作数枚举实例，Err 原样返回）
+    g_cur_block = err_blk
+    var ld_a = ir.new_inst(g_cur_block, 21, oty)  // load 聚合值
+    ir.add_operand(ld_a, eaddr, 0)
+    var agg_v = ir.get_value(ld_a)
+    var ret_e = ir.new_inst(g_cur_block, 32, oty)  // ret 聚合
+    ir.add_operand(ret_e, agg_v, 0)
+    // 6. ok_blk：解包 payload（槽 1）
+    g_cur_block = ok_blk
+    var g1 = ir.new_inst(g_cur_block, 27, oty)  // agg_gep 下标 1
+    ir.add_operand(g1, eaddr, 0)
+    ir.add_operand(g1, 1, 2)
+    var g1p = ir.get_value(g1)
+    var uty = node_types[id]  // 解包类型（infer_try_unwrap 已登记）
+    if uty < 0 {
+        uty = types.named(TK_I64)
+    }
+    // string payload：槽存 i64 指针值 → load i64 → inttoptr 还原 ptr
+    if uty == types.named(TK_STR) {
+        var ld1 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+        ir.add_operand(ld1, g1p, 0)
+        var pv1 = ir.get_value(ld1)
+        var ip = ir.new_inst(g_cur_block, 25, types.named(TK_STR))  // inttoptr
+        ir.add_operand(ip, pv1, 0)
+        return ir.get_value(ip)
+    }
+    // 窄整数 payload：槽存 sext 后 i64 → load i64 → trunc 还原（tig_coerce）
+    if types.is_int(uty) && uty != types.named(TK_I64) && uty != types.named(TK_U64) {
+        var ld2 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+        ir.add_operand(ld2, g1p, 0)
+        var pv2 = ir.get_value(ld2)
+        return tig_coerce(pv2, types.named(TK_I64), uty)  // trunc opcode 37
+    }
+    // 其他（i64/u64）：槽统一 i64，load 直用
+    var ld3 = ir.new_inst(g_cur_block, 21, types.named(TK_I64))
+    ir.add_operand(ld3, g1p, 0)
+    return ir.get_value(ld3)
+}
+
+// S2.3：`panic("消息")` 不可恢复错误语句（N_PANIC=134）→ 打印消息 + 退出。
+// 参考 tig_println（call_vararg + 格式串池 id + 消息）与 exit() 先例
+// （tig_ext_call1("exit", ...)，C 运行时 exit() 自带 stdio flush）。
+// 批次 7（任务 18）：可捕获 panic——若处于 catch_panic 捕获域（@tie_panic_active
+// 为真），打印消息后 longjmp 回 catch 点（不 exit，宿主继续运行）；否则保持
+// 原语义 printf + exit(1)。可配置目标行为（嵌入式 halt / wasm trap）后续。
+func tig_panic(id: i64) -> i64 {
+    var msg = sstate.child(id, 0)
+    var mv = tig_expr(msg)
+    if mv < 0 {
+        return -1
+    }
+    // 读捕获激活标记 @tie_panic_active（i1）
+    llvmgen.catch_enable()
+    var act_id = interner.intern("@tie_panic_active")
+    var lda = ir.new_inst(g_cur_block, 21, types.named(TK_BOOL))  // load i1
+    ir.add_operand(lda, act_id, 3)
+    var active = ir.get_value(lda)
+    // 分支：受捕（打印 + longjmp）/ 未受捕（打印 + exit）
+    var cblk = ir.new_block(g_cur_func, interner.intern("pnc.c"))
+    var xblk = ir.new_block(g_cur_func, interner.intern("pnc.x"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cb, active, 0)
+    ir.add_operand(cb, cblk, 1)
+    ir.add_operand(cb, xblk, 1)
+    var fmt = interner.intern("%s\n")
+    // cblk（受捕）：printf 消息 + longjmp(@tie_panic_jb, 1)（noreturn，跳回 catch 点）
+    g_cur_block = cblk
+    var inst = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
+    ir.add_operand(inst, fmt, 0)
+    ir.add_operand(inst, mv, 0)
+    var jb_id = interner.intern("@tie_panic_jb")
+    var one32 = tig_int_lit_ty(1, types.named(TK_I32))
+    var lj = ir.new_inst(g_cur_block, 36, -1)  // extern_call void（longjmp）
+    ir.add_operand(lj, interner.intern("longjmp"), 0)
+    ir.add_operand(lj, -1, 2)  // 返回 void
+    ir.add_operand(lj, types.named(TK_STR), 2)  // arg0 ty ptr
+    ir.add_operand(lj, jb_id, 3)  // arg0 @tie_panic_jb（OK_GLOBAL）
+    ir.add_operand(lj, types.named(TK_I32), 2)  // arg1 ty i32
+    ir.add_operand(lj, one32, 0)  // arg1 1
+    // longjmp 是 noreturn，但 LLVM 要求块有显式 terminator——追加死 br 到 xblk
+    //（longjmp 永不返回，br 为死代码，优化器删除；满足语法终止）。
+    var ljb = ir.new_inst(g_cur_block, 30, -1)  // br xblk（死代码）
+    ir.add_operand(ljb, xblk, 1)
+    // xblk（未受捕）：printf + exit(1)
+    g_cur_block = xblk
+    var inst2 = ir.new_inst(g_cur_block, 41, types.named(TK_I32))  // call_vararg
+    ir.add_operand(inst2, fmt, 0)
+    ir.add_operand(inst2, mv, 0)
+    var one = tig_int_lit_ty(1, types.named(TK_I64))
+    tig_ext_call1("exit", one, types.named(TK_I64), -1)
+    return 0
+}
+
+// 批次 7（任务 18）：`catch_panic(f)`——f 为 fn() -> T 闭包值，返回 bool。
+// f 内 panic（处于捕获域 @tie_panic_active）→ 打印消息 + longjmp 回跳（不
+// exit）→ 捕获分支返回 true；f 正常返回 → false。宿主据此继续运行。
+// 对齐 clang 对 MSVC setjmp 的生成：`_setjmp(env, frameaddr)`（returns_twice，
+// 帧地址经 llvm.frameaddress.p0(i32 0)）+ `longjmp(env, 1)`（noreturn）；
+// jmp_buf = 256 字节 align 16（对齐 [16 x _SETJMP_FLOAT128]）。
+func tig_catch_panic(id: i64) -> i64 {
+    llvmgen.catch_enable()
+    // 1. 求值闭包 f（fn 值聚合）；语义层已登记 node_types[fn_node] = fn 类型
+    var fn_node = call_arg(id, 0)
+    var fv = tig_expr(fn_node)
+    if fv < 0 {
+        return -1
+    }
+    var fty = node_types[fn_node]
+    if fty < 0 || !types.is_fn(fty) {
+        sm_err_msg = "catch_panic 参数必须是函数值（fn() -> T），函数 " + g_cur_fn_name
+        return -1
+    }
+    // f 落 alloca 聚合槽，提取 env（槽0）/ entry（槽1）
+    var fa = ir.new_inst(g_cur_block, 20, fty)  // alloca fn 聚合
+    ir.add_operand(fa, fty, 2)
+    var fap = ir.get_value(fa)
+    var st = ir.new_inst(g_cur_block, 22, -1)  // store 聚合值
+    ir.add_operand(st, fty, 2)
+    ir.add_operand(st, fv, 0)
+    ir.add_operand(st, fap, 0)
+    var g0 = ir.new_inst(g_cur_block, 27, fty)  // agg_gep 字段 0（env）
+    ir.add_operand(g0, fap, 0)
+    ir.add_operand(g0, 0, 2)
+    var ld0 = ir.new_inst(g_cur_block, 21, types.named(TK_STR))
+    ir.add_operand(ld0, ir.get_value(g0), 0)
+    var env_v = ir.get_value(ld0)
+    var g1 = ir.new_inst(g_cur_block, 27, fty)  // agg_gep 字段 1（entry）
+    ir.add_operand(g1, fap, 0)
+    ir.add_operand(g1, 1, 2)
+    var ld1 = ir.new_inst(g_cur_block, 21, types.named(TK_STR))
+    ir.add_operand(ld1, ir.get_value(g1), 0)
+    var entry_v = ir.get_value(ld1)
+    // 结果槽（bool）：alloca 须在 entry 区域（分支前）生成，否则 llvmgen
+    // alloca 提升/重编号会出现编号倒挂（instruction expected to be numbered）
+    var res_a = ir.new_inst(g_cur_block, 20, types.named(TK_BOOL))  // alloca bool
+    ir.add_operand(res_a, types.named(TK_BOOL), 2)
+    var res_p = ir.get_value(res_a)
+    // 2. frameaddr = call ptr @llvm.frameaddress.p0(i32 0)（immarg 立即数）。
+    // 返回类型必须 K_PTR（非 TK_STR）——TK_STR 会触发 llvmgen op36 的字符串
+    // 扫描补头（strlen + malloc），对地址值做垃圾扫描（曾生成 icmp null +
+    // strlen 地址导致后续 longjmp 路径崩溃）。
+    var fa2 = ir.new_inst(g_cur_block, 36, types.ptr_of(types.named(TK_I8)))
+    ir.add_operand(fa2, interner.intern("llvm.frameaddress.p0"), 0)
+    ir.add_operand(fa2, types.ptr_of(types.named(TK_I8)), 2)
+    ir.add_operand(fa2, types.named(TK_I32), 2)
+    ir.add_operand(fa2, 0, 2)  // i32 0（IMM）
+    var fa_v = ir.get_value(fa2)
+    // 3. r = call i32 @_setjmp(ptr @tie_panic_jb, ptr %fa)
+    var jb_id = interner.intern("@tie_panic_jb")
+    var sj = ir.new_inst(g_cur_block, 36, types.named(TK_I32))
+    ir.add_operand(sj, interner.intern("_setjmp"), 0)
+    ir.add_operand(sj, types.named(TK_I32), 2)
+    ir.add_operand(sj, types.named(TK_STR), 2)
+    ir.add_operand(sj, jb_id, 3)
+    ir.add_operand(sj, types.named(TK_STR), 2)
+    ir.add_operand(sj, fa_v, 0)
+    var sj_v = ir.get_value(sj)
+    // 4. r == 0 → ok_blk（正常执行 f）/ cap_blk（捕获）
+    var z0 = tig_int_lit_ty(0, types.named(TK_I32))
+    var is0 = ir.new_inst(g_cur_block, 12, types.named(TK_BOOL))  // icmp eq i32
+    ir.add_operand(is0, sj_v, 0)
+    ir.add_operand(is0, z0, 0)
+    ir.add_operand(is0, 0, 2)
+    var is0v = ir.get_value(is0)
+    var ok_blk = ir.new_block(g_cur_func, interner.intern("cap.ok"))
+    var cap_blk = ir.new_block(g_cur_func, interner.intern("cap.c"))
+    var cb = ir.new_inst(g_cur_block, 31, -1)  // cond_br
+    ir.add_operand(cb, is0v, 0)
+    ir.add_operand(cb, ok_blk, 1)
+    ir.add_operand(cb, cap_blk, 1)
+    var act_id = interner.intern("@tie_panic_active")
+    var merge = ir.new_block(g_cur_func, interner.intern("cap.m"))
+    // 5. ok_blk：active=true；调用 f（call_indirect，无参，结果丢弃）；active=false；res=false
+    g_cur_block = ok_blk
+    var tr = tig_bool_lit(1)  // true（i1，块内独立生成，SSA）
+    var st1 = ir.new_inst(g_cur_block, 22, -1)  // store i1 true
+    ir.add_operand(st1, types.named(TK_BOOL), 2)
+    ir.add_operand(st1, tr, 0)
+    ir.add_operand(st1, act_id, 3)
+    var ret_ty = types.fn_ret_ty(fty)
+    var ci = ir.new_inst(g_cur_block, 70, ret_ty)  // call_indirect
+    ir.add_operand(ci, entry_v, 0)
+    ir.add_operand(ci, ret_ty, 2)
+    ir.add_operand(ci, env_v, 0)
+    var fl_ok = tig_bool_lit(0)  // false（i1，块内独立）
+    var st2 = ir.new_inst(g_cur_block, 22, -1)  // store i1 false（active）
+    ir.add_operand(st2, types.named(TK_BOOL), 2)
+    ir.add_operand(st2, fl_ok, 0)
+    ir.add_operand(st2, act_id, 3)
+    s21_store(res_p, fl_ok, types.named(TK_BOOL))  // res = false
+    var br1 = ir.new_inst(g_cur_block, 30, -1)  // br merge
+    ir.add_operand(br1, merge, 1)
+    // 6. cap_blk：active=false；res=true
+    g_cur_block = cap_blk
+    var fl_cap = tig_bool_lit(0)  // false（块内独立，SSA）
+    var st3 = ir.new_inst(g_cur_block, 22, -1)  // store i1 false
+    ir.add_operand(st3, types.named(TK_BOOL), 2)
+    ir.add_operand(st3, fl_cap, 0)
+    ir.add_operand(st3, act_id, 3)
+    var tr2 = tig_bool_lit(1)  // true（块内独立）
+    s21_store(res_p, tr2, types.named(TK_BOOL))  // res = true
+    var br2 = ir.new_inst(g_cur_block, 30, -1)  // br merge
+    ir.add_operand(br2, merge, 1)
+    // merge：load res（bool 值返回）
+    g_cur_block = merge
+    g_builtin_res = s21_load(res_p, types.named(TK_BOOL))
+    return 0
+}
+
+// 批次 8（任务 23）：`cb_ptr(f) -> string`——无捕获闭包/命名函数转 C 回调指针。
+// f 须为无捕获闭包字面量（env=null）或命名函数（无 env）；捕获闭包无法作
+// C 回调（C 函数指针不携带 env）。生成 thunk `cb_<节点id>`：签名 fn(A...) -> R
+//（去掉隐藏 env 参数），体内 call 目标（闭包入口 call clos_<id>(ptr null, A...)；
+// 命名函数 call @func(A...)）→ ret。返回 @cb_<节点id> 地址（opcode 63 ptrtoint，
+// extern 函数指针参数按 string/ptr 槽消费，llvmgen to_ptr 直引 @sym）。
+func tig_cb_ptr(id: i64) -> i64 {
+    var fn_node = call_arg(id, 0)
+    var fty = node_types[fn_node]
+    if fty < 0 || !types.is_fn(fty) {
+        sm_err_line = s_lines[fn_node]
+        sm_err_col = s_cols[fn_node]
+        sm_err_msg = "cb_ptr 参数必须是函数值（fn(A) -> R），函数 " + g_cur_fn_name
+        return -1
+    }
+    var ret_ty = types.fn_ret_ty(fty)
+    var nparams = types.fn_nparams_of(fty)
+    // 目标符号与调用形态：with_env=1 → 闭包入口（call clos_<id>(null, ...)），
+    // with_env=0 → 命名函数（call @func(...)）
+    var target: string = ""
+    var with_env: i64 = 0
+    var tag = s_tags[fn_node]
+    if tag == 132 {   // N_FN_LIT 闭包字面量
+        // 捕获非空 → 无法作 C 回调（环境无处置）
+        var ci = closure_index(fn_node)
+        if ci >= 0 {
+            var c_end = len(cl_capkeys)
+            if ci + 1 < len(cl_capoff) {
+                c_end = cl_capoff[ci + 1]
+            }
+            if c_end - cl_capoff[ci] > 0 {
+                sm_err_line = s_lines[fn_node]
+                sm_err_col = s_cols[fn_node]
+                sm_err_msg = "cb_ptr 参数闭包含捕获变量（C 回调函数指针不携带环境），函数 " + g_cur_fn_name
+                return -1
+            }
+        }
+        // 生成闭包入口函数 clos_<id>（cb_ptr 只取地址、不构造闭包值，但入口
+        // 须落地，否则 thunk 引用 @clos_<id> 未定义）；返回值（闭包聚合）丢弃
+        var gv = tig_closure_lit(fn_node)
+        if gv < 0 {
+            return -1
+        }
+        target = "clos_" + to_string(fn_node)
+        with_env = 1
+    } else if tag == 6 {   // S_N_VAR 命名函数提升（变量名解析为函数）
+        var full_nm = resolve_call_name(sstate.name_str(fn_node))
+        var fsig = sstate.fn_sig(full_nm)
+        if fsig < 0 {
+            sm_err_line = s_lines[fn_node]
+            sm_err_col = s_cols[fn_node]
+            sm_err_msg = "cb_ptr 参数 '" + sstate.name_str(fn_node) + "' 不是命名函数（函数 " + g_cur_fn_name + "）"
+            return -1
+        }
+        target = full_nm
+        with_env = 0
+    } else {
+        sm_err_line = s_lines[fn_node]
+        sm_err_col = s_cols[fn_node]
+        sm_err_msg = "cb_ptr 参数必须是无捕获闭包字面量或命名函数（函数 " + g_cur_fn_name + "）"
+        return -1
+    }
+    // 生成 thunk：fn(A...) -> R（无 env 参数，匹配 C 回调签名）
+    var cb_name = "cb_" + to_string(fn_node)
+    var params: table<i64> = table_new_i64()
+    var k: i64 = 0
+    while k < nparams {
+        table_push(params, types.fn_param_of(fty, k))
+        k = k + 1
+    }
+    var saved_func = g_cur_func
+    var saved_block = g_cur_block
+    var fid = ir.new_func(interner.intern(cb_name), ret_ty, params)
+    g_cur_func = fid
+    var entry = ir.new_block(fid, interner.intern("entry"))
+    g_cur_block = entry
+    // call 目标（闭包入口 env=null；命名函数直接传实参）
+    var sym = interner.intern(target)
+    llvmgen.call_sym_reg(sym)
+    var ty35: i64 = -1
+    if ret_ty != types.named(TK_VOID) {
+        ty35 = ret_ty
+    }
+    // 注意：所有值产生指令（const_i/load）必须在 call 指令**之前**创建——
+    // ir_ops 是全局尾插，子表达式指令的操作数会落到 call 操作数区间中间
+    // 覆盖（历史：tig_int_lit 在 add_operand(call) 之间创建，const_i 的操作
+    // 数 L+2 覆盖 call 的 opnd2 → env 类型错乱成 i8 13）。
+    var env_ld: i64 = -1
+    if with_env == 1 {
+        // env=null：alloca ptr 槽 + store null（store 经 to_ptr 转 "null"）+
+        // load → 真 ptr 值（不能直传 const_i——i64 与 ptr 形参类型不匹配）
+        var ea = ir.new_inst(g_cur_block, 20, types.named(TK_STR))  // alloca ptr
+        ir.add_operand(ea, types.named(TK_STR), 2)
+        var eap = ir.get_value(ea)
+        var nullv = tig_int_lit(0)  // const_i 0（store to_ptr → null）
+        var stn = ir.new_inst(g_cur_block, 22, -1)  // store ptr null
+        ir.add_operand(stn, types.named(TK_STR), 2)
+        ir.add_operand(stn, nullv, 0)
+        ir.add_operand(stn, eap, 0)
+        var ldn = ir.new_inst(g_cur_block, 21, types.named(TK_STR))  // load ptr
+        ir.add_operand(ldn, eap, 0)
+        env_ld = ir.get_value(ldn)
+    }
+    var inst = ir.new_inst(g_cur_block, 35, ty35)  // call（子表达式指令已前置）
+    ir.add_operand(inst, sym, 0)
+    ir.add_operand(inst, ret_ty, 2)
+    if with_env == 1 {
+        ir.add_operand(inst, types.named(TK_STR), 2)
+        ir.add_operand(inst, env_ld, 0)
+    }
+    k = 0
+    while k < nparams {
+        var pty = types.fn_param_of(fty, k)
+        ir.add_operand(inst, pty, 2)
+        ir.add_operand(inst, ir.param_val(fid, k), 0)
+        k = k + 1
+    }
+    // ret（void → ret void；其余 → ret 调用结果）
+    if ret_ty == types.named(TK_VOID) {
+        var ret = ir.new_inst(g_cur_block, 32, -1)  // ret void
+    } else {
+        var ret = ir.new_inst(g_cur_block, 32, ret_ty)
+        ir.add_operand(ret, ir.get_value(inst), 0)
+    }
+    // 恢复调用方上下文
+    g_cur_func = saved_func
+    g_cur_block = saved_block
+    // 返回 @cb_<节点id> 地址（string/ptr 槽；extern 参数 to_ptr 直引 @sym）
+    g_builtin_res = tig_func_addr(cb_name)
+    return 0
+}
+
+
+// 类型零值生成：i64/整数 → const 0；string/ptr → 空串全局常量；
+// bool → false；f64 → 0.0（const_f）；i8/i32 等 → 0 常量
+func tig_default_val(ty: i64) -> i64 {
+    if ty == types.named(TK_STR) || types.is_table(ty) || types.is_map(ty) {
+        return tig_str_lit(interner.intern("\"\""))  // 空串指针
+    }
+    if ty == types.named(TK_F64) || ty == types.named(TK_F32) {
+        return tig_float_lit(interner.intern("0.0"))
+    }
+    if ty == types.named(TK_BOOL) {
+        return tig_bool_lit(0)
+    }
+    if ty == types.named(TK_I8) || ty == types.named(TK_CHAR) || ty == types.named(TK_TRIT) {
+        return tig_int_lit_ty(0, ty)
+    }
+    // 聚合类型（struct/enum/fn/tuple/port）：alloca + load 得零/未初始化聚合值。
+    // 用于「switch 无 default 的 fallthrough 补 ret」等不可达代码——运行时不会
+    // 执行（enum 全覆盖匹配），仅满足 LLVM 语法（ret 类型匹配）。
+    if types.kind(ty) == K_STRUCT || types.kind(ty) == K_ENUM || types.kind(ty) == K_FN ||
+        types.kind(ty) == K_TUPLE || types.kind(ty) == K_PORT {
+        var za = ir.new_inst(g_cur_block, 20, ty)  // alloca 聚合
+        ir.add_operand(za, ty, 2)
+        var zp = ir.get_value(za)
+        var lz = ir.new_inst(g_cur_block, 21, ty)  // load 聚合值
+        ir.add_operand(lz, zp, 0)
+        return ir.get_value(lz)
+    }
+    return tig_int_lit_ty(0, types.named(TK_I64))
+}
+}
