@@ -72,21 +72,22 @@ func pool_save() {
     g_pool_sn = s_n
 }
 
-// 池恢复：重新绑定全局表（宏执行后调用；s_n 用快照值而非 len 推导——
-// append_ast 只追加不更新 s_n，且 restore 后 len(s_tags) 是快照引用长度，
-// 与展开循环期望的 s_n 语义一致，显式恢复更稳）。
+// 池恢复：**深拷贝** g_pool_* 快照到全新表（重新绑定 s_* = 快照会导致后续
+// append_ast/splice/gen_code_lit 追加直接改到 g_pool_* 本体——快照被污染，
+// 多宏展开时第二次 pool_restore 拿到的池含上一次的克隆垃圾，类型推断错乱）。
+// s_n 用拷贝后表长（快照保存时的 s_n 恒 == len(s_tags)，等价）。
 func pool_restore() {
-    s_tags = g_pool_tags
-    s_names = g_pool_names
-    s_vals = g_pool_vals
-    s_aux = g_pool_aux
-    s_coff = g_pool_coff
-    s_nchild = g_pool_nchild
-    s_children = g_pool_children
-    s_lines = g_pool_lines
-    s_cols = g_pool_cols
-    node_types = g_pool_types
-    s_n = g_pool_sn
+    s_tags = copy_i64(g_pool_tags)
+    s_names = copy_i64(g_pool_names)
+    s_vals = copy_i64(g_pool_vals)
+    s_aux = copy_i64(g_pool_aux)
+    s_coff = copy_i64(g_pool_coff)
+    s_nchild = copy_i64(g_pool_nchild)
+    s_children = copy_i64(g_pool_children)
+    s_lines = copy_i64(g_pool_lines)
+    s_cols = copy_i64(g_pool_cols)
+    node_types = copy_i64(g_pool_types)
+    s_n = len(s_tags)
 }
 
 // i64 表深拷贝。
@@ -257,7 +258,9 @@ func register_macros() -> i64 {
 // eval_macro 会重建 s_* 池（宏体执行环境），故执行前恢复池快照（池 =
 // 主文件 AST + 已展开追加），执行后再恢复并追加结果。
 func expand_one(call_id: i64) -> i64 {
-    pool_restore()
+    // 每次展开前重存工作池快照（当前 = 主文件 AST + 已展开追加；宏执行会
+    // 重建/污染 s_* 池，须在进入前保存干净状态，供完成后恢复）。
+    pool_save()
     var nm_id = s_names[call_id]
     var name = interner.lookup(nm_id)
     var mi = macro_find(nm_id)
@@ -350,6 +353,8 @@ func finish_expand(call_id: i64, name: string, result: string) -> i64 {
         sm_err_msg = "宏展开结果加载失败（AST 协议解析错误）"
         return -1
     }
+    // 语句位置 `$body` 插值块形式 code 值后，结果含嵌套 StmtList / 块形式
+    // N_CODE_LIT 作语句——由后端 tig_stmt 直接支持（逐语句生成）。
     var new_root = base
     // 找父节点与子下标（out 表输出：out[0]=父节点 id，out[1]=子下标）
     var out: table<i64> = table_new_i64()

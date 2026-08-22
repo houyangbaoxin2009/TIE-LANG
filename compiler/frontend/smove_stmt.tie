@@ -20,6 +20,21 @@ namespace smove {
 // ==================== 语句检查 ====================
 func check_stmt(s: i64) -> i64 {
     var tag = s_tags[s]
+    // 语句级宏（dev33 批次10 任务28）展开残留的嵌套 StmtList / 块形式
+    // N_CODE_LIT（`$body` 插值块后）：按语句块递归（与 scheck 处理一致）。
+    if tag == S_N_STMTLIST {
+        return check_block(s)
+    }
+    if tag == S_N_CODE_LIT {
+        if s_vals[s] == 1 {
+            var inner = sstate.child(s, 0)
+            if inner >= 0 {
+                return check_block(inner)
+            }
+            return 0
+        }
+        return 0
+    }
     // VarDecl：children=[类型或 -1, 初值]
     if tag == S_N_VAR_DECL {
         var init = sstate.child(s, 1)
@@ -91,7 +106,23 @@ func check_stmt(s: i64) -> i64 {
     }
     // ExprStmt：children=[表达式]
     if tag == S_N_EXPR_STMT {
-        return check_expr_read(sstate.child(s, 0))
+        var e = sstate.child(s, 0)
+        // 语句级宏（dev33 批次10 任务28）：`$body` 插值块后子节点是块形式
+        // N_CODE_LIT / 嵌套 StmtList → 按语句块递归（不按表达式读取检查）。
+        if e >= 0 {
+            var et = s_tags[e]
+            if et == S_N_STMTLIST {
+                return check_block(e)
+            }
+            if et == S_N_CODE_LIT && s_vals[e] == 1 {
+                var inner = sstate.child(e, 0)
+                if inner >= 0 {
+                    return check_block(inner)
+                }
+                return 0
+            }
+        }
+        return check_expr_read(e)
     }
     // If：children=[条件, then, else]
     // 分支状态隔离：检查条件 → 快照 → 检查 then → 恢复快照 → 检查 else → 恢复快照。

@@ -391,6 +391,25 @@ func check_enum_switch_case(c: i64, subj_ty: i64) -> i64 {
 // 语句检查
 pub func check_stmt(s: i64) -> i64 {
     var tag = s_tags[s]
+    if tag == S_N_STMTLIST {
+        // 语句级宏（dev33 批次10 任务28）展开残留的嵌套 StmtList
+        //（`$body` 插值块后）：逐语句检查（与 check_block 语义一致）。
+        return check_block(s)
+    }
+    if tag == S_N_CODE_LIT {
+        // 块形式 code 字面量（val=1）作语句：检查内部 StmtList。
+        if s_vals[s] == 1 {
+            var inner = sstate.child(s, 0)
+            if inner >= 0 {
+                return check_block(inner)
+            }
+            return 0
+        }
+        sm_err_line = s_lines[s]
+        sm_err_col = s_cols[s]
+        sm_err_msg = "code 字面量不能作为语句"
+        return -1
+    }
     if tag == S_N_UNSAFE_BLOCK {
         // S1.2 U3：unsafe 块 → 块内开启 unsafe 上下文（+1 深度）
         var saved2 = g_unsafe_depth
@@ -424,6 +443,22 @@ pub func check_stmt(s: i64) -> i64 {
     }
     if tag == S_N_EXPR_STMT {
         var e = sstate.child(s, 0)
+        // 语句级宏（dev33 批次10 任务28）：`$body` 插值块形式 code 值后子节点
+        // 可能是块形式 N_CODE_LIT（val=1）/嵌套 StmtList——按语句块检查，
+        // 而非表达式推断（否则内部字面量不推断 → irgen 默认 i8 类型错）。
+        if e >= 0 {
+            var et = s_tags[e]
+            if et == S_N_CODE_LIT && s_vals[e] == 1 {
+                var inner = sstate.child(e, 0)
+                if inner >= 0 {
+                    return check_block(inner)
+                }
+                return 0
+            }
+            if et == S_N_STMTLIST {
+                return check_block(e)
+            }
+        }
         var t = sinfer.infer_expr(e)
         if t < 0 {
             return -1

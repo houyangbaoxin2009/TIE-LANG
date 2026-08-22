@@ -829,8 +829,22 @@ func tig_stmt(id: i64) -> i64 {
         return 0
     }
     if tag == 102 {
-        // ExprStmt
+        // ExprStmt。语句级宏（dev33 批次10 任务28）：`$body` 插值块形式 code
+        // 值后，子节点可能是块形式 N_CODE_LIT（val=1）/嵌套 StmtList——
+        // 按语句序列生成而非表达式。
         var e = sstate.child(id, 0)
+        if e >= 0 {
+            var et = s_tags[e]
+            if et == 136 && s_vals[e] == 1 {
+                var inner = sstate.child(e, 0)
+                if inner >= 0 {
+                    return tig_stmtlist_as_stmt(inner)
+                }
+            }
+            if et == 122 {
+                return tig_stmtlist_as_stmt(e)
+            }
+        }
         return tig_expr(e)
     }
     if tag == 130 {
@@ -1178,10 +1192,47 @@ func tig_stmt(id: i64) -> i64 {
         // S2.3：`panic("消息")` 不可恢复错误语句（N_PANIC）→ printf + exit(1)
         return tig_panic(id)
     }
+    if tag == 122 {
+        // N_STMTLIST 作语句：逐子语句生成（语句位置宏 `$body` 插值块后残留的
+        // 嵌套语句列表——dev33 批次10 任务28 语句级宏）。
+        return tig_stmtlist_as_stmt(id)
+    }
+    if tag == 136 {
+        // N_CODE_LIT 块形式（val=1）作语句：展开内部 StmtList（`$body` 插值
+        // 块形式 code 值后残留；表达式形式 val=0 在表达式层报错）。
+        if s_vals[id] == 1 {
+            var inner = sstate.child(id, 0)
+            if inner >= 0 {
+                return tig_stmtlist_as_stmt(inner)
+            }
+        }
+        sm_err_line = s_lines[id]
+        sm_err_col = s_cols[id]
+        sm_err_msg = "irgen 不支持 code 字面量作语句（tag=136，函数 " + g_cur_fn_name + "）"
+        return -1
+    }
     sm_err_line = s_lines[id]
     sm_err_col = s_cols[id]
     sm_err_msg = "irgen 未支持的语句（tag=" + to_string(tag) + "，函数 " + g_cur_fn_name + "）"
     return -1  // 其他语句后续扩展
+}
+
+// N_STMTLIST 作语句（dev33 批次10 任务28）：嵌套语句列表逐子语句生成。
+// 语句级宏展开结果可能含 StmtList-in-StmtList（`$body` 插值块后），后端
+// 直接展开为序列——与语义层 smove 处理一致。
+func tig_stmtlist_as_stmt(id: i64) -> i64 {
+    var n = sstate.nchild(id)
+    var k: i64 = 0
+    while k < n {
+        var c = sstate.child(id, k)
+        if c >= 0 {
+            if tig_stmt(c) < 0 {
+                return -1
+            }
+        }
+        k = k + 1
+    }
+    return 0
 }
 
 // 判定 for 迭代对象是否为字符串码点迭代器调用 `s.chars()`（MethodCall）。
