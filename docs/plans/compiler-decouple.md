@@ -1,7 +1,7 @@
 # 编译器解耦任务——移交与衔接计划
 
-> 状态：irgen 分层已全部完成（S1–S8 + 验收均已交付并推送 origin/main）
-> 日期：2026-08-22
+> 状态：irgen 分层（S1–S8）+ 宏子系统解耦（宏 S1–S3）已全部完成，均已交付并推送 origin/main
+> 日期：2026-08-22 / 2026-08-23（宏解耦）
 > 交接对象：接手继续实施 `compiler/` 解耦/分层重构的人
 > 位置：`f:\Projects\tie\compiler\`
 
@@ -49,6 +49,9 @@
 | `f8db886` | **irgen 分层 S6**：L5 聚合结构层 → irgen_agg |
 | `1b8a1a5` | **irgen 分层 S7**：L6 调用分派/ABI 层 → irgen_call |
 | `b47a08e` | **irgen 分层 S8**：收束主文件（runtime 片 → irgen_rt），主文件 7700→1010 行 |
+| `0c1ef29` | **宏解耦 S1**：宏执行入口（eval_proto/eval_macro/eval_macro_proc/code 执行）→ interp_macro |
+| `d938cda` | **宏解耦 S2**：code 值构造（gen_code_lit/卫生/插值/协议拼接）→ interp_code |
+| `f19ec93` | **宏解耦 S3**：M4 token 流工具（expr_from_wrap/转义/parse_tokens/deparse）→ interp_macro |
 
 每步验证：一阶自举 `tiec driver.tie` + 二阶自举 + `regress-s21.ps1` 全量
 PASS=79（其中 2 个 FAIL 为历史基线 try_probe/shift_neg_free，SKIP 2 个为
@@ -115,8 +118,14 @@ PASS=79（其中 2 个 FAIL 为历史基线 try_probe/shift_neg_free，SKIP 2 �
 > 统一命名一致。分层文档 `docs/plans/irgen-llvm-layers.md` 中的函数名仍是 `gen_*` 旧名。
 
 用户原始需求（可选后续）：
-- **子任务A（后移）**：宏↔解释器回环彻底斩断（`mexpand → interp → parser`）。
-  已决策跳过后移，未开始。
+- **子任务A（已完成）**：宏↔解释器回环解耦前置步——宏子系统从 `interp`
+  主文件拆分为独立文件 `interp_macro.tie`（执行入口 + M4 token 工具）+
+  `interp_code.tie`（code 值构造/卫生/插值拼接），M4 token/转义工具从
+  interp_call 归拢。零逻辑改动，宏子系统函数有清晰归属。结构回环
+  `mexpand → interp → parser` 的源码可执行依赖仍存（interp 需 parser 供
+  REPL eval + eval_code/eval_expr/tokenize 内置做源码解析），彻底斩断需
+  eval/token 内置的源码解析入口改走协议文本或独立注入，属更深重构，另行
+  立项。
 - **剩余巨型文件**（>600 行）：scheck(1483)/sstate(1381)/semantic(主)/config(1414)/
   tieir_ser(753)/语法族(pstmt_top 1232/pexpr 1205/putil 860/pstmt_flow 660)。
   其中语法族、tieir_ser、sbuiltin 无清晰内部分区，不宜再拆；sstate 是全局状态
