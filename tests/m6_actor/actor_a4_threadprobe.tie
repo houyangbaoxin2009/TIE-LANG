@@ -1,0 +1,36 @@
+type tie<logic>
+// 一期并发 A4 执行层第 0 步地基探针：起线程。
+// 目标：验证「纯 codegen（tiec → LLVM → clang 链接）能在 tie 程序中起真实
+// OS 线程」——这是 mailbox + 1:1 线程 + 同步 RPC 全部后续的基石，也正是设计
+// 文档 concurrency-model.md §12 待决问题 3（线程入口 ABI）的直接求解。
+// 做法：kernel32 CreateThread 起线程，线程回调用 cb_ptr 生成（C 回调 thunk），
+// 子线程打印一行然后返回；main 用 WaitForSingleObject 阻塞等待子线程完成后
+// 再继续。全程零库依赖（仅链接系统 kernel32），纯 tie + extern。
+// 验证点：子线程能真正执行（打印倒数、返回退出码 0）、进程正常收尾不悬垂。
+
+// kernel32 线程原语（x64 ABI）。start 为线程回调指针（tie string→ptr 直传，
+// 免去指针转整数）；其余为 i64 句柄/大小/标志位（64 位 GPR 承载）。
+unsafe extern fn CreateThread(sec: i64, stack: i64, start: string, arg: i64, flags: i64, tid: i64) -> i64
+unsafe extern fn WaitForSingleObject(h: i64, ms: i64) -> i64
+unsafe extern fn CloseHandle(h: i64) -> i64
+
+// 线程回调：fn(i64) -> i64（匹配 CreateThread 的 LPTHREAD_START_ROUTINE 形态）
+func thread_main(_: i64) -> i64 {
+    println("子线程开始执行（A4 线程地基通过）")
+    return 42
+}
+
+func main() {
+    // 全部 extern 调用放 unsafe 块（安全边界；cb_ptr 生成 C 回调线程入口）
+    unsafe {
+        var f = cb_ptr(thread_main)            // 命名函数 → C 回调 thunk（线程入口）
+        var t = CreateThread(0, 0, f, 0, 0, 0)
+        if t == 0 {
+            println("A4 线程地基失败：CreateThread 返回 0")
+        } else {
+            var w = WaitForSingleObject(t, 10000)  // 阻塞等待子线程结束（最多 10s）
+            CloseHandle(t)
+            println("子线程已结束，wait 结果=" + to_string(w))
+        }
+    }
+}
