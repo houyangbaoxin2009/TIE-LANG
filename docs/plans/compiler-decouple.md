@@ -1,6 +1,6 @@
 # 编译器解耦任务——移交与衔接计划
 
-> 状态：进行中（交接点）
+> 状态：irgen 分层已全部完成（S1–S8 + 验收均已交付并推送 origin/main）
 > 日期：2026-08-22
 > 交接对象：接手继续实施 `compiler/` 解耦/分层重构的人
 > 位置：`f:\Projects\tie\compiler\`
@@ -45,6 +45,10 @@
 | `2720cd5` | **irgen 分层 S3**：L2 算术/比较层 → irgen_arith |
 | `cdeb613` | **irgen 分层 S4**：L3 表达式层 → irgen_expr |
 | `128e29a` | **irgen 分层 S5**：L4 语句/控制流层 → irgen_stmt |
+| `7d34252` | **irgen 命名统一**：91 个 gen_* → tig_*（tie-ir gen），新增本移交文档 |
+| `f8db886` | **irgen 分层 S6**：L5 聚合结构层 → irgen_agg |
+| `1b8a1a5` | **irgen 分层 S7**：L6 调用分派/ABI 层 → irgen_call |
+| `b47a08e` | **irgen 分层 S8**：收束主文件（runtime 片 → irgen_rt），主文件 7700→1010 行 |
 
 每步验证：一阶自举 `tiec driver.tie` + 二阶自举 + `regress-s21.ps1` 全量
 PASS=79（其中 2 个 FAIL 为历史基线 try_probe/shift_neg_free，SKIP 2 个为
@@ -54,7 +58,10 @@ PASS=79（其中 2 个 FAIL 为历史基线 try_probe/shift_neg_free，SKIP 2 �
 
 ## 3. 当前工作区状态（接手重点）
 
-**本次交接点未提交的改动 = `tig_` 精确重命名（已完成、已验证、未提交）**。
+> 已解决（2026-08-22）：本交接点对应的 `tig_` 精确重命名已提交为 `7d34252`
+> 并推送 origin/main；随后 S6–S8 分层亦已完成（见 §2），交接闭环。
+
+**原交接点未提交的改动 = `tig_` 精确重命名（已完成、已验证、已提交 7d34252）**。
 
 执行内容：把 **irgen 命名空间**的 91 个 `gen_*` 函数（含 pub `gen_ast`/
 `gen_src`）改名为 `tig_*`（tie-ir gen）。基于 91 名**白名单** + 词边界精确替换，
@@ -75,7 +82,7 @@ PASS=79（其中 2 个 FAIL 为历史基线 try_probe/shift_neg_free，SKIP 2 �
 - `llvmgen` 自身函数 `gen_func` / `gen_inst`（属 LLVM 生成器，非 irgen，保持 `gen_`）
 - `interp` 命名空间的 `gen_expr`/`gen_call` 等（不属于 irgen，不在白名单）
 
-已验证：一阶+二阶自举均 exit 0。**接手第一步：提交并推送 `tig_` 重命名。**
+已验证：一阶+二阶自举均 exit 0。**该重命名已提交并推送（commit `7d34252`）。**
 
 > 注意：工作区的 `assets/make_social_preview.py`、`assets/social-preview.png`、
 > 一堆 `tests/*/*.exe` 是回归噪音/无关改动，不要混入本次提交（只 `git add`
@@ -83,20 +90,29 @@ PASS=79（其中 2 个 FAIL 为历史基线 try_probe/shift_neg_free，SKIP 2 �
 
 ---
 
-## 4. irgen 分层剩余步骤（按 docs/plans/irgen-llvm-layers.md）
+## 4. irgen 分层完成情况（按 docs/plans/irgen-llvm-layers.md）
 
-分层已到 S5，剩余：
+分层 S1–S8 **全部完成**（对应提交见 §2）。最终职责分布：
 
-| 步骤 | 层 | 建议文件 | 内容 |
+| 层 | 文件 | 内容 | 状态 |
 | --- | --- | --- | --- |
-| **S6** | L5 聚合结构 | `irgen_agg.tie` | 元组/struct/enum/table 字面量与字段访问 |
-| **S7** | L6 调用分派/ABI | `irgen_call.tie` | gen_user_call/gen_method_call/gen_ext_call*/atomic |
-| **S8** | 收束主文件 | 主文件 | irgen.tie 仅留顶层驱动 |
-| **验收** | — | — | 自举闭合 hash 一致 + regress 全绿 + 编译零错误 |
+| L0 Builder | `irgen_builder.tie` | 作用域/循环栈/指令构造原子 | 已交（S1）|
+| L1 字面量 | `irgen_lit.tie` | 常量与类型编码 | 已交（S2）|
+| L2 算术 | `irgen_arith.tie` | 二元/比较/checked | 已交（S3）|
+| L3 表达式 | `irgen_expr.tie` | 表达式生成主调度 | 已交（S4）|
+| L4 语句/控制流 | `irgen_stmt.tie` | 语句/switch/for/打印 | 已交（S5）|
+| L5 聚合结构 | `irgen_agg.tie` | 元组/struct/enum/table 字面量与字段访问 | 已交（S6）|
+| L6 调用分派/ABI | `irgen_call.tie` | user_call/method_call/ext_call*/atomic | 已交（S7）|
+| L7 顶层入口 | `irgen.tie` | 顶层驱动 + 全局状态 + 共享辅助 | 已交（S8）|
+| 运行时控制 | `irgen_rt.tie` | try/panic/catch/cb_ptr/default_val | 已交（S8）|
+| 纵向切片 | `irgen_str/vtable/closure` | 字符串/表/字典/port/闭包 | 既存 |
 
-> 注意：分层完成后需在**改名后**（`tig_`）的函数上继续，且新拆函数名也用
-> `tig_*` 命名（保持命名统一）。分层文档 `docs/plans/irgen-llvm-layers.md`
-> 中的函数名是 `gen_*` 旧名，动手前需对照改名。
+> **没有 S9**：规划到 S8 + 验收（第 9 步）为止。验收已满足——一/二/三阶自举
+> exit 0 且二/三阶二进制 hash 一致（CLOSURE=STABLE）+ `regress-s21` 全量
+> PASS=79（FAIL=2/SKIP=2 均为既定基线）+ 编译零错误。
+
+> 命名约定：新拆函数一律沿用 `tig_*`（tie-ir gen）前缀，保持与 `gen_*`→`tig_*`
+> 统一命名一致。分层文档 `docs/plans/irgen-llvm-layers.md` 中的函数名仍是 `gen_*` 旧名。
 
 用户原始需求（可选后续）：
 - **子任务A（后移）**：宏↔解释器回环彻底斩断（`mexpand → interp → parser`）。
