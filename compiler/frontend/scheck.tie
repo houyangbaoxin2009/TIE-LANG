@@ -967,6 +967,15 @@ pub func check_var_decl(s: i64) -> i64 {
                 }
             }
         }
+        // 空表/空 map 字面量目标引导：`var em: map = []` / `var t: table = []`。
+        // 空 [] 无元素，infer_expr 兜底 i64（无法区分 table/map），由标注类型
+        // 定型：node_types[init] = ty 供 irgen gen_table_lit 选择句柄
+        // （map → esz=16 / table → esz=8），it = ty 使下方类型匹配放行。
+        if it == types.named(TK_I64) && s_tags[init] == S_N_TABLE_LIT &&
+            sstate.nchild(init) == 0 && (types.is_table(ty) || types.is_map(ty)) {
+            node_types[init] = ty
+            it = ty
+        }
         var telem: i64 = -1
         var dyn: i64 = 0
         if types.is_table(ty) {

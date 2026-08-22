@@ -5497,6 +5497,13 @@ func gen_table_lit(id: i64) -> i64 {
         return t
     }
     // 普通表字面量（元素类型推断）
+    // 空表/空 map `[]`：无 cell，has_str_key=false 落本分支。由语义层
+    // node_types[id]（标注类型引导，见 scheck.check_var_decl）区分：
+    // map → 生成 map 句柄（esz=16，复用表基座）；否则普通空表（esz 按元素
+    // 类型，空表兜底 i64=8）。
+    if nc == 0 && types.is_map(node_types[id]) {
+        return s21_map_new()
+    }
     var elem: i64 = types.named(TK_I64)
     if nc > 0 {
         var cell = sstate.child(id, 0)
@@ -6499,6 +6506,12 @@ func s21_map_arr_get(m: i64, key: i64, vty: i64) -> i64 {
     var bt = ir.new_block(g_cur_func, interner.intern("mag2.f"))
     var be = ir.new_block(g_cur_func, interner.intern("mag2.m"))
     var merge = ir.new_block(g_cur_func, interner.intern("mag2.x"))
+    // 结果槽：found 写 rv / missing 写零值（死分支，opt DCE 删），merge load 返回。
+    // 不能直接跨分支 return SSA 值 rv——missing 死 br 也汇入 merge，rv 的 load
+    // 在 bt 块不支配 merge 中的使用 → "Instruction does not dominate all uses"。
+    var slot_a = ir.new_inst(g_cur_block, 20, vty)
+    ir.add_operand(slot_a, vty, 2)
+    var slot_p = ir.get_value(slot_a)
     var cb = ir.new_inst(g_cur_block, 31, -1)
     ir.add_operand(cb, fv, 0)
     ir.add_operand(cb, bt, 1)
@@ -6507,14 +6520,15 @@ func s21_map_arr_get(m: i64, key: i64, vty: i64) -> i64 {
     g_cur_block = bt
     var pos1 = s21_load(pos_p, T64)
     var vaddr = s21_gep(s21_gep(data, s21_bin(2, pos1, gen_int_lit(16)), false), 8, true)
-    var rv = s21_load(vaddr, vty)
+    s21_store(slot_p, s21_load(vaddr, vty), vty)
     var b1 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(b1, merge, 1)
     // missing：raise（noreturn；死 br 到 merge）
     g_cur_block = be
+    s21_store(slot_p, t21_zero(vty), vty)  // 死分支写零值，保证 merge 的 load 被两分支支配
     s21_map_missing_raise(key, merge)
     g_cur_block = merge
-    return rv
+    return s21_load(slot_p, vty)
 }
 
 // 数组模式写：二分定位 → 命中覆盖 / 未命中（检查升级阈值）精确增长+平移+插入。
@@ -6796,6 +6810,11 @@ func s21_map_hash_get(m: i64, key: i64, vty: i64) -> i64 {
     var fnd = ir.new_block(g_cur_func, interner.intern("mhg.f"))
     var mis = ir.new_block(g_cur_func, interner.intern("mhg.m"))
     var exit = ir.new_block(g_cur_func, interner.intern("mhg.x"))
+    // 结果槽：fnd 写 rv / mis 写零值（死分支，DCE 删），exit load 返回。
+    // 直接跨分支 return rv 会触发 "does not dominate all uses"（mis 死 br 汇入 exit）。
+    var slot_a = ir.new_inst(g_cur_block, 20, vty)
+    ir.add_operand(slot_a, vty, 2)
+    var slot_p = ir.get_value(slot_a)
     var b0 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(b0, cond, 1)
     // cond：空槽 → mis；否则 chk
@@ -6821,10 +6840,12 @@ func s21_map_hash_get(m: i64, key: i64, vty: i64) -> i64 {
     g_cur_block = fnd
     var i3 = s21_load(idx_p, T64)
     var rv = s21_hslot_val(htab, i3, vty)
+    s21_store(slot_p, rv, vty)
     var b1 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(b1, exit, 1)
     // mis：raise（noreturn；死 br 到 exit）
     g_cur_block = mis
+    s21_store(slot_p, t21_zero(vty), vty)  // 死分支写零值，保证 exit 的 load 被支配
     s21_map_missing_raise(key, exit)
     // nxt：idx=(idx+1)%cap；br cond
     g_cur_block = nxt
@@ -6833,7 +6854,7 @@ func s21_map_hash_get(m: i64, key: i64, vty: i64) -> i64 {
     var b2 = ir.new_inst(g_cur_block, 30, -1)
     ir.add_operand(b2, cond, 1)
     g_cur_block = exit
-    return rv
+    return s21_load(slot_p, vty)
 }
 
 // 哈希模式写：装填因子检查（need*10 > cap*7 → 1.5x 倍增+全量 rehash）→

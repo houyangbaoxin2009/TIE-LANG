@@ -1,0 +1,45 @@
+type tie<logic>
+// 第 7 批字典 tie 化哈希模式探针：插入 1300+ 键触发数组→哈希升级（阈值 1024），
+// 验证 FNV-1a + 线性探测 + 1.5x 倍增 rehash 后 get/覆盖/打印仍正确。
+// 运行：tiec tests\s21_probe\b7_map_hash_probe.tie && tests\s21_probe\b7_map_hash_probe.exe
+
+func main() {
+    // 1300 键（键为 "k<0..1299>"，倒序插入制造最坏二分/哈希分布）
+    var m: map = []
+    var i: i64 = 1299
+    while i >= 0 {
+        m["k" + to_string(i)] = i * 2
+        i = i - 1
+    }
+    // len 应全量保留
+    if len(m) != 1300 {
+        println("FAIL 升级后 len=" + to_string(len(m)) + " 期望 1300")
+        exit(1)
+    }
+    println("PASS 升级后 len=1300")
+    // 抽样读回（含升级前后键）
+    var j: i64 = 0
+    while j < 1300 {
+        var want = j * 2
+        var got = m["k" + to_string(j)]
+        if got != want {
+            println("FAIL 读 k" + to_string(j) + "=" + to_string(got) + " 期望 " + to_string(want))
+            exit(1)
+        }
+        j = j + 1
+    }
+    println("PASS 1300 键全量读回")
+    // 覆盖既有键（升级后写路径）
+    m["k500"] = -1
+    m["k0"] = -1
+    m["k1299"] = -1
+    if m["k500"] != -1 || m["k0"] != -1 || m["k1299"] != -1 {
+        println("FAIL 升级后覆盖未生效")
+        exit(1)
+    }
+    println("PASS 升级后覆盖")
+    // 缺失键 raise（哈希模式路径）
+    println("哈希模式缺失键读 m[missing]...")
+    println(m["missing"])  // 预期打印错误并 exit(1)
+    println("UNREACHED")
+}

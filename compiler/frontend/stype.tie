@@ -364,6 +364,13 @@ pub func types_match(want: i64, got: i64, init_node: i64) -> bool {
     // 字面量适配
     if init_node >= 0 {
         var tag = s_tags[init_node]
+        // 空表/空 map 字面量 `[]`：无元素，infer 兜底 i64；标注 table/map 时
+        // 放行（元素类型由后续 push 定型；irgen 经 node_types 引导生成对应句柄）
+        if tag == S_N_TABLE_LIT && sstate.nchild(init_node) == 0 {
+            if types.is_table(want) || types.is_map(want) {
+                return true
+            }
+        }
         // 元组字面量：逐字段适配
         if tag == S_N_TUPLE_LIT {
             var kw = types.kind(want)
